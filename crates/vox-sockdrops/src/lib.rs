@@ -4,6 +4,7 @@
 //!
 //! - [`recv_drops`]: a UDP socket's own drop count.
 //! - [`process_args`]: another process's argv (macOS; Linux reads `/proc` without `unsafe`).
+//! - [`process_profile_env`]: only the profile-selection environment of a macOS process.
 //!
 //! **A UDP socket's own drop count.**
 //! A receiver whose socket buffer fills drops what arrives next, and the kernel counts it per
@@ -89,6 +90,11 @@ pub const MAX_PROCARGS: usize = 1 << 20;
 #[cfg(target_os = "macos")]
 #[must_use]
 pub fn process_args(pid: u32) -> Option<Vec<String>> {
+    parse_procargs2(&read_procargs2(pid)?)
+}
+
+#[cfg(target_os = "macos")]
+fn read_procargs2(pid: u32) -> Option<Vec<u8>> {
     let pid = libc::c_int::try_from(pid).ok()?;
     let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
     let mut len: libc::size_t = 0;
@@ -124,7 +130,62 @@ pub fn process_args(pid: u32) -> Option<Vec<String>> {
         return None;
     }
     buf.truncate(len);
-    parse_procargs2(&buf)
+    Some(buf)
+}
+
+/// The five environment variables used to resolve Vox's profile, in the order
+/// `VOX_DATA_DIR`, `VOX_CONFIG_DIR`, `HOME`, `XDG_DATA_HOME`, `XDG_CONFIG_HOME`.
+/// Returns `None` when the process environment cannot be read or parsed completely, including
+/// when a requested variable is duplicated. Other variables are never returned or persisted.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn process_profile_env(pid: u32) -> Option<[Option<std::ffi::OsString>; 5]> {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let buf = read_procargs2(pid)?;
+    let argc = usize::try_from(i32::from_ne_bytes(buf.get(..4)?.try_into().ok()?))
+        .ok()
+        .filter(|n| (1..=4096).contains(n))?;
+    let mut at = 4;
+    at += buf.get(at..)?.iter().position(|b| *b == 0)?;
+    at += buf.get(at..)?.iter().position(|b| *b != 0)?;
+    for _ in 0..argc {
+        at += buf.get(at..)?.iter().position(|b| *b == 0)? + 1;
+    }
+    // Hardened processes can return argv only, silently omitting the environment. An empty
+    // remainder cannot distinguish that restriction from an empty environment, so refuse it.
+    if at >= buf.len() {
+        return None;
+    }
+    let names: [&[u8]; 5] = [
+        b"VOX_DATA_DIR",
+        b"VOX_CONFIG_DIR",
+        b"HOME",
+        b"XDG_DATA_HOME",
+        b"XDG_CONFIG_HOME",
+    ];
+    let mut selected: [Option<std::ffi::OsString>; 5] = Default::default();
+    while at < buf.len() {
+        let remaining = &buf[at..];
+        let end = remaining.iter().position(|b| *b == 0)?;
+        if end == 0 {
+            // Darwin can align later apple strings with NUL padding. Scan the bounded
+            // buffer for only our profile keys; unrelated trailer strings are ignored.
+            at += 1;
+            continue;
+        }
+        let entry = &remaining[..end];
+        if let Some(eq) = entry.iter().position(|b| *b == b'=') {
+            if let Some(index) = names.iter().position(|name| *name == &entry[..eq]) {
+                if selected[index].is_some() {
+                    return None;
+                }
+                selected[index] = Some(std::ffi::OsString::from_vec(entry[eq + 1..].to_vec()));
+            }
+        }
+        at += end + 1;
+    }
+    Some(selected)
 }
 
 /// `pid`'s argv from `/proc/<pid>/cmdline`, `argv[0]` first; `None` when it cannot be read.

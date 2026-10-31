@@ -14,8 +14,8 @@
 //! and Apple vouches for both under the Developer IDs that signed the installed ones. Then one
 //! `renameatx_np(RENAME_SWAP)` puts the new bundle in place, so `Vox.app` is never missing or
 //! partial; the old one becomes `.Vox.app.previous`. A rollback is the same swap the other way.
-//! The daemon is then restarted onto the new version ([`super::restart`]); an open app keeps
-//! running the old one until restarted, and the person is asked to restart it.
+//! The daemon is then restarted onto the new version ([`super::restart`]); an app that was
+//! running from this bundle is normally quit before the swap and relaunched afterward.
 
 use std::fs;
 use std::io::Read as _;
@@ -82,9 +82,10 @@ pub(super) fn update(
             let active = apps.join(BUNDLE);
             let now = app_version(&active)
                 .ok_or_else(|| usage("the repaired Vox.app has no readable version"))?;
-            let detached = super::restart::restart_daemon(&active.join(HELPER), &now);
+            let running = stop_app(&active)?;
+            restart_for_handoff(&active, &now, &running)?;
             shell_setup_from(apps, exe);
-            super::restart::say_next(&detached);
+            relaunch_app(&active, &running)?;
             repaired.say_without_swap();
             return Ok(());
         }
@@ -106,6 +107,10 @@ pub(super) fn update(
         // **An update still updates** (decider, v0.4.2): with nothing newer, completions and the
         // agent skill pack are refreshed on the Vox.app in place. `--check` changes nothing.
         if !check_only {
+            let active = apps.join(BUNDLE);
+            let running = stop_app(&active)?;
+            restart_for_handoff(&active, &current.to_string(), &running)?;
+            relaunch_app(&active, &running)?;
             shell_setup_from(apps, exe);
             println!("Vox {current} is current; {}", super::skill_said());
         }
@@ -144,17 +149,27 @@ pub(super) fn update(
         let _ = clear(&staged);
         return Err(refused);
     }
-    let aside = publish(apps, &vox.version_text)?;
+    let running = match stop_app(&active) {
+        Ok(running) => running,
+        Err(e) => {
+            let _ = clear(&staged);
+            return Err(e);
+        }
+    };
+    let aside = match publish(apps, &vox.version_text) {
+        Ok(aside) => aside,
+        Err(e) => return Err(transition_failed(&active, &running, e)),
+    };
 
     println!("updated: {} -> Vox {}", active.display(), vox.version_text);
     println!(
         "         the previous Vox.app is kept at {} for `vox update --rollback`",
         apps.join(PREVIOUS).display()
     );
-    ask_to_restart(current.to_string().as_str(), &vox.version_text);
-    let detached = super::restart::restart_daemon(&active.join(HELPER), &vox.version_text);
+
+    restart_for_handoff(&active, &vox.version_text, &running)?;
     shell_setup_from(apps, exe);
-    super::restart::say_next(&detached);
+    relaunch_app(&active, &running)?;
     match aside {
         Some(error) => Err(error),
         None => Ok(()),
@@ -177,22 +192,28 @@ pub(super) fn rollback(apps: &Path, exe: &Path) -> Result<(), AppError> {
             apps.display()
         )));
     }
+    let running = stop_app(&active)?;
     let was = app_version(&active).unwrap_or_else(|| "unknown".to_owned());
     // The kept bundle becomes an application again before it is swapped in; the one it replaces
     // is set aside after, so neither is ever both in place and set aside.
-    restore(&previous)?;
+    if let Err(e) = restore(&previous) {
+        return Err(transition_failed(&active, &running, e));
+    }
     if let Err(failed) = swap(&previous, &active) {
         // Nothing was swapped: the kept bundle is set aside again, never left an application.
-        return Err(match set_aside(&previous) {
+        let error = match set_aside(&previous) {
             Ok(()) => failed,
             Err(aside) => AppError::Usage(format!(
                 "the rollback swap failed ({failed}), and {aside}; run `vox update` to repair, \
                  and until then open Vox as {}",
                 active.display()
             )),
-        });
+        };
+        return Err(transition_failed(&active, &running, error));
     }
-    sync_dir(apps)?;
+    if let Err(e) = sync_dir(apps) {
+        return Err(transition_failed(&active, &running, e));
+    }
     // The rollback is done at this point. A set-aside that fails is reported last, after the
     // active bundle is registered and the daemon restarted, so a failed step never leaves the
     // rest of the transition undone or invites a second --rollback that would reverse it.
@@ -206,10 +227,17 @@ pub(super) fn rollback(apps: &Path, exe: &Path) -> Result<(), AppError> {
         "         Vox {was} is kept at {} for --rollback",
         previous.display()
     );
-    ask_to_restart(&was, &now);
-    let detached = super::restart::restart_daemon(&active.join(HELPER), &now);
+    restart_for_handoff(&active, &now, &running).map_err(|e| {
+        usage(format!(
+            "rollback to Vox {now} is already in place; do not repeat --rollback: {e}"
+        ))
+    })?;
     shell_setup_from(apps, exe);
-    super::restart::say_next(&detached);
+    relaunch_app(&active, &running).map_err(|e| {
+        usage(format!(
+            "rollback to Vox {now} is already in place; do not repeat --rollback: {e}"
+        ))
+    })?;
     // Said, not failed: the rollback is committed, and a command that reports failure invites
     // the same command again, which would roll back once more and reverse it. The repair is
     // `vox update`, which sets the kept bundle aside under the lock without swapping anything.
@@ -745,10 +773,422 @@ fn writable(dir: &Path) -> Result<(), AppError> {
     Ok(())
 }
 
-/// The bundle is in place, but an app already open is not: say so, and ask. The daemon is
-/// restarted by the update itself ([`super::restart`]).
-fn ask_to_restart(was: &str, now: &str) {
-    println!("restart Vox to run {now}: an open Vox keeps running {was} until it is restarted");
+/// PIDs with a particular owned file open; never a process-name match.
+fn pids_using(path: &Path) -> Result<Vec<u32>, AppError> {
+    let out = Command::new("/usr/sbin/lsof")
+        .arg("-t")
+        .arg(path)
+        .env_clear()
+        .output()
+        .map_err(|e| usage(format!("cannot inspect {}: {e}", path.display())))?;
+    if !out.status.success() && (out.status.code() != Some(1) || !out.stderr.is_empty()) {
+        return Err(usage(format!(
+            "cannot inspect {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    String::from_utf8(out.stdout)
+        .map_err(|_| usage("lsof returned invalid process IDs"))?
+        .lines()
+        .map(|line| {
+            line.parse()
+                .map_err(|_| usage("lsof returned invalid process IDs"))
+        })
+        .collect()
+}
+
+/// Finish the app handoff only when the caller is the newly installed helper invoked by the
+/// still-running updater that owns this exact install's lock and retained executable.
+pub(super) fn post_install_delegate() -> Result<(), AppError> {
+    let Some(parent) = crate::claude_injector::proc_of(std::process::id()).map(|p| p.ppid) else {
+        return Ok(());
+    };
+    let Some(args) = vox_sockdrops::process_args(parent) else {
+        return Ok(());
+    };
+    if args.get(1).map(String::as_str) != Some("update") || args.iter().any(|arg| arg == "--check")
+    {
+        return Ok(());
+    }
+    let exe = std::env::current_exe().map_err(AppError::Io)?;
+    let super::Channel::Bundle { apps_dir: apps, .. } = super::detect_channel(&exe)? else {
+        return Ok(());
+    };
+    let previous = apps.join(PREVIOUS);
+    if !previous.join(HELPER).is_file() {
+        return Ok(());
+    }
+    if !pids_using(&previous.join(HELPER))?.contains(&parent) {
+        return Ok(());
+    }
+    let lock = apps.join(super::LOCK_NAME);
+    if !pids_using(&lock)?.contains(&parent) {
+        return Err(usage(
+            "the updater does not hold the install lock; the app was not quit",
+        ));
+    }
+    let lock_file = fs::OpenOptions::new().read(true).write(true).open(&lock)?;
+    match rustix::fs::flock(
+        &lock_file,
+        rustix::fs::FlockOperation::NonBlockingLockExclusive,
+    ) {
+        Ok(()) => return Err(usage("the install lock is not held; the app was not quit")),
+        Err(e) if e == rustix::io::Errno::AGAIN => {}
+        Err(e) => return Err(usage(format!("cannot verify the install lock: {e}"))),
+    }
+    let plist = [KEPT_INFO_PLIST, INFO_PLIST]
+        .iter()
+        .map(|name| previous.join(name))
+        .find(|path| path.is_file())
+        .ok_or_else(|| {
+            usage("the retained app's Info.plist is unavailable; the app was not quit")
+        })?;
+    let out = Command::new("/usr/libexec/PlistBuddy")
+        .args(["-c", "Print :CFBundleExecutable"])
+        .arg(plist)
+        .env_clear()
+        .output()?;
+    if !out.status.success() || out.stdout.len() > MAX_VERSION_OUTPUT_BYTES {
+        return Err(usage(
+            "the retained app's executable cannot be identified; the app was not quit",
+        ));
+    }
+    let name = std::str::from_utf8(&out.stdout)
+        .map_err(|_| usage("the retained app's executable name is invalid"))?
+        .trim();
+    let name_path = Path::new(name);
+    if name.is_empty()
+        || name_path.components().count() != 1
+        || !matches!(
+            name_path.components().next(),
+            Some(std::path::Component::Normal(_))
+        )
+    {
+        return Err(usage(
+            "the retained app's executable name is invalid; the app was not quit",
+        ));
+    }
+    let previous_executable = previous.join("Contents/MacOS").join(name);
+    if !previous_executable.is_file() {
+        return Err(usage(
+            "the retained app executable is missing; the app was not quit",
+        ));
+    }
+    let active = apps.join(BUNDLE);
+    let old_pids = pids_using(&previous_executable)?;
+    if old_pids.is_empty() {
+        println!("vox: no previously running Vox app needs a restart");
+        return Ok(());
+    }
+    let stopped = stop_app_from(&active, Some(&previous_executable))?.ok_or_else(|| {
+        usage("the retained app process could not be identified; it was not quit")
+    })?;
+    let stopped = Some(stopped);
+    let now = app_version(&active).ok_or_else(|| {
+        usage("the installed app version cannot be identified; the app was not relaunched")
+    })?;
+    restart_for_handoff(&active, &now, &stopped)?;
+    relaunch_app(&active, &stopped)?;
+    println!("vox: the installed Vox app was relaunched; no manual restart is needed");
+    Ok(())
+}
+
+/// AppKit identifies a running application by its bundle URL, executable URL and PID.
+/// Never address it by display name or bundle identifier: another install can share both.
+/// `terminate` is the ordinary, cancellable application quit, not a forced signal.
+const APP_HANDOFF: &str = r#"
+ObjC.import('AppKit');
+ObjC.import('Foundation');
+function run(argv) {
+    const action = argv[0];
+    const url = $.NSURL.fileURLWithPath($(argv[1])).URLByResolvingSymlinksInPath;
+    const bundle = $.NSBundle.bundleWithURL(url);
+    if (!bundle || !bundle.executableURL) throw new Error('bundle executable is unavailable');
+    const wantedBundle = ObjC.unwrap(url.path);
+    const wantedExecutable = ObjC.unwrap(bundle.executableURL.URLByResolvingSymlinksInPath.path);
+    const legacy = action === 'legacy-inspect' || action === 'legacy-stop';
+    const previousBundle = legacy
+        ? ObjC.unwrap(url.URLByDeletingLastPathComponent.URLByAppendingPathComponent('.Vox.app.previous').URLByResolvingSymlinksInPath.path)
+        : '';
+    const previousExecutable = legacy
+        ? ObjC.unwrap($.NSURL.fileURLWithPath($(argv[4])).URLByResolvingSymlinksInPath.path)
+        : '';
+    function matching() {
+        const apps = $.NSWorkspace.sharedWorkspace.runningApplications;
+        const found = [];
+        for (let i = 0; i < apps.count; i++) {
+            const app = apps.objectAtIndex(i);
+            const bundleURL = app.bundleURL;
+            if (bundleURL.isNil()) continue;
+            const appBundle = ObjC.unwrap(bundleURL.URLByResolvingSymlinksInPath.path);
+            if (appBundle !== wantedBundle && (!legacy || appBundle !== previousBundle)) continue;
+            const executableURL = app.executableURL;
+            const executable = executableURL.isNil() ? null
+                : ObjC.unwrap(executableURL.URLByResolvingSymlinksInPath.path);
+            if (executable !== wantedExecutable && (!legacy || executable !== previousExecutable))
+                throw new Error('running application at bundle path has a different or unavailable executable');
+            if (!app.isTerminated) found.push(app);
+        }
+        return found;
+    }
+    function identity(app) {
+        // Integer microseconds survive JSON and Rust parsing without a rounded f64 identity.
+        const started = Math.round(Number(app.launchDate.timeIntervalSince1970) * 1e6);
+        if (!Number.isSafeInteger(started) || started <= 0) throw new Error('application launch date is unavailable; the app was not quit');
+        return { pid: Number(app.processIdentifier), started };
+    }
+    if (action === 'inspect' || action === 'stop' || legacy) {
+        const apps = matching();
+        if (apps.length === 0) {
+            if (action === 'stop' || action === 'legacy-stop') throw new Error('application exited before the quit request');
+            return 'not-running';
+        }
+        if (apps.length !== 1) throw new Error('multiple applications run from this bundle; none was stopped');
+        const app = apps[0];
+        const instance = identity(app);
+        if (action === 'inspect' || action === 'legacy-inspect') return JSON.stringify(instance);
+        if (instance.pid !== Number(argv[2]) || instance.started !== Number(argv[3]))
+            throw new Error('application changed before the quit request; none was stopped');
+        if (!app.terminate) throw new Error('application pid ' + instance.pid + ' refused the quit request');
+        for (let i = 0; i < 150; i++) {
+            if (app.isTerminated) return 'stopped';
+            $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.2));
+        }
+        throw new Error('application pid ' + instance.pid + ' did not quit within 30 seconds');
+    }
+    const oldPid = Number(argv[2]);
+    const oldStarted = Number(argv[3]);
+    for (let i = 0; i < 150; i++) {
+        const apps = matching();
+        for (const app of apps) {
+            const instance = identity(app);
+            if (instance.pid !== oldPid || instance.started !== oldStarted) return String(instance.pid);
+        }
+        $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.2));
+    }
+    throw new Error('no replacement process from the installed bundle appeared within 30 seconds');
+}
+"#;
+
+#[derive(serde::Deserialize)]
+struct AppIdentity {
+    pid: u32,
+    started: u64,
+}
+
+struct StoppedApp {
+    identity: AppIdentity,
+    account: vox_core::node::paths::Account,
+    environment: [Option<std::ffi::OsString>; 5],
+}
+
+fn app_handoff(
+    action: &str,
+    active: &Path,
+    identity: Option<&AppIdentity>,
+    previous_executable: Option<&Path>,
+) -> Result<String, AppError> {
+    let mut command = Command::new("/usr/bin/osascript");
+    command.args(["-l", "JavaScript", "-e", APP_HANDOFF, "--", action]);
+    command.arg(active);
+    if let Some(identity) = identity {
+        command
+            .arg(identity.pid.to_string())
+            .arg(identity.started.to_string());
+    }
+    if let Some(previous) = previous_executable {
+        if identity.is_none() {
+            command.args(["0", "0"]);
+        }
+        command.arg(previous);
+    }
+    let out = command.output().map_err(|e| {
+        usage(format!(
+            "could not inspect or control {}: {e}",
+            active.display()
+        ))
+    })?;
+    if !out.status.success() {
+        return Err(usage(format!(
+            "application handoff for {} failed: {}",
+            active.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+}
+
+fn stop_app(active: &Path) -> Result<Option<StoppedApp>, AppError> {
+    stop_app_from(active, None)
+}
+
+fn stop_app_from(active: &Path, previous: Option<&Path>) -> Result<Option<StoppedApp>, AppError> {
+    let action = if previous.is_some() {
+        "legacy-inspect"
+    } else {
+        "inspect"
+    };
+    let result = app_handoff(action, active, None, previous)?;
+    if result == "not-running" {
+        return Ok(None);
+    }
+    let identity: AppIdentity = serde_json::from_str(&result)
+        .map_err(|_| usage("application handoff returned an invalid process identity"))?;
+    if identity.pid == 0 || identity.started == 0 {
+        return Err(usage(
+            "application handoff returned an invalid process identity",
+        ));
+    }
+    if let Some(previous) = previous {
+        if !pids_using(previous)?.contains(&identity.pid) {
+            return Err(usage(
+                "the running app is not using the retained executable; it was not quit",
+            ));
+        }
+    }
+    let env = vox_sockdrops::process_profile_env(identity.pid)
+        .ok_or_else(|| usage("cannot read the running Vox app's profile; the app was not quit"))?;
+    let root = |explicit: &Option<std::ffi::OsString>,
+                xdg: &Option<std::ffi::OsString>|
+     -> Result<PathBuf, AppError> {
+        let path = if let Some(value) = explicit {
+            PathBuf::from(value)
+        } else if let Some(value) = xdg.as_ref().filter(|v| !v.is_empty()) {
+            PathBuf::from(value).join("vox")
+        } else {
+            let home = env[2]
+                .as_ref()
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| usage("the running Vox app has no HOME; it was not quit"))?;
+            PathBuf::from(home).join("Library/Application Support/vox")
+        };
+        if !path.is_absolute() {
+            return Err(usage(
+                "the running Vox app has a relative profile path; it was not quit",
+            ));
+        }
+        Ok(path)
+    };
+    let account = vox_core::node::paths::Account {
+        data_root: root(&env[0], &env[3])?,
+        config_dir: root(&env[1], &env[4])?,
+    };
+    let action = if previous.is_some() {
+        "legacy-stop"
+    } else {
+        "stop"
+    };
+    app_handoff(action, active, Some(&identity), previous)?;
+    Ok(Some(StoppedApp {
+        identity,
+        account,
+        environment: env,
+    }))
+}
+
+fn restart_for_handoff(
+    active: &Path,
+    now: &str,
+    stopped: &Option<StoppedApp>,
+) -> Result<(), AppError> {
+    use vox_core::node::paths::Account;
+    let restart = |account: &Account| {
+        let detached = super::restart::restart_daemon_checked(account, &active.join(HELPER), now)
+            .map_err(|e| {
+            usage(format!(
+                "{} is in place, but the daemon restart failed: {e}{}",
+                active.display(),
+                if stopped.is_some() {
+                    "; the stopped app was not relaunched"
+                } else {
+                    ""
+                }
+            ))
+        })?;
+        super::restart::say_next(&detached);
+        Ok::<(), AppError>(())
+    };
+    if let Some(app) = stopped {
+        restart(&app.account)
+    } else {
+        let account = Account::of(None, None).map_err(|e| {
+            usage(format!(
+                "{} is in place, but the updater's daemon account could not be resolved: {e}",
+                active.display()
+            ))
+        })?;
+        restart(&account)
+    }
+}
+
+fn relaunch_app(active: &Path, stopped: &Option<StoppedApp>) -> Result<(), AppError> {
+    let Some(app) = stopped else {
+        return Ok(());
+    };
+    let mut open = Command::new("/usr/bin/open");
+    open.arg("-n");
+    // Pass resolved roots, never the updater's potentially different profile environment.
+    for (key, value) in [
+        ("VOX_DATA_DIR", &app.account.data_root),
+        ("VOX_CONFIG_DIR", &app.account.config_dir),
+    ] {
+        let mut assignment = std::ffi::OsString::from(format!("{key}="));
+        assignment.push(value);
+        open.arg("--env").arg(assignment);
+    }
+    for (key, value) in ["HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME"]
+        .into_iter()
+        .zip(app.environment[2..].iter())
+    {
+        open.env_remove(key);
+        if let Some(value) = value {
+            let mut assignment = std::ffi::OsString::from(format!("{key}="));
+            assignment.push(value);
+            open.arg("--env").arg(assignment);
+        }
+    }
+    let out = open.arg(active).output().map_err(|e| {
+        usage(format!(
+            "{} is installed, but could not be relaunched: {e}",
+            active.display()
+        ))
+    })?;
+    if !out.status.success() {
+        return Err(usage(format!(
+            "{} is installed, but LaunchServices could not relaunch it: {}",
+            active.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    let new_pid = app_handoff("wait", active, Some(&app.identity), None).map_err(|e| {
+        usage(format!(
+            "{} is installed, but its relaunch was not confirmed: {e}",
+            active.display()
+        ))
+    })?;
+    println!("relaunched {} (pid {new_pid})", active.display());
+    Ok(())
+}
+
+/// A publication can fail before or after its atomic swap. Reopen whichever bundle remains
+/// active, and report both the original failure and any failure to reopen it.
+fn transition_failed(active: &Path, stopped: &Option<StoppedApp>, error: AppError) -> AppError {
+    let reopened = app_version(active)
+        .ok_or_else(|| {
+            usage("the active app version is unavailable; the stopped app was not relaunched")
+        })
+        .and_then(|version| restart_for_handoff(active, &version, stopped))
+        .and_then(|()| relaunch_app(active, stopped));
+    match reopened {
+        Ok(()) => usage(format!(
+            "the app transition did not finish: {error}; {} is in place",
+            active.display()
+        )),
+        Err(relaunch) => usage(format!(
+            "the app transition did not finish: {error}; {relaunch}"
+        )),
+    }
 }
 
 /// Refresh completions and the agent skill pack through the path the person ran, when that is

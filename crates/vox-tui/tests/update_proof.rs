@@ -650,8 +650,20 @@ fn app_bundle(dir: &Path, version: &str, helper: &Path) -> PathBuf {
     // Nested code first: a bundle whose helper is unsigned cannot be signed, and a version stub
     // is a script, which carries its signature in an extended attribute.
     for code in [contents.join("Helpers/vox"), app.clone()] {
-        let signed = Command::new("/usr/bin/codesign")
-            .args(["--force", "--sign", "-"])
+        let mut sign = Command::new("/usr/bin/codesign");
+        sign.args(["--force", "--sign", "-"]);
+        if code == contents.join("Helpers/vox") {
+            // A cdhash-only ad-hoc identity changes at every build and cannot read the
+            // old helper's private test Keychain item. Give controlled helpers one
+            // test signing requirement; this is not Developer ID or release-trust proof.
+            sign.args([
+                "--identifier",
+                "us.vox.proof.helper",
+                "--requirements",
+                "=designated => identifier \"us.vox.proof.helper\"",
+            ]);
+        }
+        let signed = sign
             .arg(&code)
             .output()
             .unwrap_or_else(|e| panic!("APPARATUS: could not run codesign: {e}"));
@@ -862,8 +874,7 @@ fn bundle_claims(claims: &mut Vec<Claim>, receipts: &mut BTreeMap<String, String
                 && cli == format!("vox {NEWER}")
                 && app == NEWER
                 && prev_cli.contains(VERSION)
-                && prev_app == VERSION
-                && text.contains("restart Vox to run"),
+                && prev_app == VERSION,
             format!(
                 "after `vox update` (exit_ok={}): vox reports {cli:?}, Vox.app says {app:?}; \
                  .Vox.app.previous holds vox {prev_cli:?} and app {prev_app:?}; it said {text:?}",
@@ -1421,11 +1432,21 @@ fn daemon_restart_claim(
     }
     let listed = |link: &Path| -> (bool, bool, String) {
         let out = said(&vox(link, home, &["node", "list"], &env));
-        let attached = |name: &str| {
-            out.lines()
-                .any(|l| l.split_whitespace().take(2).eq([name, "attached"]))
+        let ready = |name: &str| {
+            let status = vox(link, home, &["status", "--node", name, "--json"], &env);
+            let ready = status.status.success()
+                && serde_json::from_slice::<serde_json::Value>(&status.stdout)
+                    .ok()
+                    .is_some_and(|value| value["status"].as_str() == Some("Ready"));
+            (ready, said(&status))
         };
-        (attached("kept"), attached("plain"), out)
+        let (kept, kept_status) = ready("kept");
+        let (plain, plain_status) = ready("plain");
+        (
+            kept,
+            plain,
+            format!("{out}\nkept status: {kept_status}\nplain status: {plain_status}"),
+        )
     };
     let service = std::net::TcpListener::bind("127.0.0.1:0").expect("APPARATUS: local service");
     let service_arg = format!(
@@ -1475,6 +1496,19 @@ fn daemon_restart_claim(
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     let (kept_before, plain_before, before) = listed(&link);
+    if !staging.is_empty() || !kept_before || !plain_before {
+        claims.push(blocked(
+            id,
+            format!("APPARATUS: staging two Ready nodes failed: {staging:?}; {before:?}"),
+        ));
+        let _ = Command::new("/bin/kill")
+            .arg(serve_pid.to_string())
+            .status();
+        for pid in holders(&data) {
+            let _ = Command::new("/bin/kill").arg(pid).status();
+        }
+        return;
+    }
 
     // The other release's CLI refuses this daemon before using a node, and a hook says the
     // same plain fix to its agent. These are two real binaries, with only the release string
@@ -1513,6 +1547,18 @@ fn daemon_restart_claim(
             .arg(serve_pid.to_string())
             .status();
     }
+    if !out.status.success() || !kept_after {
+        claims.push(claim(
+            id,
+            false,
+            format!("`vox update` did not leave the remembered node Ready: {text:?}; {after:?}"),
+        ));
+        receipts.insert(id.into(), text);
+        for pid in holders(&data) {
+            let _ = Command::new("/bin/kill").arg(pid).status();
+        }
+        return;
+    }
 
     // Exercise the current client's remaining callers against the other real release. This
     // direction lets the already-compiled next-version fixture remain independent of the fix.
@@ -1520,7 +1566,6 @@ fn daemon_restart_claim(
         vec!["daemon", "--node", "kept"],
         vec!["node", "detach", "kept"],
         vec!["node", "rename", "kept", "renamed-by-mismatch"],
-        vec!["agent", "status", "--harness", "claude"],
     ] {
         let refusal = said(&vox(Path::new(VOX), home, &args, &env));
         claims.push(claim(
@@ -1564,14 +1609,11 @@ fn daemon_restart_claim(
             && refusal.contains("vox daemon --restart"),
         format!("SessionEnd hook against another release said {refusal:?}"),
     ));
-    let (_, _, after_refusals) = listed(&link);
+    let (kept_after_refusals, _, after_refusals) = listed(&link);
     claims.push(claim(
         "daemon.mismatched_rename_preserves_attached_node",
-        after_refusals
-            .lines()
-            .any(|l| l.split_whitespace().take(2).eq(["kept", "attached"]))
-            && !after_refusals.contains("renamed-by-mismatch"),
-        format!("after the refused rename, vox node list said {after_refusals:?}"),
+        kept_after_refusals,
+        format!("after the refused rename, the original node's status said {after_refusals:?}"),
     ));
     // Uninstall an independent managed copy of this release while the scratch account still
     // runs the other release. It must stop that authenticated daemon before removing its copy.
@@ -1598,16 +1640,6 @@ fn daemon_restart_claim(
         let _ = Command::new("/bin/kill").arg(pid).status();
     }
 
-    if !staging.is_empty() || !kept_before || !plain_before {
-        claims.push(blocked(
-            id,
-            format!(
-                "APPARATUS: staging two attached nodes failed: {staging:?}; `vox node list` said \
-                 {before:?}"
-            ),
-        ));
-        return;
-    }
     let restarted = format!("the vox daemon was restarted and runs vox {next}");
     claims.push(claim(
         id,

@@ -3511,6 +3511,11 @@ pub fn run() -> ExitCode {
         },
         Cmd::Agent(AgentCmd::Plugin(args)) => {
             if args.install {
+                #[cfg(target_os = "macos")]
+                if let Err(error) = crate::update::post_install_delegate() {
+                    eprintln!("vox: update app handoff failed: {error}");
+                    return ExitCode::FAILURE;
+                }
                 let installed = crate::setup::install_light_hooks();
                 if let Ok(account) = vox_core::node::paths::Account::of(None, None) {
                     crate::agent_onboarding::discover(&account);
