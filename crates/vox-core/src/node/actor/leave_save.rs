@@ -918,6 +918,7 @@ impl Node {
         self.legacy_cleanup_rooms.remove(room);
         let preparing = self.cancel_room_preparation(room, Fault::ChannelNotOpen);
         let reopening = self.reopening.remove(room);
+        self.reopen_failures.remove(room);
         if self.channels.contains_key(room) {
             self.own_key_room_set_changed.send_replace(());
         }
@@ -965,6 +966,7 @@ impl Node {
             net.forget_board_exchange_room(room);
         }
         self.cancel_room_preparation(room, Fault::UnknownChannel);
+        self.reopen_failures.remove(room);
         let (overtaken, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.leave_waiters)
             .into_iter()
             .partition(|(r, _, _, _, _)| r == room);

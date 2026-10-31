@@ -1179,6 +1179,10 @@ impl UiState {
         let Some(summary) = vm.channels.get(self.selected_channel) else {
             return Action::Redraw;
         };
+        if let Some(reason) = &summary.open_failure {
+            self.status_message = Some(reason.clone());
+            return Action::Redraw;
+        }
         if summary.preparing {
             // The list says why this room is pending; its saved key needs no new prompt.
             return Action::Redraw;

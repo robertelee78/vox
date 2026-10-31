@@ -405,7 +405,9 @@ fn render_sidebar(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiState) {
             format!(" ({})", levels.join(" · "))
         };
         // In words, never a padlock (ADR-028 L-8).
-        let closed = if c.preparing {
+        let closed = if c.open_failure.is_some() {
+            " (failed)"
+        } else if c.preparing {
             " (preparing history)"
         } else if c.open {
             ""
@@ -420,11 +422,15 @@ fn render_sidebar(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiState) {
             ""
         };
         let (reach, reach_style) = reachability_label(c.reachability);
-        items.push(ListItem::new(Line::from(vec![
+        let mut spans = vec![
             Span::raw(format!("{marker}{}{attention}{closed}{unread}  [", c.name)),
             Span::styled(reach, reach_style),
             Span::raw("]"),
-        ])));
+        ];
+        if let Some(reason) = &c.open_failure {
+            spans.push(Span::raw(format!(" — {reason}")));
+        }
+        items.push(ListItem::new(Line::from(spans)));
     }
     if !vm.machine_nodes.is_empty() {
         items.push(
@@ -640,7 +646,12 @@ fn render_serve(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiState) {
 
 fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiState) {
     let Some(channel) = vm.active.as_ref() else {
-        let p = Paragraph::new("No room open").block(Block::default().borders(Borders::ALL));
+        let text = ui
+            .selected_room
+            .and_then(|id| vm.channels.iter().find(|c| c.channel_id == id))
+            .and_then(|c| c.open_failure.as_deref())
+            .unwrap_or("No room open");
+        let p = Paragraph::new(text).block(Block::default().borders(Borders::ALL));
         frame.render_widget(p, area);
         return;
     };

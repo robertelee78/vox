@@ -696,8 +696,8 @@ fn a_room_held_closed_is_opened_by_joining_it_again() {
 }
 
 /// **A room the daemon does not reopen says why** (#412): a remembered room whose reopen fails
-/// is held closed, and the daemon's log names it and what refused it — a closed room with no word
-/// was one nobody could tell how to get back. The failure is driven by `VOX_TEST_REOPEN_FAILS`
+/// is held closed, and both its listing and a refused read retain the daemon's reason. The log
+/// also names the room and what refused it. The failure is driven by `VOX_TEST_REOPEN_FAILS`
 /// (test-knobs only), which makes every reopen fail with the reason it carries.
 ///
 /// **The note is said before the unlock's answer**, and the daemon used to take the answer first
@@ -756,16 +756,18 @@ fn a_room_that_does_not_reopen_says_why() {
         .lines()
         .find(|l| l.contains("did not reopen") && l.contains(&room[..12]))
         .map(str::to_owned);
-    println!(
-        "[proof] the room is listed closed: {}; the daemon said: {note:?}",
-        listed.contains("[closed]")
-    );
-    assert!(
-        listed.contains("[closed]"),
-        "PRODUCT (staging): the room reopened although its reopen was made to fail:\n{listed}"
-    );
+    println!("[proof] the room listing: {listed}; the daemon said: {note:?}");
     assert!(
         note.as_deref().is_some_and(|n| n.contains(why)),
         "PRODUCT: a room that did not reopen was not named in the daemon's log with why:\n{said}"
+    );
+    assert!(
+        listed.contains(why),
+        "PRODUCT: the closed room listing lost the daemon's reopen failure:\n{listed}"
+    );
+    let (ok, _, err) = vox(&alice, &["room", "read", &room], None);
+    assert!(
+        !ok && err.contains(why),
+        "PRODUCT: reading the failed room did not report the daemon's reopen failure:\n{err}"
     );
 }

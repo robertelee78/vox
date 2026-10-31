@@ -43,6 +43,8 @@ pub struct ChannelSummary {
     pub open: bool,
     /// The room is recovering locally; its history is not yet available.
     pub preparing: bool,
+    /// The daemon's last automatic reopen failure; absent while open, preparing or locked.
+    pub open_failure: Option<String>,
     /// While preparing: what the room waits for, in words, and since when (unix ms), so a
     /// person can tell a stuck room from a slow one (ADR-038 FX-16, #991).
     pub waiting: Option<(String, u64)>,
