@@ -2521,6 +2521,9 @@ enum Cmd {
         #[arg(long, conflicts_with = "check")]
         rollback: bool,
     },
+    /// Internal target-version update transaction.
+    #[command(hide = true)]
+    UpdateApply { request: std::path::PathBuf },
     /// Print shell completions for SHELL to stdout.
     Completions {
         /// The shell to generate completions for (bash, zsh, fish, …).
@@ -3527,11 +3530,6 @@ pub fn run() -> ExitCode {
         },
         Cmd::Agent(AgentCmd::Plugin(args)) => {
             if args.install {
-                #[cfg(target_os = "macos")]
-                if let Err(error) = crate::update::post_install_delegate() {
-                    eprintln!("vox: update app handoff failed: {error}");
-                    return ExitCode::FAILURE;
-                }
                 let installed = crate::setup::install_light_hooks();
                 if let Ok(account) = vox_core::node::paths::Account::of(None, None) {
                     crate::agent_onboarding::discover(&account);
@@ -3843,6 +3841,13 @@ pub fn run() -> ExitCode {
             }
         },
         Cmd::Update { check, rollback } => match crate::update::run(check, rollback) {
+            Ok(code) => ExitCode::from(code),
+            Err(e) => {
+                eprintln!("vox: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Cmd::UpdateApply { request } => match crate::update::apply_request(&request) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("vox: {e}");

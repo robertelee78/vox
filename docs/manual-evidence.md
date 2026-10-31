@@ -4,6 +4,53 @@ Updated: 2026-10-15 for the v0.4.5 source/documentation pass. Prior walkthrough 
 remain historical evidence at their stated revisions. Scope: ADR-027 M27.1 / work item #421. This is maintainer evidence, not a chapter in the public navigation manifest. Source
 inspection is not an execution test.
 
+## v0.4.13 target-version updater ownership candidate (#1090)
+
+The operator corrected M-29b's architecture: the installed binary is to download and verify
+the target updater, then transfer control before installed-state or app/daemon changes.
+Post-install plugin delegation is removed, not extended.
+
+Source `36d9f9c8b38062336ad2b9f98458e0fed5072dba` was compiled as actual bootstrap-capable
+0.4.12 and target 0.4.13 fixtures. The 0.4.12 fixture is not the untouched published 0.4.12:
+that older binary does not call the new pre-publication entrypoint. In a fresh scratch macOS
+guest, a temporary target `update-apply` process held the installation lock while the app
+still reported 0.4.12. It then installed 0.4.13, restarted the daemon, restored the node Ready,
+relaunched the exact app with its original data/config/HOME despite a different updater
+profile, and preserved the exact saved room message.
+
+A real immutable older-backup directory produced a truthful cleanup refusal after handoff.
+After that obstruction was removed, a frozen pre-fix binary left retained work pending when
+the next updater asset returned 404; corrected code repaired it without repeating completed
+handoff, while still returning failure for the unavailable upgrade. Clean upgrade, local
+rollback and closed-app version changes passed. The unrelated running app kept its exact
+launch identity. A separate owned standalone install checked without upgrading, then installed
+the target and restored Ready with exactly one engine-asset download.
+
+The first runtime attempt exposed a real creation-mode defect: tempfile directories defaulted
+to 0755 under umask 0022, but the target required 0700. Creation now explicitly requests 0700;
+the consumer's strict guard was not weakened. Source review alone missed that defect.
+
+Reviewed-plan execution then rebuilt product source `d2b4fa87d4b5daf5c2972a809c4c50f931b382b6`;
+`0352e21aba96a4b13f92f2413b93a6f4b828c45e` adds the independently approved ADR/plan.
+A fresh native 0.4.12 → 0.4.13 journey again observed `update-apply` before publication,
+then the replacement app, its exact original profile, Ready node and saved message.
+A separate normal-feature rollback exposed a swallowed daemon-readiness failure: the old
+wrapper returned zero; the rebuilt command returned nonzero and no successful next-step message.
+That after-fixture retained the same version, so it is restart-failure evidence, not a
+version-changing rollback claim.
+
+Actual x86-64 Linux binaries passed check without mutation, update, rollback, Ready service
+and saved-message retention. An installation under a real non-UTF-8 pathname updated at its
+exact byte path. The first container lacked a reaping init; its defunct old daemon caused a
+shutdown-bound refusal. Repeating under `--init` corrected that apparatus fault. Cross-build
+and Linux-target Clippy used native-arm Rust after the emulated x86 compiler itself crashed.
+
+These are source-bound controlled ad-hoc/loopback observations, not public Developer ID or
+notarization acceptance. Mac receipts are under
+`/private/tmp/vox1007-practical-42qu344_/v0413-reviewed-plan-*` and
+`v0413-standalone-restart-false-success-*`; Linux logs are under
+`/Users/robert.lee/vox-owner-linux-20261031-7oam1dbj/`. No unit tests or CI gates were added.
+
 ## v0.4.12 updater correction candidate (#1090)
 
 The [full updater RCA](updater-rca-2026-10-30.md) separates the unknown original OS refusal

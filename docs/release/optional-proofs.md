@@ -19,13 +19,19 @@ They are kept "at the ready for troubleshooting". When a user reports one of the
 
 ### macOS update recovery (ADR-014 M-29a)
 
-A plain `vox update` first repairs the local install under its transition lock, before asking
-GitHub for release metadata. If an earlier publish was interrupted, a previous bundle still has
-its live `Contents/Info.plist`, or a retired bundle needs disarming or removal, this invocation
-finishes that repair **without another bundle exchange**. It restarts a running scratch daemon
-through the active bundle's helper, refreshes shell integration, and ends with
-`repaired an earlier app transition without swapping Vox.app`, naming the repaired state.
-Run `vox update` again when a separate release update is wanted. `--check` remains read-only.
+For a newer release, `vox update` downloads and verifies its updater before transferring the
+same invocation to it. The target owns the transition lock, retained local recovery and the
+new installation. Repair does not suppress an available newer upgrade. If release lookup or
+engine download is unavailable, installed code can still finish retained local work; that
+repair is reported separately from the failed upgrade. `--check` remains read-only and
+`--rollback` remains local. A repair of a committed rollback must not exchange the bundles again.
+
+The existing controlled bundle and daemon journeys require `VOX_PROOF_NEXT_BINARY` to name a
+genuinely compiled next-version helper, built with `test-knobs`; for workspace version
+`0.4.13`, their existing next-version convention is `9.4.13`. A `--version` script or patched
+version string is not a next-release binary. Their release fixture serves that exact signed
+helper and tag-pinned app records. Native app launch/registration claims remain in the signed
+guest journey below; the controlled CLI bundle fixture does not establish them.
 
 On macOS, daemon restart recognizes a kernel zombie state or native process-lookup `ESRCH`
 as stopped even if the terminal or service-manager parent has not reaped the PID yet.
@@ -54,15 +60,19 @@ cargo test --release -p vox-tui --features optional-proofs,test-knobs \
   an_update_and_rollback_leave_one_launchable_vox --nocapture
 ```
 
-For current-source recovery evidence, assemble a genuine native prior bundle at the current
-workspace version with the existing `test-knobs` feature in its helper, and a newer candidate
-from the same source with only the workspace-version delta and **normal release features**.
-Developer ID sign and notarize the helpers and complete bundles before supplying them. Record
-the source patch, both versions, feature selections, artifact digests and Apple's receipts.
-The prior's existing loopback-release selector serves the signed candidate; the normal candidate
-repairs local interrupted state before networking. No apps-directory selector is needed.
-These are source-bound signed artifacts, not a claim that the proof-only prior was a published
-release. Keep previously published-artifact runs separately attributed.
+For current-source recovery evidence, assemble a genuine native prior bundle and a newer
+candidate from the same source with only the workspace-version delta. Both helpers must be
+built with the existing `test-knobs` feature: publication and its interruption now belong to
+the downloaded target, so a knob compiled only into the prior or test runner cannot stage it.
+The journey checks the supplied helpers as an apparatus precondition. Developer ID sign and
+notarize both complete bundles before supplying them; change neither after signing. Record
+the source delta, versions, feature selections, artifact digests and Apple's receipts.
+
+This source-bound interruption proof is not normal-artifact release-trust evidence. Record
+the untouched public-prior → normal public-candidate upgrade separately, using the published
+release endpoint and normal signature checks. Before publication, controlled loopback target
+execution requires test-knobs and cannot establish normal-artifact delivery. An older public
+caller without the bootstrap still cannot establish pre-publication target ownership.
 
 The journey drives `install.sh`, the physically installed helpers, real publish interruption,
 identifier launches, rollback, graceful quit, a real live retirement, and a read-only-Contents

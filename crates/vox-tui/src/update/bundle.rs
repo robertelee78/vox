@@ -8,9 +8,9 @@
 //! - `.Vox.app.previous`, the bundle the last update or install replaced, for `--rollback`;
 //! - `.vox-standalone.lock`, held for a whole transition.
 //!
-//! An update fetches vox's record and the app's, requires one version, downloads the app, and
-//! unpacks it beside the bundle as `.Vox.app.partial`. It verifies every part before anything is
-//! renamed: the vox inside is byte for byte the vox the record names, the app says that version,
+//! The target updater uses its pinned vox record and fetches the app record for that exact
+//! version, downloads the app, and unpacks it beside the bundle as `.Vox.app.partial`. It verifies
+//! every part before anything is renamed: the vox inside is byte for byte the vox the record names,
 //! and Apple vouches for both under the Developer IDs that signed the installed ones. Then one
 //! `renameatx_np(RENAME_SWAP)` puts the new bundle in place, so `Vox.app` is never missing or
 //! partial; the old one becomes `.Vox.app.previous`. A rollback is the same swap the other way.
@@ -26,9 +26,9 @@ use std::process::Command;
 use sha2::{Digest, Sha256};
 
 use super::{
-    apple_required, codesign_ok, download_asset, fetch_app_record, fetch_record, run_shell_setup,
-    signing_identity, sync_dir, target_triple, usage, InstallLock, Validated, IO_BUFFER_BYTES,
-    MAX_VERSION_OUTPUT_BYTES,
+    apple_required, codesign_ok, download_asset, fetch_app_record_at, fetch_record,
+    run_shell_setup, signing_identity, sync_dir, target_triple, usage, InstallLock, Validated,
+    IO_BUFFER_BYTES, MAX_VERSION_OUTPUT_BYTES,
 };
 use crate::app::AppError;
 
@@ -226,78 +226,116 @@ fn prepare_transition(
 #[cfg(feature = "test-knobs")]
 const TEST_ABORT_AFTER_SWAP_ENV: &str = "VOX_TEST_ABORT_AFTER_SWAP";
 
-/// `vox update [--check]` for the Vox.app in `apps`.
-///
-/// # Errors
-/// No release, a release whose app and vox disagree, a transfer or verification failure, or a
-/// failed swap. Nothing in `apps` is changed by a refusal.
+/// Check the channel or refresh the installed bundle without downloading a candidate.
 pub(super) fn update(
     apps: &Path,
     channel: &str,
     exe: &Path,
     check_only: bool,
 ) -> Result<(), AppError> {
-    let target = target_triple();
-    let current = semver::Version::parse(env!("CARGO_PKG_VERSION"))
-        .map_err(|_| usage("this binary's own version is not SemVer"))?;
-    // A local repair must not depend on GitHub being reachable, nor perform another exchange.
-    // Hold the same lock through recovery and any subsequent publication.
-    let _lock = if check_only {
-        None
-    } else {
-        Some(InstallLock::acquire(apps)?)
-    };
-    if !check_only {
-        let repaired = recover(apps)?;
-        if !repaired.is_empty() {
-            if !repaired.handoff_done {
-                let active = apps.join(BUNDLE);
-                let now = app_version(&active)
-                    .ok_or_else(|| usage("the repaired Vox.app has no readable version"))?;
-                journaled_refresh(apps, &active, &now)?;
-            }
-            shell_setup_from(apps, exe);
-            repaired.say_without_swap();
-            return Ok(());
+    if check_only {
+        let vox = fetch_record(channel, target_triple())?;
+        let current = installed_version(apps)?;
+        if vox.version > current {
+            println!(
+                "Vox {} is available on {channel} (this is {current})",
+                vox.version_text
+            );
+        } else {
+            println!(
+                "Vox {current} is current (the newest {channel} release is {})",
+                vox.version_text
+            );
+        }
+        return Ok(());
+    }
+    let _lock = InstallLock::acquire(apps)?;
+    if repair_locked(apps, exe)? {
+        return Ok(());
+    }
+    refresh(apps, exe)
+}
+
+/// Repair retained local work after a release lookup fails, without requiring network access.
+pub(super) fn repair(apps: &Path, exe: &Path) -> Result<bool, AppError> {
+    let _lock = InstallLock::acquire(apps)?;
+    repair_locked(apps, exe)
+}
+
+fn repair_locked(apps: &Path, exe: &Path) -> Result<bool, AppError> {
+    let repaired = recover(apps)?;
+    if repaired.is_empty() {
+        return Ok(false);
+    }
+    if !repaired.handoff_done {
+        let active = apps.join(BUNDLE);
+        let now = app_version(&active)
+            .ok_or_else(|| usage("the repaired Vox.app has no readable version"))?;
+        journaled_refresh(apps, &active, &now)?;
+    }
+    shell_setup_from(apps, exe);
+    repaired.say_without_swap();
+    Ok(true)
+}
+
+fn installed_version(apps: &Path) -> Result<semver::Version, AppError> {
+    let helper = apps.join(BUNDLE).join(HELPER);
+    let version = super::binary_version(&helper).ok_or_else(|| {
+        usage(format!(
+            "cannot identify installed version at {}",
+            helper.display()
+        ))
+    })?;
+    semver::Version::parse(&version)
+        .map_err(|_| usage(format!("installed version {version:?} is not SemVer")))
+}
+
+fn refresh(apps: &Path, exe: &Path) -> Result<(), AppError> {
+    let active = apps.join(BUNDLE);
+    let now = app_version(&active).ok_or_else(|| {
+        usage(format!(
+            "cannot identify installed version at {}",
+            active.display()
+        ))
+    })?;
+    journaled_refresh(apps, &active, &now)?;
+    shell_setup_from(apps, exe);
+    sweep(apps, &mut Recovery::default())?;
+    println!("Vox {now} is current; {}", super::skill_said());
+    Ok(())
+}
+
+/// Apply the already verified helper release, with the target engine owning the transaction.
+pub(super) fn apply(apps: &Path, exe: &Path, vox: &Validated) -> Result<(), AppError> {
+    let _lock = InstallLock::acquire(apps)?;
+    let channel = super::Marker::read(&apps.join(super::MARKER_NAME))?.channel;
+    if channel != vox.record.channel {
+        return Err(usage(
+            "the install channel changed while the update was being prepared",
+        ));
+    }
+    match super::detect_channel(exe)? {
+        super::Channel::Bundle {
+            apps_dir,
+            channel: owned_channel,
+        } if apps_dir == apps && owned_channel == channel => {}
+        _ => {
+            return Err(usage(
+                "the original helper no longer belongs to this bundle install",
+            ))
         }
     }
-    let vox = fetch_record(channel, target)?;
-    let app = fetch_app_record(channel, target)?;
+    let repaired = repair_locked(apps, exe)?;
+    let current = installed_version(apps)?;
+    if vox.version <= current {
+        return if repaired { Ok(()) } else { refresh(apps, exe) };
+    }
+    let app = fetch_app_record_at(&channel, &vox.target, &vox.version_text)?;
     if app.version != vox.version {
         return Err(usage(format!(
-            "the {channel} release offers vox {} but Vox.app {}; they are applied together or not \
-             at all",
+            "the {channel} release offers vox {} but Vox.app {}; they are applied together or not at all",
             vox.version_text, app.version_text
         )));
-    }
-    if vox.version <= current {
-        println!(
-            "Vox {current} is current (the newest {channel} release is {})",
-            vox.version_text
-        );
-        // **An update still updates** (decider, v0.4.2): with nothing newer, completions and the
-        // agent skill pack are refreshed on the Vox.app in place. `--check` changes nothing.
-        if !check_only {
-            let active = apps.join(BUNDLE);
-            let now = app_version(&active).ok_or_else(|| {
-                usage(format!(
-                    "cannot identify installed version at {}",
-                    active.display()
-                ))
-            })?;
-            journaled_refresh(apps, &active, &now)?;
-            shell_setup_from(apps, exe);
-            sweep(apps, &mut Recovery::default())?;
-            println!("Vox {current} is current; {}", super::skill_said());
-        }
-        return Ok(());
-    }
-    println!(
-        "Vox {} is available on {channel} (this is {current})",
-        vox.version_text
-    );
-    if check_only {
-        return Ok(());
     }
 
     let active = apps.join(BUNDLE);
@@ -331,13 +369,13 @@ pub(super) fn update(
     let zip = downloading.into_temp_path();
 
     let staged = unpack(apps, &zip)?;
-    if let Err(refused) = verify(&active, &staged, &vox) {
+    if let Err(refused) = verify(&active, &staged, vox) {
         return Err(match clear_candidate(&staged) {
             Ok(()) => refused,
             Err(cleanup) => usage(format!("{refused}; candidate cleanup failed: {cleanup}")),
         });
     }
-    let running = inspect_app(&active, None)?;
+    let running = inspect_app(&active)?;
     let mut transition = prepare_transition(
         apps,
         &staged,
@@ -345,7 +383,7 @@ pub(super) fn update(
         &vox.version_text,
         &running,
     )?;
-    stop_captured_app(&active, None, &running)?;
+    stop_captured_app(&active, &running)?;
     let aside = match publish(apps, &vox.version_text) {
         Ok(aside) => aside,
         Err(e) => {
@@ -410,13 +448,13 @@ pub(super) fn rollback(apps: &Path, exe: &Path) -> Result<(), AppError> {
             apps.display()
         )));
     }
-    let running = inspect_app(&active, None)?;
+    let running = inspect_app(&active)?;
     let was = app_version(&active).ok_or_else(|| usage("active Vox.app version is unavailable"))?;
     let target =
         app_version(&previous).ok_or_else(|| usage("previous Vox.app version is unavailable"))?;
     let mut transition =
         prepare_transition(apps, &previous, TransitionKind::Rollback, &target, &running)?;
-    stop_captured_app(&active, None, &running)?;
+    stop_captured_app(&active, &running)?;
     // The kept bundle becomes an application again before it is swapped in; the one it replaces
     // is set aside after, so neither is ever both in place and set aside.
     if let Err(e) = restore(&previous) {
@@ -1076,7 +1114,7 @@ fn recover(apps: &Path) -> Result<Recovery, AppError> {
     // Upgrade only an unambiguous legacy layout. Capture only an app observed now; a legacy
     // journal cannot tell us whether an earlier updater had already stopped a different app.
     let active = apps.join(BUNDLE);
-    let running = inspect_app(&active, None)?;
+    let running = inspect_app(&active)?;
     let (source, target) = if active_version == published.trim() {
         (if staged_present { &staged } else { &previous }, &active)
     } else {
@@ -1268,14 +1306,14 @@ fn recover_transition(apps: &Path, path: &Path) -> Result<Recovery, AppError> {
         let app_handoff = || -> Result<(), AppError> {
             let mut app_already_restored = false;
             if let Some(saved) = app.as_ref() {
-                if let Some(current) = inspect_app(&active, None)? {
+                if let Some(current) = inspect_app(&active)? {
                     if current.identity.pid == saved.identity.pid
                         && current.identity.started == saved.identity.started
                     {
                         if !committed {
                             return Ok(());
                         }
-                        stop_captured_app(&active, None, &app)?;
+                        stop_captured_app(&active, &app)?;
                     } else {
                         let same_profile = current.account.data_root == saved.account.data_root
                             && current.account.config_dir == saved.account.config_dir
@@ -1285,7 +1323,7 @@ fn recover_transition(apps: &Path, path: &Path) -> Result<Recovery, AppError> {
                         {
                             return Err(usage("another app instance is running; refusing to guess interrupted handoff identity"));
                         }
-                        let confirmed = inspect_app(&active, None)?.ok_or_else(|| {
+                        let confirmed = inspect_app(&active)?.ok_or_else(|| {
                             usage("replacement app exited while its identity was checked")
                         })?;
                         if confirmed.identity.pid != current.identity.pid
@@ -1647,31 +1685,6 @@ fn writable(dir: &Path) -> Result<(), AppError> {
     Ok(())
 }
 
-/// PIDs with a particular owned file open; never a process-name match.
-fn pids_using(path: &Path) -> Result<Vec<u32>, AppError> {
-    let out = Command::new("/usr/sbin/lsof")
-        .arg("-t")
-        .arg(path)
-        .env_clear()
-        .output()
-        .map_err(|e| usage(format!("cannot inspect {}: {e}", path.display())))?;
-    if !out.status.success() && (out.status.code() != Some(1) || !out.stderr.is_empty()) {
-        return Err(usage(format!(
-            "cannot inspect {}: {}",
-            path.display(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-    String::from_utf8(out.stdout)
-        .map_err(|_| usage("lsof returned invalid process IDs"))?
-        .lines()
-        .map(|line| {
-            line.parse()
-                .map_err(|_| usage("lsof returned invalid process IDs"))
-        })
-        .collect()
-}
-
 /// Verify the process maps this file as executable text, not merely that it opened the file.
 fn pid_executes(path: &Path, pid: u32) -> Result<bool, AppError> {
     let out = Command::new("/usr/sbin/lsof")
@@ -1745,101 +1758,6 @@ fn active_executable(bundle: &Path) -> Result<PathBuf, AppError> {
     Ok(executable)
 }
 
-/// Finish the app handoff only when the caller is the newly installed helper invoked by the
-/// still-running updater that owns this exact install's lock and retained executable.
-pub(super) fn post_install_delegate() -> Result<(), AppError> {
-    let Some(parent) = crate::claude_injector::proc_of(std::process::id()).map(|p| p.ppid) else {
-        return Ok(());
-    };
-    let Some(args) = vox_sockdrops::process_args(parent) else {
-        return Ok(());
-    };
-    if args.get(1).map(String::as_str) != Some("update") || args.iter().any(|arg| arg == "--check")
-    {
-        return Ok(());
-    }
-    let exe = std::env::current_exe().map_err(AppError::Io)?;
-    let super::Channel::Bundle { apps_dir: apps, .. } = super::detect_channel(&exe)? else {
-        return Ok(());
-    };
-    let previous = apps.join(PREVIOUS);
-    if !previous.join(HELPER).is_file() {
-        return Ok(());
-    }
-    if !pids_using(&previous.join(HELPER))?.contains(&parent) {
-        return Ok(());
-    }
-    let lock = apps.join(super::LOCK_NAME);
-    if !pids_using(&lock)?.contains(&parent) {
-        return Err(usage(
-            "the updater does not hold the install lock; the app was not quit",
-        ));
-    }
-    let lock_file = fs::OpenOptions::new().read(true).write(true).open(&lock)?;
-    match rustix::fs::flock(
-        &lock_file,
-        rustix::fs::FlockOperation::NonBlockingLockExclusive,
-    ) {
-        Ok(()) => return Err(usage("the install lock is not held; the app was not quit")),
-        Err(e) if e == rustix::io::Errno::AGAIN => {}
-        Err(e) => return Err(usage(format!("cannot verify the install lock: {e}"))),
-    }
-    let plist = [KEPT_INFO_PLIST, INFO_PLIST]
-        .iter()
-        .map(|name| previous.join(name))
-        .find(|path| path.is_file())
-        .ok_or_else(|| {
-            usage("the retained app's Info.plist is unavailable; the app was not quit")
-        })?;
-    let out = Command::new("/usr/libexec/PlistBuddy")
-        .args(["-c", "Print :CFBundleExecutable"])
-        .arg(plist)
-        .env_clear()
-        .output()?;
-    if !out.status.success() || out.stdout.len() > MAX_VERSION_OUTPUT_BYTES {
-        return Err(usage(
-            "the retained app's executable cannot be identified; the app was not quit",
-        ));
-    }
-    let name = std::str::from_utf8(&out.stdout)
-        .map_err(|_| usage("the retained app's executable name is invalid"))?
-        .trim();
-    let name_path = Path::new(name);
-    if name.is_empty()
-        || name_path.components().count() != 1
-        || !matches!(
-            name_path.components().next(),
-            Some(std::path::Component::Normal(_))
-        )
-    {
-        return Err(usage(
-            "the retained app's executable name is invalid; the app was not quit",
-        ));
-    }
-    let previous_executable = previous.join("Contents/MacOS").join(name);
-    if !previous_executable.is_file() {
-        return Err(usage(
-            "the retained app executable is missing; the app was not quit",
-        ));
-    }
-    let active = apps.join(BUNDLE);
-    let old_pids = pids_using(&previous_executable)?;
-    if old_pids.is_empty() {
-        println!("vox: no previously running Vox app needs a restart");
-        return Ok(());
-    }
-    let stopped = stop_app_from(&active, Some(&previous_executable))?.ok_or_else(|| {
-        usage("the retained app process could not be identified; it was not quit")
-    })?;
-    let stopped = Some(stopped);
-    let now = app_version(&active).ok_or_else(|| {
-        usage("the installed app version cannot be identified; the app was not relaunched")
-    })?;
-    handoff_unjournaled(&active, &now, &stopped)?;
-    println!("vox: the installed Vox app was relaunched; no manual restart is needed");
-    Ok(())
-}
-
 /// AppKit identifies a running application by its bundle URL, executable URL and PID.
 /// Never address it by display name or bundle identifier: another install can share both.
 /// `terminate` is the ordinary, cancellable application quit, not a forced signal.
@@ -1853,13 +1771,6 @@ function run(argv) {
     if (!bundle || !bundle.executableURL) throw new Error('bundle executable is unavailable');
     const wantedBundle = ObjC.unwrap(url.path);
     const wantedExecutable = ObjC.unwrap(bundle.executableURL.URLByResolvingSymlinksInPath.path);
-    const legacy = action === 'legacy-inspect' || action === 'legacy-stop';
-    const previousBundle = legacy
-        ? ObjC.unwrap(url.URLByDeletingLastPathComponent.URLByAppendingPathComponent('.Vox.app.previous').URLByResolvingSymlinksInPath.path)
-        : '';
-    const previousExecutable = legacy
-        ? ObjC.unwrap($.NSURL.fileURLWithPath($(argv[4])).URLByResolvingSymlinksInPath.path)
-        : '';
     function matching() {
         const apps = $.NSWorkspace.sharedWorkspace.runningApplications;
         const found = [];
@@ -1868,11 +1779,11 @@ function run(argv) {
             const bundleURL = app.bundleURL;
             if (bundleURL.isNil()) continue;
             const appBundle = ObjC.unwrap(bundleURL.URLByResolvingSymlinksInPath.path);
-            if (appBundle !== wantedBundle && (!legacy || appBundle !== previousBundle)) continue;
+            if (appBundle !== wantedBundle) continue;
             const executableURL = app.executableURL;
             const executable = executableURL.isNil() ? null
                 : ObjC.unwrap(executableURL.URLByResolvingSymlinksInPath.path);
-            if (executable !== wantedExecutable && (!legacy || executable !== previousExecutable))
+            if (executable !== wantedExecutable)
                 throw new Error('running application at bundle path has a different or unavailable executable');
             if (!app.isTerminated) found.push(app);
         }
@@ -1884,16 +1795,16 @@ function run(argv) {
         if (!Number.isSafeInteger(started) || started <= 0) throw new Error('application launch date is unavailable; the app was not quit');
         return { pid: Number(app.processIdentifier), started };
     }
-    if (action === 'inspect' || action === 'stop' || legacy) {
+    if (action === 'inspect' || action === 'stop') {
         const apps = matching();
         if (apps.length === 0) {
-            if (action === 'stop' || action === 'legacy-stop') throw new Error('application exited before the quit request');
+            if (action === 'stop') throw new Error('application exited before the quit request');
             return 'not-running';
         }
         if (apps.length !== 1) throw new Error('multiple applications run from this bundle; none was stopped');
         const app = apps[0];
         const instance = identity(app);
-        if (action === 'inspect' || action === 'legacy-inspect') return JSON.stringify(instance);
+        if (action === 'inspect') return JSON.stringify(instance);
         if (instance.pid !== Number(argv[2]) || instance.started !== Number(argv[3]))
             throw new Error('application changed before the quit request; none was stopped');
         if (!app.terminate) throw new Error('application pid ' + instance.pid + ' refused the quit request');
@@ -1933,7 +1844,6 @@ fn app_handoff(
     action: &str,
     active: &Path,
     identity: Option<&AppIdentity>,
-    previous_executable: Option<&Path>,
 ) -> Result<String, AppError> {
     let mut command = Command::new("/usr/bin/osascript");
     command.args(["-l", "JavaScript", "-e", APP_HANDOFF, "--", action]);
@@ -1942,12 +1852,6 @@ fn app_handoff(
         command
             .arg(identity.pid.to_string())
             .arg(identity.started.to_string());
-    }
-    if let Some(previous) = previous_executable {
-        if identity.is_none() {
-            command.args(["0", "0"]);
-        }
-        command.arg(previous);
     }
     let out = command.output().map_err(|e| {
         usage(format!(
@@ -1965,19 +1869,8 @@ fn app_handoff(
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
-fn stop_app_from(active: &Path, previous: Option<&Path>) -> Result<Option<StoppedApp>, AppError> {
-    let app = inspect_app(active, previous)?;
-    stop_captured_app(active, previous, &app)?;
-    Ok(app)
-}
-
-fn inspect_app(active: &Path, previous: Option<&Path>) -> Result<Option<StoppedApp>, AppError> {
-    let action = if previous.is_some() {
-        "legacy-inspect"
-    } else {
-        "inspect"
-    };
-    let result = app_handoff(action, active, None, previous)?;
+fn inspect_app(active: &Path) -> Result<Option<StoppedApp>, AppError> {
+    let result = app_handoff("inspect", active, None)?;
     if result == "not-running" {
         return Ok(None);
     }
@@ -1987,13 +1880,6 @@ fn inspect_app(active: &Path, previous: Option<&Path>) -> Result<Option<StoppedA
         return Err(usage(
             "application handoff returned an invalid process identity",
         ));
-    }
-    if let Some(previous) = previous {
-        if !pids_using(previous)?.contains(&identity.pid) {
-            return Err(usage(
-                "the running app is not using the retained executable; it was not quit",
-            ));
-        }
     }
     let env = vox_sockdrops::process_profile_env(identity.pid)
         .ok_or_else(|| usage("cannot read the running Vox app's profile; the app was not quit"))?;
@@ -2029,18 +1915,9 @@ fn inspect_app(active: &Path, previous: Option<&Path>) -> Result<Option<StoppedA
     }))
 }
 
-fn stop_captured_app(
-    active: &Path,
-    previous: Option<&Path>,
-    app: &Option<StoppedApp>,
-) -> Result<(), AppError> {
+fn stop_captured_app(active: &Path, app: &Option<StoppedApp>) -> Result<(), AppError> {
     let Some(app) = app else { return Ok(()) };
-    let action = if previous.is_some() {
-        "legacy-stop"
-    } else {
-        "stop"
-    };
-    app_handoff(action, active, Some(&app.identity), previous)?;
+    app_handoff("stop", active, Some(&app.identity))?;
     Ok(())
 }
 
@@ -2115,7 +1992,7 @@ fn relaunch_app(active: &Path, stopped: &Option<StoppedApp>) -> Result<(), AppEr
             String::from_utf8_lossy(&out.stderr).trim()
         )));
     }
-    let new_pid = app_handoff("wait", active, Some(&app.identity), None).map_err(|e| {
+    let new_pid = app_handoff("wait", active, Some(&app.identity)).map_err(|e| {
         usage(format!(
             "{} is installed, but its relaunch was not confirmed: {e}",
             active.display()
@@ -2125,25 +2002,11 @@ fn relaunch_app(active: &Path, stopped: &Option<StoppedApp>) -> Result<(), AppEr
     Ok(())
 }
 
-fn handoff_unjournaled(
-    active: &Path,
-    version: &str,
-    stopped: &Option<StoppedApp>,
-) -> Result<(), AppError> {
-    let daemon = restart_for_handoff(active, version, stopped, None);
-    let app = relaunch_app(active, stopped);
-    match (daemon, app) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(e), Ok(())) | (Ok(()), Err(e)) => Err(e),
-        (Err(a), Err(b)) => Err(usage(format!("{a}; {b}"))),
-    }
-}
-
 fn journaled_refresh(apps: &Path, active: &Path, version: &str) -> Result<(), AppError> {
-    let running = inspect_app(active, None)?;
+    let running = inspect_app(active)?;
     let mut transition =
         prepare_transition(apps, active, TransitionKind::Refresh, version, &running)?;
-    stop_captured_app(active, None, &running)?;
+    stop_captured_app(active, &running)?;
     transition_handoff(apps, active, version, &running, &mut transition)?;
     finish_journal(apps)
 }

@@ -27,6 +27,7 @@
 
 use std::fs;
 use std::io::{Read as _, Write as _};
+use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -42,12 +43,6 @@ use crate::app::AppError;
 #[cfg(target_os = "macos")]
 mod bundle;
 pub(crate) mod restart;
-
-/// Complete an app transition when an updater invokes its newly installed helper.
-#[cfg(target_os = "macos")]
-pub(crate) fn post_install_delegate() -> Result<(), AppError> {
-    bundle::post_install_delegate()
-}
 
 /// The repository releases are published from.
 const REPO: &str = "robertelee78/vox";
@@ -133,6 +128,7 @@ struct Validated {
     version_text: String,
     target: String,
     size: u64,
+    record: ReleaseRecord,
     sha256: [u8; 32],
 }
 
@@ -188,10 +184,11 @@ impl ReleaseRecord {
         }
         Ok(Validated {
             version,
-            version_text: record.version,
-            target: record.target,
+            version_text: record.version.clone(),
+            target: record.target.clone(),
             size: record.size,
             sha256,
+            record,
         })
     }
 }
@@ -500,22 +497,32 @@ fn fetch_record(channel: &str, target: &str) -> Result<Validated, AppError> {
         channel,
         target,
         MAX_BINARY_BYTES,
+        None,
     )
 }
 
-/// Fetch and validate the newest Vox.app record for `channel` and this target.
-///
-/// # Errors
-/// As [`fetch_record`].
+/// Fetch the app record from the already selected release, never from latest again.
 #[cfg(target_os = "macos")]
-fn fetch_app_record(channel: &str, target: &str) -> Result<Validated, AppError> {
-    fetch_named(
+fn fetch_app_record_at(channel: &str, target: &str, version: &str) -> Result<Validated, AppError> {
+    let parsed = semver::Version::parse(version)
+        .map_err(|_| usage("selected release version is not SemVer"))?;
+    if parsed.to_string() != version {
+        return Err(usage("selected release version is not canonical"));
+    }
+    let record = fetch_named(
         &format!("app-{channel}-{target}.json"),
         (APP_RECORD_KIND, APP_PACKAGE),
         channel,
         target,
         MAX_APP_BYTES,
-    )
+        Some(version),
+    )?;
+    if record.version_text != version {
+        return Err(usage(
+            "app release record does not match the selected version",
+        ));
+    }
+    Ok(record)
 }
 
 fn fetch_named(
@@ -524,8 +531,12 @@ fn fetch_named(
     channel: &str,
     target: &str,
     max_size: u64,
+    version: Option<&str>,
 ) -> Result<Validated, AppError> {
-    let url = format!("{}/latest/download/{name}", releases_base());
+    let url = match version {
+        Some(version) => format!("{}/download/v{version}/{name}", releases_base()),
+        None => format!("{}/latest/download/{name}", releases_base()),
+    };
     let response = client(RECORD_TIMEOUT, github_redirects())?
         .get(&url)
         .header(ACCEPT_ENCODING, "identity")
@@ -891,21 +902,21 @@ fn publish(install_dir: &Path, candidate: &Path) -> Result<(), AppError> {
 /// # Errors
 /// [`AppError::Usage`] with a reason for the person: no release for this platform, a transfer,
 /// verification or trust failure, or an install this tooling does not own.
-pub fn run(check_only: bool, rollback: bool) -> Result<(), AppError> {
-    let exe = std::env::current_exe()
-        .map_err(|e| usage(format!("cannot locate the running binary: {e}")))?;
+pub fn run(check_only: bool, rollback: bool) -> Result<u8, AppError> {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let exe =
+        fs::canonicalize(std::env::current_exe().map_err(AppError::Io)?).map_err(AppError::Io)?;
     let installed = detect_channel(&exe)?;
-    if let Channel::Bundle { apps_dir, channel } = &installed {
-        return run_bundle(apps_dir, channel, &exe, check_only, rollback);
-    }
-
     if rollback {
-        let (install_dir, _) = owned(installed, "`vox update --rollback` will not touch it")?;
-        return do_rollback(&install_dir);
+        if let Channel::Bundle { apps_dir, channel } = &installed {
+            run_bundle(apps_dir, channel, &exe, false, true)?;
+        } else {
+            let (dir, _) = owned(installed, "`vox update --rollback` will not touch it")?;
+            do_rollback(&dir)?;
+        }
+        return Ok(0);
     }
-
-    // The channel comes from the install's marker; a binary this tooling does not own still
-    // gets to *ask* what the default channel holds, which is what `--check` is for.
     let channel = match &installed {
         Channel::Standalone { channel, .. } | Channel::Bundle { channel, .. } => channel.clone(),
         Channel::Source { .. } | Channel::Unmanaged { .. } => DEFAULT_CHANNEL.to_owned(),
@@ -917,89 +928,290 @@ pub fn run(check_only: bool, rollback: bool) -> Result<(), AppError> {
              Silicon Macs on macOS 13 or later)",
         ));
     }
-    // On macOS vox ships inside Vox.app (ADR-014); a standalone install keeps updating as it is,
-    // and is told once per run how to move.
     if cfg!(target_os = "macos") && matches!(installed, Channel::Standalone { .. }) {
         println!(
             "vox: on a Mac, vox now comes with Vox.app; to move to it, run the installer again: \
              curl -fsSL https://raw.githubusercontent.com/{REPO}/main/install.sh | sh"
         );
     }
-
-    let current = semver::Version::parse(env!("CARGO_PKG_VERSION"))
-        .map_err(|_| usage("this binary's own version is not SemVer"))?;
-    let release = fetch_record(&channel, target)?;
+    let current_text = match &installed {
+        Channel::Standalone { .. } | Channel::Bundle { .. } => binary_version(&exe)
+            .ok_or_else(|| usage("cannot identify the installed vox version"))?,
+        _ => env!("CARGO_PKG_VERSION").to_owned(),
+    };
+    let current = semver::Version::parse(&current_text)
+        .map_err(|_| usage("installed vox version is not SemVer"))?;
+    let release = match fetch_record(&channel, target) {
+        Ok(release) => release,
+        Err(error) => {
+            #[cfg(target_os = "macos")]
+            if !check_only {
+                if let Channel::Bundle { apps_dir, .. } = &installed {
+                    if bundle::repair(apps_dir, &exe)? {
+                        return Ok(0);
+                    }
+                }
+            }
+            return Err(error);
+        }
+    };
     if release.version <= current {
-        println!(
-            "vox {current} is current (the newest {channel} release is {})",
-            release.version_text
-        );
-        // **An update still updates** (decider, v0.4.2): with nothing newer, what an update
-        // refreshes is refreshed on the vox in place: completions and the agent skill pack.
-        // `--check` changes nothing.
-        if !check_only {
-            if let Ok((install_dir, _)) = owned(installed, "") {
-                run_shell_setup(&install_dir.join(ACTIVE_NAME));
-                println!("vox {current} is current; {}", skill_said());
+        if let Channel::Bundle { apps_dir, channel } = &installed {
+            if check_only {
+                println!(
+                    "Vox {current} is current (the newest {channel} release is {})",
+                    release.version_text
+                );
+            } else {
+                run_bundle(apps_dir, channel, &exe, false, false)?;
+            }
+        } else {
+            println!(
+                "vox {current} is current (the newest {channel} release is {})",
+                release.version_text
+            );
+            if !check_only {
+                if let Ok((dir, _)) = owned(installed, "") {
+                    run_shell_setup(&dir.join(ACTIVE_NAME));
+                    println!("vox {current} is current; {}", skill_said());
+                }
             }
         }
-        return Ok(());
+        return Ok(0);
     }
     println!(
         "vox {} is available on {channel} (this is {current})",
         release.version_text
     );
     if check_only {
-        return Ok(());
+        return Ok(0);
     }
-
-    // Only an install this tooling made is replaced in place. A source build is the
-    // developer's own artifact and overwriting it would destroy work.
-    let (install_dir, _) = owned(installed, "`vox update` will not replace it")?;
-    let active = install_dir.join(ACTIVE_NAME);
-    if !active.is_file() {
-        return Err(usage(format!(
-            "{} holds the install marker but no `{ACTIVE_NAME}` binary",
-            install_dir.display()
-        )));
+    match &installed {
+        Channel::Standalone { install_dir, .. } if exe == install_dir.join(ACTIVE_NAME) => {}
+        Channel::Bundle { .. } => {}
+        _ => {
+            let _ = owned(installed, "`vox update` will not replace it")?;
+            return Err(usage(
+                "the install marker does not identify the active vox binary",
+            ));
+        }
     }
-    let _lock = InstallLock::acquire(&install_dir)?;
-
-    let mut downloading = tempfile::Builder::new()
+    let dir = tempfile::Builder::new()
         .prefix("vox-update.")
-        .tempfile()
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir()
         .map_err(AppError::Io)?;
-    download_asset(
+    let candidate = dir.path().join("vox");
+    let mut downloading = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o700)
+        .open(&candidate)
+        .map_err(AppError::Io)?;
+    let downloaded = download_asset(
         &release,
         &format!("vox-{}", release.target),
-        downloading.as_file_mut(),
-    )?;
+        &mut downloading,
+    );
+    #[cfg(target_os = "macos")]
+    let downloaded = downloaded.map_err(|error| {
+        if let Channel::Bundle { apps_dir, .. } = &installed {
+            match bundle::repair(apps_dir, &exe) {
+                Ok(true) => {
+                    return usage(format!(
+                        "local repair completed; the newer updater could not be downloaded: {error}"
+                    ));
+                }
+                Err(repair) => {
+                    return usage(format!("{error}; local repair also failed: {repair}"));
+                }
+                Ok(false) => {}
+            }
+        }
+        error
+    });
+    downloaded?;
     downloading
-        .as_file()
         .set_permissions(fs::Permissions::from_mode(0o555))
         .map_err(AppError::Io)?;
-    downloading.as_file().sync_all().map_err(AppError::Io)?;
+    downloading.sync_all().map_err(AppError::Io)?;
+    drop(downloading);
+    verify_candidate(&exe, &candidate, &release.version_text)?;
+    let request = ApplyRequest {
+        installed_exe: exe.as_os_str().as_bytes().to_vec(),
+        record: release.record,
+    };
+    let bytes = serde_json::to_vec(&request).map_err(|_| usage("cannot encode update request"))?;
+    if bytes.len() > MAX_REQUEST_BYTES {
+        return Err(usage("update request exceeds its size bound"));
+    }
+    let request_path = dir.path().join("request.json");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&request_path)
+        .map_err(AppError::Io)?;
+    file.write_all(&bytes).map_err(AppError::Io)?;
+    drop(file);
+    let status = Command::new(&candidate)
+        .arg("update-apply")
+        .arg(&request_path)
+        .status()
+        .map_err(AppError::Io)?;
+    Ok(status
+        .code()
+        .unwrap_or_else(|| 128 + status.signal().unwrap_or(1))
+        .clamp(0, 255) as u8)
+}
 
-    // **Close the write handle before anything executes this file.** Linux's `execve`
-    // returns `ETXTBSY` for a file that still has an open writable descriptor, and the
-    // non-macOS trust check runs the candidate to read its `--version`. Holding the
-    // `NamedTempFile` across that call made `vox update` fail on Linux every time, at
-    // every version — the error surfaced as "Text file busy", three layers from the
-    // cause. `into_temp_path` drops the handle and keeps both the path and the
-    // delete-on-drop, so nothing else about the transition changes.
-    let candidate = downloading.into_temp_path();
-    verify_apple_release(&active, &candidate, &release.version_text)?;
-    publish(&install_dir, &candidate)?;
+const MAX_REQUEST_BYTES: usize = MAX_RECORD_BYTES + 32 * 1024;
 
-    println!("updated: {} -> {}", active.display(), release.version_text);
-    println!(
-        "         previous kept at {}",
-        install_dir.join(PREVIOUS_NAME).display()
-    );
-    let detached = restart::restart_daemon(&active, &release.version_text);
-    run_shell_setup(&active);
-    restart::say_next(&detached);
-    Ok(())
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApplyRequest {
+    installed_exe: Vec<u8>,
+    record: ReleaseRecord,
+}
+
+fn verify_candidate(active: &Path, candidate: &Path, version: &str) -> Result<(), AppError> {
+    #[cfg(target_os = "macos")]
+    if !apple_required() {
+        if binary_version(candidate).as_deref() != Some(version) {
+            return Err(usage(
+                "candidate version does not match the selected release",
+            ));
+        }
+        return Ok(());
+    }
+    verify_apple_release(active, candidate, version)
+}
+
+/// Apply a bootstrap request using this release's updater.
+pub(crate) fn apply_request(path: &Path) -> Result<(), AppError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let uid = rustix::process::getuid().as_raw();
+    let directory = path
+        .parent()
+        .ok_or_else(|| usage("update request has no directory"))?;
+    let directory_meta = fs::symlink_metadata(directory).map_err(AppError::Io)?;
+    let request_meta = fs::symlink_metadata(path).map_err(AppError::Io)?;
+    if !directory_meta.is_dir()
+        || directory_meta.uid() != uid
+        || directory_meta.mode() & 0o077 != 0
+        || !request_meta.is_file()
+        || request_meta.uid() != uid
+        || request_meta.mode() & 0o077 != 0
+    {
+        return Err(usage("update request is not in an owned private directory"));
+    }
+    let file = fs::File::open(path).map_err(AppError::Io)?;
+    if !file.metadata().map_err(AppError::Io)?.is_file() {
+        return Err(usage("update request is not a regular file"));
+    }
+    let mut bytes = Vec::new();
+    file.take((MAX_REQUEST_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(AppError::Io)?;
+    if bytes.is_empty() || bytes.len() > MAX_REQUEST_BYTES {
+        return Err(usage("update request size is outside the supported bound"));
+    }
+    let request: ApplyRequest =
+        serde_json::from_slice(&bytes).map_err(|_| usage("invalid update request"))?;
+    let installed_exe = PathBuf::from(std::ffi::OsString::from_vec(request.installed_exe));
+    let active = fs::canonicalize(&installed_exe).map_err(AppError::Io)?;
+    if active != installed_exe {
+        return Err(usage("update request executable is not canonical"));
+    }
+    let installed = detect_channel(&active)?;
+    let channel = match &installed {
+        Channel::Standalone {
+            install_dir,
+            channel,
+        } if active == install_dir.join(ACTIVE_NAME) => channel.clone(),
+        Channel::Bundle { channel, .. } => channel.clone(),
+        _ => return Err(usage("update request does not name an owned installation")),
+    };
+    let record_bytes =
+        serde_json::to_vec(&request.record).map_err(|_| usage("invalid release record"))?;
+    let release = ReleaseRecord::validate(
+        &record_bytes,
+        (RECORD_KIND, "vox"),
+        &channel,
+        target_triple(),
+        MAX_BINARY_BYTES,
+    )?;
+    if release.version_text != env!("CARGO_PKG_VERSION") {
+        return Err(usage(
+            "update engine version does not match the selected release",
+        ));
+    }
+    let engine =
+        fs::canonicalize(std::env::current_exe().map_err(AppError::Io)?).map_err(AppError::Io)?;
+    let request_dir = fs::canonicalize(directory).map_err(AppError::Io)?;
+    if engine.parent() != Some(request_dir.as_path())
+        || engine.file_name().is_none_or(|name| name != "vox")
+    {
+        return Err(usage(
+            "update engine is not in the request's private directory",
+        ));
+    }
+    let mut engine_file = fs::File::open(&engine).map_err(AppError::Io)?;
+    let mut hasher = Sha256::new();
+    let mut size = 0_u64;
+    let mut buffer = vec![0_u8; IO_BUFFER_BYTES];
+    loop {
+        let n = engine_file.read(&mut buffer).map_err(AppError::Io)?;
+        if n == 0 {
+            break;
+        }
+        size = size
+            .checked_add(n as u64)
+            .ok_or_else(|| usage("engine size overflow"))?;
+        if size > release.size {
+            return Err(usage("update engine exceeds release size"));
+        }
+        hasher.update(&buffer[..n]);
+    }
+    let digest: [u8; 32] = hasher.finalize().into();
+    if size != release.size || digest != release.sha256 {
+        return Err(usage("update engine does not match the release record"));
+    }
+    verify_candidate(&active, &engine, &release.version_text)?;
+    match installed {
+        #[cfg(target_os = "macos")]
+        Channel::Bundle { apps_dir, .. } => bundle::apply(&apps_dir, &active, &release),
+        Channel::Standalone { install_dir, .. } => {
+            let _lock = InstallLock::acquire(&install_dir)?;
+            if detect_channel(&active)?
+                != (Channel::Standalone {
+                    install_dir: install_dir.clone(),
+                    channel: channel.to_owned(),
+                })
+            {
+                return Err(usage("installation ownership changed during update"));
+            }
+            let current = binary_version(&active)
+                .and_then(|v| semver::Version::parse(&v).ok())
+                .ok_or_else(|| usage("cannot identify the installed vox version"))?;
+            if current >= release.version {
+                println!("vox {current} is already installed; no downgrade performed");
+                return Ok(());
+            }
+            publish(&install_dir, &engine)?;
+            println!("updated: {} -> {}", active.display(), release.version_text);
+            println!(
+                "         previous kept at {}",
+                install_dir.join(PREVIOUS_NAME).display()
+            );
+            let detached = restart::restart_daemon(&active, &release.version_text)?;
+            run_shell_setup(&active);
+            restart::say_next(&detached);
+            Ok(())
+        }
+        _ => Err(usage("update request does not name an owned installation")),
+    }
 }
 
 /// A Vox.app install: the whole bundle is updated or rolled back (ADR-014 M-29).
@@ -1072,7 +1284,7 @@ fn do_rollback(install_dir: &Path) -> Result<(), AppError> {
             );
             // As any rollback does: the daemon is restarted onto the binary now in place, which
             // brings its own completions.
-            let detached = restart_onto(&active);
+            let detached = restart_onto(&active)?;
             run_shell_setup(&active);
             restart::say_next(&detached);
             return Ok(());
@@ -1099,14 +1311,14 @@ fn do_rollback(install_dir: &Path) -> Result<(), AppError> {
         active.display(),
         binary_version(&active).unwrap_or_else(|| "unknown".to_owned())
     );
-    let detached = restart_onto(&active);
+    let detached = restart_onto(&active)?;
     run_shell_setup(&active);
     restart::say_next(&detached);
     Ok(())
 }
 
 /// Restart the daemon onto the binary a rollback put in place, as the version it says it is.
-fn restart_onto(active: &Path) -> Vec<vox_core::node::paths::NodeName> {
+fn restart_onto(active: &Path) -> Result<Vec<vox_core::node::paths::NodeName>, AppError> {
     let now = binary_version(active).unwrap_or_else(|| "unknown".to_owned());
     restart::restart_daemon(active, &now)
 }

@@ -1,6 +1,6 @@
 # Install and update
 
-Applies to Vox v0.4.12.
+Applies to Vox v0.4.13.
 
 Vox runs on Linux on x86_64, and on Macs with Apple Silicon and macOS 13 or later. On a Mac it
 comes as `Vox.app`, with `vox` inside it.
@@ -57,10 +57,17 @@ vox update --check
 vox update
 ```
 
-`vox update --check` reports whether a newer release exists and changes nothing. `vox update`
-downloads and checks it, keeps the binary it replaces, and refreshes the shell setup and the
+`vox update --check` reports whether a newer release exists and changes nothing. When a newer
+release is available, `vox update` downloads and verifies that release's updater, then gives it
+control before changing the installation or stopping the app or daemon. That new updater owns
+installation, recovery and the final result in the same invocation; a second command is not
+needed to acquire its logic. It keeps the binary it replaces and refreshes the shell setup and
 agent skill pack. On a Mac it replaces the whole `Vox.app`, and the new app must carry the same
 Developer ID. A `vox` you built from source is not replaced.
+
+This bootstrap starts with v0.4.13. An older installed release still uses the update code it
+already carries for its first upgrade; installing new code cannot change that older running
+process retroactively.
 
 The update restarts the daemon onto the new version, so update when it is safe to interrupt your
 rooms and services. Every node stops as the daemon stops. The new daemon makes each remembered
@@ -77,9 +84,11 @@ An open `vox tui` still runs its original version until you restart that termina
 An update can install the new app before a later cleanup operation is refused. Vox reports
 what is installed, which handoff failed, and the affected operation and path; it retains the
 unfinished transition for local repair. After resolving that specific obstruction, run
-`vox update` to finish locally without another exchange or a release download. Do not repeat
-`vox update --rollback` to repair an already-installed rollback: doing so could reverse it.
-Do not delete the retained bundles or transition journal to dismiss an error.
+`vox update` to finish the retained work. If a newer updater is available, it owns both repair
+and the upgrade in that invocation. Repairable local work can still finish when the newer
+updater's download fails, but the unavailable upgrade is reported as a failure, not success.
+Do not repeat `vox update --rollback` to repair an already-installed rollback: doing so could
+reverse it. Do not delete retained bundles or the transition journal to dismiss an error.
 
 Vox v0.4.5 does not promise migration from previous releases or mixed-version operation. Read
 the release notes before updating an earlier installation. A stored format the new binary cannot

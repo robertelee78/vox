@@ -66,7 +66,7 @@ A real daemon-start refusal stopped the previous daemon while app relaunch succe
 
 The corrected journal captures whether a daemon was running, its existing startup authority, listen address, anchors and attached node names before stopping it. Recovery must restore a required missing daemon and confirm its release and remembered-node readiness before checkpointing completion. An originally absent daemon remains optional: an incomplete unused node must not make an otherwise unnecessary daemon handoff fail. No passphrase, whole argv or arbitrary environment is persisted.
 
-## Corrected candidate: observed runtime evidence
+## v0.4.12 correction: observed runtime evidence
 
 Updater logic through `9c86b03ffccfa906f6e61ffed28144a883ca5737` received two independent exact-source acceptances. Strict workspace/all-target Clippy passed. The logic was compiled at v0.4.11 for the existing updater apparatus and at the real workspace version v0.4.12 for the candidate helper; the native app was also built at v0.4.12. No version string was substituted in a binary.
 
@@ -103,7 +103,7 @@ Receipts and complete console observations are retained under `/private/tmp/vox1
 
 No claim is made that green CI, source review or the test apparatus itself proves the user's feature. No new CI gate, unit/in-process test, CPU cap or artificial product timeout is part of this correction.
 
-## Corrected behavior and delivery boundary
+## v0.4.12 behavior and delivery boundary
 
 The source candidate uses the existing install lock and journal, not another transaction system. It persists unambiguous source/target bundle identity and exact owned handoff intent before stopping an app or exchanging bundles; committed installation, per-component handoff completion and cleanup completion are separate. Rollback executables and journal authority are retained on unfinished work. Unreadable/ambiguous recovery state is refused rather than deleted.
 
@@ -114,3 +114,65 @@ Filesystem failures identify the attempted operation, affected path(s), underlyi
 The table above records the exercised correction claims, not an exhaustive failure matrix. Independent source review and Clippy support the candidate but are not substitutes for those product observations. Old-v0.4.10 caller behavior is attributed separately; a new artifact cannot repair a parent that has already returned before invoking it, and that parent's exit status alone is not handoff evidence.
 
 Signed/notarized publication and a real upgrade from the untouched public prior artifact are the final delivery boundary. Their source-bound receipts belong to the [v0.4.12 release](https://github.com/robertelee78/vox/releases/tag/v0.4.12) and [#1090](https://github.com/robertelee78/vox/issues/1090), not to an assumption that the controlled ad-hoc fixture was equivalent. v0.4.11 remains a historical published artifact; it is not overwritten to hide the incident.
+
+## Architecture correction: target-version updater ownership
+
+The operator rejected a further architectural mistake on 2026-10-31: the installed binary
+still owned installation and reporting, and called newly installed code only afterward through
+the plugin-install delegate. That could expose a new helper without giving the same update
+invocation the new transaction logic before it needed it. The v0.4.12 observations above prove
+their stated handoff/recovery behavior, not the corrected ownership boundary.
+
+M-29b is amended so the installed binary is only a bootstrap: it selects, downloads and verifies
+the target updater, then invokes its explicit `update-apply` entrypoint before installed-state
+or app/daemon changes. The verified target owns the install lock, recovery, candidate bundle,
+atomic publication, daemon/app handoff, cleanup and final reporting. The parent retains private
+temporary storage while waiting and propagates the target's exit status; the post-install
+plugin callback and legacy process-guessing path are removed.
+
+Independent review found two concrete regressions in the first source candidate: a failed
+engine-asset download bypassed repairable retained work, and JSON `PathBuf` encoding rejected
+non-UTF-8 Unix installation paths. Both are corrected. A real scratch update then found a
+third defect that source review missed: tempfile 3.27.0 creates directories as 0777 minus
+umask, yielding 0755 under the guest's normal 0022 mask, but the new target correctly required
+0700. Explicit private permissions are now supplied at directory creation; the target's guard
+was not weakened.
+
+Corrected source `36d9f9c8b38062336ad2b9f98458e0fed5072dba` was compiled into actual
+bootstrap-capable 0.4.12 and target 0.4.13 artifacts, with no version-string stand-in. A target
+process holding the install lock was observed while the installed app still reported 0.4.12.
+That target installed 0.4.13, restarted the daemon, restored Ready, relaunched the exact app
+with its original profile despite a different updater profile, and preserved the saved room.
+An immutable older backup caused a truthful remaining cleanup refusal. With that obstruction
+removed, corrected code repaired retained work even when a newer engine asset returned 404,
+without repeating completed handoff or claiming the unavailable upgrade succeeded. Clean
+upgrade, local rollback, closed-app preservation and unrelated-app isolation passed. The
+standalone path installed its already-downloaded engine and restored Ready with one transfer.
+
+The bootstrap-capable 0.4.12 fixture is not the untouched published 0.4.12. That older delivered
+caller does not invoke the new entrypoint and cannot retroactively surrender pre-publication
+control. Its first upgrade and a bootstrap-capable A-to-B transaction are distinct claims.
+This architectural cutover starts with v0.4.13; prior release artifacts are not rewritten.
+
+After the separate Opus plan review and explicit operator authorization, product correction
+`d2b4fa87d4b5daf5c2972a809c4c50f931b382b6` removed Linux's conditional-compilation Clippy
+failure and made standalone daemon-restart failures propagate to update and rollback callers.
+A normal-feature scratch rollback had reported a remembered-node readiness failure but returned
+zero; the rebuilt command returned nonzero instead of a successful next-step message. The
+after-fixture retained the same version, so this does not establish version-changing rollback.
+
+A fresh native journey using reviewed source `0352e21aba96a4b13f92f2413b93a6f4b828c45e`
+observed the target process before the installed 0.4.12 changed, then installed 0.4.13 and
+verified the replacement app's exact original profile, Ready service and saved message.
+Real x86-64 Linux binaries passed check, update, rollback and exact saved-message retention;
+an installation under a non-UTF-8 directory updated at its original byte path. An initial
+non-reaping container left a defunct old daemon; the corrected `--init` apparatus passed.
+The x86 compiler itself crashed under emulation, so builds and Linux-target Clippy used a
+native-arm cross-builder. Neither apparatus fault is attributed to the product.
+
+These observations use controlled ad-hoc signatures and the existing test-knobs loopback
+origin. Complete Mac receipts are under `/private/tmp/vox1007-practical-42qu344_/v0413-*`;
+Linux logs are under `/Users/robert.lee/vox-owner-linux-20261031-7oam1dbj/`. The private Linux
+profile archive contains scratch credentials and is not publication material. Signed/notarized
+publication and public-artifact delivery remain separate final boundaries, not an inference
+from these fixtures.

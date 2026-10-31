@@ -147,25 +147,16 @@ pub(super) fn capture_daemon_intent(
 /// Restart the account's daemon, if one runs, onto `helper`, the vox now in place, and say what that did: the version it runs, and each node it no longer has attached.
 ///
 /// The nodes it left detached are returned, for [`say_next`].
-pub(super) fn restart_daemon(helper: &Path, now: &str) -> Vec<NodeName> {
-    let account = match Account::of(None, None) {
-        Ok(a) => a,
-        Err(e) => {
-            println!("the vox daemon was not restarted: {e}; restart it to run {now}");
-            return Vec::new();
-        }
-    };
-    let rt = match tokio::runtime::Builder::new_current_thread()
+/// A failed restart is an error, not a successful handoff with no detached nodes.
+pub(super) fn restart_daemon(
+    helper: &Path,
+    now: &str,
+) -> Result<Vec<NodeName>, crate::app::AppError> {
+    let account = Account::of(None, None)?;
+    let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            println!("the vox daemon was not restarted: {e}; restart it to run {now}");
-            return Vec::new();
-        }
-    };
-    rt.block_on(restart(&account, helper, now))
+        .build()?;
+    rt.block_on(restart_checked(&account, helper, now, false, None))
 }
 
 /// Restart a particular account and propagate failures to the app handoff.
@@ -197,16 +188,6 @@ pub(crate) fn restart_current(account: &Account) -> Result<(), crate::app::AppEr
         None,
     ))?;
     Ok(())
-}
-
-async fn restart(account: &Account, helper: &Path, now: &str) -> Vec<NodeName> {
-    match restart_checked(account, helper, now, false, None).await {
-        Ok(nodes) => nodes,
-        Err(e) => {
-            println!("the vox daemon restart did not finish: {e}");
-            Vec::new()
-        }
-    }
 }
 
 async fn restart_checked(
