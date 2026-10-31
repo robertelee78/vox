@@ -1243,7 +1243,7 @@ fn skill_said() -> String {
         .map(|h| h.name)
         .collect();
     if have.is_empty() {
-        "no harness here has the agent skill: Claude Code, Codex and OpenCode were not found"
+        "no harness here has the agent skill: Claude Code, Codex, OpenCode and Oh My Pi were not found"
             .to_owned()
     } else {
         format!("the agent skill is installed for {}", have.join(", "))

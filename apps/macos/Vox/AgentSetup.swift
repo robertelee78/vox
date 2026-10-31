@@ -12,13 +12,31 @@ struct AgentSetupRequest: Codable, Equatable, Identifiable {
     let request: String
     let sessions: [String]
     let explicit: Bool
+    let ompAgentDir: String?
     var id: String { "\(harness)-\(request)" }
     var name: String {
-        switch harness { case "claude": "Claude Code"; case "codex": "Codex"; default: "OpenCode" }
+        switch harness { case "claude": "Claude Code"; case "codex": "Codex"; case "opencode": "OpenCode"; case "omp": "Oh My Pi"; default: harness }
     }
     enum CodingKeys: String, CodingKey {
         case harness, dir, node, sessions, explicit
+        case ompAgentDir = "omp_agent_dir"
         case request = "id"
+    }
+
+    func completionTarget() throws -> [String] {
+        guard harness == "omp" else {
+            guard ompAgentDir == nil else {
+                throw VoxError.Failed(reason: "An OMP agent directory is not valid for this harness.")
+            }
+            return []
+        }
+        guard let target = ompAgentDir, target.hasPrefix("/"), target.utf8.count <= 4096,
+              target.contains(where: { $0 != "/" }),
+              !target.components(separatedBy: "/").contains(".."),
+              target.rangeOfCharacter(from: .controlCharacters) == nil else {
+            throw VoxError.Failed(reason: "The OMP agent directory is missing or invalid. Request setup again.")
+        }
+        return ["--omp-agent-dir", target]
     }
 }
 
@@ -40,7 +58,7 @@ enum AgentSetupStore {
     }
 
     static func requests() -> [AgentSetupRequest] {
-        ["claude", "codex", "opencode"].compactMap { harness in
+        ["claude", "codex", "opencode", "omp"].compactMap { harness in
             guard let at = try? file(harness, ".json"), let bytes = try? Data(contentsOf: at),
                   bytes.count <= 16 * 1024,
                   let request = try? JSONDecoder().decode(AgentSetupRequest.self, from: bytes),
@@ -147,6 +165,11 @@ struct AgentSetupSheet: View {
             Text(request.dir.isEmpty ? "No session directory yet." : "Directory: \(request.dir)")
                 .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
                 .accessibilityIdentifier("agent-setup-directory")
+            if request.harness == "omp" {
+                Text("OMP agent directory: \(request.ompAgentDir ?? "missing")")
+                    .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("agent-setup-omp-directory")
+            }
             TextField("Node name", text: $name)
                 .accessibilityIdentifier("agent-setup-name")
             Text("Lowercase letters, digits, dots, dashes and underscores.").secondaryText()

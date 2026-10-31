@@ -925,6 +925,7 @@ final class AppModel: ObservableObject {
             return false
         }
         guard current.request == shown.request && current.dir == shown.dir && current.node == shown.node
+                && current.ompAgentDir == shown.ompAgentDir
         else {
             offerAgentSetup(current)
             agentSetupFailed = "A newer setup request arrived. Review it before choosing Set Up or Not Now."
@@ -954,14 +955,16 @@ final class AppModel: ObservableObject {
             agentSetupFailed = "The two passphrases differ; nothing was created."
             return
         }
+        defer { secret.wipe() }
         agentSetupBusy = true
         agentSetupFailed = nil
         defer { agentSetupBusy = false }
         do {
+            let target = try request.completionTarget()
             let passphrase = try secret.passphrase()
             defer { passphrase.wipe() }
             _ = try await Daemon.command(["agent", "setup", request.harness, "--node", name,
-                                          "--finish", "--check"],
+                                          "--finish", "--check"] + target,
                                          patience: 30, environment: Daemon.harnessEnvironment())
             let client: VoxClient
             if let existing = self.client { client = existing }
@@ -971,7 +974,7 @@ final class AppModel: ObservableObject {
                 _ = try await client.createNode(node: name, passphrase: passphrase)
             }
             try await client.keep(node: name, passphrase: passphrase)
-            _ = try await Daemon.command(["agent", "setup", request.harness, "--node", name, "--finish"],
+            _ = try await Daemon.command(["agent", "setup", request.harness, "--node", name, "--finish"] + target,
                                          patience: 30, environment: Daemon.harnessEnvironment())
             try AgentSetupStore.answer(request, outcome: "ready", node: name)
             refreshAgentSetups()

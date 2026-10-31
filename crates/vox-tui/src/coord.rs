@@ -71,6 +71,7 @@ pub fn session(flag: Option<&str>) -> Option<String> {
 fn named_session(flag: Option<&str>) -> Option<(&'static str, String)> {
     let from_env = |k: &'static str| std::env::var(k).ok().map(|v| (k, v));
     flag.map(|f| ("--session", f.to_owned()))
+        .or_else(|| from_env("PI_SESSION_ID"))
         .or_else(|| from_env("VOX_SESSION"))
         .or_else(|| from_env("OPENCODE_SESSION_ID"))
         .or_else(|| from_env("CLAUDE_CODE_SESSION_ID"))
@@ -118,15 +119,18 @@ pub(crate) fn posting_session(
     let vox = mark("VOX_SESSION")?;
     let claude = mark("CLAUDE_CODE_SESSION_ID")?;
     let opencode = mark("OPENCODE_SESSION_ID")?;
+    let omp = mark("PI_SESSION_ID")?;
     let native = codex
         .as_ref()
         .or(claude.as_ref())
+        .or(omp.as_ref())
         .or(opencode.as_ref())
         .or(vox.as_ref());
     if [
         codex.as_ref(),
         claude.as_ref(),
         opencode.as_ref(),
+        omp.as_ref(),
         vox.as_ref(),
     ]
     .into_iter()
@@ -138,7 +142,12 @@ pub(crate) fn posting_session(
         ));
     }
     let inherited = vox.or_else(|| claude.clone());
-    let Some(actual) = codex.clone().or_else(|| opencode.clone()).or(inherited) else {
+    let Some(actual) = codex
+        .clone()
+        .or_else(|| opencode.clone())
+        .or_else(|| omp.clone())
+        .or(inherited)
+    else {
         // These markers identify a harness, not an individual Session. A caller-chosen flag
         // cannot turn them into proof of which of that harness's registrations is speaking.
         if [
@@ -166,6 +175,7 @@ pub(crate) fn posting_session(
         || (codex.is_some() && registered.harness != "codex")
         || (claude.is_some() && registered.harness != "claude")
         || (opencode.is_some() && registered.harness != "opencode")
+        || (omp.is_some() && registered.harness != "omp")
     {
         return Err(AppError::Usage(
             "the sending session's registration does not match this harness; nothing was posted"
@@ -202,6 +212,7 @@ pub(crate) fn agent_marked() -> bool {
         "CLAUDE_CODE_SESSION_ID",
         "CODEX_THREAD_ID",
         "OPENCODE_SESSION_ID",
+        "PI_SESSION_ID",
     ]
     .iter()
     .any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()))

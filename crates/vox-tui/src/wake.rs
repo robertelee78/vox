@@ -305,7 +305,7 @@ pub(crate) async fn current_attention(
     session: &Session,
 ) -> Result<Option<AttentionRoute>, String> {
     use futures_util::StreamExt as _;
-    if !matches!(session.harness.as_str(), "opencode" | "claude") || !session.interactive {
+    if !matches!(session.harness.as_str(), "opencode" | "claude" | "omp") || !session.interactive {
         return Ok(None);
     }
     let same = || {
@@ -321,6 +321,27 @@ pub(crate) async fn current_attention(
             .attention
             .clone()
             .filter(|route| AttentionRoute::claude(session).as_ref() == Some(route)));
+    }
+    if session.harness == "omp" {
+        let Some(route) = session.attention.as_ref() else {
+            return Ok(None);
+        };
+        let client = AttentionClient {
+            version: 1,
+            node: String::new(),
+            directory: String::new(),
+            socket: route.endpoint.clone(),
+            token: route.token.clone(),
+            client: route.route.iter().map(|b| format!("{b:02x}")).collect(),
+        };
+        let found = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            current_client_route(&client, &session.session),
+        )
+        .await
+        .ok()
+        .flatten();
+        return Ok(found.filter(|found| found == route && same()));
     }
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
     let clients = attention_clients(paths, session)?;
@@ -853,8 +874,9 @@ pub fn store_checked(paths: &Paths, reg: &Session) -> Result<(), String> {
             .unwrap_or_default();
         reg.state_ms = earlier.as_ref().map_or(0, |b| b.state_ms);
         reg.last_drained_ms = earlier.as_ref().map_or(0, |b| b.last_drained_ms);
-        // An idle client route refresh says nothing about its mirror or terminal binding.
-        if let Some(before) = &earlier {
+        // OMP reopens the same conversation with new native transport credentials.
+        // Other idle route refreshes say nothing about their mirror or terminal binding.
+        if let Some(before) = earlier.as_ref().filter(|_| reg.harness != "omp") {
             reg.endpoint.clone_from(&before.endpoint);
             reg.token.clone_from(&before.token);
             reg.mirror.clone_from(&before.mirror);
@@ -914,13 +936,20 @@ impl Session {
     #[must_use]
     pub fn from_env(session: &str, codex: bool) -> Self {
         let mut s = Self::from_env_untmuxed(session, codex);
-        match crate::claude_injector::claim_here() {
-            Ok(claim) => s.tmux_claim = claim,
-            Err(why) => s.tmux_why = Some(why),
+        if std::env::var("VOX_HARNESS").as_deref() != Ok("omp") {
+            match crate::claude_injector::claim_here() {
+                Ok(claim) => s.tmux_claim = claim,
+                Err(why) => s.tmux_why = Some(why),
+            }
         }
         s.attention = AttentionRoute::from_env();
         if s.attention.is_some() && !codex {
-            s.harness = "opencode".into();
+            s.harness = if std::env::var("VOX_HARNESS").as_deref() == Ok("omp") {
+                "omp"
+            } else {
+                "opencode"
+            }
+            .into();
         }
         // Claude Code sets `CLAUDE_CODE_ENTRYPOINT` for its hooks even when its messaging socket
         // is off.
@@ -1318,6 +1347,33 @@ pub fn record_idle(paths: &Paths, session: &str) {
     }
 }
 
+/// Record an OMP turn state only for the exact registration followed by its native bridge.
+pub(crate) fn record_omp_state(paths: &Paths, expected: &Session, busy: bool) {
+    let Some(_lock) = registration_write(paths) else {
+        return;
+    };
+    let Some(mut current) = load(paths, &expected.session) else {
+        return;
+    };
+    if current.harness != "omp"
+        || !current.same(expected)
+        || current.first_seen_ms != expected.first_seen_ms
+        || current.mirror != expected.mirror
+    {
+        return;
+    }
+    current.state = if busy { BUSY } else { IDLE }.into();
+    current.state_ms = now_millis();
+    if let Ok(body) = serde_json::to_vec(&current) {
+        if let Err(error) = vox_core::node::paths::write_private_file_unique(
+            &paths.session_file(&current.session),
+            &body,
+        ) {
+            eprintln!("vox: OMP Session state was not recorded: {error}");
+        }
+    }
+}
+
 /// Remove `session`'s registration, its notice record and its record of wakes (Claude Code's
 /// `SessionEnd`, V030-20): a session that has ended is never woken again. Its cursors stay, for a
 /// session resumed later.
@@ -1333,6 +1389,27 @@ pub fn end(paths: &Paths, session: &str) {
 /// Lock contention or a failed removal is reported; absence already satisfies the removal.
 pub fn end_checked(paths: &Paths, session: &str) -> Result<(), String> {
     let _lock = registration_lock(paths)?;
+    end_locked(paths, session)
+}
+
+/// End only the exact OMP registration that emitted its native shutdown event.
+pub(crate) fn end_omp_checked(paths: &Paths, expected: &Session) -> Result<bool, String> {
+    let _lock = registration_lock(paths)?;
+    let Some(current) = load(paths, &expected.session) else {
+        return Ok(false);
+    };
+    if current.harness != "omp"
+        || !current.same(expected)
+        || current.first_seen_ms != expected.first_seen_ms
+        || current.mirror != expected.mirror
+    {
+        return Ok(false);
+    }
+    end_locked(paths, &expected.session)?;
+    Ok(true)
+}
+
+fn end_locked(paths: &Paths, session: &str) -> Result<(), String> {
     // Keep the room-bearing registration until every fallible auxiliary removal is done.
     // On failure the daemon can retry and still enqueue the end in its captured room.
     for path in [
@@ -1519,7 +1596,7 @@ pub async fn attention(
     let Some(route) = session
         .attention
         .as_ref()
-        .filter(|_| session.harness == "opencode")
+        .filter(|_| matches!(session.harness.as_str(), "opencode" | "omp"))
     else {
         return Outcome::Unavailable(
             if session.harness == "codex" {
@@ -1671,7 +1748,7 @@ pub(crate) async fn claude_attention(
 /// requires a current native receiver; Codex receives ordinary hook context only.
 #[must_use]
 pub fn wakeable(harness: &str) -> bool {
-    matches!(harness, "opencode" | "claude")
+    matches!(harness, "opencode" | "claude" | "omp")
 }
 
 /// The kinds that are never a reply worth announcing (V030-20): acknowledgements, progress,

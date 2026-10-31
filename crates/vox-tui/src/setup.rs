@@ -1,6 +1,6 @@
 //! `vox setup`: set up this machine (ADR-029 §7).
 //!
-//! It looks for the harnesses installed here (Claude Code, Codex, OpenCode: each one's program on
+//! It looks for the harnesses installed here (Claude Code, Codex, OpenCode, Oh My Pi: each one's program on
 //! `PATH`), and offers each a node of its own, `<harness>-<host>` (ADR-026 N-6) or a name the
 //! operator types instead (#665; `skip` makes none), with a passphrase
 //! the operator types (ADR-028 K-11), its hook installed in the harness's own settings and the
@@ -35,7 +35,7 @@ pub(crate) struct Harness {
 }
 
 /// The harnesses `vox setup` and `vox agent setup` wire.
-pub(crate) const HARNESSES: [Harness; 3] = [
+pub(crate) const HARNESSES: [Harness; 4] = [
     Harness {
         key: "claude",
         name: "Claude Code",
@@ -50,6 +50,11 @@ pub(crate) const HARNESSES: [Harness; 3] = [
         key: "opencode",
         name: "OpenCode",
         program: "opencode",
+    },
+    Harness {
+        key: "omp",
+        name: "Oh My Pi",
+        program: "omp",
     },
 ];
 
@@ -299,6 +304,31 @@ pub(crate) fn install_light_hooks() -> bool {
                     );
                     true
                 }
+            } else if h.key == "omp" {
+                if existing.trim().is_empty() {
+                    writable()?;
+                    write(&hook, crate::agent_hook::LIGHT_OMP_EXTENSION)?;
+                    println!(
+                        "vox: {}: installed light extension in {}",
+                        h.name,
+                        hook.display()
+                    );
+                } else if existing != crate::agent_hook::LIGHT_OMP_EXTENSION {
+                    let node = wiring.owned_omp_node(&existing)?.ok_or_else(|| {
+                        AppError::Usage(format!(
+                            "{} holds an edited or unknown extension; left unchanged",
+                            hook.display()
+                        ))
+                    })?;
+                    writable()?;
+                    wiring.install_hook(&node)?;
+                    println!(
+                        "vox: {}: refreshed extension for {node} in {}",
+                        h.name,
+                        hook.display()
+                    );
+                }
+                true
             } else {
                 let value: serde_json::Value = if existing.trim().is_empty() {
                     serde_json::json!({})
@@ -573,25 +603,17 @@ pub(crate) struct Wiring {
 
 impl Wiring {
     pub(crate) fn of(key: &'static str) -> Result<Self, AppError> {
-        let home = || {
-            std::env::var_os("HOME")
-                .filter(|h| !h.is_empty())
-                .map(PathBuf::from)
-        };
-        let var = |v: &str| {
-            std::env::var_os(v)
-                .filter(|d| !d.is_empty())
-                .map(PathBuf::from)
-        };
-        let dir = match key {
-            "claude" => var("CLAUDE_CONFIG_DIR").or_else(|| home().map(|h| h.join(".claude"))),
-            "codex" => var("CODEX_HOME").or_else(|| home().map(|h| h.join(".codex"))),
-            _ => var("OPENCODE_CONFIG_DIR")
-                .or_else(|| var("XDG_CONFIG_HOME").map(|x| x.join("opencode")))
-                .or_else(|| home().map(|h| h.join(".config").join("opencode"))),
-        };
+        let dir = crate::skill_pack::config_dir(key);
         dir.map(|dir| Self { key, dir }).ok_or_else(|| {
             AppError::Usage("HOME is not set, so no harness's settings can be found".into())
+        })
+    }
+
+    pub(crate) fn omp_at(dir: &str) -> Result<Self, AppError> {
+        crate::agent_onboarding::validate_omp_target(dir)?;
+        Ok(Self {
+            key: "omp",
+            dir: PathBuf::from(dir),
         })
     }
 
@@ -600,7 +622,7 @@ impl Wiring {
     /// OpenCode's plugin with its node written in).
     pub(crate) fn wired_node(&self) -> Option<String> {
         let text = std::fs::read_to_string(self.hook_file()).ok()?;
-        if self.key == "opencode" {
+        if matches!(self.key, "opencode" | "omp") {
             return text.lines().find_map(|l| {
                 l.trim()
                     .strip_prefix("const VOX_NODE = \"")?
@@ -633,6 +655,7 @@ impl Wiring {
         match self.key {
             "claude" => self.dir.join("settings.json"),
             "codex" => self.dir.join("hooks.json"),
+            "omp" => self.dir.join("extensions").join("vox.ts"),
             _ => self.dir.join("plugin").join("vox.js"),
         }
     }
@@ -687,6 +710,18 @@ impl Wiring {
             || earlier)
             .then_some(node))
     }
+    fn owned_omp_node(&self, text: &str) -> Result<Option<NodeName>, AppError> {
+        let Some(node) = opencode_plugin_node(text) else {
+            return Ok(None);
+        };
+        let receipt = self.plugin_receipt()?;
+        Ok((text == crate::agent_hook::omp_extension(&node)
+            || receipt
+                .get("extensions/vox.ts")
+                .and_then(|hash| hash.as_str())
+                == Some(plugin_digest(text).as_str()))
+        .then_some(node))
+    }
 
     fn skill_dir(&self) -> PathBuf {
         self.dir.join("skills").join(crate::skill_pack::DIR_NAME)
@@ -706,6 +741,10 @@ impl Wiring {
                  app-server is to be kept running (`codex app-server daemon start`), so a plain `codex` session can be \
                  followed and driven from Vox: it runs no model",
                 self.hook_file().display()
+            ),
+            "omp" => format!(
+                "its native extension, acting as {node}, is to be written to {}; generated-file ownership is recorded in {}",
+                self.hook_file().display(), self.plugin_receipt_file().display()
             ),
             _ => format!(
                 "its server plugin, acting as {node}, is to be written to {}; its client attention plugin is to go in {}, added to tui.json without replacing other settings; generated-file digests are to be recorded in {}",
@@ -758,8 +797,40 @@ impl Wiring {
         match self.key {
             "claude" => merge_hooks(&hook, &crate::agent_hook::claude_settings(node)),
             "codex" => merge_hooks(&hook, &crate::agent_hook::codex_hooks(node)),
+            "omp" => self.install_omp_extension(node),
             _ => self.install_opencode_plugins(node),
         }
+    }
+    fn install_omp_extension(&self, node: &NodeName) -> Result<(), AppError> {
+        let hook = self.hook_file();
+        match std::fs::read_to_string(&hook) {
+            Ok(text)
+                if text.trim().is_empty() || text == crate::agent_hook::LIGHT_OMP_EXTENSION => {}
+            Ok(text) if self.owned_omp_node(&text)?.is_some() => {}
+            Ok(_) => {
+                return Err(AppError::Usage(format!(
+                    "{} holds an edited or unknown extension; left unchanged",
+                    hook.display()
+                )))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        let receipt = self.plugin_receipt_file();
+        for path in [&hook, &receipt] {
+            if std::fs::metadata(path).is_ok_and(|m| m.permissions().readonly()) {
+                return Err(AppError::Usage(format!("{} is read-only", path.display())));
+            }
+        }
+        let extension = crate::agent_hook::omp_extension(node);
+        let mut files = self.plugin_receipt()?;
+        files.insert("extensions/vox.ts".into(), plugin_digest(&extension).into());
+        let receipt_text =
+            serde_json::to_string_pretty(&serde_json::json!({"format": 1, "files": files}))
+                .map_err(|e| AppError::Usage(format!("cannot record Oh My Pi extension: {e}")))?
+                + "\n";
+        write(&hook, &extension)?;
+        write(&receipt, &receipt_text)
     }
 
     /// OpenCode loads TUI plugins from tui.json, separately from server plugins.
@@ -1066,6 +1137,38 @@ pub(crate) fn unwire(account: &vox_core::node::paths::Account) -> Vec<Unwire> {
                 Err(e) => out.push(Unwire::Keep(format!(
                     "{} is kept: its plugin receipt could not be read ({e})",
                     receipt.display()
+                ))),
+            }
+        } else if h.key == "omp" {
+            match std::fs::read_to_string(&hook) {
+                Ok(text)
+                    if text == crate::agent_hook::LIGHT_OMP_EXTENSION
+                        || nodes
+                            .iter()
+                            .any(|n| crate::agent_hook::omp_extension(n) == text) =>
+                {
+                    out.push(Unwire::Remove(hook.clone()));
+                    let receipt = w.plugin_receipt_file();
+                    let expected = serde_json::to_string_pretty(&serde_json::json!({
+                        "format": 1,
+                        "files": { "extensions/vox.ts": plugin_digest(&text) }
+                    }))
+                    .ok()
+                    .map(|s| s + "\n");
+                    if expected.is_some_and(|expected| {
+                        std::fs::read_to_string(&receipt).ok().as_deref() == Some(expected.as_str())
+                    }) {
+                        out.push(Unwire::Remove(receipt));
+                    }
+                }
+                Ok(_) => out.push(Unwire::Keep(format!(
+                    "{} is kept: its extension was edited or is not Vox's",
+                    hook.display()
+                ))),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => out.push(Unwire::Keep(format!(
+                    "{} is kept: its extension could not be read ({e})",
+                    hook.display()
                 ))),
             }
         } else if let Some(text) = without_vox_hooks(&hook) {

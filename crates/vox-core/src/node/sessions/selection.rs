@@ -49,7 +49,7 @@ pub async fn resolve(
         .ok_or_else(|| format!("no Session in this room is named {}", typed.trim()))
 }
 
-/// Resolve retained metadata, returning absence only after the full bounded scan.
+/// Resolve the newest opening of each id, returning absence only after the full bounded scan.
 /// Read callers may then use the existing opening-not-received activity path.
 ///
 /// # Errors
@@ -62,7 +62,7 @@ pub async fn lookup(
     ended_ok: bool,
     label: impl Fn(&SessionRow) -> String,
 ) -> Result<Option<SessionRow>, String> {
-    select(client, room, node, typed, ended_ok, label, false).await
+    select(client, room, node, typed, ended_ok, label).await
 }
 
 /// Resolve the newest opening of each id for a message addressed to one node.
@@ -76,7 +76,7 @@ pub async fn addressable(
     typed: &str,
     label: impl Fn(&SessionRow) -> String,
 ) -> Result<String, String> {
-    select(client, room, Some(node), typed, false, label, true)
+    select(client, room, Some(node), typed, false, label)
         .await?
         .map(|s| s.id)
         .ok_or_else(|| format!("no Session in this room is named {}", typed.trim()))
@@ -89,7 +89,6 @@ async fn select(
     typed: &str,
     ended_ok: bool,
     label: impl Fn(&SessionRow) -> String,
-    latest: bool,
 ) -> Result<Option<SessionRow>, String> {
     let typed = typed.trim();
     if typed.is_empty() {
@@ -144,7 +143,7 @@ async fn select(
             }
             let id_match = row.id == typed || (prefix && row.id.starts_with(typed));
             let name_match = row.name.as_deref() == Some(typed);
-            if latest && (id_match || name_match) {
+            if id_match || name_match {
                 match client
                     .session_lookup(room, row.node, row.id.clone())
                     .await

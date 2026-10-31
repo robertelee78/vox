@@ -4,6 +4,50 @@ Updated: 2026-10-15 for the v0.4.5 source/documentation pass. Prior walkthrough 
 remain historical evidence at their stated revisions. Scope: ADR-027 M27.1 / work item #421. This is maintainer evidence, not a chapter in the public navigation manifest. Source
 inspection is not an execution test.
 
+## v0.4.11 Oh My Pi native integration candidate (#1091)
+
+Real unmodified OMP v18.14.0 ran with the installed Vox native extension, an authenticated
+model and scratch Vox data/config and OMP profile directories. Ordinary room context and
+addressed urgent messages reached the actual conversation, idle and across a real skill-read
+tool round, under Read-only authority without tmux or terminal message injection. Private input
+was refused after Drive withdrawal; an explicit Drive grant enabled private text and file
+delivery while ordinary room attention was paused. The fresh private token survived the skill
+tool call, and the attached file was read only from its Vox-verified delivered path after native
+resume. A new conversation reported no inherited private Drive input. An inactive target was
+refused rather than creating or reopening a conversation.
+
+Fresh private input after native resume exposed duplicate-opening selection: the exact native
+Session ID was counted twice. The shared resolver now uses the existing newest-opening lookup,
+as addressed room messages already did. With a rebuilt normal release CLI, the previously
+refused fresh token reached the resumed OMP conversation, and the authorized peer read its
+actual private activity and reply through the same exact ID.
+
+The review corrections were also exercised in real native surfaces: clearing a queued private
+request in OMP plan mode no longer blocked the next private request; Read-only room context
+still arrived afterward. Moving the live conversation to another room through `vox agent room`
+put subsequent native tool/reply activity in that destination. App-assisted setup displayed and
+wired the requested custom OMP profile, reported Ready and remembered, and left the unrelated
+default profile unwired. A real native soft compaction reduced the conversation from 10K to
+2.8K; the next prompt recalled the exact earlier private deployment fact without tools or
+file reads. Its scratch OMP retained-tail setting was 1,024 tokens; the initial default-tail
+attempt had refused as too small and is not counted as compaction evidence.
+
+The persisted native process was also killed abruptly and resumed without restarting Vox's
+daemon; fresh private input reached that resumed conversation with its earlier registration
+retained. A separate cancellation journey observed a native turn start, successful Vox
+interrupt and native turn end before queuing private input. The native TUI confirmed its
+context reset without starting another turn; the next private request succeeded and its fresh
+token appeared in the native reply without the cancelled token. This caught and corrected a
+discard-frame envelope defect. It is one genuine pending cancellation, not a saturation proof.
+
+Receipts and native surfaces are under `/private/tmp/vox1007-practical-42qu344_/v0411-1091-*`
+and `/private/tmp/vox1091-native-48863r3r/`. Earlier product failures in generated-extension
+refresh and multi-tool context retention were corrected and exercised with fresh native
+Sessions; initial file-read refusal was an operator-prompt restriction, not lost delivery.
+These are local candidate observations, not a published release or proof of model understanding,
+all providers, crash durability, revocation during an in-flight file pull or every native
+navigation/cancellation interleaving. OMP source was not changed. No new CI gate was added.
+
 ## v0.4.11 one-command app update candidate (#1090)
 
 The actual released v0.4.10 SwiftUI app and its published-source updater were exercised in the

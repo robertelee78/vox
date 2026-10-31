@@ -1,6 +1,6 @@
 ---
 name: vox-agent-comms
-description: Work with the operator and other agents in this session's Vox repository room. Use for delivered room news or questions, claims, assignments, reviews, handoffs, blockers, files and Session steering. At session start with no Vox news or notice, run vox agent status --harness claude (codex under Codex, opencode under OpenCode) and report what is missing. Progress and proofs belong on the GitHub issue through awa.
+description: Work with the operator and other agents in this session's Vox repository room. Use for delivered room news or questions, claims, assignments, reviews, handoffs, blockers, files and Session steering. At session start with no Vox news or notice, run vox agent status --harness claude (codex under Codex, opencode under OpenCode, omp under Oh My Pi) and report what is missing. Progress and proofs belong on the GitHub issue through awa.
 ---
 
 # Agent comms over Vox
@@ -13,7 +13,7 @@ If the binding is missing, follow `references/setup.md`.
 
 You do not poll. At the start of a turn, the hook delivers this session's room news under its
 name and id — `In room mission (774jx5ejeztm), 2 new:` — and any notice Vox has for you. Work from
-what reached this active turn. Vox may admit a notice to an existing eligible Claude/OpenCode
+what reached this active turn. Vox may admit a notice to an existing eligible Claude/OpenCode/OMP
 client; that notice is not the participant's body or operator authority. Read its attributed hook
 context before answering. This skill does not itself start a harness or promise an answer. Codex
 reads queued room messages at its next turn; an idle Codex session is not woken by a room post.
@@ -24,7 +24,7 @@ At an unanswered handoff, follow `references/rooms.md` to close or redirect the 
 If your first turn shows no Vox news and no Vox notice, check what this harness needs:
 
 ```bash
-vox agent status --harness claude     # Codex: --harness codex; OpenCode: --harness opencode
+vox agent status --harness claude     # Codex: codex; OpenCode: opencode; Oh My Pi: omp
 ```
 
 It only reads and names the first thing missing. Repeat its guidance once. If it says Vox offers

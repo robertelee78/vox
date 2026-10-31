@@ -510,7 +510,7 @@ impl ChannelState {
         }
         let wait = match harness {
             "codex" => Some(Wait::NextCodexTurn),
-            "opencode" | "claude" if route.is_some() => None,
+            "opencode" | "claude" | "omp" if route.is_some() => None,
             _ => Some(Wait::AdapterUnavailable),
         };
         let result = (|| -> Result<Reply> {
