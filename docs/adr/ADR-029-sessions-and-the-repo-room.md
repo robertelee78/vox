@@ -252,7 +252,8 @@ me specify one if not".)
   setup, installation, diagnostics, room binding, real session identity and lifecycle, activity
   publication, discovery and authorized Session interaction MUST cover it, not merely rename
   another harness's messages. Integration MUST use Oh My Pi's actual supported session and
-  extension contracts. In particular, eligible urgent room messages MUST reach the intended
+  extension contracts and MUST NOT require changes to Oh My Pi itself. In particular, eligible
+  urgent room messages MUST reach the intended
   already-running Oh My Pi session through native message delivery, without tmux or simulated
   terminal input. Normal room attention MUST retain its existing read/addressing authorization;
   private Session content and driving MUST retain their separate drive authorization. Session
