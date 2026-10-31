@@ -34,7 +34,8 @@ const REATTACH_WITHIN: Duration = Duration::from_secs(30);
 const LOGIN_ITEM: &str = "us.vox.daemon";
 
 /// How the running daemon was started, and so how it is started again.
-enum Started {
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(super) enum Started {
     /// By a client.
     ByClient,
     /// By launchd, as the app's login item: its `gui/<uid>/<label>` target.
@@ -45,6 +46,102 @@ enum Started {
     UserUnit(String),
     /// In a terminal, or by anything else.
     ByHand,
+}
+
+/// Original daemon startup authority, captured before a transition can stop it.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(super) enum DaemonIntent {
+    Absent,
+    Running {
+        started: Started,
+        listen: std::net::SocketAddr,
+        anchors: Vec<String>,
+        attached: Vec<String>,
+    },
+}
+
+#[cfg(target_os = "macos")]
+impl DaemonIntent {
+    pub(super) fn is_valid(&self) -> bool {
+        match self {
+            Self::Absent => true,
+            Self::Running {
+                started,
+                anchors,
+                attached,
+                ..
+            } => {
+                let authority = match started {
+                    Started::LoginItem(target) => {
+                        *target
+                            == format!("gui/{}/{LOGIN_ITEM}", rustix::process::getuid().as_raw())
+                    }
+                    Started::ByClient | Started::ByHand => true,
+                };
+                authority
+                    && anchors
+                        .iter()
+                        .all(|anchor| !anchor.is_empty() && !anchor.contains('\0'))
+                    && attached.iter().all(|name| NodeName::parse(name).is_ok())
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn capture_daemon_intent(
+    account: &Account,
+) -> Result<DaemonIntent, crate::app::AppError> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async {
+        let daemon = match DaemonClient::observe(&account.socket()).await {
+            Ok(daemon) => daemon,
+            Err(vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Unreachable {
+                ..
+            })) => return Ok(DaemonIntent::Absent),
+            Err(e) => return Err(crate::app::AppError::Usage(e.to_string())),
+        };
+        let words = arguments(daemon.pid);
+        if words.is_empty() {
+            return Err(crate::app::AppError::Usage(
+                "cannot inspect the original daemon's startup arguments".into(),
+            ));
+        }
+        let value = words
+            .windows(2)
+            .find(|words| words[0] == "--listen")
+            .map(|words| words[1].as_str())
+            .or_else(|| words.iter().find_map(|word| word.strip_prefix("--listen=")))
+            .unwrap_or(crate::client::DEFAULT_LISTEN);
+        let listen = value.parse().map_err(|e| {
+            crate::app::AppError::Usage(format!(
+                "cannot parse the original daemon's listen address: {e}"
+            ))
+        })?;
+        let anchors = words
+            .iter()
+            .enumerate()
+            .filter_map(|(index, word)| {
+                if word == "--anchor" {
+                    words.get(index + 1).cloned()
+                } else {
+                    word.strip_prefix("--anchor=").map(str::to_owned)
+                }
+            })
+            .collect();
+        Ok(DaemonIntent::Running {
+            started: how_started(daemon.pid),
+            listen,
+            anchors,
+            attached: daemon
+                .attached
+                .iter()
+                .map(|node| node.name.as_str().to_owned())
+                .collect(),
+        })
+    })
 }
 
 /// Restart the account's daemon, if one runs, onto `helper`, the vox now in place, and say what that did: the version it runs, and each node it no longer has attached.
@@ -77,11 +174,13 @@ pub(super) fn restart_daemon_checked(
     account: &Account,
     helper: &Path,
     now: &str,
+    intent: Option<&DaemonIntent>,
 ) -> Result<Vec<NodeName>, crate::app::AppError> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    rt.block_on(restart_checked(account, helper, now, false))
+    let required = matches!(intent, Some(DaemonIntent::Running { .. }));
+    rt.block_on(restart_checked(account, helper, now, required, intent))
 }
 
 /// The explicit repair offered when a client finds a daemon of a different release.
@@ -95,12 +194,13 @@ pub(crate) fn restart_current(account: &Account) -> Result<(), crate::app::AppEr
         &helper,
         env!("CARGO_PKG_VERSION"),
         true,
+        None,
     ))?;
     Ok(())
 }
 
 async fn restart(account: &Account, helper: &Path, now: &str) -> Vec<NodeName> {
-    match restart_checked(account, helper, now, false).await {
+    match restart_checked(account, helper, now, false, None).await {
         Ok(nodes) => nodes,
         Err(e) => {
             println!("the vox daemon restart did not finish: {e}");
@@ -114,24 +214,66 @@ async fn restart_checked(
     helper: &Path,
     now: &str,
     start_if_absent: bool,
+    intent: Option<&DaemonIntent>,
 ) -> Result<Vec<NodeName>, crate::app::AppError> {
     use crate::app::AppError;
     let default_listen = crate::client::DEFAULT_LISTEN.parse().map_err(|e| {
         AppError::Usage(format!("the default daemon listen address is invalid: {e}"))
     })?;
     let socket = account.socket();
-    // Read only Hello, then close. Even the updater sends no request to another release.
+    // Read only Hello, then close. An optional absent daemon needs no node inspection.
     let before = match DaemonClient::observe(&socket).await {
-        Ok(d) => d,
+        Ok(daemon) => Some(daemon),
         Err(vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Unreachable { .. })) => {
             if !start_if_absent {
                 return Ok(Vec::new());
             }
-            crate::daemon_client::start_daemon(helper, account, default_listen, &[]).await?;
-            println!("the vox daemon was started and runs vox {now}");
-            return Ok(Vec::new());
+            None
         }
         Err(e) => return Err(AppError::Usage(e.to_string())),
+    };
+    let mut kept = crate::host::read_attach_file(&account.attach_file())
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect::<Vec<_>>();
+    // No-passphrase nodes also start themselves, even after Forget. Wait for their actual
+    // startup before reporting the update complete.
+    for name in account.nodes_on_disk() {
+        let paths = account.node_paths_as_they_are(&name);
+        let headless = !paths.vault_file().is_file()
+            && vox_core::node::headless::identity_file(&paths).is_file();
+        if (headless || !paths.requires_passphrase()?) && !kept.contains(&name) {
+            kept.push(name);
+        }
+    }
+    let Some(before) = before else {
+        let attached = if let Some(DaemonIntent::Running {
+            started,
+            listen,
+            anchors,
+            attached,
+        }) = intent
+        {
+            start_selected(account, helper, *listen, anchors, started).await?;
+            attached.as_slice()
+        } else {
+            crate::daemon_client::start_daemon(helper, account, default_listen, &[]).await?;
+            &[]
+        };
+        let after = wait_for_replacement(account, now, None, &kept).await?;
+        println!("the vox daemon was started and runs vox {} (pid {}), and its remembered nodes are Ready",
+                after.version, after.pid);
+        let missing = attached
+            .iter()
+            .filter(|name| {
+                !after.attached.iter().any(|node| {
+                    node.name.as_str() == name.as_str() && node.state == NodeState::Attached
+                })
+            })
+            .map(|name| NodeName::parse(name).map_err(|e| AppError::Usage(e.to_string())))
+            .collect::<Result<Vec<_>, _>>()?;
+        say_detached(&missing);
+        return Ok(missing);
     };
     let started = how_started(before.pid);
     let words = arguments(before.pid);
@@ -172,20 +314,6 @@ async fn restart_checked(
     } else {
         Vec::new()
     };
-    let mut kept = crate::host::read_attach_file(&account.attach_file())
-        .into_iter()
-        .map(|(name, _)| name)
-        .collect::<Vec<_>>();
-    // No-passphrase nodes also start themselves, even after Forget. Wait for their actual
-    // startup before reporting the update complete.
-    for name in account.nodes_on_disk() {
-        let paths = account.node_paths_as_they_are(&name);
-        let headless = !paths.vault_file().is_file()
-            && vox_core::node::headless::identity_file(&paths).is_file();
-        if (headless || !paths.requires_passphrase()?) && !kept.contains(&name) {
-            kept.push(name);
-        }
-    }
 
     // A normal termination signal follows the daemon's own bounded shutdown path. Its pid
     // came from this user's authenticated control socket, never a stale lock-file pid.
@@ -209,77 +337,8 @@ async fn restart_checked(
             )));
         }
     }
-    match started {
-        #[cfg(target_os = "macos")]
-        Started::LoginItem(target) => {
-            let out = Command::new("/bin/launchctl")
-                .args(["kickstart", &target])
-                .bounded_output()?;
-            if !out.status.success() {
-                return Err(AppError::Usage(format!(
-                    "launchd did not restart the daemon: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                )));
-            }
-        }
-        #[cfg(target_os = "linux")]
-        Started::UserUnit(unit) => {
-            let out = Command::new("systemctl")
-                .args(["--user", "restart", &unit])
-                .bounded_output()?;
-            if !out.status.success() {
-                return Err(AppError::Usage(format!(
-                    "systemd did not restart the daemon: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                )));
-            }
-        }
-        Started::ByClient | Started::ByHand => {
-            crate::daemon_client::start_daemon(helper, account, listen, &anchors).await?;
-        }
-    }
-    let t0 = Instant::now();
-    let mut preparing = None;
-    // Keep one authenticated connection to the replacement daemon continuously open while
-    // remembered nodes prepare. A detached daemon with no Ready node otherwise retires as idle
-    // after its startup grace, before this longer readiness bound expires.
-    let mut _held_after = None;
-    let after = loop {
-        let greeting = DaemonClient::observe_held(&socket).await;
-        if let Ok(d) = greeting {
-            if d.version == now && d.pid != before.pid {
-                let pending: Vec<_> = kept
-                    .iter()
-                    .filter(|k| {
-                        !d.attached
-                            .iter()
-                            .any(|n| &n.name == *k && n.state == NodeState::Attached)
-                    })
-                    .map(NodeName::as_str)
-                    .collect();
-                if pending.is_empty() {
-                    break d;
-                }
-                preparing = Some(pending.join(", "));
-                // The new greeting is established before assignment drops the prior one, so the
-                // daemon never observes an idle gap between readiness polls.
-                _held_after = Some(d);
-            }
-        }
-        if t0.elapsed() >= REATTACH_WITHIN {
-            if let Some(nodes) = preparing {
-                return Err(AppError::Usage(format!(
-                    "the new daemon answered on vox {now}, but these remembered nodes did not become Ready within {} s: {nodes}; its log is {}",
-                    REATTACH_WITHIN.as_secs(), account.log_file().display(),
-                )));
-            }
-            return Err(AppError::Usage(format!(
-                "the daemon did not return with its remembered nodes Ready on vox {now} within {} s; its log is {}",
-                REATTACH_WITHIN.as_secs(), account.log_file().display(),
-            )));
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    };
+    start_selected(account, helper, listen, &anchors, &started).await?;
+    let after = wait_for_replacement(account, now, Some(before.pid), &kept).await?;
     let ended = match (held.is_empty(), attached.is_empty()) {
         (false, _) => format!(
             "; held sessions {} ended, along with other connections on nodes {}",
@@ -313,6 +372,91 @@ async fn restart_checked(
         .collect::<Vec<_>>();
     say_detached(&missing);
     Ok(missing)
+}
+
+async fn start_selected(
+    account: &Account,
+    helper: &Path,
+    listen: std::net::SocketAddr,
+    anchors: &[String],
+    started: &Started,
+) -> Result<(), crate::app::AppError> {
+    use crate::app::AppError;
+    match started {
+        #[cfg(target_os = "macos")]
+        Started::LoginItem(target) => {
+            let out = Command::new("/bin/launchctl")
+                .args(["kickstart", target])
+                .bounded_output()?;
+            if !out.status.success() {
+                return Err(AppError::Usage(format!(
+                    "launchd did not restart the daemon: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )));
+            }
+        }
+        #[cfg(target_os = "linux")]
+        Started::UserUnit(unit) => {
+            let out = Command::new("systemctl")
+                .args(["--user", "restart", unit])
+                .bounded_output()?;
+            if !out.status.success() {
+                return Err(AppError::Usage(format!(
+                    "systemd did not restart the daemon: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )));
+            }
+        }
+        Started::ByClient | Started::ByHand => {
+            crate::daemon_client::start_daemon(helper, account, listen, anchors).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn wait_for_replacement(
+    account: &Account,
+    now: &str,
+    previous_pid: Option<u32>,
+    kept: &[NodeName],
+) -> Result<DaemonClient, crate::app::AppError> {
+    use crate::app::AppError;
+    let socket = account.socket();
+    let t0 = Instant::now();
+    let mut preparing = None;
+    // Keep the authenticated replacement continuously observed while remembered nodes prepare.
+    let mut _held_after = None;
+    loop {
+        if let Ok(daemon) = DaemonClient::observe_held(&socket).await {
+            if daemon.version == now && Some(daemon.pid) != previous_pid {
+                let pending =
+                    kept.iter()
+                        .filter(|name| {
+                            !daemon.attached.iter().any(|node| {
+                                node.name == **name && node.state == NodeState::Attached
+                            })
+                        })
+                        .map(NodeName::as_str)
+                        .collect::<Vec<_>>();
+                if pending.is_empty() {
+                    return Ok(daemon);
+                }
+                preparing = Some(pending.join(", "));
+                _held_after = Some(daemon);
+            }
+        }
+        if t0.elapsed() >= REATTACH_WITHIN {
+            return Err(AppError::Usage(match preparing {
+                Some(nodes) => format!(
+                    "the new daemon answered on vox {now}, but these remembered nodes did not become Ready within {} s: {nodes}; its log is {}",
+                    REATTACH_WITHIN.as_secs(), account.log_file().display()),
+                None => format!(
+                    "the daemon did not return with its remembered nodes Ready on vox {now} within {} s; its log is {}",
+                    REATTACH_WITHIN.as_secs(), account.log_file().display()),
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// Named services and forwards on the matching daemon, before ending their held connections.

@@ -1,6 +1,6 @@
 # Install and update
 
-Applies to Vox v0.4.11.
+Applies to Vox v0.4.12.
 
 Vox runs on Linux on x86_64, and on Macs with Apple Silicon and macOS 13 or later. On a Mac it
 comes as `Vox.app`, with `vox` inside it.
@@ -73,6 +73,13 @@ it was running. They preserve that app's profile even when the updater uses diff
 config or home directories. An app that was closed stays closed; another Vox installation is
 not restarted. A refused quit or failed relaunch is reported as a failure, not success.
 An open `vox tui` still runs its original version until you restart that terminal client.
+
+An update can install the new app before a later cleanup operation is refused. Vox reports
+what is installed, which handoff failed, and the affected operation and path; it retains the
+unfinished transition for local repair. After resolving that specific obstruction, run
+`vox update` to finish locally without another exchange or a release download. Do not repeat
+`vox update --rollback` to repair an already-installed rollback: doing so could reverse it.
+Do not delete the retained bundles or transition journal to dismiss an error.
 
 Vox v0.4.5 does not promise migration from previous releases or mixed-version operation. Read
 the release notes before updating an earlier installation. A stored format the new binary cannot

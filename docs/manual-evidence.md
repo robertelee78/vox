@@ -4,6 +4,39 @@ Updated: 2026-10-15 for the v0.4.5 source/documentation pass. Prior walkthrough 
 remain historical evidence at their stated revisions. Scope: ADR-027 M27.1 / work item #421. This is maintainer evidence, not a chapter in the public navigation manifest. Source
 inspection is not an execution test.
 
+## v0.4.12 updater correction candidate (#1090)
+
+The [full updater RCA](updater-rca-2026-10-30.md) separates the unknown original OS refusal
+from the reproduced publication/handoff defect and incorrect backup-unregister reporting.
+The earlier v0.4.11 acceptance was withdrawn after the operator's installed update failed.
+
+Updater logic through `9c86b03ffccfa906f6e61ffed28144a883ca5737` was compiled at the real
+v0.4.12 workspace version and exercised in a fresh macOS 27.2 guest with SIP and
+authenticated root enabled. Native update and rollback preserved the exact saved message
+and app profile. Real daemon-start and app-launch refusals exercised both independent
+component checkpoints; offline repair completed only failed work. A required missing
+daemon had to become Ready before repair could succeed; an optional absent daemon stayed
+absent despite unrelated incomplete node facts.
+
+The existing post-exchange abort knob staged a real interrupted publication. Recovery
+made the new daemon Ready before reporting the remaining older-bundle cleanup refusal;
+removing only that obstruction allowed offline cleanup without another handoff or swap.
+An unreadable scratch journal was refused without deleting data. A closed app stayed
+closed and the other running installation retained its exact launch identity.
+
+Normal current-version updates with retained backups produced no false LaunchServices
+failure. A genuinely stale raw backup registration was present before the product ran
+and absent afterward; the product did not restore the disabled plist to unregister it.
+
+These are source-bound real-binary observations with controlled ad-hoc app signatures and
+the existing loopback/test-knobs apparatus where required, not a notarized corrective-
+artifact claim. The RCA records staging errors separately rather than counting them as
+product failures or passes. Receipts are under
+`/private/tmp/vox1007-practical-42qu344_/v0412-*`; no real host profile or platform security
+setting was changed. Public signed-artifact delivery evidence belongs to the release and
+its work-item record.
+
+
 ## v0.4.11 Oh My Pi native integration candidate (#1091)
 
 Real unmodified OMP v18.14.0 ran with the installed Vox native extension, an authenticated
