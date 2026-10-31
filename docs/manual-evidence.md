@@ -4,6 +4,29 @@ Updated: 2026-10-15 for the v0.4.5 source/documentation pass. Prior walkthrough 
 remain historical evidence at their stated revisions. Scope: ADR-027 M27.1 / work item #421. This is maintainer evidence, not a chapter in the public navigation manifest. Source
 inspection is not an execution test.
 
+## v0.4.11 one-command app update candidate (#1090)
+
+The actual released v0.4.10 SwiftUI app and its published-source updater were exercised in the
+isolated macOS guest against a real compiled 9.4.10 app/helper fixture. Only the existing
+`test-knobs` loopback release apparatus and controlled ad-hoc signatures were used; this is not
+a Developer ID or notarization claim. One `vox update` replaced the running app, restarted its
+daemon and relaunched the new app without a manual restart. A following `vox update --rollback`
+restored v0.4.10 and another app process. Both transitions preserved the original app profile,
+Ready node and exact saved room message despite different updater HOME/XDG/data/config paths.
+The other scratch Vox installation retained its running process throughout. After the target
+app was quit normally, another update left it closed.
+
+The existing different-version daemon journey also passed with a private scratch Keychain and
+matching controlled signing lineage: the remembered protected node became Ready, unremembered
+nodes received an unlock instruction, the named held service ended, version-mismatch callers
+refused without mutating the node, and uninstall stopped the other local version. Earlier
+AppKit nil-URL and launch-date precision defects were corrected; signing/Keychain and native
+observer staging failures were retained separately rather than counted as product results.
+
+Local receipts are under `/private/tmp/vox1007-practical-42qu344_/v0411-1090-*` and
+`/private/tmp/vox1090-gui-cutover-pg4tjp41/`. These are candidate observations, not release
+publication, the optional signed-identifier proof, or an exhaustive failed-quit/launch matrix.
+
 ## v0.4.11 room-reopen failure candidate (#629)
 
 The candidate retains the daemon's automatic-reopen refusal in closed room summaries and

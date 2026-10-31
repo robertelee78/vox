@@ -43,6 +43,12 @@ use crate::app::AppError;
 mod bundle;
 pub(crate) mod restart;
 
+/// Complete an app transition when an updater invokes its newly installed helper.
+#[cfg(target_os = "macos")]
+pub(crate) fn post_install_delegate() -> Result<(), AppError> {
+    bundle::post_install_delegate()
+}
+
 /// The repository releases are published from.
 const REPO: &str = "robertelee78/vox";
 

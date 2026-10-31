@@ -65,9 +65,14 @@ Developer ID. A `vox` you built from source is not replaced.
 The update restarts the daemon onto the new version, so update when it is safe to interrupt your
 rooms and services. Every node stops as the daemon stops. The new daemon makes each remembered
 node Ready again. For any other node, the update prints the command that makes it Ready, such as
-`vox node unlock robertgpt`. A daemon you started yourself with `vox daemon` keeps running the old
-version, and the update says so. An open `vox tui` or Vox app keeps the old version until you
-restart it.
+`vox node unlock robertgpt`. A daemon started in a terminal ends; its replacement runs detached
+on the same configured address and anchors.
+
+On a Mac, update and rollback quit and relaunch the app from the installation being changed if
+it was running. They preserve that app's profile even when the updater uses different data,
+config or home directories. An app that was closed stays closed; another Vox installation is
+not restarted. A refused quit or failed relaunch is reported as a failure, not success.
+An open `vox tui` still runs its original version until you restart that terminal client.
 
 Vox v0.4.5 does not promise migration from previous releases or mixed-version operation. Read
 the release notes before updating an earlier installation. A stored format the new binary cannot

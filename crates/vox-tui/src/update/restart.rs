@@ -71,6 +71,19 @@ pub(super) fn restart_daemon(helper: &Path, now: &str) -> Vec<NodeName> {
     rt.block_on(restart(&account, helper, now))
 }
 
+/// Restart a particular account and propagate failures to the app handoff.
+#[cfg(target_os = "macos")]
+pub(super) fn restart_daemon_checked(
+    account: &Account,
+    helper: &Path,
+    now: &str,
+) -> Result<Vec<NodeName>, crate::app::AppError> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(restart_checked(account, helper, now, false))
+}
+
 /// The explicit repair offered when a client finds a daemon of a different release.
 pub(crate) fn restart_current(account: &Account) -> Result<(), crate::app::AppError> {
     let helper = std::env::current_exe()?;
