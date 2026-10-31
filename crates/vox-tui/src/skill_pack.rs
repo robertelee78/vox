@@ -102,7 +102,7 @@ pub struct Harness {
 }
 
 /// The harnesses, in the order they are reported.
-pub const HARNESSES: [Harness; 3] = [
+pub const HARNESSES: [Harness; 4] = [
     Harness {
         key: "claude",
         name: "Claude Code",
@@ -118,6 +118,11 @@ pub const HARNESSES: [Harness; 3] = [
         name: "OpenCode",
         program: "opencode",
     },
+    Harness {
+        key: "omp",
+        name: "Oh My Pi",
+        program: "omp",
+    },
 ];
 
 fn var(v: &str) -> Option<PathBuf> {
@@ -126,18 +131,58 @@ fn var(v: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// The harness's own configuration folder, as it finds it: `$CLAUDE_CONFIG_DIR` or `~/.claude`;
-/// `$CODEX_HOME` or `~/.codex`; `$OPENCODE_CONFIG_DIR`, `$XDG_CONFIG_HOME/opencode` or
-/// `~/.config/opencode`. `None` with no `HOME`.
+/// The harness's own configuration folder. Oh My Pi uses the active profile's agent directory,
+/// or `PI_CODING_AGENT_DIR` / `~/.omp/agent` for its default profile.
 #[must_use]
 pub fn config_dir(key: &str) -> Option<PathBuf> {
     let home = || var("HOME");
     match key {
         "claude" => var("CLAUDE_CONFIG_DIR").or_else(|| home().map(|h| h.join(".claude"))),
         "codex" => var("CODEX_HOME").or_else(|| home().map(|h| h.join(".codex"))),
-        _ => var("OPENCODE_CONFIG_DIR")
+        "opencode" => var("OPENCODE_CONFIG_DIR")
             .or_else(|| var("XDG_CONFIG_HOME").map(|x| x.join("opencode")))
             .or_else(|| home().map(|h| h.join(".config").join("opencode"))),
+        "omp" => {
+            let root = || {
+                home().map(|h| {
+                    let config = var("PI_CONFIG_DIR").unwrap_or_else(|| ".omp".into());
+                    h.join(config.strip_prefix("/").unwrap_or(&config))
+                })
+            };
+            let profile = std::env::var("OMP_PROFILE")
+                .ok()
+                .or_else(|| std::env::var("PI_PROFILE").ok());
+            let profile = profile
+                .as_deref()
+                .map(str::trim)
+                .filter(|p| !p.is_empty() && *p != "default");
+            if let Some(profile) = profile {
+                let stem = profile
+                    .split('.')
+                    .next()
+                    .unwrap_or(profile)
+                    .to_ascii_lowercase();
+                let reserved = matches!(stem.as_str(), "con" | "prn" | "aux" | "nul")
+                    || (stem.len() == 4
+                        && (stem.starts_with("com") || stem.starts_with("lpt"))
+                        && stem.as_bytes()[3].is_ascii_digit());
+                if reserved
+                    || profile.len() > 64
+                    || profile.ends_with('.')
+                    || !profile.bytes().enumerate().all(|(i, c)| {
+                        c.is_ascii_lowercase()
+                            || c.is_ascii_digit()
+                            || (i > 0 && matches!(c, b'.' | b'_' | b'-'))
+                    })
+                {
+                    return None;
+                }
+                root().map(|r| r.join("profiles").join(profile).join("agent"))
+            } else {
+                var("PI_CODING_AGENT_DIR").or_else(|| root().map(|r| r.join("agent")))
+            }
+        }
+        _ => None,
     }
 }
 

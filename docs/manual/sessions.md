@@ -1,6 +1,6 @@
 # Sessions
 
-Applies to Vox v0.4.5.
+Applies to Vox v0.4.11.
 
 This page shows how to put an agent's sessions in the right room, follow what a session does,
 and drive it. To drive a session, the agent's node must trust your node with **read + drive**
@@ -10,8 +10,8 @@ from the earlier chapters; actual Session IDs and waiting references come from y
 
 ## What a Session is
 
-A **Session** is one harness session, such as one Claude Code, Codex or OpenCode session a
-person opened, as it appears in its room. Vox makes one when an interactive session's hook first
+A **Session** is one harness session, such as one Claude Code, Codex, OpenCode or Oh My Pi session a
+person opened, as it appears in its room. Vox makes one when the interactive session's integration first
 runs. A headless run, such as `claude -p` or `codex exec`, gets none. A Session ends when the
 harness session ends. Its steps have a separate lifetime from the room conversation.
 
@@ -41,7 +41,7 @@ The session's node decides who sees inside:
 A Session's label is your name for its node, the session's own name if it has one, and the first
 eight characters of its ID: `claude-mac · 3f0c25bf`, or `codex-mac · gso-cap · 01a113e7`. The name and
 ID are the node's claim. When the session is renamed in its harness, its Session takes the new
-name: Claude Code's at its next prompt or turn end, Codex's and OpenCode's at once.
+name: Claude Code's at its next prompt or turn end, Codex's and OpenCode's at once, and OMP's at its next native activity event.
 
 ## The room a session works in
 
@@ -154,6 +154,11 @@ There is no fixed Session ID to reuse from this manual.
 With `--json`, each returned row has `can_drive`. A read-only viewer may get no row at all; absence
 from that list does not prove the harness is stopped. Use the owner's view for an owner-side check.
 
+A resumed OMP conversation keeps its native Session ID but has a new Vox opening. The retained
+listing may include its earlier ended opening. ID/name lookup selects the newest opening for
+that node and ID; an ended earlier opening does not make the resumed conversation ambiguous.
+Different matching Sessions are still refused rather than guessed.
+
 `vox room session` takes a Session's ID (at least eight characters) or its name, and prints one
 line per thing the session did:
 
@@ -198,6 +203,11 @@ How Vox reaches each harness:
 - **Codex:** through Codex's app-server, which `vox setup` keeps running. `--say` starts the
   session's next turn.
 - **OpenCode:** through the plugin `vox setup` installs.
+- **Oh My Pi:** through its installed native extension, without tmux or terminal input injection.
+  `--say` and `--file` use a one-shot private delivery checked against the current Drive grant and
+  exact native conversation before releasing content. `--interrupt` and `--stop` use OMP's abort
+  API. Generic slash, approval and question-answer controls are refused as unavailable rather
+  than pretending to operate a native prompt. A queued private request is not confirmed delivery.
 
 Driving does not launch a new harness or Session. Submitted input can start a turn in the existing
 Session. A slash command that would start a new session,

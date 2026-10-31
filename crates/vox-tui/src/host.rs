@@ -82,6 +82,8 @@ pub struct Router {
     inner: Arc<Inner>,
 }
 
+type SessionLifecycleLocks = BTreeMap<(NodeName, String), Weak<tokio::sync::Mutex<()>>>;
+
 struct Inner {
     /// Archive and live/control reservations span every node this daemon hosts.
     history_budget: Arc<vox_core::node::history_budget::Budget>,
@@ -122,6 +124,11 @@ struct Inner {
     sink: Arc<crate::session_sink::Sink>,
     /// Ordered admission and the bounded, explicitly volatile storage-failure tail.
     posting: tokio::sync::Mutex<SessionHolds>,
+    /// Serializes one Session's opening, registration, activity and lifecycle changes.
+    /// Weak entries do not retain inactive Sessions.
+    session_lifecycle: Mutex<SessionLifecycleLocks>,
+    /// Exact registrations whose native OMP shutdown is being committed.
+    omp_ending: Mutex<BTreeSet<(NodeName, String)>>,
     session_admissions: Arc<tokio::sync::Semaphore>,
     /// The Claude Code sessions whose transcript is read for a new name (ADR-029 MD-1).
     titles: Mutex<BTreeSet<(NodeName, String)>>,
@@ -135,6 +142,44 @@ struct Inner {
     codex: Arc<crate::codex_mirror::CodexMirror>,
     /// OpenCode sessions' activity, read through Vox's OpenCode plugin (ADR-029 #542).
     opencode: Arc<crate::opencode_mirror::OpenCodeMirror>,
+    /// OMP sessions' activity and controls through their native extension.
+    omp: Arc<crate::omp_mirror::OmpMirror>,
+}
+
+struct OmpEnding {
+    inner: Arc<Inner>,
+    key: (NodeName, String),
+}
+
+impl Drop for OmpEnding {
+    fn drop(&mut self) {
+        lock(&self.inner.omp_ending).remove(&self.key);
+    }
+}
+
+/// Authorization captured for one deferred OMP Drive message.
+#[derive(Clone)]
+pub(crate) struct OmpDriveGuard {
+    current: Arc<dyn Fn() -> bool + Send + Sync>,
+    views: tokio::sync::watch::Receiver<vox_core::node::api::NodeView>,
+}
+
+impl OmpDriveGuard {
+    pub(crate) fn allowed(&self) -> bool {
+        (self.current)()
+    }
+
+    pub(crate) async fn cancelled(&self) {
+        let mut views = self.views.clone();
+        loop {
+            if !self.allowed() {
+                return;
+            }
+            if views.changed().await.is_err() {
+                return;
+            }
+        }
+    }
 }
 
 struct MachineAnchors {
@@ -330,6 +375,32 @@ fn begin_detach(
 }
 
 impl Router {
+    fn session_lifecycle(&self, node: &NodeName, session: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut fences = lock(&self.inner.session_lifecycle);
+        fences.retain(|_, fence| fence.strong_count() != 0);
+        let key = (node.clone(), session.to_owned());
+        if let Some(fence) = fences.get(&key).and_then(Weak::upgrade) {
+            return fence;
+        }
+        let fence = Arc::new(tokio::sync::Mutex::new(()));
+        fences.insert(key, Arc::downgrade(&fence));
+        fence
+    }
+
+    fn current_omp_registration(&self, node: &NodeName, expected: &crate::wake::Session) -> bool {
+        self.inner
+            .account
+            .node_paths(node)
+            .ok()
+            .and_then(|paths| crate::wake::registration(&paths, &expected.session))
+            .is_some_and(|current| {
+                current.harness == "omp"
+                    && current.same(expected)
+                    && current.first_seen_ms == expected.first_seen_ms
+                    && current.mirror == expected.mirror
+            })
+    }
+
     /// A router for `account`'s nodes, on `rt`.
     #[must_use]
     pub fn new(account: Account, rt: Handle, defaults: Defaults) -> Self {
@@ -338,22 +409,45 @@ impl Router {
             .map(|bind| Arc::new(crate::daemon_proxy::DaemonProxy::new(bind)));
         let router = Self {
             inner: Arc::new_cyclic(|weak: &std::sync::Weak<Inner>| {
-                let (weak, weak_room, weak_rename, weak_attention) =
-                    (weak.clone(), weak.clone(), weak.clone(), weak.clone());
+                let (
+                    weak,
+                    weak_room,
+                    weak_rename,
+                    weak_attention,
+                    weak_omp_end,
+                    weak_omp_activity,
+                    weak_omp_rename,
+                ) = (
+                    weak.clone(),
+                    weak.clone(),
+                    weak.clone(),
+                    weak.clone(),
+                    weak.clone(),
+                    weak.clone(),
+                    weak.clone(),
+                );
                 let sink = crate::session_sink::Sink::new(
                     Arc::new(
                         move |node: NodeName,
                               session: String,
                               room: Digest32,
                               bodies: Vec<String>,
-                              effects: Option<crate::session_sink::SourceEffects>| {
+                              effects: Option<crate::session_sink::SourceEffects>,
+                              expected: Option<Arc<crate::wake::Session>>| {
                             let weak = weak.clone();
                             Box::pin(async move {
                                 match weak.upgrade() {
                                     Some(inner) => {
                                         let mut fresh = false;
                                         let admission = Router { inner }
-                                            .post_session(&node, &session, room, bodies, effects, &mut fresh)
+                                            .post_session(
+                                                &node,
+                                                &session,
+                                                room,
+                                                bodies,
+                                                effects,
+                                                (expected.as_deref(), &mut fresh),
+                                            )
                                             .await;
                                         crate::session_sink::Posted { admission, fresh }
                                     }
@@ -386,10 +480,55 @@ impl Router {
                 );
                 let codex = crate::codex_mirror::CodexMirror::new(Arc::clone(&sink));
                 let opencode = crate::opencode_mirror::OpenCodeMirror::new(Arc::clone(&sink));
+                let omp = crate::omp_mirror::OmpMirror::new(
+                    Arc::new(move |node, registration, name| {
+                        let weak = weak_omp_rename.clone();
+                        Box::pin(async move {
+                            if let Some(inner) = weak.upgrade() {
+                                (Router { inner })
+                                    .rename_omp_session(&node, &registration, &name)
+                                    .await;
+                            }
+                        })
+                    }),
+                    Arc::new(move |node, registration| {
+                        let weak = weak_omp_end.clone();
+                        Box::pin(async move {
+                            if let Some(inner) = weak.upgrade() {
+                                if let Err(error) = (Router { inner })
+                                    .omp_session_end(&node, &registration)
+                                    .await
+                                {
+                                    eprintln!("vox daemon: {node}: OMP session end was not confirmed: {error:?}");
+                                }
+                            }
+                        })
+                    }),
+                    Arc::new(move |node, registration, bodies| {
+                        let weak = weak_omp_activity.clone();
+                        Box::pin(async move {
+                            let Some(inner) = weak.upgrade() else {
+                                return;
+                            };
+                            let router = Router { inner };
+                            let lifecycle = router.session_lifecycle(&node, &registration.session);
+                            let _guard = lifecycle.lock().await;
+                            if !router.current_omp_registration(&node, &registration) {
+                                return;
+                            }
+                            router
+                                .inner
+                                .sink
+                                .omp_activity(&node, Arc::new(registration), bodies)
+                                .await;
+                        })
+                    }),
+                );
                 Inner {
                     history_budget: vox_core::node::history_budget::Budget::new(),
                     codex,
                     opencode,
+                    omp,
                     account,
                     rt,
                     manual_anchors: tokio::sync::Mutex::new(MachineAnchors {
@@ -416,6 +555,8 @@ impl Router {
                     starting: Mutex::new(BTreeSet::new()),
                     sink,
                     posting: tokio::sync::Mutex::default(),
+                    session_lifecycle: Mutex::default(),
+                    omp_ending: Mutex::default(),
                     session_admissions: Arc::new(tokio::sync::Semaphore::new(64)),
                     titles: Mutex::default(),
                     session_openings: Mutex::default(),
@@ -1351,6 +1492,8 @@ impl Router {
         // (#666): the hook, inside a model's turn, is answered at once with the node as attaching,
         // and the Session exists from this first turn.
         if let Some(info) = self.attaching(node) {
+            let lifecycle = self.session_lifecycle(node, &session.session);
+            let _lifecycle = lifecycle.lock().await;
             // The reply says attachment is pending, but registration itself must already
             // be saved. A busy registration lock is a refusal, not a queued success.
             let paths = self
@@ -1361,10 +1504,18 @@ impl Router {
                     node: node.clone(),
                     why: error.to_string(),
                 })?;
+            let ending = lock(&self.inner.omp_ending);
+            if ending.contains(&(node.clone(), session.session.clone())) {
+                return Err(Refusal::Failed {
+                    node: node.clone(),
+                    why: "the Session is ending; retry registration".into(),
+                });
+            }
             crate::wake::store_checked(&paths, &session).map_err(|why| Refusal::Failed {
                 node: node.clone(),
                 why: format!("session was not registered: {why}"),
             })?;
+            drop(ending);
             let router = self.clone();
             let queued = node.clone();
             let (id, asked) = (id.clone(), asked.clone());
@@ -1419,6 +1570,8 @@ impl Router {
         known: bool,
         join: Option<(String, Zeroizing<String>)>,
     ) -> Result<DaemonFrame, Refusal> {
+        let lifecycle = self.session_lifecycle(node, &id);
+        let _lifecycle = lifecycle.lock().await;
         let g = self
             .want(
                 node,
@@ -1528,6 +1681,7 @@ impl Router {
             cwd: reg.start.clone().filter(|cwd| !cwd.is_empty()),
         };
         let expected_room = room_b32.clone();
+        let expected_omp = (reg.harness == "omp").then(|| reg.clone());
         self.inner.rt.spawn(async move {
             let still_registered = || {
                 router
@@ -1540,6 +1694,12 @@ impl Router {
                         current.interactive
                             && current.harness != "unknown"
                             && current.room.as_deref() == Some(expected_room.as_str())
+                            && expected_omp.as_ref().is_none_or(|expected| {
+                                current.same(expected)
+                                    && current.first_seen_ms == expected.first_seen_ms
+                                    && current.name == expected.name
+                                    && current.mirror == expected.mirror
+                            })
                     })
             };
             while !*detached.borrow()
@@ -1563,6 +1723,15 @@ impl Router {
                     // projection work; an end or room move cancels this owner instead of
                     // reopening stale state. A readiness deadline bounds one attempt, not the
                     // durable obligation: the exact registration remains its retry source.
+                    let lifecycle = router.session_lifecycle(&key.0, &key.1);
+                    let guard = if expected_omp.is_some() {
+                        Some(lifecycle.lock().await)
+                    } else {
+                        None
+                    };
+                    if !still_registered() {
+                        break Ok(());
+                    }
                     let future =
                         vox_core::node::sessions::open_when_member(&handle, room, &opening);
                     tokio::pin!(future);
@@ -1577,6 +1746,7 @@ impl Router {
                             }
                         }
                     };
+                    drop(guard);
                     match attempt {
                         Err(why)
                             if vox_core::node::sessions::opening_refreshing(&why)
@@ -1593,6 +1763,18 @@ impl Router {
                 }
             };
             lock(&router.inner.session_openings).remove(&key);
+            if expected_omp.is_some() && !still_registered() && !*detached.borrow() {
+                if let Some(current) = router
+                    .inner
+                    .account
+                    .node_paths(&key.0)
+                    .ok()
+                    .and_then(|paths| crate::wake::registration(&paths, &key.1))
+                    .filter(|current| current.harness == "omp")
+                {
+                    router.open_registered(&key.0, &handle, detached.clone(), &current);
+                }
+            }
             match result {
                 Ok(()) => {
                     lock(&router.inner.session_open_failures).remove(&key);
@@ -1677,6 +1859,8 @@ impl Router {
             failed("its work is not running; try again when the node is Ready".into())
         })?;
         vox_core::node::link::b32_decode(room, "room").map_err(|e| failed(e.to_string()))?;
+        let lifecycle = self.session_lifecycle(node, session);
+        let _lifecycle = lifecycle.lock().await;
         let mut ingress = self.inner.posting.lock().await;
         let before = crate::wake::store_room(&paths, session, room)
             .ok_or_else(|| failed(format!("no session {session} is registered")))?;
@@ -1861,6 +2045,8 @@ impl Router {
             let Ok(paths) = self.inner.account.node_paths(&s.node) else {
                 continue;
             };
+            let lifecycle = self.session_lifecycle(&s.node, &s.session);
+            let _lifecycle = lifecycle.lock().await;
             if crate::wake::store_room(&paths, &s.session, &room_b32).is_none() {
                 continue;
             }
@@ -2230,6 +2416,63 @@ impl Router {
             );
         }
         let reg = current_reg;
+        let omp_guard = if reg.harness == "omp"
+            && matches!(&req.action, Action::Text { .. } | Action::File { .. })
+        {
+            let Some(instance) = current
+                .open_channels
+                .iter()
+                .find(|channel| {
+                    channel.channel_id == info.channel_id && channel.members.contains(&info.peer)
+                })
+                .map(|channel| channel.history_instance)
+            else {
+                return refuse("the driver or room is no longer present; nothing was sent".into());
+            };
+            let (router, node, handle, paths, reg) = (
+                self.clone(),
+                node.clone(),
+                handle.clone(),
+                paths.clone(),
+                reg.clone(),
+            );
+            let peer = info.peer;
+            let channel = info.channel_id;
+            Some(OmpDriveGuard {
+                views: handle.watch(),
+                current: Arc::new(move || {
+                    let same = {
+                        let slots = lock(&router.inner.slots);
+                        matches!(slots.get(&node), Some(Slot::Attached(attached))
+                            if attached.generation == generation
+                                && Arc::ptr_eq(attached.handle.app(), handle.app())
+                                && !*attached.detached.borrow())
+                    };
+                    let view = handle.view();
+                    same && !view.locked
+                        && !view.locking
+                        && me.is_some()
+                        && view.identity.as_ref().map(|identity| identity.fingerprint) == me
+                        && (me == Some(peer) || view.drive.contains(&peer))
+                        && view.open_channels.iter().any(|room| {
+                            room.channel_id == channel
+                                && room.history_instance == instance
+                                && room.members.contains(&peer)
+                        })
+                        && crate::wake::pause_registration(&paths, &reg.session)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|now| {
+                                now.same(&reg)
+                                    && now.first_seen_ms == reg.first_seen_ms
+                                    && now.mirror == reg.mirror
+                                    && now.interactive
+                            })
+                }),
+            })
+        } else {
+            None
+        };
         let outcome: Result<String, String> = match &req.action {
             Action::Approve { r#ref } => handed(sink.answer(
                 node,
@@ -2283,6 +2526,18 @@ impl Router {
                     _ => Ok(format!("accepted, pulling {size} bytes")),
                 }
             }
+            Action::Text { text } if reg.harness == "omp" => {
+                self.inner
+                    .omp
+                    .steer_guarded(
+                        node,
+                        &reg,
+                        crate::codex_mirror::Steer::Text(text.clone()),
+                        None,
+                        omp_guard.clone(),
+                    )
+                    .await
+            }
             input => self.steer(node, &reg, input).await,
         };
         // Every drive's outcome, beside it (DR-6): what happened, or why it was not delivered.
@@ -2322,6 +2577,7 @@ impl Router {
                 router
                     .land_driven(
                         &node, &handle, &paths, &reg, &session, &by, &alias, driven, note,
+                        omp_guard,
                     )
                     .await;
             });
@@ -2358,6 +2614,7 @@ impl Router {
         alias: &str,
         driven: vox_core::node::pulls::Driven,
         note: Option<String>,
+        omp_guard: Option<OmpDriveGuard>,
     ) {
         let outcome: Result<String, String> = async {
             let path = vox_core::node::pulls::pull_driven(handle, paths, &driven)
@@ -2393,10 +2650,25 @@ impl Router {
                 Some(n) if !n.is_empty() => format!("{alias} sent you a file: {shown} — {n}"),
                 _ => format!("{alias} sent you a file: {shown}"),
             };
-            self.steer(node, reg, &crate::drive::Action::Text { text: line })
-                .await
-                .map(|_| format!("landed at {shown}, and the session was told"))
-                .map_err(|e| format!("landed at {shown}, but the session was not told: {e}"))
+            if reg.harness == "omp" {
+                self.inner
+                    .omp
+                    .steer_guarded(
+                        node,
+                        reg,
+                        crate::codex_mirror::Steer::Text(line),
+                        None,
+                        omp_guard,
+                    )
+                    .await
+                    .map(|said| format!("landed at {shown}; {said}"))
+                    .map_err(|e| format!("landed at {shown}, but the session was not told: {e}"))
+            } else {
+                self.steer(node, reg, &crate::drive::Action::Text { text: line })
+                    .await
+                    .map(|_| format!("landed at {shown}, and the session was told"))
+                    .map_err(|e| format!("landed at {shown}, but the session was not told: {e}"))
+            }
         }
         .await;
         let mut result = serde_json::json!({
@@ -2443,10 +2715,12 @@ impl Router {
             }
             _ => return Err("not an input for the session's terminal".into()),
         };
-        // Reserve before the harness can emit its prompt echo. A full echo window refuses the
-        // send, and an attempted send's unknown outcome retains the marker even on cancellation.
+        // OMP injects an agent-attributed message, not a terminal user prompt echo.
+        // Other harnesses reserve before they can echo the driver's text.
         let mut delivery = match &steer {
-            Steer::Text(t) => Some(self.inner.sink.reserve_delivery(node, &reg.session, t)?),
+            Steer::Text(t) if reg.harness != "omp" => {
+                Some(self.inner.sink.reserve_delivery(node, &reg.session, t)?)
+            }
             _ => None,
         };
         let done = match reg.harness.as_str() {
@@ -2471,6 +2745,15 @@ impl Router {
                 self.inner
                     .opencode
                     .steer_guarded(&reg.session, steer, guard)
+                    .await
+            }
+            "omp" => {
+                if let Some(reservation) = &mut delivery {
+                    reservation.attempting();
+                }
+                self.inner
+                    .omp
+                    .steer_guarded(node, reg, steer, guard, None)
                     .await
             }
             "claude" => {
@@ -2505,9 +2788,7 @@ impl Router {
         done
     }
 
-    /// Follow a registered session's activity where its harness offers it (ADR-029 SC-1): a
-    /// Codex session from its `CODEX_HOME`'s app-server, an OpenCode session through Vox's
-    /// plugin's socket. Claude Code's comes through its hooks.
+    /// Follow registered native activity; Claude Code's comes through its hooks.
     fn watch_harness(&self, node: &NodeName, s: &crate::wake::Session) {
         match s.harness.as_str() {
             "codex" if !s.codex_home.is_empty() => {
@@ -2520,7 +2801,54 @@ impl Router {
                     .opencode
                     .watch(node, &s.session, &s.mirror, &s.token);
             }
+            "omp" if !s.mirror.is_empty() => {
+                if let Ok(paths) = self.inner.account.node_paths(node) {
+                    if let Some(saved) = crate::wake::registration(&paths, &s.session) {
+                        if saved.harness == "omp"
+                            && saved.endpoint == s.endpoint
+                            && saved.mirror == s.mirror
+                            && saved.token == s.token
+                            && saved.attention == s.attention
+                        {
+                            self.inner.omp.watch(&paths, node, &saved);
+                        }
+                    }
+                }
+            }
+            "omp" => self.inner.omp.end(&s.session),
             _ => {}
+        }
+    }
+
+    /// A native name belongs only to the exact route that observed it.
+    async fn rename_omp_session(
+        &self,
+        node: &NodeName,
+        expected: &crate::wake::Session,
+        name: &str,
+    ) {
+        let lifecycle = self.session_lifecycle(node, &expected.session);
+        let _guard = lifecycle.lock().await;
+        if !self.current_omp_registration(node, expected) {
+            return;
+        }
+        let Ok(paths) = self.inner.account.node_paths(node) else {
+            return;
+        };
+        let Some(reg) = crate::wake::store_name(&paths, &expected.session, name) else {
+            return;
+        };
+        if !self.current_omp_registration(node, expected) {
+            return;
+        }
+        let attached = match lock(&self.inner.slots).get(node) {
+            Some(Slot::Attached(a)) if !*a.detached.borrow() => {
+                Some((a.handle.clone(), a.detached.subscribe()))
+            }
+            _ => None,
+        };
+        if let Some((handle, detached)) = attached {
+            self.open_registered(node, &handle, detached, &reg);
         }
     }
 
@@ -2727,8 +3055,9 @@ impl Router {
         room: Digest32,
         bodies: Vec<String>,
         effects: Option<crate::session_sink::SourceEffects>,
-        fresh: &mut bool,
+        fence: (Option<&crate::wake::Session>, &mut bool),
     ) -> vox_core::node::daemonipc::SessionAdmission {
+        let (expected, fresh) = fence;
         use vox_core::node::{
             daemonipc::SessionAdmission,
             session_ingress::{MAX_BATCH_BYTES, MAX_BATCH_ITEMS},
@@ -2752,6 +3081,11 @@ impl Router {
             );
         };
         let mut held = self.inner.posting.lock().await;
+        if expected.is_some_and(|registration| !self.current_omp_registration(node, registration)) {
+            return SessionAdmission::Refused(
+                "the OMP registration changed; this batch was not retained".into(),
+            );
+        }
         if let Some(why) = held.blocked_nodes.get(node) {
             return SessionAdmission::Refused(why.clone());
         }
@@ -2782,6 +3116,15 @@ impl Router {
             if let Some((saved_room, effects)) = committed {
                 let resolutions = self.inner.sink.committed_source(node, session, effects);
                 save_source_resolutions(&handle, &mut held, &key, saved_room, resolutions).await;
+            }
+            // A retained tail may have taken time to save. Never admit the new follower's
+            // batch if its exact route changed during that wait.
+            if expected
+                .is_some_and(|registration| !self.current_omp_registration(node, registration))
+            {
+                return SessionAdmission::Refused(
+                    "the OMP registration changed; this batch was not retained".into(),
+                );
             }
             if let Some(session_hold) = held.sessions.get(&key) {
                 let would_overflow = session_hold.bytes
@@ -2952,6 +3295,83 @@ impl Router {
         });
     }
 
+    /// End only the exact OMP registration which emitted a native shutdown event.
+    async fn omp_session_end(
+        &self,
+        node: &NodeName,
+        expected: &crate::wake::Session,
+    ) -> Result<(), Refusal> {
+        let lifecycle = self.session_lifecycle(node, &expected.session);
+        let _lifecycle = lifecycle.lock().await;
+        let mut ingress = self.inner.posting.lock().await;
+        let handle = self.handle_of(node);
+        let paths = self
+            .inner
+            .account
+            .node_paths(node)
+            .map_err(|error| Refusal::Failed {
+                node: node.clone(),
+                why: error.to_string(),
+            })?;
+        let failed = |why| Refusal::Failed {
+            node: node.clone(),
+            why: format!("OMP session end was not confirmed: {why}"),
+        };
+        let going = {
+            let mut slots = lock(&self.inner.slots);
+            let mut ending = lock(&self.inner.omp_ending);
+            if !crate::wake::end_omp_checked(&paths, expected).map_err(failed)? {
+                return Ok(());
+            }
+            ending.insert((node.clone(), expected.session.clone()));
+            drop(ending);
+            self.inner.omp.end(&expected.session);
+            match slots.get_mut(node) {
+                Some(Slot::Attached(attached)) => {
+                    attached.sessions.remove(&expected.session);
+                    if attached.implicit && attached.holders == 0 && attached.sessions.is_empty() {
+                        begin_detach(&mut slots, node, &self.inner.defaults.computer)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        };
+        let _ending = OmpEnding {
+            inner: Arc::clone(&self.inner),
+            key: (node.clone(), expected.session.clone()),
+        };
+        // With the registration removed under the lifecycle fence, Sink cannot post into a
+        // replacement Session while it retires this one's in-memory correlation state.
+        self.inner.sink.session_end(node, &expected.session).await;
+        if let (Some(handle), Some(room)) = (
+            handle,
+            expected
+                .room
+                .as_deref()
+                .and_then(|room| vox_core::node::link::b32_decode(room, "room").ok()),
+        ) {
+            enqueue_session_end(
+                &handle,
+                &mut ingress,
+                node,
+                room,
+                &expected.session,
+                "shutdown",
+            )
+            .await;
+        }
+        drop(ingress);
+        drop(_ending);
+        if let Some((attached, done)) = going {
+            let _ = self
+                .finish_detach(node.clone(), attached, done, DetachCause::LastHolder)
+                .await;
+        }
+        Ok(())
+    }
+
     /// Unregister an agent session of `node`, and detach the node if it was attached implicitly
     /// and that session was its last holder, **in one decision** (L-3): the unregister and the
     /// move to `Detaching` happen in one critical section, so a session registering at the same
@@ -2972,6 +3392,8 @@ impl Router {
         if vox_core::node::sessions::keeps_open(reason) {
             return Ok((true, false));
         }
+        let lifecycle = self.session_lifecycle(node, session);
+        let _lifecycle = lifecycle.lock().await;
         // Whatever it was asking, nobody can answer now.
         self.inner.sink.session_end(node, session).await;
         // Serialize against admissions/removal. Capture the room before removing the saved
@@ -3019,6 +3441,7 @@ impl Router {
         let (was, going) = going;
         self.inner.codex.end(session);
         self.inner.opencode.end(session);
+        self.inner.omp.end(session);
         if let (Some(handle), Some(room)) = (handle, room) {
             enqueue_session_end(&handle, &mut ingress, node, room, session, reason).await;
         }
@@ -3497,10 +3920,18 @@ impl Router {
                 })
             }
             Want::Session(s) => {
+                let ending = lock(&self.inner.omp_ending);
+                if ending.contains(&(node.clone(), s.session.clone())) {
+                    return Err(Refusal::Failed {
+                        node: node.clone(),
+                        why: "the Session is ending; retry registration".into(),
+                    });
+                }
                 crate::wake::store_checked(&a.paths, &s).map_err(|why| Refusal::Failed {
                     node: node.clone(),
                     why: format!("session was not registered: {why}"),
                 })?;
+                drop(ending);
                 self.watch_harness(node, &s);
                 a.sessions.insert(s.session.clone());
                 None

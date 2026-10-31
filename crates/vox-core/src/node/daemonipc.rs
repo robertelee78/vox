@@ -770,6 +770,7 @@ pub fn harness_words(harness: &str) -> &str {
         "claude" => "Claude Code",
         "codex" => "Codex",
         "opencode" => "OpenCode",
+        "omp" => "Oh My Pi",
         other => other,
     }
 }

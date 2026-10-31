@@ -14,7 +14,7 @@ struct AgentSetupRequest: Codable, Equatable, Identifiable {
     let explicit: Bool
     var id: String { "\(harness)-\(request)" }
     var name: String {
-        switch harness { case "claude": "Claude Code"; case "codex": "Codex"; default: "OpenCode" }
+        switch harness { case "claude": "Claude Code"; case "codex": "Codex"; case "opencode": "OpenCode"; case "omp": "Oh My Pi"; default: harness }
     }
     enum CodingKeys: String, CodingKey {
         case harness, dir, node, sessions, explicit
@@ -40,7 +40,7 @@ enum AgentSetupStore {
     }
 
     static func requests() -> [AgentSetupRequest] {
-        ["claude", "codex", "opencode"].compactMap { harness in
+        ["claude", "codex", "opencode", "omp"].compactMap { harness in
             guard let at = try? file(harness, ".json"), let bytes = try? Data(contentsOf: at),
                   bytes.count <= 16 * 1024,
                   let request = try? JSONDecoder().decode(AgentSetupRequest.self, from: bytes),

@@ -34,6 +34,7 @@ pub(crate) fn key(harness: &str) -> Option<&'static str> {
         "claude" | "claude-code" => Some("claude"),
         "codex" => Some("codex"),
         "opencode" => Some("opencode"),
+        "omp" => Some("omp"),
         _ => None,
     }
 }

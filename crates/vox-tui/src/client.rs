@@ -1121,7 +1121,7 @@ pub async fn node_rename(args: &NodeArgs, old: &str, new: &str) -> Result<(), Ap
         };
         if wiring.wired_node().as_deref() == Some(old.as_str()) {
             if let Err(e) = wiring.rename_node(&new) {
-                let line = if h.key == "opencode" {
+                let line = if matches!(h.key, "opencode" | "omp") {
                     format!("const VOX_NODE = \"{new}\"")
                 } else {
                     format!(

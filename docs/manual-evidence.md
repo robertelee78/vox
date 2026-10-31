@@ -4,6 +4,33 @@ Updated: 2026-10-15 for the v0.4.5 source/documentation pass. Prior walkthrough 
 remain historical evidence at their stated revisions. Scope: ADR-027 M27.1 / work item #421. This is maintainer evidence, not a chapter in the public navigation manifest. Source
 inspection is not an execution test.
 
+## v0.4.11 Oh My Pi native integration candidate (#1091)
+
+Real unmodified OMP v18.14.0 ran with the installed Vox native extension, an authenticated
+model and scratch Vox data/config and OMP profile directories. Ordinary room context and
+addressed urgent messages reached the actual conversation, idle and across a real skill-read
+tool round, under Read-only authority without tmux or terminal message injection. Private input
+was refused after Drive withdrawal; an explicit Drive grant enabled private text and file
+delivery while ordinary room attention was paused. The fresh private token survived the skill
+tool call, and the attached file was read only from its Vox-verified delivered path after native
+resume. A new conversation reported no inherited private Drive input. An inactive target was
+refused rather than creating or reopening a conversation.
+
+Fresh private input after native resume exposed duplicate-opening selection: the exact native
+Session ID was counted twice. The shared resolver now uses the existing newest-opening lookup,
+as addressed room messages already did. With a rebuilt normal release CLI, the previously
+refused fresh token reached the resumed OMP conversation, and the authorized peer read its
+actual private activity and reply through the same exact ID.
+
+Receipts and native surfaces are under `/private/tmp/vox1007-practical-42qu344_/v0411-1091-*`
+and `/private/tmp/vox1091-native-48863r3r/`. Earlier product failures in generated-extension
+refresh and multi-tool context retention were corrected and exercised with fresh native
+Sessions; initial file-read refusal was an operator-prompt restriction, not lost delivery.
+These are local candidate observations, not a published release or proof of model understanding,
+all providers, crash durability, revocation during an in-flight file pull or every native
+navigation/cancellation interleaving. OMP source was not changed. No new CI gate was added.
+
+
 ## v0.4.11 room-reopen failure candidate (#629)
 
 The candidate retains the daemon's automatic-reopen refusal in closed room summaries and
