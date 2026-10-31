@@ -4,6 +4,37 @@ Updated: 2026-10-15 for the v0.4.5 source/documentation pass. Prior walkthrough 
 remain historical evidence at their stated revisions. Scope: ADR-027 M27.1 / work item #421. This is maintainer evidence, not a chapter in the public navigation manifest. Source
 inspection is not an execution test.
 
+## v0.4.13 target-version updater ownership candidate (#1090)
+
+The operator corrected M-29b's architecture: the installed binary is to download and verify
+the target updater, then transfer control before installed-state or app/daemon changes.
+Post-install plugin delegation is removed, not extended.
+
+Source `36d9f9c8b38062336ad2b9f98458e0fed5072dba` was compiled as actual bootstrap-capable
+0.4.12 and target 0.4.13 fixtures. The 0.4.12 fixture is not the untouched published 0.4.12:
+that older binary does not call the new pre-publication entrypoint. In a fresh scratch macOS
+guest, a temporary target `update-apply` process held the installation lock while the app
+still reported 0.4.12. It then installed 0.4.13, restarted the daemon, restored the node Ready,
+relaunched the exact app with its original data/config/HOME despite a different updater
+profile, and preserved the exact saved room message.
+
+A real immutable older-backup directory produced a truthful cleanup refusal after handoff.
+After that obstruction was removed, a frozen pre-fix binary left retained work pending when
+the next updater asset returned 404; corrected code repaired it without repeating completed
+handoff, while still returning failure for the unavailable upgrade. Clean upgrade, local
+rollback and closed-app version changes passed. The unrelated running app kept its exact
+launch identity. A separate owned standalone install checked without upgrading, then installed
+the target and restored Ready with exactly one engine-asset download.
+
+The first runtime attempt exposed a real creation-mode defect: tempfile directories defaulted
+to 0755 under umask 0022, but the target required 0700. Creation now explicitly requests 0700;
+the consumer's strict guard was not weakened. Source review alone missed that defect.
+
+These are source-bound controlled ad-hoc/loopback observations, not public Developer ID or
+notarization acceptance. Linux non-UTF-8 paths are corrected by source inspection; Darwin
+rejected that filename staging, so no Linux runtime claim is made. Receipts are under
+`/private/tmp/vox1007-practical-42qu344_/v0413-owner-*`. No unit tests or CI gates were added.
+
 ## v0.4.12 updater correction candidate (#1090)
 
 The [full updater RCA](updater-rca-2026-10-30.md) separates the unknown original OS refusal
