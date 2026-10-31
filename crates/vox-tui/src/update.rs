@@ -923,7 +923,10 @@ pub fn run(check_only: bool, rollback: bool) -> Result<u8, AppError> {
     };
     let target = target_triple();
     if target == "unsupported" {
-        return Err(usage("this platform has no vox release"));
+        return Err(usage(
+            "this platform has no vox release (releases are built for x86_64 Linux and for Apple \
+             Silicon Macs on macOS 13 or later)",
+        ));
     }
     if cfg!(target_os = "macos") && matches!(installed, Channel::Standalone { .. }) {
         println!(
@@ -987,13 +990,15 @@ pub fn run(check_only: bool, rollback: bool) -> Result<u8, AppError> {
         Channel::Standalone { install_dir, .. } if exe == install_dir.join(ACTIVE_NAME) => {}
         Channel::Bundle { .. } => {}
         _ => {
+            let _ = owned(installed, "`vox update` will not replace it")?;
             return Err(usage(
-                "`vox update` will not replace an unowned installation",
-            ))
+                "the install marker does not identify the active vox binary",
+            ));
         }
     }
     let dir = tempfile::Builder::new()
         .prefix("vox-update.")
+        .permissions(fs::Permissions::from_mode(0o700))
         .tempdir()
         .map_err(AppError::Io)?;
     let candidate = dir.path().join("vox");
