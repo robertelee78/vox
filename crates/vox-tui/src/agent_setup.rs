@@ -178,7 +178,7 @@ async fn in_bound_room(
                 .map(|rooms| {
                     rooms
                         .iter()
-                        .any(|(id, _, _, over, _, _)| Some(*id) == room && over.is_empty())
+                        .any(|(id, _, _, over, ..)| Some(*id) == room && over.is_empty())
                 })
                 .map_err(|e| e.to_string()),
             Err(e) => Err(e.to_string()),
