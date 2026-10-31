@@ -26,19 +26,48 @@ Linux and its standalone publication mechanism remain unchanged. No plist mutati
 
 Retain the bootstrap already shipped in v0.4.13: select a newer release once; download the selected standalone engine into owner-private storage; enforce its size, digest, canonical version and platform trust; close writable handles; explicitly invoke its bounded internal update entrypoint; retain temporary storage and propagate the final child exit status. Preserve Unix pathname bytes. The old caller must not publish, restart components, run plugin completion hooks or reinterpret child success afterward.
 
+### Installer caller cutover
+
+`install.sh` is currently another writer of the updater's journal and `.previous` directories.
+Its legacy shell recovery can delete a new-format journal; it must not remain after this cutover.
+For an existing owned `Vox.app`, the installer must invoke the already verified downloaded target
+helper through the existing bounded `update-apply` request before shell-side installation mutation.
+The request adds an optional raw-byte archive pathname; ordinary installed bootstrap requests omit
+it. The engine, request and downloaded archive must share the owner-private request directory.
+The engine must revalidate the selected pinned app record, archive size/digest and complete app/helper
+trust before using it, without downloading another copy. Hold the authenticated regular-file
+descriptor through extraction, or copy/hash into engine-private storage if necessary to prevent
+path replacement. Do not silently ignore this field for standalone or unsupported-platform requests.
+The shell waits and propagates the engine's result; it must not recover, remove, rename or reinterpret
+the updater journal, retained archives or displaced bundles.
+
+This preserves update semantics: a same/newer healthy installed version performs only needed
+local repair/integration, not an implicit downgrade or forced replacement of a damaged installation.
+No new force-reinstall or general prior-install migration feature is included. An older selected
+engine that cannot understand this protocol must be refused without modifying the installation.
+For a first installation with no active app, the shell may create the initial bundle atomically
+under the existing install lock; it must recheck that no app or recovery authority appeared, touch
+only its own current staging, and never delete an updater journal or unknown leftover to proceed.
+Linux installation remains unchanged. Exercise both fresh install and an owned install with a
+new-format pending journal through the real installer; the latter must reach the same recovery owner
+and preserve the exact saved message, app/profile and Ready node.
+
 ### Target engine
 
 The verified target `vox` owns the existing installation lock continuously across revalidation, recovery, snapshot preparation, publication, restoration, handoff and final reporting. It downloads the app from the selected release tag, requires matching app/helper versions and the helper digest from the selected standalone record, and keeps existing Developer ID/notarization validation. No second engine download, latest-release reselection or old-engine fallback after transfer.
 
 `crates/vox-tui/src/update/bundle.rs` remains the transaction owner. Introduce only the archive/journal state needed for this cutover. Reuse existing process-start identity, app/profile capture, daemon startup intent, component receipts and ownership checks. Do not build a parallel installer service or general transaction framework.
 
-Add a small macOS-only Objective-C filesystem bridge compiled into the verified Rust engine through `crates/vox-tui/build.rs`; it is not another executable or service. Its two operations are `NSFileManager`'s `URLForDirectory:inDomain:appropriateForURL:create:error:` with `NSItemReplacementDirectory`, and `removeItemAtURL:error:` for an exact journal-owned bundle. The former must return a private same-volume path; the latter must preserve the native operation/path/error. Pass filesystem byte paths and caller-owned bounded result/error buffers across FFI; expose no lock, trust, journal or handoff decisions. Use SDK declarations, a pinned existing `cc` build dependency and Foundation linkage only on macOS. Retain the existing `rustix` atomic exchange; refuse unsupported exchange before installed mutation instead of adding a two-rename fallback.
+Add a small macOS-only Objective-C filesystem bridge compiled into the verified Rust engine through the existing `vox-sockdrops` narrow-OS-call crate, preserving the repository's sole unsafe-code boundary and `vox-tui`'s `forbid(unsafe_code)`. Its two operations are `NSFileManager`'s `URLForDirectory:inDomain:appropriateForURL:create:error:` with `NSItemReplacementDirectory`, and `removeItemAtURL:error:` for an exact journal-owned bundle. The former must return a private same-volume path; the latter must preserve the native operation/path/error. Pass filesystem byte paths and caller-owned bounded result/error buffers across FFI; expose no lock, trust, journal or handoff decisions. Build/link cc 1.2.65 and Foundation only on macOS; no extra crate, executable or service. Replacement directories may disappear after process exit and must never hold the only durable recovery authority. Retain the existing `rustix` atomic exchange; refuse unsupported exchange before installed mutation rather than add a two-rename fallback.
 
-The independently reproduced daemon cleanup defect is also in scope: in
-`crates/vox-core/src/node/ipc.rs`, capture the created control socket's filesystem identity
-and unlink it on shutdown only if the pathname still identifies that socket. Do not change
-profile replacement/reset semantics or stop the operator's daemon. A real two-generation
-scratch journey must show the successor remains reachable after predecessor shutdown.
+The independently reproduced daemon cleanup defect is also in scope: remove shutdown's
+pathname unlink from `crates/vox-core/src/node/ipc.rs`. Even comparing an inode before unlink
+races replacement. The next owner already removes stale socket files at bind, so teardown need
+not modify the pathname at all. Stop requires the captured process gone and the endpoint
+unreachable, not absence of a stale socket file. Preserve profile/reset semantics; never stop
+the operator's daemon. The real two-generation scratch journey must show the successor still
+answers after predecessor shutdown. Capture daemon startup intent and process birth/executable
+identity together; journal the separate process identity without changing legacy intent encoding.
 
 ## 3. Rollback representation and trust
 
@@ -108,7 +137,7 @@ These are source-bound implementation tasks on the existing #1090 outcome, not d
 |3|Recover the reported current incomplete state: existing journal reader and recovery paths|A staged genuine v0.4.13 incomplete transition is completed without manual cleanup, silent data deletion or automatic downgrade after current-version use.|
 |4|Concise truthful CLI/app output: `update.rs`, existing shell/skill/plugin result interfaces and native Update action as affected|One final authoritative result; precise scoped errors; no unchanged bookkeeping or premature success advice. No unrelated shell/plugin redesign.|
 |5|Ownership-fenced daemon endpoint cleanup: `crates/vox-core/src/node/ipc.rs`|A predecessor's normal shutdown leaves its successor's replacement socket reachable; unrelated profile/reset behavior is unchanged.|
-|6|Migrate affected real-binary proof consumers and operator documentation|Extend existing update journeys for archive rollback/retirement and automatic restoration. Delete obsolete plist-mutation, fake-version and wording-only assertions; no new harness or unit/in-process tests.|
+|6|Migrate affected real-binary proof consumers, `install.sh` and operator documentation|Existing owned-installer calls reach the same verified engine and reuse the downloaded archive; the shell never deletes updater authority. Fresh install stays create-only. Extend existing update/installer journeys, remove obsolete plist/fake-version/wording assertions; no new harness or unit/in-process test.|
 |7|Signed candidate artifacts: existing `release.yml` manual-dispatch mode and signing/assembly scripts|Unmerged exact-source normal candidate and separately labelled two-version source fixtures are signed/notarized without publishing; normal release gating and credential boundaries remain unchanged.|
 |8|Run signed scratch journeys and discriminating inverses; obtain Anthropic Opus result review through OMP|Final immutable source and complete observed evidence accepted independently. A plan verdict, CI green or prior release does not substitute.|
 
@@ -130,10 +159,11 @@ Every started Vox process sets both scratch data and config roots. Native work u
 |Output and integration|Observe real changed/unchanged integration runs and a real scoped failure. Assert the actual final outcome and exit status; no wording inventory or internal forwarding test.|
 |Predecessor shutdown|Start real scratch daemon generations on replacement socket inodes; stop only the predecessor normally and show the successor still answers the installed CLI with its same node/profile. This is the previously reproduced product defect, not an internal inode-value assertion.|
 |Unchanged Linux/standalone/check boundary|Only run callers whose changed code is reached. Check remains read-only; Linux standalone behavior and lossless Unix paths are preserved. Do not duplicate its already-green unrelated journeys.|
+|Installer entrypoints|A fresh scratch installation yields the real matching CLI/app. Invoking the installer on an owned scratch app with a current-format incomplete transition reaches the engine's recovery without shell deletion, manual cleanup or saved-data loss; no duplicate app download. A concurrent/unowned/ambiguous installation is preserved and refused.|
 
 Build/signing uses the existing `.github/workflows/release.yml` and `scripts/sign_notarize_release.sh` / `sign_notarize_app.sh`, not local credentials or a new release. The existing dispatch currently requires exact-main CI and its publish job assumes a tag, so it cannot produce an unmerged reviewed candidate unchanged. Add an explicit **candidate-only manual dispatch mode** to that already registered workflow. Restrict it to the exact repository, repository-owner actor, a branch ref and an explicitly supplied immutable SHA matching the checkout; fail these checks before credentialed steps. It must reuse `apple-release`, expose only read permissions, upload named candidate artifacts and receipts, and skip Linux packaging and the entire publish job. The normal tag/main-CI release path must remain unchanged. Read-only environment metadata confirmed `apple-release` exists but has no required-reviewer or branch restrictions; do not describe nonexistent approval protections or modify its policy.
 
-Candidate mode must produce a normal-feature candidate and separately labelled non-shipping test-knob fixtures from actual source: prior v0.4.13 at its immutable tag commit and the reviewed newer candidate source/version. Use separate build directories and existing signing/notarization/assembly scripts. Test-knob artifacts must not enter `package-release.sh` or release uploads; its refusal remains enforced. Do not rewrite signed helpers, fabricate versions or use stand-in notarization receipts. Both source-fixture versions must be genuinely compiled and signed/notarized; retain their feature selection and exact hashes. This manual artifact-production mode is not a new CI proof or release gate. Its first credentialed dispatch is itself a prerequisite to the signed journeys, and a failed dispatch/signing/notarization is APPARATUS, not a product green.
+Candidate mode must produce a normal-feature candidate and separately labelled non-shipping test-knob fixtures from the **same reviewed current implementation**, genuinely compiled at versions 0.4.13 and 0.4.14. The lower-version fixture has only an explicit workspace-version/derived-lockfile build delta; include its patch, digests, base SHA and compiled version in the receipt. It is not the public v0.4.13 artifact. Use separate source/build directories and existing signers; never rewrite a signed helper, fabricate a version-printing script or use stand-in notarization receipts. Knob artifacts must not enter release packaging/uploads. The immutable public v0.4.13 commit remains a separate reference for the untouched-public first-hop journey. Its old runtime cannot retroactively read the new archive format after a rollback; repeat offline rollback is proved between corrected-implementation versions, not falsely attributed to that old runtime. This is a current-version contract, not an old-release compatibility retrofit. Existing signed interruption fixtures may use existing test knobs with explicit provenance; they do not establish normal-feature public delivery. The first credentialed candidate dispatch is a prerequisite, and signing/dispatch failures are APPARATUS, not a product green.
 
 
 Retain exact source commits, actual compiled versions, feature selection, artifact digests, signing/notarization receipts, commands, exits, complete relevant output and whitelisted profile/process observations. A controlled-origin signed source fixture establishes its exercised filesystem/authorization behavior, not public-origin delivery. The untouched signed public-prior → normal signed candidate upgrade remains a separate delivery claim, after implementation acceptance and explicit release authorization.
