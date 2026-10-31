@@ -1,6 +1,6 @@
 # Install and update
 
-Applies to Vox v0.4.5.
+Applies to Vox v0.4.11.
 
 Vox runs on Linux on x86_64, and on Macs with Apple Silicon and macOS 13 or later. On a Mac it
 comes as `Vox.app`, with `vox` inside it.
