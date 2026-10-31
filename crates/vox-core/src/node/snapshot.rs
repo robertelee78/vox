@@ -32,6 +32,8 @@ pub struct RoomSnap {
     pub open: bool,
     /// Saved room history is still preparing locally.
     pub preparing: bool,
+    /// The daemon's failed automatic reopen reason, absent while open or preparing.
+    pub open_failure: Option<String>,
 }
 
 /// An open room's detail, without its timeline.
@@ -126,6 +128,7 @@ impl NodeSnapshot {
                     name: c.name.clone(),
                     open: c.open,
                     preparing: c.preparing,
+                    open_failure: c.open_failure.clone(),
                 })
                 .collect(),
             open: nv
@@ -182,12 +185,13 @@ impl NodeSnapshot {
         e.uint(u64::from(self.mlock_active));
         e.array(self.rooms.len());
         for r in &self.rooms {
-            e.array(5)
+            e.array(6)
                 .bytes(&r.channel_id)
                 .uint(u64::from(r.name.is_some()))
                 .text(r.name.as_deref().unwrap_or_default())
                 .uint(u64::from(r.open))
-                .uint(u64::from(r.preparing));
+                .uint(u64::from(r.preparing))
+                .text(r.open_failure.as_deref().unwrap_or(""));
         }
         e.array(self.open.len());
         for o in &self.open {
@@ -284,13 +288,15 @@ impl NodeSnapshot {
         let mlock_active = d.uint().map_err(bad("ipc snapshot mlock"))? != 0;
         let mut rooms = Vec::new();
         for _ in 0..d.array().map_err(bad("ipc snapshot rooms"))? {
-            want(&mut d, 5, "ipc snapshot room")?;
+            want(&mut d, 6, "ipc snapshot room")?;
             let channel_id = digest(&mut d)?;
             let named = d.uint().map_err(bad("ipc snapshot room named"))? != 0;
             let name = d.text().map_err(bad("ipc snapshot room name"))?.to_owned();
             let open = d.uint().map_err(bad("ipc snapshot room open"))? != 0;
             let preparing = d.uint().map_err(bad("ipc snapshot room preparing"))? != 0;
-            if open && preparing {
+            let failure = d.text().map_err(bad("ipc snapshot room open failure"))?;
+            let open_failure = (!failure.is_empty()).then(|| failure.to_owned());
+            if open && preparing || open_failure.is_some() && (open || preparing) {
                 return Err(Error::MalformedIpc("ipc snapshot room availability"));
             }
             rooms.push(RoomSnap {
@@ -298,6 +304,7 @@ impl NodeSnapshot {
                 name: named.then_some(name),
                 open,
                 preparing,
+                open_failure,
             });
         }
         let mut open = Vec::new();

@@ -218,6 +218,8 @@ pub struct ChannelSummary {
     pub open: bool,
     /// Saved room history is preparing locally.
     pub preparing: bool,
+    /// The daemon's reason a saved room could not reopen.
+    pub open_failure: Option<String>,
     /// The channelID (`SHA-256(genesis)`).
     pub channel_id: Digest32,
     /// The room's shared name (ADR-028 R-1), or its short id while it has none or is closed.

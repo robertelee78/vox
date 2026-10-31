@@ -68,7 +68,15 @@ struct MainWindow: View {
                 switch model.selection {
                 case let .room(id):
                     // One view per room: its draft, To:, urgent and attachment do not carry over.
-                    if model.rooms.first(where: { $0.id == id })?.preparing == true {
+                    if let failure = model.rooms.first(where: { $0.id == id })?.openFailure {
+                        VStack(spacing: Space.s12) {
+                            Text(model.roomName(id)).title()
+                            StateMark(kind: .danger, words: failure)
+                                .accessibilityIdentifier("room-open-failure")
+                        }
+                        .padding(Space.s12)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    } else if model.rooms.first(where: { $0.id == id })?.preparing == true {
                         VStack(spacing: Space.s12) {
                             ProgressView()
                             Text("Preparing room history").title()

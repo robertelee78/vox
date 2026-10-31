@@ -53,6 +53,8 @@ final class NodeModel: ObservableObject {
         let name: String
         let open: Bool
         let preparing: Bool
+        /// The daemon's reason an automatic reopen failed, if any.
+        var openFailure: String? = nil
         /// While preparing, what the room waits for, in the daemon's words; empty when it has not said.
         var preparingFor: String = ""
         /// Unread messages addressed to this node; of them, urgent.
@@ -1144,7 +1146,7 @@ final class NodeModel: ObservableObject {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 3_000_000_000)
                 guard let self else { return }
-                if self.rooms.contains(where: { $0.preparing }) {
+                if self.rooms.contains(where: { $0.preparing || $0.openFailure != nil }) {
                     _ = await self.refresh()
                 } else {
                     await self.readFacts()
@@ -1260,7 +1262,8 @@ final class NodeModel: ObservableObject {
 
     private func readNewOnScreen() async {
         guard case let .room(id) = selection, ended == nil, !showingSession, !roomReloadNeeded,
-              rooms.first(where: { $0.id == id })?.preparing != true else { return }
+              let room = rooms.first(where: { $0.id == id }),
+              !room.preparing, room.openFailure == nil else { return }
         let generation = roomReadGeneration, epoch = nodeObservationEpoch
         let view = selectedRoomView, displayed = showing, viewGeneration = roomViewGeneration
         let revision = roomMessageRevision, follows = timelineFollowingNewest
@@ -1741,11 +1744,14 @@ final class NodeModel: ObservableObject {
         do {
             let fresh = try await client.rooms()
             guard epoch == nodeObservationEpoch, !Task.isCancelled else { return false }
-            let preparedOnScreen = fresh.first { r in
-                selection == .room(r.id) && r.open && rooms.first(where: { $0.id == r.id })?.preparing == true
+            let openedOnScreen = fresh.first { r in
+                selection == .room(r.id) && r.open && rooms.contains {
+                    $0.id == r.id && ($0.preparing || $0.openFailure != nil)
+                }
             }?.id
             let now = fresh.map { r in
                 var room = Room(id: r.id, name: name(of: r), open: r.open, preparing: r.preparing)
+                room.openFailure = r.open ? nil : r.openFailure
                 room.preparingFor = r.waiting
                 if let held = rooms.first(where: { $0.id == r.id }) {
                     room.addressed = held.addressed
@@ -1772,7 +1778,7 @@ final class NodeModel: ObservableObject {
             let back = await readTrustsBack()
             guard epoch == nodeObservationEpoch, !Task.isCancelled else { return false }
             if back != trustsBack { trustsBack = back }
-            if let id = preparedOnScreen, selection == .room(id) { await show(.room(id)) }
+            if let id = openedOnScreen, selection == .room(id) { await show(.room(id)) }
             return true
         } catch {
             guard epoch == nodeObservationEpoch, !Task.isCancelled else { return false }
@@ -1928,6 +1934,11 @@ final class NodeModel: ObservableObject {
         }
         guard case let .room(id) = selection,
               ended == nil || whileRecovering && observationNeedsRestart else { return false }
+        guard rooms.first(where: { $0.id == id })?.openFailure == nil else {
+            // A terminal refusal is an authoritative room state, not a failed node recovery.
+            if whileRecovering { ended = nil }
+            return true
+        }
         guard rooms.first(where: { $0.id == id })?.preparing != true else {
             // Preparing has no authoritative page or roster yet. Keep reconnect's unavailable
             // state and its action boundary until this room can publish both.
