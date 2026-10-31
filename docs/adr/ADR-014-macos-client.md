@@ -3,7 +3,9 @@
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC 2119] [RFC 8174] when, and only when, they appear in all capitals, as shown here.
 
 **Status**: Accepted for v0.4.0 (the decider, 2026-10-05); M-15, M-20 and M-21 amended to remove
-the lanes view (the decider, 2026-10-06); M-29b added for v0.4.11 (the decider, 2026-10-30).
+the lanes view (the decider, 2026-10-06); M-29b added for v0.4.11 (the decider, 2026-10-30)
+and amended for target-version updater ownership and separate plan/result review
+(the decider, 2026-10-31).
 Nothing in this ADR is built unless a requirement says so.
 **Date**: 2026-10-05
 **Deciders**: Robert E. Lee
@@ -185,7 +187,7 @@ F-9–F-11; RR-1, RR-3, RR-4 (RR-2 is the daemon's); D-3; L-1–L-10; W-1–W-6;
   vox`, so the CLI, the daemon and the app are one binary of one version.
 - **M-29.** `vox update`, and the app's own "Update Vox" offer, MUST replace the whole bundle
   atomically (download beside it, verify, rename into place, keep the previous bundle for
-  `--rollback`), and MUST then ask the person to restart the app and the daemon (ADR-028 I-3).
+  `--rollback`). Automatic CLI, app and daemon handoff follows M-29b (ADR-028 I-3).
   An install not made by `install.sh` MUST be refused, as today (ADR-015 17.10).
 - **M-29a.** The previous bundle kept for `--rollback` MUST NOT be launchable as Vox. On every
   path that sets a bundle aside (publish, retirement, recovery) the updater MUST keep it as no
@@ -204,8 +206,31 @@ F-9–F-11; RR-1, RR-3, RR-4 (RR-2 is the daemon's); D-3; L-1–L-10; W-1–W-6;
   Vox.app was running, the updater MUST hand it off to the newly installed app without requiring
   a manual quit, restart, kill or repair command. It MUST target only the app belonging to the
   installation being updated, MUST NOT launch an app that was not running, and MUST report an
-  unsuccessful handoff rather than claim completion. This supersedes M-29's instruction to ask
-  the person to restart; bundle verification, atomic replacement and rollback still apply.
+  unsuccessful handoff rather than claim completion. Bundle verification, atomic replacement
+  and rollback still apply.
+  For an upgrade to a newer release, the installed binary MUST find, download and verify that
+  release's updater, then explicitly transfer control to it in the same invocation, before
+  changing installed state or stopping the app or daemon. The verified target-version updater
+  MUST own the installation lock, recovery, publication, app/daemon handoff, cleanup and final
+  reporting. The bootstrap MUST only wait for and propagate its result after transfer; it
+  MUST NOT install first, finish the transaction afterward, or delegate through an unrelated
+  plugin/setup command. Acquiring the new logic MUST NOT require another invocation.
+  The selected release MUST remain pinned through engine and app downloads. The target MUST
+  compare against the actually installed version, not its own temporary executable's version,
+  and MUST preserve the captured app's installation, profile and startup intent. Completed
+  handoff components MUST NOT be repeated during repair; ambiguous recovery state MUST be
+  refused without discarding the record or data. A completed installation or local repair MUST
+  NOT be reported as a completed upgrade while required handoff or cleanup has failed.
+  `--check` MUST remain read-only, and rollback and retained local repair MUST remain available
+  without downloading a newer engine. If that download fails, completed local repair MUST be
+  distinguished from the failed upgrade. These boundaries also govern the shared updater's
+  standalone-install path; ADR-015's transport and platform-trust requirements remain in force.
+  The execution plan is [Target-owned updater](../design/updater-owner-plan.md). The ADR and
+  related tasks MUST be updated before independent plan review; execution MUST follow that
+  review, and the executed result MUST receive separate independent review before merge or
+  release. An existing candidate or its implementation review MUST NOT substitute for plan
+  approval. Verification MUST distinguish a bootstrap-capable two-version journey from the
+  first upgrade by an older public binary: new code cannot retroactively change that caller.
 
 
 ### 6. Proof
