@@ -4,6 +4,15 @@ on:
   push:
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      candidate_only:
+        description: Build non-publishing signed candidate artifacts
+        type: boolean
+        default: false
+      candidate_sha:
+        description: Full immutable SHA of the selected branch checkout (candidate mode only)
+        type: string
+        required: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -21,6 +30,7 @@ jobs:
   # that is on `main`. The tree proved is still the tree published: the same SHA.
   ci-passed:
     name: CI passed on this exact commit
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.candidate_only }}
     runs-on: ubuntu-latest
     # CI's slowest job has a 120-minute budget; a tag pushed straight after `main` waits for it.
     timeout-minutes: 150
@@ -64,6 +74,7 @@ jobs:
           exit 1
 
   build-linux-x64:
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.candidate_only }}
     needs: [ci-passed]
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -94,6 +105,7 @@ jobs:
   # the app at Contents/Helpers/vox, signs the app inside-out, notarizes and staples it, and
   # packages both. One job, so neither artifact can exist without the other.
   build-darwin-arm64:
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.candidate_only }}
     needs: [ci-passed]
     runs-on: macos-latest
     timeout-minutes: 120  # two notary submissions, each waited on
@@ -182,7 +194,101 @@ jobs:
           name: aarch64-apple-darwin
           path: dist/*
 
+  # This preflight has no environment or signing credentials. The branch workflow and its
+  # checkout must both be the exact explicitly selected source before apple-release is reached.
+  candidate-preflight:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_only }}
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Require owner, branch and exact reviewed source
+        env:
+          REPOSITORY: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          REF: ${{ github.ref }}
+          EVENT_SHA: ${{ github.sha }}
+          EXPECTED_SHA: ${{ inputs.candidate_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$REPOSITORY" == robertelee78/vox && "$ACTOR" == robertelee78 && \
+             "$TRIGGERING_ACTOR" == robertelee78 ]] || {
+            echo "::error::candidate requires the repository owner in robertelee78/vox"; exit 1; }
+          [[ "$REF" == refs/heads/* && "$REF" != refs/heads/ ]] || {
+            echo "::error::candidate requires a branch ref"; exit 1; }
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ && "$EXPECTED_SHA" == "$EVENT_SHA" && \
+             "$(git rev-parse HEAD)" == "$EXPECTED_SHA" ]] || {
+            echo "::error::supplied immutable SHA does not match the event and checkout"; exit 1; }
+
+  candidate-darwin-arm64:
+    needs: [candidate-preflight]
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_only }}
+    runs-on: macos-latest
+    timeout-minutes: 360
+    environment: apple-release
+    permissions:
+      contents: read
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Recheck checkout before credentialed steps
+        env:
+          REPOSITORY: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          REF: ${{ github.ref }}
+          EVENT_SHA: ${{ github.sha }}
+          EXPECTED_SHA: ${{ inputs.candidate_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$REPOSITORY" == robertelee78/vox && "$ACTOR" == robertelee78 && \
+             "$TRIGGERING_ACTOR" == robertelee78 && \
+             "$REF" == refs/heads/* && "$REF" != refs/heads/ && \
+             "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ && "$EXPECTED_SHA" == "$EVENT_SHA" && \
+             "$(git rev-parse HEAD)" == "$EXPECTED_SHA" ]] || {
+            echo "::error::candidate repository, owner, branch or checkout mismatch"; exit 1; }
+      - name: Build isolated candidate and fixture sources
+        env:
+          EXPECTED_SHA: ${{ inputs.candidate_sha }}
+        run: bash scripts/build-signed-candidates.sh build
+      - name: Sign, notarize and assemble candidate artifacts
+        env:
+          EXPECTED_SHA: ${{ inputs.candidate_sha }}
+          APPLE_DEVELOPER_ID_APPLICATION: ${{ vars.APPLE_DEVELOPER_ID_APPLICATION }}
+          APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64 }}
+          APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD }}
+          APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+          APPLE_NOTARY_KEY_ID: ${{ vars.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ vars.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          APPLE_CODESIGN_IDENTIFIER: ${{ vars.APPLE_CODESIGN_IDENTIFIER }}
+        run: bash scripts/build-signed-candidates.sh sign
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vox-candidate-normal-aarch64-apple-darwin
+          path: ${{ runner.temp }}/vox-candidates/output/normal/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vox-nonshipping-current-source-test-knobs-v0.4.13-aarch64-apple-darwin
+          path: ${{ runner.temp }}/vox-candidates/output/lower-version-test-knobs/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vox-nonshipping-current-source-test-knobs-v0.4.14-aarch64-apple-darwin
+          path: ${{ runner.temp }}/vox-candidates/output/current-test-knobs/
+          if-no-files-found: error
+
   publish:
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.candidate_only }}
     needs: [build-linux-x64, build-darwin-arm64]
     runs-on: ubuntu-latest
     timeout-minutes: 45

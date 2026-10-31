@@ -7,7 +7,10 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 publish = false
-description = "The narrow OS calls Vox needs that no safe crate offers: a UDP socket's own drop count (SO_MEMINFO), and another process's argv on macOS (KERN_PROCARGS2). The only Vox crate that allows unsafe."
+description = "Narrow safe wrappers for Vox OS and macOS Foundation operations that require unsafe."
 
 [target.'cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))'.dependencies]
 libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.build-dependencies]
+cc = "=1.2.65"

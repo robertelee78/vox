@@ -64,11 +64,20 @@ fn install_dir(root: &Path) -> PathBuf {
     dir
 }
 
-/// "The vox you had before": runnable, and told apart from the real one by its `--version`.
-fn previous_stub(path: &Path, version: &str) {
-    std::fs::write(path, format!("#!/bin/sh\necho \"vox {version}\"\n"))
-        .expect("APPARATUS: cannot write the previous-vox stub");
+/// Stage the other genuinely compiled binary, never a script impersonating a release.
+fn previous_binary(path: &Path) -> String {
+    let binary = std::env::var_os("VOX_PROOF_NEXT_BINARY").expect(
+        "APPARATUS: set VOX_PROOF_NEXT_BINARY to a genuinely compiled different-version vox",
+    );
+    let version = version_of(Path::new(&binary))
+        .expect("APPARATUS: next-version binary does not report its version");
+    assert!(
+        version.starts_with("vox ") && version != format!("vox {VERSION}"),
+        "APPARATUS: next-version binary must report a different vox version: {version}"
+    );
+    std::fs::copy(binary, path).expect("APPARATUS: cannot copy the next-version binary");
     make_runnable(path);
+    version
 }
 
 /// Mode 0755, as an installed binary has.
@@ -140,7 +149,7 @@ fn a_rollback_leaves_a_runnable_vox_whatever_instant_the_power_goes() {
     let dir = install_dir(tmp.path());
     let (active, previous) = (dir.join("vox"), dir.join(".vox-previous"));
     let scratch = dir.join(".vox-rollback.partial");
-    previous_stub(&previous, "0.0.1");
+    let other_version = previous_binary(&previous);
 
     // ---- the shipped binary, unmodified, under the recorder; nothing of the person's touched ---
     let log = tmp.path().join("calls.tsv");
@@ -148,6 +157,8 @@ fn a_rollback_leaves_a_runnable_vox_whatever_instant_the_power_goes() {
         .args(["update", "--rollback"])
         .env_clear()
         .env("HOME", &home)
+        .env("VOX_DATA_DIR", home.join("data"))
+        .env("VOX_CONFIG_DIR", home.join("config"))
         .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
         .env("VOX_NO_SHELL_SETUP", "1")
         .env("DYLD_INSERT_LIBRARIES", syscalls::interposer())
@@ -178,7 +189,7 @@ fn a_rollback_leaves_a_runnable_vox_whatever_instant_the_power_goes() {
     );
     assert_eq!(
         now_active.as_deref(),
-        Some("vox 0.0.1"),
+        Some(other_version.as_str()),
         "PRODUCT: the rollback did not put the previous binary back: {said}"
     );
     assert!(
@@ -293,6 +304,8 @@ fn rollback_with(dir: &Path, home: &Path, shell: bool, log: Option<&Path>) -> (b
     cmd.args(["update", "--rollback"])
         .env_clear()
         .env("HOME", home)
+        .env("VOX_DATA_DIR", home.join("data"))
+        .env("VOX_CONFIG_DIR", home.join("config"))
         .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
         .env("SHELL", "/bin/zsh");
     if !shell {
@@ -328,7 +341,7 @@ fn impostor(path: &Path, body: &str) {
 /// renames left `vox` (the rolled-back binary) and the partial copy (the other one), with no
 /// `.vox-previous`, and every later `--rollback` refused: "no previous vox was retained". Staged
 /// here directly, as each state a power loss can leave (the binary that runs the next rollback is
-/// whatever is `vox` then, so this build is `vox`, and the other binary is a runnable stub):
+/// whatever is `vox` then, so this build is `vox`, and the other binary is genuinely compiled):
 ///
 /// 1. **between the renames** — `--rollback` finishes the swap and stops there: `vox` is still
 ///    this build, `.vox-previous` is the other binary, no partial is left;
@@ -351,7 +364,7 @@ fn an_interrupted_rollback_is_finished_by_the_next_one() {
     {
         let root = tmp.path().join("between");
         let dir = install_dir(&root);
-        previous_stub(&dir.join(".vox-rollback.partial"), "0.0.1");
+        let other_version = previous_binary(&dir.join(".vox-rollback.partial"));
         let (ok, said) = rollback(&dir, &home);
         let (active, previous) = (
             version_of(&dir.join("vox")),
@@ -365,7 +378,7 @@ fn an_interrupted_rollback_is_finished_by_the_next_one() {
         );
         if !(ok
             && active.as_deref().is_some_and(|v| v.contains(VERSION))
-            && previous.as_deref() == Some("vox 0.0.1")
+            && previous.as_deref() == Some(other_version.as_str())
             && !partial_left)
         {
             failures.push(format!(
@@ -378,7 +391,7 @@ fn an_interrupted_rollback_is_finished_by_the_next_one() {
     {
         let root = tmp.path().join("before");
         let dir = install_dir(&root);
-        previous_stub(&dir.join(".vox-previous"), "0.0.1");
+        let other_version = previous_binary(&dir.join(".vox-previous"));
         std::fs::copy(dir.join("vox"), dir.join(".vox-rollback.partial"))
             .expect("APPARATUS: cannot stage the leftover copy");
         let (ok, said) = rollback(&dir, &home);
@@ -392,7 +405,7 @@ fn an_interrupted_rollback_is_finished_by_the_next_one() {
              {previous:?}; partial left: {partial_left}"
         );
         if !(ok
-            && active.as_deref() == Some("vox 0.0.1")
+            && active.as_deref() == Some(other_version.as_str())
             && previous.as_deref().is_some_and(|v| v.contains(VERSION))
             && !partial_left)
         {
@@ -563,7 +576,7 @@ fn the_recovery_path_is_bounded_durable_and_complete() {
     // 6a. finishing the swap flushes the directory after its rename
     {
         let dir = install_dir(&tmp.path().join("durable-finish"));
-        previous_stub(&dir.join(".vox-rollback.partial"), "0.0.1");
+        previous_binary(&dir.join(".vox-rollback.partial"));
         let log = tmp.path().join("finish.tsv");
         let (ok, said) = rollback_with(&dir, &home, false, Some(&log));
         let events = syscalls::parse(&std::fs::read_to_string(&log).unwrap_or_default());
@@ -607,7 +620,7 @@ fn the_recovery_path_is_bounded_durable_and_complete() {
     // 6b. discarding a leftover copy flushes the directory before the name is used again
     {
         let dir = install_dir(&tmp.path().join("durable-discard"));
-        previous_stub(&dir.join(".vox-previous"), "0.0.1");
+        previous_binary(&dir.join(".vox-previous"));
         std::fs::copy(dir.join("vox"), dir.join(".vox-rollback.partial"))
             .expect("APPARATUS: cannot stage the leftover copy");
         let log = tmp.path().join("discard.tsv");
@@ -652,22 +665,18 @@ fn the_recovery_path_is_bounded_durable_and_complete() {
     // 7. completions, as a rollback refreshes them
     {
         let normal = install_dir(&tmp.path().join("shell-normal"));
-        previous_stub(&normal.join(".vox-previous"), "0.0.1");
+        previous_binary(&normal.join(".vox-previous"));
         let (ok_n, said_n) = rollback_with(&normal, &tmp.path().join("home-n"), true, None);
         let finish = install_dir(&tmp.path().join("shell-finish"));
-        previous_stub(&finish.join(".vox-rollback.partial"), "0.0.1");
+        previous_binary(&finish.join(".vox-rollback.partial"));
         let (ok_f, said_f) = rollback_with(&finish, &tmp.path().join("home-f"), true, None);
-        // What follows the recovery's own line is the shell set-up's, as after a rollback. This
-        // build's set-up says `vox shell-setup: <shell>: …`; its paths name the private HOME, so
-        // the prefix is what is compared.
-        let tail_f: Vec<&str> = said_f.lines().skip(1).collect();
-        let refreshed = tail_f.iter().any(|l| l.starts_with("vox shell-setup:"));
+        let completion = tmp
+            .path()
+            .join("home-f/.local/share/zsh/site-functions/_vox");
+        let refreshed = std::fs::metadata(&completion).is_ok_and(|m| m.len() > 0);
         eprintln!(
-            "[proof] (7) completions: a normal rollback ok={ok_n} printed {} line(s) after its \
-             own; the finished recovery ok={ok_f} printed {}, the shell set-up's among them: \
-             {refreshed}",
-            said_n.lines().count().saturating_sub(1),
-            tail_f.len()
+            "[proof] (7) normal rollback ok={ok_n}; interrupted rollback ok={ok_f}; \
+             completion refreshed={refreshed}: {said_n}; {said_f}"
         );
         if !(ok_f && refreshed) {
             failures.push(format!(

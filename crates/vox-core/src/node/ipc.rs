@@ -6346,7 +6346,7 @@ pub(crate) async fn named(path: &Path, e: Error) -> Error {
 
 // ---- server ----------------------------------------------------------------
 
-/// A bound control socket. Dropping it stops accepting and unlinks the path.
+/// A bound control socket. Dropping it stops accepting; the next owner removes its stale path.
 #[derive(Debug)]
 pub struct IpcServer {
     path: PathBuf,
@@ -6364,9 +6364,9 @@ impl IpcServer {
 impl Drop for IpcServer {
     fn drop(&mut self) {
         self.task.abort();
-        // Best effort: leaving the file behind only costs the next bind an
-        // unlink, which `place_socket` does anyway.
-        let _ = std::fs::remove_file(&self.path);
+        // A successor may have replaced this pathname. Even an inode check followed by unlink
+        // races that replacement, so teardown never removes it. `place_socket` already removes
+        // the stale endpoint when the next owner binds.
     }
 }
 
