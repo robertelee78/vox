@@ -1008,29 +1008,29 @@ pub fn run(check_only: bool, rollback: bool) -> Result<u8, AppError> {
         .mode(0o700)
         .open(&candidate)
         .map_err(AppError::Io)?;
-    if let Err(error) = download_asset(
+    let downloaded = download_asset(
         &release,
         &format!("vox-{}", release.target),
         &mut downloading,
-    ) {
-        #[cfg(target_os = "macos")]
+    );
+    #[cfg(target_os = "macos")]
+    let downloaded = downloaded.map_err(|error| {
         if let Channel::Bundle { apps_dir, .. } = &installed {
             match bundle::repair(apps_dir, &exe) {
                 Ok(true) => {
-                    return Err(usage(format!(
+                    return usage(format!(
                         "local repair completed; the newer updater could not be downloaded: {error}"
-                    )));
+                    ));
                 }
                 Err(repair) => {
-                    return Err(usage(format!(
-                        "{error}; local repair also failed: {repair}"
-                    )));
+                    return usage(format!("{error}; local repair also failed: {repair}"));
                 }
                 Ok(false) => {}
             }
         }
-        return Err(error);
-    }
+        error
+    });
+    downloaded?;
     downloading
         .set_permissions(fs::Permissions::from_mode(0o555))
         .map_err(AppError::Io)?;
@@ -1205,7 +1205,7 @@ pub(crate) fn apply_request(path: &Path) -> Result<(), AppError> {
                 "         previous kept at {}",
                 install_dir.join(PREVIOUS_NAME).display()
             );
-            let detached = restart::restart_daemon(&active, &release.version_text);
+            let detached = restart::restart_daemon(&active, &release.version_text)?;
             run_shell_setup(&active);
             restart::say_next(&detached);
             Ok(())
@@ -1284,7 +1284,7 @@ fn do_rollback(install_dir: &Path) -> Result<(), AppError> {
             );
             // As any rollback does: the daemon is restarted onto the binary now in place, which
             // brings its own completions.
-            let detached = restart_onto(&active);
+            let detached = restart_onto(&active)?;
             run_shell_setup(&active);
             restart::say_next(&detached);
             return Ok(());
@@ -1311,14 +1311,14 @@ fn do_rollback(install_dir: &Path) -> Result<(), AppError> {
         active.display(),
         binary_version(&active).unwrap_or_else(|| "unknown".to_owned())
     );
-    let detached = restart_onto(&active);
+    let detached = restart_onto(&active)?;
     run_shell_setup(&active);
     restart::say_next(&detached);
     Ok(())
 }
 
 /// Restart the daemon onto the binary a rollback put in place, as the version it says it is.
-fn restart_onto(active: &Path) -> Vec<vox_core::node::paths::NodeName> {
+fn restart_onto(active: &Path) -> Result<Vec<vox_core::node::paths::NodeName>, AppError> {
     let now = binary_version(active).unwrap_or_else(|| "unknown".to_owned());
     restart::restart_daemon(active, &now)
 }
