@@ -3,7 +3,8 @@
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC 2119] [RFC 8174] when, and only when, they appear in all capitals, as shown here.
 
 **Status**: Accepted for v0.4.0 (the decider, 2026-10-05); M-15, M-20 and M-21 amended to remove
-the lanes view (the decider, 2026-10-06); M-29b added for v0.4.11 (the decider, 2026-10-30).
+the lanes view (the decider, 2026-10-06); M-29b added for v0.4.11 (the decider, 2026-10-30)
+and amended to require target-version updater ownership (the decider, 2026-10-31).
 Nothing in this ADR is built unless a requirement says so.
 **Date**: 2026-10-05
 **Deciders**: Robert E. Lee
@@ -206,6 +207,12 @@ F-9–F-11; RR-1, RR-3, RR-4 (RR-2 is the daemon's); D-3; L-1–L-10; W-1–W-6;
   installation being updated, MUST NOT launch an app that was not running, and MUST report an
   unsuccessful handoff rather than claim completion. This supersedes M-29's instruction to ask
   the person to restart; bundle verification, atomic replacement and rollback still apply.
+  In that same invocation, the installed binary MUST bootstrap the update by finding,
+  downloading and verifying the target-version updater, then transferring control to it
+  before any installed-state change or app/daemon handoff. The verified target-version
+  updater MUST own installation, recovery, handoff, cleanup and final reporting. The old
+  updater MUST NOT install the new version first and delegate completion afterward.
+  Acquiring the new update logic MUST NOT require a second invocation or manual repair.
 
 
 ### 6. Proof
