@@ -18,7 +18,7 @@
 //! running from this bundle is normally quit before the swap and relaunched afterward.
 
 use std::fs;
-use std::io::Read as _;
+use std::io::{BufRead as _, Read as _};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -48,6 +48,177 @@ const HELPER: &str = "Contents/Helpers/vox";
 const PUBLISHING: &str = ".Vox.app.publishing";
 /// In [`PUBLISHING`]: the version the publish puts in place.
 const PUBLISHING_VERSION: &str = "version";
+const TRANSITION: &str = "transition.json";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Transition {
+    kind: TransitionKind,
+    version: String,
+    source: BundleIdentity,
+    target: BundleIdentity,
+    daemon_data_root: Vec<u8>,
+    daemon_config_dir: Vec<u8>,
+    daemon: super::restart::DaemonIntent,
+    app: Option<AppIntent>,
+    #[serde(default)]
+    daemon_complete: bool,
+    #[serde(default)]
+    app_complete: bool,
+    handoff_complete: bool,
+}
+
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+enum TransitionKind {
+    Update,
+    Rollback,
+    Refresh,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct BundleIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct AppIntent {
+    pid: u32,
+    started: u64,
+    data_root: Vec<u8>,
+    config_dir: Vec<u8>,
+    home: Option<Vec<u8>>,
+    xdg_data: Option<Vec<u8>>,
+    xdg_config: Option<Vec<u8>>,
+}
+
+fn bundle_identity(path: &Path) -> Result<BundleIdentity, AppError> {
+    use std::os::unix::fs::MetadataExt as _;
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|e| usage(format!("cannot inspect {}: {e}", path.display())))?;
+    if !metadata.is_dir() {
+        return Err(usage(format!(
+            "{} is not a bundle directory",
+            path.display()
+        )));
+    }
+    Ok(BundleIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+fn path_exists(path: &Path) -> Result<bool, AppError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(usage(format!("cannot inspect {}: {e}", path.display()))),
+    }
+}
+
+fn write_transition_in(journal: &Path, transition: &Transition) -> Result<(), AppError> {
+    use std::io::Write as _;
+    let temporary = journal.join("transition.tmp");
+    let destination = journal.join(TRANSITION);
+    let bytes = serde_json::to_vec(transition)
+        .map_err(|e| usage(format!("cannot encode transition: {e}")))?;
+    let mut file = fs::File::create(&temporary)
+        .map_err(|e| usage(format!("cannot create {}: {e}", temporary.display())))?;
+    file.write_all(&bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|e| {
+            usage(format!(
+                "cannot write and sync {}: {e}",
+                temporary.display()
+            ))
+        })?;
+    fs::rename(&temporary, &destination).map_err(|e| {
+        usage(format!(
+            "cannot rename {} to {}: {e}",
+            temporary.display(),
+            destination.display()
+        ))
+    })?;
+    sync_dir(journal)
+        .map_err(|e| usage(format!("cannot sync directory {}: {e}", journal.display())))
+}
+
+fn write_transition(apps: &Path, transition: &Transition) -> Result<(), AppError> {
+    write_transition_in(&apps.join(PUBLISHING), transition)?;
+    sync_dir(apps).map_err(|e| usage(format!("cannot sync directory {}: {e}", apps.display())))
+}
+
+fn transition_record(
+    source: &Path,
+    target: &Path,
+    kind: TransitionKind,
+    version: &str,
+    app: &Option<StoppedApp>,
+) -> Result<Transition, AppError> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let account = match app.as_ref() {
+        Some(app) => vox_core::node::paths::Account {
+            data_root: app.account.data_root.clone(),
+            config_dir: app.account.config_dir.clone(),
+        },
+        None => vox_core::node::paths::Account::of(None, None)
+            .map_err(|e| usage(format!("cannot resolve daemon account: {e}")))?,
+    };
+    let daemon_data_root = account.data_root.as_os_str().as_bytes().to_vec();
+    let daemon_config_dir = account.config_dir.as_os_str().as_bytes().to_vec();
+    let app = app.as_ref().map(|app| AppIntent {
+        pid: app.identity.pid,
+        started: app.identity.started,
+        data_root: app.account.data_root.as_os_str().as_bytes().to_vec(),
+        config_dir: app.account.config_dir.as_os_str().as_bytes().to_vec(),
+        home: app.environment[2].as_ref().map(|s| s.as_bytes().to_vec()),
+        xdg_data: app.environment[3].as_ref().map(|s| s.as_bytes().to_vec()),
+        xdg_config: app.environment[4].as_ref().map(|s| s.as_bytes().to_vec()),
+    });
+    Ok(Transition {
+        kind,
+        version: version.to_owned(),
+        source: bundle_identity(source)?,
+        target: bundle_identity(target)?,
+        daemon_data_root,
+        daemon_config_dir,
+        daemon: super::restart::capture_daemon_intent(&account)?,
+        app,
+        daemon_complete: false,
+        app_complete: false,
+        handoff_complete: false,
+    })
+}
+
+fn prepare_transition(
+    apps: &Path,
+    candidate: &Path,
+    kind: TransitionKind,
+    version: &str,
+    app: &Option<StoppedApp>,
+) -> Result<Transition, AppError> {
+    let transition = transition_record(&apps.join(BUNDLE), candidate, kind, version, app)?;
+    let journal = apps.join(PUBLISHING);
+    if path_exists(&journal)? {
+        return Err(usage(format!(
+            "journal {} already exists",
+            journal.display()
+        )));
+    }
+    let preparing = tempfile::Builder::new()
+        .prefix(".Vox.app.prepare.")
+        .tempdir_in(apps)
+        .map_err(|e| {
+            usage(format!(
+                "cannot create transition preparation directory in {}: {e}",
+                apps.display()
+            ))
+        })?;
+    write_transition_in(preparing.path(), &transition)?;
+    fs::rename(preparing.path(), &journal)
+        .map_err(|e| usage(format!("cannot publish journal {}: {e}", journal.display())))?;
+    sync_dir(apps).map_err(|e| usage(format!("cannot sync directory {}: {e}", apps.display())))?;
+    Ok(transition)
+}
 
 /// **Test-only**: abort the process right after a publish's swap, before the replaced bundle is
 /// renamed to [`PREVIOUS`], so a proof can stand a publish cut short at its one awkward moment.
@@ -79,13 +250,13 @@ pub(super) fn update(
     if !check_only {
         let repaired = recover(apps)?;
         if !repaired.is_empty() {
-            let active = apps.join(BUNDLE);
-            let now = app_version(&active)
-                .ok_or_else(|| usage("the repaired Vox.app has no readable version"))?;
-            let running = stop_app(&active)?;
-            restart_for_handoff(&active, &now, &running)?;
+            if !repaired.handoff_done {
+                let active = apps.join(BUNDLE);
+                let now = app_version(&active)
+                    .ok_or_else(|| usage("the repaired Vox.app has no readable version"))?;
+                journaled_refresh(apps, &active, &now)?;
+            }
             shell_setup_from(apps, exe);
-            relaunch_app(&active, &running)?;
             repaired.say_without_swap();
             return Ok(());
         }
@@ -108,10 +279,15 @@ pub(super) fn update(
         // agent skill pack are refreshed on the Vox.app in place. `--check` changes nothing.
         if !check_only {
             let active = apps.join(BUNDLE);
-            let running = stop_app(&active)?;
-            restart_for_handoff(&active, &current.to_string(), &running)?;
-            relaunch_app(&active, &running)?;
+            let now = app_version(&active).ok_or_else(|| {
+                usage(format!(
+                    "cannot identify installed version at {}",
+                    active.display()
+                ))
+            })?;
+            journaled_refresh(apps, &active, &now)?;
             shell_setup_from(apps, exe);
+            sweep(apps, &mut Recovery::default())?;
             println!("Vox {current} is current; {}", super::skill_said());
         }
         return Ok(());
@@ -135,30 +311,51 @@ pub(super) fn update(
     let mut downloading = tempfile::Builder::new()
         .prefix("vox-update.")
         .tempfile()
-        .map_err(AppError::Io)?;
+        .map_err(|e| {
+            usage(format!(
+                "cannot create temporary download in {}: {e}",
+                std::env::temp_dir().display()
+            ))
+        })?;
     download_asset(
         &app,
         &format!("Vox-{}-{}.zip", app.version_text, app.target),
         downloading.as_file_mut(),
     )?;
-    downloading.as_file().sync_all().map_err(AppError::Io)?;
+    downloading.as_file().sync_all().map_err(|e| {
+        usage(format!(
+            "cannot sync download {}: {e}",
+            downloading.path().display()
+        ))
+    })?;
     let zip = downloading.into_temp_path();
 
     let staged = unpack(apps, &zip)?;
     if let Err(refused) = verify(&active, &staged, &vox) {
-        let _ = clear(&staged);
-        return Err(refused);
+        return Err(match clear_candidate(&staged) {
+            Ok(()) => refused,
+            Err(cleanup) => usage(format!("{refused}; candidate cleanup failed: {cleanup}")),
+        });
     }
-    let running = match stop_app(&active) {
-        Ok(running) => running,
-        Err(e) => {
-            let _ = clear(&staged);
-            return Err(e);
-        }
-    };
+    let running = inspect_app(&active, None)?;
+    let mut transition = prepare_transition(
+        apps,
+        &staged,
+        TransitionKind::Update,
+        &vox.version_text,
+        &running,
+    )?;
+    stop_captured_app(&active, None, &running)?;
     let aside = match publish(apps, &vox.version_text) {
         Ok(aside) => aside,
-        Err(e) => return Err(transition_failed(&active, &running, e)),
+        Err(e) => {
+            return Err(transition_failed_journal(
+                apps,
+                &running,
+                &mut transition,
+                e,
+            ))
+        }
     };
 
     println!("updated: {} -> Vox {}", active.display(), vox.version_text);
@@ -167,13 +364,24 @@ pub(super) fn update(
         apps.join(PREVIOUS).display()
     );
 
-    restart_for_handoff(&active, &vox.version_text, &running)?;
+    let handoff = transition_handoff(apps, &active, &vox.version_text, &running, &mut transition);
     shell_setup_from(apps, exe);
-    relaunch_app(&active, &running)?;
-    match aside {
-        Some(error) => Err(error),
-        None => Ok(()),
+    let mut failures = Vec::new();
+    if let Some(e) = aside {
+        failures.push(e.to_string());
     }
+    if let Err(e) = handoff {
+        failures.push(e.to_string());
+    }
+    if !failures.is_empty() {
+        return Err(usage(format!(
+            "Vox {} is installed; transition incomplete: {}; run `vox update` for local repair",
+            vox.version_text,
+            failures.join("; ")
+        )));
+    }
+    finish_journal(apps).and_then(|()| sweep(apps, &mut Recovery::default()))
+        .map_err(|e| usage(format!("Vox {} is installed and handoff completed, but cleanup failed: {e}; run `vox update` for local repair", vox.version_text)))
 }
 
 /// `vox update --rollback` for the Vox.app in `apps`: swap it with `.Vox.app.previous`, so a
@@ -185,19 +393,39 @@ pub(super) fn rollback(apps: &Path, exe: &Path) -> Result<(), AppError> {
     let active = apps.join(BUNDLE);
     let previous = apps.join(PREVIOUS);
     let _lock = InstallLock::acquire(apps)?;
-    recover(apps)?;
+    let repaired = recover(apps)?;
+    if !repaired.is_empty() {
+        if !repaired.handoff_done {
+            let now = app_version(&active)
+                .ok_or_else(|| usage("the repaired Vox.app has no readable version"))?;
+            journaled_refresh(apps, &active, &now)?;
+        }
+        shell_setup_from(apps, exe);
+        repaired.say_without_swap();
+        return Ok(());
+    }
     if !previous.join(HELPER).is_file() {
         return Err(usage(format!(
             "no previous Vox.app was retained in {} — nothing to roll back to",
             apps.display()
         )));
     }
-    let running = stop_app(&active)?;
-    let was = app_version(&active).unwrap_or_else(|| "unknown".to_owned());
+    let running = inspect_app(&active, None)?;
+    let was = app_version(&active).ok_or_else(|| usage("active Vox.app version is unavailable"))?;
+    let target =
+        app_version(&previous).ok_or_else(|| usage("previous Vox.app version is unavailable"))?;
+    let mut transition =
+        prepare_transition(apps, &previous, TransitionKind::Rollback, &target, &running)?;
+    stop_captured_app(&active, None, &running)?;
     // The kept bundle becomes an application again before it is swapped in; the one it replaces
     // is set aside after, so neither is ever both in place and set aside.
     if let Err(e) = restore(&previous) {
-        return Err(transition_failed(&active, &running, e));
+        return Err(transition_failed_journal(
+            apps,
+            &running,
+            &mut transition,
+            e,
+        ));
     }
     if let Err(failed) = swap(&previous, &active) {
         // Nothing was swapped: the kept bundle is set aside again, never left an application.
@@ -209,11 +437,16 @@ pub(super) fn rollback(apps: &Path, exe: &Path) -> Result<(), AppError> {
                 active.display()
             )),
         };
-        return Err(transition_failed(&active, &running, error));
+        return Err(transition_failed_journal(
+            apps,
+            &running,
+            &mut transition,
+            error,
+        ));
     }
-    if let Err(e) = sync_dir(apps) {
-        return Err(transition_failed(&active, &running, e));
-    }
+    let sync_error = sync_dir(apps)
+        .err()
+        .map(|e| usage(format!("cannot sync directory {}: {e}", apps.display())));
     // The rollback is done at this point. A set-aside that fails is reported last, after the
     // active bundle is registered and the daemon restarted, so a failed step never leaves the
     // rest of the transition undone or invites a second --rollback that would reverse it.
@@ -227,28 +460,27 @@ pub(super) fn rollback(apps: &Path, exe: &Path) -> Result<(), AppError> {
         "         Vox {was} is kept at {} for --rollback",
         previous.display()
     );
-    restart_for_handoff(&active, &now, &running).map_err(|e| {
-        usage(format!(
-            "rollback to Vox {now} is already in place; do not repeat --rollback: {e}"
-        ))
-    })?;
+    let handoff = transition_handoff(apps, &active, &now, &running, &mut transition);
     shell_setup_from(apps, exe);
-    relaunch_app(&active, &running).map_err(|e| {
-        usage(format!(
-            "rollback to Vox {now} is already in place; do not repeat --rollback: {e}"
-        ))
-    })?;
-    // Said, not failed: the rollback is committed, and a command that reports failure invites
-    // the same command again, which would roll back once more and reverse it. The repair is
-    // `vox update`, which sets the kept bundle aside under the lock without swapping anything.
-    if let Err(e) = aside {
-        println!(
-            "vox: the rollback is done, but the replaced Vox.app was not set aside: {e}; run \
-             `vox update` to repair (it swaps nothing), and until then open Vox as {}",
-            active.display()
-        );
+    let mut failures = Vec::new();
+    if let Some(e) = sync_error {
+        failures.push(e.to_string());
     }
-    Ok(())
+    if let Err(e) = aside {
+        failures.push(e.to_string());
+    }
+    if let Err(e) = handoff {
+        failures.push(e.to_string());
+    }
+    if !failures.is_empty() {
+        return Err(usage(format!(
+            "rollback to Vox {now} is already in place; do not repeat --rollback; run `vox update` for local repair: {}",
+            failures.join("; ")
+        )));
+    }
+    finish_journal(apps).map_err(|e| usage(format!(
+        "rollback to Vox {now} is already in place; do not repeat --rollback; run `vox update` for local repair: {e}"
+    )))
 }
 
 /// Exchange two paths in one step (`renameatx_np` with `RENAME_SWAP`): each name holds a whole
@@ -261,7 +493,13 @@ fn swap(a: &Path, b: &Path) -> Result<(), AppError> {
         b,
         rustix::fs::RenameFlags::EXCHANGE,
     )
-    .map_err(|e| AppError::Io(e.into()))
+    .map_err(|e| {
+        usage(format!(
+            "cannot exchange {} and {}: {e}",
+            a.display(),
+            b.display()
+        ))
+    })
 }
 
 /// Make the verified `.Vox.app.partial` the bundle, keeping the one it replaces.
@@ -274,41 +512,68 @@ fn publish(apps: &Path, version: &str) -> Result<Option<AppError>, AppError> {
     let staged = apps.join(PARTIAL);
     let previous = apps.join(PREVIOUS);
     let journal = apps.join(PUBLISHING);
-    clear(&journal)?;
-    fs::create_dir(&journal).map_err(AppError::Io)?;
-    fs::write(journal.join(PUBLISHING_VERSION), version).map_err(AppError::Io)?;
-    if fs::symlink_metadata(&previous).is_ok() {
-        fs::rename(&previous, journal.join(BUNDLE)).map_err(AppError::Io)?;
+    // The authoritative transition was persisted before the app was stopped.
+    if path_exists(&previous)? {
+        fs::rename(&previous, journal.join(BUNDLE)).map_err(|e| {
+            usage(format!(
+                "cannot rename {} to {}: {e}",
+                previous.display(),
+                journal.join(BUNDLE).display()
+            ))
+        })?;
     }
-    sync_dir(apps)?;
-    if let Err(failed) = swap(&staged, &apps.join(BUNDLE)) {
-        // Nothing was swapped: the previous bundle goes back where it was.
-        let _ = recover(apps);
-        return Err(failed);
+    let before_swap = sync_dir(apps)
+        .map_err(|e| usage(format!("cannot sync directory {}: {e}", apps.display())))
+        .and_then(|()| swap(&staged, &apps.join(BUNDLE)));
+    if let Err(failed) = before_swap {
+        let kept = journal.join(BUNDLE);
+        let restored = if path_exists(&kept).unwrap_or(true) {
+            fs::rename(&kept, &previous).map_err(|e| {
+                usage(format!(
+                    "cannot restore {} to {}: {e}",
+                    kept.display(),
+                    previous.display()
+                ))
+            })
+        } else {
+            Ok(())
+        };
+        return Err(match restored {
+            Ok(()) => failed,
+            Err(e) => usage(format!(
+                "{failed}; rollback authority restoration failed: {e}"
+            )),
+        });
     }
-    sync_dir(apps)?;
+    sync_dir(apps).map_err(|e| {
+        usage(format!(
+            "cannot sync directory {} after exchange: {e}",
+            apps.display()
+        ))
+    })?;
     #[cfg(feature = "test-knobs")]
     if std::env::var_os(TEST_ABORT_AFTER_SWAP_ENV).is_some_and(|v| !v.is_empty()) {
         std::process::abort();
     }
     // The swap left the replaced bundle under the partial name.
-    fs::rename(&staged, &previous).map_err(AppError::Io)?;
-    sync_dir(apps)?;
+    fs::rename(&staged, &previous).map_err(|e| {
+        usage(format!(
+            "cannot rename {} to {}: {e}",
+            staged.display(),
+            previous.display()
+        ))
+    })?;
+    sync_dir(apps).map_err(|e| {
+        usage(format!(
+            "cannot sync directory {} after rename: {e}",
+            apps.display()
+        ))
+    })?;
     let aside = set_aside(&previous);
     if let Err(said) = launch_services(true, &apps.join(BUNDLE)) {
         println!("note: {said}; the current Vox.app is in place and opens by path");
     }
-    // The bundle that was previous before this publish goes, unless something still runs from
-    // it: then it is retired, and a later transition removes it (see [`sweep`]).
-    let older = journal.join(BUNDLE);
-    if fs::symlink_metadata(&older).is_ok() {
-        if in_use(&older) {
-            retire(apps, &older)?;
-        } else {
-            clear(&older)?;
-        }
-    }
-    clear(&journal)?;
+    // Cleanup is deferred until the owned handoff has completed.
     // The publish is done at this point; a set-aside that failed is the caller's to report
     // after it has restarted the daemon, never a reason to leave the transition half finished.
     Ok(aside.err().map(|e| {
@@ -320,18 +585,64 @@ fn publish(apps: &Path, version: &str) -> Result<Option<AppError>, AppError> {
     }))
 }
 
+fn finish_journal(apps: &Path) -> Result<(), AppError> {
+    let journal = apps.join(PUBLISHING);
+    let older = journal.join(BUNDLE);
+    match fs::symlink_metadata(&older) {
+        Ok(_) => {
+            if in_use(&older) {
+                retire(apps, &older)?;
+            } else {
+                set_aside(&older)?;
+                clear(&older)?;
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(usage(format!("cannot inspect {}: {e}", older.display()))),
+    }
+    // The live journal must never lose its record through a partial recursive removal.
+    // Retire its completed authority atomically; interrupted disposal is then only cleanup.
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    let completed = apps.join(format!("{COMPLETED_PREFIX}{ms}.{}", std::process::id()));
+    fs::rename(&journal, &completed).map_err(|e| {
+        usage(format!(
+            "cannot retire completed journal {} to {}: {e}",
+            journal.display(),
+            completed.display()
+        ))
+    })?;
+    sync_dir(apps).map_err(|e| {
+        usage(format!(
+            "cannot sync directory {} after retiring completed journal: {e}",
+            apps.display()
+        ))
+    })?;
+    clear(&completed)
+}
+
 /// Bundles retired by earlier transitions while code from them was running: `.Vox.app.retired.*`.
 const RETIRED_PREFIX: &str = ".Vox.app.retired.";
+/// Completed journals awaiting disposal; these never contain a retained executable.
+const COMPLETED_PREFIX: &str = ".Vox.app.retired.journal.";
 
 /// Rename `bundle` aside as retired: a daemon not restarted since an earlier update runs from it.
 fn retire(apps: &Path, bundle: &Path) -> Result<(), AppError> {
+    set_aside(bundle)?;
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis());
     let name = format!("{RETIRED_PREFIX}{ms}.{}", std::process::id());
     let retired = apps.join(name);
-    fs::rename(bundle, &retired).map_err(AppError::Io)?;
-    set_aside(&retired)
+    fs::rename(bundle, &retired).map_err(|e| {
+        usage(format!(
+            "cannot rename {} to {}: {e}",
+            bundle.display(),
+            retired.display()
+        ))
+    })?;
+    Ok(())
 }
 
 /// Tell LaunchServices about a bundle: `register` adds or refreshes the bundle in place;
@@ -340,9 +651,10 @@ fn retire(apps: &Path, bundle: &Path) -> Result<(), AppError> {
 /// record a running app may still re-register when it quits. Best effort: a refusal is said,
 /// not fatal. Measured 2026-10-19: both bundles registered as `us.vox.app` with the same
 /// CFBundleVersion, and reopening Vox launched the replaced 0.4.4 against the 0.4.6 daemon.
+const LSREGISTER: &str = "/System/Library/Frameworks/CoreServices.framework/Frameworks/\
+                          LaunchServices.framework/Support/lsregister";
+
 fn launch_services(register: bool, bundle: &Path) -> Result<(), String> {
-    const LSREGISTER: &str = "/System/Library/Frameworks/CoreServices.framework/Frameworks/\
-                              LaunchServices.framework/Support/lsregister";
     let flag = if register { "-f" } else { "-u" };
     let verb = if register { "register" } else { "release" };
     match Command::new(LSREGISTER)
@@ -354,15 +666,134 @@ fn launch_services(register: bool, bundle: &Path) -> Result<(), String> {
         .status()
     {
         Ok(status) if status.success() => Ok(()),
-        Ok(status) => Err(format!(
-            "LaunchServices did not {verb} {} ({status})",
-            bundle.display()
-        )),
+        Ok(status) => {
+            let failure = format!(
+                "LaunchServices did not {verb} {} ({status})",
+                bundle.display()
+            );
+            if register {
+                return Err(failure);
+            }
+            match registered_path(bundle) {
+                Ok(false) => Ok(()),
+                Ok(true) => Err(failure),
+                Err(e) => Err(format!(
+                    "{failure}; could not confirm registration absence: {e}"
+                )),
+            }
+        }
         Err(e) => Err(format!(
             "LaunchServices was not told to {verb} {}: {e}",
             bundle.display()
         )),
     }
+}
+
+/// A failed unregister is harmless only if a successful full database dump independently proves
+/// that this exact path is absent. NSWorkspace's available-applications query filters records.
+fn registered_path(bundle: &Path) -> Result<bool, String> {
+    let wanted = fs::canonicalize(bundle)
+        .map_err(|e| format!("cannot canonicalize {}: {e}", bundle.display()))?;
+    let mut child = Command::new(LSREGISTER)
+        .arg("-dump")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("cannot run lsregister -dump: {e}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or("lsregister -dump has no output stream")?;
+    let mut reader = std::io::BufReader::new(stdout);
+    let mut line = Vec::new();
+    let mut paths = 0_usize;
+    let mut identifiers = 0_usize;
+    let mut found = false;
+    let mut parse_error = None;
+    loop {
+        line.clear();
+        // Never let a malformed database record allocate unbounded memory.
+        match (&mut reader).take(65_537).read_until(b'\n', &mut line) {
+            Ok(0) => break,
+            Ok(_) if line.len() > 65_536 => {
+                parse_error = Some("oversized LaunchServices database line".to_owned());
+                break;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                parse_error = Some(format!("cannot read lsregister -dump: {e}"));
+                break;
+            }
+        }
+        let Ok(text) = std::str::from_utf8(&line) else {
+            parse_error = Some("LaunchServices database dump is not UTF-8".to_owned());
+            break;
+        };
+        let text = text.trim();
+        if let Some(value) = text.strip_prefix("path:") {
+            paths += 1;
+            let value = value.trim();
+            let value = match value.rsplit_once(" (0x") {
+                Some((before, suffix)) if !suffix.contains('/') => {
+                    let Some(hex) = suffix.strip_suffix(')') else {
+                        parse_error = Some("ambiguous LaunchServices path annotation".to_owned());
+                        break;
+                    };
+                    if hex.is_empty() || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                        parse_error = Some("invalid LaunchServices path annotation".to_owned());
+                        break;
+                    }
+                    before
+                }
+                _ => value,
+            };
+            let path = Path::new(value);
+            if !path.is_absolute() {
+                parse_error =
+                    Some("LaunchServices database contains a non-absolute path".to_owned());
+                break;
+            }
+            if path == wanted {
+                found = true;
+            } else if !found {
+                match fs::canonicalize(path) {
+                    Ok(path) => found = path == wanted,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        parse_error = Some(format!(
+                            "cannot resolve registration path {} while checking {}: {e}",
+                            path.display(),
+                            wanted.display()
+                        ));
+                        break;
+                    }
+                }
+            }
+        } else if text.starts_with("identifier:") {
+            identifiers += 1;
+        }
+    }
+    if parse_error.is_some() {
+        // Closing the pipe ensures a producer cannot block while we wait for it.
+        drop(reader);
+        let _ = child.kill();
+    }
+    let status = child
+        .wait()
+        .map_err(|e| format!("cannot wait for lsregister -dump: {e}"))?;
+    if let Some(error) = parse_error {
+        return Err(error);
+    }
+    if !status.success() {
+        return Err(format!("lsregister -dump exited {status}"));
+    }
+    if paths == 0 || identifiers == 0 {
+        return Err(format!(
+            "cannot parse LaunchServices database (paths={paths}, identifiers={identifiers})"
+        ));
+    }
+    Ok(found)
 }
 
 /// A set-aside bundle's `Info.plist`, kept under this name until a rollback restores it. Without
@@ -372,40 +803,63 @@ fn launch_services(register: bool, bundle: &Path) -> Result<(), String> {
 const KEPT_INFO_PLIST: &str = "Contents/Info.plist.kept";
 const INFO_PLIST: &str = "Contents/Info.plist";
 
-/// Set a replaced or retired bundle aside: its LaunchServices record removed, then no
-/// `Info.plist`. The rename is the guarantee (a folder without `Contents/Info.plist` is no
-/// application, whatever record remains); the record removal is the second measure, said when it
-/// fails and tried again by every later transition that finds the bundle still there (`sweep`,
-/// `recover`, the next publish), until it succeeds.
+/// Remove the exact registration and disable the bundle even when removal fails.
 fn set_aside(bundle: &Path) -> Result<(), AppError> {
-    if let Err(said) = launch_services(false, bundle) {
-        println!("note: {said}; tried again at the next update or rollback");
-    }
+    let unregister = launch_services(false, bundle).err();
     let plist = bundle.join(INFO_PLIST);
-    if !plist.is_file() {
-        return Ok(());
+    let kept = bundle.join(KEPT_INFO_PLIST);
+    let disable = match fs::symlink_metadata(&plist) {
+        Ok(_) => fs::rename(&plist, &kept)
+            .map_err(|e| {
+                format!(
+                    "cannot rename {} to {}: {e}",
+                    plist.display(),
+                    kept.display()
+                )
+            })
+            .err(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => Some(format!("cannot inspect {}: {e}", plist.display())),
+    };
+    match (unregister, disable) {
+        (None, None) => Ok(()),
+        (Some(e), None) | (None, Some(e)) => Err(usage(e)),
+        (Some(a), Some(b)) => Err(usage(format!("{a}; {b}"))),
     }
-    fs::rename(&plist, bundle.join(KEPT_INFO_PLIST)).map_err(|e| {
-        AppError::Usage(format!(
-            "{} is still an application: its Info.plist could not be set aside ({e})",
-            bundle.display()
-        ))
-    })
 }
 
 /// Make a set-aside bundle an application again, for the swap that brings it back.
 fn restore(bundle: &Path) -> Result<(), AppError> {
     let kept = bundle.join(KEPT_INFO_PLIST);
-    if kept.is_file() {
-        fs::rename(&kept, bundle.join(INFO_PLIST)).map_err(AppError::Io)?;
+    let plist = bundle.join(INFO_PLIST);
+    if path_exists(&kept)? {
+        fs::rename(&kept, &plist).map_err(|e| {
+            usage(format!(
+                "cannot rename {} to {}: {e}",
+                kept.display(),
+                plist.display()
+            ))
+        })?;
     }
     Ok(())
 }
 
 /// Remove the retired bundles nothing runs from any more.
 fn sweep(apps: &Path, repaired: &mut Recovery) -> Result<(), AppError> {
-    let entries = fs::read_dir(apps).map_err(AppError::Io)?;
-    for entry in entries.filter_map(Result::ok) {
+    let entries = fs::read_dir(apps)
+        .map_err(|e| usage(format!("cannot read directory {}: {e}", apps.display())))?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|e| usage(format!("cannot read entry in {}: {e}", apps.display())))?;
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(COMPLETED_PREFIX)
+        {
+            clear(&entry.path())?;
+            repaired.retired_removed += 1;
+            continue;
+        }
         let retired = entry
             .file_name()
             .to_string_lossy()
@@ -430,25 +884,35 @@ fn sweep(apps: &Path, repaired: &mut Recovery) -> Result<(), AppError> {
 /// cannot say, the bundle is taken to be in use: kept is the safe side.
 fn in_use(bundle: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt as _;
+    let Ok(contents) = fs::canonicalize(bundle.join("Contents")) else {
+        return true;
+    };
     let mut files = Vec::new();
     let mut dirs = vec![bundle.join("Contents")];
     while let Some(dir) = dirs.pop() {
         let Ok(entries) = fs::read_dir(&dir) else {
-            continue;
+            return true;
         };
-        for entry in entries.filter_map(Result::ok) {
+        for entry in entries {
+            let Ok(entry) = entry else { return true };
             let Ok(meta) = fs::symlink_metadata(entry.path()) else {
-                continue;
+                return true;
             };
-            if meta.is_dir() {
+            if meta.file_type().is_symlink() {
+                // Only links resolved inside the traversed tree are accounted for by its files.
+                if !fs::canonicalize(entry.path()).is_ok_and(|target| target.starts_with(&contents))
+                {
+                    return true;
+                }
+            } else if meta.is_dir() {
                 dirs.push(entry.path());
-            } else if meta.is_file() && meta.permissions().mode() & 0o100 != 0 {
+            } else if meta.is_file() && meta.permissions().mode() & 0o111 != 0 {
                 files.push(entry.path());
             }
         }
     }
     if files.is_empty() {
-        return false;
+        return true;
     }
     // The pids, not the status: lsof exits 1 when any one file named is not open.
     Command::new("/usr/sbin/lsof")
@@ -456,7 +920,11 @@ fn in_use(bundle: &Path) -> bool {
         .args(&files)
         .env_clear()
         .output()
-        .map_or(true, |out| !out.stdout.is_empty())
+        .map_or(true, |out| {
+            !out.stdout.is_empty()
+                || (!out.status.success()
+                    && (out.status.code() != Some(1) || !out.stderr.is_empty()))
+        })
 }
 
 /// Finish or undo a publish that was cut short (see [`publish`]); nothing when none was. Run
@@ -469,71 +937,432 @@ fn in_use(bundle: &Path) -> bool {
 /// back when nothing has taken its place.
 fn recover(apps: &Path) -> Result<Recovery, AppError> {
     let mut repaired = Recovery::default();
-    sweep(apps, &mut repaired)?;
     let journal = apps.join(PUBLISHING);
-    if fs::symlink_metadata(&journal).is_err() {
-        // No publish was cut short. A previous bundle is set aside again under the lock: one an
-        // earlier release left as an application (before M-29a), or one whose record removal
-        // failed last time.
+    let journal_present = match fs::symlink_metadata(&journal) {
+        Ok(meta) if meta.is_dir() => true,
+        Ok(_) => {
+            return Err(usage(format!(
+                "journal {} is not a directory",
+                journal.display()
+            )))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            return Err(usage(format!(
+                "cannot inspect journal {}: {e}",
+                journal.display()
+            )))
+        }
+    };
+    if !journal_present {
+        let mut failures = Vec::new();
+        if let Err(e) = sweep(apps, &mut repaired) {
+            failures.push(e.to_string());
+        }
         let previous = apps.join(PREVIOUS);
-        if fs::symlink_metadata(&previous).is_ok() {
-            repaired.previous_set_aside = previous.join(INFO_PLIST).is_file();
-            set_aside(&previous)?;
+        match path_exists(&previous) {
+            Ok(true) => {
+                repaired.previous_set_aside = previous.join(INFO_PLIST).is_file();
+                if let Err(e) = set_aside(&previous) {
+                    failures.push(e.to_string());
+                }
+            }
+            Ok(false) => {}
+            Err(e) => failures.push(e.to_string()),
+        }
+        if !failures.is_empty() {
+            let active = apps.join(BUNDLE);
+            let handoff = app_version(&active)
+                .ok_or_else(|| {
+                    usage(format!(
+                        "cannot identify installed version at {}",
+                        active.display()
+                    ))
+                })
+                .and_then(|version| journaled_refresh(apps, &active, &version));
+            if let Err(e) = handoff {
+                failures.push(e.to_string());
+            }
+            return Err(usage(format!(
+                "installed app cleanup is incomplete: {}; run `vox update` for local repair",
+                failures.join("; ")
+            )));
         }
         return Ok(repaired);
     }
+    let transition_path = journal.join(TRANSITION);
+    match fs::symlink_metadata(&transition_path) {
+        Ok(_) => return recover_transition(apps, &transition_path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(usage(format!(
+                "cannot inspect {}: {e}",
+                transition_path.display()
+            )))
+        }
+    }
     let staged = apps.join(PARTIAL);
     let previous = apps.join(PREVIOUS);
-    let published = fs::read_to_string(journal.join(PUBLISHING_VERSION)).unwrap_or_default();
-    repaired.interrupted_publish = true;
-    if fs::symlink_metadata(&previous).is_err() && staged.join(HELPER).is_file() {
-        if app_version(&apps.join(BUNDLE)).as_deref() == Some(published.trim()) {
-            fs::rename(&staged, &previous).map_err(AppError::Io)?;
-            set_aside(&previous)?;
-            println!(
-                "vox: an update was cut short after Vox {} was put in place; the Vox.app it \
-                 replaced is kept at {} for `vox update --rollback`",
-                published.trim(),
+    let version_path = journal.join(PUBLISHING_VERSION);
+    let published = fs::read_to_string(&version_path).map_err(|e| {
+        usage(format!(
+            "cannot read journal {}: {e}",
+            version_path.display()
+        ))
+    })?;
+    if semver::Version::parse(published.trim()).is_err() {
+        return Err(usage(format!(
+            "invalid version in journal {}",
+            version_path.display()
+        )));
+    }
+    let active_version = app_version(&apps.join(BUNDLE)).ok_or_else(|| {
+        usage(format!(
+            "cannot identify active version at {}; journal retained",
+            apps.join(BUNDLE).display()
+        ))
+    })?;
+    let previous_present = path_exists(&previous)?;
+    let staged_present = path_exists(&staged)?;
+    let staged_version = if staged_present {
+        Some(app_version(&staged).ok_or_else(|| {
+            usage(format!(
+                "cannot identify staged bundle at {}; journal retained",
+                staged.display()
+            ))
+        })?)
+    } else {
+        None
+    };
+    if staged_present
+        && (previous_present
+            || (active_version == published.trim()
+                && staged_version.as_deref() == Some(published.trim())))
+    {
+        return Err(usage(format!(
+            "ambiguous legacy journal {}; no bundles removed",
+            journal.display()
+        )));
+    }
+    if staged_present
+        && active_version != published.trim()
+        && staged_version.as_deref() != Some(published.trim())
+    {
+        return Err(usage(format!(
+            "ambiguous legacy journal {}; no bundles removed",
+            journal.display()
+        )));
+    }
+    if !staged_present && (active_version != published.trim() || !previous_present) {
+        return Err(usage(format!(
+            "ambiguous legacy journal {}; no bundles removed",
+            journal.display()
+        )));
+    }
+    if !staged_present {
+        let previous_version = app_version(&previous).ok_or_else(|| {
+            usage(format!(
+                "cannot identify retained bundle at {}; journal retained",
                 previous.display()
-            );
+            ))
+        })?;
+        if previous_version == published.trim() {
+            return Err(usage(format!(
+                "ambiguous same-version legacy journal {}; no bundles removed",
+                journal.display()
+            )));
+        }
+    }
+    // Upgrade only an unambiguous legacy layout. Capture only an app observed now; a legacy
+    // journal cannot tell us whether an earlier updater had already stopped a different app.
+    let active = apps.join(BUNDLE);
+    let running = inspect_app(&active, None)?;
+    let (source, target) = if active_version == published.trim() {
+        (if staged_present { &staged } else { &previous }, &active)
+    } else {
+        (&active, &staged)
+    };
+    let transition = transition_record(
+        source,
+        target,
+        TransitionKind::Update,
+        published.trim(),
+        &running,
+    )?;
+    write_transition(apps, &transition)?;
+    recover_transition(apps, &transition_path)
+}
+
+/// Recover using the bundle identities and owned handoff captured before the app was stopped.
+fn recover_transition(apps: &Path, path: &Path) -> Result<Recovery, AppError> {
+    use std::os::unix::ffi::OsStringExt as _;
+    let bytes =
+        fs::read(path).map_err(|e| usage(format!("cannot read {}: {e}", path.display())))?;
+    let mut transition: Transition = serde_json::from_slice(&bytes)
+        .map_err(|e| usage(format!("cannot parse {}: {e}", path.display())))?;
+    let valid_root = |bytes: &[u8]| {
+        !bytes.contains(&0)
+            && PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec())).is_absolute()
+    };
+    if (transition.source == transition.target)
+        != matches!(transition.kind, TransitionKind::Refresh)
+        || semver::Version::parse(&transition.version).is_err()
+        || !valid_root(&transition.daemon_data_root)
+        || !valid_root(&transition.daemon_config_dir)
+        || !transition.daemon.is_valid()
+        || (transition.handoff_complete && !(transition.daemon_complete && transition.app_complete))
+        || transition.app.as_ref().is_some_and(|app| {
+            app.pid == 0
+                || app.started == 0
+                || !valid_root(&app.data_root)
+                || !valid_root(&app.config_dir)
+                || app.data_root != transition.daemon_data_root
+                || app.config_dir != transition.daemon_config_dir
+                || app.home.as_ref().is_some_and(|v| v.contains(&0))
+                || app.xdg_data.as_ref().is_some_and(|v| v.contains(&0))
+                || app.xdg_config.as_ref().is_some_and(|v| v.contains(&0))
+        })
+    {
+        return Err(usage(format!(
+            "invalid transition {}; no bundles removed",
+            path.display()
+        )));
+    }
+    let active = apps.join(BUNDLE);
+    let previous = apps.join(PREVIOUS);
+    let staged = apps.join(PARTIAL);
+    let kept = apps.join(PUBLISHING).join(BUNDLE);
+    let current = bundle_identity(&active)?;
+    let committed =
+        if matches!(transition.kind, TransitionKind::Refresh) && current == transition.source {
+            false
+        } else if current == transition.target {
+            true
+        } else if current == transition.source {
+            false
+        } else {
+            return Err(usage(format!(
+                "ambiguous transition {}: active bundle identity changed; no bundles removed",
+                path.display()
+            )));
+        };
+    let now = app_version(&active).ok_or_else(|| {
+        usage(format!(
+            "cannot identify installed version at {}",
+            active.display()
+        ))
+    })?;
+    if (committed || matches!(transition.kind, TransitionKind::Refresh))
+        && now != transition.version
+    {
+        return Err(usage(format!(
+            "installed version does not match {}; no bundles removed",
+            path.display()
+        )));
+    }
+    let mut errors = Vec::new();
+    let normalize = || -> Result<(), AppError> {
+        match (&transition.kind, committed) {
+            (TransitionKind::Update, true) => {
+                if !path_exists(&previous)? {
+                    if bundle_identity(&staged)? != transition.source {
+                        return Err(usage(
+                            "retained update bundle identity does not match journal",
+                        ));
+                    }
+                    fs::rename(&staged, &previous).map_err(|e| {
+                        usage(format!(
+                            "cannot rename {} to {}: {e}",
+                            staged.display(),
+                            previous.display()
+                        ))
+                    })?;
+                }
+                if bundle_identity(&previous)? != transition.source {
+                    return Err(usage("previous bundle identity does not match journal"));
+                }
+                set_aside(&previous)?;
+            }
+            (TransitionKind::Update, false) => {
+                if path_exists(&kept)? {
+                    if path_exists(&previous)? {
+                        return Err(usage(
+                            "ambiguous rollback authority: both journal and previous bundles exist",
+                        ));
+                    }
+                    fs::rename(&kept, &previous).map_err(|e| {
+                        usage(format!(
+                            "cannot restore {} to {}: {e}",
+                            kept.display(),
+                            previous.display()
+                        ))
+                    })?;
+                }
+            }
+            (TransitionKind::Rollback, _) => {
+                let expected = if committed {
+                    &transition.source
+                } else {
+                    &transition.target
+                };
+                if &bundle_identity(&previous)? != expected {
+                    return Err(usage("rollback bundle identity does not match journal"));
+                }
+                set_aside(&previous)?;
+            }
+            (TransitionKind::Refresh, _) => {}
+        }
+        Ok(())
+    };
+    if let Err(e) = normalize() {
+        errors.push(e.to_string());
+    }
+    if let Err(e) = sync_dir(apps) {
+        errors.push(format!("cannot sync directory {}: {e}", apps.display()));
+    }
+    if !transition.handoff_complete {
+        let app = transition.app.as_ref().map(|intent| StoppedApp {
+            identity: AppIdentity {
+                pid: intent.pid,
+                started: intent.started,
+            },
+            account: vox_core::node::paths::Account {
+                data_root: PathBuf::from(std::ffi::OsString::from_vec(intent.data_root.clone())),
+                config_dir: PathBuf::from(std::ffi::OsString::from_vec(intent.config_dir.clone())),
+            },
+            environment: [
+                None,
+                None,
+                intent.home.clone().map(std::ffi::OsString::from_vec),
+                intent.xdg_data.clone().map(std::ffi::OsString::from_vec),
+                intent.xdg_config.clone().map(std::ffi::OsString::from_vec),
+            ],
+        });
+        if !transition.daemon_complete {
+            let account = vox_core::node::paths::Account {
+                data_root: PathBuf::from(std::ffi::OsString::from_vec(
+                    transition.daemon_data_root.clone(),
+                )),
+                config_dir: PathBuf::from(std::ffi::OsString::from_vec(
+                    transition.daemon_config_dir.clone(),
+                )),
+            };
+            match super::restart::restart_daemon_checked(
+                &account,
+                &active.join(HELPER),
+                &now,
+                Some(&transition.daemon),
+            ) {
+                Ok(detached) => {
+                    super::restart::say_next(&detached);
+                    transition.daemon_complete = true;
+                    if let Err(e) = write_transition(apps, &transition) {
+                        errors.push(e.to_string());
+                    }
+                }
+                Err(e) => errors.push(format!(
+                    "installed Vox {now}, but daemon handoff failed: {e}"
+                )),
+            }
+        }
+        let app_handoff = || -> Result<(), AppError> {
+            let mut app_already_restored = false;
+            if let Some(saved) = app.as_ref() {
+                if let Some(current) = inspect_app(&active, None)? {
+                    if current.identity.pid == saved.identity.pid
+                        && current.identity.started == saved.identity.started
+                    {
+                        if !committed {
+                            return Ok(());
+                        }
+                        stop_captured_app(&active, None, &app)?;
+                    } else {
+                        let same_profile = current.account.data_root == saved.account.data_root
+                            && current.account.config_dir == saved.account.config_dir
+                            && current.environment[2..] == saved.environment[2..];
+                        if !same_profile
+                            || !pid_executes(&active_executable(&active)?, current.identity.pid)?
+                        {
+                            return Err(usage("another app instance is running; refusing to guess interrupted handoff identity"));
+                        }
+                        let confirmed = inspect_app(&active, None)?.ok_or_else(|| {
+                            usage("replacement app exited while its identity was checked")
+                        })?;
+                        if confirmed.identity.pid != current.identity.pid
+                            || confirmed.identity.started != current.identity.started
+                            || confirmed.account.data_root != current.account.data_root
+                            || confirmed.account.config_dir != current.account.config_dir
+                            || confirmed.environment[2..] != current.environment[2..]
+                        {
+                            return Err(usage(
+                                "replacement app changed while its identity was checked",
+                            ));
+                        }
+                        // The exact active executable and captured profile are already running.
+                        // Do not quit or launch a second instance after an interrupted relaunch.
+                        app_already_restored = true;
+                    }
+                }
+            }
+            if app_already_restored {
+                Ok(())
+            } else {
+                relaunch_app(&active, &app)
+            }
+        };
+        if !transition.app_complete {
+            match app_handoff() {
+                Ok(()) => {
+                    transition.app_complete = true;
+                    if let Err(e) = write_transition(apps, &transition) {
+                        errors.push(e.to_string());
+                    }
+                }
+                Err(e) => errors.push(e.to_string()),
+            }
+        }
+        if transition.daemon_complete && transition.app_complete {
+            transition.handoff_complete = true;
+            if let Err(e) = write_transition(apps, &transition) {
+                errors.push(e.to_string());
+            }
+        }
+    }
+    if !errors.is_empty() {
+        return Err(usage(format!(
+            "Vox {now} is installed; transition remains incomplete{}: {}; run `vox update` for local repair",
+            if committed && matches!(transition.kind, TransitionKind::Rollback) {
+                "; do not repeat --rollback"
+            } else { "" },
+            errors.join("; ")
+        )));
+    }
+    if !committed && matches!(transition.kind, TransitionKind::Update) && path_exists(&staged)? {
+        if bundle_identity(&staged)? != transition.target {
+            return Err(usage("staged bundle identity changed; journal retained"));
+        }
+        if in_use(&staged) {
+            retire(apps, &staged)?;
         } else {
             clear(&staged)?;
         }
     }
-    let kept = journal.join(BUNDLE);
-    if fs::symlink_metadata(&previous).is_err() && fs::symlink_metadata(&kept).is_ok() {
-        // No exchange happened: restore the rollback bundle held by the journal.
-        fs::rename(&kept, &previous).map_err(AppError::Io)?;
-    }
-    // The previous bundle is set aside again under the lock, before anything else reads `apps`:
-    // one an earlier release left as an application, or one whose record removal failed.
-    if fs::symlink_metadata(&previous).is_ok() {
-        repaired.previous_set_aside |= previous.join(INFO_PLIST).is_file();
-        set_aside(&previous)?;
-    }
-    // Recovery has the same live-code retention obligation as an uninterrupted publish.
-    if fs::symlink_metadata(&kept).is_ok() {
-        if in_use(&kept) {
-            retire(apps, &kept)?;
-            repaired.retired_set_aside += 1;
-        } else {
-            set_aside(&kept)?;
-            clear(&kept)?;
-            repaired.retired_removed += 1;
-        }
-    }
-    if let Err(said) = launch_services(true, &apps.join(BUNDLE)) {
-        println!("note: {said}; the current Vox.app is in place and opens by path");
-    }
-    sync_dir(apps)?;
-    clear(&journal)?;
-    Ok(repaired)
+    finish_journal(apps).map_err(|e| usage(format!(
+        "Vox {now} is installed and handoff completed{}; cleanup failed: {e}; run `vox update` for local repair",
+        if committed && matches!(transition.kind, TransitionKind::Rollback) { "; do not repeat --rollback" } else { "" }
+    )))?;
+    Ok(Recovery {
+        interrupted_publish: true,
+        handoff_done: true,
+        ..Recovery::default()
+    })
 }
 
 /// Work left by an earlier transition, reported after the active daemon has been restarted.
 #[derive(Default)]
 struct Recovery {
     interrupted_publish: bool,
+    handoff_done: bool,
     previous_set_aside: bool,
     retired_set_aside: usize,
     retired_removed: usize,
@@ -577,23 +1406,37 @@ fn unpack(apps: &Path, zip: &Path) -> Result<PathBuf, AppError> {
     let unpacked = apps.join(UNPACK_PARTIAL);
     let staged = apps.join(PARTIAL);
     clear(&unpacked)?;
-    clear(&staged)?;
-    fs::create_dir(&unpacked).map_err(AppError::Io)?;
+    clear_candidate(&staged)?;
+    fs::create_dir(&unpacked).map_err(|e| {
+        usage(format!(
+            "cannot create directory {}: {e}",
+            unpacked.display()
+        ))
+    })?;
     let out = Command::new("/usr/bin/ditto")
         .args(["-x", "-k"])
         .arg(zip)
         .arg(&unpacked)
         .output()
-        .map_err(AppError::Io)?;
+        .map_err(|e| {
+            usage(format!(
+                "cannot unpack {} to {} with ditto: {e}",
+                zip.display(),
+                unpacked.display()
+            ))
+        })?;
     if !out.status.success() {
         let _ = clear(&unpacked);
         return Err(usage("the downloaded Vox.app did not unpack"));
     }
     let entries: Vec<String> = fs::read_dir(&unpacked)
-        .map_err(AppError::Io)?
-        .filter_map(Result::ok)
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .collect();
+        .map_err(|e| usage(format!("cannot read directory {}: {e}", unpacked.display())))?
+        .map(|entry| {
+            entry
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .map_err(|e| usage(format!("cannot read entry in {}: {e}", unpacked.display())))
+        })
+        .collect::<Result<_, _>>()?;
     let bundle = unpacked.join(BUNDLE);
     let is_dir = fs::symlink_metadata(&bundle).is_ok_and(|m| m.is_dir());
     if entries != [BUNDLE] || !is_dir {
@@ -602,7 +1445,13 @@ fn unpack(apps: &Path, zip: &Path) -> Result<PathBuf, AppError> {
             "the downloaded zip holds {entries:?}, not exactly {BUNDLE}"
         )));
     }
-    fs::rename(&bundle, &staged).map_err(AppError::Io)?;
+    fs::rename(&bundle, &staged).map_err(|e| {
+        usage(format!(
+            "cannot rename {} to {}: {e}",
+            bundle.display(),
+            staged.display()
+        ))
+    })?;
     clear(&unpacked)?;
     Ok(staged)
 }
@@ -725,11 +1574,14 @@ fn app_version(bundle: &Path) -> Option<String> {
 }
 
 fn sha256_of(path: &Path) -> Result<[u8; 32], AppError> {
-    let mut file = fs::File::open(path).map_err(AppError::Io)?;
+    let mut file =
+        fs::File::open(path).map_err(|e| usage(format!("cannot open {}: {e}", path.display())))?;
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; IO_BUFFER_BYTES];
     loop {
-        let read = file.read(&mut buffer).map_err(AppError::Io)?;
+        let read = file
+            .read(&mut buffer)
+            .map_err(|e| usage(format!("cannot read {}: {e}", path.display())))?;
         if read == 0 {
             return Ok(hasher.finalize().into());
         }
@@ -737,12 +1589,24 @@ fn sha256_of(path: &Path) -> Result<[u8; 32], AppError> {
     }
 }
 
+fn clear_candidate(path: &Path) -> Result<(), AppError> {
+    if path_exists(path)? && in_use(path) {
+        return Err(usage(format!(
+            "cannot safely remove {}: executable use is active or unknown",
+            path.display()
+        )));
+    }
+    clear(path)
+}
+
 /// Remove `path` if it is there, scratch from a transition that was cut short or the bundle
 /// about to be replaced. Read-only folders inside are made writable first: a folder's entries
 /// cannot be removed while it is read-only.
 fn clear(path: &Path) -> Result<(), AppError> {
-    let Ok(meta) = fs::symlink_metadata(path) else {
-        return Ok(());
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(usage(format!("cannot inspect {}: {e}", path.display()))),
     };
     if meta.is_dir() {
         writable(path)?;
@@ -752,7 +1616,7 @@ fn clear(path: &Path) -> Result<(), AppError> {
     }
     .map_err(|e| {
         usage(format!(
-            "cannot clear {}: {e}\n       remove it by hand, then run this again",
+            "cannot remove {}: {e}; retain it and run `vox update` for local repair",
             path.display()
         ))
     })
@@ -760,13 +1624,23 @@ fn clear(path: &Path) -> Result<(), AppError> {
 
 fn writable(dir: &Path) -> Result<(), AppError> {
     let mode = fs::symlink_metadata(dir)
-        .map_err(AppError::Io)?
+        .map_err(|e| usage(format!("cannot inspect {}: {e}", dir.display())))?
         .permissions()
         .mode();
-    fs::set_permissions(dir, fs::Permissions::from_mode(mode | 0o700)).map_err(AppError::Io)?;
-    for entry in fs::read_dir(dir).map_err(AppError::Io)? {
-        let entry = entry.map_err(AppError::Io)?;
-        if entry.file_type().map_err(AppError::Io)?.is_dir() {
+    if mode & 0o700 != 0o700 {
+        fs::set_permissions(dir, fs::Permissions::from_mode(mode | 0o700))
+            .map_err(|e| usage(format!("cannot chmod {}: {e}", dir.display())))?;
+    }
+    for entry in fs::read_dir(dir)
+        .map_err(|e| usage(format!("cannot read directory {}: {e}", dir.display())))?
+    {
+        let entry =
+            entry.map_err(|e| usage(format!("cannot read entry in {}: {e}", dir.display())))?;
+        if entry
+            .file_type()
+            .map_err(|e| usage(format!("cannot inspect {}: {e}", entry.path().display())))?
+            .is_dir()
+        {
             writable(&entry.path())?;
         }
     }
@@ -796,6 +1670,79 @@ fn pids_using(path: &Path) -> Result<Vec<u32>, AppError> {
                 .map_err(|_| usage("lsof returned invalid process IDs"))
         })
         .collect()
+}
+
+/// Verify the process maps this file as executable text, not merely that it opened the file.
+fn pid_executes(path: &Path, pid: u32) -> Result<bool, AppError> {
+    let out = Command::new("/usr/sbin/lsof")
+        .args(["-a", "-t", "-d", "txt", "-p"])
+        .arg(pid.to_string())
+        .arg(path)
+        .env_clear()
+        .output()
+        .map_err(|e| {
+            usage(format!(
+                "cannot inspect executable {} for pid {pid}: {e}",
+                path.display()
+            ))
+        })?;
+    if !out.status.success() && (out.status.code() != Some(1) || !out.stderr.is_empty()) {
+        return Err(usage(format!(
+            "cannot inspect executable {} for pid {pid}: {}",
+            path.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    let text =
+        std::str::from_utf8(&out.stdout).map_err(|_| usage("lsof returned invalid process IDs"))?;
+    let mut matched = false;
+    for line in text.lines() {
+        let found: u32 = line
+            .parse()
+            .map_err(|_| usage("lsof returned invalid process IDs"))?;
+        matched |= found == pid;
+    }
+    Ok(matched)
+}
+
+fn active_executable(bundle: &Path) -> Result<PathBuf, AppError> {
+    let plist = bundle.join(INFO_PLIST);
+    let out = Command::new("/usr/libexec/PlistBuddy")
+        .args(["-c", "Print :CFBundleExecutable"])
+        .arg(&plist)
+        .env_clear()
+        .output()
+        .map_err(|e| usage(format!("cannot inspect {}: {e}", plist.display())))?;
+    if !out.status.success() || out.stdout.len() > MAX_VERSION_OUTPUT_BYTES {
+        return Err(usage(format!(
+            "cannot identify executable in {}",
+            plist.display()
+        )));
+    }
+    let name = std::str::from_utf8(&out.stdout)
+        .map_err(|_| usage(format!("invalid executable name in {}", plist.display())))?
+        .trim();
+    let path = Path::new(name);
+    if name.is_empty()
+        || path.components().count() != 1
+        || !matches!(
+            path.components().next(),
+            Some(std::path::Component::Normal(_))
+        )
+    {
+        return Err(usage(format!(
+            "invalid executable name in {}",
+            plist.display()
+        )));
+    }
+    let executable = bundle.join("Contents/MacOS").join(name);
+    if !executable.is_file() {
+        return Err(usage(format!(
+            "active app executable {} is unavailable",
+            executable.display()
+        )));
+    }
+    Ok(executable)
 }
 
 /// Finish the app handoff only when the caller is the newly installed helper invoked by the
@@ -888,8 +1835,7 @@ pub(super) fn post_install_delegate() -> Result<(), AppError> {
     let now = app_version(&active).ok_or_else(|| {
         usage("the installed app version cannot be identified; the app was not relaunched")
     })?;
-    restart_for_handoff(&active, &now, &stopped)?;
-    relaunch_app(&active, &stopped)?;
+    handoff_unjournaled(&active, &now, &stopped)?;
     println!("vox: the installed Vox app was relaunched; no manual restart is needed");
     Ok(())
 }
@@ -1019,11 +1965,13 @@ fn app_handoff(
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
-fn stop_app(active: &Path) -> Result<Option<StoppedApp>, AppError> {
-    stop_app_from(active, None)
+fn stop_app_from(active: &Path, previous: Option<&Path>) -> Result<Option<StoppedApp>, AppError> {
+    let app = inspect_app(active, previous)?;
+    stop_captured_app(active, previous, &app)?;
+    Ok(app)
 }
 
-fn stop_app_from(active: &Path, previous: Option<&Path>) -> Result<Option<StoppedApp>, AppError> {
+fn inspect_app(active: &Path, previous: Option<&Path>) -> Result<Option<StoppedApp>, AppError> {
     let action = if previous.is_some() {
         "legacy-inspect"
     } else {
@@ -1074,12 +2022,6 @@ fn stop_app_from(active: &Path, previous: Option<&Path>) -> Result<Option<Stoppe
         data_root: root(&env[0], &env[3])?,
         config_dir: root(&env[1], &env[4])?,
     };
-    let action = if previous.is_some() {
-        "legacy-stop"
-    } else {
-        "stop"
-    };
-    app_handoff(action, active, Some(&identity), previous)?;
     Ok(Some(StoppedApp {
         identity,
         account,
@@ -1087,25 +2029,37 @@ fn stop_app_from(active: &Path, previous: Option<&Path>) -> Result<Option<Stoppe
     }))
 }
 
+fn stop_captured_app(
+    active: &Path,
+    previous: Option<&Path>,
+    app: &Option<StoppedApp>,
+) -> Result<(), AppError> {
+    let Some(app) = app else { return Ok(()) };
+    let action = if previous.is_some() {
+        "legacy-stop"
+    } else {
+        "stop"
+    };
+    app_handoff(action, active, Some(&app.identity), previous)?;
+    Ok(())
+}
+
 fn restart_for_handoff(
     active: &Path,
     now: &str,
     stopped: &Option<StoppedApp>,
+    intent: Option<&super::restart::DaemonIntent>,
 ) -> Result<(), AppError> {
     use vox_core::node::paths::Account;
     let restart = |account: &Account| {
-        let detached = super::restart::restart_daemon_checked(account, &active.join(HELPER), now)
-            .map_err(|e| {
-            usage(format!(
-                "{} is in place, but the daemon restart failed: {e}{}",
-                active.display(),
-                if stopped.is_some() {
-                    "; the stopped app was not relaunched"
-                } else {
-                    ""
-                }
-            ))
-        })?;
+        let detached =
+            super::restart::restart_daemon_checked(account, &active.join(HELPER), now, intent)
+                .map_err(|e| {
+                    usage(format!(
+                        "{} is in place, but the daemon restart failed: {e}",
+                        active.display()
+                    ))
+                })?;
         super::restart::say_next(&detached);
         Ok::<(), AppError>(())
     };
@@ -1171,24 +2125,103 @@ fn relaunch_app(active: &Path, stopped: &Option<StoppedApp>) -> Result<(), AppEr
     Ok(())
 }
 
-/// A publication can fail before or after its atomic swap. Reopen whichever bundle remains
-/// active, and report both the original failure and any failure to reopen it.
-fn transition_failed(active: &Path, stopped: &Option<StoppedApp>, error: AppError) -> AppError {
-    let reopened = app_version(active)
-        .ok_or_else(|| {
-            usage("the active app version is unavailable; the stopped app was not relaunched")
-        })
-        .and_then(|version| restart_for_handoff(active, &version, stopped))
-        .and_then(|()| relaunch_app(active, stopped));
-    match reopened {
-        Ok(()) => usage(format!(
-            "the app transition did not finish: {error}; {} is in place",
-            active.display()
-        )),
-        Err(relaunch) => usage(format!(
-            "the app transition did not finish: {error}; {relaunch}"
-        )),
+fn handoff_unjournaled(
+    active: &Path,
+    version: &str,
+    stopped: &Option<StoppedApp>,
+) -> Result<(), AppError> {
+    let daemon = restart_for_handoff(active, version, stopped, None);
+    let app = relaunch_app(active, stopped);
+    match (daemon, app) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(e), Ok(())) | (Ok(()), Err(e)) => Err(e),
+        (Err(a), Err(b)) => Err(usage(format!("{a}; {b}"))),
     }
+}
+
+fn journaled_refresh(apps: &Path, active: &Path, version: &str) -> Result<(), AppError> {
+    let running = inspect_app(active, None)?;
+    let mut transition =
+        prepare_transition(apps, active, TransitionKind::Refresh, version, &running)?;
+    stop_captured_app(active, None, &running)?;
+    transition_handoff(apps, active, version, &running, &mut transition)?;
+    finish_journal(apps)
+}
+
+fn transition_handoff(
+    apps: &Path,
+    active: &Path,
+    version: &str,
+    stopped: &Option<StoppedApp>,
+    transition: &mut Transition,
+) -> Result<(), AppError> {
+    let mut failures = Vec::new();
+    if !transition.daemon_complete {
+        match restart_for_handoff(active, version, stopped, Some(&transition.daemon)) {
+            Ok(()) => {
+                transition.daemon_complete = true;
+                if let Err(e) = write_transition(apps, transition) {
+                    failures.push(e.to_string());
+                }
+            }
+            Err(e) => failures.push(e.to_string()),
+        }
+    }
+    if !transition.app_complete {
+        match relaunch_app(active, stopped) {
+            Ok(()) => {
+                transition.app_complete = true;
+                if let Err(e) = write_transition(apps, transition) {
+                    failures.push(e.to_string());
+                }
+            }
+            Err(e) => failures.push(e.to_string()),
+        }
+    }
+    if transition.daemon_complete && transition.app_complete {
+        transition.handoff_complete = true;
+        if let Err(e) = write_transition(apps, transition) {
+            failures.push(e.to_string());
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(usage(failures.join("; ")))
+    }
+}
+
+/// Report the original failure without skipping an independently possible owned handoff.
+fn transition_failed_journal(
+    apps: &Path,
+    stopped: &Option<StoppedApp>,
+    transition: &mut Transition,
+    error: AppError,
+) -> AppError {
+    let active = apps.join(BUNDLE);
+    let version = app_version(&active);
+    let mut failures = vec![error.to_string()];
+    let reopened = version
+        .as_ref()
+        .ok_or_else(|| {
+            usage("active app version is unavailable; the stopped app was not relaunched")
+        })
+        .and_then(|version| transition_handoff(apps, &active, version, stopped, transition));
+    if let Err(e) = reopened {
+        failures.push(e.to_string());
+    }
+    let committed_rollback = matches!(transition.kind, TransitionKind::Rollback)
+        && bundle_identity(&active).is_ok_and(|identity| identity == transition.target);
+    usage(format!(
+        "Vox {} is installed{}; transition incomplete: {}; run `vox update` for local repair",
+        version.as_deref().unwrap_or("with unknown version"),
+        if committed_rollback {
+            "; do not repeat --rollback"
+        } else {
+            ""
+        },
+        failures.join("; ")
+    ))
 }
 
 /// Refresh completions and the agent skill pack through the path the person ran, when that is
