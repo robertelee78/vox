@@ -906,16 +906,19 @@ fn install_sh_installs_what_it_verified_and_refuses_what_it_could_not() {
                 .output()
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
                 .unwrap_or_default();
-            let said_where = text.contains(&format!("installed: {}", app.display()));
+            let linked_to_app = match (
+                std::fs::canonicalize(&link),
+                std::fs::canonicalize(app.join("Contents/Helpers/vox")),
+            ) {
+                (Ok(link), Ok(helper)) => link == helper,
+                _ => false,
+            };
             claims.push(claim(
                 id,
-                ok && link == app.join("Contents/Helpers/vox")
-                    && !app_version.is_empty()
-                    && version == format!("vox {app_version}")
-                    && said_where,
+                ok && linked_to_app && app_version == SERVED && version == format!("vox {SERVED}"),
                 format!(
                     "exit_ok={ok}, ~/.local/bin/vox -> {}, it reports {version:?}, the app says \
-                     {app_version:?}, said where={said_where}, said {text:?}",
+                     {app_version:?}, linked to selected app={linked_to_app}, said {text:?}",
                     link.display()
                 ),
             ));
