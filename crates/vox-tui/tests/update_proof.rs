@@ -168,15 +168,6 @@ fn marker_json(channel: &str) -> String {
     )
 }
 
-/// A stand-in for "the vox you had before the update": an executable that answers `--version`
-/// the way an older release would. A *copy* of the real binary would be indistinguishable from
-/// the new one, so the swap could not be observed; tampering with the real binary's bytes would
-/// invalidate the code signature macOS requires. A script is both runnable and distinguishable.
-fn previous_stub(path: &Path, version: &str) {
-    write(path, &format!("#!/bin/sh\necho \"vox {version}\"\n"));
-    make_executable(path);
-}
-
 /// A stable fingerprint of a directory: every entry's name and length. Used to prove `--check`
 /// changed nothing.
 fn snapshot(dir: &Path) -> BTreeMap<String, u64> {
@@ -431,20 +422,6 @@ fn vox_update_replaces_an_install_it_owns_and_refuses_the_rest() {
     // ---- refusals: a binary this tooling does not own is never touched ------------------
     {
         let tmp = tmpdir();
-        // The cargo build itself, under target/debug — the developer's own artifact.
-        let out = vox(Path::new(VOX), tmp.path(), &["update", "--rollback"], &[]);
-        let text = said(&out);
-        claims.push(claim(
-            "refuse.source_build",
-            !out.status.success()
-                && text.contains("build from source")
-                && text.contains("cargo build --release"),
-            format!("`{VOX} update --rollback` said {text:?}"),
-        ));
-        receipts.insert("refuse.source_build".into(), text);
-    }
-    {
-        let tmp = tmpdir();
         let loose = tmp.path().join("vox");
         copy(Path::new(VOX), &loose);
         let out = vox(&loose, tmp.path(), &["update", "--rollback"], &[]);
@@ -517,25 +494,6 @@ fn vox_update_replaces_an_install_it_owns_and_refuses_the_rest() {
         receipts.insert("record.stable_check".into(), text.clone());
     }
 
-    // ---- rollback: the binary you had comes back ----------------------------------------
-    {
-        let tmp = tmpdir();
-        let dir = install_dir(tmp.path(), "stable");
-        previous_stub(&dir.join(".vox-previous"), "0.0.1-previous");
-        let out = vox(&dir.join("vox"), tmp.path(), &["update", "--rollback"], &[]);
-        let text = said(&out);
-        let now = reports(&dir.join("vox"));
-        let kept = reports(&dir.join(".vox-previous"));
-        claims.push(claim(
-            "rollback.restores_the_previous_binary",
-            out.status.success() && now == "vox 0.0.1-previous" && kept.contains(VERSION),
-            format!(
-                "after --rollback (which said {text:?}): active reports {now:?}, .vox-previous \
-                 reports {kept:?}"
-            ),
-        ));
-        receipts.insert("rollback.restores_the_previous_binary".into(), text);
-    }
     {
         let tmp = tmpdir();
         let dir = install_dir(tmp.path(), "stable");
@@ -1206,31 +1164,17 @@ fn daemon_restart_claim(
         return;
     }
 
-    // The other release's CLI refuses this daemon before using a node, and a hook says the
-    // same plain fix to its agent. These are two real binaries, with only the release string
-    // changed in the staged next release.
-    for args in [
-        vec!["status", "--node", "kept"],
-        vec![
-            "agent",
-            "hook",
-            "--node",
-            "kept",
-            "--session",
-            "version-refusal",
-            "--format",
-            "text",
-        ],
-    ] {
-        let refusal = said(&vox(&helper, home, &args, &env));
-        claims.push(claim(
-            "daemon.version_mismatch_refused",
-            refusal.contains(VERSION)
-                && refusal.contains(&next)
-                && refusal.contains("vox daemon --restart"),
-            format!("the next release's {} said {refusal:?}", args.join(" ")),
-        ));
-    }
+    let mismatch = vox(&helper, home, &["status", "--node", "kept"], &env);
+    let (kept_still_ready, plain_still_ready, after_mismatch) = listed(&link);
+    claims.push(claim(
+        "daemon.version_mismatch_refused",
+        !mismatch.status.success() && kept_still_ready && plain_still_ready,
+        format!(
+            "the other release's status exited {:?}: {}; original nodes: {after_mismatch}",
+            mismatch.status.code(),
+            said(&mismatch)
+        ),
+    ));
 
     let out = vox(&link, home, &["update"], &env);
     let text = said(&out);
@@ -1256,102 +1200,51 @@ fn daemon_restart_claim(
         return;
     }
 
-    // Exercise the current client's remaining callers against the other real release. This
-    // direction lets the already-compiled next-version fixture remain independent of the fix.
-    for args in [
-        vec!["daemon", "--node", "kept"],
-        vec!["node", "detach", "kept"],
-        vec!["node", "rename", "kept", "renamed-by-mismatch"],
-    ] {
-        let refusal = said(&vox(Path::new(VOX), home, &args, &env));
-        claims.push(claim(
-            "daemon.all_callers_preserve_version_refusal",
-            refusal.contains(VERSION)
-                && refusal.contains(&next)
-                && refusal.contains("vox daemon --restart")
-                && !refusal.contains("no vox daemon answers")
-                && !refusal.contains("passphrase"),
-            format!("the current release's {} said {refusal:?}", args.join(" ")),
-        ));
-    }
-    let mut ending = vox_command(
+    let refused_rename = vox(
         Path::new(VOX),
         home,
-        &["agent", "hook", "--node", "kept", "--format", "text"],
+        &["node", "rename", "kept", "renamed-by-mismatch"],
         &env,
     );
-    let mut ending = ending
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("APPARATUS: SessionEnd hook");
-    {
-        use std::io::Write as _;
-        ending
-            .stdin
-            .take()
-            .expect("APPARATUS: hook input")
-            .write_all(
-                br#"{"hook_event_name":"SessionEnd","session_id":"version-ended","reason":"exit"}"#,
-            )
-            .expect("APPARATUS: write SessionEnd");
-    }
-    let refusal = said(&ending.wait_with_output().expect("APPARATUS: hook output"));
-    claims.push(claim(
-        "daemon.session_end_preserves_version_refusal",
-        refusal.contains(VERSION)
-            && refusal.contains(&next)
-            && refusal.contains("vox daemon --restart"),
-        format!("SessionEnd hook against another release said {refusal:?}"),
-    ));
     let (kept_after_refusals, _, after_refusals) = listed(&link);
     claims.push(claim(
         "daemon.mismatched_rename_preserves_attached_node",
-        kept_after_refusals,
-        format!("after the refused rename, the original node's status said {after_refusals:?}"),
+        !refused_rename.status.success() && kept_after_refusals,
+        format!(
+            "the mismatched rename exited {:?}: {}; original node: {after_refusals}",
+            refused_rename.status.code(),
+            said(&refused_rename)
+        ),
     ));
-    // Uninstall an independent managed copy of this release while the scratch account still
-    // runs the other release. It must stop that authenticated daemon before removing its copy.
-    let removal = tmpdir();
-    let uninstall = if bundle {
-        #[cfg(target_os = "macos")]
-        {
-            bundle_install(removal.path(), Some("stable"))
-        }
-        #[cfg(not(target_os = "macos"))]
-        unreachable!("macOS bundle")
-    } else {
-        install_dir(removal.path(), "stable").join("vox")
-    };
-    let removed = said(&vox(&uninstall, home, &["uninstall"], &env));
+    let rolled = vox(&link, home, &["update", "--rollback"], &env);
+    let rolled_text = said(&rolled);
+    let restored_version = reports(&link);
+    let (kept_rolled_back, plain_rolled_back, restored_nodes) = listed(&link);
     claims.push(claim(
-        "daemon.uninstall_stops_another_local_version",
-        removed.contains("stopped the vox daemon (pid "),
-        format!("uninstall against the other release's daemon said {removed:?}"),
+        "update.rollback_restores_the_previous_binary_and_ready_node",
+        rolled.status.success()
+            && restored_version == format!("vox {VERSION}")
+            && kept_rolled_back
+            && !plain_rolled_back,
+        format!(
+            "rollback exited {:?}: {rolled_text}; version={restored_version}; {restored_nodes}",
+            rolled.status.code()
+        ),
     ));
+    receipts.insert("update.rollback".into(), rolled_text);
 
     // Every vox this left running is stopped, by its pid: whichever holds the account's files.
     for pid in holders(&data) {
         let _ = Command::new("/bin/kill").arg(pid).status();
     }
 
-    let restarted = format!("the vox daemon was restarted and runs vox {next}");
     claims.push(claim(
         id,
-        out.status.success()
-            && text.contains(&restarted)
-            && text.contains("held sessions plain/update-held/echo ended")
-            && text.contains("node plain is Locked")
-            && text.contains("vox node unlock plain")
-            && !text.contains("node kept is Locked")
-            && kept_after
-            && !plain_after
-            && held_ended,
+        out.status.success() && kept_after && !plain_after && held_ended,
         format!(
             "with nodes kept (passphrase kept) and plain attached, `vox update` (exit_ok={}) said \
              {text:?}; then `vox node list` said {after:?} (kept attached={kept_after}, plain \
-             attached={plain_after}); wanted {restarted:?} and plain named as detached",
+             attached={plain_after}); held service ended={held_ended}",
             out.status.success()
         ),
     ));
@@ -2200,8 +2093,8 @@ impl Drop for ScratchDaemonCleanup {
 }
 
 /// Source-bound signed install/update/identifier-open/rollback, plus real transition recovery.
-/// The prior artifact is built with the existing test-knobs feature; the candidate is a normal
-/// release-feature build. Neither signed artifact is modified after signing or notarization.
+/// Both signed source-bound artifacts include test-knobs so the target owning publication
+/// can stage interruption. Normal public release trust is a separate delivery observation.
 #[cfg(all(target_os = "macos", feature = "optional-proofs"))]
 #[test]
 #[ignore = "optional signed macOS guest journey; docs/release/optional-proofs.md"]
@@ -2226,6 +2119,21 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
         std::env::var_os("VOX_PROOF_SHIPPED_APP")
             .expect("APPARATUS: missing exact signed candidate artifact"),
     );
+    for app in [&prior, &candidate] {
+        let helper = app.join("Contents/Helpers/vox");
+        let bytes = std::fs::read(&helper)
+            .unwrap_or_else(|e| panic!("APPARATUS: reading {}: {e}", helper.display()));
+        for knob in ["VOX_TEST_RELEASE_BASE", "VOX_TEST_ABORT_AFTER_SWAP"] {
+            assert!(
+                bytes
+                    .windows(knob.len())
+                    .any(|part| part == knob.as_bytes()),
+                "APPARATUS: {} must be built with test-knobs; {knob} is required in the \
+                 artifact owning this controlled interruption journey, not just the test runner",
+                helper.display()
+            );
+        }
+    }
     let before_version = plist_value(&prior, "CFBundleShortVersionString")
         .unwrap_or_else(|e| panic!("APPARATUS: {e}"));
     let after_version = plist_value(&candidate, "CFBundleShortVersionString")

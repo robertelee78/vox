@@ -60,17 +60,19 @@ cargo test --release -p vox-tui --features optional-proofs,test-knobs \
   an_update_and_rollback_leave_one_launchable_vox --nocapture
 ```
 
-For current-source recovery evidence, assemble a genuine native prior bundle at the current
-workspace version with the existing `test-knobs` feature in its helper, and a newer candidate
-from the same source with only the workspace-version delta and **normal release features**.
-Developer ID sign and notarize the helpers and complete bundles before supplying them. Record
-the source patch, both versions, feature selections, artifact digests and Apple's receipts.
-The prior's existing loopback selector serves the signed candidate's helper. When that helper
-uses normal release features, the candidate version must already be published: its updater
-fetches the pinned app record and archive from GitHub, not the test-only loopback origin.
-Before publication, a controlled two-version loopback journey needs a target built with
-`test-knobs` and cannot establish normal-artifact release trust. Record these source-bound
-and published-prior claims separately; neither proves the other.
+For current-source recovery evidence, assemble a genuine native prior bundle and a newer
+candidate from the same source with only the workspace-version delta. Both helpers must be
+built with the existing `test-knobs` feature: publication and its interruption now belong to
+the downloaded target, so a knob compiled only into the prior or test runner cannot stage it.
+The journey checks the supplied helpers as an apparatus precondition. Developer ID sign and
+notarize both complete bundles before supplying them; change neither after signing. Record
+the source delta, versions, feature selections, artifact digests and Apple's receipts.
+
+This source-bound interruption proof is not normal-artifact release-trust evidence. Record
+the untouched public-prior → normal public-candidate upgrade separately, using the published
+release endpoint and normal signature checks. Before publication, controlled loopback target
+execution requires test-knobs and cannot establish normal-artifact delivery. An older public
+caller without the bootstrap still cannot establish pre-publication target ownership.
 
 The journey drives `install.sh`, the physically installed helpers, real publish interruption,
 identifier launches, rollback, graceful quit, a real live retirement, and a read-only-Contents
