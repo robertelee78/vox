@@ -27,6 +27,7 @@
 
 use std::fs;
 use std::io::{Read as _, Write as _};
+use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -1002,11 +1003,29 @@ pub fn run(check_only: bool, rollback: bool) -> Result<u8, AppError> {
         .mode(0o700)
         .open(&candidate)
         .map_err(AppError::Io)?;
-    download_asset(
+    if let Err(error) = download_asset(
         &release,
         &format!("vox-{}", release.target),
         &mut downloading,
-    )?;
+    ) {
+        #[cfg(target_os = "macos")]
+        if let Channel::Bundle { apps_dir, .. } = &installed {
+            match bundle::repair(apps_dir, &exe) {
+                Ok(true) => {
+                    return Err(usage(format!(
+                        "local repair completed; the newer updater could not be downloaded: {error}"
+                    )));
+                }
+                Err(repair) => {
+                    return Err(usage(format!(
+                        "{error}; local repair also failed: {repair}"
+                    )));
+                }
+                Ok(false) => {}
+            }
+        }
+        return Err(error);
+    }
     downloading
         .set_permissions(fs::Permissions::from_mode(0o555))
         .map_err(AppError::Io)?;
@@ -1014,7 +1033,7 @@ pub fn run(check_only: bool, rollback: bool) -> Result<u8, AppError> {
     drop(downloading);
     verify_candidate(&exe, &candidate, &release.version_text)?;
     let request = ApplyRequest {
-        installed_exe: exe,
+        installed_exe: exe.as_os_str().as_bytes().to_vec(),
         record: release.record,
     };
     let bytes = serde_json::to_vec(&request).map_err(|_| usage("cannot encode update request"))?;
@@ -1041,12 +1060,12 @@ pub fn run(check_only: bool, rollback: bool) -> Result<u8, AppError> {
         .clamp(0, 255) as u8)
 }
 
-const MAX_REQUEST_BYTES: usize = MAX_RECORD_BYTES + 16 * 1024;
+const MAX_REQUEST_BYTES: usize = MAX_RECORD_BYTES + 32 * 1024;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ApplyRequest {
-    installed_exe: PathBuf,
+    installed_exe: Vec<u8>,
     record: ReleaseRecord,
 }
 
@@ -1095,8 +1114,9 @@ pub(crate) fn apply_request(path: &Path) -> Result<(), AppError> {
     }
     let request: ApplyRequest =
         serde_json::from_slice(&bytes).map_err(|_| usage("invalid update request"))?;
-    let active = fs::canonicalize(&request.installed_exe).map_err(AppError::Io)?;
-    if active != request.installed_exe {
+    let installed_exe = PathBuf::from(std::ffi::OsString::from_vec(request.installed_exe));
+    let active = fs::canonicalize(&installed_exe).map_err(AppError::Io)?;
+    if active != installed_exe {
         return Err(usage("update request executable is not canonical"));
     }
     let installed = detect_channel(&active)?;
