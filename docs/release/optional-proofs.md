@@ -19,13 +19,19 @@ They are kept "at the ready for troubleshooting". When a user reports one of the
 
 ### macOS update recovery (ADR-014 M-29a)
 
-A plain `vox update` first repairs the local install under its transition lock, before asking
-GitHub for release metadata. If an earlier publish was interrupted, a previous bundle still has
-its live `Contents/Info.plist`, or a retired bundle needs disarming or removal, this invocation
-finishes that repair **without another bundle exchange**. It restarts a running scratch daemon
-through the active bundle's helper, refreshes shell integration, and ends with
-`repaired an earlier app transition without swapping Vox.app`, naming the repaired state.
-Run `vox update` again when a separate release update is wanted. `--check` remains read-only.
+For a newer release, `vox update` downloads and verifies its updater before transferring the
+same invocation to it. The target owns the transition lock, retained local recovery and the
+new installation. Repair does not suppress an available newer upgrade. If release lookup or
+engine download is unavailable, installed code can still finish retained local work; that
+repair is reported separately from the failed upgrade. `--check` remains read-only and
+`--rollback` remains local. A repair of a committed rollback must not exchange the bundles again.
+
+The existing controlled bundle and daemon journeys require `VOX_PROOF_NEXT_BINARY` to name a
+genuinely compiled next-version helper, built with `test-knobs`; for workspace version
+`0.4.13`, their existing next-version convention is `9.4.13`. A `--version` script or patched
+version string is not a next-release binary. Their release fixture serves that exact signed
+helper and tag-pinned app records. Native app launch/registration claims remain in the signed
+guest journey below; the controlled CLI bundle fixture does not establish them.
 
 On macOS, daemon restart recognizes a kernel zombie state or native process-lookup `ESRCH`
 as stopped even if the terminal or service-manager parent has not reaped the PID yet.
@@ -59,10 +65,12 @@ workspace version with the existing `test-knobs` feature in its helper, and a ne
 from the same source with only the workspace-version delta and **normal release features**.
 Developer ID sign and notarize the helpers and complete bundles before supplying them. Record
 the source patch, both versions, feature selections, artifact digests and Apple's receipts.
-The prior's existing loopback-release selector serves the signed candidate; the normal candidate
-repairs local interrupted state before networking. No apps-directory selector is needed.
-These are source-bound signed artifacts, not a claim that the proof-only prior was a published
-release. Keep previously published-artifact runs separately attributed.
+The prior's existing loopback selector serves the signed candidate's helper. When that helper
+uses normal release features, the candidate version must already be published: its updater
+fetches the pinned app record and archive from GitHub, not the test-only loopback origin.
+Before publication, a controlled two-version loopback journey needs a target built with
+`test-knobs` and cannot establish normal-artifact release trust. Record these source-bound
+and published-prior claims separately; neither proves the other.
 
 The journey drives `install.sh`, the physically installed helpers, real publish interruption,
 identifier launches, rollback, graceful quit, a real live retirement, and a read-only-Contents

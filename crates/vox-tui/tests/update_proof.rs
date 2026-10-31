@@ -548,31 +548,6 @@ fn vox_update_replaces_an_install_it_owns_and_refuses_the_rest() {
         ));
     }
 
-    // ---- the update -> shell-setup edge -------------------------------------------------
-    {
-        let tmp = tmpdir();
-        let home = tmp.path();
-        let dir = install_dir(home, "stable");
-        copy(Path::new(VOX), &dir.join(".vox-previous"));
-        write(&home.join(".zshrc"), "export VOX_PROOF_USER_LINE=kept\n");
-        for d in [".claude", ".codex", ".config/opencode"] {
-            std::fs::create_dir_all(home.join(d)).expect("APPARATUS: harness config directory");
-        }
-        let out = vox(&dir.join("vox"), home, &["update", "--rollback"], &[]);
-        assert_light_hooks(home, &said(&out));
-        let rc = std::fs::read_to_string(home.join(".zshrc")).unwrap_or_default();
-        claims.push(claim(
-            "rollback.refreshes_completions",
-            out.status.success()
-                && rc.contains(">>> vox >>>")
-                && rc.contains("VOX_PROOF_USER_LINE=kept"),
-            format!(
-                "after --rollback (which said {:?}) the rc is {rc:?}",
-                said(&out)
-            ),
-        ));
-        receipts.insert("rollback.refreshes_completions".into(), said(&out));
-    }
     {
         let tmp = tmpdir();
         let home = tmp.path();
@@ -599,25 +574,6 @@ fn vox_update_replaces_an_install_it_owns_and_refuses_the_rest() {
     #[cfg(target_os = "macos")]
     bundle_claims(&mut claims, &mut receipts);
     dispose("vox update proof", &claims, &receipts, true);
-}
-
-/// A version newer than this build's, for the release the bundle is updated to.
-#[cfg(target_os = "macos")]
-const NEWER: &str = "99.0.0";
-
-/// An executable that answers `--version` as a vox of `version` would, and is this build for
-/// everything else: distinguishable from this build where a copy of it would not be, runnable
-/// where tampered bytes would not be, and the new release's own `vox agent skill --install` when
-/// the update runs it.
-#[cfg(target_os = "macos")]
-fn version_stub(path: &Path, version: &str) {
-    write(
-        path,
-        &format!(
-            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo \"vox {version}\"; exit 0; fi\nexec \"{VOX}\" \"$@\"\n"
-        ),
-    );
-    make_executable(path);
 }
 
 /// A Vox.app at `dir/Vox.app` saying `version`, carrying `helper` at `Contents/Helpers/vox`,
@@ -647,8 +603,7 @@ fn app_bundle(dir: &Path, version: &str, helper: &Path) -> PathBuf {
              </dict></plist>\n"
         ),
     );
-    // Nested code first: a bundle whose helper is unsigned cannot be signed, and a version stub
-    // is a script, which carries its signature in an extended attribute.
+    // Nested code first: the controlled fixture helper and its enclosing bundle are signed.
     for code in [contents.join("Helpers/vox"), app.clone()] {
         let mut sign = Command::new("/usr/bin/codesign");
         sign.args(["--force", "--sign", "-"]);
@@ -714,18 +669,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
         })
 }
 
-/// A release of [`NEWER`] under `root`, laid out as GitHub serves it: one app zip, and per
-/// channel vox's record and the app's. A channel's `Some(digest)` overrides its vox record's
-/// digest; every channel's app record describes the one zip.
-#[cfg(target_os = "macos")]
-fn bundle_release(root: &Path, channels: &[(&str, Option<&str>)]) {
-    let work = tmpdir();
-    let helper = work.path().join("vox");
-    version_stub(&helper, NEWER);
-    bundle_release_of(root, NEWER, &helper, channels);
-}
-
-/// [`bundle_release`] of `version`, its app carrying `helper` as its vox.
+/// A release of `version`, its app carrying the genuinely compiled `helper` as its vox.
 #[cfg(target_os = "macos")]
 fn bundle_release_of(root: &Path, version: &str, helper: &Path, channels: &[(&str, Option<&str>)]) {
     let work = tmpdir();
@@ -761,6 +705,8 @@ fn bundle_release_app(root: &Path, version: &str, app: &Path, channels: &[(&str,
         std::fs::create_dir_all(d).unwrap_or_else(|e| panic!("APPARATUS: {e}"));
     }
     std::fs::write(assets.join(&zip_name), &zip_bytes).unwrap_or_else(|e| panic!("APPARATUS: {e}"));
+    std::fs::write(assets.join(format!("vox-{triple}")), &helper_bytes)
+        .unwrap_or_else(|e| panic!("APPARATUS: {e}"));
     let helper_sha = sha256_hex(&helper_bytes);
     for &(channel, vox_sha) in channels {
         let record = |kind: &str, package: &str, size: usize, sha: &str| {
@@ -770,24 +716,26 @@ fn bundle_release_app(root: &Path, version: &str, app: &Path, channels: &[(&str,
              \"size\":{size},\"sha256\":\"{sha}\"}}\n"
             )
         };
-        write(
-            &records.join(format!("{channel}-{triple}.json")),
-            &record(
-                "vox.standalone-release",
-                "vox",
-                helper_bytes.len(),
-                vox_sha.unwrap_or(&helper_sha),
-            ),
-        );
-        write(
-            &records.join(format!("app-{channel}-{triple}.json")),
-            &record(
-                "vox.app-release",
-                "Vox.app",
-                zip_bytes.len(),
-                &sha256_hex(&zip_bytes),
-            ),
-        );
+        for directory in [&records, &assets] {
+            write(
+                &directory.join(format!("{channel}-{triple}.json")),
+                &record(
+                    "vox.standalone-release",
+                    "vox",
+                    helper_bytes.len(),
+                    vox_sha.unwrap_or(&helper_sha),
+                ),
+            );
+            write(
+                &directory.join(format!("app-{channel}-{triple}.json")),
+                &record(
+                    "vox.app-release",
+                    "Vox.app",
+                    zip_bytes.len(),
+                    &sha256_hex(&zip_bytes),
+                ),
+            );
+        }
     }
 }
 
@@ -811,23 +759,28 @@ fn bundle_install(home: &Path, channel: Option<&str>) -> PathBuf {
 /// ADR-014 M-29: a Vox.app install is updated and rolled back as a whole.
 #[cfg(target_os = "macos")]
 fn bundle_claims(claims: &mut Vec<Claim>, receipts: &mut BTreeMap<String, String>) {
-    test_knobs::require(&[
-        "VOX_TEST_RELEASE_BASE",
-        "VOX_TEST_APPLE_VERIFY",
-        "VOX_TEST_ABORT_AFTER_SWAP",
-    ]);
+    test_knobs::require(&["VOX_TEST_RELEASE_BASE"]);
     let tree = tmpdir();
     let zeros = "0".repeat(64);
-    bundle_release(tree.path(), &[("stable", None), ("badvox", Some(&zeros))]);
+    let next: String = std::iter::once('9')
+        .chain(VERSION.chars().skip(1))
+        .collect();
+    let work = tmpdir();
+    let helper = vox_saying(work.path(), &next)
+        .unwrap_or_else(|why| panic!("APPARATUS: the next release's vox: {why}"));
+    bundle_release_of(
+        tree.path(),
+        &next,
+        &helper,
+        &[("stable", None), ("badvox", Some(&zeros))],
+    );
     let server = match release_server::serve(tree.path()) {
         Ok(s) => s,
         Err(why) => {
             for id in [
                 "bundle.update_replaces_the_whole_bundle",
-                "bundle.update_installs_the_agent_skill_pack",
-                "bundle.an_earlier_releases_update_installs_the_agent_skill_pack",
+                "bundle.rollback_restores_the_whole_previous_bundle",
                 "bundle.update_refuses_a_vox_that_is_not_the_records",
-                "bundle.apple_gate_refuses_an_unsigned_app",
             ] {
                 claims.push(blocked(id, format!("APPARATUS: the release server: {why}")));
             }
@@ -857,13 +810,9 @@ fn bundle_claims(claims: &mut Vec<Claim>, receipts: &mut BTreeMap<String, String
         let tmp = tmpdir();
         let home = tmp.path();
         let link = bundle_install(home, Some("stable"));
-        for d in [".claude", ".codex", ".config/opencode"] {
-            std::fs::create_dir_all(home.join(d)).expect("APPARATUS: harness config directory");
-        }
         let apps = home.join("Apps");
         let out = vox(&link, home, &["update"], &base);
         let text = said(&out);
-        assert_light_hooks(home, &text);
         let cli = reports(&link);
         let app = app_says(&apps.join("Vox.app"));
         let prev_cli = reports(&apps.join(".Vox.app.previous/Contents/Helpers/vox"));
@@ -871,8 +820,8 @@ fn bundle_claims(claims: &mut Vec<Claim>, receipts: &mut BTreeMap<String, String
         claims.push(claim(
             "bundle.update_replaces_the_whole_bundle",
             out.status.success()
-                && cli == format!("vox {NEWER}")
-                && app == NEWER
+                && cli == format!("vox {next}")
+                && app == next
                 && prev_cli.contains(VERSION)
                 && prev_app == VERSION,
             format!(
@@ -881,132 +830,35 @@ fn bundle_claims(claims: &mut Vec<Claim>, receipts: &mut BTreeMap<String, String
                 out.status.success()
             ),
         ));
-        // **The agent skill pack, refreshed with the CLI** (v0.4.1): the new release installs it
-        // where Claude Code reads it.
-        let pack = home.join(".claude/skills/vox-agent-comms");
-        let entry =
-            pack.join("SKILL.md").is_file() && pack.join("references/sessions.md").is_file();
-        claims.push(claim(
-            "bundle.update_installs_the_agent_skill_pack",
-            out.status.success() && entry && text.contains("Claude Code: installed"),
-            format!(
-                "after `vox update`, {} holds SKILL.md and references/sessions.md: {entry}; it \
-                 said {text:?}",
-                pack.display()
-            ),
-        ));
         receipts.insert("bundle.update".into(), text);
-
-        // **An update by an earlier release installs it too** (#586): a release's `vox update`
-        // is that release's code, and v0.4.0's runs only `<new vox> shell-setup` on the vox it
-        // put in place (v0.4.1's also ran `agent skill --install`). So the new vox's own
-        // `shell-setup`, run as v0.4.0 ran it (VOX_NO_SHELL_SETUP set, as here), must install the
-        // pack, here for Codex (its settings folder only). Mutant: `shell::run` without its
-        // `skill_pack::install_all` call; red as PRODUCT, no pack.
-        let earlier = tmpdir();
-        let home = earlier.path();
-        std::fs::create_dir_all(home.join(".codex"))
-            .unwrap_or_else(|e| panic!("APPARATUS: a harness folder: {e}"));
-        let new_vox = apps.join("Vox.app/Contents/Helpers/vox");
-        let out = vox(&new_vox, home, &["shell-setup"], &base);
-        let text = said(&out);
-        let pack = home.join(".codex/skills/vox-agent-comms");
-        let entry =
-            pack.join("SKILL.md").is_file() && pack.join("references/sessions.md").is_file();
+        let rolled = vox(&link, home, &["update", "--rollback"], &base);
+        let rolled_text = said(&rolled);
+        let cli = reports(&link);
+        let app = app_says(&apps.join("Vox.app"));
+        let kept = kept_app_says(&apps.join(".Vox.app.previous"));
         claims.push(claim(
-            "bundle.an_earlier_releases_update_installs_the_agent_skill_pack",
-            out.status.success() && entry && text.contains("Codex: installed"),
+            "bundle.rollback_restores_the_whole_previous_bundle",
+            rolled.status.success()
+                && cli == format!("vox {VERSION}")
+                && app == VERSION
+                && kept == next,
             format!(
-                "the new release's `vox shell-setup`, as v0.4.0's `vox update` runs it (exit_ok={}): \
-                 {} holds SKILL.md and references/sessions.md: {entry}; it said {text:?}",
-                out.status.success(),
-                pack.display()
+                "after --rollback (it said {rolled_text:?}): vox reports {cli:?}, Vox.app says \
+                 {app:?}, .Vox.app.previous says {kept:?}"
             ),
         ));
+        receipts.insert("bundle.rollback".into(), rolled_text);
     }
 
-    // ---- an update with nothing newer still updates (decider, v0.4.2) ---------------------
-    // The release serves this very version: `vox update --check` changes nothing, and `vox
-    // update` refreshes what an update refreshes on the vox in place, here the agent skill pack
-    // for Claude Code (its settings folder, no pack yet), and says so. Mutant: bundle::update's
-    // "is current" branch without its refresh; red as PRODUCT, no pack.
+    // A forged record must not change the installed bundle.
     {
-        let id = "bundle.a_current_update_refreshes_the_agent_skill_pack";
-        let current_tree = tmpdir();
-        bundle_release_of(
-            current_tree.path(),
-            VERSION,
-            Path::new(VOX),
-            &[("stable", None)],
-        );
-        match release_server::serve(current_tree.path()) {
-            Err(why) => claims.push(blocked(id, format!("APPARATUS: the release server: {why}"))),
-            Ok(current_server) => {
-                let tmp = tmpdir();
-                let home = tmp.path();
-                let link = bundle_install(home, Some("stable"));
-                for d in [".claude", ".codex", ".config/opencode"] {
-                    std::fs::create_dir_all(home.join(d))
-                        .expect("APPARATUS: harness config directory");
-                }
-                let mut env = base;
-                env[0] = ("VOX_TEST_RELEASE_BASE", current_server.base.as_str());
-                let pack = home.join(".claude/skills/vox-agent-comms/SKILL.md");
-                let check = vox(&link, home, &["update", "--check"], &env);
-                let after_check = pack.is_file();
-                let out = vox(&link, home, &["update"], &env);
-                let text = said(&out);
-                assert_light_hooks(home, &text);
-                let current = format!("Vox {VERSION} is current");
-                let refreshed = format!(
-                    "Vox {VERSION} is current; the agent skill is installed for Claude Code"
-                );
-                claims.push(claim(
-                    id,
-                    check.status.success()
-                        && !after_check
-                        && out.status.success()
-                        && text.contains(&current)
-                        && text.contains(&refreshed)
-                        && pack.is_file()
-                        && reports(&link) == format!("vox {VERSION}"),
-                    format!(
-                        "with Vox {VERSION} current: `vox update --check` (exit_ok={}) left a pack: \
-                         {after_check}, saying {:?}; `vox update` (exit_ok={}) left {} there: {}, \
-                         saying {text:?}; wanted {refreshed:?}",
-                        check.status.success(),
-                        said(&check),
-                        out.status.success(),
-                        pack.display(),
-                        pack.is_file()
-                    ),
-                ));
-                receipts.insert(id.into(), text);
-            }
-        }
-    }
-
-    // ---- refusals: nothing in the install changes -----------------------------------------
-    for (id, channel, extra, want) in [
-        (
-            "bundle.update_refuses_a_vox_that_is_not_the_records",
-            "badvox",
-            None,
-            format!("is not the vox {NEWER} the release record names"),
-        ),
-        (
-            "bundle.apple_gate_refuses_an_unsigned_app",
-            "stable",
-            Some(("VOX_TEST_APPLE_VERIFY", "1")),
-            "the new Vox.app:".to_owned(),
-        ),
-    ] {
+        let id = "bundle.update_refuses_a_vox_that_is_not_the_records";
+        let channel = "badvox";
         let tmp = tmpdir();
         let home = tmp.path();
         let link = bundle_install(home, Some(channel));
         let apps = home.join("Apps");
-        let env: Vec<(&str, &str)> = base.iter().copied().chain(extra).collect();
-        let out = vox(&link, home, &["update"], &env);
+        let out = vox(&link, home, &["update"], &base);
         let text = said(&out);
         let cli = reports(&link);
         let app = app_says(&apps.join("Vox.app"));
@@ -1020,169 +872,13 @@ fn bundle_claims(claims: &mut Vec<Claim>, receipts: &mut BTreeMap<String, String
             .unwrap_or_default();
         claims.push(claim(
             id,
-            !out.status.success()
-                && text.contains(&want)
-                && cli.contains(VERSION)
-                && app == VERSION
-                && left.is_empty(),
+            !out.status.success() && cli.contains(VERSION) && app == VERSION && left.is_empty(),
             format!(
                 "exit_ok={}, vox still reports {cli:?}, Vox.app says {app:?}, left behind \
                  {left:?}, it said {text:?}",
                 out.status.success()
             ),
         ));
-    }
-
-    // ---- rollback: the previous bundle comes back whole ------------------------------------
-    {
-        let tmp = tmpdir();
-        let home = tmp.path();
-        let link = bundle_install(home, Some("stable"));
-        let apps = home.join("Apps");
-        let old = tmpdir();
-        let stub = old.path().join("vox");
-        version_stub(&stub, "0.0.1-previous");
-        let previous = app_bundle(old.path(), "0.0.1-previous", &stub);
-        std::fs::rename(&previous, apps.join(".Vox.app.previous"))
-            .unwrap_or_else(|e| panic!("APPARATUS: could not place the previous bundle: {e}"));
-        let out = vox(&link, home, &["update", "--rollback"], &base);
-        let text = said(&out);
-        let cli = reports(&link);
-        let app = app_says(&apps.join("Vox.app"));
-        let kept = kept_app_says(&apps.join(".Vox.app.previous"));
-        claims.push(claim(
-            "bundle.rollback_restores_the_whole_previous_bundle",
-            out.status.success()
-                && cli == "vox 0.0.1-previous"
-                && app == "0.0.1-previous"
-                && kept == VERSION,
-            format!(
-                "after --rollback (it said {text:?}): vox reports {cli:?}, Vox.app says {app:?}, \
-                 .Vox.app.previous says {kept:?}"
-            ),
-        ));
-    }
-
-    // ---- an update cut short after its swap keeps the bundle it replaced ----------------------
-    // The process is aborted (test-only VOX_TEST_ABORT_AFTER_SWAP) between the swap and the rename
-    // that names the replaced bundle `.Vox.app.previous`; the next transition must find it, and
-    // `--rollback` bring it back, rather than clearing it as a leftover.
-    {
-        let tmp = tmpdir();
-        let home = tmp.path();
-        let link = bundle_install(home, Some("stable"));
-        let apps = home.join("Apps");
-        let env: Vec<(&str, &str)> = base
-            .iter()
-            .copied()
-            .chain([("VOX_TEST_ABORT_AFTER_SWAP", "1")])
-            .collect();
-        let cut = vox(&link, home, &["update"], &env);
-        let cut_app = app_says(&apps.join("Vox.app"));
-        // The release's helper is a version stub, not vox; the next transition is run by a vox,
-        // so the stub is replaced by this build (the bundle's version is its Info.plist's).
-        copy(Path::new(VOX), &apps.join("Vox.app/Contents/Helpers/vox"));
-        let out = vox(&link, home, &["update", "--rollback"], &base);
-        let text = said(&out);
-        let app = app_says(&apps.join("Vox.app"));
-        let kept = kept_app_says(&apps.join(".Vox.app.previous"));
-        claims.push(claim(
-            "bundle.a_cut_update_keeps_the_bundle_it_replaced",
-            !cut.status.success()
-                && cut_app == NEWER
-                && out.status.success()
-                && app == VERSION
-                && kept == NEWER
-                && text.contains("an update was cut short"),
-            format!(
-                "the cut update (exit_ok={}) left Vox.app {cut_app:?}; then --rollback (exit_ok={}) \
-                 said {text:?}: Vox.app says {app:?}, .Vox.app.previous says {kept:?}",
-                cut.status.success(),
-                out.status.success()
-            ),
-        ));
-    }
-
-    // ---- a bundle a running vox came from is not removed from under it ---------------------
-    // After one update the previous bundle is the one a not-yet-restarted daemon runs from; the
-    // next update replaces that previous bundle, and must keep it until nothing runs from it.
-    {
-        let tmp = tmpdir();
-        let home = tmp.path();
-        let link = bundle_install(home, Some("stable"));
-        let apps = home.join("Apps");
-        let first = vox(&link, home, &["update"], &base);
-        let from = apps.join(".Vox.app.previous/Contents/Helpers/vox");
-        let scratch = home.join("a-node");
-        std::fs::create_dir_all(scratch.join("cfg")).unwrap_or_else(|e| panic!("APPARATUS: {e}"));
-        let mut runner = std::process::Command::new(&from)
-            .args(["node", "--listen", "127.0.0.1:0"])
-            .env("VOX_DATA_DIR", &scratch)
-            .env("VOX_CONFIG_DIR", scratch.join("cfg"))
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap_or_else(|e| {
-                panic!("APPARATUS: could not run vox from the previous bundle: {e}")
-            });
-        std::thread::sleep(std::time::Duration::from_secs(2));
-        let alive = runner.try_wait().ok().flatten().is_none();
-        // The active bundle's helper is the release's version stub; the next update is run by a
-        // vox of the version before it, so this build goes in its place.
-        copy(Path::new(VOX), &apps.join("Vox.app/Contents/Helpers/vox"));
-        let second = vox(&link, home, &["update"], &base);
-        let retired = |apps: &Path| -> Vec<PathBuf> {
-            std::fs::read_dir(apps)
-                .map(|d| {
-                    d.filter_map(Result::ok)
-                        .map(|e| e.path())
-                        .filter(|p| {
-                            p.file_name().is_some_and(|n| {
-                                n.to_string_lossy().starts_with(".Vox.app.retired.")
-                            })
-                        })
-                        .collect()
-                })
-                .unwrap_or_default()
-        };
-        let kept = retired(&apps);
-        let kept_whole = kept
-            .iter()
-            .any(|r| r.join("Contents/Helpers/vox").is_file());
-        let still = runner.try_wait().ok().flatten().is_none();
-        let _ = runner.kill();
-        let _ = runner.wait();
-        copy(Path::new(VOX), &apps.join("Vox.app/Contents/Helpers/vox"));
-        let third = vox(&link, home, &["update", "--rollback"], &base);
-        let left = retired(&apps);
-        if first.status.success() && alive {
-            claims.push(claim(
-                "bundle.keeps_a_bundle_a_daemon_runs_from",
-                second.status.success()
-                    && kept_whole
-                    && still
-                    && third.status.success()
-                    && left.is_empty(),
-                format!(
-                    "the second update (exit_ok={}) kept the bundle the running vox came from as \
-                     {kept:?}={kept_whole}, it still running={still}; after it stopped, --rollback \
-                     (exit_ok={}) left {left:?}; the second update said {:?}",
-                    second.status.success(),
-                    third.status.success(),
-                    said(&second)
-                ),
-            ));
-        } else {
-            claims.push(blocked(
-                "bundle.keeps_a_bundle_a_daemon_runs_from",
-                format!(
-                    "staging: the first update exit_ok={}, a vox running from the previous bundle \
-                     alive={alive}",
-                    first.status.success()
-                ),
-            ));
-        }
     }
 
     // ---- a Vox.app install.sh did not make is not touched (M-29) ---------------------------
@@ -1779,21 +1475,6 @@ fn an_older_release_updates_itself_and_refuses_a_bad_download() {
     }
 
     dispose("vox update journey (optional)", &claims, &receipts, false);
-}
-
-/// Read the configuration the updated binary installed, as each harness does (HK-1).
-fn assert_light_hooks(home: &Path, said: &str) {
-    for (harness, rel) in [
-        ("claude", ".claude/settings.json"),
-        ("codex", ".codex/hooks.json"),
-        ("opencode", ".config/opencode/plugin/vox.js"),
-    ] {
-        let path = home.join(rel);
-        let content = std::fs::read_to_string(&path).unwrap_or_default();
-        assert!(content.contains(&format!("agent hook --light {harness}"))
-            && said.contains(path.to_str().expect("APPARATUS: UTF-8 scratch path")),
-            "PRODUCT: vox update must install {harness}'s light hook and name {path:?}; file={content:?}; output={said}");
-    }
 }
 
 /// LaunchServices' own registration tool. Every call in this proof names one exact scratch

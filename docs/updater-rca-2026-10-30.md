@@ -154,9 +154,25 @@ caller does not invoke the new entrypoint and cannot retroactively surrender pre
 control. Its first upgrade and a bootstrap-capable A-to-B transaction are distinct claims.
 This architectural cutover starts with v0.4.13; prior release artifacts are not rewritten.
 
+After the separate Opus plan review and explicit operator authorization, product correction
+`d2b4fa87d4b5daf5c2972a809c4c50f931b382b6` removed Linux's conditional-compilation Clippy
+failure and made standalone daemon-restart failures propagate to update and rollback callers.
+A normal-feature scratch rollback had reported a remembered-node readiness failure but returned
+zero; the rebuilt command returned nonzero instead of a successful next-step message. The
+after-fixture retained the same version, so this does not establish version-changing rollback.
+
+A fresh native journey using reviewed source `0352e21aba96a4b13f92f2413b93a6f4b828c45e`
+observed the target process before the installed 0.4.12 changed, then installed 0.4.13 and
+verified the replacement app's exact original profile, Ready service and saved message.
+Real x86-64 Linux binaries passed check, update, rollback and exact saved-message retention;
+an installation under a non-UTF-8 directory updated at its original byte path. An initial
+non-reaping container left a defunct old daemon; the corrected `--init` apparatus passed.
+The x86 compiler itself crashed under emulation, so builds and Linux-target Clippy used a
+native-arm cross-builder. Neither apparatus fault is attributed to the product.
+
 These observations use controlled ad-hoc signatures and the existing test-knobs loopback
-origin. Linux non-UTF-8 handling is source-backed, not Linux-runtime-proved: Darwin rejected
-that filename staging. Complete source-bound receipts are retained under
-`/private/tmp/vox1007-practical-42qu344_/v0413-owner-*`. Signed/notarized publication and
-public-artifact delivery evidence remain the final delivery boundary, not an inference from
-these fixtures.
+origin. Complete Mac receipts are under `/private/tmp/vox1007-practical-42qu344_/v0413-*`;
+Linux logs are under `/Users/robert.lee/vox-owner-linux-20261031-7oam1dbj/`. The private Linux
+profile archive contains scratch credentials and is not publication material. Signed/notarized
+publication and public-artifact delivery remain separate final boundaries, not an inference
+from these fixtures.
