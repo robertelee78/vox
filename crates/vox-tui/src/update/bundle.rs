@@ -2503,12 +2503,13 @@ fn prepare_legacy_migration(apps: &Path, transition: &mut Transition) -> Result<
     ];
     let mut source = None;
     for path in &possible {
-        if path_exists(path)? && bundle_identity(path)? == transition.source {
-            if source.replace(path.clone()).is_some() {
-                return Err(usage(
-                    "multiple legacy bundles match the source identity; all retained",
-                ));
-            }
+        if path_exists(path)?
+            && bundle_identity(path)? == transition.source
+            && source.replace(path.clone()).is_some()
+        {
+            return Err(usage(
+                "multiple legacy bundles match the source identity; all retained",
+            ));
         }
     }
     let source = source

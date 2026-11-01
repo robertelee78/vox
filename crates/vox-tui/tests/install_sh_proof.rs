@@ -692,6 +692,11 @@ fn install_sh_installs_what_it_verified_and_refuses_what_it_could_not() {
 
         // --purge: install again (the nodes are still there), then the installed vox refuses
         // with no terminal, and at a terminal, once the node's name is typed, removes them too.
+        // Its preservation was asserted above. Park only this deliberately edited apparatus
+        // fixture so the independent purge journey can first install its own valid hooks.
+        if oc.join("vox.js").exists() {
+            std::fs::rename(oc.join("vox.js"), home.join("edited-plugin.kept")).staged();
+        }
         let (again, again_text) = run_installer(&server, home, "stable");
         let refused = run_vox(&vox, &env, &["uninstall", "--purge"]);
         let kept_after_refusal = home.join("data/nodes/alice").is_dir();
