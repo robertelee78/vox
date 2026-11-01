@@ -966,16 +966,15 @@ pub fn run(check_only: bool, rollback: bool) -> Result<u8, AppError> {
                 run_bundle(apps_dir, channel, &exe, false, false)?;
             }
         } else {
+            if !check_only {
+                if let Ok((dir, _)) = owned(installed, "") {
+                    run_shell_setup(&dir.join(ACTIVE_NAME))?;
+                }
+            }
             println!(
                 "vox {current} is current (the newest {channel} release is {})",
                 release.version_text
             );
-            if !check_only {
-                if let Ok((dir, _)) = owned(installed, "") {
-                    run_shell_setup(&dir.join(ACTIVE_NAME));
-                    println!("vox {current} is current; {}", skill_said());
-                }
-            }
         }
         return Ok(0);
     }
@@ -1040,6 +1039,7 @@ pub fn run(check_only: bool, rollback: bool) -> Result<u8, AppError> {
     let request = ApplyRequest {
         installed_exe: exe.as_os_str().as_bytes().to_vec(),
         record: release.record,
+        app_archive: None,
     };
     let bytes = serde_json::to_vec(&request).map_err(|_| usage("cannot encode update request"))?;
     if bytes.len() > MAX_REQUEST_BYTES {
@@ -1072,6 +1072,8 @@ const MAX_REQUEST_BYTES: usize = MAX_RECORD_BYTES + 32 * 1024;
 struct ApplyRequest {
     installed_exe: Vec<u8>,
     record: ReleaseRecord,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    app_archive: Option<Vec<u8>>,
 }
 
 fn verify_candidate(active: &Path, candidate: &Path, version: &str) -> Result<(), AppError> {
@@ -1179,9 +1181,27 @@ pub(crate) fn apply_request(path: &Path) -> Result<(), AppError> {
         return Err(usage("update engine does not match the release record"));
     }
     verify_candidate(&active, &engine, &release.version_text)?;
+    let app_archive = request
+        .app_archive
+        .map(|bytes| PathBuf::from(std::ffi::OsString::from_vec(bytes)));
+    if let Some(archive) = &app_archive {
+        let canonical = fs::canonicalize(archive).map_err(AppError::Io)?;
+        if canonical != *archive || canonical.parent() != Some(request_dir.as_path()) {
+            return Err(usage(
+                "installer archive is not in the request's private directory",
+            ));
+        }
+        if !matches!(installed, Channel::Bundle { .. }) {
+            return Err(usage(
+                "an installer app archive requires a Vox.app installation",
+            ));
+        }
+    }
     match installed {
         #[cfg(target_os = "macos")]
-        Channel::Bundle { apps_dir, .. } => bundle::apply(&apps_dir, &active, &release),
+        Channel::Bundle { apps_dir, .. } => {
+            bundle::apply(&apps_dir, &active, &release, app_archive.as_deref())
+        }
         Channel::Standalone { install_dir, .. } => {
             let _lock = InstallLock::acquire(&install_dir)?;
             if detect_channel(&active)?
@@ -1200,14 +1220,13 @@ pub(crate) fn apply_request(path: &Path) -> Result<(), AppError> {
                 return Ok(());
             }
             publish(&install_dir, &engine)?;
+            restart::restart_daemon(&active, &release.version_text)?;
+            run_shell_setup(&active)?;
             println!("updated: {} -> {}", active.display(), release.version_text);
             println!(
                 "         previous kept at {}",
                 install_dir.join(PREVIOUS_NAME).display()
             );
-            let detached = restart::restart_daemon(&active, &release.version_text)?;
-            run_shell_setup(&active);
-            restart::say_next(&detached);
             Ok(())
         }
         _ => Err(usage("update request does not name an owned installation")),
@@ -1276,17 +1295,15 @@ fn do_rollback(install_dir: &Path) -> Result<(), AppError> {
         if !previous.is_file() && runs_as_vox(&scratch) {
             fs::rename(&scratch, &previous).map_err(AppError::Io)?;
             sync_dir(install_dir)?;
+            // As any rollback does: restart the daemon and refresh integrations first.
+            restart_onto(&active)?;
+            run_shell_setup(&active)?;
             println!(
                 "finished a rollback that was interrupted: {} is {}, and {} is kept for --rollback",
                 active.display(),
                 binary_version(&active).unwrap_or_else(|| "unknown".to_owned()),
                 previous.display()
             );
-            // As any rollback does: the daemon is restarted onto the binary now in place, which
-            // brings its own completions.
-            let detached = restart_onto(&active)?;
-            run_shell_setup(&active);
-            restart::say_next(&detached);
             return Ok(());
         }
         fs::remove_file(&scratch).map_err(AppError::Io)?;
@@ -1306,14 +1323,13 @@ fn do_rollback(install_dir: &Path) -> Result<(), AppError> {
     sync_dir(install_dir)?;
     fs::rename(&scratch, &previous).map_err(AppError::Io)?;
     sync_dir(install_dir)?;
+    restart_onto(&active)?;
+    run_shell_setup(&active)?;
     println!(
         "rolled back: {} -> {}",
         active.display(),
         binary_version(&active).unwrap_or_else(|| "unknown".to_owned())
     );
-    let detached = restart_onto(&active)?;
-    run_shell_setup(&active);
-    restart::say_next(&detached);
     Ok(())
 }
 
@@ -1426,66 +1442,58 @@ fn binary_version(path: &Path) -> Option<String> {
 /// are refreshed with the CLI: this runs the binary that is now in place — the new one is the one
 /// that matters — as every earlier release's update runs it. It honours `VOX_NO_SHELL_SETUP` and
 /// `VOX_NO_SKILL_INSTALL` itself, each for its own part.
-fn run_shell_setup(active: &Path) {
-    match Command::new(active).arg("shell-setup").output() {
-        Ok(o) => {
-            print!("{}", String::from_utf8_lossy(&o.stdout));
-            eprint!("{}", String::from_utf8_lossy(&o.stderr));
-            if !o.status.success() {
-                println!("         note: run `vox shell-setup` to refresh completions, the agent skill and hooks");
-            }
-        }
-        Err(_) => println!(
-            "         note: run `vox shell-setup` to refresh completions, the agent skill and hooks"
-        ),
-    }
+fn run_shell_setup(active: &Path) -> Result<(), AppError> {
+    run_integration(active, &["shell-setup"])
 }
 
-/// Where the agent skill pack is now, as a person reads it: the harnesses here whose skills
-/// folder holds it, read from disk after the refresh.
-fn skill_said() -> String {
-    if std::env::var_os("VOX_NO_SKILL_INSTALL").is_some_and(|v| !v.is_empty()) {
-        return "the agent skill was left as it is (VOX_NO_SKILL_INSTALL is set)".to_owned();
+fn run_integration(active: &Path, args: &[&str]) -> Result<(), AppError> {
+    let output = Command::new(active)
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .output()
+        .map_err(|e| {
+            usage(format!(
+                "could not run {} {}: {e}",
+                active.display(),
+                args.join(" ")
+            ))
+        })?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        return Err(usage(format!(
+            "{} {} failed ({}): {}",
+            active.display(),
+            args.join(" "),
+            output.status,
+            stderr.trim()
+        )));
     }
-    let have: Vec<&str> = crate::skill_pack::HARNESSES
-        .iter()
-        .filter(|h| {
-            crate::skill_pack::pack_dir(h.key).is_some_and(|d| d.join("SKILL.md").is_file())
-        })
-        .map(|h| h.name)
-        .collect();
-    if have.is_empty() {
-        "no harness here has the agent skill: Claude Code, Codex, OpenCode and Oh My Pi were not found"
-            .to_owned()
-    } else {
-        format!("the agent skill is installed for {}", have.join(", "))
+    if !stderr.is_empty() {
+        eprint!("{stderr}");
     }
+    Ok(())
 }
 
 /// The agent skill pack and missing light hooks, where `vox shell-setup` is not run (a Vox.app
 /// update run from inside the bundle). The binary now in place refreshes every harness here,
 /// keeping operator changes. `VOX_NO_SKILL_INSTALL` skips only the skill pack.
 #[cfg(target_os = "macos")]
-fn run_skill_install(active: &Path) {
+fn run_skill_install(active: &Path) -> Result<(), AppError> {
+    let mut errors = Vec::new();
     for command in ["skill", "plugin"] {
-        if command == "skill" && std::env::var_os("VOX_NO_SKILL_INSTALL").is_some() {
+        if command == "skill"
+            && std::env::var_os("VOX_NO_SKILL_INSTALL").is_some_and(|v| !v.is_empty())
+        {
             continue;
         }
-        match Command::new(active)
-            .args(["agent", command, "--install"])
-            .output()
-        {
-            Ok(o) => {
-                print!("{}", String::from_utf8_lossy(&o.stdout));
-                eprint!("{}", String::from_utf8_lossy(&o.stderr));
-                if !o.status.success() {
-                    println!("         note: run `vox agent {command} --install` to finish harness setup");
-                }
-            }
-            Err(_) => println!(
-                "         note: run `vox agent {command} --install` to finish harness setup"
-            ),
+        if let Err(error) = run_integration(active, &["agent", command, "--install"]) {
+            errors.push(error.to_string());
         }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(usage(errors.join("; ")))
     }
 }
 

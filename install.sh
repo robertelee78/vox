@@ -102,10 +102,8 @@ fi
 # `-f` is not optional: without it a 404 exits 0 and writes the body ("Not Found") into the
 # output file, which would then be read as the release record.
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/vox-install.XXXXXX")
-# On any exit, the bundle a cut-short swap moved aside goes back (see `restore_app`), then the
-# scratch goes. An interrupt exits: without `exit` the script carried on with $tmp deleted.
-restore_app() { :; }
-trap 'restore_app; rm -rf "$tmp"' EXIT
+# Scratch belongs only to this invocation; updater recovery belongs to the target engine.
+trap 'rm -rf "$tmp"' EXIT
 trap 'exit 130' INT TERM
 curl -fsSL $CURL_PROTO --max-filesize 4096 \
   -o "$tmp/record.json" "${BASE}/latest/download/${RECORD}" \
@@ -176,7 +174,7 @@ if [ "$os" = Darwin ]; then
   # --- Vox.app (macOS) ---------------------------------------------------------------------
   # Its own record, from the same release as vox's: the two are one version or neither installs.
   curl -fsSL $CURL_PROTO --max-filesize 4096 \
-    -o "$tmp/app-record.json" "${BASE}/latest/download/${APP_RECORD}" \
+    -o "$tmp/app-record.json" "${BASE}/download/v${version}/${APP_RECORD}" \
     || fail "could not fetch release record ${APP_RECORD} (no ${CHANNEL} release of Vox.app for ${TARGET} yet?)"
   a_kind=$(field kind "$tmp/app-record.json"); a_schema=$(field schema_version "$tmp/app-record.json")
   a_pkg=$(field package "$tmp/app-record.json"); a_channel=$(field channel "$tmp/app-record.json")
@@ -196,12 +194,12 @@ if [ "$os" = Darwin ]; then
     APPS="$HOME/Applications"
   fi
   if [ -e "$APPS/Vox.app" ] && [ ! -e "$APPS/$MARKER" ]; then
-    fail "$APPS/Vox.app exists but was not installed by this installer; remove it first"
+    fail "$APPS/Vox.app exists without this installer's ownership record; it was preserved"
   fi
   if [ -e "$INSTALL_DIR/vox" ] && [ ! -e "$INSTALL_DIR/$MARKER" ]; then
     case "$(readlink "$INSTALL_DIR/vox" 2>/dev/null || true)" in
       */Vox.app/Contents/Helpers/vox) ;;  # a link this installer made
-      *) fail "$INSTALL_DIR/vox exists but was not installed by this installer; remove it or set VOX_INSTALL_DIR" ;;
+      *) fail "$INSTALL_DIR/vox exists without this installer's ownership record; it was preserved" ;;
     esac
   fi
 
@@ -231,134 +229,122 @@ if [ "$os" = Darwin ]; then
   [ "$ran" = "vox $version" ] \
     || fail "the vox inside Vox.app reports ${ran:-nothing}, not vox $version; nothing was installed"
 
-  # --- install the bundle --------------------------------------------------------------
-  # Copied beside its destination, then renamed into place; the bundle it replaces is kept as
-  # .Vox.app.previous. Leftovers of a run that was cut short may be read-only, so they are made
-  # writable before they are removed, and a leftover that will not go stops the install.
-  #
-  # **One install or update at a time** (`vox update` takes the same lock): the swap runs under
-  # `lockf` on .vox-standalone.lock in the applications folder, so this and a `vox update` never
-  # remove each other's partial or previous bundle halfway.
-  #
-  # **No moment without Vox.app that a failure can leave behind**: between moving the old bundle
-  # aside and the new one landing, any exit (an error, Ctrl-C, a kill other than SIGKILL) puts the
-  # old one back, and a later step that fails puts it back too.
-  mkdir -p "$APPS"
-  gone() { # <path>: removed, or the install stops
-    if [ -e "$1" ] || [ -L "$1" ]; then
-      chmod -R u+w "$1" 2>/dev/null || true
-      rm -rf "$1" 2>/dev/null || true
-      [ ! -e "$1" ] && [ ! -L "$1" ] || fail "could not remove $1; remove it and run this again"
+  # Owned reinstalls use the same verified target engine as `vox update`. The shell must never
+  # recover or remove the updater's journal, archives or displaced bundles.
+  mkdir -p "$APPS" "$INSTALL_DIR"
+  # Keep pathname bytes, including a trailing newline, while resolving the parent directory.
+  APPS=$(CDPATH= cd "$APPS" && pwd -P && printf x) || fail "cannot resolve applications directory"
+  APPS=${APPS%?}
+  APPS=${APPS%?}
+  tmp=$(CDPATH= cd "$tmp" && pwd -P) || fail "cannot resolve private download directory"
+  chmod 0600 "$tmp/$APP_ZIP"
+
+  link_cli() {
+    if [ -L "$INSTALL_DIR/vox" ] \
+      && [ "$(readlink "$INSTALL_DIR/vox")" = "$APPS/Vox.app/Contents/Helpers/vox" ]; then
+      return
     fi
+    if { [ -e "$INSTALL_DIR/vox" ] || [ -L "$INSTALL_DIR/vox" ]; } \
+      && [ ! -f "$INSTALL_DIR/$MARKER" ]; then
+      fail "$INSTALL_DIR/vox belongs to another installation; it was preserved"
+    fi
+    link=$(mktemp "$INSTALL_DIR/.vox-link.XXXXXX") || fail "cannot stage the CLI link"
+    rm "$link"
+    ln -s "$APPS/Vox.app/Contents/Helpers/vox" "$link" || fail "cannot create the CLI link"
+    mv -f "$link" "$INSTALL_DIR/vox" || fail "cannot publish the CLI link"
   }
-  cat >"$tmp/swap.sh" <<'SWAP'
+
+  if [ -e "$APPS/Vox.app" ] || [ -L "$APPS/Vox.app" ]; then
+    [ -d "$APPS/Vox.app" ] && [ ! -L "$APPS/Vox.app" ] \
+      || fail "$APPS/Vox.app is not an owned regular bundle directory"
+    # The archive request is supported starting with 0.4.14. Refuse older downloaded engines
+    # before even changing the CLI link; their strict old request parser is not a fallback.
+    protocol_major=${version%%.*}
+    protocol_tail=${version#*.}
+    protocol_minor=${protocol_tail%%.*}
+    protocol_patch=${protocol_tail#*.}
+    protocol_patch=${protocol_patch%%[-+]*}
+    if [ "$protocol_major" -eq 0 ] && {
+      [ "$protocol_minor" -lt 4 ] || {
+        [ "$protocol_minor" -eq 4 ] && [ "$protocol_patch" -lt 14 ]
+      }
+    }; then
+      fail "vox $version predates the owned-installer archive protocol; the installation was preserved"
+    fi
+    # Establish the CLI path before the engine starts its transaction, not after it reports
+    # completion. The link keeps naming the same installed path across atomic bundle exchange.
+    link_cli
+    cp "$helper" "$tmp/vox"
+    chmod 0500 "$tmp/vox"
+    byte_array() {
+      # od emits decimal octets, so shell word splitting cannot reinterpret pathname bytes.
+      set -- $(printf '%s' "$1" | od -An -v -tu1)
+      separator=
+      for byte do
+        printf '%s%s' "$separator" "$byte"
+        separator=,
+      done
+    }
+    (
+      umask 077
+      {
+        printf '{"installed_exe":['
+        byte_array "$APPS/Vox.app/Contents/Helpers/vox"
+        printf '],"record":'
+        cat "$tmp/record.json"
+        printf ',"app_archive":['
+        byte_array "$tmp/$APP_ZIP"
+        printf ']}\n'
+      } >"$tmp/request.json"
+    )
+    # An older engine rejects the unknown archive field before installation mutation. Do not
+    # fall back to the shell writer or an installed older updater after a refusal.
+    "$tmp/vox" update-apply "$tmp/request.json"
+    exit 0
+  fi
+
+  # A first install creates only a new bundle. Recheck under the shared lock; recovery authority
+  # or unknown leftovers belong to the engine, never to shell cleanup.
+  cat >"$tmp/initial.sh" <<'INITIAL'
 set -eu
+umask 077
 APPS=$1 NEW=$2 MARKER=$3 CHANNEL=$4
 fail() { printf 'vox install: %s\n' "$*" >&2; exit 1; }
-gone() {
-  if [ -e "$1" ] || [ -L "$1" ]; then
-    chmod -R u+w "$1" 2>/dev/null || true
-    rm -rf "$1" 2>/dev/null || true
-    [ ! -e "$1" ] && [ ! -L "$1" ] || fail "could not remove $1; remove it and run this again"
+[ ! -e "$APPS/Vox.app" ] && [ ! -L "$APPS/Vox.app" ] \
+  || fail "Vox.app appeared during installation; its existing installation was preserved"
+for retained in "$APPS"/.Vox.app*; do
+  if [ -e "$retained" ] || [ -L "$retained" ]; then
+    fail "retained updater state exists at $retained; the shell will not change it"
   fi
-}
-moved=0
-put_back() {
-  if [ "$moved" = 1 ] && [ ! -e "$APPS/Vox.app" ] && [ -e "$APPS/.Vox.app.previous" ]; then
-    mv "$APPS/.Vox.app.previous" "$APPS/Vox.app" \
-      && printf 'vox install: the swap was cut short; the Vox.app that was installed is back\n' >&2
-  fi
-}
-trap put_back EXIT
-trap 'exit 130' INT TERM
-# A bundle is never removed while code from it runs: a daemon not yet restarted after an earlier
-# update runs from the bundle that update replaced. It is retired (renamed aside), and removed by
-# a later transition once nothing runs from it.
-in_use() { # <bundle>: whether any process runs one of its executables
-  files=$(find "$1/Contents" -type f -perm -u+x 2>/dev/null)
-  [ -n "$files" ] || return 1
-  # shellcheck disable=SC2086 # one argument per file
-  # Read the pids, not the status: lsof exits 1 when any one file named is not open.
-  [ -n "$(/usr/sbin/lsof -t $files 2>/dev/null)" ]
-}
-retire() { # <bundle>
-  mv "$1" "$APPS/.Vox.app.retired.$(date +%s).$$" || fail "could not move $1 aside"
-}
-for r in "$APPS"/.Vox.app.retired.*; do
-  [ -e "$r" ] || continue
-  in_use "$r" || gone "$r"
 done
-# A `vox update` cut short between its swap and naming the replaced bundle .Vox.app.previous
-# left a journal (.Vox.app.publishing, as vox update's recover() reads it): finished here the
-# same way, so the replaced bundle under the partial name is kept rather than cleared.
-J="$APPS/.Vox.app.publishing"
-if [ -d "$J" ]; then
-  published=$(cat "$J/version" 2>/dev/null || true)
-  if [ ! -e "$APPS/.Vox.app.previous" ] && [ -f "$APPS/.Vox.app.partial/Contents/Helpers/vox" ]; then
-    active=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
-      "$APPS/Vox.app/Contents/Info.plist" 2>/dev/null || true)
-    if [ -n "$published" ] && [ "$active" = "$published" ]; then
-      mv "$APPS/.Vox.app.partial" "$APPS/.Vox.app.previous" \
-        || fail "could not keep the Vox.app a cut-short update replaced"
-      printf 'vox install: an update was cut short after Vox %s was put in place; the Vox.app it replaced is kept at %s\n' \
-        "$published" "$APPS/.Vox.app.previous" >&2
-    fi
-  fi
-  if [ ! -e "$APPS/.Vox.app.previous" ] && [ -e "$J/Vox.app" ]; then
-    mv "$J/Vox.app" "$APPS/.Vox.app.previous" || fail "could not put back $APPS/.Vox.app.previous"
-  fi
-  gone "$J"
-fi
-gone "$APPS/.Vox.app.partial"
-gone "$APPS/.Vox.app.previous.partial"
-/usr/bin/ditto "$NEW" "$APPS/.Vox.app.partial" || fail "could not copy Vox.app into $APPS"
+stage=$(mktemp -d "$APPS/.vox-install.XXXXXX") || fail "cannot create private installation staging"
+trap 'rm -rf "$stage"' EXIT
+trap 'exit 130' INT TERM
+/usr/bin/ditto "$NEW" "$stage/Vox.app" || fail "cannot stage Vox.app"
 printf '{"kind":"vox.install-channel","schema_version":1,"package":"vox","channel":"%s"}\n' \
-  "$CHANNEL" >"$APPS/.marker.partial" || fail "could not write $APPS/$MARKER"
-if [ -e "$APPS/Vox.app" ]; then
-  if [ -e "$APPS/.Vox.app.previous" ]; then
-    if in_use "$APPS/.Vox.app.previous"; then retire "$APPS/.Vox.app.previous"; else gone "$APPS/.Vox.app.previous"; fi
-  fi
-  mv "$APPS/Vox.app" "$APPS/.Vox.app.previous" || fail "could not move the installed Vox.app aside"
-  moved=1
+  "$CHANNEL" >"$stage/marker"
+if [ -e "$APPS/$MARKER" ] || [ -L "$APPS/$MARKER" ]; then
+  [ -f "$APPS/$MARKER" ] && [ ! -L "$APPS/$MARKER" ] \
+    && cmp -s "$stage/marker" "$APPS/$MARKER" \
+    || fail "existing installation marker is not the selected channel; it was preserved"
+else
+  mv -n "$stage/marker" "$APPS/$MARKER" || fail "cannot publish the installation marker"
+  [ ! -e "$stage/marker" ] || fail "installation marker appeared concurrently; it was preserved"
 fi
-mv "$APPS/.Vox.app.partial" "$APPS/Vox.app" || fail "could not put the new Vox.app in place"
-moved=0
-mv -f "$APPS/.marker.partial" "$APPS/$MARKER" || fail "could not write $APPS/$MARKER"
-SWAP
+mv -n "$stage/Vox.app" "$APPS" || fail "cannot publish the initial Vox.app"
+[ ! -e "$stage/Vox.app" ] || fail "Vox.app appeared concurrently; its installation was preserved"
+INITIAL
   rc=0
-  /usr/bin/lockf -k -t 0 "$APPS/.vox-standalone.lock" /bin/sh "$tmp/swap.sh" \
+  /usr/bin/lockf -k -t 0 "$APPS/.vox-standalone.lock" /bin/sh "$tmp/initial.sh" \
     "$APPS" "$new_app" "$MARKER" "$CHANNEL" || rc=$?
   [ "$rc" = 0 ] || {
-    [ "$rc" = 75 ] && fail "another install or a \`vox update\` is changing $APPS/Vox.app now; run this again when it is done"
+    [ "$rc" = 75 ] && fail "another install or a \`vox update\` is changing $APPS/Vox.app now"
     exit "$rc"
   }
-  # From here, a failure puts the bundle that was installed back (and the link with it).
-  restore_app() {
-    if [ "${linked_ok:-0}" != 1 ] && [ -e "$APPS/.Vox.app.previous" ]; then
-      gone "$APPS/.Vox.app.failed"
-      mv "$APPS/Vox.app" "$APPS/.Vox.app.failed" 2>/dev/null \
-        && mv "$APPS/.Vox.app.previous" "$APPS/Vox.app" \
-        && printf 'vox install: the install failed after Vox.app was replaced; the Vox.app that was installed is back\n' >&2
-    fi
-  }
-  say "installed: $APPS/Vox.app (Vox $version)"
-
-  # --- link the CLI into it --------------------------------------------------------------
-  mkdir -p "$INSTALL_DIR"
-  rm -f "$INSTALL_DIR/.vox-link.partial"
-  ln -s "$APPS/Vox.app/Contents/Helpers/vox" "$INSTALL_DIR/.vox-link.partial"
-  mv -f "$INSTALL_DIR/.vox-link.partial" "$INSTALL_DIR/vox"
-  # A standalone vox installed here before belongs to no bundle; its marker and previous go.
-  rm -f "$INSTALL_DIR/$MARKER" "$INSTALL_DIR/.vox-previous" \
-    "$INSTALL_DIR/.vox-candidate.partial" "$INSTALL_DIR/.vox-previous.partial"
+  link_cli
   installed=$("$INSTALL_DIR/vox" --version 2>/dev/null || true)
   [ "$installed" = "vox $version" ] \
-    || fail "$INSTALL_DIR/vox reports ${installed:-nothing}, not vox $version (on macOS see: codesign -dv $APPS/Vox.app)"
-  linked_ok=1
-  say "linked: $INSTALL_DIR/vox -> $APPS/Vox.app/Contents/Helpers/vox ($installed)"
-  # A running app or daemon keeps the old code until restarted (`vox update` restarts the daemon;
-  # a reinstall does not).
-  say "restart Vox and the vox daemon to run vox $version: both keep running what they started with until they are restarted"
+    || fail "$INSTALL_DIR/vox reports ${installed:-nothing}, not vox $version"
 else
   # --- vox (Linux, unchanged by ADR-014) -----------------------------------------------------
   fetch_asset "$ASSET" "$size" "$sha256" "$tmp/$ASSET"
@@ -405,7 +391,12 @@ fi
 # settings folder), the pack an agent reads goes in that harness's own skills folder, or is
 # refreshed there. Idempotent; a file you changed is kept, and said so. VOX_NO_SKILL_INSTALL=1
 # skips it. `vox update` runs the same command on the vox it puts in place.
-"$INSTALL_DIR/vox" shell-setup </dev/null || say "warning: shell setup or the agent skill reported a problem (vox itself is installed)"
+if [ "$os" = Darwin ]; then
+  "$INSTALL_DIR/vox" shell-setup </dev/null
+  say "installed: $APPS/Vox.app (Vox $version); CLI: $INSTALL_DIR/vox"
+else
+  "$INSTALL_DIR/vox" shell-setup </dev/null || say "warning: shell setup or the agent skill reported a problem (vox itself is installed)"
+fi
 
 say ""
 say "also: \`vox\` opens the interactive client, \`vox serve ssh=22\` offers this machine's ssh in a new room, \`vox update\` installs the next release"

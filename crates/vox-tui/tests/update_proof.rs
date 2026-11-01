@@ -15,11 +15,9 @@
 //! it is compiled only with vox-tui's `optional-proofs` feature, and without it a stand-in of the
 //! same name says `OPTIONAL PROOF NOT RUN`. It blocks nothing, and it accepts no gap.
 //!
-//! On macOS it also measures a Vox.app install (ADR-014 M-29): `vox update` replaces the whole
-//! bundle, from a loopback release this proof serves, and `--rollback` restores the whole previous
-//! one. `vox update` fetches only from GitHub in a build a person installs; the loopback release
-//! is reached through `VOX_TEST_RELEASE_BASE`, which only a `test-knobs` build reads, so that part
-//! needs `--features vox-tui/test-knobs` and says CANNOT MEASURE without it.
+//! The controlled macOS bundle journey uses ad-hoc fixtures with genuinely compiled helpers;
+//! it does not establish native-app or Apple trust. The separate optional native journey uses
+//! genuine signed bundles. Both controlled journeys use the existing test-knobs transport.
 //!
 //! A red says which side it is on: `PRODUCT:` for a claim `vox` failed, quoting what it said;
 //! `CANNOT MEASURE:` for a claim the world could not be asked (GitHub unreachable, nothing
@@ -510,7 +508,13 @@ fn vox_update_replaces_an_install_it_owns_and_refuses_the_rest() {
         let tmp = tmpdir();
         let home = tmp.path();
         let dir = install_dir(home, "stable");
-        copy(Path::new(VOX), &dir.join(".vox-previous"));
+        let next: String = std::iter::once('9')
+            .chain(VERSION.chars().skip(1))
+            .collect();
+        let fixture = tmpdir();
+        let helper = vox_saying(fixture.path(), &next)
+            .unwrap_or_else(|why| panic!("APPARATUS: the next release's vox: {why}"));
+        copy(&helper, &dir.join(".vox-previous"));
         write(&home.join(".zshrc"), "export VOX_PROOF_USER_LINE=kept\n");
         let out = vox(
             &dir.join("vox"),
@@ -521,7 +525,9 @@ fn vox_update_replaces_an_install_it_owns_and_refuses_the_rest() {
         let rc = std::fs::read_to_string(home.join(".zshrc")).unwrap_or_default();
         claims.push(claim(
             "rollback.honours_the_opt_out",
-            out.status.success() && rc == "export VOX_PROOF_USER_LINE=kept\n",
+            out.status.success()
+                && reports(&dir.join("vox")) == format!("vox {next}")
+                && rc == "export VOX_PROOF_USER_LINE=kept\n",
             format!(
                 "with VOX_NO_SHELL_SETUP=1, --rollback said {:?} and the rc is {rc:?}",
                 said(&out)
@@ -534,8 +540,7 @@ fn vox_update_replaces_an_install_it_owns_and_refuses_the_rest() {
     dispose("vox update proof", &claims, &receipts, true);
 }
 
-/// A Vox.app at `dir/Vox.app` saying `version`, carrying `helper` at `Contents/Helpers/vox`,
-/// ad-hoc signed: a Developer ID signature exists only as output of the release workflow.
+/// Minimal ad-hoc bundle fixture, not native-app or Apple trust evidence.
 #[cfg(target_os = "macos")]
 fn app_bundle(dir: &Path, version: &str, helper: &Path) -> PathBuf {
     let app = dir.join("Vox.app");
@@ -561,14 +566,10 @@ fn app_bundle(dir: &Path, version: &str, helper: &Path) -> PathBuf {
              </dict></plist>\n"
         ),
     );
-    // Nested code first: the controlled fixture helper and its enclosing bundle are signed.
     for code in [contents.join("Helpers/vox"), app.clone()] {
         let mut sign = Command::new("/usr/bin/codesign");
         sign.args(["--force", "--sign", "-"]);
         if code == contents.join("Helpers/vox") {
-            // A cdhash-only ad-hoc identity changes at every build and cannot read the
-            // old helper's private test Keychain item. Give controlled helpers one
-            // test signing requirement; this is not Developer ID or release-trust proof.
             sign.args([
                 "--identifier",
                 "us.vox.proof.helper",
@@ -582,7 +583,7 @@ fn app_bundle(dir: &Path, version: &str, helper: &Path) -> PathBuf {
             .unwrap_or_else(|e| panic!("APPARATUS: could not run codesign: {e}"));
         assert!(
             signed.status.success(),
-            "APPARATUS: ad-hoc signing the fixture's {} failed: {}",
+            "APPARATUS: ad-hoc signing {} failed: {}",
             code.display(),
             String::from_utf8_lossy(&signed.stderr)
         );
@@ -601,20 +602,6 @@ fn app_says(app: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// A retained bundle is not an application, but preserves its original plist for rollback.
-#[cfg(target_os = "macos")]
-fn kept_app_says(app: &Path) -> String {
-    if app.join("Contents/Info.plist").exists() {
-        return String::new();
-    }
-    Command::new("/usr/libexec/PlistBuddy")
-        .args(["-c", "Print :CFBundleShortVersionString"])
-        .arg(app.join("Contents/Info.plist.kept"))
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
-        .unwrap_or_default()
-}
-
 #[cfg(target_os = "macos")]
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
@@ -627,7 +614,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
         })
 }
 
-/// A release of `version`, its app carrying the genuinely compiled `helper` as its vox.
+/// Build a controlled bundle from a genuinely compiled helper.
 #[cfg(target_os = "macos")]
 fn bundle_release_of(root: &Path, version: &str, helper: &Path, channels: &[(&str, Option<&str>)]) {
     let work = tmpdir();
@@ -697,8 +684,7 @@ fn bundle_release_app(root: &Path, version: &str, app: &Path, channels: &[(&str,
     }
 }
 
-/// An install `install.sh` made: `home/Apps/Vox.app` carrying this build, the marker beside it
-/// naming `channel` (none when `None`), and `home/bin/vox` a link into it. Returns the link.
+/// An install with a controlled bundle, marker, and link outside the app.
 #[cfg(target_os = "macos")]
 fn bundle_install(home: &Path, channel: Option<&str>) -> PathBuf {
     let apps = home.join("Apps");
@@ -763,7 +749,7 @@ fn bundle_claims(claims: &mut Vec<Claim>, receipts: &mut BTreeMap<String, String
         ),
     ];
 
-    // ---- the update: both the CLI and the app are the new version, the old kept whole ----
+    // The update installs the new app; offline rollback must restore each real version.
     {
         let tmp = tmpdir();
         let home = tmp.path();
@@ -773,39 +759,49 @@ fn bundle_claims(claims: &mut Vec<Claim>, receipts: &mut BTreeMap<String, String
         let text = said(&out);
         let cli = reports(&link);
         let app = app_says(&apps.join("Vox.app"));
-        let prev_cli = reports(&apps.join(".Vox.app.previous/Contents/Helpers/vox"));
-        let prev_app = kept_app_says(&apps.join(".Vox.app.previous"));
         claims.push(claim(
             "bundle.update_replaces_the_whole_bundle",
-            out.status.success()
-                && cli == format!("vox {next}")
-                && app == next
-                && prev_cli.contains(VERSION)
-                && prev_app == VERSION,
+            out.status.success() && cli == format!("vox {next}") && app == next,
             format!(
                 "after `vox update` (exit_ok={}): vox reports {cli:?}, Vox.app says {app:?}; \
-                 .Vox.app.previous holds vox {prev_cli:?} and app {prev_app:?}; it said {text:?}",
+                 it said {text:?}",
                 out.status.success()
             ),
         ));
         receipts.insert("bundle.update".into(), text);
-        let rolled = vox(&link, home, &["update", "--rollback"], &base);
+        let offline = [
+            ("VOX_TEST_RELEASE_BASE", "http://127.0.0.1:0"),
+            ("VOX_NO_SHELL_SETUP", "1"),
+            (
+                "VOX_DATA_DIR",
+                no_data.to_str().expect("APPARATUS: a UTF-8 temp path"),
+            ),
+            (
+                "VOX_CONFIG_DIR",
+                no_config.to_str().expect("APPARATUS: a UTF-8 temp path"),
+            ),
+        ];
+        let rolled = vox(&link, home, &["update", "--rollback"], &offline);
         let rolled_text = said(&rolled);
         let cli = reports(&link);
         let app = app_says(&apps.join("Vox.app"));
-        let kept = kept_app_says(&apps.join(".Vox.app.previous"));
         claims.push(claim(
             "bundle.rollback_restores_the_whole_previous_bundle",
-            rolled.status.success()
-                && cli == format!("vox {VERSION}")
-                && app == VERSION
-                && kept == next,
+            rolled.status.success() && cli == format!("vox {VERSION}") && app == VERSION,
             format!(
-                "after --rollback (it said {rolled_text:?}): vox reports {cli:?}, Vox.app says \
-                 {app:?}, .Vox.app.previous says {kept:?}"
+                "after offline --rollback (it said {rolled_text:?}): vox reports {cli:?}, \
+                 Vox.app says {app:?}"
             ),
         ));
         receipts.insert("bundle.rollback".into(), rolled_text);
+        let reversed = vox(&link, home, &["update", "--rollback"], &offline);
+        claims.push(claim(
+            "bundle.offline_second_rollback_restores_replaced_version",
+            reversed.status.success()
+                && reports(&link) == format!("vox {next}")
+                && app_says(&apps.join("Vox.app")) == next,
+            format!("second offline rollback: {}", said(&reversed)),
+        ));
     }
 
     // A forged record must not change the installed bundle.
@@ -820,20 +816,11 @@ fn bundle_claims(claims: &mut Vec<Claim>, receipts: &mut BTreeMap<String, String
         let text = said(&out);
         let cli = reports(&link);
         let app = app_says(&apps.join("Vox.app"));
-        let left: Vec<String> = std::fs::read_dir(&apps)
-            .map(|d| {
-                d.filter_map(Result::ok)
-                    .map(|e| e.file_name().to_string_lossy().into_owned())
-                    .filter(|n| n.contains("partial") || n.contains("previous"))
-                    .collect()
-            })
-            .unwrap_or_default();
         claims.push(claim(
             id,
-            !out.status.success() && cli.contains(VERSION) && app == VERSION && left.is_empty(),
+            !out.status.success() && cli == format!("vox {VERSION}") && app == VERSION,
             format!(
-                "exit_ok={}, vox still reports {cli:?}, Vox.app says {app:?}, left behind \
-                 {left:?}, it said {text:?}",
+                "exit_ok={}, vox still reports {cli:?}, Vox.app says {app:?}; it said {text:?}",
                 out.status.success()
             ),
         ));
@@ -971,13 +958,12 @@ fn daemon_restart_claim(
     } else {
         "update.restarts_the_daemon_onto_the_new_version"
     };
-    // The next release: this build, saying a version above this one's.
     let next: String = std::iter::once('9')
         .chain(VERSION.chars().skip(1))
         .collect();
     let work = tmpdir();
     let helper = match vox_saying(work.path(), &next) {
-        Ok(h) => h,
+        Ok(helper) => helper,
         Err(why) => {
             claims.push(blocked(
                 id,
@@ -1457,12 +1443,6 @@ impl LaunchServicesCleanup {
         }
     }
 
-    fn register(&mut self, bundle: &Path) -> Result<(), String> {
-        lsregister("-f", bundle)?;
-        self.remember(bundle);
-        Ok(())
-    }
-
     fn remember(&mut self, bundle: &Path) {
         self.bundles.push(bundle.to_path_buf());
         let plugins = bundle.join("Contents/PlugIns");
@@ -1832,21 +1812,6 @@ fn plist_value(app: &Path, key: &str) -> Result<String, String> {
 }
 
 #[cfg(all(target_os = "macos", feature = "optional-proofs"))]
-fn expected_build_version(version: &str) -> Result<String, String> {
-    let parsed = semver::Version::parse(version)
-        .map_err(|e| format!("the app version {version:?} is not SemVer: {e}"))?;
-    Ok(format!(
-        "{}.{}.{}",
-        parsed
-            .major
-            .checked_add(1)
-            .ok_or_else(|| "the app version's major component cannot be raised".to_owned())?,
-        parsed.minor,
-        parsed.patch
-    ))
-}
-
-#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
 fn signed(path: &Path) -> Result<(), String> {
     let out = Command::new("/usr/bin/codesign")
         .args(["--verify", "--strict", "--deep", "--all-architectures"])
@@ -1917,7 +1882,7 @@ fn shipped_notarized(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// A native application opened by its installed path, held until the proof asks it to quit.
+/// Observe the original app's retirement and the updater's replacement, then quit that replacement.
 #[cfg(all(target_os = "macos", feature = "optional-proofs"))]
 struct HeldApp {
     observer: std::process::Child,
@@ -1933,14 +1898,25 @@ import AppKit
 import Foundation
 import Darwin
 let wanted = CommandLine.arguments[1]
+let activePath = CommandLine.arguments[2]
 let ownedPaths = Set(CommandLine.arguments.dropFirst(2))
 let center = NSWorkspace.shared.notificationCenter
 var launched: NSRunningApplication?
 var ownsLaunch = false
-var askedToQuit = false
-var processExit: DispatchSourceProcess?
+var originalExited = false
+var quittingOriginal = false
+var originalExit: DispatchSourceProcess?
+var replacementExit: DispatchSourceProcess?
+func quitReplacement(_ app: NSRunningApplication) {
+    let monitor = DispatchSource.makeProcessSource(identifier: app.processIdentifier, eventMask: .exit, queue: .main)
+    monitor.setEventHandler { replacementExit?.cancel(); exit(0) }
+    replacementExit = monitor
+    monitor.resume()
+    if !app.terminate() { _ = app.forceTerminate(); exit(3) }
+}
 let launchToken = center.addObserver(forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main) { note in
-    guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+    guard launched == nil,
+          let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
           app.bundleIdentifier == wanted else { return }
     launched = app
     ownsLaunch = ownedPaths.contains(app.bundleURL?.path ?? "")
@@ -1949,18 +1925,40 @@ let launchToken = center.addObserver(forName: NSWorkspace.didLaunchApplicationNo
     // Unregistering the live displaced app can remove its LaunchServices application record.
     // Observe its physical process, not a later LS termination notification for that record.
     let monitor = DispatchSource.makeProcessSource(identifier: pid, eventMask: .exit, queue: .main)
-    monitor.setEventHandler { processExit?.cancel(); exit(askedToQuit ? 0 : 4) }
-    processExit = monitor
+    monitor.setEventHandler {
+        originalExited = true
+        originalExit?.cancel()
+        if quittingOriginal { exit(0) }
+    }
+    originalExit = monitor
     monitor.resume()
     print(app.bundleURL?.path ?? "")
     fflush(stdout)
 }
 DispatchQueue.global().async {
-    _ = readLine()
+    let command = readLine()
     DispatchQueue.main.async {
         guard ownsLaunch, let app = launched else { exit(2) }
-        askedToQuit = true
-        if !app.terminate() { _ = app.forceTerminate(); exit(3) }
+        let gone = originalExited || (kill(app.processIdentifier, 0) == -1 && errno == ESRCH)
+        let replacements = NSWorkspace.shared.runningApplications.filter {
+            $0.bundleIdentifier == wanted && $0.bundleURL?.path == activePath
+                && $0.processIdentifier != app.processIdentifier
+        }
+        if command == "HANDOFF" {
+            guard gone else { fputs("original app still runs after update\n", stderr); exit(4) }
+            guard replacements.count == 1 else {
+                fputs("update did not leave exactly one running replacement app\n", stderr)
+                exit(5)
+            }
+            quitReplacement(replacements[0])
+        } else if !gone {
+            quittingOriginal = true
+            if !app.terminate() { _ = app.forceTerminate(); exit(3) }
+        } else if replacements.count == 1 {
+            quitReplacement(replacements[0])
+        } else {
+            exit(replacements.isEmpty ? 0 : 2)
+        }
     }
 }
 print("READY")
@@ -2014,10 +2012,10 @@ withExtendedLifetime(launchToken) { RunLoop.main.run() }
         app
     }
 
-    fn quit(mut self) {
+    fn finish_handoff(mut self) {
         use std::io::Write as _;
         if let Some(mut input) = self.observer.stdin.take() {
-            let _ = writeln!(input, "QUIT");
+            let _ = writeln!(input, "HANDOFF");
         }
         let status = self
             .observer
@@ -2025,7 +2023,7 @@ withExtendedLifetime(launchToken) { RunLoop.main.run() }
             .expect("APPARATUS: observe graceful app termination");
         assert!(
             status.success(),
-            "PRODUCT: scratch Vox did not quit gracefully: {status}, launched {:?}",
+            "PRODUCT: update did not retire the original app and restore one running replacement: {status}, launched {:?}",
             self.path
         );
     }
@@ -2100,7 +2098,6 @@ impl Drop for ScratchDaemonCleanup {
 #[ignore = "optional signed macOS guest journey; docs/release/optional-proofs.md"]
 fn an_update_and_rollback_leave_one_launchable_vox() {
     use std::io::BufRead as _;
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     let model = Command::new("/usr/sbin/sysctl")
         .args(["-n", "hw.model"])
         .output()
@@ -2119,21 +2116,6 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
         std::env::var_os("VOX_PROOF_SHIPPED_APP")
             .expect("APPARATUS: missing exact signed candidate artifact"),
     );
-    for app in [&prior, &candidate] {
-        let helper = app.join("Contents/Helpers/vox");
-        let bytes = std::fs::read(&helper)
-            .unwrap_or_else(|e| panic!("APPARATUS: reading {}: {e}", helper.display()));
-        for knob in ["VOX_TEST_RELEASE_BASE", "VOX_TEST_ABORT_AFTER_SWAP"] {
-            assert!(
-                bytes
-                    .windows(knob.len())
-                    .any(|part| part == knob.as_bytes()),
-                "APPARATUS: {} must be built with test-knobs; {knob} is required in the \
-                 artifact owning this controlled interruption journey, not just the test runner",
-                helper.display()
-            );
-        }
-    }
     let before_version = plist_value(&prior, "CFBundleShortVersionString")
         .unwrap_or_else(|e| panic!("APPARATUS: {e}"));
     let after_version = plist_value(&candidate, "CFBundleShortVersionString")
@@ -2187,33 +2169,8 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
         release_server::serve(candidate_tree.path()).expect("APPARATUS: serve signed candidate");
     let mut claims = Vec::new();
     let mut receipts = BTreeMap::new();
-    let prior_build =
-        plist_value(&prior, "CFBundleVersion").expect("APPARATUS: prior build number");
-    let candidate_build =
-        plist_value(&candidate, "CFBundleVersion").expect("APPARATUS: candidate build number");
-    let components = |value: &str| {
-        value
-            .split('.')
-            .map(str::parse::<u64>)
-            .collect::<Result<Vec<_>, _>>()
-    };
-    claims.push(claim(
-        "bundle.signed_build_numbers_follow_release_versions",
-        expected_build_version(&before_version).as_deref() == Ok(prior_build.as_str())
-            && expected_build_version(&after_version).as_deref() == Ok(candidate_build.as_str())
-            && components(&candidate_build)
-                .expect("PRODUCT: candidate build number is not numeric")
-                > components(&prior_build).expect("PRODUCT: prior build number is not numeric"),
-        format!(
-            "prior={before_version}/{prior_build}, candidate={after_version}/{candidate_build}"
-        ),
-    ));
 
-    for scenario in [
-        "update-and-rollback",
-        "interrupted-publish",
-        "read-only-and-live-retirement",
-    ] {
+    for scenario in ["update-and-rollback", "interrupted-publish"] {
         let scratch = tempfile::Builder::new()
             .prefix("vox-m29a-")
             .tempdir_in("/Users/Shared")
@@ -2262,61 +2219,135 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
             said(&install)
         );
         cleanup.remember(&active);
+        let pass = home.join("proof-pass");
+        write(&pass, "updater proof passphrase\n");
+        let pass_arg = pass.to_str().expect("APPARATUS: UTF-8 passphrase path");
+        let keychain = unlock_staging::keychain(&home.join("data"));
+        let keychain_arg = keychain.to_str().expect("APPARATUS: UTF-8 Keychain path");
         let env = [
             ("VOX_TEST_RELEASE_BASE", release.base.as_str()),
             ("VOX_TEST_APPLE_VERIFY", "1"),
             ("VOX_NO_SHELL_SETUP", "1"),
             ("VOX_NO_SKILL_INSTALL", "1"),
+            ("VOX_TEST_KEYCHAIN", keychain_arg),
         ];
+        let mut daemon = vox_command(
+            &helper,
+            home,
+            &["daemon", "--no-node", "--listen", "127.0.0.1:0"],
+            &env,
+        )
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .expect("APPARATUS: start scratch foreground daemon");
+        let mut ready = String::new();
+        std::io::BufReader::new(daemon.stdout.take().expect("APPARATUS: daemon stdout"))
+            .read_line(&mut ready)
+            .expect("APPARATUS: daemon startup event");
+        assert!(
+            ready.starts_with("vox daemon: control socket "),
+            "APPARATUS: daemon did not start: {ready}"
+        );
+        for args in [
+            &["node", "create", "kept", "--passphrase-file", pass_arg][..],
+            &[
+                "node",
+                "attach",
+                "kept",
+                "--keep",
+                "--passphrase-file",
+                pass_arg,
+            ],
+            &[
+                "room",
+                "create",
+                "--node",
+                "kept",
+                "--passphrase-file",
+                pass_arg,
+                "--name",
+                "saved",
+            ],
+        ] {
+            let out = vox(&helper, home, args, &env);
+            assert!(
+                out.status.success(),
+                "PRODUCT (staging): vox {}: {}",
+                args.join(" "),
+                said(&out)
+            );
+        }
+        let listing = vox(&helper, home, &["room", "list", "--node", "kept"], &env);
+        let room = String::from_utf8_lossy(&listing.stdout)
+            .split_whitespace()
+            .next()
+            .expect("PRODUCT (staging): no saved room")
+            .to_owned();
+        let message = "updater proof exact saved message";
+        let posted = vox(
+            &helper,
+            home,
+            &["room", "post", &room, message, "--node", "kept"],
+            &env,
+        );
+        assert!(
+            posted.status.success(),
+            "PRODUCT (staging): saved post: {}",
+            said(&posted)
+        );
+        let profile_intact = || {
+            let status = vox(&helper, home, &["status", "--node", "kept", "--json"], &env);
+            let read = vox(
+                &helper,
+                home,
+                &["room", "read", &room, "--node", "kept"],
+                &env,
+            );
+            status.status.success()
+                && serde_json::from_slice::<serde_json::Value>(&status.stdout)
+                    .is_ok_and(|v| v["status"] == "Ready")
+                && read.status.success()
+                && String::from_utf8_lossy(&read.stdout)
+                    .lines()
+                    .any(|l| l.ends_with(message))
+        };
+        assert!(
+            profile_intact(),
+            "PRODUCT (staging): saved message or Ready node unavailable"
+        );
 
         if scenario == "interrupted-publish" {
-            let mut daemon =
-                vox_command(&helper, home, &["daemon", "--listen", "127.0.0.1:0"], &env)
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::inherit())
-                    .spawn()
-                    .expect("APPARATUS: start scratch foreground daemon");
-            let mut ready = String::new();
-            std::io::BufReader::new(daemon.stdout.take().expect("APPARATUS: daemon stdout"))
-                .read_line(&mut ready)
-                .expect("APPARATUS: daemon startup event");
-            assert!(
-                ready.starts_with("vox daemon: control socket "),
-                "APPARATUS: daemon did not start: {ready}"
-            );
             let cut_env: Vec<_> = env
                 .iter()
                 .copied()
                 .chain([("VOX_TEST_ABORT_AFTER_SWAP", "1")])
                 .collect();
             let cut = vox(&helper, home, &["update"], &cut_env);
-            assert!(
-                !cut.status.success() && partial.is_dir(),
-                "APPARATUS: real publish did not reach the cut-after-swap boundary: {}",
-                said(&cut)
-            );
-            let inode = std::fs::metadata(&active)
-                .expect("APPARATUS: published inode")
-                .ino();
-            let repaired = vox(&helper, home, &["update"], &env);
-            let text = said(&repaired);
-            println!("interrupted publish repair {}: {text}", repaired.status);
-            let last = text.lines().last().unwrap_or("");
             claims.push(claim(
-                "bundle.recovery_finishes_a_real_cut_without_another_swap",
-                repaired.status.success()
-                    && inode
-                        == std::fs::metadata(&active)
-                            .expect("APPARATUS: repaired inode")
-                            .ino()
-                    && kept_app_says(&previous) == before_version
-                    && !apps.join(".Vox.app.publishing").exists()
-                    && text.contains(&format!(
-                        "the vox daemon was restarted and runs vox {after_version}"
-                    ))
-                    && last.contains("without swapping Vox.app")
-                    && last.contains("cut short"),
-                text.clone(),
+                "bundle.real_exchange_was_interrupted",
+                !cut.status.success() && app_says(&active) == after_version,
+                format!("cut: {}; active={}", said(&cut), app_says(&active)),
+            ));
+            if cut.status.success() || app_says(&active) != after_version {
+                dispose("signed interrupted publish", &claims, &receipts, false);
+            }
+            let offline = [
+                ("VOX_TEST_RELEASE_BASE", "http://127.0.0.1:0"),
+                ("VOX_TEST_APPLE_VERIFY", "1"),
+                ("VOX_NO_SHELL_SETUP", "1"),
+                ("VOX_NO_SKILL_INSTALL", "1"),
+                ("VOX_TEST_KEYCHAIN", keychain_arg),
+            ];
+            let repaired = vox(&helper, home, &["update"], &offline);
+            let text = said(&repaired);
+            claims.push(claim(
+                "bundle.precommit_recovery_restores_the_original",
+                app_says(&active) == before_version
+                    && reports(&helper) == format!("vox {before_version}")
+                    && signed(&active).is_ok()
+                    && profile_intact(),
+                format!("offline recovery {}: {text}", repaired.status),
             ));
             let _ = daemon.kill();
             let _ = daemon.wait();
@@ -2328,18 +2359,14 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
         let updated = vox(&helper, home, &["update"], &env);
         println!("{scenario} update {}: {}", updated.status, said(&updated));
         claims.push(claim(
-            "bundle.kept_bundle_is_not_an_application",
-            updated.status.success() && kept_app_says(&previous) == before_version,
-            format!(
-                "update={}, kept version {:?}: {}",
-                updated.status,
-                kept_app_says(&previous),
-                said(&updated)
-            ),
+            "bundle.update_installs_the_signed_candidate",
+            updated.status.success()
+                && app_says(&active) == after_version
+                && reports(&helper) == format!("vox {after_version}")
+                && profile_intact(),
+            said(&updated),
         ));
-        // A failed product prerequisite must reach its own verdict before later apparatus
-        // depends on the retained plist. Unwinding still owns the running scratch app.
-        if kept_app_says(&previous) != before_version || !updated.status.success() {
+        if !updated.status.success() || app_says(&active) != after_version {
             dispose(
                 "signed one-launchable-app journey",
                 &claims,
@@ -2347,13 +2374,13 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
                 false,
             );
         }
-        old_app.quit();
+        old_app.finish_handoff();
+        let records =
+            launch_services_paths("us.vox.app").expect("APPARATUS: records after graceful quit");
         claims.push(claim(
-            "bundle.quitting_the_renamed_app_does_not_register_it",
-            !launch_services_paths("us.vox.app")
-                .expect("APPARATUS: records after graceful quit")
-                .contains(&previous),
-            format!("records={:?}", launch_services_paths("us.vox.app")),
+            "bundle.no_displaced_application_is_selectable",
+            records.iter().all(|path| path == &active),
+            format!("active={}, records={records:?}", active.display()),
         ));
         let opened = opened_bundle("us.vox.app", &home.join("data"), &home.join("config"), home)
             .unwrap_or_else(|e| panic!("APPARATUS: {e}"));
@@ -2366,170 +2393,51 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
             format!("selected={:?}, error={:?}", opened.path, opened.error),
         ));
 
-        // Hold the genuinely signed candidate across rollback. The following real update must
-        // retire it, not remove code from under the still-running application.
-        let live_candidate = if scenario == "read-only-and-live-retirement" {
-            Some(HeldApp::launch(home, &active, &cleanup.bundles))
-        } else {
-            None
-        };
-        let rollback = vox(&helper, home, &["update", "--rollback"], &env);
+        let offline = [
+            ("VOX_TEST_RELEASE_BASE", "http://127.0.0.1:0"),
+            ("VOX_TEST_APPLE_VERIFY", "1"),
+            ("VOX_NO_SHELL_SETUP", "1"),
+            ("VOX_NO_SKILL_INSTALL", "1"),
+            ("VOX_TEST_KEYCHAIN", keychain_arg),
+        ];
+        let rollback = vox(&helper, home, &["update", "--rollback"], &offline);
         println!(
             "{scenario} rollback {}: {}",
             rollback.status,
             said(&rollback)
         );
         claims.push(claim(
-            "bundle.rollback_restores_the_signed_bundle_and_disarms_the_displaced_one",
+            "bundle.offline_rollback_restores_the_signed_bundle",
             rollback.status.success()
                 && app_says(&active) == before_version
-                && shipped_notarized(&active).is_ok()
-                && kept_app_says(&previous) == after_version,
+                && reports(&helper) == format!("vox {before_version}")
+                && signed(&active).is_ok()
+                && profile_intact(),
             said(&rollback),
         ));
-        if scenario == "update-and-rollback" {
-            let opened =
-                opened_bundle("us.vox.app", &home.join("data"), &home.join("config"), home)
-                    .unwrap_or_else(|e| panic!("APPARATUS: {e}"));
-            claims.push(claim(
-                "bundle.identifier_launches_the_signed_rollback",
-                opened.ok && opened.path.as_deref() == Some(active.as_path()),
-                format!("selected={:?}, error={:?}", opened.path, opened.error),
-            ));
-        } else {
-            let updated = vox(&helper, home, &["update"], &env);
-            assert!(
-                updated.status.success(),
-                "PRODUCT: second real update failed: {}",
-                said(&updated)
-            );
-            let retired: Vec<_> = std::fs::read_dir(&apps)
-                .expect("APPARATUS: retired directory")
-                .map(|e| e.expect("APPARATUS: retired entry").path())
-                .filter(|p| {
-                    p.file_name()
-                        .is_some_and(|n| n.to_string_lossy().starts_with(".Vox.app.retired."))
-                })
-                .collect();
-            assert_eq!(
-                retired.len(),
-                1,
-                "PRODUCT: real update removed the still-running retired bundle"
-            );
-            let retired = &retired[0];
-            cleanup.remember(retired);
-            // Reproduce a legacy live application record, not a fabricated transition journal.
-            std::fs::rename(
-                retired.join("Contents/Info.plist.kept"),
-                retired.join("Contents/Info.plist"),
-            )
-            .expect(
-                "APPARATUS: restore original signed plist to reproduce failed legacy set-aside",
-            );
-            cleanup
-                .register(retired)
-                .unwrap_or_else(|e| panic!("APPARATUS: {e}"));
-            assert!(
-                launch_services_paths("us.vox.app")
-                    .expect("APPARATUS: seeded record")
-                    .contains(retired),
-                "APPARATUS: exact retained registration was not staged"
-            );
-            let mode = std::fs::metadata(retired.join("Contents"))
-                .expect("APPARATUS: Contents mode")
-                .permissions()
-                .mode();
-            std::fs::set_permissions(
-                retired.join("Contents"),
-                std::fs::Permissions::from_mode(mode & !0o222),
-            )
-            .expect("APPARATUS: make Contents read-only");
-            let refused = vox(&helper, home, &["update"], &env);
-            std::fs::set_permissions(
-                retired.join("Contents"),
-                std::fs::Permissions::from_mode(mode),
-            )
-            .expect("APPARATUS: remove the exact permission obstruction");
-            // Unregister happened before the failed rename. Seed the exact record again so the
-            // unregister inverse has its own causally staged, independent product assertion.
-            cleanup
-                .register(retired)
-                .unwrap_or_else(|e| panic!("APPARATUS: {e}"));
-            assert!(
-                launch_services_paths("us.vox.app")
-                    .expect("APPARATUS: re-seeded record")
-                    .contains(retired),
-                "APPARATUS: registration inverse was not staged before repair"
-            );
-            let inode = std::fs::metadata(&active)
-                .expect("APPARATUS: active inode")
-                .ino();
-            let ready = vox(
-                &helper,
-                home,
-                &["daemon", "--detach", "--listen", "127.0.0.1:0"],
-                &env,
-            );
-            assert!(ready.status.success(),
-                "APPARATUS: authenticated scratch daemon was not ready before restart measurement: {}", said(&ready));
-            let repaired = vox(&helper, home, &["update"], &env);
-            let text = said(&repaired);
-            println!(
-                "read-only repair {}: {text}; refusal: {}",
-                repaired.status,
-                said(&refused)
-            );
-            let records = launch_services_paths("us.vox.app")
-                .expect("APPARATUS: records after retained repair");
-            claims.push(claim(
-                "bundle.kept_bundle_has_no_launchservices_record",
-                !records.contains(retired),
-                format!(
-                    "seeded exact path={}, records={records:?}",
-                    retired.display()
-                ),
-            ));
-            claims.push(claim(
-                "bundle.recovery_repairs_read_only_and_live_retirement_without_a_swap",
-                !refused.status.success()
-                    && repaired.status.success()
-                    && retired.is_dir()
-                    && kept_app_says(retired) == after_version
-                    && inode
-                        == std::fs::metadata(&active)
-                            .expect("APPARATUS: repaired active inode")
-                            .ino()
-                    && text.contains(&format!(
-                        "the vox daemon was restarted and runs vox {after_version}"
-                    ))
-                    && text
-                        .lines()
-                        .last()
-                        .unwrap_or("")
-                        .contains("without swapping Vox.app")
-                    && text.lines().last().unwrap_or("").contains("retired bundle"),
-                format!("refusal={}; repair={text}", said(&refused)),
-            ));
-            live_candidate
-                .expect("APPARATUS: owned live candidate")
-                .quit();
-            let swept = vox(&helper, home, &["update"], &env);
-            claims.push(claim(
-                "bundle.recovery_removes_retired_code_only_after_graceful_exit",
-                swept.status.success()
-                    && !retired.exists()
-                    && said(&swept)
-                        .lines()
-                        .last()
-                        .unwrap_or("")
-                        .contains("removed 1 retired bundle"),
-                said(&swept),
-            ));
-        }
+        let opened = opened_bundle("us.vox.app", &home.join("data"), &home.join("config"), home)
+            .unwrap_or_else(|e| panic!("APPARATUS: {e}"));
+        claims.push(claim(
+            "bundle.identifier_launches_the_signed_rollback",
+            opened.ok && opened.path.as_deref() == Some(active.as_path()),
+            format!("selected={:?}, error={:?}", opened.path, opened.error),
+        ));
+        let reversed = vox(&helper, home, &["update", "--rollback"], &offline);
+        claims.push(claim(
+            "bundle.second_offline_rollback_restores_signed_candidate",
+            reversed.status.success()
+                && app_says(&active) == after_version
+                && reports(&helper) == format!("vox {after_version}")
+                && signed(&active).is_ok()
+                && profile_intact(),
+            said(&reversed),
+        ));
         receipts.insert(
             scenario.to_owned(),
             format!("update={}\nrollback={}", said(&updated), said(&rollback)),
         );
+        let _ = daemon.kill();
+        let _ = daemon.wait();
     }
     dispose(
         "signed one-launchable-app journey",

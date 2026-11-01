@@ -1,25 +1,10 @@
-//! `vox update` for a macOS install: Vox.app is replaced whole (ADR-014 M-29, ADR-028 I-3).
-//!
-//! `install.sh` lays an install out in one folder, `/Applications` or `~/Applications`:
-//!
-//! - `Vox.app`, carrying this binary at `Contents/Helpers/vox`, which `~/.local/bin/vox` links to;
-//! - `.vox-standalone.json`, the marker, beside the bundle because a file inside it would break
-//!   its code seal;
-//! - `.Vox.app.previous`, the bundle the last update or install replaced, for `--rollback`;
-//! - `.vox-standalone.lock`, held for a whole transition.
-//!
-//! The target updater uses its pinned vox record and fetches the app record for that exact
-//! version, downloads the app, and unpacks it beside the bundle as `.Vox.app.partial`. It verifies
-//! every part before anything is renamed: the vox inside is byte for byte the vox the record names,
-//! and Apple vouches for both under the Developer IDs that signed the installed ones. Then one
-//! `renameatx_np(RENAME_SWAP)` puts the new bundle in place, so `Vox.app` is never missing or
-//! partial; the old one becomes `.Vox.app.previous`. A rollback is the same swap the other way.
-//! The daemon is then restarted onto the new version ([`super::restart`]); an app that was
-//! running from this bundle is normally quit before the swap and relaunched afterward.
+//! Target-owned macOS update: archive and verify the installed signed application, exchange an
+//! authenticated candidate, retire displaced trees, then complete the captured handoff. A
+//! durable archive beside the install is the offline rollback authority; interrupted precommit
+//! transitions restore the verified source, and committed transitions resume handoff only.
 
 use std::fs;
 use std::io::{BufRead as _, Read as _};
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -34,7 +19,7 @@ use crate::app::AppError;
 
 /// The bundle's name in its folder.
 const BUNDLE: &str = "Vox.app";
-/// The bundle the last transition replaced, kept for `--rollback`.
+/// Retained bundle name used by older updater versions during legacy recovery.
 const PREVIOUS: &str = ".Vox.app.previous";
 /// A verified candidate waiting to be swapped in; scratch whenever no update is running.
 const PARTIAL: &str = ".Vox.app.partial";
@@ -42,15 +27,66 @@ const PARTIAL: &str = ".Vox.app.partial";
 const UNPACK_PARTIAL: &str = ".Vox.app.unpack.partial";
 /// The CLI inside the bundle.
 const HELPER: &str = "Contents/Helpers/vox";
-/// The journal of a publish under way: it holds the version being published and the bundle that
-/// was [`PREVIOUS`], so a publish cut short is finished or undone by the next transition
-/// ([`recover`]) instead of losing the replaced bundle.
+/// Durable transition and staged rollback archives, held under the installation lock.
 const PUBLISHING: &str = ".Vox.app.publishing";
-/// In [`PUBLISHING`]: the version the publish puts in place.
+/// The version file used by older updater journals.
 const PUBLISHING_VERSION: &str = "version";
 const TRANSITION: &str = "transition.json";
+const ROLLBACK_ARCHIVE: &str = ".Vox.app.rollback.zip";
+const ROLLBACK_AUTHORITY: &str = ".Vox.app.rollback.json";
+const SOURCE_ARCHIVE: &str = "source.zip";
+const PRIOR_ARCHIVE: &str = "prior.zip";
+const PRIOR_AUTHORITY: &str = "prior.json";
+
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+enum FilesystemPhase {
+    Prepared,
+    Stopped,
+    Exchanged,
+    Retiring,
+    Restoring,
+    FilesystemCommitted,
+    HandingOff,
+}
 
 #[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArchiveTransition {
+    phase: FilesystemPhase,
+    #[serde(default)]
+    legacy: bool,
+    #[serde(default)]
+    legacy_path: Option<Vec<u8>>,
+    #[serde(default)]
+    legacy_superseded: Option<ArchiveAuthority>,
+    #[serde(default)]
+    legacy_superseded_identity: Option<BundleIdentity>,
+    source_archive: ArchiveAuthority,
+    previous_archive: Option<ArchiveAuthority>,
+    restoration: Option<BundleIdentity>,
+    restoration_directory: Option<BundleIdentity>,
+    restoration_path: Option<Vec<u8>>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CandidatePreparation {
+    directory: BundleIdentity,
+    staged: Option<BundleIdentity>,
+    verification_directory: Option<BundleIdentity>,
+    verification_path: Option<Vec<u8>>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyPreparation {
+    directory: BundleIdentity,
+    verification_directory: Option<BundleIdentity>,
+    verification_path: Option<Vec<u8>>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Transition {
     kind: TransitionKind,
     version: String,
@@ -59,6 +95,16 @@ struct Transition {
     daemon_data_root: Vec<u8>,
     daemon_config_dir: Vec<u8>,
     daemon: super::restart::DaemonIntent,
+    #[serde(default)]
+    daemon_process: Option<super::restart::DaemonProcess>,
+    #[serde(default)]
+    archive: Option<ArchiveTransition>,
+    #[serde(default)]
+    candidate_preparation: Option<CandidatePreparation>,
+    #[serde(default)]
+    legacy_preparation: Option<LegacyPreparation>,
+    #[serde(default)]
+    legacy_no_handoff: bool,
     app: Option<AppIntent>,
     #[serde(default)]
     daemon_complete: bool,
@@ -75,12 +121,14 @@ enum TransitionKind {
 }
 
 #[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 struct BundleIdentity {
     device: u64,
     inode: u64,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AppIntent {
     pid: u32,
     started: u64,
@@ -89,6 +137,29 @@ struct AppIntent {
     home: Option<Vec<u8>>,
     xdg_data: Option<Vec<u8>>,
     xdg_config: Option<Vec<u8>>,
+}
+
+fn replacement_directory(active: &Path) -> Result<PathBuf, AppError> {
+    use std::os::unix::fs::MetadataExt as _;
+    let directory = vox_sockdrops::replacement_directory(active).map_err(|e| {
+        usage(format!(
+            "cannot create replacement directory for {}: {e}",
+            active.display()
+        ))
+    })?;
+    let metadata = fs::symlink_metadata(&directory).map_err(AppError::Io)?;
+    if !directory.is_absolute()
+        || !metadata.is_dir()
+        || metadata.uid() != rustix::process::getuid().as_raw()
+        || metadata.mode() & 0o077 != 0
+        || metadata.dev() != bundle_identity(active)?.device
+    {
+        return Err(usage(format!(
+            "replacement directory {} is not private on the installation volume",
+            directory.display()
+        )));
+    }
+    Ok(directory)
 }
 
 fn bundle_identity(path: &Path) -> Result<BundleIdentity, AppError> {
@@ -117,24 +188,32 @@ fn path_exists(path: &Path) -> Result<bool, AppError> {
 
 fn write_transition_in(journal: &Path, transition: &Transition) -> Result<(), AppError> {
     use std::io::Write as _;
-    let temporary = journal.join("transition.tmp");
+    let mut temporary = tempfile::Builder::new()
+        .prefix("transition.")
+        .tempfile_in(journal)
+        .map_err(|e| {
+            usage(format!(
+                "cannot create transition in {}: {e}",
+                journal.display()
+            ))
+        })?;
     let destination = journal.join(TRANSITION);
     let bytes = serde_json::to_vec(transition)
         .map_err(|e| usage(format!("cannot encode transition: {e}")))?;
-    let mut file = fs::File::create(&temporary)
-        .map_err(|e| usage(format!("cannot create {}: {e}", temporary.display())))?;
-    file.write_all(&bytes)
-        .and_then(|()| file.sync_all())
+    temporary
+        .as_file_mut()
+        .write_all(&bytes)
+        .and_then(|()| temporary.as_file().sync_all())
         .map_err(|e| {
             usage(format!(
                 "cannot write and sync {}: {e}",
-                temporary.display()
+                temporary.path().display()
             ))
         })?;
-    fs::rename(&temporary, &destination).map_err(|e| {
+    fs::rename(temporary.path(), &destination).map_err(|e| {
         usage(format!(
             "cannot rename {} to {}: {e}",
-            temporary.display(),
+            temporary.path().display(),
             destination.display()
         ))
     })?;
@@ -149,6 +228,7 @@ fn write_transition(apps: &Path, transition: &Transition) -> Result<(), AppError
 
 fn transition_record(
     source: &Path,
+    active: &Path,
     target: &Path,
     kind: TransitionKind,
     version: &str,
@@ -174,6 +254,8 @@ fn transition_record(
         xdg_data: app.environment[3].as_ref().map(|s| s.as_bytes().to_vec()),
         xdg_config: app.environment[4].as_ref().map(|s| s.as_bytes().to_vec()),
     });
+    let (daemon, daemon_process) =
+        super::restart::capture_daemon_state(&account, &active.join(HELPER))?;
     Ok(Transition {
         kind,
         version: version.to_owned(),
@@ -181,7 +263,12 @@ fn transition_record(
         target: bundle_identity(target)?,
         daemon_data_root,
         daemon_config_dir,
-        daemon: super::restart::capture_daemon_intent(&account)?,
+        daemon,
+        daemon_process,
+        archive: None,
+        candidate_preparation: None,
+        legacy_preparation: None,
+        legacy_no_handoff: false,
         app,
         daemon_complete: false,
         app_complete: false,
@@ -189,14 +276,7 @@ fn transition_record(
     })
 }
 
-fn prepare_transition(
-    apps: &Path,
-    candidate: &Path,
-    kind: TransitionKind,
-    version: &str,
-    app: &Option<StoppedApp>,
-) -> Result<Transition, AppError> {
-    let transition = transition_record(&apps.join(BUNDLE), candidate, kind, version, app)?;
+fn publish_new_journal(apps: &Path, transition: &Transition) -> Result<(), AppError> {
     let journal = apps.join(PUBLISHING);
     if path_exists(&journal)? {
         return Err(usage(format!(
@@ -207,21 +287,163 @@ fn prepare_transition(
     let preparing = tempfile::Builder::new()
         .prefix(".Vox.app.prepare.")
         .tempdir_in(apps)
-        .map_err(|e| {
-            usage(format!(
-                "cannot create transition preparation directory in {}: {e}",
-                apps.display()
-            ))
-        })?;
-    write_transition_in(preparing.path(), &transition)?;
+        .map_err(AppError::Io)?;
+    write_transition_in(preparing.path(), transition)?;
     fs::rename(preparing.path(), &journal)
         .map_err(|e| usage(format!("cannot publish journal {}: {e}", journal.display())))?;
-    sync_dir(apps).map_err(|e| usage(format!("cannot sync directory {}: {e}", apps.display())))?;
+    sync_dir(apps)
+}
+
+fn prepare_candidate_journal(apps: &Path) -> Result<Transition, AppError> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    let active = apps.join(BUNDLE);
+    let unpacked = apps.join(UNPACK_PARTIAL);
+    if path_exists(&unpacked)?
+        || path_exists(&apps.join(PARTIAL))?
+        || path_exists(&apps.join(PUBLISHING))?
+    {
+        return Err(usage(
+            "unexpected candidate staging or journal exists; all files retained",
+        ));
+    }
+    let running = inspect_app(&active)?;
+    let version =
+        app_version(&active).ok_or_else(|| usage("active Vox.app version is unavailable"))?;
+    let mut transition = transition_record(
+        &active,
+        &active,
+        &active,
+        TransitionKind::Refresh,
+        &version,
+        &running,
+    )?;
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&unpacked)
+        .map_err(|e| usage(format!("cannot create {}: {e}", unpacked.display())))?;
+    transition.candidate_preparation = Some(CandidatePreparation {
+        directory: bundle_identity(&unpacked)?,
+        staged: None,
+        verification_directory: None,
+        verification_path: None,
+    });
+    if let Err(error) = publish_new_journal(apps, &transition) {
+        return match fs::remove_dir(&unpacked) {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(usage(format!(
+                "{error}; cannot remove empty {}: {cleanup}",
+                unpacked.display()
+            ))),
+        };
+    }
     Ok(transition)
 }
 
-/// **Test-only**: abort the process right after a publish's swap, before the replaced bundle is
-/// renamed to [`PREVIOUS`], so a proof can stand a publish cut short at its one awkward moment.
+fn stage_candidate(
+    apps: &Path,
+    candidate: &Path,
+    transition: &mut Transition,
+) -> Result<PathBuf, AppError> {
+    let unpacked = apps.join(UNPACK_PARTIAL);
+    let staged = apps.join(PARTIAL);
+    let preparation = transition
+        .candidate_preparation
+        .as_ref()
+        .ok_or_else(|| usage("missing candidate preparation authority"))?;
+    if candidate != unpacked.join(BUNDLE)
+        || bundle_identity(&unpacked)? != preparation.directory
+        || path_exists(&staged)?
+    {
+        return Err(usage(
+            "candidate staging identity changed; all files retained",
+        ));
+    }
+    let identity = bundle_identity(candidate)?;
+    transition
+        .candidate_preparation
+        .as_mut()
+        .ok_or_else(|| usage("missing candidate preparation authority"))?
+        .staged = Some(identity);
+    write_transition(apps, transition)?;
+    move_durable(candidate, &staged)?;
+    vox_sockdrops::remove_item(&unpacked)
+        .map_err(|e| usage(format!("cannot remove {}: {e}", unpacked.display())))?;
+    Ok(staged)
+}
+
+fn prepare_transition(
+    apps: &Path,
+    candidate: &Path,
+    kind: TransitionKind,
+    version: &str,
+    app: &Option<StoppedApp>,
+) -> Result<Transition, AppError> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let active = apps.join(BUNDLE);
+    let mut transition = transition_record(&active, &active, candidate, kind, version, app)?;
+    if matches!(kind, TransitionKind::Refresh) {
+        publish_new_journal(apps, &transition)?;
+        return Ok(transition);
+    }
+    let journal = apps.join(PUBLISHING);
+    let bytes = fs::read(journal.join(TRANSITION)).map_err(AppError::Io)?;
+    let mut preparing: Transition = serde_json::from_slice(&bytes)
+        .map_err(|e| usage(format!("invalid candidate preparation journal: {e}")))?;
+    let preparation = preparing
+        .candidate_preparation
+        .as_ref()
+        .ok_or_else(|| usage("missing candidate preparation authority"))?;
+    if preparing.source != transition.source
+        || preparation.staged.as_ref() != Some(&transition.target)
+        || candidate != apps.join(PARTIAL)
+    {
+        return Err(usage(
+            "candidate or source identity changed during preparation",
+        ));
+    }
+    let archive_path = journal.join(SOURCE_ARCHIVE);
+    let source_archive = archive_authority(&active, &archive_path)?;
+    let previous_archive = read_rollback_authority(apps)?;
+    let replacement = replacement_directory(&active)?;
+    let preparation = preparing
+        .candidate_preparation
+        .as_mut()
+        .ok_or_else(|| usage("missing candidate preparation authority"))?;
+    preparation.verification_directory = Some(bundle_identity(&replacement)?);
+    preparation.verification_path = Some(replacement.join(BUNDLE).as_os_str().as_bytes().to_vec());
+    write_transition(apps, &preparing)?;
+    let checked = extract_archive(&archive_path, &source_archive, &replacement).and_then(|path| {
+        launch_services(false, &path).map_err(usage)?;
+        Ok(())
+    });
+    let cleanup = vox_sockdrops::remove_item(&replacement).map_err(|e| {
+        usage(format!(
+            "cannot remove replacement directory {}: {e}",
+            replacement.display()
+        ))
+    });
+    match (checked, cleanup) {
+        (Err(e), Err(cleanup)) => return Err(usage(format!("{e}; {cleanup}"))),
+        (Err(e), _) | (_, Err(e)) => return Err(e),
+        _ => {}
+    }
+    transition.archive = Some(ArchiveTransition {
+        phase: FilesystemPhase::Prepared,
+        legacy: false,
+        legacy_path: None,
+        legacy_superseded: None,
+        legacy_superseded_identity: None,
+        source_archive,
+        previous_archive,
+        restoration: None,
+        restoration_directory: None,
+        restoration_path: None,
+    });
+    write_transition(apps, &transition)?;
+    Ok(transition)
+}
+
+/// **Test-only**: abort after exchange and its directory sync, before retirement or commit.
 /// Nothing a person runs sets it; not compiled in without the `test-knobs` feature (V210-105).
 #[cfg(feature = "test-knobs")]
 const TEST_ABORT_AFTER_SWAP_ENV: &str = "VOX_TEST_ABORT_AFTER_SWAP";
@@ -273,7 +495,7 @@ fn repair_locked(apps: &Path, exe: &Path) -> Result<bool, AppError> {
             .ok_or_else(|| usage("the repaired Vox.app has no readable version"))?;
         journaled_refresh(apps, &active, &now)?;
     }
-    shell_setup_from(apps, exe);
+    shell_setup_from(apps, exe)?;
     repaired.say_without_swap();
     Ok(true)
 }
@@ -299,14 +521,19 @@ fn refresh(apps: &Path, exe: &Path) -> Result<(), AppError> {
         ))
     })?;
     journaled_refresh(apps, &active, &now)?;
-    shell_setup_from(apps, exe);
+    shell_setup_from(apps, exe)?;
     sweep(apps, &mut Recovery::default())?;
-    println!("Vox {now} is current; {}", super::skill_said());
+    println!("Vox {now} is current");
     Ok(())
 }
 
 /// Apply the already verified helper release, with the target engine owning the transaction.
-pub(super) fn apply(apps: &Path, exe: &Path, vox: &Validated) -> Result<(), AppError> {
+pub(super) fn apply(
+    apps: &Path,
+    exe: &Path,
+    vox: &Validated,
+    supplied_archive: Option<&Path>,
+) -> Result<(), AppError> {
     let _lock = InstallLock::acquire(apps)?;
     let channel = super::Marker::read(&apps.join(super::MARKER_NAME))?.channel;
     if channel != vox.record.channel {
@@ -346,70 +573,79 @@ pub(super) fn apply(apps: &Path, exe: &Path, vox: &Validated) -> Result<(), AppE
         )));
     }
 
-    let mut downloading = tempfile::Builder::new()
-        .prefix("vox-update.")
-        .tempfile()
-        .map_err(|e| {
+    use std::io::Seek as _;
+    let mut downloaded = None;
+    let zip_file = if let Some(path) = supplied_archive {
+        verified_release_zip(path, &app)?
+    } else {
+        let mut downloading = tempfile::Builder::new()
+            .prefix("vox-update.")
+            .tempfile()
+            .map_err(|e| {
+                usage(format!(
+                    "cannot create temporary download in {}: {e}",
+                    std::env::temp_dir().display()
+                ))
+            })?;
+        download_asset(
+            &app,
+            &format!("Vox-{}-{}.zip", app.version_text, app.target),
+            downloading.as_file_mut(),
+        )?;
+        downloading.as_file().sync_all().map_err(|e| {
             usage(format!(
-                "cannot create temporary download in {}: {e}",
-                std::env::temp_dir().display()
+                "cannot sync download {}: {e}",
+                downloading.path().display()
             ))
         })?;
-    download_asset(
-        &app,
-        &format!("Vox-{}-{}.zip", app.version_text, app.target),
-        downloading.as_file_mut(),
-    )?;
-    downloading.as_file().sync_all().map_err(|e| {
-        usage(format!(
-            "cannot sync download {}: {e}",
-            downloading.path().display()
-        ))
-    })?;
-    let zip = downloading.into_temp_path();
-
-    let staged = unpack(apps, &zip)?;
-    if let Err(refused) = verify(&active, &staged, vox) {
-        return Err(match clear_candidate(&staged) {
-            Ok(()) => refused,
-            Err(cleanup) => usage(format!("{refused}; candidate cleanup failed: {cleanup}")),
-        });
-    }
-    let running = inspect_app(&active)?;
+        let (mut file, path) = downloading.into_parts();
+        file.rewind().map_err(AppError::Io)?;
+        downloaded = Some(path);
+        file
+    };
+    let zip: &Path = match supplied_archive {
+        Some(path) => path,
+        None => downloaded
+            .as_deref()
+            .ok_or_else(|| usage("downloaded app archive is unavailable"))?,
+    };
+    let mut preparation = prepare_candidate_journal(apps)?;
+    let staged =
+        unpack(apps, zip, zip_file, &mut preparation).map_err(|e| preparation_failed(apps, e))?;
+    verify(&active, &staged, vox).map_err(|e| preparation_failed(apps, e))?;
+    let running = inspect_app(&active).map_err(|e| preparation_failed(apps, e))?;
     let mut transition = prepare_transition(
         apps,
         &staged,
         TransitionKind::Update,
         &vox.version_text,
         &running,
-    )?;
-    stop_captured_app(&active, &running)?;
-    let aside = match publish(apps, &vox.version_text) {
-        Ok(aside) => aside,
-        Err(e) => {
-            return Err(transition_failed_journal(
-                apps,
-                &running,
-                &mut transition,
-                e,
-            ))
-        }
-    };
-
-    println!("updated: {} -> Vox {}", active.display(), vox.version_text);
-    println!(
-        "         the previous Vox.app is kept at {} for `vox update --rollback`",
-        apps.join(PREVIOUS).display()
-    );
-
-    let handoff = transition_handoff(apps, &active, &vox.version_text, &running, &mut transition);
-    shell_setup_from(apps, exe);
-    let mut failures = Vec::new();
-    if let Some(e) = aside {
-        failures.push(e.to_string());
+    )
+    .map_err(|e| preparation_failed(apps, e))?;
+    if let Err(e) = stop_transaction(apps, &running, &mut transition)
+        .and_then(|()| publish(apps, &mut transition))
+    {
+        return Err(transition_failed_journal(
+            apps,
+            &running,
+            &mut transition,
+            e,
+        ));
     }
+    transition
+        .archive
+        .as_mut()
+        .ok_or_else(|| usage("missing archive transaction authority"))?
+        .phase = FilesystemPhase::HandingOff;
+    write_transition(apps, &transition)?;
+    let handoff = transition_handoff(apps, &active, &vox.version_text, &running, &mut transition);
+    let integration = shell_setup_from(apps, exe);
+    let mut failures = Vec::new();
     if let Err(e) = handoff {
         failures.push(e.to_string());
+    }
+    if let Err(e) = integration {
+        failures.push(format!("integration failed: {e}"));
     }
     if !failures.is_empty() {
         return Err(usage(format!(
@@ -418,46 +654,51 @@ pub(super) fn apply(apps: &Path, exe: &Path, vox: &Validated) -> Result<(), AppE
             failures.join("; ")
         )));
     }
-    finish_journal(apps).and_then(|()| sweep(apps, &mut Recovery::default()))
-        .map_err(|e| usage(format!("Vox {} is installed and handoff completed, but cleanup failed: {e}; run `vox update` for local repair", vox.version_text)))
+    finish_journal(apps)?;
+    println!(
+        "updated: {} -> Vox {}; previous version retained for rollback",
+        active.display(),
+        vox.version_text
+    );
+    Ok(())
 }
 
-/// `vox update --rollback` for the Vox.app in `apps`: swap it with `.Vox.app.previous`, so a
-/// rollback is itself reversible.
-///
-/// # Errors
-/// No previous bundle, or a failed swap.
+/// Restore the authenticated offline archive, retaining the replaced version for the next rollback.
 pub(super) fn rollback(apps: &Path, exe: &Path) -> Result<(), AppError> {
     let active = apps.join(BUNDLE);
-    let previous = apps.join(PREVIOUS);
     let _lock = InstallLock::acquire(apps)?;
     let repaired = recover(apps)?;
-    if !repaired.is_empty() {
+    if !repaired.is_empty() && !repaired.legacy_migrated {
         if !repaired.handoff_done {
             let now = app_version(&active)
                 .ok_or_else(|| usage("the repaired Vox.app has no readable version"))?;
             journaled_refresh(apps, &active, &now)?;
         }
-        shell_setup_from(apps, exe);
+        shell_setup_from(apps, exe)?;
         repaired.say_without_swap();
         return Ok(());
     }
-    if !previous.join(HELPER).is_file() {
-        return Err(usage(format!(
-            "no previous Vox.app was retained in {} — nothing to roll back to",
-            apps.display()
-        )));
-    }
-    let running = inspect_app(&active)?;
-    let was = app_version(&active).ok_or_else(|| usage("active Vox.app version is unavailable"))?;
-    let target =
-        app_version(&previous).ok_or_else(|| usage("previous Vox.app version is unavailable"))?;
+    let authority = read_rollback_authority(apps)?
+        .ok_or_else(|| usage("no rollback archive was retained — nothing to roll back to"))?;
+    let mut preparation = prepare_candidate_journal(apps)?;
+    let candidate = extract_archive(
+        &apps.join(ROLLBACK_ARCHIVE),
+        &authority,
+        &apps.join(UNPACK_PARTIAL),
+    )
+    .map_err(|e| preparation_failed(apps, e))?;
+    let staged = stage_candidate(apps, &candidate, &mut preparation)
+        .map_err(|e| preparation_failed(apps, e))?;
+    let running = inspect_app(&active).map_err(|e| preparation_failed(apps, e))?;
+    let was = app_version(&active)
+        .ok_or_else(|| preparation_failed(apps, usage("active Vox.app version is unavailable")))?;
+    let now = authority.version.clone();
     let mut transition =
-        prepare_transition(apps, &previous, TransitionKind::Rollback, &target, &running)?;
-    stop_captured_app(&active, &running)?;
-    // The kept bundle becomes an application again before it is swapped in; the one it replaces
-    // is set aside after, so neither is ever both in place and set aside.
-    if let Err(e) = restore(&previous) {
+        prepare_transition(apps, &staged, TransitionKind::Rollback, &now, &running)
+            .map_err(|e| preparation_failed(apps, e))?;
+    if let Err(e) = stop_transaction(apps, &running, &mut transition)
+        .and_then(|()| publish(apps, &mut transition))
+    {
         return Err(transition_failed_journal(
             apps,
             &running,
@@ -465,60 +706,33 @@ pub(super) fn rollback(apps: &Path, exe: &Path) -> Result<(), AppError> {
             e,
         ));
     }
-    if let Err(failed) = swap(&previous, &active) {
-        // Nothing was swapped: the kept bundle is set aside again, never left an application.
-        let error = match set_aside(&previous) {
-            Ok(()) => failed,
-            Err(aside) => AppError::Usage(format!(
-                "the rollback swap failed ({failed}), and {aside}; run `vox update` to repair, \
-                 and until then open Vox as {}",
-                active.display()
-            )),
-        };
-        return Err(transition_failed_journal(
-            apps,
-            &running,
-            &mut transition,
-            error,
-        ));
-    }
-    let sync_error = sync_dir(apps)
-        .err()
-        .map(|e| usage(format!("cannot sync directory {}: {e}", apps.display())));
-    // The rollback is done at this point. A set-aside that fails is reported last, after the
-    // active bundle is registered and the daemon restarted, so a failed step never leaves the
-    // rest of the transition undone or invites a second --rollback that would reverse it.
-    let aside = set_aside(&previous);
-    if let Err(said) = launch_services(true, &active) {
-        println!("note: {said}; the current Vox.app is in place and opens by path");
-    }
-    let now = app_version(&active).unwrap_or_else(|| "unknown".to_owned());
-    println!("rolled back: {} -> Vox {now}", active.display());
-    println!(
-        "         Vox {was} is kept at {} for --rollback",
-        previous.display()
-    );
+    transition
+        .archive
+        .as_mut()
+        .ok_or_else(|| usage("missing archive transaction authority"))?
+        .phase = FilesystemPhase::HandingOff;
+    write_transition(apps, &transition)?;
     let handoff = transition_handoff(apps, &active, &now, &running, &mut transition);
-    shell_setup_from(apps, exe);
+    let integration = shell_setup_from(apps, exe);
     let mut failures = Vec::new();
-    if let Some(e) = sync_error {
-        failures.push(e.to_string());
-    }
-    if let Err(e) = aside {
-        failures.push(e.to_string());
-    }
     if let Err(e) = handoff {
         failures.push(e.to_string());
     }
+    if let Err(e) = integration {
+        failures.push(format!("integration failed: {e}"));
+    }
     if !failures.is_empty() {
         return Err(usage(format!(
-            "rollback to Vox {now} is already in place; do not repeat --rollback; run `vox update` for local repair: {}",
+            "rollback to Vox {now} is in place; handoff incomplete; do not repeat --rollback: {}",
             failures.join("; ")
         )));
     }
-    finish_journal(apps).map_err(|e| usage(format!(
-        "rollback to Vox {now} is already in place; do not repeat --rollback; run `vox update` for local repair: {e}"
-    )))
+    finish_journal(apps)?;
+    println!(
+        "rolled back: {} -> Vox {now}; Vox {was} retained for rollback",
+        active.display()
+    );
+    Ok(())
 }
 
 /// Exchange two paths in one step (`renameatx_np` with `RENAME_SWAP`): each name holds a whole
@@ -540,103 +754,112 @@ fn swap(a: &Path, b: &Path) -> Result<(), AppError> {
     })
 }
 
-/// Make the verified `.Vox.app.partial` the bundle, keeping the one it replaces.
-///
-/// **Journalled** ([`PUBLISHING`]): the bundle that was [`PREVIOUS`] is moved into the journal
-/// rather than removed, so a swap that fails puts it back, and a publish cut short between the
-/// swap and the rename (which leaves the replaced bundle under the partial name) is finished by
-/// [`recover`] rather than having that bundle cleared as scratch.
-fn publish(apps: &Path, version: &str) -> Result<Option<AppError>, AppError> {
+fn stop_transaction(
+    apps: &Path,
+    running: &Option<StoppedApp>,
+    transition: &mut Transition,
+) -> Result<(), AppError> {
+    use std::os::unix::ffi::OsStringExt as _;
+    let active = apps.join(BUNDLE);
+    let account = vox_core::node::paths::Account {
+        data_root: PathBuf::from(std::ffi::OsString::from_vec(
+            transition.daemon_data_root.clone(),
+        )),
+        config_dir: PathBuf::from(std::ffi::OsString::from_vec(
+            transition.daemon_config_dir.clone(),
+        )),
+    };
+    stop_captured_app(&active, running)?;
+    super::restart::stop_captured_daemon(
+        &account,
+        &transition.daemon,
+        transition.daemon_process.as_ref(),
+        &active.join(HELPER),
+    )?;
+    transition
+        .archive
+        .as_mut()
+        .ok_or_else(|| usage("missing archive transaction authority"))?
+        .phase = FilesystemPhase::Stopped;
+    write_transition(apps, transition)
+}
+
+/// Exchange the candidate, retire the displaced tree, then commit archive authority.
+fn publish(apps: &Path, transition: &mut Transition) -> Result<(), AppError> {
+    let active = apps.join(BUNDLE);
     let staged = apps.join(PARTIAL);
-    let previous = apps.join(PREVIOUS);
-    let journal = apps.join(PUBLISHING);
-    // The authoritative transition was persisted before the app was stopped.
-    if path_exists(&previous)? {
-        fs::rename(&previous, journal.join(BUNDLE)).map_err(|e| {
-            usage(format!(
-                "cannot rename {} to {}: {e}",
-                previous.display(),
-                journal.join(BUNDLE).display()
-            ))
-        })?;
+    if bundle_identity(&active)? != transition.source
+        || bundle_identity(&staged)? != transition.target
+    {
+        return Err(usage(
+            "bundle identities changed before exchange; all files retained",
+        ));
     }
-    let before_swap = sync_dir(apps)
-        .map_err(|e| usage(format!("cannot sync directory {}: {e}", apps.display())))
-        .and_then(|()| swap(&staged, &apps.join(BUNDLE)));
-    if let Err(failed) = before_swap {
-        let kept = journal.join(BUNDLE);
-        let restored = if path_exists(&kept).unwrap_or(true) {
-            fs::rename(&kept, &previous).map_err(|e| {
-                usage(format!(
-                    "cannot restore {} to {}: {e}",
-                    kept.display(),
-                    previous.display()
-                ))
-            })
-        } else {
-            Ok(())
-        };
-        return Err(match restored {
-            Ok(()) => failed,
-            Err(e) => usage(format!(
-                "{failed}; rollback authority restoration failed: {e}"
-            )),
-        });
-    }
-    sync_dir(apps).map_err(|e| {
-        usage(format!(
-            "cannot sync directory {} after exchange: {e}",
-            apps.display()
-        ))
-    })?;
+    swap(&staged, &active)?;
+    sync_dir(apps)?;
     #[cfg(feature = "test-knobs")]
     if std::env::var_os(TEST_ABORT_AFTER_SWAP_ENV).is_some_and(|v| !v.is_empty()) {
         std::process::abort();
     }
-    // The swap left the replaced bundle under the partial name.
-    fs::rename(&staged, &previous).map_err(|e| {
-        usage(format!(
-            "cannot rename {} to {}: {e}",
-            staged.display(),
-            previous.display()
-        ))
-    })?;
-    sync_dir(apps).map_err(|e| {
-        usage(format!(
-            "cannot sync directory {} after rename: {e}",
-            apps.display()
-        ))
-    })?;
-    let aside = set_aside(&previous);
-    if let Err(said) = launch_services(true, &apps.join(BUNDLE)) {
-        println!("note: {said}; the current Vox.app is in place and opens by path");
+    transition
+        .archive
+        .as_mut()
+        .ok_or_else(|| usage("missing archive transaction authority"))?
+        .phase = FilesystemPhase::Exchanged;
+    write_transition(apps, transition)?;
+    if bundle_identity(&active)? != transition.target
+        || bundle_identity(&staged)? != transition.source
+    {
+        return Err(usage(
+            "bundle identities changed after exchange; all files retained",
+        ));
     }
-    // Cleanup is deferred until the owned handoff has completed.
-    // The publish is done at this point; a set-aside that failed is the caller's to report
-    // after it has restarted the daemon, never a reason to leave the transition half finished.
-    Ok(aside.err().map(|e| {
-        AppError::Usage(format!(
-            "Vox {version} is in place, but the replaced Vox.app was not set aside: {e}; run \
-             `vox update` again to finish, and until then open Vox as {}",
-            apps.join(BUNDLE).display()
+    transition
+        .archive
+        .as_mut()
+        .ok_or_else(|| usage("missing archive transaction authority"))?
+        .phase = FilesystemPhase::Retiring;
+    write_transition(apps, transition)?;
+    launch_services(false, &staged).map_err(usage)?;
+    if bundle_identity(&active)? != transition.target
+        || bundle_identity(&staged)? != transition.source
+    {
+        return Err(usage(
+            "bundle identities changed before retirement; all files retained",
+        ));
+    }
+    vox_sockdrops::remove_item(&staged).map_err(|e| {
+        usage(format!(
+            "cannot retire displaced bundle {}: {e}",
+            staged.display()
         ))
-    }))
+    })?;
+    sync_dir(apps)?;
+    promote_archive(
+        apps,
+        transition
+            .archive
+            .as_ref()
+            .ok_or_else(|| usage("missing archive transaction authority"))?,
+    )?;
+    launch_services(true, &active).map_err(usage)?;
+    transition
+        .archive
+        .as_mut()
+        .ok_or_else(|| usage("missing archive transaction authority"))?
+        .phase = FilesystemPhase::FilesystemCommitted;
+    write_transition(apps, transition)?;
+    Ok(())
 }
 
 fn finish_journal(apps: &Path) -> Result<(), AppError> {
     let journal = apps.join(PUBLISHING);
     let older = journal.join(BUNDLE);
-    match fs::symlink_metadata(&older) {
-        Ok(_) => {
-            if in_use(&older) {
-                retire(apps, &older)?;
-            } else {
-                set_aside(&older)?;
-                clear(&older)?;
-            }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(usage(format!("cannot inspect {}: {e}", older.display()))),
+    if path_exists(&older)? {
+        return Err(usage(format!(
+            "unresolved legacy bundle {} retained",
+            older.display()
+        )));
     }
     // The live journal must never lose its record through a partial recursive removal.
     // Retire its completed authority atomically; interrupted disposal is then only cleanup.
@@ -665,30 +888,7 @@ const RETIRED_PREFIX: &str = ".Vox.app.retired.";
 /// Completed journals awaiting disposal; these never contain a retained executable.
 const COMPLETED_PREFIX: &str = ".Vox.app.retired.journal.";
 
-/// Rename `bundle` aside as retired: a daemon not restarted since an earlier update runs from it.
-fn retire(apps: &Path, bundle: &Path) -> Result<(), AppError> {
-    set_aside(bundle)?;
-    let ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis());
-    let name = format!("{RETIRED_PREFIX}{ms}.{}", std::process::id());
-    let retired = apps.join(name);
-    fs::rename(bundle, &retired).map_err(|e| {
-        usage(format!(
-            "cannot rename {} to {}: {e}",
-            bundle.display(),
-            retired.display()
-        ))
-    })?;
-    Ok(())
-}
-
-/// Tell LaunchServices about a bundle: `register` adds or refreshes the bundle in place;
-/// otherwise a record made for a bundle now set aside is taken out. The set-aside bundle has no
-/// `Info.plist` ([`set_aside`]), which is what keeps it unlaunchable; this call only clears the
-/// record a running app may still re-register when it quits. Best effort: a refusal is said,
-/// not fatal. Measured 2026-10-19: both bundles registered as `us.vox.app` with the same
-/// CFBundleVersion, and reopening Vox launched the replaced 0.4.4 against the 0.4.6 daemon.
+/// Register the active bundle or unregister an exact displaced bundle path.
 const LSREGISTER: &str = "/System/Library/Frameworks/CoreServices.framework/Frameworks/\
                           LaunchServices.framework/Support/lsregister";
 
@@ -834,55 +1034,11 @@ fn registered_path(bundle: &Path) -> Result<bool, String> {
     Ok(found)
 }
 
-/// A set-aside bundle's `Info.plist`, kept under this name until a rollback restores it. Without
-/// `Contents/Info.plist` the folder is no application bundle: LaunchServices cannot register it,
-/// not even when the app still running from it quits, so opening Vox by its identifier never
-/// lands on it (ADR-014 M-29a). `lsregister -u` is the second measure, for a record already made.
+/// The legacy disabled-plist name is accepted only when reconstructing a private copy.
 const KEPT_INFO_PLIST: &str = "Contents/Info.plist.kept";
 const INFO_PLIST: &str = "Contents/Info.plist";
 
-/// Remove the exact registration and disable the bundle even when removal fails.
-fn set_aside(bundle: &Path) -> Result<(), AppError> {
-    let unregister = launch_services(false, bundle).err();
-    let plist = bundle.join(INFO_PLIST);
-    let kept = bundle.join(KEPT_INFO_PLIST);
-    let disable = match fs::symlink_metadata(&plist) {
-        Ok(_) => fs::rename(&plist, &kept)
-            .map_err(|e| {
-                format!(
-                    "cannot rename {} to {}: {e}",
-                    plist.display(),
-                    kept.display()
-                )
-            })
-            .err(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => Some(format!("cannot inspect {}: {e}", plist.display())),
-    };
-    match (unregister, disable) {
-        (None, None) => Ok(()),
-        (Some(e), None) | (None, Some(e)) => Err(usage(e)),
-        (Some(a), Some(b)) => Err(usage(format!("{a}; {b}"))),
-    }
-}
-
-/// Make a set-aside bundle an application again, for the swap that brings it back.
-fn restore(bundle: &Path) -> Result<(), AppError> {
-    let kept = bundle.join(KEPT_INFO_PLIST);
-    let plist = bundle.join(INFO_PLIST);
-    if path_exists(&kept)? {
-        fs::rename(&kept, &plist).map_err(|e| {
-            usage(format!(
-                "cannot rename {} to {}: {e}",
-                kept.display(),
-                plist.display()
-            ))
-        })?;
-    }
-    Ok(())
-}
-
-/// Remove the retired bundles nothing runs from any more.
+/// Dispose completed journals; preserve unknown legacy retired bundles.
 fn sweep(apps: &Path, repaired: &mut Recovery) -> Result<(), AppError> {
     let entries = fs::read_dir(apps)
         .map_err(|e| usage(format!("cannot read directory {}: {e}", apps.display())))?;
@@ -903,76 +1059,16 @@ fn sweep(apps: &Path, repaired: &mut Recovery) -> Result<(), AppError> {
             .to_string_lossy()
             .starts_with(RETIRED_PREFIX);
         if retired {
-            // Set aside first, again if an earlier attempt failed: the record goes and the
-            // bundle is no application even if it then cannot be removed. One still in use stays.
-            let path = entry.path();
-            let was_application = path.join(INFO_PLIST).is_file();
-            set_aside(&path)?;
-            repaired.retired_set_aside += usize::from(was_application);
-            if !in_use(&entry.path()) {
-                clear(&entry.path())?;
-                repaired.retired_removed += 1;
-            }
+            return Err(usage(format!(
+                "unresolved legacy retired bundle {} retained",
+                entry.path().display()
+            )));
         }
     }
     Ok(())
 }
 
-/// Whether any process runs one of `bundle`'s executables, as `lsof` reports it. When `lsof`
-/// cannot say, the bundle is taken to be in use: kept is the safe side.
-fn in_use(bundle: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt as _;
-    let Ok(contents) = fs::canonicalize(bundle.join("Contents")) else {
-        return true;
-    };
-    let mut files = Vec::new();
-    let mut dirs = vec![bundle.join("Contents")];
-    while let Some(dir) = dirs.pop() {
-        let Ok(entries) = fs::read_dir(&dir) else {
-            return true;
-        };
-        for entry in entries {
-            let Ok(entry) = entry else { return true };
-            let Ok(meta) = fs::symlink_metadata(entry.path()) else {
-                return true;
-            };
-            if meta.file_type().is_symlink() {
-                // Only links resolved inside the traversed tree are accounted for by its files.
-                if !fs::canonicalize(entry.path()).is_ok_and(|target| target.starts_with(&contents))
-                {
-                    return true;
-                }
-            } else if meta.is_dir() {
-                dirs.push(entry.path());
-            } else if meta.is_file() && meta.permissions().mode() & 0o111 != 0 {
-                files.push(entry.path());
-            }
-        }
-    }
-    if files.is_empty() {
-        return true;
-    }
-    // The pids, not the status: lsof exits 1 when any one file named is not open.
-    Command::new("/usr/sbin/lsof")
-        .arg("-t")
-        .args(&files)
-        .env_clear()
-        .output()
-        .map_or(true, |out| {
-            !out.stdout.is_empty()
-                || (!out.status.success()
-                    && (out.status.code() != Some(1) || !out.stderr.is_empty()))
-        })
-}
-
-/// Finish or undo a publish that was cut short (see [`publish`]); nothing when none was. Run
-/// under the install lock, before anything else reads `apps`.
-///
-/// With no [`PREVIOUS`] but a bundle under [`PARTIAL`], the journal's version says which side of
-/// the swap the publish stopped on: if [`BUNDLE`] is that version, the swap happened and the
-/// partial name holds the replaced bundle, which becomes [`PREVIOUS`]; otherwise the partial is
-/// the unpublished candidate, and goes. Either way the journal's earlier previous bundle comes
-/// back when nothing has taken its place.
+/// Recover the exact recorded transaction under the install lock; preserve ambiguous authority.
 fn recover(apps: &Path) -> Result<Recovery, AppError> {
     let mut repaired = Recovery::default();
     let journal = apps.join(PUBLISHING);
@@ -993,38 +1089,62 @@ fn recover(apps: &Path) -> Result<Recovery, AppError> {
         }
     };
     if !journal_present {
-        let mut failures = Vec::new();
-        if let Err(e) = sweep(apps, &mut repaired) {
-            failures.push(e.to_string());
+        let unpacked = apps.join(UNPACK_PARTIAL);
+        if path_exists(&unpacked)? {
+            use std::os::unix::fs::MetadataExt as _;
+            let meta = fs::symlink_metadata(&unpacked).map_err(AppError::Io)?;
+            if !meta.is_dir()
+                || meta.uid() != rustix::process::getuid().as_raw()
+                || meta.mode() & 0o077 != 0
+                || path_exists(&apps.join(PARTIAL))?
+            {
+                return Err(usage(format!(
+                    "unrecorded candidate directory {} retained",
+                    unpacked.display()
+                )));
+            }
+            fs::remove_dir(&unpacked).map_err(|e| {
+                usage(format!(
+                    "unrecorded nonempty or inaccessible candidate directory {} retained: {e}",
+                    unpacked.display()
+                ))
+            })?;
+            sync_dir(apps)?;
         }
+        sweep(apps, &mut repaired)?;
         let previous = apps.join(PREVIOUS);
-        match path_exists(&previous) {
-            Ok(true) => {
-                repaired.previous_set_aside = previous.join(INFO_PLIST).is_file();
-                if let Err(e) = set_aside(&previous) {
-                    failures.push(e.to_string());
-                }
+        if path_exists(&previous)? {
+            if read_rollback_authority(apps)?.is_some() {
+                return Err(usage(
+                    "both legacy bundle and archive rollback authorities exist; all retained",
+                ));
             }
-            Ok(false) => {}
-            Err(e) => failures.push(e.to_string()),
-        }
-        if !failures.is_empty() {
             let active = apps.join(BUNDLE);
-            let handoff = app_version(&active)
-                .ok_or_else(|| {
-                    usage(format!(
-                        "cannot identify installed version at {}",
-                        active.display()
-                    ))
-                })
-                .and_then(|version| journaled_refresh(apps, &active, &version));
-            if let Err(e) = handoff {
-                failures.push(e.to_string());
-            }
-            return Err(usage(format!(
-                "installed app cleanup is incomplete: {}; run `vox update` for local repair",
-                failures.join("; ")
-            )));
+            let version = app_version(&active)
+                .ok_or_else(|| usage("active Vox.app version is unavailable"))?;
+            let running = inspect_app(&active)?;
+            let mut transition = transition_record(
+                &previous,
+                &active,
+                &active,
+                TransitionKind::Update,
+                &version,
+                &running,
+            )?;
+            transition.legacy_no_handoff = true;
+            let preparing = tempfile::Builder::new()
+                .prefix(".Vox.app.prepare.")
+                .tempdir_in(apps)
+                .map_err(AppError::Io)?;
+            write_transition_in(preparing.path(), &transition)?;
+            fs::rename(preparing.path(), &journal).map_err(|e| {
+                usage(format!(
+                    "cannot publish legacy journal {}: {e}",
+                    journal.display()
+                ))
+            })?;
+            sync_dir(apps)?;
+            return recover_transition(apps, &journal.join(TRANSITION));
         }
         return Ok(repaired);
     }
@@ -1122,6 +1242,7 @@ fn recover(apps: &Path) -> Result<Recovery, AppError> {
     };
     let transition = transition_record(
         source,
+        &active,
         target,
         TransitionKind::Update,
         published.trim(),
@@ -1129,6 +1250,176 @@ fn recover(apps: &Path) -> Result<Recovery, AppError> {
     )?;
     write_transition(apps, &transition)?;
     recover_transition(apps, &transition_path)
+}
+
+fn stopped_from_transition(transition: &Transition) -> Option<StoppedApp> {
+    use std::os::unix::ffi::OsStringExt as _;
+    transition.app.as_ref().map(|intent| StoppedApp {
+        identity: AppIdentity {
+            pid: intent.pid,
+            started: intent.started,
+        },
+        account: vox_core::node::paths::Account {
+            data_root: PathBuf::from(std::ffi::OsString::from_vec(intent.data_root.clone())),
+            config_dir: PathBuf::from(std::ffi::OsString::from_vec(intent.config_dir.clone())),
+        },
+        environment: [
+            None,
+            None,
+            intent.home.clone().map(std::ffi::OsString::from_vec),
+            intent.xdg_data.clone().map(std::ffi::OsString::from_vec),
+            intent.xdg_config.clone().map(std::ffi::OsString::from_vec),
+        ],
+    })
+}
+
+fn reconcile_app_handoff(
+    active: &Path,
+    stopped: &Option<StoppedApp>,
+    committed: bool,
+) -> Result<(), AppError> {
+    let mut app_already_restored = false;
+    if let Some(saved) = stopped.as_ref() {
+        if let Some(current) = inspect_app(active)? {
+            if current.identity.pid == saved.identity.pid
+                && current.identity.started == saved.identity.started
+            {
+                if !committed {
+                    return Ok(());
+                }
+                stop_captured_app(active, stopped)?;
+            } else {
+                let same_profile = current.account.data_root == saved.account.data_root
+                    && current.account.config_dir == saved.account.config_dir
+                    && current.environment[2..] == saved.environment[2..];
+                if !same_profile
+                    || !pid_executes(&active_executable(active)?, current.identity.pid)?
+                {
+                    return Err(usage("another app instance is running; refusing to guess interrupted handoff identity"));
+                }
+                let confirmed = inspect_app(active)?.ok_or_else(|| {
+                    usage("replacement app exited while its identity was checked")
+                })?;
+                if confirmed.identity.pid != current.identity.pid
+                    || confirmed.identity.started != current.identity.started
+                    || confirmed.account.data_root != current.account.data_root
+                    || confirmed.account.config_dir != current.account.config_dir
+                    || confirmed.environment[2..] != current.environment[2..]
+                {
+                    return Err(usage(
+                        "replacement app changed while its identity was checked",
+                    ));
+                }
+                app_already_restored = true;
+            }
+        }
+    }
+    if app_already_restored {
+        Ok(())
+    } else {
+        relaunch_app(active, stopped)
+    }
+}
+
+fn preparation_failed(apps: &Path, error: AppError) -> AppError {
+    let path = apps.join(PUBLISHING).join(TRANSITION);
+    match recover_transition(apps, &path) {
+        Ok(_) => error,
+        Err(cleanup) => usage(format!(
+            "{error}; candidate preparation cleanup failed: {cleanup}; journal retained"
+        )),
+    }
+}
+
+fn recover_candidate_preparation(apps: &Path, transition: &Transition) -> Result<(), AppError> {
+    use std::os::unix::ffi::OsStringExt as _;
+    let preparation = transition
+        .candidate_preparation
+        .as_ref()
+        .ok_or_else(|| usage("missing candidate preparation authority"))?;
+    if !matches!(transition.kind, TransitionKind::Refresh)
+        || transition.archive.is_some()
+        || transition.source != transition.target
+        || bundle_identity(&apps.join(BUNDLE))? != transition.source
+    {
+        return Err(usage(
+            "candidate preparation active identity changed; all files retained",
+        ));
+    }
+    let unpacked = apps.join(UNPACK_PARTIAL);
+    let staged = apps.join(PARTIAL);
+    if path_exists(&unpacked)? && bundle_identity(&unpacked)? != preparation.directory {
+        return Err(usage(
+            "candidate preparation directory identity changed; all files retained",
+        ));
+    }
+    if path_exists(&staged)? && preparation.staged.as_ref() != Some(&bundle_identity(&staged)?) {
+        return Err(usage(
+            "staged candidate identity changed; all files retained",
+        ));
+    }
+    match (
+        &preparation.verification_directory,
+        &preparation.verification_path,
+    ) {
+        (None, None) => {}
+        (Some(identity), Some(bytes)) => {
+            let path = PathBuf::from(std::ffi::OsString::from_vec(bytes.clone()));
+            let parent = path
+                .parent()
+                .ok_or_else(|| usage("invalid snapshot verification path"))?;
+            if !path.is_absolute() || path.file_name() != Some(std::ffi::OsStr::new(BUNDLE)) {
+                return Err(usage(
+                    "invalid snapshot verification path; all files retained",
+                ));
+            }
+            if path_exists(parent)? {
+                if &bundle_identity(parent)? != identity {
+                    return Err(usage(
+                        "snapshot verification directory identity changed; all files retained",
+                    ));
+                }
+                if path_exists(&path)? {
+                    bundle_identity(&path)?;
+                    launch_services(false, &path).map_err(usage)?;
+                }
+                vox_sockdrops::remove_item(parent).map_err(|e| {
+                    usage(format!(
+                        "cannot remove snapshot verification directory {}: {e}",
+                        parent.display()
+                    ))
+                })?;
+            }
+        }
+        _ => {
+            return Err(usage(
+                "incomplete snapshot verification authority; all files retained",
+            ))
+        }
+    }
+    if path_exists(&unpacked)? {
+        let partial_app = unpacked.join(BUNDLE);
+        if path_exists(&partial_app)? {
+            bundle_identity(&partial_app)?;
+            launch_services(false, &partial_app).map_err(usage)?;
+        }
+        vox_sockdrops::remove_item(&unpacked).map_err(|e| {
+            usage(format!(
+                "cannot remove candidate directory {}: {e}",
+                unpacked.display()
+            ))
+        })?;
+    }
+    if path_exists(&staged)? {
+        launch_services(false, &staged).map_err(usage)?;
+        vox_sockdrops::remove_item(&staged).map_err(|e| {
+            usage(format!(
+                "cannot remove staged candidate {}: {e}",
+                staged.display()
+            ))
+        })?;
+    }
+    finish_journal(apps)
 }
 
 /// Recover using the bundle identities and owned handoff captured before the app was stopped.
@@ -1148,6 +1439,10 @@ fn recover_transition(apps: &Path, path: &Path) -> Result<Recovery, AppError> {
         || !valid_root(&transition.daemon_data_root)
         || !valid_root(&transition.daemon_config_dir)
         || !transition.daemon.is_valid()
+        || transition
+            .daemon_process
+            .as_ref()
+            .is_some_and(|process| !process.is_valid())
         || (transition.handoff_complete && !(transition.daemon_complete && transition.app_complete))
         || transition.app.as_ref().is_some_and(|app| {
             app.pid == 0
@@ -1166,10 +1461,111 @@ fn recover_transition(apps: &Path, path: &Path) -> Result<Recovery, AppError> {
             path.display()
         )));
     }
+    if transition.candidate_preparation.is_some() {
+        recover_candidate_preparation(apps, &transition)?;
+        return Ok(Recovery {
+            interrupted_publish: true,
+            handoff_done: true,
+            legacy_migrated: true,
+            ..Recovery::default()
+        });
+    }
+    if transition.archive.is_none()
+        && !matches!(transition.kind, TransitionKind::Refresh)
+        && bundle_identity(&apps.join(BUNDLE))? == transition.source
+    {
+        let previous = apps.join(PREVIOUS);
+        let kept = apps.join(PUBLISHING).join(BUNDLE);
+        if path_exists(&kept)? {
+            if path_exists(&previous)? {
+                return Err(usage(
+                    "ambiguous legacy rollback authority; all bundles retained",
+                ));
+            }
+            move_durable(&kept, &previous)?;
+        }
+        let staged = apps.join(PARTIAL);
+        if matches!(transition.kind, TransitionKind::Update) && path_exists(&staged)? {
+            if bundle_identity(&staged)? != transition.target {
+                return Err(usage(
+                    "legacy candidate identity changed; all bundles retained",
+                ));
+            }
+            launch_services(false, &staged).map_err(usage)?;
+            vox_sockdrops::remove_item(&staged).map_err(|e| {
+                usage(format!(
+                    "cannot remove unpublished candidate {}: {e}",
+                    staged.display()
+                ))
+            })?;
+        }
+        if path_exists(&previous)? {
+            if matches!(transition.kind, TransitionKind::Rollback)
+                && bundle_identity(&previous)? != transition.target
+            {
+                return Err(usage(
+                    "legacy rollback identity changed; all bundles retained",
+                ));
+            }
+            transition.source = bundle_identity(&previous)?;
+            transition.target = bundle_identity(&apps.join(BUNDLE))?;
+            transition.kind = TransitionKind::Update;
+            transition.version = app_version(&apps.join(BUNDLE))
+                .ok_or_else(|| usage("active Vox.app version is unavailable"))?;
+            write_transition(apps, &transition)?;
+        }
+    }
+    if transition.archive.is_none()
+        && !matches!(transition.kind, TransitionKind::Refresh)
+        && bundle_identity(&apps.join(BUNDLE))? == transition.target
+    {
+        prepare_legacy_migration(apps, &mut transition)?;
+    }
+    if transition.archive.as_ref().is_some_and(|archive| {
+        archive.legacy
+            && archive.phase != FilesystemPhase::FilesystemCommitted
+            && archive.phase != FilesystemPhase::HandingOff
+    }) {
+        resume_legacy_migration(apps, &mut transition)?;
+    }
+    if let Some(archive) = transition.archive.as_ref() {
+        if !matches!(
+            archive.phase,
+            FilesystemPhase::FilesystemCommitted | FilesystemPhase::HandingOff
+        ) {
+            let stopped = stopped_from_transition(&transition);
+            restore_source_and_handoff(apps, &stopped, &mut transition)?;
+            return Ok(Recovery {
+                interrupted_publish: true,
+                handoff_done: true,
+                ..Recovery::default()
+            });
+        }
+        if bundle_identity(&apps.join(BUNDLE))? != transition.target
+            || read_rollback_authority(apps)?.as_ref() != Some(&archive.source_archive)
+        {
+            return Err(usage(
+                "committed archive transaction identity changed; all files retained",
+            ));
+        }
+    }
+    if transition.legacy_no_handoff {
+        if !transition.archive.as_ref().is_some_and(|archive| {
+            archive.legacy && archive.phase == FilesystemPhase::FilesystemCommitted
+        }) {
+            return Err(usage(
+                "legacy migration has no committed archive; journal retained",
+            ));
+        }
+        finish_journal(apps)?;
+        return Ok(Recovery {
+            interrupted_publish: true,
+            handoff_done: true,
+            legacy_migrated: true,
+            ..Recovery::default()
+        });
+    }
     let active = apps.join(BUNDLE);
-    let previous = apps.join(PREVIOUS);
-    let staged = apps.join(PARTIAL);
-    let kept = apps.join(PUBLISHING).join(BUNDLE);
     let current = bundle_identity(&active)?;
     let committed =
         if matches!(transition.kind, TransitionKind::Refresh) && current == transition.source {
@@ -1199,83 +1595,11 @@ fn recover_transition(apps: &Path, path: &Path) -> Result<Recovery, AppError> {
         )));
     }
     let mut errors = Vec::new();
-    let normalize = || -> Result<(), AppError> {
-        match (&transition.kind, committed) {
-            (TransitionKind::Update, true) => {
-                if !path_exists(&previous)? {
-                    if bundle_identity(&staged)? != transition.source {
-                        return Err(usage(
-                            "retained update bundle identity does not match journal",
-                        ));
-                    }
-                    fs::rename(&staged, &previous).map_err(|e| {
-                        usage(format!(
-                            "cannot rename {} to {}: {e}",
-                            staged.display(),
-                            previous.display()
-                        ))
-                    })?;
-                }
-                if bundle_identity(&previous)? != transition.source {
-                    return Err(usage("previous bundle identity does not match journal"));
-                }
-                set_aside(&previous)?;
-            }
-            (TransitionKind::Update, false) => {
-                if path_exists(&kept)? {
-                    if path_exists(&previous)? {
-                        return Err(usage(
-                            "ambiguous rollback authority: both journal and previous bundles exist",
-                        ));
-                    }
-                    fs::rename(&kept, &previous).map_err(|e| {
-                        usage(format!(
-                            "cannot restore {} to {}: {e}",
-                            kept.display(),
-                            previous.display()
-                        ))
-                    })?;
-                }
-            }
-            (TransitionKind::Rollback, _) => {
-                let expected = if committed {
-                    &transition.source
-                } else {
-                    &transition.target
-                };
-                if &bundle_identity(&previous)? != expected {
-                    return Err(usage("rollback bundle identity does not match journal"));
-                }
-                set_aside(&previous)?;
-            }
-            (TransitionKind::Refresh, _) => {}
-        }
-        Ok(())
-    };
-    if let Err(e) = normalize() {
-        errors.push(e.to_string());
-    }
     if let Err(e) = sync_dir(apps) {
         errors.push(format!("cannot sync directory {}: {e}", apps.display()));
     }
     if !transition.handoff_complete {
-        let app = transition.app.as_ref().map(|intent| StoppedApp {
-            identity: AppIdentity {
-                pid: intent.pid,
-                started: intent.started,
-            },
-            account: vox_core::node::paths::Account {
-                data_root: PathBuf::from(std::ffi::OsString::from_vec(intent.data_root.clone())),
-                config_dir: PathBuf::from(std::ffi::OsString::from_vec(intent.config_dir.clone())),
-            },
-            environment: [
-                None,
-                None,
-                intent.home.clone().map(std::ffi::OsString::from_vec),
-                intent.xdg_data.clone().map(std::ffi::OsString::from_vec),
-                intent.xdg_config.clone().map(std::ffi::OsString::from_vec),
-            ],
-        });
+        let app = stopped_from_transition(&transition);
         if !transition.daemon_complete {
             let account = vox_core::node::paths::Account {
                 data_root: PathBuf::from(std::ffi::OsString::from_vec(
@@ -1291,8 +1615,7 @@ fn recover_transition(apps: &Path, path: &Path) -> Result<Recovery, AppError> {
                 &now,
                 Some(&transition.daemon),
             ) {
-                Ok(detached) => {
-                    super::restart::say_next(&detached);
+                Ok(_detached) => {
                     transition.daemon_complete = true;
                     if let Err(e) = write_transition(apps, &transition) {
                         errors.push(e.to_string());
@@ -1303,53 +1626,8 @@ fn recover_transition(apps: &Path, path: &Path) -> Result<Recovery, AppError> {
                 )),
             }
         }
-        let app_handoff = || -> Result<(), AppError> {
-            let mut app_already_restored = false;
-            if let Some(saved) = app.as_ref() {
-                if let Some(current) = inspect_app(&active)? {
-                    if current.identity.pid == saved.identity.pid
-                        && current.identity.started == saved.identity.started
-                    {
-                        if !committed {
-                            return Ok(());
-                        }
-                        stop_captured_app(&active, &app)?;
-                    } else {
-                        let same_profile = current.account.data_root == saved.account.data_root
-                            && current.account.config_dir == saved.account.config_dir
-                            && current.environment[2..] == saved.environment[2..];
-                        if !same_profile
-                            || !pid_executes(&active_executable(&active)?, current.identity.pid)?
-                        {
-                            return Err(usage("another app instance is running; refusing to guess interrupted handoff identity"));
-                        }
-                        let confirmed = inspect_app(&active)?.ok_or_else(|| {
-                            usage("replacement app exited while its identity was checked")
-                        })?;
-                        if confirmed.identity.pid != current.identity.pid
-                            || confirmed.identity.started != current.identity.started
-                            || confirmed.account.data_root != current.account.data_root
-                            || confirmed.account.config_dir != current.account.config_dir
-                            || confirmed.environment[2..] != current.environment[2..]
-                        {
-                            return Err(usage(
-                                "replacement app changed while its identity was checked",
-                            ));
-                        }
-                        // The exact active executable and captured profile are already running.
-                        // Do not quit or launch a second instance after an interrupted relaunch.
-                        app_already_restored = true;
-                    }
-                }
-            }
-            if app_already_restored {
-                Ok(())
-            } else {
-                relaunch_app(&active, &app)
-            }
-        };
         if !transition.app_complete {
-            match app_handoff() {
+            match reconcile_app_handoff(&active, &app, committed) {
                 Ok(()) => {
                     transition.app_complete = true;
                     if let Err(e) = write_transition(apps, &transition) {
@@ -1375,16 +1653,6 @@ fn recover_transition(apps: &Path, path: &Path) -> Result<Recovery, AppError> {
             errors.join("; ")
         )));
     }
-    if !committed && matches!(transition.kind, TransitionKind::Update) && path_exists(&staged)? {
-        if bundle_identity(&staged)? != transition.target {
-            return Err(usage("staged bundle identity changed; journal retained"));
-        }
-        if in_use(&staged) {
-            retire(apps, &staged)?;
-        } else {
-            clear(&staged)?;
-        }
-    }
     finish_journal(apps).map_err(|e| usage(format!(
         "Vox {now} is installed and handoff completed{}; cleanup failed: {e}; run `vox update` for local repair",
         if committed && matches!(transition.kind, TransitionKind::Rollback) { "; do not repeat --rollback" } else { "" }
@@ -1401,33 +1669,17 @@ fn recover_transition(apps: &Path, path: &Path) -> Result<Recovery, AppError> {
 struct Recovery {
     interrupted_publish: bool,
     handoff_done: bool,
-    previous_set_aside: bool,
-    retired_set_aside: usize,
+    legacy_migrated: bool,
     retired_removed: usize,
 }
 
 impl Recovery {
     fn is_empty(&self) -> bool {
-        !self.interrupted_publish
-            && !self.previous_set_aside
-            && self.retired_set_aside == 0
-            && self.retired_removed == 0
+        !self.interrupted_publish && self.retired_removed == 0
     }
 
     fn say_without_swap(&self) {
-        print!("vox: repaired an earlier app transition without swapping Vox.app:");
-        if self.interrupted_publish {
-            print!(" finished an update cut short;");
-        }
-        if self.previous_set_aside {
-            print!(" made the kept previous bundle non-launchable again;");
-        }
-        if self.retired_set_aside > 0 {
-            print!(
-                " made {} retired bundle(s) non-launchable;",
-                self.retired_set_aside
-            );
-        }
+        print!("vox: recovered an earlier app transition;");
         if self.retired_removed > 0 {
             print!(
                 " removed {} retired bundle(s) no process still used;",
@@ -1438,22 +1690,70 @@ impl Recovery {
     }
 }
 
+fn verified_release_zip(path: &Path, record: &Validated) -> Result<fs::File, AppError> {
+    use std::io::{Seek as _, SeekFrom};
+    use std::os::unix::fs::MetadataExt as _;
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|e| usage(format!("cannot inspect {}: {e}", path.display())))?;
+    let mut file =
+        fs::File::open(path).map_err(|e| usage(format!("cannot open {}: {e}", path.display())))?;
+    let opened = file.metadata().map_err(AppError::Io)?;
+    if !metadata.is_file()
+        || !opened.is_file()
+        || metadata.dev() != opened.dev()
+        || metadata.ino() != opened.ino()
+        || opened.len() != record.size
+    {
+        return Err(usage(format!(
+            "app archive {} does not match the release record",
+            path.display()
+        )));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| usage("supplied app archive has no directory"))?;
+    let directory = fs::symlink_metadata(parent).map_err(AppError::Io)?;
+    let uid = rustix::process::getuid().as_raw();
+    if !directory.is_dir()
+        || directory.uid() != uid
+        || directory.mode() & 0o077 != 0
+        || opened.uid() != uid
+        || opened.mode() & 0o077 != 0
+    {
+        return Err(usage(
+            "supplied app archive is not in an owned private directory",
+        ));
+    }
+    let (size, digest) = hash_open_file(&mut file, Some(record.size))?;
+    if size != record.size || digest != record.sha256 {
+        return Err(usage(format!(
+            "app archive {} does not match the release record",
+            path.display()
+        )));
+    }
+    file.seek(SeekFrom::Start(0)).map_err(AppError::Io)?;
+    Ok(file)
+}
+
 /// Unpack the downloaded zip beside the bundle, on its filesystem, and return the one Vox.app
 /// it held, moved to `.Vox.app.partial`.
-fn unpack(apps: &Path, zip: &Path) -> Result<PathBuf, AppError> {
+fn unpack(
+    apps: &Path,
+    zip: &Path,
+    file: fs::File,
+    transition: &mut Transition,
+) -> Result<PathBuf, AppError> {
     let unpacked = apps.join(UNPACK_PARTIAL);
-    let staged = apps.join(PARTIAL);
-    clear(&unpacked)?;
-    clear_candidate(&staged)?;
-    fs::create_dir(&unpacked).map_err(|e| {
-        usage(format!(
-            "cannot create directory {}: {e}",
-            unpacked.display()
-        ))
-    })?;
+    let preparation = transition
+        .candidate_preparation
+        .as_ref()
+        .ok_or_else(|| usage("missing candidate preparation authority"))?;
+    if bundle_identity(&unpacked)? != preparation.directory {
+        return Err(usage("candidate preparation directory identity changed"));
+    }
     let out = Command::new("/usr/bin/ditto")
-        .args(["-x", "-k"])
-        .arg(zip)
+        .args(["-x", "-k", "-"])
+        .stdin(std::process::Stdio::from(file))
         .arg(&unpacked)
         .output()
         .map_err(|e| {
@@ -1464,8 +1764,11 @@ fn unpack(apps: &Path, zip: &Path) -> Result<PathBuf, AppError> {
             ))
         })?;
     if !out.status.success() {
-        let _ = clear(&unpacked);
-        return Err(usage("the downloaded Vox.app did not unpack"));
+        return Err(usage(format!(
+            "cannot unpack {}: {}",
+            zip.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
     }
     let entries: Vec<String> = fs::read_dir(&unpacked)
         .map_err(|e| usage(format!("cannot read directory {}: {e}", unpacked.display())))?
@@ -1478,20 +1781,11 @@ fn unpack(apps: &Path, zip: &Path) -> Result<PathBuf, AppError> {
     let bundle = unpacked.join(BUNDLE);
     let is_dir = fs::symlink_metadata(&bundle).is_ok_and(|m| m.is_dir());
     if entries != [BUNDLE] || !is_dir {
-        let _ = clear(&unpacked);
         return Err(usage(format!(
             "the downloaded zip holds {entries:?}, not exactly {BUNDLE}"
         )));
     }
-    fs::rename(&bundle, &staged).map_err(|e| {
-        usage(format!(
-            "cannot rename {} to {}: {e}",
-            bundle.display(),
-            staged.display()
-        ))
-    })?;
-    clear(&unpacked)?;
-    Ok(staged)
+    stage_candidate(apps, &bundle, transition)
 }
 
 /// Everything about the candidate is checked before it is published.
@@ -1611,35 +1905,1045 @@ fn app_version(bundle: &Path) -> Option<String> {
     Some(text.trim().to_owned()).filter(|v| !v.is_empty())
 }
 
+/// Authenticated local rollback authority, without a fresh online notarization claim.
+#[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ArchiveAuthority {
+    size: u64,
+    sha256: [u8; 32],
+    version: String,
+    fixture_identity: bool,
+    bundle_team: String,
+    bundle_identifier: String,
+    helper_team: String,
+    helper_identifier: String,
+    root_name: Vec<u8>,
+}
+
+fn read_archive_record(path: &Path) -> Result<ArchiveAuthority, AppError> {
+    use std::os::unix::fs::MetadataExt as _;
+    let metadata = fs::symlink_metadata(path).map_err(AppError::Io)?;
+    let file = fs::File::open(path).map_err(AppError::Io)?;
+    let opened = file.metadata().map_err(AppError::Io)?;
+    if !metadata.is_file()
+        || !opened.is_file()
+        || metadata.dev() != opened.dev()
+        || metadata.ino() != opened.ino()
+        || opened.len() > 65536
+        || opened.uid() != rustix::process::getuid().as_raw()
+        || opened.mode() & 0o077 != 0
+    {
+        return Err(usage(format!(
+            "invalid private rollback authority at {}",
+            path.display()
+        )));
+    }
+    let mut bytes = Vec::new();
+    file.take(65537)
+        .read_to_end(&mut bytes)
+        .map_err(AppError::Io)?;
+    if bytes.len() > 65536 {
+        return Err(usage(format!(
+            "rollback authority {} exceeds its size bound",
+            path.display()
+        )));
+    }
+    serde_json::from_slice(&bytes).map_err(|e| {
+        usage(format!(
+            "invalid rollback authority {}: {e}",
+            path.display()
+        ))
+    })
+}
+
+fn read_rollback_authority(apps: &Path) -> Result<Option<ArchiveAuthority>, AppError> {
+    let record = apps.join(ROLLBACK_AUTHORITY);
+    let archive = apps.join(ROLLBACK_ARCHIVE);
+    let exists = (path_exists(&record)?, path_exists(&archive)?);
+    if exists == (false, false) {
+        return Ok(None);
+    }
+    if exists != (true, true) {
+        return Err(usage(
+            "incomplete rollback archive authority; all files retained",
+        ));
+    }
+    let authority = read_archive_record(&record)?;
+    if !archive_matches(&archive, &authority)? {
+        return Err(usage(format!(
+            "rollback archive {} does not match its authority",
+            archive.display()
+        )));
+    }
+    Ok(Some(authority))
+}
+
+fn move_durable(from: &Path, to: &Path) -> Result<(), AppError> {
+    if path_exists(to)? {
+        return Err(usage(format!("refusing to overwrite {}", to.display())));
+    }
+    fs::rename(from, to).map_err(|e| {
+        usage(format!(
+            "cannot rename {} to {}: {e}",
+            from.display(),
+            to.display()
+        ))
+    })?;
+    if let Some(parent) = from.parent() {
+        sync_dir(parent)?;
+    }
+    if let Some(parent) = to.parent() {
+        sync_dir(parent)?;
+    }
+    Ok(())
+}
+
+fn write_archive_record(path: &Path, authority: &ArchiveAuthority) -> Result<(), AppError> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let bytes = serde_json::to_vec(authority)
+        .map_err(|e| usage(format!("cannot encode rollback authority: {e}")))?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| usage(format!("cannot create {}: {e}", path.display())))?;
+    file.write_all(&bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|e| usage(format!("cannot write and sync {}: {e}", path.display())))
+}
+
+fn promote_archive(apps: &Path, archive: &ArchiveTransition) -> Result<(), AppError> {
+    let journal = apps.join(PUBLISHING);
+    let final_archive = apps.join(ROLLBACK_ARCHIVE);
+    let final_record = apps.join(ROLLBACK_AUTHORITY);
+    if read_rollback_authority(apps)? != archive.previous_archive {
+        return Err(usage(
+            "previous rollback authority changed before promotion; all files retained",
+        ));
+    }
+    if !archive_matches(&journal.join(SOURCE_ARCHIVE), &archive.source_archive)? {
+        return Err(usage(
+            "source archive changed before promotion; all files retained",
+        ));
+    }
+    if archive.previous_archive.is_some() {
+        move_durable(&final_archive, &journal.join(PRIOR_ARCHIVE))?;
+        move_durable(&final_record, &journal.join(PRIOR_AUTHORITY))?;
+    } else if path_exists(&final_archive)? || path_exists(&final_record)? {
+        return Err(usage(
+            "unexpected rollback authority appeared; retaining all files",
+        ));
+    }
+    let new_record = journal.join("source.json");
+    if path_exists(&new_record)? {
+        let recorded = read_archive_record(&new_record)?;
+        if recorded != archive.source_archive {
+            return Err(usage("staged rollback record does not match journal"));
+        }
+    } else {
+        write_archive_record(&new_record, &archive.source_archive)?;
+    }
+    sync_dir(&journal)?;
+    move_durable(&journal.join(SOURCE_ARCHIVE), &final_archive)?;
+    move_durable(&new_record, &final_record)
+}
+
+fn archive_matches(path: &Path, authority: &ArchiveAuthority) -> Result<bool, AppError> {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = fs::symlink_metadata(path).map_err(AppError::Io)?;
+    if !meta.is_file() || meta.len() != authority.size {
+        return Ok(false);
+    }
+    let mut file = fs::File::open(path).map_err(AppError::Io)?;
+    let opened = file.metadata().map_err(AppError::Io)?;
+    if !opened.is_file()
+        || opened.dev() != meta.dev()
+        || opened.ino() != meta.ino()
+        || opened.len() != authority.size
+    {
+        return Ok(false);
+    }
+    let (size, digest) = hash_open_file(&mut file, Some(authority.size))?;
+    Ok(size == authority.size && digest == authority.sha256)
+}
+
+fn restore_previous_authority(apps: &Path, archive: &ArchiveTransition) -> Result<(), AppError> {
+    let journal = apps.join(PUBLISHING);
+    let final_zip = apps.join(ROLLBACK_ARCHIVE);
+    let final_record = apps.join(ROLLBACK_AUTHORITY);
+    let source_zip = journal.join(SOURCE_ARCHIVE);
+    let source_record = journal.join("source.json");
+    let prior_zip = journal.join(PRIOR_ARCHIVE);
+    let prior_record = journal.join(PRIOR_AUTHORITY);
+    if path_exists(&final_zip)? {
+        if archive_matches(&final_zip, &archive.source_archive)? && !path_exists(&source_zip)? {
+            move_durable(&final_zip, &source_zip)?;
+        } else if match archive.previous_archive.as_ref() {
+            Some(previous) => !archive_matches(&final_zip, previous)?,
+            None => true,
+        } {
+            return Err(usage(
+                "rollback archive identity is ambiguous; all files retained",
+            ));
+        }
+    }
+    if path_exists(&final_record)? {
+        let record = read_archive_record(&final_record)?;
+        if record == archive.source_archive && !path_exists(&source_record)? {
+            move_durable(&final_record, &source_record)?;
+        } else if archive.previous_archive.as_ref() != Some(&record) {
+            return Err(usage(
+                "rollback record identity is ambiguous; all files retained",
+            ));
+        }
+    }
+    if let Some(previous) = &archive.previous_archive {
+        if path_exists(&prior_zip)? {
+            if !archive_matches(&prior_zip, previous)? {
+                return Err(usage("saved prior archive does not match journal"));
+            }
+            move_durable(&prior_zip, &final_zip)?;
+        }
+        if path_exists(&prior_record)? {
+            let record = read_archive_record(&prior_record)?;
+            if &record != previous {
+                return Err(usage("saved prior rollback record does not match journal"));
+            }
+            move_durable(&prior_record, &final_record)?;
+        }
+        if read_rollback_authority(apps)?.as_ref() != Some(previous) {
+            return Err(usage("prior rollback authority could not be restored"));
+        }
+    } else if path_exists(&final_zip)? || path_exists(&final_record)? {
+        return Err(usage(
+            "unexpected rollback authority retained during restoration",
+        ));
+    }
+    Ok(())
+}
+
+fn restore_source_filesystem(apps: &Path, transition: &mut Transition) -> Result<(), AppError> {
+    use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+    let active = apps.join(BUNDLE);
+    let staged = apps.join(PARTIAL);
+    let journal = apps.join(PUBLISHING);
+    let current = bundle_identity(&active)?;
+    let archive = transition
+        .archive
+        .as_mut()
+        .ok_or_else(|| usage("missing archive transaction authority"))?;
+    archive.phase = FilesystemPhase::Restoring;
+    write_transition(apps, transition)?;
+    let archive = transition
+        .archive
+        .as_ref()
+        .ok_or_else(|| usage("missing archive transaction authority"))?;
+    restore_previous_authority(apps, archive)?;
+    let is_restored = archive.restoration.as_ref() == Some(&current);
+    if current != transition.source && !is_restored {
+        if current != transition.target {
+            return Err(usage(
+                "active bundle identity is ambiguous; all recovery authority retained",
+            ));
+        }
+        let saved = archive
+            .restoration_path
+            .as_ref()
+            .map(|bytes| PathBuf::from(std::ffi::OsString::from_vec(bytes.clone())));
+        let existing = match saved {
+            Some(path) => {
+                let parent = path
+                    .parent()
+                    .ok_or_else(|| usage("invalid restoration path"))?;
+                if path_exists(parent)? {
+                    if archive.restoration_directory.as_ref() != Some(&bundle_identity(parent)?) {
+                        return Err(usage(
+                            "restoration directory identity changed; all files retained",
+                        ));
+                    }
+                    if archive.restoration.is_some() && path_exists(&path)? {
+                        if archive.restoration.as_ref() != Some(&bundle_identity(&path)?) {
+                            return Err(usage(
+                                "restoration staging identity changed; all files retained",
+                            ));
+                        }
+                        verify_local_bundle(&path, &archive.source_archive)?;
+                        Some(path)
+                    } else {
+                        if path_exists(&path)? {
+                            launch_services(false, &path).map_err(usage)?;
+                        }
+                        vox_sockdrops::remove_item(parent).map_err(|e| {
+                            usage(format!(
+                                "cannot clear interrupted replacement directory {}: {e}",
+                                parent.display()
+                            ))
+                        })?;
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
+        let restore_path = if let Some(path) = existing {
+            path
+        } else {
+            let directory = replacement_directory(&active)?;
+            let directory_identity = bundle_identity(&directory)?;
+            let name = std::ffi::OsString::from_vec(archive.source_archive.root_name.clone());
+            let root = Path::new(&name);
+            if root.components().count() != 1
+                || !matches!(
+                    root.components().next(),
+                    Some(std::path::Component::Normal(_))
+                )
+            {
+                return Err(usage("invalid rollback archive root name"));
+            }
+            let path = directory.join(name);
+            let archive = transition
+                .archive
+                .as_mut()
+                .ok_or_else(|| usage("missing archive transaction authority"))?;
+            archive.restoration = None;
+            archive.restoration_directory = Some(directory_identity);
+            archive.restoration_path = Some(path.as_os_str().as_bytes().to_vec());
+            write_transition(apps, transition)?;
+            let archive = transition
+                .archive
+                .as_ref()
+                .ok_or_else(|| usage("missing archive transaction authority"))?;
+            let extracted = extract_archive(
+                &journal.join(SOURCE_ARCHIVE),
+                &archive.source_archive,
+                &directory,
+            )?;
+            if extracted != path {
+                return Err(usage("restoration extracted an unexpected path"));
+            }
+            let identity = bundle_identity(&path)?;
+            let archive = transition
+                .archive
+                .as_mut()
+                .ok_or_else(|| usage("missing archive transaction authority"))?;
+            archive.restoration = Some(identity);
+            write_transition(apps, transition)?;
+            path
+        };
+        if bundle_identity(&active)? != transition.target {
+            return Err(usage("active bundle changed before restoration exchange"));
+        }
+        swap(&restore_path, &active)?;
+        sync_dir(apps)?;
+    }
+    let archive = transition
+        .archive
+        .as_ref()
+        .ok_or_else(|| usage("missing archive transaction authority"))?;
+    let current = bundle_identity(&active)?;
+    if current != transition.source && archive.restoration.as_ref() != Some(&current) {
+        return Err(usage("restored bundle identity does not match journal"));
+    }
+    verify_local_bundle(&active, &archive.source_archive)?;
+    if let Some(bytes) = &archive.restoration_path {
+        let path = PathBuf::from(std::ffi::OsString::from_vec(bytes.clone()));
+        if let Some(parent) = path.parent() {
+            if path_exists(parent)? {
+                if archive.restoration_directory.as_ref() != Some(&bundle_identity(parent)?) {
+                    return Err(usage(
+                        "restoration directory identity changed; all files retained",
+                    ));
+                }
+                if path_exists(&path)? {
+                    let identity = bundle_identity(&path)?;
+                    if identity != transition.target
+                        && archive.restoration.as_ref() != Some(&identity)
+                    {
+                        return Err(usage(
+                            "restoration staging bundle identity changed; all files retained",
+                        ));
+                    }
+                    launch_services(false, &path).map_err(usage)?;
+                    vox_sockdrops::remove_item(&path).map_err(|e| {
+                        usage(format!(
+                            "cannot remove rejected bundle {}: {e}",
+                            path.display()
+                        ))
+                    })?;
+                }
+                vox_sockdrops::remove_item(parent).map_err(|e| {
+                    usage(format!(
+                        "cannot remove replacement directory {}: {e}",
+                        parent.display()
+                    ))
+                })?;
+            }
+        }
+    }
+    if path_exists(&staged)? {
+        let identity = bundle_identity(&staged)?;
+        if identity != transition.source && identity != transition.target {
+            return Err(usage("staged bundle identity changed; all files retained"));
+        }
+        launch_services(false, &staged).map_err(usage)?;
+        vox_sockdrops::remove_item(&staged).map_err(|e| {
+            usage(format!(
+                "cannot remove displaced bundle {}: {e}",
+                staged.display()
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn clear_legacy_preparation(apps: &Path, transition: &mut Transition) -> Result<(), AppError> {
+    use std::os::unix::ffi::OsStringExt as _;
+    if transition.archive.is_some() {
+        return Err(usage(
+            "cannot discard a committed legacy archive preparation",
+        ));
+    }
+    let work = apps.join(PUBLISHING).join("legacy-work");
+    if let Some(preparation) = &transition.legacy_preparation {
+        match (
+            &preparation.verification_directory,
+            &preparation.verification_path,
+        ) {
+            (None, None) => {}
+            (Some(identity), Some(bytes)) => {
+                let path = PathBuf::from(std::ffi::OsString::from_vec(bytes.clone()));
+                let parent = path
+                    .parent()
+                    .ok_or_else(|| usage("invalid legacy verification path"))?;
+                if !path.is_absolute() || path.file_name() != Some(std::ffi::OsStr::new(BUNDLE)) {
+                    return Err(usage(
+                        "invalid legacy verification path; all files retained",
+                    ));
+                }
+                if path_exists(parent)? {
+                    if &bundle_identity(parent)? != identity {
+                        return Err(usage(
+                            "legacy verification directory identity changed; all files retained",
+                        ));
+                    }
+                    if path_exists(&path)? {
+                        bundle_identity(&path)?;
+                        launch_services(false, &path).map_err(usage)?;
+                    }
+                    vox_sockdrops::remove_item(parent).map_err(|e| {
+                        usage(format!(
+                            "cannot remove legacy verification directory {}: {e}",
+                            parent.display()
+                        ))
+                    })?;
+                }
+            }
+            _ => {
+                return Err(usage(
+                    "incomplete legacy verification authority; all files retained",
+                ))
+            }
+        }
+        if path_exists(&work)? {
+            if bundle_identity(&work)? != preparation.directory {
+                return Err(usage(
+                    "legacy staging directory identity changed; all files retained",
+                ));
+            }
+            let copy = work.join("copy").join(BUNDLE);
+            if path_exists(&copy)? {
+                bundle_identity(&copy)?;
+                launch_services(false, &copy).map_err(usage)?;
+            }
+            vox_sockdrops::remove_item(&work).map_err(|e| {
+                usage(format!(
+                    "cannot remove legacy staging directory {}: {e}",
+                    work.display()
+                ))
+            })?;
+        }
+        transition.legacy_preparation = None;
+        write_transition(apps, transition)?;
+    } else if path_exists(&work)? {
+        fs::remove_dir(&work).map_err(|e| {
+            usage(format!(
+                "unrecorded nonempty legacy staging {} retained: {e}",
+                work.display()
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn archive_legacy_bundle(
+    apps: &Path,
+    original: &Path,
+    destination: &Path,
+    transition: &mut Transition,
+) -> Result<ArchiveAuthority, AppError> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let copy_dir = apps.join(PUBLISHING).join("legacy-work").join("copy");
+    if path_exists(&copy_dir)? || path_exists(destination)? {
+        return Err(usage(
+            "incomplete legacy archive staging retained; refusing to guess its authority",
+        ));
+    }
+    fs::create_dir(&copy_dir)
+        .map_err(|e| usage(format!("cannot create {}: {e}", copy_dir.display())))?;
+    let copy = copy_dir.join(BUNDLE);
+    let output = Command::new("/usr/bin/ditto")
+        .arg(original)
+        .arg(&copy)
+        .output()
+        .map_err(|e| {
+            usage(format!(
+                "cannot copy legacy bundle {}: {e}",
+                original.display()
+            ))
+        })?;
+    if !output.status.success() {
+        return Err(usage(format!(
+            "cannot copy legacy bundle {}: {}",
+            original.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let plist = copy.join(INFO_PLIST);
+    let kept = copy.join(KEPT_INFO_PLIST);
+    match (path_exists(&plist)?, path_exists(&kept)?) {
+        (true, false) => {}
+        (false, true) if fs::symlink_metadata(&kept).map_err(AppError::Io)?.is_file() => {
+            fs::rename(&kept, &plist).map_err(|e| {
+                usage(format!(
+                    "cannot reconstruct private copy {}: {e}",
+                    copy.display()
+                ))
+            })?;
+        }
+        _ => {
+            return Err(usage(format!(
+                "ambiguous legacy plist layout at {}; original retained",
+                original.display()
+            )))
+        }
+    }
+    let fixture = !apple_required();
+    let active = apps.join(BUNDLE);
+    for (old, installed) in [(&copy, &active), (&copy.join(HELPER), &active.join(HELPER))] {
+        let old_identity = local_signing_identity(old, fixture)?;
+        let active_identity = local_signing_identity(installed, fixture)?;
+        if old_identity.1 != active_identity.1 || (!fixture && old_identity.0 != active_identity.0)
+        {
+            return Err(usage(format!(
+                "legacy signing identity does not match active installation at {}",
+                original.display()
+            )));
+        }
+    }
+    let authority = archive_authority(&copy, destination)?;
+    let replacement = replacement_directory(&active)?;
+    let preparation = transition
+        .legacy_preparation
+        .as_mut()
+        .ok_or_else(|| usage("missing legacy preparation authority"))?;
+    preparation.verification_directory = Some(bundle_identity(&replacement)?);
+    preparation.verification_path = Some(replacement.join(BUNDLE).as_os_str().as_bytes().to_vec());
+    write_transition(apps, transition)?;
+    let extracted = extract_archive(destination, &authority, &replacement)?;
+    launch_services(false, &extracted).map_err(usage)?;
+    vox_sockdrops::remove_item(&replacement).map_err(|e| {
+        usage(format!(
+            "cannot remove replacement directory {}: {e}",
+            replacement.display()
+        ))
+    })?;
+    let preparation = transition
+        .legacy_preparation
+        .as_mut()
+        .ok_or_else(|| usage("missing legacy preparation authority"))?;
+    preparation.verification_directory = None;
+    preparation.verification_path = None;
+    write_transition(apps, transition)?;
+    launch_services(false, &copy).map_err(usage)?;
+    vox_sockdrops::remove_item(&copy_dir).map_err(|e| {
+        usage(format!(
+            "cannot remove private legacy copy {}: {e}",
+            copy_dir.display()
+        ))
+    })?;
+    Ok(authority)
+}
+
+fn prepare_legacy_migration(apps: &Path, transition: &mut Transition) -> Result<(), AppError> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let journal = apps.join(PUBLISHING);
+    let active = apps.join(BUNDLE);
+    if bundle_identity(&active)? != transition.target {
+        return Err(usage(
+            "legacy journal does not identify the active committed bundle; authority retained",
+        ));
+    }
+    clear_legacy_preparation(apps, transition)?;
+    let work = journal.join("legacy-work");
+    fs::create_dir(&work).map_err(|e| usage(format!("cannot create {}: {e}", work.display())))?;
+    transition.legacy_preparation = Some(LegacyPreparation {
+        directory: bundle_identity(&work)?,
+        verification_directory: None,
+        verification_path: None,
+    });
+    write_transition(apps, transition)?;
+    let possible = [
+        apps.join(PREVIOUS),
+        apps.join(PARTIAL),
+        journal.join(BUNDLE),
+    ];
+    let mut source = None;
+    for path in &possible {
+        if path_exists(path)?
+            && bundle_identity(path)? == transition.source
+            && source.replace(path.clone()).is_some()
+        {
+            return Err(usage(
+                "multiple legacy bundles match the source identity; all retained",
+            ));
+        }
+    }
+    let source = source
+        .ok_or_else(|| usage("legacy source bundle identity is unavailable; all retained"))?;
+    for path in &possible[..2] {
+        if path != &source && path_exists(path)? {
+            return Err(usage(
+                "ambiguous legacy retained bundle; all files retained",
+            ));
+        }
+    }
+    let superseded = journal.join(BUNDLE);
+    let (legacy_superseded, legacy_superseded_identity) =
+        if superseded != source && path_exists(&superseded)? {
+            let identity = bundle_identity(&superseded)?;
+            let authority = archive_legacy_bundle(
+                apps,
+                &superseded,
+                &work.join("legacy-superseded.zip"),
+                transition,
+            )?;
+            (Some(authority), Some(identity))
+        } else {
+            (None, None)
+        };
+    let source_archive =
+        archive_legacy_bundle(apps, &source, &work.join(SOURCE_ARCHIVE), transition)?;
+    let previous_archive = read_rollback_authority(apps)?;
+    transition.archive = Some(ArchiveTransition {
+        phase: FilesystemPhase::Retiring,
+        legacy: true,
+        legacy_path: Some(source.as_os_str().as_bytes().to_vec()),
+        legacy_superseded,
+        legacy_superseded_identity,
+        source_archive,
+        previous_archive,
+        restoration: None,
+        restoration_directory: None,
+        restoration_path: None,
+    });
+    write_transition(apps, transition)
+}
+
+fn finish_legacy_staging(apps: &Path, transition: &mut Transition) -> Result<(), AppError> {
+    let Some(preparation) = transition.legacy_preparation.as_ref() else {
+        return Ok(());
+    };
+    if preparation.verification_directory.is_some() || preparation.verification_path.is_some() {
+        return Err(usage(
+            "legacy verification is incomplete; all authority retained",
+        ));
+    }
+    let archive = transition
+        .archive
+        .as_ref()
+        .ok_or_else(|| usage("missing legacy archive authority"))?;
+    let journal = apps.join(PUBLISHING);
+    let work = journal.join("legacy-work");
+    if path_exists(&work)? && bundle_identity(&work)? != preparation.directory {
+        return Err(usage(
+            "legacy staging directory identity changed; all authority retained",
+        ));
+    }
+    for (name, authority) in [
+        (SOURCE_ARCHIVE, Some(&archive.source_archive)),
+        ("legacy-superseded.zip", archive.legacy_superseded.as_ref()),
+    ] {
+        let Some(authority) = authority else {
+            continue;
+        };
+        let staged = work.join(name);
+        let destination = journal.join(name);
+        if path_exists(&staged)? {
+            if !archive_matches(&staged, authority)? {
+                return Err(usage(format!(
+                    "legacy staged archive {} changed",
+                    staged.display()
+                )));
+            }
+            move_durable(&staged, &destination)?;
+        } else if path_exists(&destination)? {
+            if !archive_matches(&destination, authority)? {
+                return Err(usage(format!(
+                    "legacy archive {} changed",
+                    destination.display()
+                )));
+            }
+        } else if name != SOURCE_ARCHIVE
+            || !path_exists(&apps.join(ROLLBACK_ARCHIVE))?
+            || !archive_matches(&apps.join(ROLLBACK_ARCHIVE), authority)?
+        {
+            return Err(usage(format!(
+                "legacy archive {name} is missing; all authority retained"
+            )));
+        }
+    }
+    if path_exists(&work)? {
+        fs::remove_dir(&work).map_err(|e| {
+            usage(format!(
+                "legacy staging {} is not empty: {e}",
+                work.display()
+            ))
+        })?;
+        sync_dir(&journal)?;
+    }
+    transition.legacy_preparation = None;
+    write_transition(apps, transition)
+}
+
+fn resume_legacy_migration(apps: &Path, transition: &mut Transition) -> Result<(), AppError> {
+    use std::os::unix::ffi::OsStringExt as _;
+    let journal = apps.join(PUBLISHING);
+    if bundle_identity(&apps.join(BUNDLE))? != transition.target {
+        return Err(usage(
+            "legacy active bundle identity changed; all files retained",
+        ));
+    }
+    finish_legacy_staging(apps, transition)?;
+    let archive = transition
+        .archive
+        .as_ref()
+        .ok_or_else(|| usage("missing legacy archive authority"))?;
+    if !archive.legacy || bundle_identity(&apps.join(BUNDLE))? != transition.target {
+        return Err(usage(
+            "legacy active bundle identity changed; all files retained",
+        ));
+    }
+    let path = PathBuf::from(std::ffi::OsString::from_vec(
+        archive
+            .legacy_path
+            .clone()
+            .ok_or_else(|| usage("missing legacy source path"))?,
+    ));
+    if path != apps.join(PREVIOUS) && path != apps.join(PARTIAL) && path != journal.join(BUNDLE) {
+        return Err(usage("legacy source path is not journal-owned"));
+    }
+    let current = read_rollback_authority(apps);
+    if !matches!(&current, Ok(Some(value)) if value == &archive.source_archive) {
+        if let Err(e) = restore_previous_authority(apps, archive) {
+            return Err(usage(format!(
+                "legacy archive promotion could not be reconciled: {e}; prior inspection: {}",
+                current
+                    .err()
+                    .map_or_else(|| "different authority".to_owned(), |e| e.to_string())
+            )));
+        }
+        promote_archive(apps, archive)?;
+    }
+    if let Some(superseded) = &archive.legacy_superseded {
+        let zip = journal.join("legacy-superseded.zip");
+        if !archive_matches(&zip, superseded)? {
+            return Err(usage(
+                "superseded legacy archive does not match its authority",
+            ));
+        }
+        let old = journal.join(BUNDLE);
+        if path_exists(&old)? {
+            if archive.legacy_superseded_identity.as_ref() != Some(&bundle_identity(&old)?) {
+                return Err(usage(
+                    "superseded legacy bundle identity changed; all retained",
+                ));
+            }
+            launch_services(false, &old).map_err(usage)?;
+            if archive.legacy_superseded_identity.as_ref() != Some(&bundle_identity(&old)?) {
+                return Err(usage(
+                    "superseded legacy bundle identity changed before retirement",
+                ));
+            }
+            vox_sockdrops::remove_item(&old)
+                .map_err(|e| usage(format!("cannot retire {}: {e}", old.display())))?;
+        }
+    }
+    if path_exists(&path)? {
+        if bundle_identity(&path)? != transition.source {
+            return Err(usage("legacy source bundle identity changed; all retained"));
+        }
+        launch_services(false, &path).map_err(usage)?;
+        if bundle_identity(&path)? != transition.source {
+            return Err(usage(
+                "legacy source bundle identity changed before retirement",
+            ));
+        }
+        vox_sockdrops::remove_item(&path)
+            .map_err(|e| usage(format!("cannot retire {}: {e}", path.display())))?;
+    }
+    sync_dir(apps)?;
+    transition
+        .archive
+        .as_mut()
+        .ok_or_else(|| usage("missing legacy archive authority"))?
+        .phase = FilesystemPhase::FilesystemCommitted;
+    write_transition(apps, transition)
+}
+
+fn local_signing_identity(path: &Path, fixture: bool) -> Result<(String, String), AppError> {
+    if !fixture {
+        let identity = signing_identity(path)?;
+        return Ok((identity.team_id, identity.identifier));
+    }
+    if apple_required() {
+        return Err(usage(
+            "fixture-only rollback authority cannot be used with Apple trust required",
+        ));
+    }
+    let output = Command::new("/usr/bin/codesign")
+        .args(["--display", "--verbose=4"])
+        .arg(path)
+        .output()
+        .map_err(AppError::Io)?;
+    if !output.status.success()
+        || output.stderr.len() > super::MAX_SIGNING_INFO_BYTES
+        || !output.stdout.is_empty()
+    {
+        return Err(usage(format!(
+            "cannot read fixture signing identity at {}",
+            path.display()
+        )));
+    }
+    let report = std::str::from_utf8(&output.stderr)
+        .map_err(|_| usage("fixture signing identity is not UTF-8"))?;
+    let hash = super::unique_value(report, "CDHash=")?;
+    let identifier = super::unique_value(report, "Identifier=")?;
+    if hash.is_empty()
+        || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || identifier.is_empty()
+    {
+        return Err(usage("fixture signing identity is invalid"));
+    }
+    Ok((hash.to_owned(), identifier.to_owned()))
+}
+
+fn check_local_helper_version(helper: &Path, version: &str) -> Result<bool, AppError> {
+    let probe = tempfile::tempdir().map_err(AppError::Io)?;
+    let output = Command::new(helper)
+        .arg("--version")
+        .env_clear()
+        .env("VOX_DATA_DIR", probe.path().join("data"))
+        .env("VOX_CONFIG_DIR", probe.path().join("config"))
+        .output()
+        .map_err(|e| usage(format!("cannot inspect helper {}: {e}", helper.display())))?;
+    Ok(output.status.success()
+        && output.stdout.len() <= MAX_VERSION_OUTPUT_BYTES
+        && output.stdout == format!("vox {version}\n").as_bytes())
+}
+
+fn verify_local_bundle(bundle: &Path, authority: &ArchiveAuthority) -> Result<(), AppError> {
+    let strict = ["--verify", "--strict", "--deep", "--all-architectures"];
+    let helper = bundle.join(HELPER);
+    for (path, team, identifier) in [
+        (bundle, &authority.bundle_team, &authority.bundle_identifier),
+        (
+            helper.as_path(),
+            &authority.helper_team,
+            &authority.helper_identifier,
+        ),
+    ] {
+        codesign_ok(path, &strict, "retained local signature does not verify")?;
+        let identity = local_signing_identity(path, authority.fixture_identity)?;
+        if &identity.0 != team || &identity.1 != identifier {
+            return Err(usage(format!(
+                "retained signing identity changed at {}",
+                path.display()
+            )));
+        }
+    }
+    if app_version(bundle).as_deref() != Some(authority.version.as_str())
+        || !check_local_helper_version(&helper, &authority.version)?
+    {
+        return Err(usage(format!(
+            "retained app or helper version does not match {}",
+            bundle.display()
+        )));
+    }
+    Ok(())
+}
+
+fn archive_authority(bundle: &Path, archive: &Path) -> Result<ArchiveAuthority, AppError> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let version = app_version(bundle)
+        .ok_or_else(|| usage(format!("cannot identify {}", bundle.display())))?;
+    semver::Version::parse(&version).map_err(|_| usage("retained bundle version is invalid"))?;
+    let strict = ["--verify", "--strict", "--deep", "--all-architectures"];
+    codesign_ok(
+        bundle,
+        &strict,
+        "source application signature does not verify",
+    )?;
+    let helper = bundle.join(HELPER);
+    codesign_ok(&helper, &strict, "source helper signature does not verify")?;
+    let fixture_identity = !apple_required();
+    let app_identity = local_signing_identity(bundle, fixture_identity)?;
+    let helper_identity = local_signing_identity(&helper, fixture_identity)?;
+    if !check_local_helper_version(&helper, &version)? {
+        return Err(usage("source application and helper versions differ"));
+    }
+    let root_name = bundle
+        .file_name()
+        .ok_or_else(|| usage("source bundle has no name"))?
+        .as_bytes()
+        .to_vec();
+    let output = Command::new("/usr/bin/ditto")
+        .args(["-c", "-k", "--sequesterRsrc", "--keepParent"])
+        .arg(bundle)
+        .arg(archive)
+        .output()
+        .map_err(|e| {
+            usage(format!(
+                "cannot archive {} to {}: {e}",
+                bundle.display(),
+                archive.display()
+            ))
+        })?;
+    if !output.status.success() {
+        return Err(usage(format!(
+            "cannot archive {} to {}: {}",
+            bundle.display(),
+            archive.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let file = fs::File::open(archive)
+        .map_err(|e| usage(format!("cannot open {}: {e}", archive.display())))?;
+    file.sync_all()
+        .map_err(|e| usage(format!("cannot sync {}: {e}", archive.display())))?;
+    let size = file.metadata().map_err(AppError::Io)?.len();
+    Ok(ArchiveAuthority {
+        size,
+        sha256: sha256_of(archive)?,
+        version,
+        fixture_identity,
+        bundle_team: app_identity.0,
+        bundle_identifier: app_identity.1,
+        helper_team: helper_identity.0,
+        helper_identifier: helper_identity.1,
+        root_name,
+    })
+}
+
+fn extract_archive(
+    archive: &Path,
+    authority: &ArchiveAuthority,
+    destination: &Path,
+) -> Result<PathBuf, AppError> {
+    use std::io::{Seek as _, SeekFrom};
+    use std::os::unix::ffi::OsStringExt as _;
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = fs::symlink_metadata(archive)
+        .map_err(|e| usage(format!("cannot inspect {}: {e}", archive.display())))?;
+    let mut file = fs::File::open(archive)
+        .map_err(|e| usage(format!("cannot open {}: {e}", archive.display())))?;
+    let opened = file.metadata().map_err(AppError::Io)?;
+    if !meta.is_file()
+        || !opened.is_file()
+        || meta.dev() != opened.dev()
+        || meta.ino() != opened.ino()
+        || opened.len() != authority.size
+    {
+        return Err(usage(format!(
+            "rollback archive {} does not match its authority",
+            archive.display()
+        )));
+    }
+    let (size, digest) = hash_open_file(&mut file, Some(authority.size))?;
+    if size != authority.size || digest != authority.sha256 {
+        return Err(usage(format!(
+            "rollback archive {} does not match its authority",
+            archive.display()
+        )));
+    }
+    file.seek(SeekFrom::Start(0)).map_err(AppError::Io)?;
+    let name = std::ffi::OsString::from_vec(authority.root_name.clone());
+    let relative = Path::new(&name);
+    if relative.components().count() != 1
+        || !matches!(
+            relative.components().next(),
+            Some(std::path::Component::Normal(_))
+        )
+    {
+        return Err(usage("invalid rollback archive root name"));
+    }
+    let output = Command::new("/usr/bin/ditto")
+        .args(["-x", "-k", "-"])
+        .arg(destination)
+        .stdin(std::process::Stdio::from(file))
+        .output()
+        .map_err(|e| usage(format!("cannot extract {}: {e}", archive.display())))?;
+    if !output.status.success() {
+        return Err(usage(format!(
+            "cannot extract {}: {}",
+            archive.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let mut entries = fs::read_dir(destination).map_err(AppError::Io)?;
+    let entry = entries
+        .next()
+        .transpose()
+        .map_err(AppError::Io)?
+        .ok_or_else(|| usage("rollback archive is empty"))?;
+    if entry.file_name() != name || entries.next().transpose().map_err(AppError::Io)?.is_some() {
+        return Err(usage("rollback archive has unexpected top-level entries"));
+    }
+    let bundle = destination.join(name);
+    bundle_identity(&bundle)?;
+    verify_local_bundle(&bundle, authority)?;
+    Ok(bundle)
+}
+
 fn sha256_of(path: &Path) -> Result<[u8; 32], AppError> {
     let mut file =
         fs::File::open(path).map_err(|e| usage(format!("cannot open {}: {e}", path.display())))?;
+    hash_open_file(&mut file, None).map(|(_, digest)| digest)
+}
+
+fn hash_open_file(file: &mut fs::File, maximum: Option<u64>) -> Result<(u64, [u8; 32]), AppError> {
     let mut hasher = Sha256::new();
-    let mut buffer = vec![0_u8; IO_BUFFER_BYTES];
+    let mut buffer = [0_u8; IO_BUFFER_BYTES];
+    let mut size = 0_u64;
     loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|e| usage(format!("cannot read {}: {e}", path.display())))?;
+        let read = file.read(&mut buffer).map_err(AppError::Io)?;
         if read == 0 {
-            return Ok(hasher.finalize().into());
+            return Ok((size, hasher.finalize().into()));
+        }
+        size = size
+            .checked_add(read as u64)
+            .ok_or_else(|| usage("archive byte count overflow"))?;
+        if maximum.is_some_and(|maximum| size > maximum) {
+            return Err(usage("archive exceeds its recorded size"));
         }
         hasher.update(&buffer[..read]);
     }
 }
 
-fn clear_candidate(path: &Path) -> Result<(), AppError> {
-    if path_exists(path)? && in_use(path) {
-        return Err(usage(format!(
-            "cannot safely remove {}: executable use is active or unknown",
-            path.display()
-        )));
-    }
-    clear(path)
-}
-
-/// Remove `path` if it is there, scratch from a transition that was cut short or the bundle
-/// about to be replaced. Read-only folders inside are made writable first: a folder's entries
-/// cannot be removed while it is read-only.
+/// Remove owned scratch without modifying its contents or permissions.
 fn clear(path: &Path) -> Result<(), AppError> {
     let meta = match fs::symlink_metadata(path) {
         Ok(meta) => meta,
@@ -1647,42 +2951,11 @@ fn clear(path: &Path) -> Result<(), AppError> {
         Err(e) => return Err(usage(format!("cannot inspect {}: {e}", path.display()))),
     };
     if meta.is_dir() {
-        writable(path)?;
-        fs::remove_dir_all(path)
+        vox_sockdrops::remove_item(path)
+            .map_err(|e| usage(format!("cannot remove {}: {e}", path.display())))
     } else {
-        fs::remove_file(path)
+        fs::remove_file(path).map_err(|e| usage(format!("cannot remove {}: {e}", path.display())))
     }
-    .map_err(|e| {
-        usage(format!(
-            "cannot remove {}: {e}; retain it and run `vox update` for local repair",
-            path.display()
-        ))
-    })
-}
-
-fn writable(dir: &Path) -> Result<(), AppError> {
-    let mode = fs::symlink_metadata(dir)
-        .map_err(|e| usage(format!("cannot inspect {}: {e}", dir.display())))?
-        .permissions()
-        .mode();
-    if mode & 0o700 != 0o700 {
-        fs::set_permissions(dir, fs::Permissions::from_mode(mode | 0o700))
-            .map_err(|e| usage(format!("cannot chmod {}: {e}", dir.display())))?;
-    }
-    for entry in fs::read_dir(dir)
-        .map_err(|e| usage(format!("cannot read directory {}: {e}", dir.display())))?
-    {
-        let entry =
-            entry.map_err(|e| usage(format!("cannot read entry in {}: {e}", dir.display())))?;
-        if entry
-            .file_type()
-            .map_err(|e| usage(format!("cannot inspect {}: {e}", entry.path().display())))?
-            .is_dir()
-        {
-            writable(&entry.path())?;
-        }
-    }
-    Ok(())
 }
 
 /// Verify the process maps this file as executable text, not merely that it opened the file.
@@ -1929,7 +3202,7 @@ fn restart_for_handoff(
 ) -> Result<(), AppError> {
     use vox_core::node::paths::Account;
     let restart = |account: &Account| {
-        let detached =
+        let _detached =
             super::restart::restart_daemon_checked(account, &active.join(HELPER), now, intent)
                 .map_err(|e| {
                     usage(format!(
@@ -1937,7 +3210,7 @@ fn restart_for_handoff(
                         active.display()
                     ))
                 })?;
-        super::restart::say_next(&detached);
+
         Ok::<(), AppError>(())
     };
     if let Some(app) = stopped {
@@ -1992,13 +3265,12 @@ fn relaunch_app(active: &Path, stopped: &Option<StoppedApp>) -> Result<(), AppEr
             String::from_utf8_lossy(&out.stderr).trim()
         )));
     }
-    let new_pid = app_handoff("wait", active, Some(&app.identity)).map_err(|e| {
+    app_handoff("wait", active, Some(&app.identity)).map_err(|e| {
         usage(format!(
             "{} is installed, but its relaunch was not confirmed: {e}",
             active.display()
         ))
     })?;
-    println!("relaunched {} (pid {new_pid})", active.display());
     Ok(())
 }
 
@@ -2054,50 +3326,90 @@ fn transition_handoff(
     }
 }
 
-/// Report the original failure without skipping an independently possible owned handoff.
+fn restore_source_and_handoff(
+    apps: &Path,
+    stopped: &Option<StoppedApp>,
+    transition: &mut Transition,
+) -> Result<(), AppError> {
+    use std::os::unix::ffi::OsStringExt as _;
+    let filesystem = restore_source_filesystem(apps, transition);
+    let active = apps.join(BUNDLE);
+    let archive = transition
+        .archive
+        .as_ref()
+        .ok_or_else(|| usage("missing archive transaction authority"))?;
+    let identity = bundle_identity(&active)?;
+    if identity != transition.source && archive.restoration.as_ref() != Some(&identity) {
+        return Err(usage(format!(
+            "source restoration failed: {}",
+            filesystem
+                .err()
+                .map_or_else(|| "identity mismatch".into(), |e| e.to_string())
+        )));
+    }
+    verify_local_bundle(&active, &archive.source_archive)?;
+    launch_services(true, &active).map_err(usage)?;
+    let version = archive.source_archive.version.clone();
+    let account = vox_core::node::paths::Account {
+        data_root: PathBuf::from(std::ffi::OsString::from_vec(
+            transition.daemon_data_root.clone(),
+        )),
+        config_dir: PathBuf::from(std::ffi::OsString::from_vec(
+            transition.daemon_config_dir.clone(),
+        )),
+    };
+    if !transition.daemon_complete {
+        super::restart::restart_daemon_checked(
+            &account,
+            &active.join(HELPER),
+            &version,
+            Some(&transition.daemon),
+        )?;
+        transition.daemon_complete = true;
+        write_transition(apps, transition)?;
+    }
+    if !transition.app_complete {
+        reconcile_app_handoff(&active, stopped, false)?;
+        transition.app_complete = true;
+        write_transition(apps, transition)?;
+    }
+    transition_handoff(apps, &active, &version, stopped, transition)?;
+    filesystem?;
+    finish_journal(apps)
+}
+
+/// Report the original failure, restoring only before the filesystem commit boundary.
 fn transition_failed_journal(
     apps: &Path,
     stopped: &Option<StoppedApp>,
     transition: &mut Transition,
     error: AppError,
 ) -> AppError {
-    let active = apps.join(BUNDLE);
-    let version = app_version(&active);
-    let mut failures = vec![error.to_string()];
-    let reopened = version
-        .as_ref()
-        .ok_or_else(|| {
-            usage("active app version is unavailable; the stopped app was not relaunched")
-        })
-        .and_then(|version| transition_handoff(apps, &active, version, stopped, transition));
-    if let Err(e) = reopened {
-        failures.push(e.to_string());
+    if transition.archive.as_ref().is_some_and(|archive| {
+        matches!(
+            archive.phase,
+            FilesystemPhase::FilesystemCommitted | FilesystemPhase::HandingOff
+        )
+    }) {
+        return usage(format!("{error}; filesystem commit may have completed; retained journal for handoff, no automatic downgrade"));
     }
-    let committed_rollback = matches!(transition.kind, TransitionKind::Rollback)
-        && bundle_identity(&active).is_ok_and(|identity| identity == transition.target);
-    usage(format!(
-        "Vox {} is installed{}; transition incomplete: {}; run `vox update` for local repair",
-        version.as_deref().unwrap_or("with unknown version"),
-        if committed_rollback {
-            "; do not repeat --rollback"
-        } else {
-            ""
-        },
-        failures.join("; ")
-    ))
+    match restore_source_and_handoff(apps, stopped, transition) {
+        Ok(()) => usage(format!("{error}; previous installation and startup intent restored")),
+        Err(restoration) => usage(format!("{error}; automatic source restoration incomplete: {restoration}; recovery authority retained")),
+    }
 }
 
 /// Refresh completions and the agent skill pack through the path the person ran, when that is
 /// the link outside the bundle; the rc block records that directory, never one inside the bundle.
 /// Run from inside the bundle, only the skill pack is refreshed.
-fn shell_setup_from(apps: &Path, exe: &Path) {
+fn shell_setup_from(apps: &Path, exe: &Path) -> Result<(), AppError> {
     let inside = exe
         .parent()
         .and_then(|dir| fs::canonicalize(dir).ok())
         .is_some_and(|dir| dir.starts_with(apps));
     if inside {
-        super::run_skill_install(exe);
+        super::run_skill_install(exe)
     } else {
-        run_shell_setup(exe);
+        run_shell_setup(exe)
     }
 }

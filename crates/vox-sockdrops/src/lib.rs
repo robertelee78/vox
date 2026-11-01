@@ -1,10 +1,10 @@
 //! **The narrow OS calls Vox needs that no safe crate offers** (#218), and so the one Vox crate
-//! that allows `unsafe`. Each is one system call with a buffer whose length is passed in and
-//! checked on return:
+//! that allows `unsafe`. Calls use bounded buffers whose lengths are passed in and checked.
 //!
 //! - [`recv_drops`]: a UDP socket's own drop count.
 //! - [`process_args`]: another process's argv (macOS; Linux reads `/proc` without `unsafe`).
 //! - [`process_profile_env`]: only the profile-selection environment of a macOS process.
+//! - [`replacement_directory`] and [`remove_item`]: Foundation replacement storage and removal.
 //!
 //! **A UDP socket's own drop count.**
 //! A receiver whose socket buffer fills drops what arrives next, and the kernel counts it per
@@ -28,6 +28,11 @@
 //! gives a path and a name, not argv. [`process_args`] is one `sysctl(KERN_PROCARGS2)` into a
 //! bounded buffer, parsed with every length checked; anything it cannot read whole is `None`.
 #![deny(missing_docs)]
+
+#[cfg(target_os = "macos")]
+mod filesystem;
+#[cfg(target_os = "macos")]
+pub use filesystem::{remove_item, replacement_directory};
 
 use std::io;
 

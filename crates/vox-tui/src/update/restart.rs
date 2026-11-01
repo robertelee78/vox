@@ -88,10 +88,72 @@ impl DaemonIntent {
     }
 }
 
+/// Identity of the exact daemon observed when its startup intent was captured.
 #[cfg(target_os = "macos")]
-pub(super) fn capture_daemon_intent(
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(super) struct DaemonProcess {
+    pid: u32,
+    start_seconds: u64,
+    start_microseconds: u64,
+}
+
+#[cfg(target_os = "macos")]
+impl DaemonProcess {
+    pub(super) fn is_valid(&self) -> bool {
+        self.pid > 1
+            && self.pid <= i32::MAX as u32
+            && self.start_seconds > 0
+            && self.start_microseconds < 1_000_000
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn daemon_process(pid: u32) -> Result<DaemonProcess, crate::app::AppError> {
+    let raw = i32::try_from(pid)
+        .map_err(|_| crate::app::AppError::Usage("invalid daemon process id".into()))?;
+    let info = libproc::proc_pid::pidinfo::<libproc::bsd_info::BSDInfo>(raw, 0).map_err(|e| {
+        crate::app::AppError::Usage(format!("cannot inspect daemon pid {pid}: {e}"))
+    })?;
+    Ok(DaemonProcess {
+        pid,
+        start_seconds: info.pbi_start_tvsec,
+        start_microseconds: info.pbi_start_tvusec,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn same_daemon_process(a: &DaemonProcess, b: &DaemonProcess) -> bool {
+    a.pid == b.pid
+        && a.start_seconds == b.start_seconds
+        && a.start_microseconds == b.start_microseconds
+}
+
+#[cfg(target_os = "macos")]
+fn require_daemon_executable(pid: u32, helper: &Path) -> Result<(), crate::app::AppError> {
+    use crate::app::AppError;
+    let expected = std::fs::canonicalize(helper).map_err(|e| {
+        AppError::Usage(format!(
+            "cannot inspect installed daemon helper {}: {e}",
+            helper.display()
+        ))
+    })?;
+    let actual = crate::claude_injector::exe_of(pid)
+        .ok_or_else(|| AppError::Usage(format!("cannot inspect executable of daemon pid {pid}")))?;
+    if actual != expected {
+        return Err(AppError::Usage(format!(
+            "daemon pid {pid} runs {} rather than installed helper {}; refusing to stop it",
+            actual.display(),
+            expected.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn capture_daemon_state(
     account: &Account,
-) -> Result<DaemonIntent, crate::app::AppError> {
+    helper: &Path,
+) -> Result<(DaemonIntent, Option<DaemonProcess>), crate::app::AppError> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -100,9 +162,11 @@ pub(super) fn capture_daemon_intent(
             Ok(daemon) => daemon,
             Err(vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Unreachable {
                 ..
-            })) => return Ok(DaemonIntent::Absent),
+            })) => return Ok((DaemonIntent::Absent, None)),
             Err(e) => return Err(crate::app::AppError::Usage(e.to_string())),
         };
+        let process = daemon_process(daemon.pid)?;
+        require_daemon_executable(daemon.pid, helper)?;
         let words = arguments(daemon.pid);
         if words.is_empty() {
             return Err(crate::app::AppError::Usage(
@@ -131,22 +195,110 @@ pub(super) fn capture_daemon_intent(
                 }
             })
             .collect();
-        Ok(DaemonIntent::Running {
-            started: how_started(daemon.pid),
-            listen,
-            anchors,
-            attached: daemon
-                .attached
-                .iter()
-                .map(|node| node.name.as_str().to_owned())
-                .collect(),
-        })
+        let started = how_started(daemon.pid);
+        let again = DaemonClient::observe(&account.socket())
+            .await
+            .map_err(|e| {
+                crate::app::AppError::Usage(format!(
+                    "daemon changed while capturing startup intent: {e}"
+                ))
+            })?;
+        if again.pid != process.pid || !same_daemon_process(&process, &daemon_process(again.pid)?) {
+            return Err(crate::app::AppError::Usage(
+                "daemon changed while capturing startup intent".into(),
+            ));
+        }
+        require_daemon_executable(again.pid, helper)?;
+        Ok((
+            DaemonIntent::Running {
+                started,
+                listen,
+                anchors,
+                attached: daemon
+                    .attached
+                    .iter()
+                    .map(|node| node.name.as_str().to_owned())
+                    .collect(),
+            },
+            Some(process),
+        ))
+    })
+}
+
+/// Stop only the daemon whose startup intent and process identity were captured.
+#[cfg(target_os = "macos")]
+pub(super) fn stop_captured_daemon(
+    account: &Account,
+    intent: &DaemonIntent,
+    process: Option<&DaemonProcess>,
+    helper: &Path,
+) -> Result<(), crate::app::AppError> {
+    use crate::app::AppError;
+    if process.is_some_and(|process| !process.is_valid()) {
+        return Err(AppError::Usage(
+            "invalid captured daemon process identity".into(),
+        ));
+    }
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async {
+        let daemon = match DaemonClient::observe(&account.socket()).await {
+            Ok(daemon) => Some(daemon),
+            Err(vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Unreachable { .. })) => None,
+            Err(e) => return Err(AppError::Usage(format!("cannot observe daemon before stopping it: {e}"))),
+        };
+        match (intent, process, daemon) {
+            (DaemonIntent::Absent, None, None) => Ok(()),
+            (DaemonIntent::Running { .. }, Some(expected), None) => {
+                if gone_within(expected.pid, Duration::ZERO).await {
+                    Ok(())
+                } else {
+                    Err(AppError::Usage("captured daemon process is still present but its socket is unreachable".into()))
+                }
+            }
+            (DaemonIntent::Running { .. }, Some(expected), Some(current))
+                if current.pid == expected.pid
+                    && same_daemon_process(expected, &daemon_process(current.pid)?) =>
+            {
+                require_daemon_executable(current.pid, helper)?;
+                if let DaemonIntent::Running { started: Started::LoginItem(target), .. } = intent {
+                    if !matches!(how_started(current.pid), Started::LoginItem(actual) if actual == *target) {
+                        return Err(AppError::Usage(
+                            "the captured login-item daemon is no longer launchd's matching job".into(),
+                        ));
+                    }
+                }
+                if !same_daemon_process(expected, &daemon_process(current.pid)?) {
+                    return Err(AppError::Usage("daemon changed before it could be stopped".into()));
+                }
+                let pid = i32::try_from(expected.pid).ok()
+                    .and_then(rustix::process::Pid::from_raw)
+                    .ok_or_else(|| AppError::Usage("invalid daemon process id".into()))?;
+                rustix::process::kill_process(pid, rustix::process::Signal::TERM)
+                    .map_err(|e| AppError::Usage(format!("the captured daemon could not be stopped: {e}")))?;
+                if !gone_within(expected.pid, STOP_WITHIN).await {
+                    return Err(AppError::Usage(format!(
+                        "the captured daemon (pid {}) did not stop within {} s",
+                        expected.pid, STOP_WITHIN.as_secs()
+                    )));
+                }
+                match DaemonClient::observe(&account.socket()).await {
+                    Err(vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Unreachable { .. })) => Ok(()),
+                    Ok(_) => Err(AppError::Usage("a daemon appeared after the captured daemon stopped".into())),
+                    Err(e) => Err(AppError::Usage(format!("cannot confirm daemon stopped: {e}"))),
+                }
+            }
+            _ => Err(AppError::Usage(
+                "daemon identity changed or was not captured; refusing to stop it".into(),
+            )),
+        }
     })
 }
 
 /// Restart the account's daemon, if one runs, onto `helper`, the vox now in place, and say what that did: the version it runs, and each node it no longer has attached.
 ///
-/// The nodes it left detached are returned, for [`say_next`].
+/// Returns the nodes it left detached.
 /// A failed restart is an error, not a successful handoff with no detached nodes.
 pub(super) fn restart_daemon(
     helper: &Path,
@@ -227,6 +379,51 @@ async fn restart_checked(
             kept.push(name);
         }
     }
+    #[cfg(target_os = "macos")]
+    if let (Some(intent), Some(existing)) = (intent, before.as_ref()) {
+        let DaemonIntent::Running {
+            started, attached, ..
+        } = intent
+        else {
+            return Err(AppError::Usage(
+                "a daemon appeared although the captured startup intent was absent".into(),
+            ));
+        };
+        if existing.version != now {
+            return Err(AppError::Usage(format!(
+                "an unexpected daemon runs vox {} rather than {now}; refusing to stop it",
+                existing.version
+            )));
+        }
+        let process = daemon_process(existing.pid)?;
+        require_daemon_executable(existing.pid, helper)?;
+        if let Started::LoginItem(target) = started {
+            if !matches!(how_started(existing.pid), Started::LoginItem(actual) if actual == *target)
+            {
+                return Err(AppError::Usage(
+                    "the replacement daemon is not the captured launchd login item".into(),
+                ));
+            }
+        }
+        let after = wait_for_replacement(account, now, None, &kept).await?;
+        if after.pid != process.pid || !same_daemon_process(&process, &daemon_process(after.pid)?) {
+            return Err(AppError::Usage(
+                "the replacement daemon changed during handoff".into(),
+            ));
+        }
+        require_daemon_executable(after.pid, helper)?;
+        let missing = attached
+            .iter()
+            .filter(|name| {
+                !after.attached.iter().any(|node| {
+                    node.name.as_str() == name.as_str() && node.state == NodeState::Attached
+                })
+            })
+            .map(|name| NodeName::parse(name).map_err(|e| AppError::Usage(e.to_string())))
+            .collect::<Result<Vec<_>, _>>()?;
+        say_detached(&missing);
+        return Ok(missing);
+    }
     let Some(before) = before else {
         let attached = if let Some(DaemonIntent::Running {
             started,
@@ -242,6 +439,10 @@ async fn restart_checked(
             &[]
         };
         let after = wait_for_replacement(account, now, None, &kept).await?;
+        #[cfg(target_os = "macos")]
+        if intent.is_some() {
+            require_daemon_executable(after.pid, helper)?;
+        }
         println!("the vox daemon was started and runs vox {} (pid {}), and its remembered nodes are Ready",
                 after.version, after.pid);
         let missing = attached
@@ -503,26 +704,6 @@ fn say_detached(nodes: &[NodeName]) {
             "node {node} is Locked, as the daemon remembers no passphrase for it; unlock it \
              again with `vox node unlock {node}`"
         );
-    }
-}
-
-/// The last line of an update or a rollback: what to do next, given the nodes the restart left
-/// `detached` (#666).
-pub(super) fn say_next(detached: &[NodeName]) {
-    match detached {
-        [] => println!("Next: run `vox status` to see your nodes and rooms on this version"),
-        [node] => println!(
-            "Next: run `vox node unlock {node}`; it asks for the passphrase once and then \
-             remembers it"
-        ),
-        nodes => println!(
-            "Next: unlock each: {}; each asks for its passphrase once and then remembers it",
-            nodes
-                .iter()
-                .map(|n| vox_text::shell::command(&["vox", "node", "unlock", n.as_str()]))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
     }
 }
 

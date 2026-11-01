@@ -370,7 +370,7 @@ pub fn install_all() -> bool {
             continue;
         }
         let Some(dir) = pack_dir(h.key) else {
-            println!(
+            eprintln!(
                 "vox: {}: HOME is not set, so its skills folder cannot be found",
                 h.name
             );
@@ -384,7 +384,7 @@ pub fn install_all() -> bool {
                 }
             }
             Err(e) => {
-                println!(
+                eprintln!(
                     "vox: {}: the skill could not be installed in {}: {e}",
                     h.name,
                     dir.display()

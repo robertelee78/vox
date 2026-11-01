@@ -4,8 +4,8 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 
 **Status**: Accepted for v0.4.0 (the decider, 2026-10-05); M-15, M-20 and M-21 amended to remove
 the lanes view (the decider, 2026-10-06); M-29b added for v0.4.11 (the decider, 2026-10-30)
-and amended for target-version updater ownership and separate plan/result review
-(the decider, 2026-10-31).
+and amended for target-version updater ownership, intact signed-bundle replacement with
+archive rollback, and separate plan/result review (the decider, 2026-10-31).
 Nothing in this ADR is built unless a requirement says so.
 **Date**: 2026-10-05
 **Deciders**: Robert E. Lee
@@ -186,22 +186,29 @@ F-9–F-11; RR-1, RR-3, RR-4 (RR-2 is the daemon's); D-3; L-1–L-10; W-1–W-6;
   (ADR-028 I-2), and MUST make `~/.local/bin/vox` a symbolic link to the app's `Contents/Helpers/
   vox`, so the CLI, the daemon and the app are one binary of one version.
 - **M-29.** `vox update`, and the app's own "Update Vox" offer, MUST replace the whole bundle
-  atomically (download beside it, verify, rename into place, keep the previous bundle for
-  `--rollback`). Automatic CLI, app and daemon handoff follows M-29b (ADR-028 I-3).
+  atomically after verifying it, retaining the previous installation for explicit offline
+  `--rollback`. Automatic CLI, app and daemon handoff follows M-29b (ADR-028 I-3).
   An install not made by `install.sh` MUST be refused, as today (ADR-015 17.10).
-- **M-29a.** The previous bundle kept for `--rollback` MUST NOT be launchable as Vox. On every
-  path that sets a bundle aside (publish, retirement, recovery) the updater MUST keep it as no
-  application: its `Info.plist` set aside under another name until a rollback restores it, so
-  LaunchServices cannot register it even when an app still running from it quits, and any record
-  already made unregistered, tried again at each later transition until it is gone. Opening Vox
-  from the Dock, Spotlight, Launchpad or by its identifier
-  then opens the current bundle; a rollback makes the bundle it swaps back in an application
-  again before the swap. Each release's `CFBundleVersion` MUST grow with its version in Apple's
-  documented form (three integers, the first above zero): the version with its major raised by
-  one. Measured 2026-10-19:
-  both bundles were registered as `us.vox.app` with the same `CFBundleVersion`, LaunchServices
-  opened `.Vox.app.previous` (0.4.4) when the decider reopened Vox, and that app reported the
-  0.4.6 daemon as not answering.
+- **M-29a.** Retained rollback state MUST NOT be a launchable second Vox application. The
+  updater MUST preserve the previous signed bundle in a verified archive, prepared before
+  publication; it MUST NOT disable a signed bundle by renaming or editing its `Info.plist`.
+  Restoration MUST extract into private same-volume replacement storage and verify the
+  archived bundle's integrity, version and original Developer ID before publication. Rollback
+  MUST remain available without a release lookup, download, new signing key or online
+  notarization request. An update or rollback MUST preserve the version it replaces as the
+  next rollback archive. A failed preparation MUST preserve the existing installation and
+  prior rollback authority.
+  Displaced and staged applications MUST NOT remain registered or selectable as Vox after
+  completion. Opening Vox from the Dock, Spotlight, Launchpad or by identifier MUST select
+  the current installed bundle. Required retirement MUST finish before new-version app or
+  daemon handoff; on a retirement or publication refusal the updater MUST automatically
+  restore the previous verified installation and its captured startup intent, not require
+  operator cleanup. An unconfirmed restoration MUST preserve its journal and both recoverable
+  payloads and report the exact failure, never delete data or claim success.
+  Each release's `CFBundleVersion` MUST grow with its version in Apple's documented form
+  (three integers, the first above zero): the version with its major raised by one.
+  This preserves the 2026-10-19 one-launchable-app decision while replacing its failed
+  plist-mutation mechanism.
 - **M-29b.** `vox update` alone MUST complete the upgrade of the CLI, app and daemon. When
   Vox.app was running, the updater MUST hand it off to the newly installed app without requiring
   a manual quit, restart, kill or repair command. It MUST target only the app belonging to the
@@ -231,6 +238,25 @@ F-9–F-11; RR-1, RR-3, RR-4 (RR-2 is the daemon's); D-3; L-1–L-10; W-1–W-6;
   release. An existing candidate or its implementation review MUST NOT substitute for plan
   approval. Verification MUST distinguish a bootstrap-capable two-version journey from the
   first upgrade by an older public binary: new code cannot retroactively change that caller.
+- **M-29c.** The macOS installer MUST follow the established intact-bundle replacement pattern
+  documented in the execution plan: owner-private replacement storage on the installation's
+  volume, authenticated complete bundles, atomic exchange, and recoverable displaced state.
+  The implementation MUST use supported macOS filesystem interfaces and preserve Apple code
+  signing and update-security policy; it MUST NOT weaken platform protections, require sudo,
+  or ask the operator to repair an ordinarily refused filesystem transition.
+  Sparkle 2.10.1's released installer is the researched reference, not an assumed drop-in
+  transaction API. Its public updater does not supply Vox's pinned local-archive, single-owner
+  journal and explicit offline-rollback interface. The implementation MUST NOT silently drop
+  those requirements, invoke private Sparkle runtime APIs, or maintain an unreviewed Sparkle
+  fork. Reusing the documented replacement pattern under Vox's verified target-version owner
+  MUST be identified honestly as such, not represented as installing through Sparkle.
+  Normal successful updates MUST emit one concise final outcome. Unchanged completion,
+  skill-file and plugin bookkeeping MUST NOT obscure it; an incomplete integration or handoff
+  MUST be reported as its actual scoped result, not inferred from file presence. Success and
+  next-step advice MUST follow required completion, and failure MUST retain precise
+  operation/path diagnostics without duplicated repair instructions.
+  Daemon endpoint cleanup MUST be fenced to the endpoint identity owned by that process:
+  a predecessor's shutdown MUST NOT unlink a successor's socket at the same pathname.
 
 
 ### 6. Proof
