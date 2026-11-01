@@ -28,7 +28,7 @@ repair is reported separately from the failed upgrade. `--check` remains read-on
 
 The existing controlled bundle and daemon journeys require `VOX_PROOF_NEXT_BINARY` to name a
 genuinely compiled next-version helper, built with `test-knobs`; for workspace version
-`0.4.13`, their existing next-version convention is `9.4.13`. A `--version` script or patched
+`0.4.14`, their existing next-version convention is `9.4.14`. A `--version` script or patched
 version string is not a next-release binary. Their release fixture serves that exact signed
 helper and tag-pinned app records. Native app launch/registration claims remain in the signed
 guest journey below; the controlled CLI bundle fixture does not establish them.
@@ -38,18 +38,25 @@ as stopped even if the terminal or service-manager parent has not reaped the PID
 A live process, permission refusal, or unknown query failure is still waited for; this does
 not change the existing shutdown bound.
 
-A repaired retired bundle remains on disk while code from it is running. Recovery of an
-interrupted publish applies the same rule to the older rollback bundle held in the journal:
-it retires that bundle rather than deleting live code with the journal.
+Before filesystem commit, the updater preserves and round-trip-verifies the source as an
+authenticated rollback archive. It stops the captured app/daemon, exchanges intact bundles,
+and retires the displaced tree before allowing new-version startup. A precommit refusal restores
+the source from that verified archive, not from a possibly partially deleted tree. A postcommit
+handoff failure resumes unfinished work without an implicit downgrade.
 
-This behavior is not signed-artifact evidence. A signed update/identifier-launch/rollback
-measurement must retain both release bundles' original signed helpers, verify the restored
-signature, inspect the kept plist and exact LaunchServices records, and observe the bundle
-actually selected by identifier. An ad-hoc fixture or a rewritten helper cannot establish that
-claim. Perform identifier and registration work only in a dedicated proof guest; clean only the
-run's remembered scratch bundle and extension paths.
+A signed update/identifier-launch/rollback measurement must retain both release bundles'
+original signed helpers, verify the restored signature and unchanged signed plist, inspect exact
+LaunchServices records, and observe the bundle actually selected by identifier. An ad-hoc fixture
+or rewritten helper cannot establish that claim. Perform registration work only in a dedicated
+proof guest; clean only this run's exact scratch bundle and extension paths.
 
 Run the optional signed journey in that guest:
+
+The unmodified proof requires a logged-in GUI session, `python3` on `PATH` for its existing
+loopback release server, and `/usr/bin/swift` for its native launch observers. A pristine macOS
+restore image does not include Command Line Tools. Supplying a real private Python runtime is
+apparatus setup; a run that substitutes precompiled copies of the existing Swift observers must
+be reported as a derived spike, with its source/dispatcher hashes, not as the unmodified proof.
 
 ```sh
 VOX_DATA_DIR=/absolute/scratch/data VOX_CONFIG_DIR=/absolute/scratch/config \
@@ -74,13 +81,16 @@ release endpoint and normal signature checks. Before publication, controlled loo
 execution requires test-knobs and cannot establish normal-artifact delivery. An older public
 caller without the bootstrap still cannot establish pre-publication target ownership.
 
-The journey drives `install.sh`, the physically installed helpers, real publish interruption,
-identifier launches, rollback, graceful quit, a real live retirement, and a read-only-Contents
-failure whose exact permission obstruction is then removed. It fabricates no journal and
-rewrites no signed helper. Its independent registration inverse seeds and reads back the exact
-retired path before repair. Pair the run with separately built/signed source inverses omitting
-unregister, plist rename, and recovery repair; each must fail its corresponding named product
-assertion, not staging, signature verification, or cleanup.
+The existing journey drives `install.sh`, the physically installed helpers, an open app's
+retirement and replacement, identifier launches, two version-changing offline rollbacks, and
+real interruption immediately after exchange followed by offline source restoration. Its
+consumer assertions require the saved message and Ready remembered node after each transition.
+
+Run the real precommit filesystem-refusal/partial-delete restoration and genuine already-used
+legacy incomplete-journal scenarios separately under the same signed trust and scratch rules.
+Pair one-selectable-app evidence with a genuinely compiled/signed nonshipping retirement
+inverse; it must fail the named product assertion, not setup, trust verification or cleanup.
+Plist-renaming inverses are obsolete: current rollback authority is an authenticated archive.
 
 ## Manual checks (Vox.app, macOS): run by a person before tagging
 

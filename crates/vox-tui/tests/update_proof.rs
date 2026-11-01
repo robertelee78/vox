@@ -1882,7 +1882,7 @@ fn shipped_notarized(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// A native application opened by its installed path, held until the proof asks it to quit.
+/// Observe the original app's retirement and the updater's replacement, then quit that replacement.
 #[cfg(all(target_os = "macos", feature = "optional-proofs"))]
 struct HeldApp {
     observer: std::process::Child,
@@ -1898,14 +1898,25 @@ import AppKit
 import Foundation
 import Darwin
 let wanted = CommandLine.arguments[1]
+let activePath = CommandLine.arguments[2]
 let ownedPaths = Set(CommandLine.arguments.dropFirst(2))
 let center = NSWorkspace.shared.notificationCenter
 var launched: NSRunningApplication?
 var ownsLaunch = false
-var askedToQuit = false
-var processExit: DispatchSourceProcess?
+var originalExited = false
+var quittingOriginal = false
+var originalExit: DispatchSourceProcess?
+var replacementExit: DispatchSourceProcess?
+func quitReplacement(_ app: NSRunningApplication) {
+    let monitor = DispatchSource.makeProcessSource(identifier: app.processIdentifier, eventMask: .exit, queue: .main)
+    monitor.setEventHandler { replacementExit?.cancel(); exit(0) }
+    replacementExit = monitor
+    monitor.resume()
+    if !app.terminate() { _ = app.forceTerminate(); exit(3) }
+}
 let launchToken = center.addObserver(forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main) { note in
-    guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+    guard launched == nil,
+          let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
           app.bundleIdentifier == wanted else { return }
     launched = app
     ownsLaunch = ownedPaths.contains(app.bundleURL?.path ?? "")
@@ -1914,18 +1925,40 @@ let launchToken = center.addObserver(forName: NSWorkspace.didLaunchApplicationNo
     // Unregistering the live displaced app can remove its LaunchServices application record.
     // Observe its physical process, not a later LS termination notification for that record.
     let monitor = DispatchSource.makeProcessSource(identifier: pid, eventMask: .exit, queue: .main)
-    monitor.setEventHandler { processExit?.cancel(); exit(askedToQuit ? 0 : 4) }
-    processExit = monitor
+    monitor.setEventHandler {
+        originalExited = true
+        originalExit?.cancel()
+        if quittingOriginal { exit(0) }
+    }
+    originalExit = monitor
     monitor.resume()
     print(app.bundleURL?.path ?? "")
     fflush(stdout)
 }
 DispatchQueue.global().async {
-    _ = readLine()
+    let command = readLine()
     DispatchQueue.main.async {
         guard ownsLaunch, let app = launched else { exit(2) }
-        askedToQuit = true
-        if !app.terminate() { _ = app.forceTerminate(); exit(3) }
+        let gone = originalExited || (kill(app.processIdentifier, 0) == -1 && errno == ESRCH)
+        let replacements = NSWorkspace.shared.runningApplications.filter {
+            $0.bundleIdentifier == wanted && $0.bundleURL?.path == activePath
+                && $0.processIdentifier != app.processIdentifier
+        }
+        if command == "HANDOFF" {
+            guard gone else { fputs("original app still runs after update\n", stderr); exit(4) }
+            guard replacements.count == 1 else {
+                fputs("update did not leave exactly one running replacement app\n", stderr)
+                exit(5)
+            }
+            quitReplacement(replacements[0])
+        } else if !gone {
+            quittingOriginal = true
+            if !app.terminate() { _ = app.forceTerminate(); exit(3) }
+        } else if replacements.count == 1 {
+            quitReplacement(replacements[0])
+        } else {
+            exit(replacements.isEmpty ? 0 : 2)
+        }
     }
 }
 print("READY")
@@ -1979,10 +2012,10 @@ withExtendedLifetime(launchToken) { RunLoop.main.run() }
         app
     }
 
-    fn quit(mut self) {
+    fn finish_handoff(mut self) {
         use std::io::Write as _;
         if let Some(mut input) = self.observer.stdin.take() {
-            let _ = writeln!(input, "QUIT");
+            let _ = writeln!(input, "HANDOFF");
         }
         let status = self
             .observer
@@ -1990,7 +2023,7 @@ withExtendedLifetime(launchToken) { RunLoop.main.run() }
             .expect("APPARATUS: observe graceful app termination");
         assert!(
             status.success(),
-            "PRODUCT: scratch Vox did not quit gracefully: {status}, launched {:?}",
+            "PRODUCT: update did not retire the original app and restore one running replacement: {status}, launched {:?}",
             self.path
         );
     }
@@ -2341,7 +2374,7 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
                 false,
             );
         }
-        old_app.quit();
+        old_app.finish_handoff();
         let records =
             launch_services_paths("us.vox.app").expect("APPARATUS: records after graceful quit");
         claims.push(claim(

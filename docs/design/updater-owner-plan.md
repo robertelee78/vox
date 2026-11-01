@@ -2,7 +2,7 @@
 
 Authority: [ADR-014 M-29–M-29c](../adr/ADR-014-macos-client.md#5-packaging-install-and-update), with ADR-015 §17's unchanged release-origin, ownership and platform-trust requirements.
 Work item: [#1090](https://github.com/robertelee78/vox/issues/1090), key `robertelee78/vox:ADR-014:S5:update-alone-app-handoff`.
-Status: proposed correction; independent Anthropic Opus plan review is required before product edits. No new release is authorized by this plan. Published v0.4.11–v0.4.13 assets remain immutable. The next delivery tag must be recorded separately before release work.
+Status: [independent Anthropic Opus plan review accepted](https://github.com/robertelee78/vox/issues/1090#issuecomment-6550509841); implementation and signed scratch acceptance are in progress under #1090. Source-only review is not runtime acceptance. No new release is authorized by this plan. Published v0.4.11–v0.4.13 assets remain immutable. The next delivery tag must be recorded separately before release work.
 
 ## 1. Problem and researched decision
 
@@ -16,7 +16,7 @@ The concrete reference is released Sparkle 2.10.1, not an assumed API:
 - The [released CLI](https://sparkle-project.org/documentation/sparkle-cli/) and [`SPUUpdater.h`](https://github.com/sparkle-project/Sparkle/blob/2.10.1/Sparkle/SPUUpdater.h) select and download through Sparkle's feed lifecycle. They do not accept Vox's already-pinned local artifact, external journal owner or authenticated offline rollback request.
 - Apple's [`NSUpdateSecurityPolicy`](https://developer.apple.com/documentation/bundleresources/information-property-list/nsupdatesecuritypolicy) documents same-team update authorization and optional policy customization. The observed helper and both application bundles already carry the same Team ID. Neither adding a policy nor changing signing metadata is therefore an established remedy for this incident.
 
-**Decision proposed for review:** retain Vox's verified target-version transaction owner, adopt the researched intact-bundle/same-volume replacement pattern through supported macOS filesystem interfaces, and replace launchable backup bundles with verified archives. This is Sparkle-informed installation, **not Sparkle framework integration**. Do not vendor or fork its private installer, add a second transaction owner, invent upstream hooks, introduce a new signing key, or remove Vox's rollback/journal guarantees to fit its public API. The earlier drop-in-framework recommendation is withdrawn on the source evidence above. Plan review must explicitly assess this choice; library reputation is not acceptance evidence.
+**Accepted decision:** retain Vox's verified target-version transaction owner, adopt the researched intact-bundle/same-volume replacement pattern through supported macOS filesystem interfaces, and replace launchable backup bundles with verified archives. This is Sparkle-informed installation, **not Sparkle framework integration**. Do not vendor or fork its private installer, add a second transaction owner, invent upstream hooks, introduce a new signing key, or remove Vox's rollback/journal guarantees to fit its public API. The earlier drop-in-framework recommendation is withdrawn on the source evidence above. The linked plan review explicitly assessed this choice; library reputation is not acceptance evidence.
 
 Linux and its standalone publication mechanism remain unchanged. No plist mutation is an authorization strategy. No sudo, Full Disk Access request, SIP/TCC change, ownership workaround or operator repair step is part of this design.
 

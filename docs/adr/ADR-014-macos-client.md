@@ -305,7 +305,7 @@ in one line and name swictation for dictation that stays on the Mac.
 
 | ADR line | Was | Now |
 |---|---|---|
-| ADR-015 17.9 | On macOS too, the binary is published by renaming a candidate beside it, keeping `.previous` | On macOS the whole `Vox.app` bundle is swapped and the previous bundle kept for `--rollback`; `~/.local/bin/vox` is a link into it (M-28, M-29). Linux unchanged |
+| ADR-015 17.9 | On macOS too, the binary is published by renaming a candidate beside it, keeping `.previous` | On macOS the whole `Vox.app` bundle is exchanged intact and the previous signed bundle retained in a verified archive for offline `--rollback`; `~/.local/bin/vox` is a link into the active bundle (M-28, M-29, M-29a). Linux unchanged |
 | ADR-015 17.10 | The installer's marker sits beside the binary in place | On macOS the marker belongs to the installed bundle; `~/.local/bin/vox` is its link (M-28) |
 | ADR-015 17.15 | Targets include `x86_64-apple-darwin`; macOS floor 11.0 | Targets are `x86_64-unknown-linux-gnu` and `aarch64-apple-darwin`; macOS floor 13.0 (M-26a) |
 | ADR-015 17.16–17.19 | Signing, notarization and receipts per macOS target | Also for `Vox.app`; one macOS target (M-27) |
