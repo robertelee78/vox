@@ -131,7 +131,8 @@ get past an error, and never attach them to a report.
 
 Each node records every refusal and every change of who reaches it: a refused join or tunnel, a
 cut session, a node added to or removed from the keyring, a stopped share. Each entry says what,
-about whom, when and why, such as `join proof-of-possession failed` for a wrong room passphrase.
+about whom, when and why. `join proof-of-possession failed` means the peer's join proof
+could not be verified; that message alone does not establish a mistyped passphrase.
 It never holds message text, file names, passphrases or keys. A refusal that repeats is recorded
 once, then counted.
 
@@ -150,7 +151,11 @@ A node's identity passphrase protects its keys. A room's passphrase admits newco
 be empty. An empty identity passphrase leaves the node's key unencrypted on disk, and an empty room
 passphrase lets anyone with the link join.
 
-At a terminal, Vox asks with a hidden prompt. Without one:
+At a terminal, the CLI asks with a hidden prompt. Typed and bracketed-pasted text are kept
+in input order, without echoing either. Press Return to submit. A newline inside pasted text
+is part of the passphrase, not a submit action.
+
+Without a terminal:
 
 - `vox node create` and `vox node unlock` read the identity passphrase from `--passphrase-file`,
   or from `VOX_IDENTITY_PASSPHRASE`.
