@@ -57,7 +57,8 @@ jobs:
                 exit 1
               fi
             else
-              set -- $line
+              read -r -a run_fields <<< "$line"
+              set -- "${run_fields[@]}"
               [ "$seen" != "$1 $2" ] && echo "CI run $1: $2 $3 ($4)" && seen="$1 $2"
               if [ "$2" = completed ]; then
                 if [ "$3" = success ]; then
@@ -73,9 +74,9 @@ jobs:
           echo "::error::CI on $SHA did not finish within this job's budget"
           exit 1
 
+  # Build once alongside exact-commit CI; only draft staging waits for both.
   build-linux-x64:
     if: ${{ github.event_name != 'workflow_dispatch' || !inputs.candidate_only }}
-    needs: [ci-passed]
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -106,7 +107,6 @@ jobs:
   # packages both. One job, so neither artifact can exist without the other.
   build-darwin-arm64:
     if: ${{ github.event_name != 'workflow_dispatch' || !inputs.candidate_only }}
-    needs: [ci-passed]
     runs-on: macos-latest
     timeout-minutes: 120  # two notary submissions, each waited on
     # Holds the Apple credentials. A fork or a pull request cannot reach them, so it cannot
@@ -289,7 +289,7 @@ jobs:
 
   publish:
     if: ${{ github.event_name != 'workflow_dispatch' || !inputs.candidate_only }}
-    needs: [build-linux-x64, build-darwin-arm64]
+    needs: [ci-passed, build-linux-x64, build-darwin-arm64]
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -324,9 +324,12 @@ jobs:
           scripts/check-release-assets.sh release "${VERSION}"
           ls -l release
 
-      - name: Create GitHub Release
+      # Keep the exact artifacts private until their scratch install/launch smoke.
+      # Publish explicitly with `gh release edit TAG --draft=false --latest`.
+      - name: Stage draft GitHub Release
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
+          draft: true
           files: release/*
           generate_release_notes: true
