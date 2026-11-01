@@ -959,6 +959,7 @@ impl Node {
                 if let Some(net) = self.net.as_ref() {
                     net.forget_board_exchange_room(&parsed.channel_id);
                 }
+                self.retire_parked_private_drive(&parsed.channel_id, Fault::ChannelNotOpen);
                 self.channels.insert(
                     parsed.channel_id,
                     Arc::new(tokio::sync::Mutex::new(*channel)),

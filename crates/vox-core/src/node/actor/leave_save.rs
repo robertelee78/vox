@@ -922,6 +922,7 @@ impl Node {
         if self.channels.contains_key(room) {
             self.own_key_room_set_changed.send_replace(());
         }
+        self.retire_parked_private_drive(room, Fault::ChannelNotOpen);
         let removed = self.channels.remove(room);
         drop(transition);
         let outcome = match removed {
@@ -986,6 +987,7 @@ impl Node {
         if self.channels.contains_key(room) {
             self.own_key_room_set_changed.send_replace(());
         }
+        self.retire_parked_private_drive(room, Fault::ChannelNotOpen);
         self.channels.remove(room);
         drop(transition);
         self.reopening.remove(room);

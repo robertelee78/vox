@@ -840,6 +840,13 @@ final class NodeModel: ObservableObject {
     @Published private(set) var memberWorkError: String?
     @Published private(set) var memberWorkLoading = false
     private var memberWorkRead = UUID()
+    /// Computer pairing is account-wide, not evidence about any room member's management.
+    enum ComputerPairingAttention: Equatable {
+        case approveHere
+        case approveThere
+    }
+    @Published private(set) var computerPairingAttention: ComputerPairingAttention?
+    private var computerPairingRead = UUID()
     @Published private(set) var trusted: [TrustedNode] = []
     /// Trust offers waiting on this node: newcomers, and nodes that trust it (ADR-028 K-15, K-17).
     @Published private(set) var offers: [OfferInfo] = []
@@ -1635,6 +1642,22 @@ final class NodeModel: ObservableObject {
         let currentOffers = try? await client.pendingOffers()
         guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
         if let currentOffers, currentOffers != offers { offers = currentOffers }
+        let pairingRead = UUID()
+        computerPairingRead = pairingRead
+        let computer = try? await client.computerStatus()
+        guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
+        if computerPairingRead == pairingRead {
+            var attention: ComputerPairingAttention?
+            if let computer, let pairing = computer.pairing,
+               Double(pairing.expiresMs) > Date().timeIntervalSince1970 * 1_000 {
+                if computer.state == "needs-approval", !pairing.approvedHere {
+                    attention = .approveHere
+                } else if computer.state == "waiting", pairing.approvedHere, !pairing.approvedThere {
+                    attention = .approveThere
+                }
+            }
+            if attention != computerPairingAttention { computerPairingAttention = attention }
+        }
         let eligibilityTargets = Set(members.map(\.id) + offers.map(\.fingerprint) + (card.map { [$0.fingerprint] } ?? []))
         for fingerprint in eligibilityTargets {
             await refreshIndividualTrustEligibility(fingerprint)

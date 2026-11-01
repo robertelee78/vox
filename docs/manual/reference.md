@@ -77,6 +77,37 @@ option value where supported, such as `--session=` followed by the actual quoted
 so it cannot be parsed as a new flag. Preserve that form in commands Vox prints. Never put a
 passphrase in a constructed command.
 
+## Pairing your computers
+
+Computer pairing is an operator action on **both** computers. On the first, run
+`vox computer invite` or open Settings → Add Computer… in Vox. Transfer its one-time link
+privately to the other computer. There, run the complete `vox computer pair` command printed
+with the invitation, review the authenticated computer identity and policy, and answer `yes`
+only if they are correct. In the app, review the computer in My Computers and use
+**Trust This Computer**. On the first computer, `vox computer status` shows the authenticated
+proposal and the exact `vox computer approve` command to run there. Both approvals are required;
+one computer cannot approve for the other.
+
+`vox computer pair --preview` authenticates and displays the proposal without approving it.
+Use the operation in its output with `vox computer approve` on the computer that still needs
+approval. If this computer already approved, status names the other computer and the action
+belongs in that computer's own terminal or app; repeating approval here does not approve there.
+For interactive `vox computer pair LINK --json`, the identity, policy and confirmation prompt
+are on stderr; a successful stdout is one JSON status. No or end-of-input adds no local approval.
+The link is sensitive: do not post it publicly or put it in a report.
+
+An incomplete expired attempt can be closed locally with the `vox computer cancel` command
+shown by status. Closing a signed attempt does not withdraw the signature from the other
+computer or remove trust there. A completed pairing is not undone by cancel; use computer
+removal after reviewing its confirmation frontier.
+
+Pairing grants the stated computer policy; it does not make either node a member of a room.
+Join each node separately with the room link and passphrase. Room membership, effective node
+trust and reciprocal room consent are distinct. After joining, a member's consent may still be
+in transit. Check effective trust and membership on the relevant computer rather than adding
+individual trust that the current computer policy already supplies. Independent node trust
+continues to work during an incomplete computer pairing.
+
 ## How a command picks its node
 
 A command acts as the first of these that names a node: `--node`, then `VOX_NODE`, then the only

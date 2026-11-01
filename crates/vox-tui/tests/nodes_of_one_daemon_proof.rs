@@ -891,6 +891,212 @@ fn computer(a: &Account, args: &[&str]) -> serde_json::Value {
     })
 }
 
+/// FX-42: explicit review remains human-visible while a JSON consumer gets one document.
+#[test]
+#[ignore = "real binaries with production Argon2id; run in release with test-knobs"]
+fn computer_pair_json_reviews_without_approving_the_peer() {
+    watchdog::arm();
+    let a = Account::new();
+    let b = Account::new();
+    let invitation = computer(&a, &["invite"]);
+    let link = invitation["invite_link"]
+        .as_str()
+        .expect("APPARATUS: the synthetic computer invitation has no link");
+    let (ok, out, err) = b.run(&["computer", "pair", link, "--json"], "yes\n");
+    assert!(ok, "PRODUCT: explicit computer approval failed: {out}{err}");
+    let reviewed: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|error| {
+        panic!("PRODUCT: successful computer pair --json is not one JSON document: {error}; stdout: {out}; stderr: {err}")
+    });
+    let peer = invitation["this_computer"]["fingerprint"]
+        .as_str()
+        .expect("APPARATUS: invitation omitted this computer's fingerprint");
+    assert!(
+        err.contains(peer),
+        "PRODUCT: JSON pairing did not show the authenticated peer for human review on stderr: {err}"
+    );
+    assert!(
+        reviewed["pairing"]["approved_here"] == true
+            && reviewed["pairing"]["approved_there"] == false
+            && reviewed["computers"].as_array().is_some_and(Vec::is_empty),
+        "PRODUCT: one explicit local approval granted peer approval or computer enrollment: {reviewed}"
+    );
+    for input in ["no\n", ""] {
+        let sponsor = Account::new();
+        let incoming = Account::new();
+        let invitation = computer(&sponsor, &["invite"]);
+        let link = invitation["invite_link"]
+            .as_str()
+            .expect("APPARATUS: negative-control invitation omitted its link");
+        let (ok, out, err) = incoming.run(&["computer", "pair", link, "--json"], input);
+        assert!(
+            !ok,
+            "PRODUCT: declining or EOF reported successful pairing: {out}{err}"
+        );
+        let shown = computer(&incoming, &["status"]);
+        assert!(
+            shown["pairing"]["approved_here"] == false
+                && shown["pairing"]["approved_there"] == false
+                && shown["computers"].as_array().is_some_and(Vec::is_empty),
+            "PRODUCT: declining or EOF recorded approval or enrollment: {shown}"
+        );
+    }
+}
+
+/// FX-39/40: already-Ready room members become usable through pairing, not a restart.
+#[test]
+#[ignore = "real binaries with production Argon2id; run in release with test-knobs"]
+fn paired_ready_nodes_read_both_ways_and_survive_reselection() {
+    watchdog::arm();
+    let a = Account::new();
+    let b = Account::new();
+    for (account, node) in [(&a, "pair-ready-a"), (&b, "pair-ready-b")] {
+        account.make_node(node);
+        let (ok, out, err) = account.run(&["node", "unlock", node, "--passphrase-file", "-"], PASS);
+        assert!(
+            ok,
+            "APPARATUS: scratch node {node} could not become Ready before pairing: {out}{err}"
+        );
+        computer(account, &["personal", node]);
+    }
+    let room = make_room(&a, "pair-ready-a");
+    let (ok, out, err) = a.run(&["room", "link", &room, "--node", "pair-ready-a"], "");
+    assert!(
+        ok,
+        "APPARATUS: existing room invitation unavailable: {out}{err}"
+    );
+    let link = out
+        .lines()
+        .find(|line| line.starts_with("vox://"))
+        .expect("APPARATUS: room link command omitted its invitation")
+        .to_owned();
+    let (ok, out, err) = b.run(
+        &[
+            "room",
+            "join",
+            &link,
+            "--node",
+            "pair-ready-b",
+            "--passphrase-file",
+            "-",
+        ],
+        ROOM_PASS,
+    );
+    assert!(
+        ok,
+        "APPARATUS: two already-Ready nodes could not share a room before pairing: {out}{err}"
+    );
+    let offer = computer(&a, &["invite"]);
+    let preview = computer(
+        &b,
+        &[
+            "pair",
+            offer["invite_link"]
+                .as_str()
+                .expect("APPARATUS: pairing invitation omitted its link"),
+            "--preview",
+        ],
+    );
+    let operation = preview["pairing"]["operation_id"]
+        .as_str()
+        .expect("APPARATUS: authenticated preview omitted its operation");
+    computer(&b, &["approve", operation]);
+    computer(&b, &["approve", operation]);
+    computer(&a, &["approve", operation]);
+    let mut last = (serde_json::Value::Null, serde_json::Value::Null);
+    assert!(
+        wait_until(CHANGE_SHOWN_WITHIN, || {
+            last = (computer(&a, &["status"]), computer(&b, &["status"]));
+            last.0["state"] == "confirmed" && last.1["state"] == "confirmed"
+        }),
+        "PRODUCT: pairing did not apply to already-Ready nodes without restart: {}; {}; logs: {}; {}",
+        last.0,
+        last.1,
+        a.log(),
+        b.log()
+    );
+    let post = |account: &Account, node: &str, text: &str| {
+        let (ok, out, err) = account.run(&["room", "post", &room, text, "--node", node], "");
+        assert!(
+            ok,
+            "PRODUCT: {node} could not post after pairing: {out}{err}"
+        );
+    };
+    let read = |account: &Account, node: &str, text: &str| {
+        let mut last = (false, String::new(), String::new());
+        assert!(
+            wait_until(RETURN_WITHIN, || {
+                last = account.run(&["room", "read", &room, "--node", node], "");
+                last.0 && last.1.contains(text)
+            }),
+            "PRODUCT: {node} could not read the other member's new post {text:?}: stdout {}; stderr {}",
+            last.1,
+            last.2
+        );
+    };
+    post(&a, "pair-ready-a", "paired-ready-a-to-b");
+    post(&b, "pair-ready-b", "paired-ready-b-to-a");
+    read(&b, "pair-ready-b", "paired-ready-a-to-b");
+    read(&a, "pair-ready-a", "paired-ready-b-to-a");
+
+    // A missing peer cannot make unchanged local selection depend on support discovery.
+    let peer_pid = b.lock_pid().expect("APPARATUS: owned peer daemon pid");
+    stop_pid(peer_pid);
+    assert!(
+        !alive(peer_pid),
+        "APPARATUS: owned peer daemon did not stop"
+    );
+    computer(&a, &["personal", "pair-ready-a"]);
+    post(
+        &a,
+        "pair-ready-a",
+        "selected-current-node-with-peer-offline",
+    );
+    read(&a, "pair-ready-a", "paired-ready-b-to-a");
+    let (ok, out, err) = b.run(
+        &["node", "unlock", "pair-ready-b", "--passphrase-file", "-"],
+        PASS,
+    );
+    assert!(ok, "APPARATUS: restore owned peer daemon: {out}{err}");
+    read(
+        &b,
+        "pair-ready-b",
+        "selected-current-node-with-peer-offline",
+    );
+    post(&b, "pair-ready-b", "peer-returned-after-local-reselection");
+    read(&a, "pair-ready-a", "peer-returned-after-local-reselection");
+
+    // A node made Ready after enrollment must receive the same policy, not manual grants.
+    b.make_node("pair-ready-later");
+    let (ok, out, err) = b.run(
+        &[
+            "node",
+            "unlock",
+            "pair-ready-later",
+            "--passphrase-file",
+            "-",
+        ],
+        PASS,
+    );
+    assert!(ok, "PRODUCT: later node could not become Ready: {out}{err}");
+    let (ok, out, err) = b.run(
+        &[
+            "room",
+            "join",
+            &link,
+            "--node",
+            "pair-ready-later",
+            "--passphrase-file",
+            "-",
+        ],
+        ROOM_PASS,
+    );
+    assert!(ok, "PRODUCT: later-Ready node could not join: {out}{err}");
+    post(&a, "pair-ready-a", "paired-current-a-to-later");
+    post(&b, "pair-ready-later", "paired-later-to-current-a");
+    read(&b, "pair-ready-later", "paired-current-a-to-later");
+    read(&a, "pair-ready-a", "paired-later-to-current-a");
+}
+
 #[allow(clippy::too_many_arguments)]
 fn pair_computers(
     a: &Account,

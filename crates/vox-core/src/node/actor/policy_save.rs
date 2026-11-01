@@ -88,10 +88,6 @@ enum DriveStage {
         result: Option<oneshot::Receiver<Outcome>>,
     },
     Consents(oneshot::Receiver<crate::error::Result<()>>),
-    Private {
-        cursor: usize,
-        result: Option<oneshot::Receiver<Outcome>>,
-    },
 }
 pub(super) struct ManagedDrive {
     ready: ManagedReady,
@@ -1186,6 +1182,7 @@ impl Node {
                 }
                 if pending.ready.expired {
                     self.publish().await;
+                    drop(save);
                     self.finish_managed_policy(pending).await;
                     return;
                 }
@@ -1209,10 +1206,11 @@ impl Node {
                             *cursor += 1;
                             *result = None;
                         }
-                        Ok(_) => {
-                            let _ = pending.reply.send(Err(Error::Profile(
-                                "managed key-package continuation failed",
-                            )));
+                        Ok(inner) => {
+                            let _ = pending.reply.send(Err(Error::AppRefused(format!(
+                                "room {} managed key-package continuation: {inner}",
+                                crate::node::link::b32_encode(&pending.ready.rooms[*cursor].room),
+                            ))));
                             return;
                         }
                         Err(oneshot::error::TryRecvError::Empty) => {
@@ -1256,76 +1254,27 @@ impl Node {
                 }
                 false
             }
-            DriveStage::Consents(receiver) => {
-                match receiver.try_recv() {
-                    Ok(Ok(())) => {
-                        pending.stage = DriveStage::Private {
-                            cursor: 0,
-                            result: None,
-                        }
-                    }
-                    Ok(Err(error)) => {
-                        let _ = pending.reply.send(Err(error));
-                        return;
-                    }
-                    Err(oneshot::error::TryRecvError::Empty) => {
-                        self.pending_policy = Some(Pending::ManagedDrive(pending));
-                        return;
-                    }
-                    Err(oneshot::error::TryRecvError::Closed) => {
-                        let _ = pending.reply.send(Err(Error::Profile(
-                            "managed consent completion owner stopped",
-                        )));
-                        return;
-                    }
-                }
-                true
-            }
-            DriveStage::Private { cursor, result } => {
-                if let Some(receiver) = result {
-                    match receiver.try_recv() {
-                        Ok(Outcome::Done) => {
-                            *cursor += 1;
-                            *result = None;
-                        }
-                        Ok(_) => {
-                            let _ = pending.reply.send(Err(Error::Profile(
-                                "managed private-key continuation failed",
-                            )));
-                            return;
-                        }
-                        Err(oneshot::error::TryRecvError::Empty) => {
-                            self.pending_policy = Some(Pending::ManagedDrive(pending));
-                            return;
-                        }
-                        Err(oneshot::error::TryRecvError::Closed) => {
-                            let _ = pending.reply.send(Err(Error::Profile(
-                                "managed private-key completion owner stopped",
-                            )));
-                            return;
-                        }
-                    }
-                }
-                if let Err(error) = pending.ready.guard.active(self.computer.as_ref()) {
-                    let _ = pending.reply.send(Err(error));
-                    return;
-                }
-                if *cursor == pending.ready.rooms.len() {
+            DriveStage::Consents(receiver) => match receiver.try_recv() {
+                Ok(Ok(())) => {
+                    drop(save);
                     self.finish_managed_policy(pending).await;
                     return;
                 }
-                let room = pending.ready.rooms[*cursor].room;
-                let (sender, receiver) = oneshot::channel();
-                *result = Some(receiver);
-                !self
-                    .begin_owned_private_drive(
-                        room,
-                        Some(pending.ready.guard.clone()),
-                        Some(Arc::clone(&save)),
-                        Some(sender),
-                    )
-                    .await
-            }
+                Ok(Err(error)) => {
+                    let _ = pending.reply.send(Err(error));
+                    return;
+                }
+                Err(oneshot::error::TryRecvError::Empty) => {
+                    self.pending_policy = Some(Pending::ManagedDrive(pending));
+                    return;
+                }
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    let _ = pending.reply.send(Err(Error::Profile(
+                        "managed consent completion owner stopped",
+                    )));
+                    return;
+                }
+            },
         };
         self.pending_policy = Some(Pending::ManagedDrive(pending));
         // A stage transition or immediate terminal refusal is a real causal edge. Native
@@ -1348,8 +1297,30 @@ impl Node {
             self.resume_own_key_donor_busy();
             self.resume_own_key_policy_waiting();
         }
-        let _ = pending.reply.send(result);
+        let rooms = pending
+            .ready
+            .rooms
+            .iter()
+            .map(|room| (room.room, Arc::clone(&room.instance)))
+            .collect::<Vec<_>>();
+        let guard = pending.ready.guard.clone();
+        let expired = pending.ready.expired;
+        release_rooms(&pending.ready.rooms, result.is_err()).await;
         drop(pending.ready);
+        let applied = result.is_ok();
+        if applied && !expired {
+            for (room, instance) in rooms {
+                if self
+                    .channels
+                    .get(&room)
+                    .is_some_and(|current| Arc::ptr_eq(current, &instance))
+                {
+                    self.begin_owned_private_drive(room, Some(guard.clone()), None, None)
+                        .await;
+                }
+            }
+        }
+        let _ = pending.reply.send(result);
     }
 }
 

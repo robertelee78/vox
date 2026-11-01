@@ -420,4 +420,4 @@ fn native_saved(mut saved: Native, kind: NativeKind) -> Result<Saved> {
 }
 
 mod continuation;
-pub(super) use continuation::{ArchiveReceipt, Continuation};
+pub(super) use continuation::{ArchiveReceipt, Continuation, ParkedPrivateDrive};

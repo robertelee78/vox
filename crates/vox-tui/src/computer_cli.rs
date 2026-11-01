@@ -192,7 +192,7 @@ pub async fn run(command: ComputerCmd) -> Result<(), AppError> {
     let mut client = DaemonClient::open(&root.socket()).await?;
     let mut status = ask(&mut client, request).await?;
     if prompt {
-        show(&status, false)?;
+        show(&status, false, json)?;
         let proposal = status.pairing.as_ref().ok_or_else(|| {
             AppError::Usage("no authenticated computer was offered for approval".into())
         })?;
@@ -222,7 +222,7 @@ pub async fn run(command: ComputerCmd) -> Result<(), AppError> {
             status = ask(&mut approval, DaemonRequest::ComputerApprove { operation }).await?;
         }
     }
-    show(&status, json)
+    show(&status, json, false)
 }
 async fn ask(
     client: &mut DaemonClient,
@@ -237,7 +237,7 @@ async fn ask(
         )),
     }
 }
-fn show(status: &ComputerStatus, json: bool) -> Result<(), AppError> {
+fn show(status: &ComputerStatus, json: bool, to_stderr: bool) -> Result<(), AppError> {
     if json {
         println!(
             "{}",
@@ -245,6 +245,19 @@ fn show(status: &ComputerStatus, json: bool) -> Result<(), AppError> {
         );
         return Ok(());
     }
+    // The interactive JSON path still needs the same human review, but not on JSON stdout.
+    macro_rules! println {
+        ($($arg:tt)*) => {
+            if to_stderr {
+                eprintln!($($arg)*);
+            } else {
+                std::println!($($arg)*);
+            }
+        };
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
     println!(
         "{}  {}\ninstallation {}\ncomputer trust: {}\npolicy revision {}",
         status.this_computer.name,
@@ -264,6 +277,33 @@ fn show(status: &ComputerStatus, json: bool) -> Result<(), AppError> {
             p.approved_here,
             p.approved_there
         );
+        if p.expires_ms <= now_ms {
+            println!(
+                "This incomplete attempt has expired. Close it on this computer: {}",
+                vox_text::shell::command(&["vox", "computer", "cancel", &p.operation_id])
+            );
+            if p.approved_here {
+                println!("Closing locally does not withdraw signed approval or remove trust on the other computer.");
+            }
+        } else if !p.approved_here {
+            println!(
+                "After reviewing this computer and policy, approve on {} ({}) here: {}",
+                status.this_computer.name,
+                status.this_computer.fingerprint,
+                vox_text::shell::command(&["vox", "computer", "approve", &p.operation_id])
+            );
+        } else if !p.approved_there {
+            println!(
+                "Approved here. Approval from {} ({}) has not reached this computer. \
+                 On that computer, review and approve in its terminal with {}, or in Vox's \
+                 My Computers window.",
+                p.peer.name,
+                p.peer.fingerprint,
+                vox_text::shell::command(&["vox", "computer", "approve", &p.operation_id])
+            );
+        } else {
+            println!("Both approvals are recorded; enrollment has not completed here yet.");
+        }
     }
     if let Some(link) = &status.invite_link {
         println!(
@@ -277,9 +317,6 @@ fn show(status: &ComputerStatus, json: bool) -> Result<(), AppError> {
             vox_text::shell::command(&["vox", "computer", "cancel", id])
         );
     }
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64);
     for application in &status.applications {
         // The last exchange this daemon started and the last it answered, each with the policy
         // revision it sent and the one it stood at after merging: which exchange carried a

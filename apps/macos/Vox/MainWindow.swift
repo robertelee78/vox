@@ -2282,24 +2282,40 @@ private struct NodeStopped: View {
 /// alias, else the start of the fingerprint.
 private struct TrustBanner: View {
     @ObservedObject var model: NodeModel
+    @State private var showingComputers = false
 
     var body: some View {
         let cut = model.members.filter { $0.trust != .mutual }
         if !cut.isEmpty {
-            HStack(spacing: 8) {
-                StateMark(kind: .attention, words: words(cut))
-                    .accessibilityIdentifier("trust-banner")
-                Spacer()
-                if cut.count == 1, let member = cut.first, !member.trust.inKeyring,
-                   model.offers.contains(where: { $0.fingerprint == member.id }) {
-                    Button("Trust \(member.name)…") { Task { await model.show(.offer(member.id)) } }
-                        .accessibilityIdentifier("trust-banner-offer")
-                } else if cut.contains(where: { !$0.trust.inKeyring }) {
-                    Button("Show Keyring") { Task { await model.show(.keyring) } }
-                        .accessibilityIdentifier("trust-banner-keyring")
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) {
+                    StateMark(kind: .attention, words: words(cut))
+                        .accessibilityIdentifier("trust-banner")
+                    Spacer()
+                    if cut.count == 1, let member = cut.first, !member.trust.inKeyring,
+                       model.offers.contains(where: { $0.fingerprint == member.id }) {
+                        Button("Trust \(member.name)…") { Task { await model.show(.offer(member.id)) } }
+                            .accessibilityIdentifier("trust-banner-offer")
+                    } else if cut.contains(where: { !$0.trust.inKeyring }) {
+                        Button("Show Keyring") { Task { await model.show(.keyring) } }
+                            .accessibilityIdentifier("trust-banner-keyring")
+                    }
+                }
+                if model.daemonReachable, model.ended == nil, let attention = model.computerPairingAttention {
+                    HStack(spacing: 8) {
+                        Text(attention == .approveHere
+                             ? "A computer pairing needs your review on this computer. Computer approval is separate from individual node trust."
+                             : "This computer approved a pairing. Review and approve it on the other computer to continue. Individual node trust is separate.")
+                            .secondaryText()
+                            .accessibilityIdentifier("trust-banner-computer-status")
+                        Spacer()
+                        Button("Review Computer Trust…") { showingComputers = true }
+                            .accessibilityIdentifier("trust-banner-computer-review")
+                    }
                 }
             }
             .padding(.horizontal, 12).padding(.vertical, 6)
+            .sheet(isPresented: $showingComputers) { ComputerTrustView() }
         }
     }
 

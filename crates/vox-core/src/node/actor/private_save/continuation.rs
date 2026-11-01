@@ -20,6 +20,24 @@ enum DriveStage {
     Sessions,
     Legacy,
     Support,
+    Query,
+}
+
+pub(in crate::node::actor) struct ParkedPrivateDrive {
+    instance: std::sync::Weak<tokio::sync::Mutex<ChannelState>>,
+    attachment: u64,
+    stage: DriveStage,
+    guard: Option<computer::ComputerPolicyGuard>,
+    authority: computer::ComputerAuthority,
+    reply: ActorReply,
+}
+
+impl ParkedPrivateDrive {
+    fn retire(self, fault: Fault) {
+        if let Some(reply) = self.reply {
+            let _ = reply.send(Outcome::Failed(fault));
+        }
+    }
 }
 #[derive(Clone, Copy)]
 enum SupportStage {
@@ -101,6 +119,164 @@ impl Continuation {
 }
 
 impl Node {
+    pub(in crate::node::actor) fn retire_parked_private_drive(
+        &mut self,
+        room: &Digest32,
+        fault: Fault,
+    ) {
+        if let Some(parked) = self.parked_private_drives.remove(room) {
+            parked.retire(fault);
+        }
+    }
+
+    pub(in crate::node::actor) fn retire_parked_private_drives(&mut self, fault: Fault) {
+        for (_, parked) in std::mem::take(&mut self.parked_private_drives) {
+            parked.retire(fault);
+        }
+    }
+
+    pub(in crate::node::actor) fn retire_stale_private_drives(&mut self) {
+        let stale: Vec<_> = self
+            .parked_private_drives
+            .iter()
+            .filter_map(|(room, parked)| {
+                (!parked.authority.current()
+                    || parked
+                        .guard
+                        .as_ref()
+                        .is_some_and(|guard| guard.active(self.computer.as_ref()).is_err()))
+                .then_some(*room)
+            })
+            .collect();
+        for room in stale {
+            self.retire_parked_private_drive(&room, Fault::ComputerPolicy);
+        }
+    }
+
+    pub(in crate::node::actor) async fn resume_parked_private_drive(&mut self, room: Digest32) {
+        if self.pending_posts.contains_key(&room) {
+            return;
+        }
+        let Some(parked) = self.parked_private_drives.remove(&room) else {
+            return;
+        };
+        let Some(instance) = parked.instance.upgrade() else {
+            parked.retire(Fault::ChannelNotOpen);
+            return;
+        };
+        if parked.attachment != self.delivery_epoch
+            || !self
+                .channels
+                .get(&room)
+                .is_some_and(|current| Arc::ptr_eq(current, &instance))
+        {
+            parked.retire(Fault::ChannelNotOpen);
+            return;
+        }
+        if !parked.authority.current()
+            || !self.computer_authority_current()
+            || parked
+                .guard
+                .as_ref()
+                .is_some_and(|guard| guard.active(self.computer.as_ref()).is_err())
+        {
+            parked.retire(Fault::ComputerPolicy);
+            return;
+        }
+        let readiness = if let Some(profile) = self
+            .profile
+            .as_ref()
+            .filter(|profile| profile.is_unlocked())
+        {
+            let channel = instance.lock().await;
+            channel
+                .legacy_cache_only(profile.store())
+                .and_then(|legacy| {
+                    if legacy {
+                        Err(Error::StreamRefused("legacy history is not current"))
+                    } else {
+                        channel
+                            .require_governance_ready(profile.store(), self.now_ms())
+                            .map(|_| ())
+                    }
+                })
+        } else {
+            Err(Error::AtRestLocked)
+        };
+        if let Err(error) = readiness {
+            let fault = fault_of(&error);
+            if matches!(
+                fault,
+                Fault::RoomNotSynced
+                    | Fault::GovernanceRefreshing
+                    | Fault::RoomPreparing
+                    | Fault::RoomChangePending
+            ) {
+                self.parked_private_drives.insert(room, parked);
+            } else {
+                parked.retire(fault);
+            }
+            return;
+        }
+        let work = match parked.stage {
+            DriveStage::Upgrade => maintenance_save::Work::Private(Work::Upgrade {
+                finish_initial: false,
+            }),
+            DriveStage::Sessions => maintenance_save::Work::Projection(ProjectionWork::Sessions),
+            DriveStage::Legacy => maintenance_save::Work::Private(Work::AnnounceLegacy),
+            DriveStage::Support => {
+                maintenance_save::Work::Consent(consent_save::Work::PrivateSupport {
+                    discovery_ready: true,
+                })
+            }
+            DriveStage::Query => maintenance_save::Work::Projection(ProjectionWork::Sessions),
+        };
+        let continuation = Continuation {
+            instance,
+            attachment: parked.attachment,
+            lifetime: None,
+            after: After::Drive {
+                stage: parked.stage,
+                guard: parked.guard,
+            },
+        };
+        self.begin_pending_maintenance(
+            room,
+            work,
+            maintenance_save::Continuation::Private(continuation),
+            parked.reply,
+        )
+        .await;
+    }
+
+    fn park_private_drive(
+        &mut self,
+        room: Digest32,
+        lifetime: Arc<maintenance_save::Lifetime>,
+        continuation: Continuation,
+        reply: ActorReply,
+    ) {
+        let After::Drive { stage, guard } = continuation.after else {
+            return;
+        };
+        if self.parked_private_drives.contains_key(&room) {
+            if let Some(reply) = reply {
+                let _ = reply.send(Outcome::Failed(Fault::RoomChangePending));
+            }
+            return;
+        }
+        self.parked_private_drives.insert(
+            room,
+            ParkedPrivateDrive {
+                instance: Arc::downgrade(&continuation.instance),
+                attachment: continuation.attachment,
+                stage,
+                guard,
+                authority: lifetime.authority.clone(),
+                reply,
+            },
+        );
+    }
     pub(in crate::node::actor) fn checked_support_discovery(
         &mut self,
         room: Digest32,
@@ -182,8 +358,8 @@ impl Node {
         .await
     }
 
-    /// Owned policy tails validate the settled receipt under their original publication
-    /// boundary; the aggregate actor revision stays pending until the entire tail completes.
+    /// Active work validates its settled authority at each continuation. Parked work drops
+    /// physical leases and reacquires admission before resuming.
     fn owned_private_drive_guard(
         &self,
         guard: Option<&computer::ComputerPolicyGuard>,
@@ -200,7 +376,7 @@ impl Node {
         ))
     }
 
-    /// Existing tend-drive callers hand over their ORIGINAL policy decision and lease.
+    /// Drive work keeps its original policy decision; a parked continuation retains no lease.
     pub(in crate::node::actor) async fn begin_owned_private_drive(
         &mut self,
         room: Digest32,
@@ -208,6 +384,12 @@ impl Node {
         lifetime: Option<Arc<maintenance_save::Lifetime>>,
         reply: ActorReply,
     ) -> bool {
+        if self.parked_private_drives.contains_key(&room) {
+            if let Some(reply) = reply {
+                let _ = reply.send(Outcome::Failed(Fault::RoomChangePending));
+            }
+            return false;
+        }
         let Some(instance) = self.channels.get(&room).cloned() else {
             if let Some(reply) = reply {
                 let _ = reply.send(Outcome::Failed(Fault::ChannelNotOpen));
@@ -219,6 +401,30 @@ impl Node {
                 let _ = reply.send(Outcome::Failed(fault_of(&error)));
             }
             return false;
+        }
+        if self.pending_posts.contains_key(&room) {
+            let authority = lifetime
+                .as_ref()
+                .map(|held| held.authority.clone())
+                .or_else(|| self.computer_authority());
+            let Some(authority) = authority else {
+                if let Some(reply) = reply {
+                    let _ = reply.send(Outcome::Failed(Fault::ComputerPolicy));
+                }
+                return false;
+            };
+            self.parked_private_drives.insert(
+                room,
+                ParkedPrivateDrive {
+                    instance: Arc::downgrade(&instance),
+                    attachment: self.delivery_epoch,
+                    stage: DriveStage::Upgrade,
+                    guard,
+                    authority,
+                    reply,
+                },
+            );
+            return true;
         }
         let Some(profile) = &self.profile else {
             if let Some(reply) = reply {
@@ -243,6 +449,33 @@ impl Node {
         let readiness = readiness
             .and_then(|()| self.owned_private_drive_guard(guard.as_ref(), lifetime.as_deref()));
         if let Err(error) = readiness {
+            let fault = fault_of(&error);
+            if matches!(
+                fault,
+                Fault::RoomNotSynced
+                    | Fault::GovernanceRefreshing
+                    | Fault::RoomPreparing
+                    | Fault::RoomChangePending
+            ) {
+                if let Some(authority) = lifetime
+                    .as_ref()
+                    .map(|held| held.authority.clone())
+                    .or_else(|| self.computer_authority())
+                {
+                    self.parked_private_drives.insert(
+                        room,
+                        ParkedPrivateDrive {
+                            instance: Arc::downgrade(&instance),
+                            attachment: self.delivery_epoch,
+                            stage: DriveStage::Upgrade,
+                            guard,
+                            authority,
+                            reply,
+                        },
+                    );
+                    return true;
+                }
+            }
             if let Some(reply) = reply {
                 let _ = reply.send(Outcome::Failed(fault_of(&error)));
             }
@@ -577,6 +810,14 @@ impl Node {
         stage: DriveStage,
     ) {
         let next = match (stage, result) {
+            (
+                DriveStage::Query,
+                maintenance_save::Saved::Projection(ProjectionProgress::Sessions { .. }),
+            ) => {
+                self.release_private_drive(room, lifetime, continuation, reply)
+                    .await;
+                return;
+            }
             (DriveStage::Upgrade, maintenance_save::Saved::Private(Saved::Upgrade(saved))) => {
                 if saved.advance == SessionAdvance::Waiting {
                     None
@@ -716,8 +957,8 @@ impl Node {
             }
             continuation.lifetime = Some(lifetime);
             self.continue_private(room, work, continuation, reply).await;
-        } else if let Some(reply) = reply {
-            let _ = reply.send(Outcome::Failed(Fault::RoomChangePending));
+        } else {
+            self.park_private_drive(room, lifetime, continuation, reply);
         }
     }
 
@@ -741,9 +982,11 @@ impl Node {
         let ensure = match answer {
             Ok(SessionReply::HasOpen(open)) => open,
             _ => {
-                if let Some(reply) = reply {
-                    let _ = reply.send(Outcome::Failed(Fault::RoomChangePending));
+                let mut continuation = continuation;
+                if let After::Drive { stage, .. } = &mut continuation.after {
+                    *stage = DriveStage::Query;
                 }
+                self.park_private_drive(room, lifetime, continuation, reply);
                 return;
             }
         };

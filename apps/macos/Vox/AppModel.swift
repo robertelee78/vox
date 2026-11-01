@@ -1022,6 +1022,8 @@ struct StartFailure: Error, Equatable {
         case busy
         /// The local client and its daemon have different release versions.
         case versionMismatch
+        /// The daemon connection could not be established or ended before its answer.
+        case unreachable
         /// Anything else.
         case other
     }
@@ -1041,7 +1043,15 @@ struct StartFailure: Error, Equatable {
         case let VoxError.Busy(reason): self.init(kind: .busy, said: reason)
         default:
             let words = sentence(error).replacingOccurrences(of: "this vox is", with: "this app is")
-            self.init(kind: Daemon.versionMismatch(words) ? .versionMismatch : .other, said: words)
+            if Daemon.versionMismatch(words) {
+                self.init(kind: .versionMismatch, said: words)
+            } else if case VoxError.Unreachable = error {
+                self.init(kind: .unreachable, said: words)
+            } else if case VoxError.ReadInterrupted = error {
+                self.init(kind: .unreachable, said: words)
+            } else {
+                self.init(kind: .other, said: words)
+            }
         }
     }
 
@@ -1052,7 +1062,8 @@ struct StartFailure: Error, Equatable {
         case .notAnswering: return "Vox's background service isn't answering"
         case .busy: return "Another copy of Vox is using this node"
         case .versionMismatch: return said
-        case .other: return "Vox can't reach its background service"
+        case .unreachable: return "Vox can't reach its background service"
+        case .other: return "Vox couldn’t make this node Ready"
         }
     }
 
@@ -1064,7 +1075,8 @@ struct StartFailure: Error, Equatable {
         case .notAnswering: return "It may still be starting, or be stuck. Your rooms are unreachable until it answers."
         case .busy: return "Only one copy may act as a node at a time: a command that has not finished, or another copy of Vox, holds it."
         case .versionMismatch: return "Restart the daemon to use this app's version. Remembered nodes return automatically."
-        case .other: return "Your rooms are unreachable until it answers."
+        case .unreachable: return "Your rooms are unreachable until it answers."
+        case .other: return "See Details for what Vox reported."
         }
     }
 }

@@ -5577,6 +5577,7 @@ struct OwnKeyComputerReady {
     rooms: Vec<(Digest32, SharedChannel)>,
     transitions: Option<Vec<crate::node::channel::own_writer_gate::Transition>>,
     publication: Option<crate::node::computer::ComputerPublicationTransition>,
+    binding: crate::error::Result<()>,
     work: computer::OwnKeyPolicyWork,
 }
 
@@ -6329,6 +6330,7 @@ pub struct Node {
     prekey_maintenance_error: Option<String>,
     channels: BTreeMap<Digest32, SharedChannel>,
     pending_posts: BTreeMap<Digest32, post_save::Pending>,
+    parked_private_drives: BTreeMap<Digest32, private_save::ParkedPrivateDrive>,
     pending_policy: Option<policy_save::Pending>,
     pending_metadata: Option<metadata_save::Pending>,
     post_save_wake: Arc<tokio::sync::Notify>,
@@ -6809,6 +6811,7 @@ impl Node {
             prekey_maintenance_error: None,
             channels: BTreeMap::new(),
             pending_posts: BTreeMap::new(),
+            parked_private_drives: BTreeMap::new(),
             pending_policy: None,
             pending_metadata: None,
             post_save_wake: Arc::new(tokio::sync::Notify::new()),
@@ -7145,8 +7148,16 @@ impl Node {
                     self.schedule().await;
                 }
                 () = post_save_wake.notified() => {
+                    let parked_busy: Vec<_> = self.parked_private_drives.keys()
+                        .filter(|room| self.pending_posts.contains_key(*room))
+                        .copied().collect();
                     self.complete_identity_startup().await;
                     self.complete_pending_posts().await;
+                    for room in parked_busy {
+                        if !self.pending_posts.contains_key(&room) {
+                            self.resume_parked_private_drive(room).await;
+                        }
+                    }
                     self.complete_pending_policies().await;
                     self.complete_pending_metadata().await;
                     self.start_own_key_computer_drain();
@@ -10583,6 +10594,7 @@ impl Node {
                     self.publish_channel_to_anchors(&channel_id, PublishCause::BoardNews, None)
                         .await;
                     self.note_new_members(&channel_id).await;
+                    self.resume_parked_private_drive(channel_id).await;
                 }
             }
             NetEvent::Pairwise(stream) => {
@@ -11079,6 +11091,22 @@ impl Node {
                 self.connected.insert(peer);
                 self.note_role_connection(peer, conn.as_ref());
                 self.discover_peers.insert(peer);
+                let rooms: Vec<_> = self
+                    .parked_private_drives
+                    .keys()
+                    .filter(|room| {
+                        self.ports.contains_key(&(**room, peer))
+                            || self.channels.get(*room).is_some_and(|channel| {
+                                channel
+                                    .try_lock()
+                                    .is_ok_and(|channel| channel.is_member(&peer))
+                            })
+                    })
+                    .copied()
+                    .collect();
+                for room in rooms {
+                    self.resume_parked_private_drive(room).await;
+                }
                 self.probe_older(peer);
                 if let Some(conn) = conn {
                     let rooms: Vec<_> = self
@@ -11683,6 +11711,7 @@ impl Node {
                         }
                     }
                     self.sched_rooms.insert(room);
+                    self.resume_parked_private_drive(room).await;
                 }
             }
             NetEvent::BoundedSecretReady {
@@ -11697,6 +11726,7 @@ impl Node {
                     && self.port_eligible(&(room, peer), service, std::time::Instant::now())
                 {
                     self.sched_rooms.insert(room);
+                    self.resume_parked_private_drive(room).await;
                 }
             }
             NetEvent::BoundedBytesReady {
@@ -11735,6 +11765,7 @@ impl Node {
                     }
                     if self.port_eligible(&(room, peer), service, std::time::Instant::now()) {
                         self.sched_rooms.insert(room);
+                        self.resume_parked_private_drive(room).await;
                     }
                 }
             }
@@ -11967,6 +11998,7 @@ impl Node {
                     }
                     self.say_session_news(&channel_id).await;
                     self.sched_rooms.insert(channel_id);
+                    self.resume_parked_private_drive(channel_id).await;
                     if rendered || governance {
                         let _ = self.event_tx.send(NodeEvent::Synced {
                             channel_id,
@@ -12063,6 +12095,7 @@ impl Node {
                         // worker. Touch the room here so schedule observes it immediately and
                         // advertises the newly committed head back to its author.
                         self.sched_rooms.insert(channel_id);
+                        self.resume_parked_private_drive(channel_id).await;
                         if let Some(sent) = acknowledged {
                             self.finish_leave_if_heard(channel_id, sent).await;
                         }
@@ -12174,7 +12207,14 @@ impl Node {
                 // was written at, and ended cleanly, handed that peer the departure (V210-164).
                 let heard = report.out.gen_have.filter(|_| report.fail.is_none());
                 if report.fail.is_none() && report.out.complete {
+                    let was_unsettled = self
+                        .channels
+                        .get(&channel_id)
+                        .is_some_and(|room| room.try_lock().is_ok_and(|room| !room.is_settled()));
                     self.settle_room(&channel_id).await;
+                    if was_unsettled || report.out.applied > 0 || report.out.governance > 0 {
+                        self.resume_parked_private_drive(channel_id).await;
+                    }
                 }
                 // A joiner this node let in, not ready for the room yet, fails a session with
                 // it: the join still settling, not a failure (#406). Its first clean session ends
@@ -12490,6 +12530,7 @@ impl Node {
                 self.hold_computer_policy_for_proof(&guard).await;
                 #[cfg(feature = "test-knobs")]
                 let reply_delay = self.hold_computer_policy_reply_for_proof();
+                self.retire_stale_private_drives();
                 if reply.is_closed() {
                     return;
                 }
@@ -17921,6 +17962,7 @@ impl Node {
     /// up to one Argon2id derivation, it would answer nobody meanwhile (V210-71). Until then the
     /// node is *locking* ([`NodeView::locking`]). The returned receiver fires once it has settled.
     async fn lock_all(&mut self) -> oneshot::Receiver<()> {
+        self.retire_parked_private_drives(Fault::Locked);
         self.retire_identity_startup();
         self.retire_pending_posts();
         if let Some(pending) = self.pending_policy.take() {
@@ -18311,6 +18353,7 @@ impl Node {
         if self.channels.contains_key(channel_id) {
             self.own_key_room_set_changed.send_replace(());
         }
+        self.retire_parked_private_drive(channel_id, Fault::ChannelNotOpen);
         self.channels.remove(channel_id);
         self.room_publication_authority.remove(channel_id);
         self.fresh_details.remove(channel_id);
@@ -18969,6 +19012,7 @@ impl Node {
             rooms,
             transitions,
             publication,
+            binding,
             work,
         } = ready;
         if self
@@ -18986,6 +19030,8 @@ impl Node {
             if work.reply.is_closed() {
                 drop(transitions);
             } else if let Err(error) = work.guard.active(self.computer.as_ref()) {
+                let _ = work.reply.send(Err(error));
+            } else if let Err(error) = binding {
                 let _ = work.reply.send(Err(error));
             } else if current {
                 if let Some(transitions) = transitions {
@@ -19014,29 +19060,18 @@ impl Node {
             let _ = work.reply.send(Err(error));
             return;
         }
-        let Some(computer) = self.computer.as_ref().filter(|computer| computer.grouped()) else {
+        if self
+            .computer
+            .as_ref()
+            .is_none_or(|computer| !computer.grouped())
+        {
             let _ = work.reply.send(Ok(()));
             return;
-        };
-        if let Some(profile) = self.profile.as_ref() {
-            match computer.plan(profile.fingerprint()) {
-                Ok(Some(plan)) => {
-                    work.targets = plan
-                        .denied
-                        .into_iter()
-                        .filter(|peer| self.trust.is_trusted(peer))
-                        .collect();
-                }
-                Ok(None) => {
-                    let _ = work.reply.send(Err(Error::ComputerPolicySuperseded));
-                    return;
-                }
-                Err(error) => {
-                    let _ = work.reply.send(Err(error));
-                    return;
-                }
-            }
         }
+        // The first binding-dependent plan cannot run before the native binding exists.
+        // Conservatively drain every currently trusted writer; the later real plan still
+        // checks for any newly required target under the original room-set fence.
+        work.targets = self.trust.trusted().into_iter().collect();
         self.own_key_computer_pending.push_back(work);
         self.start_own_key_computer_drain();
     }
@@ -19082,6 +19117,17 @@ impl Node {
             let mut epoch_changed = self.pairwise_epoch.subscribe();
             let wake = Arc::clone(&self.own_key_transition_wake);
             let computer = self.computer.clone();
+            let binding = self.profile.as_ref().map(|profile| {
+                let signer = profile.signer_arc();
+                let name = self
+                    .paths
+                    .profile_dir
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_owned)
+                    .ok_or(Error::Profile("managed node name is unreadable"));
+                (signer, name)
+            });
             tokio::spawn(async move {
                 let mut changes: Vec<_> = watches
                     .into_iter()
@@ -19141,6 +19187,44 @@ impl Node {
                 }
                 let transitions =
                     (proceed && transitions.len() == rooms.len()).then_some(transitions);
+                let (publication, binding) = match (publication, binding, computer) {
+                    (Some(publication), Some((signer, name)), Some(computer)) => {
+                        match (signer, name) {
+                            (Ok(signer), Ok(name)) if transitions.is_some() => {
+                                let guard = work.guard.clone();
+                                match tokio::task::spawn_blocking(move || {
+                                    let result = (|| {
+                                        guard.active(Some(&computer))?;
+                                        if computer.binding_group().is_some()
+                                            && !computer.current_revision_expired()
+                                            && !computer.bind_node_for_change(
+                                                signer.as_ref(),
+                                                &name,
+                                                guard.change,
+                                                &publication,
+                                            )?
+                                        {
+                                            return Err(Error::ComputerPolicySuperseded);
+                                        }
+                                        guard.active(Some(&computer))
+                                    })();
+                                    (publication, result)
+                                })
+                                .await
+                                {
+                                    Ok((publication, result)) => (Some(publication), result),
+                                    Err(_) => (
+                                        None,
+                                        Err(Error::Profile("Computer binding worker stopped")),
+                                    ),
+                                }
+                            }
+                            (Err(error), _) | (_, Err(error)) => (Some(publication), Err(error)),
+                            _ => (Some(publication), Ok(())),
+                        }
+                    }
+                    (publication, _, _) => (publication, Ok(())),
+                };
                 if let Some(result) = completed.upgrade() {
                     *result.lock().unwrap_or_else(|error| error.into_inner()) =
                         Some(OwnKeyComputerReady {
@@ -19148,6 +19232,7 @@ impl Node {
                             owner,
                             rooms,
                             transitions,
+                            binding,
                             publication,
                             work,
                         });
