@@ -116,9 +116,8 @@ struct OnTerminal {
     shown: Arc<Mutex<Vec<u8>>>,
 }
 
-/// `vox daemon` on a new pty as its controlling terminal, as a shell gives it; what it writes goes
-/// to `output` if given, else to the pty. Returns it and the pty's controlling side.
-fn daemon_on_a_pty(dir: &Path, output: Option<&Path>) -> (Child, std::fs::File) {
+/// A command on a controlling pty, as a shell gives it; output goes to `output` if given.
+fn command_on_a_pty(dir: &Path, args: &[&str], output: Option<&Path>) -> (Child, std::fs::File) {
     use rustix::pty::{grantpt, openpt, ptsname, unlockpt, OpenptFlags};
     let apparatus = |what: &str, e: &dyn std::fmt::Debug| -> ! {
         panic!("CANNOT MEASURE: setting up the pty: {what}: {e:?}")
@@ -144,7 +143,7 @@ fn daemon_on_a_pty(dir: &Path, output: Option<&Path>) -> (Child, std::fs::File) 
             .unwrap_or_else(|e| apparatus("open the pty", &e))
             .into()
     };
-    let mut cmd = vox_cmd(dir, &["daemon", "--listen", "127.0.0.1:0"]);
+    let mut cmd = vox_cmd(dir, args);
     cmd.stdin(Stdio::from(open()));
     if let Some(output) = output {
         let file = std::fs::File::create(output)
@@ -172,11 +171,11 @@ fn daemon_on_a_pty(dir: &Path, output: Option<&Path>) -> (Child, std::fs::File) 
 }
 
 impl OnTerminal {
-    fn start(dir: &Path) -> Self {
+    fn start(dir: &Path, args: &[&str]) -> Self {
         let apparatus = |what: &str, e: &dyn std::fmt::Debug| -> ! {
             panic!("CANNOT MEASURE: setting up the pty: {what}: {e:?}")
         };
-        let (child, mut screen) = daemon_on_a_pty(dir, None);
+        let (child, mut screen) = command_on_a_pty(dir, args, None);
         let keys = screen
             .try_clone()
             .unwrap_or_else(|e| apparatus("the pty, to type on", &e));
@@ -258,7 +257,7 @@ fn a_daemon_on_a_terminal_serves_after_the_passphrase() {
     watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
     let (dir, _) = profile(tmp.path(), "alice");
-    let mut d = OnTerminal::start(&dir);
+    let mut d = OnTerminal::start(&dir, &["daemon", "--listen", "127.0.0.1:0"]);
     assert!(
         d.until_shown("identity passphrase:", STOPS_WITHIN),
         "PRODUCT: `vox daemon` on a terminal did not ask for the identity passphrase within \
@@ -295,6 +294,123 @@ fn a_daemon_on_a_terminal_serves_after_the_passphrase() {
 }
 
 #[test]
+fn a_partly_pasted_room_passphrase_joins_without_echoing() {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
+    let (host, _) = profile(tmp.path(), "host");
+    let (guest, guest_fp) = profile(tmp.path(), "guest");
+    let _reaper = layout::Reaper(vec![host.clone(), guest.clone()]);
+    let mut daemons = Vec::new();
+    for dir in [&host, &guest] {
+        let mut daemon = OnTerminal::start(dir, &["daemon", "--listen", "127.0.0.1:0"]);
+        assert!(
+            daemon.until_shown("identity passphrase:", STOPS_WITHIN),
+            "APPARATUS: scratch daemon did not ask for its identity passphrase: {}",
+            daemon.shown()
+        );
+        daemon
+            .keys
+            .write_all(format!("{IDPASS}\r").as_bytes())
+            .expect("APPARATUS: unlock scratch daemon");
+        assert!(
+            daemon.until_shown("control socket", SERVES_WITHIN),
+            "APPARATUS: scratch daemon did not serve: {}",
+            daemon.shown()
+        );
+        daemons.push(daemon);
+    }
+
+    let (prefix, pasted, suffix) = ("typed-prefix-", "pasted Ω middle ", "-typed-suffix");
+    let passphrase = format!("{prefix}{pasted}{suffix}");
+    let mut create = vox_cmd(
+        &host,
+        &[
+            "room",
+            "create",
+            "--node",
+            "default",
+            "--name",
+            "paste-room",
+            "--passphrase-file",
+            "-",
+        ],
+    )
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .expect("APPARATUS: start scratch room creation");
+    writeln!(
+        create.stdin.take().expect("APPARATUS: room stdin"),
+        "{passphrase}"
+    )
+    .expect("APPARATUS: supply synthetic room passphrase");
+    let created = create.wait_with_output().expect("APPARATUS: room creation");
+    assert!(
+        created.status.success(),
+        "APPARATUS: scratch room was not created: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let listed = vox_cmd(&host, &["room", "list", "--node", "default"])
+        .output()
+        .expect("APPARATUS: list scratch room");
+    let listing = String::from_utf8_lossy(&listed.stdout);
+    let room = listing
+        .split_whitespace()
+        .next()
+        .expect("APPARATUS: created room missing");
+    let linked = vox_cmd(&host, &["room", "link", room, "--node", "default"])
+        .output()
+        .expect("APPARATUS: obtain scratch room link");
+    let link_output = String::from_utf8_lossy(&linked.stdout);
+    let link = link_output
+        .lines()
+        .find(|line| line.starts_with("vox://"))
+        .expect("APPARATUS: scratch room link missing");
+
+    let mut join = OnTerminal::start(&guest, &["room", "join", link, "--node", "default"]);
+    assert!(
+        join.until_shown("room passphrase:", STOPS_WITHIN),
+        "APPARATUS: room join did not reach its prompt: {}",
+        join.shown()
+    );
+    let ready_until = Instant::now() + STOPS_WITHIN;
+    while join.echoes() && Instant::now() < ready_until {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !join.echoes(),
+        "APPARATUS: passphrase prompt never disabled echo"
+    );
+    join.keys
+        .write_all(format!("{prefix}\x1b[200~{pasted}\x1b[201~{suffix}\r").as_bytes())
+        .expect("APPARATUS: type and paste synthetic passphrase");
+    let status = join
+        .exit_within(SERVES_WITHIN)
+        .expect("APPARATUS: room join watchdog");
+    let shown = join.shown();
+    assert!(
+        status.success() && shown.contains("joined paste-room"),
+        "PRODUCT: the correct partly pasted room passphrase was not accepted: {shown}"
+    );
+    let roster = vox_cmd(&host, &["room", "roster", room, "--node", "default"])
+        .output()
+        .expect("APPARATUS: read public room roster");
+    let members = String::from_utf8_lossy(&roster.stdout);
+    assert!(
+        roster.status.success() && members.lines().any(|line| line.trim() == guest_fp),
+        "PRODUCT: the room did not admit the node after its pasted passphrase: {members}"
+    );
+    for secret in [passphrase.as_str(), prefix, pasted, suffix] {
+        assert!(
+            !shown.contains(secret),
+            "PRODUCT: the terminal echoed a synthetic passphrase fragment: {shown}"
+        );
+    }
+    drop(daemons);
+}
+
+#[test]
 fn a_stop_before_a_daemon_serves_is_clean() {
     watchdog::arm();
     use rustix::process::Signal;
@@ -307,7 +423,7 @@ fn a_stop_before_a_daemon_serves_is_clean() {
         (Signal::HUP, "SIGHUP"),
         (Signal::QUIT, "SIGQUIT"),
     ] {
-        let mut d = OnTerminal::start(&dir);
+        let mut d = OnTerminal::start(&dir, &["daemon", "--listen", "127.0.0.1:0"]);
         assert!(
             d.until_shown("identity passphrase:", STOPS_WITHIN),
             "PRODUCT: `vox daemon` on a terminal did not ask for the identity passphrase. Its \
@@ -353,7 +469,8 @@ fn closing_the_terminal_before_a_daemon_serves_is_a_clean_stop() {
     for run in 0..HANGUPS {
         // What it says goes to a file: the terminal it would say it on is the one being closed.
         let out = tmp.path().join(format!("hangup-{run}.out"));
-        let (mut child, terminal) = daemon_on_a_pty(&dir, Some(&out));
+        let (mut child, terminal) =
+            command_on_a_pty(&dir, &["daemon", "--listen", "127.0.0.1:0"], Some(&out));
         let said = || std::fs::read_to_string(&out).unwrap_or_default();
         let deadline = Instant::now() + STOPS_WITHIN;
         while !said().contains("identity passphrase:") && Instant::now() < deadline {

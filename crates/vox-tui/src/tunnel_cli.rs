@@ -1062,6 +1062,7 @@ pub fn prompt_passphrase(what: &str) -> Result<String, AppError> {
                 KeyCode::Char(c) => out.push(c),
                 _ => {}
             },
+            Ok(Event::Paste(text)) => out.push_str(&text),
             Ok(_) => {}
             Err(e) => break Err(AppError::Io(e)),
         }
