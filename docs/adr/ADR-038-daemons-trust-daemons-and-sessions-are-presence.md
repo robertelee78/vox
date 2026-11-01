@@ -911,10 +911,16 @@ lessons. It changes neither this record's decision status nor any requirement or
   computer-policy target MUST preserve its current authority; it MUST NOT replay managed-room
   application merely because the app reopened. This shortcut MUST NOT apply when the
   authenticated identity, lifecycle, policy target or actual application is no longer current.
-  Genuinely required application MUST retain its accepted continuation across ordinary pending
-  room/support dependencies and resume on their actual progress, preserving policy
-  supersession, cancellation and secret-erasure fences. Pending work MUST NOT become terminal
-  failure, fabricated Done, or timer-driven retry.
+  Required authoritative application MUST settle its durable binding, keyring, revocation,
+  key-package and consent work before publishing the exact current actor authority. It MUST
+  release the exclusive policy publication transition before network-dependent private/session
+  delivery can require publication readers. The original room obligations MUST transfer to
+  the existing ordinary causal room-drive ownership, with exact instance, attachment and
+  authority fences; they MUST NOT retain the policy writer while waiting for discovery.
+  Ordinary pending room/support work MUST retain its obligation and resume on actual progress,
+  preserving supersession, cancellation and secret-erasure fences. Neither policy completion
+  nor application receipts claim remote message delivery. Pending work MUST NOT become
+  terminal failure, fabricated delivery, or timer-driven retry.
 
   The v0.4.14 re-selection path could invalidate the actor's already-current projection,
   replay room tails and return before restoring authority. Its private-room aggregator
@@ -924,13 +930,16 @@ lessons. It changes neither this record's decision status nor any requirement or
   permanent correction is accepted; a plausible source-reachable cause is not runtime evidence.
   Required failures MUST preserve the actual Outcome and room/stage; returned policy or room
   refusals MUST NOT be presented as inability to contact the daemon.
-  Diagnostic replay identified the sessions-stage support-recipient readiness branch for the
-  retained room at policy revision 15: it emitted `Failed(RoomChangePending)`, which the
-  managed-private aggregator made terminal and masked. Missing eligible reach or incomplete
-  checked support discovery are ordinary pending prerequisites; the capture does not
-  distinguish those upstream conditions, and neither authorizes failure of unchanged
-  authenticated node selection. The defect is the lost continuation and invalidated current
-  projection, not a demonstrated damaged key or service-transport failure.
+  Diagnostic replay identified `sessions-support-recipients-not-ready` for the retained room at
+  policy revision 15: it emitted `Failed(RoomChangePending)`, which the managed-private
+  aggregator made terminal and masked. The retained policy writer prevented discovery's
+  publication reader, and the invalid actor revision could not certify discovery completion;
+  parking the same physical owner would therefore retain a source-proven dependency cycle.
+  Missing eligible reach or incomplete checked support discovery are ordinary pending
+  prerequisites; the capture does not distinguish those upstream conditions, and neither
+  authorizes failure of unchanged authenticated node selection. The defect is the lost
+  continuation, overextended policy ownership and invalidated projection, not a demonstrated
+  damaged key or service-transport failure.
   Acceptance MUST close/reopen the native app after successful pairing and actual room
   delivery, then read fresh reciprocal posts without re-pairing or restarting another node.
   An ordinary pending dependency MUST resume its original operation when that dependency
