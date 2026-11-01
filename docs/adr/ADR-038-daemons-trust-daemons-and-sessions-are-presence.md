@@ -915,12 +915,17 @@ lessons. It changes neither this record's decision status nor any requirement or
   key-package and consent work before publishing the exact current actor authority. It MUST
   release the exclusive policy publication transition before network-dependent private/session
   delivery can require publication readers. The original room obligations MUST transfer to
-  the existing ordinary causal room-drive ownership, with exact instance, attachment and
-  authority fences; they MUST NOT retain the policy writer while waiting for discovery.
-  Ordinary pending room/support work MUST retain its obligation and resume on actual progress,
-  preserving supersession, cancellation and secret-erasure fences. Neither policy completion
-  nor application receipts claim remote message delivery. Pending work MUST NOT become
-  terminal failure, fabricated delivery, or timer-driven retry.
+  ordinary room-drive ownership extended to retain their exact causal continuation; they
+  MUST NOT retain the policy writer while waiting for discovery. A parked obligation MUST
+  retain its stage/prerequisite, original optional reply, weak room-instance identity,
+  attachment generation and settled policy target, but no store, signer, secret lease,
+  publication lease, room lock or worker. Re-entry MUST reacquire the necessary native lease
+  and publication reader and revalidate those exact fences. Real bounded-head/support,
+  connection, board/governance and publication progress wake the corresponding obligation;
+  Tick and Status MUST NOT retry unchanged parked work. Lock/shutdown, room removal or
+  replacement and policy supersession MUST retire the exact parked owner. Neither policy
+  completion nor application receipts claim remote message delivery. Pending work MUST NOT
+  become terminal failure, fabricated delivery or timer-driven retry.
 
   The v0.4.14 re-selection path could invalidate the actor's already-current projection,
   replay room tails and return before restoring authority. Its private-room aggregator
@@ -935,6 +940,8 @@ lessons. It changes neither this record's decision status nor any requirement or
   aggregator made terminal and masked. The retained policy writer prevented discovery's
   publication reader, and the invalid actor revision could not certify discovery completion;
   parking the same physical owner would therefore retain a source-proven dependency cycle.
+  The ordinary private-drive path also discarded pending continuations and relied on periodic
+  re-entry, so merely scheduling that unchanged path after releasing the writer is insufficient.
   Missing eligible reach or incomplete checked support discovery are ordinary pending
   prerequisites; the capture does not distinguish those upstream conditions, and neither
   authorizes failure of unchanged authenticated node selection. The defect is the lost
