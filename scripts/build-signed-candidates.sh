@@ -18,7 +18,7 @@ if [[ $1 == build ]]; then
     echo 'candidate: v0.4.13 does not resolve to its pinned commit' >&2; exit 1; }
   mkdir -p "$root/source" "$root/output" "$root/scratch/data" "$root/scratch/config"
   export VOX_DATA_DIR="$root/scratch/data" VOX_CONFIG_DIR="$root/scratch/config"
-  for variant in normal lower-version-test-knobs current-test-knobs; do
+  for variant in current-test-knobs; do
     version=0.4.14
     feature=default
     if [[ $variant == lower-version-test-knobs ]]; then version=0.4.13; fi
@@ -89,7 +89,7 @@ fi
 
 : "${APPLE_CODESIGN_IDENTIFIER:?}"
 [[ -d $root/source && -d $root/output ]] || { echo 'candidate: build outputs are missing' >&2; exit 1; }
-for variant in normal lower-version-test-knobs current-test-knobs; do
+for variant in current-test-knobs; do
   src="$root/source/$variant"
   out="$root/output/$variant"
   version=0.4.14

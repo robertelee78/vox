@@ -820,7 +820,8 @@ fn publish(apps: &Path, transition: &mut Transition) -> Result<(), AppError> {
         .ok_or_else(|| usage("missing archive transaction authority"))?
         .phase = FilesystemPhase::Retiring;
     write_transition(apps, transition)?;
-    launch_services(false, &staged).map_err(usage)?;
+    // Nonshipping retirement-inverse proof: retain and register the displaced signed tree.
+    launch_services(true, &staged).map_err(usage)?;
     if bundle_identity(&active)? != transition.target
         || bundle_identity(&staged)? != transition.source
     {
@@ -828,12 +829,6 @@ fn publish(apps: &Path, transition: &mut Transition) -> Result<(), AppError> {
             "bundle identities changed before retirement; all files retained",
         ));
     }
-    vox_sockdrops::remove_item(&staged).map_err(|e| {
-        usage(format!(
-            "cannot retire displaced bundle {}: {e}",
-            staged.display()
-        ))
-    })?;
     sync_dir(apps)?;
     promote_archive(
         apps,

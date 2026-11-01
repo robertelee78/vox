@@ -273,17 +273,7 @@ jobs:
         run: bash scripts/build-signed-candidates.sh sign
       - uses: actions/upload-artifact@v4
         with:
-          name: vox-candidate-normal-aarch64-apple-darwin
-          path: ${{ runner.temp }}/vox-candidates/output/normal/
-          if-no-files-found: error
-      - uses: actions/upload-artifact@v4
-        with:
-          name: vox-nonshipping-current-source-test-knobs-v0.4.13-aarch64-apple-darwin
-          path: ${{ runner.temp }}/vox-candidates/output/lower-version-test-knobs/
-          if-no-files-found: error
-      - uses: actions/upload-artifact@v4
-        with:
-          name: vox-nonshipping-current-source-test-knobs-v0.4.14-aarch64-apple-darwin
+          name: vox-retirement-inverse-current-test-knobs-nonshipping-20261101
           path: ${{ runner.temp }}/vox-candidates/output/current-test-knobs/
           if-no-files-found: error
 
