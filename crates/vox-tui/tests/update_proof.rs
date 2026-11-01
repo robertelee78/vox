@@ -2403,6 +2403,8 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
             scenario.to_owned(),
             format!("update={}\nrollback={}", said(&updated), said(&rollback)),
         );
+        let _ = daemon.kill();
+        let _ = daemon.wait();
     }
     dispose(
         "signed one-launchable-app journey",
