@@ -1,10 +1,11 @@
 # ADR-038: Daemons Trust Daemons, and Sessions Are Presence
 
-- **Status**: Proposed, after v0.4.6. The decider's product rulings of 2026-10-19 (one question
-  at a time, quoted below) are the accepted product requirements; undecided presentation details
-  remain proposed. Execution, acceptance and delivery are recorded on the source-bound GitHub
-  issues, separately from decision status. Each requirement MUST land with its proof (ADR-018)
-  in a small release (FX-19).
+- **Status**: Accepted for FX-38–FX-43 in v0.4.15. The decider's product rulings of 2026-10-19
+  (one question at a time, quoted below) remain accepted; other undecided presentation details
+  remain proposed. The 2026-11-01 correction workflow and release were selected by the decider;
+  Opus technical approval and implementation, acceptance and delivery are recorded on the
+  source-bound issues, separately from decision status. Each product requirement MUST land
+  with its proof (ADR-018) in a small release (FX-19).
 - **Date**: 2026-10-19; amended 2026-10-20 (FX-22–FX-27, the daemon's CPU); amended
   2026-10-20 (FX-28–FX-34: the idle daemon's disk and CPU, measured on v0.4.9, the own-feed
   recovery ruling of 2026-10-19, a retention change that poisoned a room, and a node on Linux
@@ -17,7 +18,9 @@
   registration handoff); amended 2026-10-23 (FX-35: the decider approved exact running capacity
   per active-or-retiring hosted identity, with no fixed floor); amended 2026-10-24 (FX-35:
   resource ownership, fair admission selection, Busy attempt credit, legal proof staging and
-  exact accepted Resume capacity ownership)
+  exact accepted Resume capacity ownership); amended 2026-11-01 (FX-38–FX-43: QE correction
+  workflow, live computer-policy application, native re-selection, approval handoffs and
+  terminal input/output contracts for v0.4.15)
 - **Deciders**: Robert E. Lee
 - **Tags**: trust, daemon identity, sessions, presence, agent comms, sync, health, releases
 - **Related**: ADR-018, ADR-020, ADR-026, ADR-029, ADR-031, ADR-033, ADR-034, ADR-035, ADR-036,
@@ -227,12 +230,12 @@ lessons. It changes neither this record's decision status nor any requirement or
   MUST run on the VM setup (the macOS guests of the v0.4.4 app-proof work), not on his working
   Macs ("use the VM stuffs so I'm not losing ability to use my macs").
 - **FX-21.** Every product requirement above (FX-1–FX-10, FX-12–FX-18, FX-22–FX-24, FX-26,
-  FX-27, FX-28–FX-35, FX-37) lands with a proof that drives the shipped `vox` binary as a person
+  FX-27, FX-28–FX-35, FX-37, FX-39–FX-43) lands with a proof that drives the shipped `vox` binary as a person
   would, with a mutant that turns it red on its own assertion (ADR-018). The two-computer requirements
   (FX-2–FX-7) are proved by two daemons in two data roots on one machine. FX-11's design, FX-19,
   FX-20 and FX-25 are process rulings: FX-19's record is each closed release milestone, FX-20's
-  is the walkthrough's defect record, FX-11's is the amendment it produces, and FX-25's is each
-  release's asset list.
+  is the walkthrough's defect record, FX-11's is the amendment it produces, FX-25's is each
+  release's asset list, and FX-38's is the source-bound corrective work and published release.
 - **FX-22.** A governance question about a room (who may read whom, who has consented, what a
   member offers) MUST answer entirely from the room's in-memory semantic projection, without
   opening the store or decrypting even the governance index header, while that semantic meaning
@@ -876,6 +879,103 @@ lessons. It changes neither this record's decision status nor any requirement or
   reconstruction MUST turn that room-create claim PRODUCT red with the reproduced worker-stack
   overflow.
 
+- **FX-38.** QE MUST carry each discovered product defect through full causal diagnosis,
+  the necessary ADR amendment, source-bound corrective tasks, independent Opus task/design
+  review, implementation, real-binary acceptance and publication. A red report is evidence,
+  not completion. Source causes, observed runtime results, apparatus faults and unresolved
+  causal details MUST remain distinct; a masked error MUST be diagnosed rather than assigned
+  a plausible cause. The decider selected v0.4.15 for FX-39–FX-43 on 2026-11-01. The separately
+  scheduled anchor-resolution status correction remains in v0.5.0. Independent work SHOULD
+  execute in parallel; one owner MUST integrate coupled policy-state changes.
+
+- **FX-39.** Completing explicit approval on both computers MUST apply authenticated bindings
+  and the fixed trust policy to nodes that were already Ready before pairing, as well as
+  nodes made Ready afterward. Every computer-policy application path — startup, live
+  reconciliation and explicit selection — MUST establish or revalidate the authenticated
+  local binding before any binding-dependent plan or operation. An already-current binding
+  MUST be reused; startup's existing binding-before-plan ordering MUST remain intact. Signing
+  and persistence MUST remain off the actor, with the original accepted owner, secret lease,
+  publication/send drain and exact policy-target fences retained. If binding preparation
+  genuinely advances the policy target, the newer target MUST take ownership without renewing
+  the old causal deadline or reporting the superseded application as successful. Missing
+  ownership MUST NOT produce an empty permissive plan, fabricated binding or per-node exception.
+
+  The v0.4.14 live path derived the binding-dependent plan first and returned on the missing
+  binding before reaching binding preparation; startup used binding-before-plan ordering.
+  Repeating Unlock on an already-Ready node returned without that work. Restart therefore
+  repaired the observed failure but MUST NOT be required to complete ordinary pairing.
+  Acceptance MUST create/join a room and read fresh posts in both directions after both
+  approvals, without restart, detach, repeated unlock or individual cross-computer grants.
+
+- **FX-40.** Authenticated re-selection of the same node at the exact already-current
+  computer-policy target MUST preserve its current authority; it MUST NOT replay managed-room
+  application merely because the app reopened. This shortcut MUST NOT apply when the
+  authenticated identity, lifecycle, policy target or actual application is no longer current.
+  Genuinely required application MUST retain its accepted continuation across ordinary pending
+  room/support dependencies and resume on their actual progress, preserving policy
+  supersession, cancellation and secret-erasure fences. Pending work MUST NOT become terminal
+  failure, fabricated Done, or timer-driven retry.
+
+  The v0.4.14 re-selection path could invalidate the actor's already-current projection,
+  replay room tails and return before restoring authority. Its private-room aggregator
+  replaced distinct non-Done results with one continuation-failed error, hiding the actual
+  room and outcome. The exact inner non-Done result, room identity and pending producer in the
+  observed reopen failure MUST be identified through diagnostic instrumentation before the
+  permanent correction is accepted; a plausible source-reachable cause is not runtime evidence.
+  Required failures MUST preserve the actual Outcome and room/stage; returned policy or room
+  refusals MUST NOT be presented as inability to contact the daemon.
+  Diagnostic replay identified the sessions-stage support-recipient readiness branch for the
+  retained room at policy revision 15: it emitted `Failed(RoomChangePending)`, which the
+  managed-private aggregator made terminal and masked. Missing eligible reach or incomplete
+  checked support discovery are ordinary pending prerequisites; the capture does not
+  distinguish those upstream conditions, and neither authorizes failure of unchanged
+  authenticated node selection. The defect is the lost continuation and invalidated current
+  projection, not a demonstrated damaged key or service-transport failure.
+  Acceptance MUST close/reopen the native app after successful pairing and actual room
+  delivery, then read fresh reciprocal posts without re-pairing or restarting another node.
+  An ordinary pending dependency MUST resume its original operation when that dependency
+  progresses; a stale target MUST remain unable to publish.
+
+- **FX-41.** Every pairing surface MUST state the next action and the authenticated computer
+  on which it belongs. Before local approval, the person MUST see the peer and fixed policy
+  and have the exact local approval action. After local approval, waiting text MUST name the
+  other computer rather than invite repeated local approval. Repeated approval MUST remain
+  idempotent. Expired or canceled attempts MUST offer truthful local closure and MUST NOT
+  claim withdrawal of signed authority already recorded elsewhere.
+
+  A room with a local authenticated computer approval pending MUST offer the existing computer
+  review, not only a keyring edit or an unqualified instruction to wait for the other node.
+  The notice MUST keep room membership, reciprocal room consent and computer approval
+  distinct; names, absent consent and room membership MUST NOT establish management identity
+  or attribute a member's missing trust to an unrelated pairing. Legitimate independent-node
+  trust MUST continue working during incomplete computer pairing. Successful room admission
+  MUST NOT advise accepting an individual grant already effective under the current policy.
+  Native and CLI acceptance MUST follow the one-sided and repeated-same-side paths through
+  the correct other-side action and actual reciprocal room reading.
+
+  The v0.4.14 CLI printed approval booleans without the missing computer's action, while its
+  repeated local approval correctly added no second signature. The room banner derived its
+  advice only from room trust/consent and had no route to an authenticated local computer
+  approval. These are handoff defects, not permission to merge the two authority models.
+
+- **FX-42.** A successful `vox computer pair --json` MUST emit exactly one JSON status
+  document on stdout. Required human identity/policy review and explicit confirmation MUST
+  remain visible on stderr. JSON selection MUST NOT silently approve; No and EOF MUST add no
+  approval. Preview, already-approved and canceled-operation paths MUST preserve their
+  existing authorization semantics. Acceptance MUST parse the real successful stdout and
+  verify that only the local approval was added until the other computer approves.
+  The v0.4.14 interactive path unconditionally printed its human preview to stdout before
+  emitting the selected JSON status; a successful command therefore was not one JSON document.
+
+- **FX-43.** Hidden terminal passphrase prompts MUST preserve ordinary key and paste events
+  in input order without echoing the secret. Bracketed paste MUST retain Unicode, whitespace
+  and embedded control/newline text as payload; only an explicit submission key submits.
+  Existing typed editing and cancellation MUST retain their behavior. The v0.4.14 prompt
+  ignored paste events, so correct supplied text could authenticate as an incomplete secret.
+  Acceptance MUST join a real room with mixed typed/pasted input and verify the admitted
+  identity in the host's roster without secret echo. Restoring paste-event loss MUST turn the
+  real admission assertion red; no passphrase or proof bypass is permitted.
+
 ## Unchanged rulings
 
 The decider confirmed these on 2026-10-19 ("that still sounds right to me"): no human/agent
@@ -904,6 +1004,11 @@ Narrow successor amendments. Requirements not named here remain in force.
 | ADR-028 K-10, ADR-031 CW-2, CW-7: a node unlocked at a terminal is remembered in the Keychain so the daemon makes it Ready at each start | Preserved where a credential store exists (the Keychain); FX-34 adds that unlocking never depends on remembering, that Linux remembers nothing for now, and that Vox never writes a passphrase file on its own |
 | ADR-037 R7, R11; ADR-026: a bounded flow keeps its state between turns, within a daemon-wide pool | FX-35 adds that a flow-state pool charge is held only while a round runs, so the pool never accounts for flows at rest (nothing is disposed by time), and that the latest start attempt's outcome is reported for every port |
 | No predecessor: signer construction reconstructed the expanded ML-DSA key to derive its cached public key, and every signature reconstructed it again | FX-37 retains the zeroizing library signing key built from the seed and reuses its cached public and expanded signing material; a larger worker stack or an elapsed-work workaround is not the fix |
+| ADR-035 CT-9, CT-14; FX-28: ordered, recoverable policy application with unchanged causal bounds | Preserved; FX-39 requires authenticated binding before every binding-dependent operation and no restart prerequisite for already-Ready nodes |
+| No predecessor: re-selection could invalidate a settled actor and terminally collapse ordinary room progress | FX-40 preserves current authority on authenticated unchanged re-selection, retains required continuations across causal pending dependencies and preserves the actual failed Outcome |
+| FX-5, FX-6: headless pairing is first-class and daemon trust is the offered path | FX-41 names the next action and authenticated computer, with a room-to-local-review handoff that preserves distinct room and computer authority |
+| No predecessor: interactive JSON pairing mixed review text and the final status on stdout | FX-42 keeps stdout as one JSON document and human review/confirmation on stderr |
+| No predecessor: hidden terminal prompts ignored paste events | FX-43 preserves pasted payload and input order; the existing accepted #1105 admission proof and mutant evidence supply this boundary, not a duplicate implementation task |
 | ADR-034 §5 "Health is true" (HL-1, HL-2), PRD-001 R35 | The lane's completed rounds are completed syncs (FX-16); the control socket answers under sync load (FX-17) |
 
 ## Implementation order and related work
@@ -924,9 +1029,15 @@ Narrow successor amendments. Requirements not named here remain in force.
    the reproduced four-node daemon syncs nothing; one cut (v0.4.10).
 9. FX-37 is an immediate cross-cutting v0.4.10 blocker: until the normal shipped daemon can
    create a room, every room journey that reaches creation is red regardless of its own change.
+10. FX-38–FX-43: diagnose the QE-discovered causes, amend this contract, bind the corrective
+    tasks to v0.4.15 and obtain Opus task/design review before permanent implementation.
+    FX-39 and FX-40 share one policy-state owner; CLI/output and native navigation work may
+    proceed independently once reviewed interfaces are fixed. The normal native and cross-host
+    CLI paths, not their restart workarounds, MUST pass before the actual signed/notarized
+    release artifacts are smoked and v0.4.15 is published.
 
-Each ADR change under this record is reviewed by an independent session (opencode-work) before
-its stories are extracted.
+Each ADR change under this record is reviewed by an independent session before its stories are
+extracted. The v0.4.15 corrective tasks and their implementation candidates require Opus review.
 
 ## Consequences
 
