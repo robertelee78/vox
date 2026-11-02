@@ -1269,8 +1269,12 @@ lessons. It changes neither this record's decision status nor any requirement or
   Selection and each resumed step MUST revalidate the room instance, attachment, current
   computer authority, original managed guard where present and actual recipient trust.
   Independent room owners can run between native completions: actor turn order alone is
-  not a publication fence. Parked state MUST NOT retain a room lock, store/secret lease,
-  publication reader, worker slot, budget charge or decrypted content. Lock/shutdown,
+  not a publication fence. Active bounded projection work uses the existing native admission
+  and physical maintenance lifetime; this does not claim that lifetime is lease-free.
+  The fix MUST NOT introduce an external dependency park holding a room lock, store/secret
+  lease, publication reader, worker slot, budget charge or decrypted content. A conflicting
+  local native owner MUST be able to complete and release admission independently; no
+  circular wait on the retained managed transition or continuation is permitted. Lock/shutdown,
   room replacement/removal, target distrust and authority supersession MUST retire the
   exact old owner and resolve its replies without clearing or resuming a newer owner.
   Selection cursors MUST advance only after both selection reads succeed; the existing
