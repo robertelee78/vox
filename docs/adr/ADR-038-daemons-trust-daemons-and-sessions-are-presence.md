@@ -26,7 +26,8 @@
   2026-11-02 (FX-49–FX-50: managed removal's read-only governance prerequisite and private
   page recovery across a temporarily unprojected Session opening); amended 2026-11-02
   (FX-44, FX-48, FX-50: shared consumer-sensitive inverse, separate from internal-path evidence);
-  amended 2026-11-02 (FX-51: post-issued-consent rekey selection through governance readiness)
+  amended 2026-11-02 (FX-51: post-issued-consent rekey selection through governance readiness);
+  amended 2026-11-02 (FX-48: precommit provider-cursor preparation and reservation readiness)
 - **Deciders**: Robert E. Lee
 - **Tags**: trust, daemon identity, sessions, presence, agent comms, sync, health, releases
 - **Related**: ADR-018, ADR-020, ADR-026, ADR-029, ADR-031, ADR-033, ADR-034, ADR-035, ADR-036,
@@ -1148,16 +1149,20 @@ lessons. It changes neither this record's decision status nor any requirement or
   Source review and a bounded spike cover exact-owner wake matching, parked-resource release,
   restart recovery and finite multi-head scanning; they MUST NOT create a mechanism CI gate.
 
-- **FX-48.** Recipient-key recovery MUST retain already-available work when a read-only
-  publication snapshot is temporarily busy. The existing publication wake MUST be subscribed
-  before the recovery worker reads its history instance or authorization generation. At those
-  two read-only boundaries, the exact typed publication-busy refusal MUST select the existing
-  bounded logical publication wait instead of marking the port initialized with a permanent
-  failure. The same room, peer, owner, dirty token, connection, attachment and current trust
-  MUST be revalidated before resumption. The worker MUST release its room guard, job, bytes and
-  secret-work ownership before waiting; no fresh catalog, prompt, regrant, restart or Tick/Status
-  polling may be required to rescue that existing obligation.
-  Provider-cursor writes, uncertain commits and all other refusals retain their meaning.
+- **FX-48.** Recipient-key recovery MUST retain already-available work when a publication
+  snapshot or precommit provider-cursor reservation is temporarily busy. The existing
+  publication wake MUST be subscribed before the recovery worker reads its history instance
+  or authorization generation and remain enabled through cursor preparation and reservation.
+  At those read-only and precommit boundaries, the exact typed publication-busy refusal MUST
+  select the existing bounded logical publication wait instead of marking the port initialized
+  with a permanent failure. The same room, peer, owner, dirty token, connection, attachment and
+  current trust MUST be revalidated before resumption. The worker MUST release its room guard,
+  job, bytes and secret-work ownership before waiting; no fresh catalog, prompt, regrant,
+  restart or Tick/Status polling may be required to rescue that existing obligation.
+  A precommit-busy result MUST be distinct from a completed or superseded cursor CAS and from
+  any error after the cursor commit has begun. No committed or uncertain provider-cursor write
+  may be replayed or rewound. All other refusals retain their meaning. The continuation MUST
+  reuse the already-enabled wake, without a second subscription or allocation.
   This correction MUST NOT create a generic error retry, another runner, timer or CI gate.
 
   The normal `04fae5739` matrix exposed all three original producer bodies locally but not the
@@ -1169,6 +1174,18 @@ lessons. It changes neither this record's decision status nor any requirement or
   distinct from FX-44's post-install receiver handoff. The original log lacks room, peer and
   read-stage correlation; it MUST NOT be claimed as the unique cause of that failed journey
   or the separate outsider-private baseline failure without the missing runtime evidence.
+
+  A later normal `f7fab7c5875c` removal journey passed its public/private baselines and local
+  retirement settlement, but the independently entitled observer did not show the author's
+  fresh post-removal public message. Its daemon had reported the same publication-busy
+  refusal before removal; that log does not establish the failed cursor stage or the cause
+  of the later consumer failure. Source review separately identifies preparation, instance
+  capture and publication reservation inside `commit_provider_cursor`, before its cursor CAS,
+  as additional busy boundaries that still reach `ScanResult::Failed` and discard the wake.
+  The correction is to distinguish those precommit waits inside that helper, while leaving
+  every postcommit error outside the wait result. Both inspection closures already own an
+  enabled publication wake. That existing wake, not a new runner or subscription, is to carry
+  the retained logical obligation after the blocking worker releases its physical owners.
 
   Acceptance MUST observe the actual original private body at an entitled reader after the
   relevant publication progress, with author-local content and fresh public connectivity as
