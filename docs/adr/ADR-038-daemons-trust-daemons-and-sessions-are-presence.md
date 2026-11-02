@@ -27,7 +27,8 @@
   page recovery across a temporarily unprojected Session opening); amended 2026-11-02
   (FX-44, FX-48, FX-50: shared consumer-sensitive inverse, separate from internal-path evidence);
   amended 2026-11-02 (FX-51: post-issued-consent rekey selection through governance readiness);
-  amended 2026-11-02 (FX-48: precommit provider-cursor preparation and reservation readiness)
+  amended 2026-11-02 (FX-48: precommit provider-cursor preparation and reservation readiness);
+  amended 2026-11-02 (FX-47: local Session projection demand independent of peer-support waits)
 - **Deciders**: Robert E. Lee
 - **Tags**: trust, daemon identity, sessions, presence, agent comms, sync, health, releases
 - **Related**: ADR-018, ADR-020, ADR-026, ADR-029, ADR-031, ADR-033, ADR-034, ADR-035, ADR-036,
@@ -1135,6 +1136,18 @@ lessons. It changes neither this record's decision status nor any requirement or
   of `post` or any ambiguous mutation. Existing attempt bounds and opening-owner cadence remain;
   original activity is not replayed, and actual lock, binding, permission and storage refusals
   retain their meaning.
+
+  A successful local Session append and an actual room-open publication MUST each retain
+  bounded local Session-projection demand independently of an automatic drive waiting for
+  peer support. The existence of that older drive MUST NOT consume a newer private-index
+  generation's projection obligation. Reuse and rearm its automatic slot, or one queued
+  automatic obligation, through the existing native Sessions projection; preserve guarded
+  owners, replies, release cursors, weak room instance, attachment and current authority.
+  Repeated appends MUST NOT accumulate automatic obligations. Resume only after conflicting
+  native ownership releases, with fresh admission and authorization. Do not replay the
+  committed append, bypass provisional-lookup guards, require an online peer for the author's
+  local body, or add Tick/Status polling, a timer, runner or renewed deadline. Reopening an
+  already-stranded current-version profile MUST recover its original content without replay.
 
   A finite scan MUST cover the existing bounded inbox directory, including more than sixteen
   active Sessions, without spinning over an unchanged blocked set. A successful atomic
