@@ -1188,6 +1188,7 @@ Narrow successor amendments. Requirements not named here remain in force.
 | FX-40: a parked obligation retains its stage/prerequisite | FX-45 requires the actual prerequisite and matching native owner, not re-entry on any aggregated post completion |
 | FX-40: room obligations retain causal ownership without physical leases | FX-46 carries that same ownership through unavailable recipient prekeys while preserving existing OTP and signed-fallback eligibility |
 | FX-40: required continuations survive ordinary room progress | FX-47 retains the durable activity ingress scheduling demand through its exact room prerequisite and restored lifecycle, without confusing accepted inbox data with projected Session content |
+| FX-44: an installed authorized receiver retains its actual read demand | FX-48 preserves the earlier recipient-key recovery obligation through exact read-only publication readiness, before a receiver can be installed |
 | ADR-034 §5 "Health is true" (HL-1, HL-2), PRD-001 R35 | The lane's completed rounds are completed syncs (FX-16); the control socket answers under sync load (FX-17) |
 
 ## Implementation order and related work
@@ -1208,9 +1209,9 @@ Narrow successor amendments. Requirements not named here remain in force.
    the reproduced four-node daemon syncs nothing; one cut (v0.4.10).
 9. FX-37 is an immediate cross-cutting v0.4.10 blocker: until the normal shipped daemon can
    create a room, every room journey that reaches creation is red regardless of its own change.
-10. FX-38–FX-47: diagnose the QE-discovered causes, amend this contract, bind the corrective
+10. FX-38–FX-48: diagnose the QE-discovered causes, amend this contract, bind the corrective
     tasks to v0.4.15 and obtain Opus task/design review before permanent implementation.
-    FX-39, FX-40 and FX-44–FX-47 share one integration owner for coupled backend state;
+    FX-39, FX-40 and FX-44–FX-48 share one integration owner for coupled backend state;
     CLI/output and native navigation work may proceed independently once interfaces are fixed.
     Later consumer reds remain acceptance failures until their distinct causes are classified
     and corrected; a sender's completion is not its reader's successful use. The normal native,
