@@ -487,14 +487,11 @@ impl Node {
                         return Ok(false);
                     }
                     prepared.save.cache_only = channel.legacy_cache_only(&store)?;
+                    let resume = prepared.save.resume_after_governance.take();
                     prepared.save.stage = if prepared.save.cache_only {
                         Stage::Trust
                     } else {
-                        prepared
-                            .save
-                            .resume_after_governance
-                            .take()
-                            .unwrap_or(Stage::Packages)
+                        resume.unwrap_or(Stage::Packages)
                     };
                 }
                 (
@@ -727,7 +724,22 @@ impl Node {
                 .save
                 .reconcile
                 .get_or_insert_with(|| trust_save::Reconcile::new(trusted, scope));
-            match reconcile.action(&channel, &store)? {
+            let action = match reconcile.action(&channel, &store) {
+                Ok(action) => action,
+                Err(error) if ChannelState::governance_refreshing(&error) => {
+                    // The last native result is installed. Keep the exact reconciliation
+                    // cursor, but release its physical reader before fresh governance work
+                    // can wait behind a Computer transition.
+                    prepared.save.lifetime = None;
+                    prepared.save.resume_after_governance = Some(Stage::Trust);
+                    prepared.save.stage = Stage::Governance;
+                    prepared.save.request = Some(Work::Projection(ProjectionWork::Governance));
+                    prepared.wait_on(stage_wait(Stage::Governance), now.get());
+                    return Ok(false);
+                }
+                Err(error) => return Err(error),
+            };
+            match action {
                 trust_save::ReconcileAction::Trust(work) => {
                     prepared.save.request = Some(Work::Trust(work))
                 }
