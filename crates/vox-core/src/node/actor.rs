@@ -7183,20 +7183,8 @@ impl Node {
                     self.schedule().await;
                 }
                 () = post_save_wake.notified() => {
-                    let parked_busy: Vec<_> = self.parked_private_drives.keys()
-                        .filter_map(|room| self.pending_posts.get(room).map(|pending| (*room, pending.owner())))
-                        .collect();
                     self.complete_identity_startup().await;
                     self.complete_pending_posts().await;
-                    for (room, owner) in parked_busy {
-                        let next = self.pending_posts.get(&room).map(post_save::Pending::owner);
-                        if self.release_private_busy_owner(room, &owner, next) {
-                            for peer in self.ready_session_release_recipients(room) {
-                                self.wake_session_release(room, peer, None).await;
-                            }
-                            self.resume_parked_private_drive(room).await;
-                        }
-                    }
                     self.complete_pending_policies().await;
                     self.complete_pending_metadata().await;
                     self.start_own_key_computer_drain();
@@ -7734,7 +7722,6 @@ impl Node {
                     self.note_peers_seen();
                     self.recover_storage();
                     self.resume_session_retirements();
-                    ingress_wake.notify_one();
                     self.retry_upgrades_if_due().await;
                     self.maintain_prekeys();
                     self.renew_records_if_due().await;
