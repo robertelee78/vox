@@ -22,6 +22,12 @@ const SEG_PRIVATE_PULLS: u64 = 23;
 const WORK_ROWS: usize = 32;
 const WORK_BYTES: usize = 1024 * 1024;
 const TRUST_CHANGED: &str = "private trust incarnation changed";
+
+pub(crate) enum PrivatePullIntent {
+    Due(u64),
+    Paced(Instant),
+    Ineligible,
+}
 type TrustNonce = Option<[u8; crate::atrest::sek::NONCE_LEN]>;
 
 pub(super) fn expired(saved: &Stored, now: u64, retention: (u64, u64)) -> bool {
@@ -784,19 +790,33 @@ impl ChannelState {
 pub(crate) mod pending_session;
 
 impl ChannelState {
-    /// Cheap actor-side selection before taking a slot, worker or disk envelope. The actor owns
-    /// the corresponding attempt token; this snapshot only says which current policy revision a
-    /// later room/store operation must still match.
-    pub(crate) fn private_pull_intent(&self, peer: Digest32) -> Option<u64> {
-        (!self.poisoned
-            && !self.drive.receivers.is_empty()
-            && !self.private_sessions.pulling.contains(&peer)
-            && self
-                .private_sessions
-                .attempted
-                .get(&peer)
-                .is_none_or(|at| at.elapsed() >= Duration::from_secs(1)))
-        .then_some(self.private_sessions.revision)
+    pub(crate) fn private_pull_revision_matches(&self, peer: Digest32, revision: u64) -> bool {
+        self.private_sessions.revision == revision && self.drive_members().contains(&peer)
+    }
+
+    /// Select without physical resources; the paced deadline is the original attempt's
+    /// exact one-second boundary, not a renewed discovery interval.
+    pub(crate) fn private_pull_intent(
+        &self,
+        peer: Digest32,
+        projection_causal: bool,
+    ) -> PrivatePullIntent {
+        if self.poisoned
+            || self.drive.receivers.is_empty()
+            || self.private_sessions.pulling.contains(&peer)
+            || !self.drive_members().contains(&peer)
+        {
+            return PrivatePullIntent::Ineligible;
+        }
+        if !projection_causal {
+            if let Some(at) = self.private_sessions.attempted.get(&peer) {
+                let deadline = *at + Duration::from_secs(1);
+                if Instant::now() < deadline {
+                    return PrivatePullIntent::Paced(deadline);
+                }
+            }
+        }
+        PrivatePullIntent::Due(self.private_sessions.revision)
     }
 
     pub(crate) fn start_private_pull(
@@ -804,6 +824,7 @@ impl ChannelState {
         store: &Store,
         peer: Digest32,
         revision: u64,
+        projection_causal: bool,
     ) -> Result<Option<Ask>> {
         if revision != self.private_sessions.revision
             || !self.private_policy_ready(store, self.now_hint)?
@@ -820,11 +841,12 @@ impl ChannelState {
                     .attempted
                     .get(&peer)
                     .is_some_and(|at| at.elapsed() < Duration::from_secs(30)))
-            || self
-                .private_sessions
-                .attempted
-                .get(&peer)
-                .is_some_and(|t| t.elapsed() < Duration::from_secs(1))
+            || (!projection_causal
+                && self
+                    .private_sessions
+                    .attempted
+                    .get(&peer)
+                    .is_some_and(|t| t.elapsed() < Duration::from_secs(1)))
         {
             return Ok(None);
         }

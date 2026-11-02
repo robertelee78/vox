@@ -196,9 +196,25 @@ pub(crate) enum Reply {
     Text(TextPage),
 }
 
-enum Failure {
+pub(crate) enum Failure {
     Storage(Error),
     Request(&'static str),
+}
+impl Failure {
+    pub(crate) fn projection_pending(&self) -> bool {
+        matches!(
+            self,
+            Self::Request(REFRESHING)
+                | Self::Storage(Error::StreamRefused(super::super::history::CHANGED))
+        )
+    }
+
+    pub(crate) fn into_error(self) -> Error {
+        match self {
+            Self::Storage(error) => error,
+            Self::Request(reason) => Error::AppRefused(reason.into()),
+        }
+    }
 }
 impl From<Error> for Failure {
     fn from(e: Error) -> Self {
@@ -435,13 +451,27 @@ impl ChannelState {
         max_bytes: usize,
         now: u64,
     ) -> std::result::Result<Reply, String> {
+        self.session_query_typed(store, query, max_bytes, now)
+            .map_err(|failure| match failure {
+                Failure::Request(reason) => reason.into(),
+                Failure::Storage(error) => error.to_string(),
+            })
+    }
+
+    pub(crate) fn session_query_typed(
+        &mut self,
+        store: &Store,
+        query: Query,
+        max_bytes: usize,
+        now: u64,
+    ) -> Answer<Reply> {
         let resource = self.history_read_resource();
         if self.poisoned
             && !resource
                 .as_ref()
                 .is_some_and(|read| read.has_pending_snapshot())
         {
-            return Err(self.save_failure().to_string());
+            return Err(Failure::Storage(self.save_failure()));
         }
         let result = match resource {
             Some(resource) => resource
@@ -456,17 +486,12 @@ impl ChannelState {
                 .map_err(Failure::Storage)
                 .and_then(|view| self.session_query_view(&view, query, max_bytes, now)),
         };
-        match result {
-            Ok(reply) => Ok(reply),
-            Err(Failure::Request(why)) => Err(why.into()),
-            Err(Failure::Storage(error @ Error::StreamRefused(super::super::history::CHANGED))) => {
-                Err(error.to_string())
-            }
-            Err(Failure::Storage(error)) => {
-                self.poison(&error);
-                Err(error.to_string())
+        if let Err(Failure::Storage(error)) = &result {
+            if !matches!(error, Error::StreamRefused(super::super::history::CHANGED)) {
+                self.poison(error);
             }
         }
+        result
     }
 
     fn session_query_view<'a>(

@@ -148,7 +148,7 @@ enum After {
         guard: history_demand::CurrentPrivateGuard,
     },
     Live {
-        answer: oneshot::Sender<Result<bool>>,
+        answer: oneshot::Sender<Result<pending_upgrade::LivePageResult>>,
         guard: history_demand::CurrentPrivateGuard,
         charge: BufferCharge,
     },
@@ -1423,7 +1423,7 @@ impl Node {
         received_at: u64,
         charge: BufferCharge,
         guard: history_demand::CurrentPrivateGuard,
-        answer: oneshot::Sender<Result<bool>>,
+        answer: oneshot::Sender<Result<pending_upgrade::LivePageResult>>,
     ) -> bool {
         let continuation = Continuation {
             instance,
@@ -1607,11 +1607,11 @@ impl Node {
                     charge,
                 },
                 maintenance_save::Saved::Private(Saved::PageFinished(
-                    pending_upgrade::PageResult::Live(advanced),
+                    pending_upgrade::PageResult::Live(result),
                 )),
             ) => {
-                let _ = answer.send(Ok(advanced));
                 drop((lifetime, guard, charge));
+                let _ = answer.send(Ok(result));
             }
             (
                 After::Archive {

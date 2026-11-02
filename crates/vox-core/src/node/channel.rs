@@ -75,7 +75,7 @@ mod private_session;
 pub(crate) mod semantic_projection;
 pub(crate) use private_session::{pending_control, pending_session, pending_upgrade};
 pub(crate) mod role_owed;
-pub(crate) use private_session::{SessionAdvance, SessionRefresh};
+pub(crate) use private_session::{PrivatePullIntent, SessionAdvance, SessionRefresh};
 pub(crate) mod availability;
 mod own_historical_keys;
 mod own_history;

@@ -1251,7 +1251,7 @@ enum NetEvent {
         token: crate::node::ports::Token,
         revision: u64,
         room: std::sync::Weak<tokio::sync::Mutex<crate::node::channel::ChannelState>>,
-        result: Result<bool, String>,
+        result: Result<crate::node::channel::pending_upgrade::LivePageResult, String>,
     },
     PrivateSessionPageReady {
         channel_id: Digest32,
@@ -1263,7 +1263,9 @@ enum NetEvent {
         received_at: u64,
         charge: crate::node::history_budget::BufferCharge,
         guard: history_demand::CurrentPrivateGuard,
-        answer: oneshot::Sender<crate::error::Result<bool>>,
+        answer: oneshot::Sender<
+            crate::error::Result<crate::node::channel::pending_upgrade::LivePageResult>,
+        >,
     },
     PrivateArchivePageReady {
         room: Digest32,
@@ -1286,6 +1288,7 @@ enum NetEvent {
         channel_id: Digest32,
         peer: Digest32,
         token: crate::node::ports::Token,
+        selection: u64,
         revision: Option<u64>,
     },
     PrivateReleaseDue {
@@ -5807,6 +5810,12 @@ struct PrivatePullOwner {
     selecting: bool,
     armed: bool,
     causal: bool,
+    /// A page has registered for Sessions publication before its lookup runs.
+    projection_observing: bool,
+    projection_progress: bool,
+    projection_wait: bool,
+    projection_causal: bool,
+    selection: u64,
     attachment: u64,
     authority: Option<computer::ComputerAuthority>,
     ticket: Option<crate::node::history_budget::Ticket>,
@@ -11962,6 +11971,10 @@ impl Node {
                     )));
                     return;
                 }
+                if let Some(owner) = self.private_pulls.get_mut(&(channel_id, peer)) {
+                    owner.projection_observing = true;
+                    owner.projection_progress = false;
+                }
                 self.begin_owned_private_live(
                     channel_id,
                     instance,
@@ -12010,9 +12023,17 @@ impl Node {
                 else {
                     return;
                 };
-                // This exact token is done even if its room disappeared. Remove only it before
-                // validating whether the result may affect the current incarnation.
-                self.private_pulls.remove(&key);
+                let pending = matches!(
+                    &result,
+                    Ok(crate::node::channel::pending_upgrade::LivePageResult::ProjectionPending)
+                );
+                let progress = self
+                    .private_pulls
+                    .get(&key)
+                    .is_some_and(|owner| owner.projection_progress);
+                if !pending {
+                    self.private_pulls.remove(&key);
+                }
                 let completed = room.upgrade();
                 if !owned_room
                     .upgrade()
@@ -12024,9 +12045,29 @@ impl Node {
                         .zip(completed.as_ref())
                         .is_some_and(|(current, completed)| Arc::ptr_eq(current, completed))
                 {
+                    self.private_pulls.remove(&key);
                     return;
                 }
-                let advanced = result.as_ref().copied().unwrap_or(false);
+                if pending {
+                    if let Some(owner) = self.private_pulls.get_mut(&key) {
+                        owner.waiting = true;
+                        owner.selecting = true;
+                        owner.armed = true;
+                        owner.task = None;
+                        owner.ticket = None;
+                        owner.projection_observing = false;
+                        owner.projection_wait = !progress;
+                        owner.projection_causal = progress;
+                    }
+                    if progress {
+                        self.start_installed_private_pull(channel_id, peer);
+                    }
+                    return;
+                }
+                let advanced = matches!(
+                    &result,
+                    Ok(crate::node::channel::pending_upgrade::LivePageResult::Complete(true))
+                );
                 if let Err(reason) = result {
                     crate::node::status::SyncBook::with(
                         &self.sync_book,
@@ -12059,11 +12100,13 @@ impl Node {
                 peer,
                 token,
                 revision,
+                selection,
             } => {
                 let key = (channel_id, peer);
                 let valid = self.private_pulls.get(&key).is_some_and(|owner| {
                     owner.token == token
                         && owner.selecting
+                        && owner.selection == selection
                         && owner.attachment == self.delivery_epoch
                         && owner
                             .authority
@@ -12079,23 +12122,35 @@ impl Node {
                     if self
                         .private_pulls
                         .get(&key)
-                        .is_some_and(|owner| owner.token == token)
+                        .is_some_and(|owner| owner.token == token && owner.selection == selection)
                     {
                         self.private_pulls.remove(&key);
                     }
                     return;
                 }
                 if let Some(revision) = revision {
+                    if self
+                        .private_pulls
+                        .get(&key)
+                        .is_some_and(|owner| owner.projection_causal && owner.revision != revision)
+                    {
+                        self.private_pulls.remove(&key);
+                        return;
+                    }
                     if let Some(owner) = self.private_pulls.get_mut(&key) {
                         owner.revision = revision;
                         owner.selecting = false;
                         owner.task = None;
                     }
                     self.continue_private_session(channel_id, peer, token).await;
-                } else {
-                    if let Some(owner) = self.private_pulls.get_mut(&key) {
-                        owner.task = None;
-                    }
+                } else if self
+                    .private_pulls
+                    .get(&key)
+                    .is_some_and(|owner| !owner.causal && !owner.projection_causal)
+                {
+                    self.private_pulls.remove(&key);
+                } else if let Some(owner) = self.private_pulls.get_mut(&key) {
+                    owner.task = None;
                 }
             }
             NetEvent::PrivateReleaseDue { room, peer, token } => {
@@ -21663,6 +21718,11 @@ impl Node {
                 selecting: true,
                 armed: false,
                 causal: true,
+                projection_observing: false,
+                projection_progress: false,
+                projection_wait: false,
+                projection_causal: false,
+                selection: 0,
                 attachment: self.delivery_epoch,
                 authority: Some(authority),
                 ticket: None,
@@ -21676,29 +21736,42 @@ impl Node {
         if let Some(owner) = self.private_pulls.get_mut(&key) {
             owner.armed = true;
         }
-        let Some((token, room)) = self
+        let Some(owner) = self
             .private_pulls
-            .get(&key)
-            .filter(|owner| owner.selecting && owner.task.is_none())
-            .map(|owner| (owner.token, owner.room.clone()))
+            .get_mut(&key)
+            .filter(|owner| owner.selecting && !owner.projection_wait && owner.task.is_none())
         else {
             return;
         };
+        owner.selection = owner.selection.wrapping_add(1);
+        let (token, room, projection_causal, selection) = (
+            owner.token,
+            owner.room.clone(),
+            owner.projection_causal,
+            owner.selection,
+        );
         let tx = self.net_tx.clone();
         let task = self.spawn_join_housekeeping(async move {
-            let Some(shared) = room.upgrade() else { return };
-            let held = shared.lock().await;
-            let revision = held
-                .drive_members()
-                .contains(&peer)
-                .then(|| held.private_pull_intent(peer))
-                .flatten();
-            drop(held);
+            let revision = loop {
+                let Some(shared) = room.upgrade() else { return };
+                let held = shared.lock().await;
+                let intent = held.private_pull_intent(peer, projection_causal);
+                drop(held);
+                drop(shared);
+                match intent {
+                    crate::node::channel::PrivatePullIntent::Due(revision) => break Some(revision),
+                    crate::node::channel::PrivatePullIntent::Ineligible => break None,
+                    crate::node::channel::PrivatePullIntent::Paced(deadline) => {
+                        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+                    }
+                }
+            };
             let _ = tx
                 .send(NetEvent::PrivateSessionIntentReady {
                     channel_id,
                     peer,
                     token,
+                    selection,
                     revision,
                 })
                 .await;
@@ -21719,11 +21792,50 @@ impl Node {
                     && peer.is_none_or(|peer| peer == *member)
                     && owner.selecting
                     && owner.armed
+                    && !owner.projection_wait
                     && owner.task.is_none())
                 .then_some(*member)
             })
             .collect();
         for peer in peers {
+            self.start_installed_private_pull(room, peer);
+        }
+    }
+
+    /// Register actual Sessions progress against the exact room's receiver owners. A page
+    /// still in flight latches the edge until its answer is filed.
+    fn private_projection_advanced(&mut self, room: Digest32, instance: &SharedChannel) {
+        let mut ready = Vec::new();
+        for ((candidate, peer), owner) in &mut self.private_pulls {
+            if *candidate != room
+                || owner.attachment != self.delivery_epoch
+                || !owner
+                    .authority
+                    .as_ref()
+                    .is_some_and(|authority| authority.current())
+                || !owner
+                    .room
+                    .upgrade()
+                    .is_some_and(|owned| Arc::ptr_eq(&owned, instance))
+            {
+                continue;
+            }
+            if owner.projection_observing {
+                owner.projection_progress = true;
+            }
+            if owner.projection_wait {
+                owner.projection_wait = false;
+                owner.projection_causal = true;
+                if owner.selecting {
+                    if let Some(task) = owner.task.take() {
+                        task.abort();
+                    }
+                    owner.selection = owner.selection.wrapping_add(1);
+                }
+                ready.push(*peer);
+            }
+        }
+        for peer in ready {
             self.start_installed_private_pull(room, peer);
         }
     }
@@ -21735,38 +21847,39 @@ impl Node {
         let Some(shared) = self.channels.get(&channel_id).map(Arc::clone) else {
             return;
         };
-        // Never await the actor's room here. A running room operation supplies its own completion
-        // event, and the retained tick is the fallback; selection itself takes no slot, worker,
-        // secret lease or disk envelope.
-        let Ok(room) = shared.try_lock() else {
-            return;
-        };
-        let intent = room.private_pull_intent(peer);
-        drop(room);
+        let held = shared.try_lock().ok();
         if let Some(owner) = self.private_pulls.get(&key) {
-            if owner.selecting {
+            let same_room = owner
+                .room
+                .upgrade()
+                .is_some_and(|room| Arc::ptr_eq(&room, &shared));
+            if same_room && !owner.waiting {
                 return;
             }
-            if !owner.waiting
-                || (owner
-                    .room
-                    .upgrade()
-                    .is_some_and(|owned| Arc::ptr_eq(&owned, &shared))
-                    && intent == Some(owner.revision))
-            {
-                return;
+            // A locked room is handled by the already retained selection or capacity owner.
+            // Only a provably stale revision may supersede an existing logical owner.
+            if same_room {
+                let Some(room) = held.as_ref() else { return };
+                if owner.selecting && !owner.projection_wait
+                    || room.private_pull_revision_matches(peer, owner.revision)
+                {
+                    return;
+                }
             }
-            // A current lifecycle event or the retained discovery tick supersedes a stale byte
-            // wait immediately; it need not wait for unrelated capacity before new policy work
-            // can own the pair. The old token still fences a release event already in flight.
             if let Some(owner) = self.private_pulls.remove(&key) {
                 if let Some(task) = owner.task {
                     task.abort();
                 }
             }
         }
-        let Some(revision) = intent else {
-            return;
+        let intent = held
+            .as_ref()
+            .map(|room| room.private_pull_intent(peer, false));
+        drop(held);
+        let (revision, selecting) = match intent {
+            Some(crate::node::channel::PrivatePullIntent::Due(revision)) => (revision, false),
+            Some(crate::node::channel::PrivatePullIntent::Ineligible) => return,
+            Some(crate::node::channel::PrivatePullIntent::Paced(_)) | None => (0, true),
         };
         let token = self.next_token;
         self.next_token += 1;
@@ -21777,16 +21890,25 @@ impl Node {
                 revision,
                 room: Arc::downgrade(&shared),
                 waiting: true,
-                selecting: false,
-                armed: false,
+                selecting,
+                armed: selecting,
                 causal: false,
+                projection_observing: false,
+                projection_progress: false,
+                projection_wait: false,
+                projection_causal: false,
+                selection: 0,
                 attachment: self.delivery_epoch,
                 authority: self.computer_authority(),
                 ticket: None,
                 task: None,
             },
         );
-        self.continue_private_session(channel_id, peer, token).await;
+        if selecting {
+            self.start_installed_private_pull(channel_id, peer);
+        } else {
+            self.continue_private_session(channel_id, peer, token).await;
+        }
     }
 
     async fn resume_private_session_bytes(
@@ -21841,14 +21963,23 @@ impl Node {
         enum IntentState {
             Current,
             Changed,
-            NotDue,
+            Paced,
+            Ineligible,
             Locked,
         }
         let state = match shared.try_lock() {
-            Ok(room) => match room.private_pull_intent(peer) {
-                Some(current) if current == revision => IntentState::Current,
-                Some(_) => IntentState::Changed,
-                None => IntentState::NotDue,
+            Ok(room) => match room.private_pull_intent(
+                peer,
+                self.private_pulls
+                    .get(&key)
+                    .is_some_and(|owner| owner.projection_causal),
+            ) {
+                crate::node::channel::PrivatePullIntent::Due(current) if current == revision => {
+                    IntentState::Current
+                }
+                crate::node::channel::PrivatePullIntent::Due(_) => IntentState::Changed,
+                crate::node::channel::PrivatePullIntent::Paced(_) => IntentState::Paced,
+                crate::node::channel::PrivatePullIntent::Ineligible => IntentState::Ineligible,
             },
             Err(_) => IntentState::Locked,
         };
@@ -21865,20 +21996,29 @@ impl Node {
                 }
                 self.start_installed_private_pull(channel_id, peer);
             }
-            IntentState::NotDue => {
-                if !self
-                    .private_pulls
-                    .get(&key)
-                    .is_some_and(|owner| owner.causal)
-                {
-                    self.private_pulls.remove(&key);
-                    return;
-                }
+            IntentState::Paced => {
                 if let Some(owner) = self.private_pulls.get_mut(&key) {
                     owner.ticket = None;
                     owner.selecting = true;
                     owner.armed = true;
                     owner.task = None;
+                }
+                self.start_installed_private_pull(channel_id, peer);
+            }
+            IntentState::Ineligible => {
+                if self
+                    .private_pulls
+                    .get(&key)
+                    .is_some_and(|owner| owner.causal || owner.projection_causal)
+                {
+                    if let Some(owner) = self.private_pulls.get_mut(&key) {
+                        owner.ticket = None;
+                        owner.selecting = true;
+                        owner.armed = true;
+                        owner.task = None;
+                    }
+                } else {
+                    self.private_pulls.remove(&key);
                 }
             }
             IntentState::Locked => {
@@ -22056,6 +22196,10 @@ impl Node {
             self.private_pulls.remove(&key);
             return;
         };
+        let projection_causal = self
+            .private_pulls
+            .get(&key)
+            .is_some_and(|owner| owner.projection_causal);
         let tx = self.net_tx.clone();
         let clock = self.millis_clock.clone();
         let abort = self.spawn_join_housekeeping(async move {
@@ -22067,7 +22211,9 @@ impl Node {
                     store.clone(),
                     work_charge,
                     guard.clone(),
-                    move |room, store| room.start_private_pull(store, peer, revision),
+                    move |room, store| {
+                        room.start_private_pull(store, peer, revision, projection_causal)
+                    },
                 )
                 .await;
                 let (work_charge, ask) = match started {
@@ -22078,7 +22224,9 @@ impl Node {
                     }
                 };
                 let Some(ask) = ask else {
-                    return Ok(false);
+                    return Ok(
+                        crate::node::channel::pending_upgrade::LivePageResult::Complete(false),
+                    );
                 };
                 let page = tokio::time::timeout(
                     Duration::from_secs(10),
@@ -22117,6 +22265,8 @@ impl Node {
             }
             .await
             .map_err(|e: crate::error::Error| e.to_string());
+            drop(_slot);
+            drop(store);
             let _ = tx
                 .send(NetEvent::PrivateSessionDone {
                     channel_id,

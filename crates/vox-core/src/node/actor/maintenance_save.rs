@@ -924,6 +924,7 @@ impl Node {
             )
         {
             self.ingress_room_progress(room, session_save::IngressProgress::Projection);
+            self.private_projection_advanced(room, &instance);
         }
         if installable
             && matches!(

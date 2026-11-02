@@ -7,8 +7,13 @@ pub(crate) enum PagePreparation {
     Work(Box<PendingUpgrade>),
     Finished(PageResult),
 }
+#[derive(Clone, Copy)]
+pub(crate) enum LivePageResult {
+    Complete(bool),
+    ProjectionPending,
+}
 pub(crate) enum PageResult {
-    Live(bool),
+    Live(LivePageResult),
     Archive(PrivatePlan),
 }
 
@@ -220,20 +225,29 @@ impl PageFlow {
                         && row.session_id != crate::node::drive::KEY_CHANGED
                     {
                         use super::super::super::session_projection::{Query, Reply};
-                        if !matches!(
-                            channel.session_query(
-                                store,
-                                Query::Lookup {
-                                    node: row.author,
-                                    id: row.session_id
-                                },
-                                1,
-                                now.get()
-                            ),
-                            Ok(Reply::Lookup(Some(_)))
+                        match channel.session_query_typed(
+                            store,
+                            Query::Lookup {
+                                node: row.author,
+                                id: row.session_id,
+                            },
+                            1,
+                            now.get(),
                         ) {
-                            self.stage = Stage::Done(false);
-                            continue;
+                            Ok(Reply::Lookup(Some(_))) => {}
+                            Ok(Reply::Lookup(None)) => {
+                                self.stage = Stage::Done(false);
+                                continue;
+                            }
+                            Ok(_) => {
+                                return Err(Error::Profile("private Session lookup reply mismatch"))
+                            }
+                            Err(failure) if failure.projection_pending() => {
+                                return Ok(PagePreparation::Finished(PageResult::Live(
+                                    LivePageResult::ProjectionPending,
+                                )));
+                            }
+                            Err(failure) => return Err(failure.into_error()),
                         }
                     }
                     let wire = std::mem::take(&mut self.page.records[i]);
@@ -287,7 +301,7 @@ impl PageFlow {
                         }
                         PageResult::Archive(plan)
                     } else {
-                        PageResult::Live(advanced)
+                        PageResult::Live(LivePageResult::Complete(advanced))
                     };
                     return Ok(PagePreparation::Finished(result));
                 }

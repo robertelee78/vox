@@ -1618,7 +1618,7 @@ impl PendingUpgrade {
 }
 
 mod page;
-pub(crate) use page::{PageFlow, PagePreparation, PageResult};
+pub(crate) use page::{LivePageResult, PageFlow, PagePreparation, PageResult};
 mod expiry;
 mod serve;
 pub(in crate::node::channel) use expiry::sweep_private;
