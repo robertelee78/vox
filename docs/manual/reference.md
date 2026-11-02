@@ -108,6 +108,16 @@ in transit. Check effective trust and membership on the relevant computer rather
 individual trust that the current computer policy already supplies. Independent node trust
 continues to work during an incomplete computer pairing.
 
+Nodes that are already Ready apply computer policy without restarting the daemon. Reopening
+the app or selecting the same current personal node does not require pairing again. When an
+offline peer returns, accepted Session activity and owed private-key delivery resume on room
+progress; do not resubmit the original prompt to force delivery.
+
+Read and Drive remain distinct. A computer's personal node can drive non-personal nodes, not
+another personal node; non-personal nodes do not gain automatic Drive. Removing computer trust
+or changing the personal-node selection fences pending work under the new policy. Revocation
+does not erase content a peer already received.
+
 ## How a command picks its node
 
 A command acts as the first of these that names a node: `--node`, then `VOX_NODE`, then the only
