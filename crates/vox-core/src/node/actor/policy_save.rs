@@ -6,6 +6,7 @@ use super::trust_save::{
 };
 use super::*;
 use crate::node::channel::pending_trust::{TrustSaved, TrustWrite};
+use crate::node::channel::session_projection::{ProjectionProgress, ProjectionWork};
 use crate::node::store::Store;
 
 mod grant;
@@ -78,6 +79,7 @@ pub(super) struct ManagedTurn {
     revision: u64,
     expired: bool,
     stage: ManagedRoomStage,
+    governance_prerequisite: bool,
     terminal: oneshot::Sender<crate::error::Result<ManagedNotice>>,
 }
 
@@ -990,6 +992,7 @@ impl Node {
             revision,
             expired,
             stage: ManagedRoomStage::Marks,
+            governance_prerequisite: false,
             terminal,
         };
         // Mark this exact room BEFORE any withdrawal rotates its sender. All other rooms still
@@ -1017,6 +1020,46 @@ impl Node {
                 return;
             }
         };
+        if turn.governance_prerequisite {
+            if let Err(error) = turn.guard.active(self.computer.as_ref()) {
+                self.fail_managed_turn(turn, error).await;
+                return;
+            }
+            match saved {
+                maintenance_save::Saved::Projection(ProjectionProgress::Governance(progress)) => {
+                    if !progress.ready && progress.pending {
+                        self.begin_pending_maintenance(
+                            room,
+                            maintenance_save::Work::Projection(ProjectionWork::Governance),
+                            maintenance_save::Continuation::Trust(TrustContinuation::Managed(turn)),
+                            None,
+                        )
+                        .await;
+                        return;
+                    }
+                    if !progress.ready {
+                        self.fail_managed_turn(
+                            turn,
+                            Error::Profile(
+                                "managed governance projection stopped before readiness",
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
+                    turn.governance_prerequisite = false;
+                    self.continue_managed_trust(turn).await;
+                }
+                _ => {
+                    self.fail_managed_turn(
+                        turn,
+                        Error::Profile("unexpected managed governance completion"),
+                    )
+                    .await;
+                }
+            }
+            return;
+        }
         let applied = match (&mut turn.stage, saved) {
             (ManagedRoomStage::Marks, maintenance_save::Saved::Trust(TrustSaved::Marked)) => {
                 turn.stage = ManagedRoomStage::Reconcile(Reconcile::new(
@@ -1125,6 +1168,16 @@ impl Node {
                     )
                     .await;
                 }
+            }
+            Err(error) if ChannelState::governance_refreshing(&error) => {
+                turn.governance_prerequisite = true;
+                self.begin_pending_maintenance(
+                    room,
+                    maintenance_save::Work::Projection(ProjectionWork::Governance),
+                    maintenance_save::Continuation::Trust(TrustContinuation::Managed(turn)),
+                    None,
+                )
+                .await;
             }
             Err(error) => self.fail_managed_turn(turn, error).await,
         }
