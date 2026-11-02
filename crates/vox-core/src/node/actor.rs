@@ -9094,6 +9094,7 @@ impl Node {
             return;
         }
         self.finish_metadata_room_publication(room, waiting);
+        self.ingress_room_progress(room, session_save::IngressProgress::Room);
         Box::pin(self.begin_owned_private_drive(room, true, None, None, None)).await;
     }
 
