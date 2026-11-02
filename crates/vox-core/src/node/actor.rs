@@ -9094,6 +9094,7 @@ impl Node {
             return;
         }
         self.finish_metadata_room_publication(room, waiting);
+        Box::pin(self.begin_owned_private_drive(room, true, None, None, None)).await;
     }
 
     /// Publish only local settings while holding the checked room incarnation. The
@@ -22406,20 +22407,6 @@ impl Node {
         shared.lock().await.sessions_revision(profile.store())
     }
 
-    /// This node's drive key in one room (ADR-029 SC-2a, SC-2b): **changed first** if a member it
-    /// was released to is no longer in `holders` (downgraded to read, or untrusted); **begun** if
-    /// this node has an open Session here and none yet, so a member given drive holds it before
-    /// the Session's first entry; then released to each member with drive that is owed it, as a
-    /// key-package in the room's log, sealed to that member's prekeys; and, after a change, an
-    /// entry under the new key that says so, so the member that lost it reads at once that it no
-    /// longer holds it. A member whose prekeys this node has not read yet stays owed, and the tick
-    /// tries again.
-    async fn tend_drive_keys_in(&mut self, channel_id: &Digest32, holders: &BTreeSet<Digest32>) {
-        let _ = self
-            .tend_drive_keys_in_guarded(channel_id, holders, None)
-            .await;
-    }
-
     fn support_recipients_checked(
         &self,
         room: &Digest32,
@@ -22484,7 +22471,7 @@ impl Node {
         guard: Option<&computer::ComputerPolicyGuard>,
     ) -> crate::error::Result<()> {
         self.computer_drive_guard(guard)?;
-        self.begin_owned_private_drive(*channel_id, guard.cloned(), None, None)
+        self.begin_owned_private_drive(*channel_id, false, guard.cloned(), None, None)
             .await;
         Ok(())
     }

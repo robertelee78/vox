@@ -1109,10 +1109,16 @@ impl Node {
     pub(in crate::node::actor) async fn begin_owned_private_drive(
         &mut self,
         room: Digest32,
+        fresh_projection: bool,
         guard: Option<computer::ComputerPolicyGuard>,
         lifetime: Option<Arc<maintenance_save::Lifetime>>,
         reply: ActorReply,
     ) -> bool {
+        let stage = if fresh_projection {
+            DriveStage::Sessions
+        } else {
+            DriveStage::Upgrade
+        };
         if self
             .parked_private_drives
             .get(&room)
@@ -1159,12 +1165,15 @@ impl Node {
                 return false;
             }
             parked.drive_active = true;
-            parked.stage = DriveStage::Upgrade;
+            parked.stage = stage;
             parked.guard = guard;
             parked.authority = authority;
             parked.reply = reply;
             parked.prerequisite = DriveWait::Native;
             parked.busy_owner = self.pending_posts.get(&room).map(post_save::Pending::owner);
+            if fresh_projection {
+                parked.room_wait = None;
+            }
             drop(lifetime);
             if parked.busy_owner.is_none() {
                 self.resume_parked_private_drive(room).await;
@@ -1212,6 +1221,45 @@ impl Node {
                 }
                 return false;
             }
+            if fresh_projection && guard.is_none() && reply.is_none() {
+                // A local append or reopen must not coalesce behind peer support.
+                // Reuse automatic work instead of accumulating displaced support stages.
+                if parked.drive_active && parked.guard.is_none() && parked.reply.is_none() {
+                    parked.stage = stage;
+                    parked.authority = authority;
+                    parked.prerequisite = DriveWait::Native;
+                    parked.room_wait = None;
+                } else if let Some(queued) = parked
+                    .upgrades
+                    .iter_mut()
+                    .find(|item| item.guard.is_none() && item.reply.is_none())
+                {
+                    queued.stage = stage;
+                    queued.authority = authority;
+                    queued.prerequisite = DriveWait::Native;
+                    queued.room_wait = None;
+                    queued.ready = true;
+                } else {
+                    parked.upgrades.push(UpgradeObligation {
+                        stage,
+                        guard: None,
+                        authority,
+                        prerequisite: DriveWait::Native,
+                        reply: None,
+                        room_wait: None,
+                        ready: true,
+                    });
+                }
+                if let Some(owner) = self.pending_posts.get(&room).map(post_save::Pending::owner) {
+                    parked.busy_owner = Some(owner);
+                }
+                let run = parked.busy_owner.is_none();
+                drop(lifetime);
+                if run {
+                    self.resume_parked_private_drive(room).await;
+                }
+                return true;
+            }
             if guard.is_none()
                 && reply.is_none()
                 && ((parked.drive_active && parked.guard.is_none() && parked.reply.is_none())
@@ -1223,7 +1271,7 @@ impl Node {
                 return true;
             }
             parked.upgrades.push(UpgradeObligation {
-                stage: DriveStage::Upgrade,
+                stage,
                 guard,
                 authority,
                 prerequisite: DriveWait::Native,
@@ -1269,7 +1317,7 @@ impl Node {
                 ParkedPrivateDrive {
                     instance: Arc::downgrade(&instance),
                     attachment: self.delivery_epoch,
-                    stage: DriveStage::Upgrade,
+                    stage,
                     busy_owner: self.pending_posts.get(&room).map(post_save::Pending::owner),
                     room_wait: None,
                     prerequisite: DriveWait::Native,
@@ -1324,7 +1372,7 @@ impl Node {
                         ParkedPrivateDrive {
                             instance: Arc::downgrade(&instance),
                             attachment: self.delivery_epoch,
-                            stage: DriveStage::Upgrade,
+                            stage,
                             releases: [Vec::new(), Vec::new()],
                             upgrades: Vec::new(),
                             drive_active: true,
@@ -1350,16 +1398,18 @@ impl Node {
             instance,
             attachment: self.delivery_epoch,
             lifetime,
-            after: After::Drive {
-                stage: DriveStage::Upgrade,
-                guard,
-            },
+            after: After::Drive { stage, guard },
+        };
+        let work = if fresh_projection {
+            maintenance_save::Work::Projection(ProjectionWork::Sessions)
+        } else {
+            maintenance_save::Work::Private(Work::Upgrade {
+                finish_initial: false,
+            })
         };
         self.begin_pending_maintenance(
             room,
-            maintenance_save::Work::Private(Work::Upgrade {
-                finish_initial: false,
-            }),
+            work,
             maintenance_save::Continuation::Private(continuation),
             reply,
         )
