@@ -1,6 +1,6 @@
 # ADR-038: Daemons Trust Daemons, and Sessions Are Presence
 
-- **Status**: Accepted for FX-38–FX-46 in v0.4.15. The decider's product rulings of 2026-10-19
+- **Status**: Accepted for FX-38–FX-47 in v0.4.15. The decider's product rulings of 2026-10-19
   (one question at a time, quoted below) remain accepted; other undecided presentation details
   remain proposed. The 2026-11-01 correction workflow and release were selected by the decider;
   Opus technical approval and implementation, acceptance and delivery are recorded on the
@@ -20,8 +20,9 @@
   resource ownership, fair admission selection, Busy attempt credit, legal proof staging and
   exact accepted Resume capacity ownership); amended 2026-11-01 (FX-38–FX-43: QE correction
   workflow, live computer-policy application, native re-selection, approval handoffs and
-  terminal input/output contracts for v0.4.15); amended 2026-11-02 (FX-44–FX-46: private
-  Session receiver admission, exact parked prerequisites and recipient-key continuation ownership)
+  terminal input/output contracts for v0.4.15); amended 2026-11-02 (FX-44–FX-47: private
+  Session receiver admission, exact parked prerequisites, recipient-key ownership and durable
+  activity ingress continuation)
 - **Deciders**: Robert E. Lee
 - **Tags**: trust, daemon identity, sessions, presence, agent comms, sync, health, releases
 - **Related**: ADR-018, ADR-020, ADR-026, ADR-029, ADR-031, ADR-033, ADR-034, ADR-035, ADR-036,
@@ -1071,6 +1072,41 @@ lessons. It changes neither this record's decision status nor any requirement or
   original private Session after actual prerequisite progress and refuse a superseded reader;
   local package marks, scheduling and unchanged General messages are not delivery proofs.
 
+- **FX-47.** A durably accepted original Session activity MUST reach its native Session
+  projection after transient room work completes, without another hook event or input replay.
+  The existing ingress owner MUST retain only bounded logical scan and exact pending-room
+  prerequisites. A busy-room wait MUST name the weak room instance, attachment and exact native
+  owner; a completion or same-count owner replacement MUST NOT be inferred from aggregate map
+  shrinkage. Matching native release, room installation, projection/governance/publication
+  readiness or authority/lifecycle progress MUST resume the affected head under fresh admission.
+  A failed save MUST distinguish its actual transient prerequisite from permanent refusal;
+  unchanged errors MUST NOT self-notify, spin, poll Tick/Status or acquire a renewed deadline.
+  No room lock, store, signer, secret/publication lease, native worker, decrypted body or
+  ingress completion capability may remain held while this scheduling demand is parked.
+
+  Admission into the durable inbox is not a published Session row. At commit `56395628f`, only
+  successful `AcceptSessionBatch` wakes the inbox turn. Its fixed sixteen selection attempts
+  consume that wake even when every head is blocked by room work. An immediate self-notification
+  after admission can likewise be consumed while the same native owner still holds the head.
+  No actual room/native completion or restored-room installation wakes that inbox owner.
+  Source review establishes the lost-edge defect; the corrected-control local prompt was not
+  observed, but neither its provisional listing nor its hook's refreshing room-drain message
+  identifies activity admission or proves this was that execution's cause. Runtime attribution
+  MUST report the actual admission and first failed continuation boundary, not assume data loss.
+
+  A finite scan MUST cover the existing bounded inbox directory, including more than sixteen
+  active Sessions, without spinning over an unchanged blocked set. A successful atomic
+  append/inbox-head completion MUST advance its next head; unlock/restart MUST seed a scan only
+  after the actual identity/room lifecycle permits selection. Lock, removal and room replacement
+  MUST retire stale weak scheduling waits without deleting durable accepted activity.
+  Acceptance MUST use the default wired harness flow: one original prompt after offline room
+  restoration, actual author-local body, actual reader return with fresh public connectivity,
+  then that same original private body on its entitled reader. No synthetic earlier SessionStart,
+  repeated prompt, sender-local mark or internal counter substitutes for that consumer result.
+  A discriminating inverse MUST fail its user-visible body assertion after valid staging.
+  Source review and a bounded spike cover exact-owner wake matching, parked-resource release,
+  restart recovery and finite multi-head scanning; they MUST NOT create a mechanism CI gate.
+
 ## Unchanged rulings
 
 The decider confirmed these on 2026-10-19 ("that still sounds right to me"): no human/agent
@@ -1107,6 +1143,7 @@ Narrow successor amendments. Requirements not named here remain in force.
 | FX-40: private work must resume on actual dependency progress | FX-44 closes the asynchronous drive-key-install/private-reader handoff and fair room-release admission gap without changing permission or ratchet rules |
 | FX-40: a parked obligation retains its stage/prerequisite | FX-45 requires the actual prerequisite and matching native owner, not re-entry on any aggregated post completion |
 | FX-40: room obligations retain causal ownership without physical leases | FX-46 carries that same ownership through unavailable recipient prekeys while preserving existing OTP and signed-fallback eligibility |
+| FX-40: required continuations survive ordinary room progress | FX-47 retains the durable activity ingress scheduling demand through its exact room prerequisite and restored lifecycle, without confusing accepted inbox data with projected Session content |
 | ADR-034 §5 "Health is true" (HL-1, HL-2), PRD-001 R35 | The lane's completed rounds are completed syncs (FX-16); the control socket answers under sync load (FX-17) |
 
 ## Implementation order and related work
@@ -1127,9 +1164,9 @@ Narrow successor amendments. Requirements not named here remain in force.
    the reproduced four-node daemon syncs nothing; one cut (v0.4.10).
 9. FX-37 is an immediate cross-cutting v0.4.10 blocker: until the normal shipped daemon can
    create a room, every room journey that reaches creation is red regardless of its own change.
-10. FX-38–FX-46: diagnose the QE-discovered causes, amend this contract, bind the corrective
+10. FX-38–FX-47: diagnose the QE-discovered causes, amend this contract, bind the corrective
     tasks to v0.4.15 and obtain Opus task/design review before permanent implementation.
-    FX-39, FX-40 and FX-44–FX-46 share one integration owner for coupled backend state;
+    FX-39, FX-40 and FX-44–FX-47 share one integration owner for coupled backend state;
     CLI/output and native navigation work may proceed independently once interfaces are fixed.
     Later consumer reds remain acceptance failures until their distinct causes are classified
     and corrected; a sender's completion is not its reader's successful use. The normal native,
