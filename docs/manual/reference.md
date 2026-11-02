@@ -113,6 +113,10 @@ the app or selecting the same current personal node does not require pairing aga
 offline peer returns, accepted Session activity and owed private-key delivery resume on room
 progress; do not resubmit the original prompt to force delivery.
 
+Your own accepted Session activity remains readable without waiting for an offline peer.
+Reopening the saved profile resumes pending activity after its room opens; another hook
+event or a replay of the original prompt is not required.
+
 Read and Drive remain distinct. A computer's personal node can drive non-personal nodes, not
 another personal node; non-personal nodes do not gain automatic Drive. Removing computer trust
 or changing the personal-node selection fences pending work under the new policy. Revocation
