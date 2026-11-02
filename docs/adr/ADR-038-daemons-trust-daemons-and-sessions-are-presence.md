@@ -1,6 +1,6 @@
 # ADR-038: Daemons Trust Daemons, and Sessions Are Presence
 
-- **Status**: Accepted for FX-38–FX-48 in v0.4.15. The decider's product rulings of 2026-10-19
+- **Status**: Accepted for FX-38–FX-50 in v0.4.15. The decider's product rulings of 2026-10-19
   (one question at a time, quoted below) remain accepted; other undecided presentation details
   remain proposed. The 2026-11-01 correction workflow and release were selected by the decider;
   Opus technical approval and implementation, acceptance and delivery are recorded on the
@@ -22,7 +22,9 @@
   workflow, live computer-policy application, native re-selection, approval handoffs and
   terminal input/output contracts for v0.4.15); amended 2026-11-02 (FX-44–FX-48: private
   Session receiver admission, exact parked prerequisites, recipient-key ownership, durable
-  activity ingress continuation and recipient-key recovery publication readiness)
+  activity ingress continuation and recipient-key recovery publication readiness); amended
+  2026-11-02 (FX-49–FX-50: managed removal's read-only governance prerequisite and private
+  page recovery across a temporarily unprojected Session opening)
 - **Deciders**: Robert E. Lee
 - **Tags**: trust, daemon identity, sessions, presence, agent comms, sync, health, releases
 - **Related**: ADR-018, ADR-020, ADR-026, ADR-029, ADR-031, ADR-033, ADR-034, ADR-035, ADR-036,
@@ -1164,6 +1166,76 @@ lessons. It changes neither this record's decision status nor any requirement or
   observations alone are not feature verdicts. Existing floors, membership, refusal and
   revocation semantics remain unchanged.
 
+- **FX-49.** A still-current managed computer-policy application MUST retain its exact turn,
+  reconciliation stage, cursor, target and reply across a read-only consent-page governance
+  prerequisite. It MUST preserve the already-committed prefix, satisfy the bounded owned
+  governance prerequisite and resume that read under fresh exact-policy validation. Temporary
+  governance refreshing at that read MUST NOT poison the room, terminalize the application or
+  require another user operation, regrant or daemon restart. No committed withdrawal, keyring
+  change, deletion or receipt may be repeated as a retry of the whole reconciliation.
+  The existing managed owner MUST retain responsibility for its admitted work. Prerequisite
+  work MUST either use that owner's compatible physical boundary or explicitly release,
+  reacquire and revalidate conflicting resources; it MUST NOT wait on background work blocked
+  by its own exclusive Computer transition or room reservation. Parked external waits MUST
+  retain no physical publication/secret lease, store, signer, room lock or native worker.
+  Actual supersession and permanent storage or mutation failures MUST retain their refusal
+  and retirement semantics. No generic error retry, second runner, polling or renewed deadline
+  is permitted.
+
+  A correlated nonshipping `d06090651` run, based on product `67eb2367f`, established public,
+  paired private and independent manual-Drive baselines before removal. Revision 14 committed
+  its native keyring and receipt, completed two withdrawals and deletion cleanup, then its
+  next `Reconcile::action` consent-page read returned governance refreshing. The exact policy
+  guard was current and not superseded. `fail_managed_turn` treated this read prerequisite as
+  terminal and poisoned the room. The final state remained applying with a pending-node
+  governance error despite a confirmed local receipt and revision-14 binding. The diagnostic
+  identifies the read and terminalization, not which of its display/semantic readiness checks
+  produced the same refusal. Acceptance MUST distinguish this product failure from the
+  apparatus's subsequent inability to stage settled removal.
+
+  Acceptance MUST perform removal after actual fresh public/private baselines, observe its
+  still-current local application settle without restart or repeated removal, verify that the
+  removed computer cannot read or drive new private content while an independent entitled
+  observer remains usable, and complete a fresh explicit re-pair with the removed computer.
+  A correctly staged omission inverse MUST fail the settled-application or consumer assertion,
+  not a missing baseline. Source review and a bounded diagnostic MUST cover committed-prefix
+  preservation, resource ownership, exact target supersession and permanent failures.
+
+- **FX-50.** A received live private page blocked by a temporarily unprojected Session opening
+  MUST retain its exact logical receiver obligation instead of reporting an ordinary unchanged
+  page and discarding the pull owner. Core-only typed lookup MUST distinguish the existing
+  projection-refresh/snapshot-change prerequisites from proven stable absence, permission
+  refusal and permanent failure. The cursor MUST NOT advance past unapplied activity.
+  Existing per-room/per-peer receiver ownership, authority, revision, attachment and weak room
+  fences MUST be reused; this obligation MUST NOT occupy or replace a sender-drive obligation.
+  Page bytes, buffer/slot/job charges, store, signer and secret/publication guards MUST be
+  released before a projection wait. Re-fetching from the unchanged authenticated cursor MUST
+  preserve cached-record and ratchet semantics, without replaying a producer or committed write.
+  Actual Session-projection publication progress MUST reselect the affected receiver, including
+  progress completed internally rather than by a subsequent network sync. Registration and
+  readiness revalidation MUST prevent a completion-before-wait handoff from losing that edge.
+  The discovery pull's existing one-second pacing MUST NOT consume a matching causal wake.
+  No new queue, runner, periodic timer, generic error retry or Tick/Status rescue is permitted.
+  Lock/shutdown, room replacement/removal and current-authority supersession MUST retire the
+  exact stale receiver wait without clearing a newer owner's work.
+
+  Source at `67eb2367f` makes `PageFlow::Apply` return `Done(false)` for every lookup result
+  other than a present opening, including typed provisional-projection refusal. No cursor is
+  committed, but `PrivateSessionDone` drops that pull owner and only an advanced page continues
+  immediately. Session projection completion currently wakes ingress, not this missing receiver
+  obligation; the ordinary sweep can be skipped while a store save is pending. A `9fa8be911`
+  diagnostic saw a successful page, a provisional absent lookup and unchanged completion,
+  followed by the exact opening becoming present. Its lookup lacked page/session correlation,
+  so it does not prove this source gap uniquely caused that run. The later `d06090651` run was
+  refused before receiving a page and MUST NOT be attributed to this Apply-stage defect.
+
+  Acceptance MUST read the same original offline-created private activity after the opening's
+  real projection progress, with local original content and fresh public round trips as
+  controls, without a new prompt, restart, regrant or individual trust workaround. A correctly
+  staged opening-wait omission inverse MUST fail that body assertion after reaching the page
+  boundary. Source review and a bounded correlated diagnostic MUST establish the typed stop,
+  unchanged cursor, exact completion wake, resource release and stale-authority refusal.
+
 ## Unchanged rulings
 
 The decider confirmed these on 2026-10-19 ("that still sounds right to me"): no human/agent
@@ -1222,9 +1294,9 @@ Narrow successor amendments. Requirements not named here remain in force.
    the reproduced four-node daemon syncs nothing; one cut (v0.4.10).
 9. FX-37 is an immediate cross-cutting v0.4.10 blocker: until the normal shipped daemon can
    create a room, every room journey that reaches creation is red regardless of its own change.
-10. FX-38–FX-48: diagnose the QE-discovered causes, amend this contract, bind the corrective
+10. FX-38–FX-50: diagnose the QE-discovered causes, amend this contract, bind the corrective
     tasks to v0.4.15 and obtain Opus task/design review before permanent implementation.
-    FX-39, FX-40 and FX-44–FX-48 share one integration owner for coupled backend state;
+    FX-39, FX-40 and FX-44–FX-50 share one integration owner for coupled backend state;
     CLI/output and native navigation work may proceed independently once interfaces are fixed.
     Later consumer reds remain acceptance failures until their distinct causes are classified
     and corrected; a sender's completion is not its reader's successful use. The normal native,
