@@ -923,6 +923,7 @@ impl Node {
             self.own_key_room_set_changed.send_replace(());
         }
         self.retire_parked_private_drive(room, Fault::ChannelNotOpen);
+        self.session_ingress_waits.retain(|(id, _), _| id != room);
         let removed = self.channels.remove(room);
         drop(transition);
         let outcome = match removed {
@@ -988,6 +989,7 @@ impl Node {
             self.own_key_room_set_changed.send_replace(());
         }
         self.retire_parked_private_drive(room, Fault::ChannelNotOpen);
+        self.session_ingress_waits.retain(|(id, _), _| id != room);
         self.channels.remove(room);
         drop(transition);
         self.reopening.remove(room);

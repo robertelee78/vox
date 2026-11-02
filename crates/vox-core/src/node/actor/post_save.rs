@@ -603,17 +603,24 @@ impl Node {
     pub(super) async fn complete_pending_posts(&mut self) {
         let rooms: Vec<_> = self.pending_posts.keys().copied().collect();
         for room in rooms {
+            let owner = self.pending_posts.get(&room).map(Pending::owner);
             let retention = self
                 .pending_posts
                 .get(&room)
                 .and_then(Pending::retention_request);
             if matches!(self.pending_posts.get(&room), Some(Pending::Metadata(_))) {
                 self.complete_room_metadata(room).await;
+                if let Some(owner) = &owner {
+                    self.ingress_owner_finished(room, owner);
+                }
                 continue;
             }
             if matches!(self.pending_posts.get(&room), Some(Pending::Maintenance(_))) {
                 self.complete_pending_maintenance(room).await;
                 self.continue_deferred_retention(room, retention).await;
+                if let Some(owner) = &owner {
+                    self.ingress_owner_finished(room, owner);
+                }
                 continue;
             }
             let Some(Pending::Append(pending)) = self.pending_posts.get(&room) else {
@@ -796,6 +803,9 @@ impl Node {
                             if governance_owed {
                                 self.continue_deferred_governance(room, &shared, pending.epoch);
                             }
+                            if let Some(owner) = &owner {
+                                self.ingress_owner_finished(room, owner);
+                            }
                             continue;
                         }
                     }
@@ -806,6 +816,9 @@ impl Node {
             self.continue_deferred_retention(room, retention).await;
             if governance_owed {
                 self.continue_deferred_governance(room, &shared, pending.epoch);
+            }
+            if let Some(owner) = &owner {
+                self.ingress_owner_finished(room, owner);
             }
         }
     }

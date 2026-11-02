@@ -793,6 +793,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         }
         NetEvent::PrivateReleaseDue { .. } => "resuming eligible private Session release",
         NetEvent::PrivateDriveRoomReady { .. } => "resuming private work after room release",
+        NetEvent::IngressPublicationReady { .. } => "resuming Session ingress after publication",
         NetEvent::PrivateSessionPageReady { .. } | NetEvent::PrivateArchivePageReady { .. } => {
             "applying private Session records"
         }
@@ -1293,6 +1294,10 @@ enum NetEvent {
         token: u64,
     },
     PrivateDriveRoomReady {
+        room: Digest32,
+        token: u64,
+    },
+    IngressPublicationReady {
         room: Digest32,
         token: u64,
     },
@@ -6412,6 +6417,8 @@ pub struct Node {
     session_room_removed: Option<mpsc::Sender<crate::node::session_ingress::Retirement>>,
     session_rooms_retiring: BTreeSet<crate::node::session_ingress::Retirement>,
     session_ingress_cursor: usize,
+    session_ingress_scan: usize,
+    session_ingress_waits: BTreeMap<(Digest32, String), session_save::IngressWait>,
     /// An empty inbox clears a recovery failure, not delivery or room cleanup failures.
     /// Separate health keeps successful reads/appends from hiding unresolved cleanup.
     session_ingress_recovery_error: Option<String>,
@@ -6862,6 +6869,8 @@ impl Node {
             session_room_removed,
             session_rooms_retiring: BTreeSet::new(),
             session_ingress_cursor: 0,
+            session_ingress_scan: 0,
+            session_ingress_waits: BTreeMap::new(),
             session_ingress_recovery_error: None,
             session_ingress_error: None,
             session_retirement_error: None,
@@ -7662,14 +7671,23 @@ impl Node {
                     self.schedule().await;
                 }
                 _ = ingress_wake.notified(), if !save_pending => {
-                    let mut scheduled = false;
-                    for _ in 0..16 {
-                        scheduled |= self.begin_owned_session_ingress().await;
+                    if self.session_ingress_scan == 0 {
+                        self.session_ingress_scan = self.profile.as_ref()
+                            .filter(|profile| profile.is_unlocked())
+                            .and_then(|profile| match crate::node::session_ingress::active_count(profile) {
+                                Ok(count) => Some(count),
+                                Err(error) => {
+                                    self.session_ingress_recovery_error = Some(format!("Session activity cannot be recovered: {error}"));
+                                    None
+                                }
+                            }).unwrap_or(0);
                     }
-                    if scheduled {
-                        // The retained backlog edge survives while the native save owns its head.
-                        ingress_wake.notify_one();
+                    let turns = self.session_ingress_scan.min(16);
+                    self.session_ingress_scan -= turns;
+                    for _ in 0..turns {
+                        self.begin_owned_session_ingress().await;
                     }
+                    if self.session_ingress_scan != 0 { ingress_wake.notify_one(); }
                 }
                 _ = ticker.tick() => {
                     self.complete_identity_startup().await;
@@ -7892,7 +7910,7 @@ impl Node {
                         })
                 };
                 if result.is_ok() {
-                    self.session_ingress_wake.notify_one();
+                    self.ingress_scan_wake();
                 }
                 let _ = reply.send(result);
                 Outcome::Done
@@ -12099,6 +12117,9 @@ impl Node {
             NetEvent::PrivateDriveRoomReady { room, token } => {
                 self.resume_private_drive_room_ready(room, token).await;
             }
+            NetEvent::IngressPublicationReady { room, token } => {
+                self.ingress_publication_ready(room, token);
+            }
             NetEvent::BoundedRoomAdvanced {
                 channel_id,
                 rendered,
@@ -12120,6 +12141,18 @@ impl Node {
                     }
                     self.say_session_news(&channel_id).await;
                     self.sched_rooms.insert(channel_id);
+                    if rendered {
+                        self.ingress_room_progress(
+                            channel_id,
+                            session_save::IngressProgress::Projection,
+                        );
+                    }
+                    if governance {
+                        self.ingress_room_progress(
+                            channel_id,
+                            session_save::IngressProgress::Governance,
+                        );
+                    }
                     self.resume_parked_private_drive(channel_id).await;
                     if rendered || governance {
                         let _ = self.event_tx.send(NodeEvent::Synced {
@@ -12220,6 +12253,7 @@ impl Node {
                         // worker. Touch the room here so schedule observes it immediately and
                         // advertises the newly committed head back to its author.
                         self.sched_rooms.insert(channel_id);
+                        self.ingress_room_progress(channel_id, session_save::IngressProgress::Room);
                         self.resume_parked_private_drive(channel_id).await;
                         if let Some(sent) = acknowledged {
                             self.finish_leave_if_heard(channel_id, sent).await;
@@ -12339,6 +12373,13 @@ impl Node {
                         .is_some_and(|room| room.try_lock().is_ok_and(|room| !room.is_settled()));
                     self.settle_room(&channel_id).await;
                     if was_unsettled || report.out.applied > 0 || report.out.governance > 0 {
+                        self.ingress_room_progress(channel_id, session_save::IngressProgress::Room);
+                        if report.out.governance > 0 {
+                            self.ingress_room_progress(
+                                channel_id,
+                                session_save::IngressProgress::Governance,
+                            );
+                        }
                         self.resume_parked_private_drive(channel_id).await;
                     }
                 }
@@ -18139,6 +18180,8 @@ impl Node {
     /// up to one Argon2id derivation, it would answer nobody meanwhile (V210-71). Until then the
     /// node is *locking* ([`NodeView::locking`]). The returned receiver fires once it has settled.
     async fn lock_all(&mut self) -> oneshot::Receiver<()> {
+        self.session_ingress_waits.clear();
+        self.session_ingress_scan = 0;
         self.retire_parked_private_drives(Fault::Locked);
         self.retire_identity_startup();
         self.retire_pending_posts();
@@ -18531,6 +18574,8 @@ impl Node {
             self.own_key_room_set_changed.send_replace(());
         }
         self.retire_parked_private_drive(channel_id, Fault::ChannelNotOpen);
+        self.session_ingress_waits
+            .retain(|(room, _), _| room != channel_id);
         self.channels.remove(channel_id);
         self.room_publication_authority.remove(channel_id);
         self.fresh_details.remove(channel_id);

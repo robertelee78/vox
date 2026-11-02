@@ -328,14 +328,13 @@ impl Node {
     pub(in crate::node::actor) fn park_session_release(
         &mut self,
         room: Digest32,
-        instance: SharedChannel,
-        attachment: u64,
-        lifetime: Arc<maintenance_save::Lifetime>,
+        owner: (SharedChannel, u64, Arc<maintenance_save::Lifetime>),
         ensure: bool,
         guard: Option<computer::ComputerPolicyGuard>,
         missed: BTreeSet<Digest32>,
         reply: ActorReply,
     ) {
+        let (instance, attachment, lifetime) = owner;
         if let Some(parked) = self.parked_private_drives.get(&room) {
             if parked.attachment != attachment
                 || !parked
@@ -724,7 +723,10 @@ impl Node {
                 return;
             }
         }
-        if self.pending_posts.contains_key(&room) {
+        if let Some(owner) = self.pending_posts.get(&room).map(post_save::Pending::owner) {
+            if let Some(parked) = self.parked_private_drives.get_mut(&room) {
+                parked.busy_owner = Some(owner);
+            }
             return;
         }
         let Some(mut parked) = self.parked_private_drives.remove(&room) else {
@@ -1139,10 +1141,12 @@ impl Node {
                 }
                 return false;
             };
-            let parked = self
-                .parked_private_drives
-                .get_mut(&room)
-                .expect("parked room");
+            let Some(parked) = self.parked_private_drives.get_mut(&room) else {
+                if let Some(reply) = reply {
+                    let _ = reply.send(Outcome::Failed(Fault::ChannelNotOpen));
+                }
+                return false;
+            };
             if parked.attachment != self.delivery_epoch
                 || !parked
                     .instance
@@ -1191,10 +1195,12 @@ impl Node {
                 }
                 return false;
             };
-            let parked = self
-                .parked_private_drives
-                .get_mut(&room)
-                .expect("parked room");
+            let Some(parked) = self.parked_private_drives.get_mut(&room) else {
+                if let Some(reply) = reply {
+                    let _ = reply.send(Outcome::Failed(Fault::ChannelNotOpen));
+                }
+                return false;
+            };
             if parked.attachment != self.delivery_epoch
                 || !parked
                     .instance

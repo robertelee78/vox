@@ -556,6 +556,7 @@ impl Node {
                         if !pending.created {
                             self.reopen_remembered().await;
                         }
+                        self.ingress_scan_wake();
                         self.resume_own_key_interruptions();
                         self.resume_own_key_donor_busy();
                         self.resume_own_key_policy_waiting();

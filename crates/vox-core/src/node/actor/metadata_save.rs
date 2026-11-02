@@ -971,6 +971,9 @@ impl Node {
         {
             return Err(Fault::ComputerPolicy);
         }
+        self.session_ingress_waits
+            .retain(|(room, _), _| *room != parsed.channel_id);
+        self.ingress_scan_wake();
         self.governance_work.wake_room(parsed.channel_id);
         self.request_admitted_recovery(parsed.channel_id);
         self.refresh_reachers().await;

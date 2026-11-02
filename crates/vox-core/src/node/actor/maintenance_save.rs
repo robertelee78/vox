@@ -915,6 +915,32 @@ impl Node {
         };
         channel.note_publication_complete();
         drop(channel);
+        if installable
+            && matches!(
+                &result,
+                Ok(Saved::Projection(
+                    session_projection::ProjectionProgress::Sessions { advanced: true }
+                ))
+            )
+        {
+            self.ingress_room_progress(room, session_save::IngressProgress::Projection);
+        }
+        if installable
+            && matches!(
+                &result,
+                Ok(Saved::Governance(governance_save::Saved::Legacy {
+                    advanced: true,
+                    ..
+                })) | Ok(Saved::Governance(governance_save::Saved::Contiguous {
+                    pending: false
+                })) | Ok(Saved::Governance(governance_save::Saved::Backfill {
+                    placed: true,
+                    ..
+                }))
+            )
+        {
+            self.ingress_room_progress(room, session_save::IngressProgress::Governance);
+        }
         if let Some((room, target)) = held {
             self.consent_keys.remove(&room, &target);
         }

@@ -1244,9 +1244,10 @@ fn private_session_opened_offline_reaches_its_paired_driver() {
     let hook_output = hook
         .wait_with_output()
         .expect("APPARATUS: collect synthetic hook");
+    let mut local = (false, String::new(), String::new());
     assert!(
         wait_until(RETURN_WITHIN, || {
-            let (ok, out, _) = worker.run(
+            local = worker.run(
                 &[
                     "room",
                     "session",
@@ -1258,11 +1259,16 @@ fn private_session_opened_offline_reaches_its_paired_driver() {
                 ],
                 "",
             );
-            ok && out.contains(PROMPT)
+            local.0 && local.1.contains(PROMPT)
         }),
-        "APPARATUS: original offline Session was not locally committed; hook stdout {}; stderr {}",
+        "PRODUCT: the original offline Session was not readable locally; stdout {}; stderr {}; hook exit {}; hook stdout {}; hook stderr {}; worker log {}; driver log {}",
+        local.1,
+        local.2,
+        hook_output.status,
         String::from_utf8_lossy(&hook_output.stdout),
-        String::from_utf8_lossy(&hook_output.stderr)
+        String::from_utf8_lossy(&hook_output.stderr),
+        worker.log(),
+        driver.log()
     );
 
     let (ok, out, err) = driver.run(
