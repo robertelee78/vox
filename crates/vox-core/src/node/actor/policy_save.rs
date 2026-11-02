@@ -1284,8 +1284,12 @@ impl Node {
                 }
                 if *cursor == pending.ready.rooms.len() {
                     let (sender, receiver) = oneshot::channel();
-                    self.begin_owned_owed_consents(Arc::clone(&save), sender)
-                        .await;
+                    self.begin_managed_owed_consents(
+                        Arc::clone(&save),
+                        pending.ready.guard.clone(),
+                        sender,
+                    )
+                    .await;
                     pending.stage = DriveStage::Consents(receiver);
                 } else {
                     let room = &pending.ready.rooms[*cursor];
