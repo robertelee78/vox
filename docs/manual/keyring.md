@@ -273,6 +273,11 @@ confirmed. This cannot erase messages or files the removed computer already rece
 or an old roster cannot restore it. Bringing it back requires a fresh two-sided enrollment.
 After removal you can instead make a deliberate new individual grant with `vox trust add`.
 
+While a received removal is being applied, a room read can say `computer policy is refreshing;
+retry`. Check `vox computer status` for the pending application; do not repeat the removal,
+regrant trust or restart the daemon to make that application finish. Read-only governance
+preparation resumes the existing application without replaying committed withdrawals.
+
 Copying a node folder does not transfer management. For an intentional move, the existing
 manager releases the exact node to one enrolled destination, then the destination approves:
 
