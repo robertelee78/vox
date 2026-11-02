@@ -24,7 +24,8 @@
   Session receiver admission, exact parked prerequisites, recipient-key ownership, durable
   activity ingress continuation and recipient-key recovery publication readiness); amended
   2026-11-02 (FX-49–FX-50: managed removal's read-only governance prerequisite and private
-  page recovery across a temporarily unprojected Session opening)
+  page recovery across a temporarily unprojected Session opening); amended 2026-11-02
+  (FX-44, FX-48, FX-50: shared consumer-sensitive inverse, separate from internal-path evidence)
 - **Deciders**: Robert E. Lee
 - **Tags**: trust, daemon identity, sessions, presence, agent comms, sync, health, releases
 - **Related**: ADR-018, ADR-020, ADR-026, ADR-029, ADR-031, ADR-033, ADR-034, ADR-035, ADR-036,
@@ -1029,8 +1030,18 @@ lessons. It changes neither this record's decision status nor any requirement or
   that same original private prompt MUST become readable without repeating its producer,
   restarting the writer, re-pairing or individual grants. Public projection readiness and actual
   reader entitlement are apparatus preconditions, not substitutes for the private-read verdict.
-  A disabled causal handoff MUST make that consumer assertion fail. Revoking drive while work
-  waits MUST prevent private disclosure while independent public read remains usable.
+  A reader-return private-ingestion omission inverse MUST make that consumer assertion fail
+  after valid author-local and public-connectivity controls. Revoking drive while work waits
+  MUST prevent private disclosure while independent public read remains usable.
+
+  The same original-private-body journey MAY supply one shared consumer-sensitive inverse
+  across FX-44–FX-50. It MUST cut the reader's private-ingestion/recovery feature only on that
+  reader's return, leaving the original producer and public connectivity controls intact.
+  Individual prerequisite, wake, cursor, resource and authority invariants MUST still receive
+  independent source review and bounded correlated diagnostics. An independent legitimate
+  recovery path delivering the body is correct behavior; omission of one internal wake alone
+  MUST NOT be required to defeat every other recovery path or become a mechanism CI gate.
+  Separate multi-head/restart consumer claims still require their own actual staged evidence.
 
 - **FX-45.** A parked private-drive obligation MUST retain its actual missing prerequisite,
   not only its stage. Publication-busy work MUST name the exact room/native owner whose
@@ -1161,10 +1172,10 @@ lessons. It changes neither this record's decision status nor any requirement or
   Acceptance MUST observe the actual original private body at an entitled reader after the
   relevant publication progress, with author-local content and fresh public connectivity as
   controls. No replacement prompt, regrant or restart may substitute for the continuation.
-  A correctly staged omission inverse MUST fail the body assertion, not staging. Source review
-  and a bounded correlated diagnostic support readiness attribution; internal stage/token
-  observations alone are not feature verdicts. Existing floors, membership, refusal and
-  revocation semantics remain unchanged.
+  The shared reader-return consumer inverse in FX-44 MUST fail the body assertion, not staging.
+  Source review and a bounded correlated diagnostic support readiness attribution; internal
+  stage/token observations alone are not feature verdicts. Existing floors, membership, refusal
+  and revocation semantics remain unchanged.
 
 - **FX-49.** A still-current managed computer-policy application MUST retain its exact turn,
   reconciliation stage, cursor, target and reply across a read-only consent-page governance
@@ -1231,10 +1242,10 @@ lessons. It changes neither this record's decision status nor any requirement or
 
   Acceptance MUST read the same original offline-created private activity after the opening's
   real projection progress, with local original content and fresh public round trips as
-  controls, without a new prompt, restart, regrant or individual trust workaround. A correctly
-  staged opening-wait omission inverse MUST fail that body assertion after reaching the page
-  boundary. Source review and a bounded correlated diagnostic MUST establish the typed stop,
-  unchanged cursor, exact completion wake, resource release and stale-authority refusal.
+  controls, without a new prompt, restart, regrant or individual trust workaround. The shared
+  reader-return consumer inverse in FX-44 MUST fail the body assertion after valid staging.
+  Source review and a bounded correlated diagnostic MUST establish this page boundary's typed
+  stop, unchanged cursor, exact completion wake, resource release and stale-authority refusal.
 
 ## Unchanged rulings
 
