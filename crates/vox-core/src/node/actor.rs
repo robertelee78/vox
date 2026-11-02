@@ -21638,6 +21638,17 @@ impl Node {
             .collect();
         for (room, shared) in rooms {
             let Ok(held) = shared.try_lock() else {
+                // Current sync ports identify known peers without borrowing the busy room.
+                // The existing pull owner revalidates membership when its room wait completes.
+                let current = crate::node::ports::RoomRef::Channel(Arc::downgrade(&shared));
+                let peers: Vec<_> = self
+                    .ports
+                    .range((room, [0; 32])..=(room, [u8::MAX; 32]))
+                    .filter_map(|((_, peer), port)| port.room.is(&current).then_some(*peer))
+                    .collect();
+                for peer in peers {
+                    self.pull_private_sessions(room, peer).await;
+                }
                 continue;
             };
             let members = held.drive_members();
