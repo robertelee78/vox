@@ -1,6 +1,6 @@
 # ADR-038: Daemons Trust Daemons, and Sessions Are Presence
 
-- **Status**: Accepted for FX-38–FX-47 in v0.4.15. The decider's product rulings of 2026-10-19
+- **Status**: Accepted for FX-38–FX-48 in v0.4.15. The decider's product rulings of 2026-10-19
   (one question at a time, quoted below) remain accepted; other undecided presentation details
   remain proposed. The 2026-11-01 correction workflow and release were selected by the decider;
   Opus technical approval and implementation, acceptance and delivery are recorded on the
@@ -20,9 +20,9 @@
   resource ownership, fair admission selection, Busy attempt credit, legal proof staging and
   exact accepted Resume capacity ownership); amended 2026-11-01 (FX-38–FX-43: QE correction
   workflow, live computer-policy application, native re-selection, approval handoffs and
-  terminal input/output contracts for v0.4.15); amended 2026-11-02 (FX-44–FX-47: private
-  Session receiver admission, exact parked prerequisites, recipient-key ownership and durable
-  activity ingress continuation)
+  terminal input/output contracts for v0.4.15); amended 2026-11-02 (FX-44–FX-48: private
+  Session receiver admission, exact parked prerequisites, recipient-key ownership, durable
+  activity ingress continuation and recipient-key recovery publication readiness)
 - **Deciders**: Robert E. Lee
 - **Tags**: trust, daemon identity, sessions, presence, agent comms, sync, health, releases
 - **Related**: ADR-018, ADR-020, ADR-026, ADR-029, ADR-031, ADR-033, ADR-034, ADR-035, ADR-036,
@@ -1120,6 +1120,36 @@ lessons. It changes neither this record's decision status nor any requirement or
   A discriminating inverse MUST fail its user-visible body assertion after valid staging.
   Source review and a bounded spike cover exact-owner wake matching, parked-resource release,
   restart recovery and finite multi-head scanning; they MUST NOT create a mechanism CI gate.
+
+- **FX-48.** Recipient-key recovery MUST retain already-available work when a read-only
+  publication snapshot is temporarily busy. The existing publication wake MUST be subscribed
+  before the recovery worker reads its history instance or authorization generation. At those
+  two read-only boundaries, the exact typed publication-busy refusal MUST select the existing
+  bounded logical publication wait instead of marking the port initialized with a permanent
+  failure. The same room, peer, owner, dirty token, connection, attachment and current trust
+  MUST be revalidated before resumption. The worker MUST release its room guard, job, bytes and
+  secret-work ownership before waiting; no fresh catalog, prompt, regrant, restart or Tick/Status
+  polling may be required to rescue that existing obligation.
+  Provider-cursor writes, uncertain commits and all other refusals retain their meaning.
+  This correction MUST NOT create a generic error retry, another runner, timer or CI gate.
+
+  The normal `04fae5739` matrix exposed all three original producer bodies locally but not the
+  first entitled remote consumer within sixty seconds. Its receiving daemon twice reported
+  `recipient key recovery could not inspect saved work: node: room publication is busy; retry
+  this operation`. Source sends that read error through `ScanResult::Failed`, marks the port
+  initialized and retains no wake. Only a later genuinely changed catalog replaces the dirty
+  token and makes it selectable again. This is a source-confirmed lost-readiness defect,
+  distinct from FX-44's post-install receiver handoff. The original log lacks room, peer and
+  read-stage correlation; it MUST NOT be claimed as the unique cause of that failed journey
+  or the separate outsider-private baseline failure without the missing runtime evidence.
+
+  Acceptance MUST observe the actual original private body at an entitled reader after the
+  relevant publication progress, with author-local content and fresh public connectivity as
+  controls. No replacement prompt, regrant or restart may substitute for the continuation.
+  A correctly staged omission inverse MUST fail the body assertion, not staging. Source review
+  and a bounded correlated diagnostic support readiness attribution; internal stage/token
+  observations alone are not feature verdicts. Existing floors, membership, refusal and
+  revocation semantics remain unchanged.
 
 ## Unchanged rulings
 
