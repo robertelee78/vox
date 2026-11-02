@@ -11,6 +11,7 @@ set -euo pipefail
 root="$RUNNER_TEMP/vox-candidates"
 prior=753b17529c96efa84b6c89a3236b0348aff54559
 triple=aarch64-apple-darwin
+source_version=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
 
 if [[ $1 == build ]]; then
   [[ ! -e $root ]] || { echo "candidate: $root already exists" >&2; exit 1; }
@@ -19,7 +20,7 @@ if [[ $1 == build ]]; then
   mkdir -p "$root/source" "$root/output" "$root/scratch/data" "$root/scratch/config"
   export VOX_DATA_DIR="$root/scratch/data" VOX_CONFIG_DIR="$root/scratch/config"
   for variant in normal lower-version-test-knobs current-test-knobs; do
-    version=0.4.14
+    version="$source_version"
     feature=default
     if [[ $variant == lower-version-test-knobs ]]; then version=0.4.13; fi
     if [[ $variant != normal ]]; then feature=vox-tui/test-knobs; fi
@@ -32,14 +33,15 @@ if [[ $1 == build ]]; then
       if [[ $variant == lower-version-test-knobs ]]; then
         cp Cargo.toml "$out/base-Cargo.toml"
         cp Cargo.lock "$out/base-Cargo.lock"
-        python3 - <<'PY'
+        SOURCE_VERSION="$source_version" python3 - <<'PY'
+import os
 from pathlib import Path
 path = Path("Cargo.toml")
 text = path.read_text()
-old = '[workspace.package]\nversion = "0.4.14"'
+old = f'[workspace.package]\nversion = "{os.environ["SOURCE_VERSION"]}"'
 new = '[workspace.package]\nversion = "0.4.13"'
 if text.count(old) != 1:
-    raise SystemExit("candidate: expected exactly one 0.4.14 workspace version")
+    raise SystemExit(f'candidate: expected exactly one {os.environ["SOURCE_VERSION"]} workspace version')
 path.write_text(text.replace(old, new, 1))
 PY
         echo '+ cargo update --workspace'
@@ -72,9 +74,9 @@ PY
       patch_sha=$(shasum -a 256 "$out/version.patch" | cut -d' ' -f1)
       lock_patch_sha=$(shasum -a 256 "$out/lock.patch" | cut -d' ' -f1)
       lock_sha=$(shasum -a 256 "$out/Cargo.lock" | cut -d' ' -f1)
-      delta=$(jq -n --arg patch_sha "$patch_sha" --arg lock_patch_sha "$lock_patch_sha" \
+    delta=$(jq -n --arg source_version "$source_version" --arg patch_sha "$patch_sha" --arg lock_patch_sha "$lock_patch_sha" \
         --arg lock_sha "$lock_sha" \
-        '{from:"0.4.14",to:"0.4.13",patch:"version.patch",patch_sha256:$patch_sha,lock_patch:"lock.patch",lock_patch_sha256:$lock_patch_sha,generated_lock:"Cargo.lock",generated_lock_sha256:$lock_sha}')
+        '{from:$source_version,to:"0.4.13",patch:"version.patch",patch_sha256:$patch_sha,lock_patch:"lock.patch",lock_patch_sha256:$lock_patch_sha,generated_lock:"Cargo.lock",generated_lock_sha256:$lock_sha}')
     else
       delta=null
     fi
@@ -92,7 +94,7 @@ fi
 for variant in normal lower-version-test-knobs current-test-knobs; do
   src="$root/source/$variant"
   out="$root/output/$variant"
-  version=0.4.14
+  version="$source_version"
   if [[ $variant == lower-version-test-knobs ]]; then version=0.4.13; fi
   (
     cd "$src"
