@@ -1183,7 +1183,7 @@ lessons. It changes neither this record's decision status nor any requirement or
   capture and publication reservation inside `commit_provider_cursor`, before its cursor CAS,
   as additional busy boundaries that still reach `ScanResult::Failed` and discard the wake.
   The correction is to distinguish those precommit waits inside that helper, while leaving
-  every postcommit error outside the wait result. Both inspection closures already own an
+  every postcommit error outside the wait result. The inspection closure already owns an
   enabled publication wake. That existing wake, not a new runner or subscription, is to carry
   the retained logical obligation after the blocking worker releases its physical owners.
 
