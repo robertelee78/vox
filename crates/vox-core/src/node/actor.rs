@@ -14836,7 +14836,6 @@ impl Node {
             .delivery_bundle_or_signed(channel_id, target)
             .await
             .map_err(Some)?;
-        self.one_time_waits.remove(&pair);
         if self.signed_said.insert(pair) {
             if let Some(net) = self.net.as_ref() {
                 net.manager().note(

@@ -498,7 +498,9 @@ impl Node {
                 return None;
             }
         };
-        self.reserve_owned_outbound(context, bundle, target)
+        let selected = self.reserve_owned_outbound(context, bundle, target)?;
+        self.one_time_waits.remove(&(*room, target));
+        Some(selected)
     }
 
     /// Legacy session initiation has always allowed immediate signed-prekey fallback;
