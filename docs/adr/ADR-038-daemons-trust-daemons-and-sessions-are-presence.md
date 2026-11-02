@@ -1050,6 +1050,19 @@ lessons. It changes neither this record's decision status nor any requirement or
   caused the private-read timeout. Acceptance retains FX-40/FX-44's actual private-read and
   stale-authority outcomes; it MUST NOT replace them with a scheduler or timing counter.
 
+  A later correlated diagnostic observed the author's opening and body appends coalescing
+  into an existing background Upgrade, followed by wake returns on a retained busy-owner marker.
+  Coalescing remains valid only because the resumed background pass reads current Session
+  state. Source exposes a separate missing edge: both the post-save notification and the
+  existing ticker complete native posts, but only the notification caller transfers or clears
+  the private busy-owner marker. If the other caller completes first, a later notification
+  sees a different owner or none and cannot release that old wait. The diagnostic did not name
+  the completing caller, so this source-demonstrated race is not unique runtime attribution.
+  Every per-room native completion MUST perform the same exact captured-owner handoff for
+  ingress and private work after all completed physical guards have dropped. An unchanged owner
+  MUST remain busy; a successor MUST inherit the wait before any fresh private admission.
+  The callback-only snapshot and any periodic rescue MUST NOT substitute for that central edge.
+
 - **FX-46.** A Session drive release that lacks an eligible recipient prekey MUST preserve its
   unresolved logical obligation instead of retiring its live chain and depending on periodic
   re-entry. It MUST reuse the same per-room weak parked ownership and retain only the original
