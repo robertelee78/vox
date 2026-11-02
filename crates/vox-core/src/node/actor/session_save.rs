@@ -917,8 +917,7 @@ impl Node {
                 // The append decision is now complete. The existing prerequisite chain may
                 // choose a fresh drive decision; never recursively acquire under its old lease.
                 drop(lifetime);
-                let holders = self.drive_holders();
-                Box::pin(self.tend_drive_keys_in(&room, &holders)).await;
+                Box::pin(self.begin_owned_private_drive(room, true, None, None, None)).await;
             }
             (
                 After::Drive { ensure, guard },

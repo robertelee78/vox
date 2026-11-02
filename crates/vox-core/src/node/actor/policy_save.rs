@@ -1373,7 +1373,7 @@ impl Node {
                     .is_some_and(|current| Arc::ptr_eq(current, &instance))
                 {
                     self.ingress_room_progress(room, session_save::IngressProgress::Authority);
-                    self.begin_owned_private_drive(room, Some(guard.clone()), None, None)
+                    self.begin_owned_private_drive(room, false, Some(guard.clone()), None, None)
                         .await;
                 }
             }
