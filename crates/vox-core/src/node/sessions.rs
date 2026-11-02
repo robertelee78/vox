@@ -82,6 +82,11 @@ pub struct LifecycleRow {
     pub cursor: LifecycleCursor,
 }
 
+// Only the two read-only opening queries translate this snapshot invalidation. A write
+// failure with the same text must never be treated as permission to replay a mutation.
+const OPENING_VIEW_CHANGED: &str = "the Session opening view changed; retry";
+const READ_VIEW_CHANGED: &str = "stream refused: the room changed while reading; refresh and retry";
+
 /// Exact own/current-author lookup. Pending policy and Session folds retry within the same
 /// deadline; neither the actor nor a waiting client retains all Session metadata.
 pub(crate) async fn lookup(
@@ -105,6 +110,12 @@ pub(crate) async fn lookup(
         {
             Ok(Reply::Lookup(row)) => return Ok(row),
             Ok(_) => return Err("unexpected Session lookup answer".into()),
+            Err(reason) if reason == READ_VIEW_CHANGED => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(OPENING_VIEW_CHANGED.into());
+                }
+                tokio::task::yield_now().await;
+            }
             Err(reason)
                 if opening_refreshing(&reason) && tokio::time::Instant::now() < deadline =>
             {
@@ -131,6 +142,7 @@ pub fn opening_refreshing(reason: &str) -> bool {
             | "node: legacy Session classification is refreshing"
             | "stream refused: Session authorization facts are refreshing"
             | "stream refused: Session control facts are refreshing"
+            | OPENING_VIEW_CHANGED
     )
 }
 
@@ -205,6 +217,12 @@ pub async fn open_when_member(
         {
             Ok(crate::node::attention::Reply::Resolved { .. }) => return Ok(()),
             Ok(_) => return Err("unexpected Session attention preparation answer".into()),
+            Err(reason) if reason == READ_VIEW_CHANGED => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(OPENING_VIEW_CHANGED.into());
+                }
+                tokio::task::yield_now().await;
+            }
             Err(reason)
                 if opening_refreshing(&reason) && tokio::time::Instant::now() < deadline =>
             {
