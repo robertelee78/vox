@@ -1274,6 +1274,8 @@ Narrow successor amendments. Requirements not named here remain in force.
 | FX-40: room obligations retain causal ownership without physical leases | FX-46 carries that same ownership through unavailable recipient prekeys while preserving existing OTP and signed-fallback eligibility |
 | FX-40: required continuations survive ordinary room progress | FX-47 retains the durable activity ingress scheduling demand through its exact room prerequisite and restored lifecycle, without confusing accepted inbox data with projected Session content |
 | FX-44: an installed authorized receiver retains its actual read demand | FX-48 preserves the earlier recipient-key recovery obligation through exact read-only publication readiness, before a receiver can be installed |
+| FX-28, FX-40: still-current managed application retains its original continuation | FX-49 preserves the committed prefix through the exact read-only governance prerequisite without poisoning or terminalizing the application |
+| FX-44: an installed authorized receiver retains its actual read demand | FX-50 retains the receiver's page obligation through a temporarily unprojected opening, without changing floors or replacing a sender-drive obligation |
 | ADR-034 §5 "Health is true" (HL-1, HL-2), PRD-001 R35 | The lane's completed rounds are completed syncs (FX-16); the control socket answers under sync load (FX-17) |
 
 ## Implementation order and related work
