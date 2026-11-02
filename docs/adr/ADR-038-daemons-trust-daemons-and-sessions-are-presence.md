@@ -1,6 +1,6 @@
 # ADR-038: Daemons Trust Daemons, and Sessions Are Presence
 
-- **Status**: Accepted for FX-38–FX-50 in v0.4.15. The decider's product rulings of 2026-10-19
+- **Status**: Accepted for FX-38–FX-51 in v0.4.15. The decider's product rulings of 2026-10-19
   (one question at a time, quoted below) remain accepted; other undecided presentation details
   remain proposed. The 2026-11-01 correction workflow and release were selected by the decider;
   Opus technical approval and implementation, acceptance and delivery are recorded on the
@@ -25,7 +25,8 @@
   activity ingress continuation and recipient-key recovery publication readiness); amended
   2026-11-02 (FX-49–FX-50: managed removal's read-only governance prerequisite and private
   page recovery across a temporarily unprojected Session opening); amended 2026-11-02
-  (FX-44, FX-48, FX-50: shared consumer-sensitive inverse, separate from internal-path evidence)
+  (FX-44, FX-48, FX-50: shared consumer-sensitive inverse, separate from internal-path evidence);
+  amended 2026-11-02 (FX-51: post-issued-consent rekey selection through governance readiness)
 - **Deciders**: Robert E. Lee
 - **Tags**: trust, daemon identity, sessions, presence, agent comms, sync, health, releases
 - **Related**: ADR-018, ADR-020, ADR-026, ADR-029, ADR-031, ADR-033, ADR-034, ADR-035, ADR-036,
@@ -1247,6 +1248,55 @@ lessons. It changes neither this record's decision status nor any requirement or
   Source review and a bounded correlated diagnostic MUST establish this page boundary's typed
   stop, unchanged cursor, exact completion wake, resource release and stale-authority refusal.
 
+- **FX-51.** After a consent has been successfully issued and its outbound job enqueued,
+  its still-current consent continuation MUST survive a governance-refreshing refusal from
+  the following read-only rekey selection. The already-issued consent MUST NOT be replayed,
+  its outbound job MUST NOT be enqueued twice, and a pending derived read MUST NOT turn the
+  managed computer-policy application into a terminal failure.
+
+  This applies to every post-issue `RekeyAfter::Consent` path, including ordinary owed-consent
+  delivery, not a particular computer, room or input. `Automatic`, `Settlement` and `Packages`
+  rekey outcomes retain their existing semantics; this is not a generic error-retry policy.
+  The original consent owner MUST retain its room instance, attachment, target, decision,
+  asked state, lifetime, replies and unadvanced selection cursors. It MUST reuse the existing
+  consent/native-maintenance continuation for bounded governance projection work, without
+  another runner, timer, total-step cap or renewed deadline. Each completion MUST be matched
+  to that exact owned prerequisite. Pending bounded projection work continues under the same
+  owner; readiness permits a fresh selection, not reuse of stale selected recipients.
+  A result with neither readiness nor remaining work MUST report its actual failure rather
+  than spin or claim completion.
+
+  Selection and each resumed step MUST revalidate the room instance, attachment, current
+  computer authority, original managed guard where present and actual recipient trust.
+  Independent room owners can run between native completions: actor turn order alone is
+  not a publication fence. Parked state MUST NOT retain a room lock, store/secret lease,
+  publication reader, worker slot, budget charge or decrypted content. Lock/shutdown,
+  room replacement/removal, target distrust and authority supersession MUST retire the
+  exact old owner and resolve its replies without clearing or resuming a newer owner.
+  Selection cursors MUST advance only after both selection reads succeed; the existing
+  successful-read ordering is preserved, not repaired as an invented cursor defect.
+
+  The `116d48515` diagnostic, behaviorally based on normal candidate `1e5b9fb1d`, traced
+  successful managed removal and withdrawal projection, followed by successful consent issue
+  and `queue.send(job)`, then `begin_owned_rekeys_for` returning the governance-refreshing
+  error through `owed_rekeys` and `consented_member_page`. The issue installation retires
+  semantic governance readiness; sealed disk authority at issue admission does not establish
+  that the subsequent semantic read is ready. This is later than FX-49's pre-issue
+  consent-page read. Both selection reads already precede cursor updates. Missing frontier
+  parents are not evidence of a permanently blocked local projection: the existing walk
+  advances past them and a later parent can separately requeue their children.
+
+  Acceptance MUST complete real computer removal through settled local policy application
+  and the independent entitled observer's effective Drive, with original private content
+  and fresh public traffic as staging controls. Fresh private content and file transfer
+  MUST remain unavailable to the removed computer, and a later explicit re-pair MUST
+  restore fresh permitted use. No restart, repeated removal, replayed prompt or individual
+  trust workaround may substitute for finishing the original application. A correctly staged
+  omission inverse MUST fail the user-visible settled-application assertion after successful
+  issue, not fail earlier setup. Independent Opus source review and bounded correlated
+  diagnostics MUST verify exact stage/receipt ownership, unchanged failed-read cursors,
+  fresh authorization, resource release and single publication; these are not mechanism gates.
+
 ## Unchanged rulings
 
 The decider confirmed these on 2026-10-19 ("that still sounds right to me"): no human/agent
@@ -1287,6 +1337,7 @@ Narrow successor amendments. Requirements not named here remain in force.
 | FX-44: an installed authorized receiver retains its actual read demand | FX-48 preserves the earlier recipient-key recovery obligation through exact read-only publication readiness, before a receiver can be installed |
 | FX-28, FX-40: still-current managed application retains its original continuation | FX-49 preserves the committed prefix through the exact read-only governance prerequisite without poisoning or terminalizing the application |
 | FX-44: an installed authorized receiver retains its actual read demand | FX-50 retains the receiver's page obligation through a temporarily unprojected opening, without changing floors or replacing a sender-drive obligation |
+| FX-28, FX-49: managed application preserves its committed prefix across derived reads | FX-51 retains the original post-issued-consent continuation through rekey-selection governance readiness without repeating issue or outbound enqueue |
 | ADR-034 §5 "Health is true" (HL-1, HL-2), PRD-001 R35 | The lane's completed rounds are completed syncs (FX-16); the control socket answers under sync load (FX-17) |
 
 ## Implementation order and related work
@@ -1307,9 +1358,9 @@ Narrow successor amendments. Requirements not named here remain in force.
    the reproduced four-node daemon syncs nothing; one cut (v0.4.10).
 9. FX-37 is an immediate cross-cutting v0.4.10 blocker: until the normal shipped daemon can
    create a room, every room journey that reaches creation is red regardless of its own change.
-10. FX-38–FX-50: diagnose the QE-discovered causes, amend this contract, bind the corrective
+10. FX-38–FX-51: diagnose the QE-discovered causes, amend this contract, bind the corrective
     tasks to v0.4.15 and obtain Opus task/design review before permanent implementation.
-    FX-39, FX-40 and FX-44–FX-50 share one integration owner for coupled backend state;
+    FX-39, FX-40 and FX-44–FX-51 share one integration owner for coupled backend state;
     CLI/output and native navigation work may proceed independently once interfaces are fixed.
     Later consumer reds remain acceptance failures until their distinct causes are classified
     and corrected; a sender's completion is not its reader's successful use. The normal native,
