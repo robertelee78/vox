@@ -460,10 +460,26 @@ impl Node {
                     if !guard.is_member(&peer) || !guard.is_member(&node) {
                         return Ok(ScanResult::Ineligible);
                     }
-                    let instance = guard.history_instance(&store)?;
-                    let generation =
-                        authorization_generation(&store, node, room, instance, guard.epoch())?;
+                    // Subscribe before either read can observe a transient publication boundary.
                     let wake = guard.history_publication_wake();
+                    let instance = match guard.history_instance(&store) {
+                        Ok(instance) => instance,
+                        Err(Error::Profile("room publication is busy; retry this operation")) => {
+                            return Ok(ScanResult::Busy(wake));
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    let generation =
+                        match authorization_generation(&store, node, room, instance, guard.epoch())
+                        {
+                            Ok(generation) => generation,
+                            Err(Error::Profile(
+                                "room publication is busy; retry this operation",
+                            )) => {
+                                return Ok(ScanResult::Busy(wake));
+                            }
+                            Err(error) => return Err(error),
+                        };
                     if advance.is_some() || remote_advance.is_some() {
                         let Some(mut cursor) = held_cursor else {
                             return Ok(ScanResult::Superseded);
