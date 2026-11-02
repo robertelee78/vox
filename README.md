@@ -314,6 +314,12 @@ exclude those knobs. Heavy, timing-bound or live-model checks need `--features o
 [docs/release/optional-proofs.md](docs/release/optional-proofs.md) and
 [ADR-018](docs/adr/ADR-018-quality-bar-and-product-proof.md).
 
+The repository owner's `release.yml` manual dispatch can build signed, notarized macOS
+candidates without publishing: set `candidate_only` and the exact branch `candidate_sha`.
+The normal candidate and current-source test-knob fixture use the workspace version; the
+separately labelled lower-version fixture is compiled at 0.4.13. Their source/version
+receipts travel with the artifacts. Test-knob fixtures are nonshipping.
+
 ## Status
 
 **v0.4.5** (October 2026). Linux and macOS, as a terminal client, CLI and daemon, and on the Mac
