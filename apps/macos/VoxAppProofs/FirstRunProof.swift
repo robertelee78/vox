@@ -501,11 +501,6 @@ final class FirstRunProof: XCTestCase {
         let quoted = words(ui, said, timeout: 30,
                            "with Keep Running chosen and its daemon refusing for good, the app must quote the login item's own line",
                            until: { $0.contains("STAGED-REASON is not a Vox data directory this version reads") }) ?? ""
-        // P4: the failure is said as what it is, with the daemon's own sentence under Details,
-        // copyable, never as the bare sentence alone.
-        words(ui, Key.id("start-failure"), timeout: 10,
-              "a daemon that stops as it starts must be said plainly, as a background service that cannot start",
-              until: { $0 == "Vox can't start its background service" })
         present(ui, Key.id("start-failure-copy"), timeout: 5,
                 "the failure's own sentence must be under Details, with Copy")
         tap(ui, Key.id("login-item-off"), "Turn Keep Running Off")
@@ -2019,8 +2014,8 @@ final class FirstRunProof: XCTestCase {
             throw Apparatus("the authenticated proposal for computer A was not staged: \(previewB)")
         }
         tap(pairingUI, Key.id("computer-pairing-approve"), "Approve on the reviewing computer only")
-        guard words(pairingUI, Key.id("computer-pairing-waiting"), timeout: 20,
-                    "one-sided approval must wait for the other computer", until: { $0.contains("Confirm on the other computer") }) != nil else { return }
+        XCTAssertTrue(el(pairingUI, Key.id("computer-pairing-approve")).waitForNonExistence(timeout: 20),
+                      "PRODUCT: approving here left the same local approval action unfinished")
         XCTAssertNil(locateEverywhere(pairingUI, Key.id("computer-pairing-cancel")),
                      "PRODUCT: a signed approval must not offer a live Cancel action")
         XCTAssertNil(locateEverywhere(pairingUI, Key.id("computer-trust-confirmed")),

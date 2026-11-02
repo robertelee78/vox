@@ -118,6 +118,14 @@ pub(super) enum Pending {
 }
 
 impl Pending {
+    pub(super) fn owner(&self) -> std::sync::Weak<()> {
+        match self {
+            Self::Append(pending) => Arc::downgrade(&pending.owner),
+            Self::Maintenance(pending) => Arc::downgrade(&pending.owner),
+            Self::Metadata(pending) => Arc::downgrade(&pending.owner),
+        }
+    }
+
     pub(super) fn owe_governance(&mut self, instance: &SharedChannel, attachment: u64) {
         match self {
             Self::Append(pending) => {
@@ -595,210 +603,225 @@ impl Node {
     pub(super) async fn complete_pending_posts(&mut self) {
         let rooms: Vec<_> = self.pending_posts.keys().copied().collect();
         for room in rooms {
-            let retention = self
-                .pending_posts
+            let owner = self.pending_posts.get(&room).map(Pending::owner);
+            self.complete_pending_post(room).await;
+            if let Some(owner) = owner {
+                self.ingress_owner_finished(room, &owner);
+                let next = self.pending_posts.get(&room).map(Pending::owner);
+                if self.release_private_busy_owner(room, &owner, next) {
+                    for peer in self.ready_session_release_recipients(room) {
+                        self.wake_session_release(room, peer, None).await;
+                    }
+                    self.resume_parked_private_drive(room).await;
+                }
+            }
+        }
+    }
+
+    async fn complete_pending_post(&mut self, room: Digest32) {
+        let retention = self
+            .pending_posts
+            .get(&room)
+            .and_then(Pending::retention_request);
+        if matches!(self.pending_posts.get(&room), Some(Pending::Metadata(_))) {
+            self.complete_room_metadata(room).await;
+            return;
+        }
+        if matches!(self.pending_posts.get(&room), Some(Pending::Maintenance(_))) {
+            self.complete_pending_maintenance(room).await;
+            self.continue_deferred_retention(room, retention).await;
+            return;
+        }
+        let Some(Pending::Append(pending)) = self.pending_posts.get(&room) else {
+            return;
+        };
+        let returned = pending
+            .result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let Some(returned) = returned else {
+            return;
+        };
+        let current = pending.epoch == self.delivery_epoch
+            && self
+                .channels
                 .get(&room)
-                .and_then(Pending::retention_request);
-            if matches!(self.pending_posts.get(&room), Some(Pending::Metadata(_))) {
-                self.complete_room_metadata(room).await;
-                continue;
-            }
-            if matches!(self.pending_posts.get(&room), Some(Pending::Maintenance(_))) {
-                self.complete_pending_maintenance(room).await;
-                self.continue_deferred_retention(room, retention).await;
-                continue;
-            }
-            let Some(Pending::Append(pending)) = self.pending_posts.get(&room) else {
-                continue;
-            };
-            let returned = pending
+                .is_some_and(|current| Arc::ptr_eq(current, &pending.instance));
+        let shared = Arc::clone(&pending.instance);
+        let Ok(mut channel) = shared.try_lock() else {
+            *pending
                 .result
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
-            let Some(returned) = returned else {
-                continue;
-            };
-            let current = pending.epoch == self.delivery_epoch
-                && self
-                    .channels
-                    .get(&room)
-                    .is_some_and(|current| Arc::ptr_eq(current, &pending.instance));
-            let shared = Arc::clone(&pending.instance);
-            let Ok(mut channel) = shared.try_lock() else {
-                *pending
-                    .result
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(returned);
-                continue;
-            };
-            let pending = self.pending_posts.remove(&room);
-            let Some(Pending::Append(pending)) = pending else {
-                continue;
-            };
-            let mut governance_owed = current && pending.governance_owed;
-            let result = match returned {
-                Ok((mut completed, _publication, withdrawal))
-                    if current && completed.can_install(&channel, &pending.owner) =>
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(returned);
+            return;
+        };
+        let pending = self.pending_posts.remove(&room);
+        let Some(Pending::Append(pending)) = pending else {
+            return;
+        };
+        let mut governance_owed = current && pending.governance_owed;
+        let result = match returned {
+            Ok((mut completed, _publication, withdrawal))
+                if current && completed.can_install(&channel, &pending.owner) =>
+            {
+                #[cfg(feature = "test-knobs")]
+                let rotated = completed.rotated;
+                governance_owed |= completed.governance_changed();
+                let pin = completed.take_history_pin();
+                let result = channel.finish_pending_text(&pending.store, completed);
+                if channel
+                    .publish_history_read(Arc::clone(&pending.store))
+                    .is_err()
                 {
-                    #[cfg(feature = "test-knobs")]
-                    let rotated = completed.rotated;
-                    governance_owed |= completed.governance_changed();
-                    let pin = completed.take_history_pin();
-                    let result = channel.finish_pending_text(&pending.store, completed);
-                    if channel
-                        .publish_history_read(Arc::clone(&pending.store))
-                        .is_err()
-                    {
-                        if let Some(pin) = pin {
-                            self.failed_post_reads.insert(
-                                room,
-                                FailedRead {
-                                    instance: Arc::downgrade(&shared),
-                                    store: Arc::clone(&pending.store),
-                                    _pin: pin,
-                                },
+                    if let Some(pin) = pin {
+                        self.failed_post_reads.insert(
+                            room,
+                            FailedRead {
+                                instance: Arc::downgrade(&shared),
+                                store: Arc::clone(&pending.store),
+                                _pin: pin,
+                            },
+                        );
+                    }
+                }
+                #[cfg(feature = "test-knobs")]
+                if matches!(&result, Ok(Saved::Text(_))) {
+                    self.note_post_proof(room, rotated);
+                }
+                result
+                    .map(|saved| (saved, true, withdrawal, _publication))
+                    .map_err(|error| {
+                        let fault = fault_of(&error);
+                        if matches!(fault, Fault::Internal) {
+                            eprintln!(
+                                "vox: posting to room {}: {error}",
+                                crate::node::link::b32_encode(&room)
                             );
                         }
+                        fault
+                    })
+            }
+            Ok((completed, _publication, withdrawal)) => {
+                governance_owed = false;
+                let result = completed
+                    .result
+                    .map(|saved| (saved, false, withdrawal, _publication))
+                    .map_err(|error| fault_of(&error));
+                channel.release_pending_text(&pending.owner, false);
+                result
+            }
+            Err(fault) => {
+                channel.release_pending_text(&pending.owner, matches!(fault, Fault::Storage));
+                Err(fault)
+            }
+        };
+        drop(channel);
+        let _ = pending.task.await;
+        match result {
+            Ok((saved, installed, mut withdrawal, publication)) => {
+                let mut outcome = pending.kind.outcome(&saved);
+                if installed {
+                    match &saved {
+                        Saved::Text(rendered) => {
+                            let _ = self.event_tx.send(NodeEvent::NewEntry {
+                                channel_id: room,
+                                row: row_of(rendered),
+                            });
+                            self.note_local_append(&room);
+                        }
+                        Saved::Governance(Some(_)) => self.note_local_governance_append(&room),
+                        Saved::Governance(None) | Saved::OwnRetention { .. } => {}
                     }
-                    #[cfg(feature = "test-knobs")]
-                    if matches!(&result, Ok(Saved::Text(_))) {
-                        self.note_post_proof(room, rotated);
+                    if matches!(pending.kind, ReplyKind::Retention) {
+                        self.retention_read_at = 0;
+                        self.refresh_node_retention(self.now_ms());
+                        self.retention_dirty.insert(room);
                     }
-                    result
-                        .map(|saved| (saved, true, withdrawal, _publication))
-                        .map_err(|error| {
-                            let fault = fault_of(&error);
-                            if matches!(fault, Fault::Internal) {
-                                eprintln!(
-                                    "vox: posting to room {}: {error}",
-                                    crate::node::link::b32_encode(&room)
-                                );
-                            }
-                            fault
-                        })
-                }
-                Ok((completed, _publication, withdrawal)) => {
-                    governance_owed = false;
-                    let result = completed
-                        .result
-                        .map(|saved| (saved, false, withdrawal, _publication))
-                        .map_err(|error| fault_of(&error));
-                    channel.release_pending_text(&pending.owner, false);
-                    result
-                }
-                Err(fault) => {
-                    channel.release_pending_text(&pending.owner, matches!(fault, Fault::Storage));
-                    Err(fault)
-                }
-            };
-            drop(channel);
-            let _ = pending.task.await;
-            match result {
-                Ok((saved, installed, mut withdrawal, publication)) => {
-                    let mut outcome = pending.kind.outcome(&saved);
-                    if installed {
-                        match &saved {
-                            Saved::Text(rendered) => {
-                                let _ = self.event_tx.send(NodeEvent::NewEntry {
-                                    channel_id: room,
-                                    row: row_of(rendered),
-                                });
-                                self.note_local_append(&room);
-                            }
-                            Saved::Governance(Some(_)) => self.note_local_governance_append(&room),
-                            Saved::Governance(None) | Saved::OwnRetention { .. } => {}
-                        }
-                        if matches!(pending.kind, ReplyKind::Retention) {
-                            self.retention_read_at = 0;
-                            self.refresh_node_retention(self.now_ms());
-                            self.retention_dirty.insert(room);
-                        }
-                        if matches!(pending.kind, ReplyKind::AddAdmin) {
-                            self.governance_work.admin_rosters.insert(room);
-                            self.governance_work.pending = true;
-                            self.governance_work.again = true;
-                        }
-                        if let Some(withdrawal) = withdrawal.take() {
-                            match withdrawal {
-                                Ok(EndWithdrawal {
-                                    pending: withdrawal,
-                                }) => {
-                                    self.withdrawn.insert(room, withdrawal);
-                                    if let Some(net) = &self.net {
-                                        if let Some(pending) = self.withdrawn.get(&room) {
-                                            let _ = net.publish_local(&pending.wire);
-                                            for board in pending.routes.keys() {
-                                                if let Some(conn) = net.manager().existing(board) {
-                                                    Self::put_withdraws(
-                                                        &conn,
-                                                        vec![pending.wire.clone()],
-                                                    );
-                                                }
+                    if matches!(pending.kind, ReplyKind::AddAdmin) {
+                        self.governance_work.admin_rosters.insert(room);
+                        self.governance_work.pending = true;
+                        self.governance_work.again = true;
+                    }
+                    if let Some(withdrawal) = withdrawal.take() {
+                        match withdrawal {
+                            Ok(EndWithdrawal {
+                                pending: withdrawal,
+                            }) => {
+                                self.withdrawn.insert(room, withdrawal);
+                                if let Some(net) = &self.net {
+                                    if let Some(pending) = self.withdrawn.get(&room) {
+                                        let _ = net.publish_local(&pending.wire);
+                                        for board in pending.routes.keys() {
+                                            if let Some(conn) = net.manager().existing(board) {
+                                                Self::put_withdraws(
+                                                    &conn,
+                                                    vec![pending.wire.clone()],
+                                                );
                                             }
                                         }
                                     }
                                 }
-                                Err(fault) => outcome = Outcome::Failed(fault),
                             }
+                            Err(fault) => outcome = Outcome::Failed(fault),
                         }
                     }
-                    if let Some(Err(fault)) = withdrawal {
-                        outcome = Outcome::Failed(fault);
-                    }
-                    drop(publication);
-                    self.publish().await;
-                    if installed && !matches!(pending.kind, ReplyKind::Text) && outcome.is_done() {
-                        self.queue_room_publication(
+                }
+                if let Some(Err(fault)) = withdrawal {
+                    outcome = Outcome::Failed(fault);
+                }
+                drop(publication);
+                self.publish().await;
+                if installed && !matches!(pending.kind, ReplyKind::Text) && outcome.is_done() {
+                    self.queue_room_publication(
+                        room,
+                        Some(pending.reply),
+                        outcome,
+                        false,
+                        if matches!(pending.kind, ReplyKind::Anchors) {
+                            RoomPublicationKind::Anchors
+                        } else {
+                            RoomPublicationKind::Settings
+                        },
+                    );
+                } else {
+                    let _ = pending.reply.send(outcome);
+                }
+            }
+            Err(fault) => {
+                #[cfg(feature = "mutant-sender")]
+                if matches!(pending.kind, ReplyKind::End)
+                    && matches!(fault, Fault::NotCreator)
+                    && crate::log::sync::mutant::withdraws_unentitled()
+                {
+                    if let Some(authority) = pending.end_authority.clone() {
+                        self.begin_metadata_mutant_withdrawal(
                             room,
-                            Some(pending.reply),
-                            outcome,
-                            false,
-                            if matches!(pending.kind, ReplyKind::Anchors) {
-                                RoomPublicationKind::Anchors
-                            } else {
-                                RoomPublicationKind::Settings
+                            metadata_save::MutantEndWithdrawal {
+                                authority,
+                                instance: pending.instance,
+                                attachment: pending.epoch,
+                                store: pending.store,
+                                secret: pending._secret,
+                                slot: pending._slot,
+                                reply: pending.reply,
                             },
-                        );
-                    } else {
-                        let _ = pending.reply.send(outcome);
-                    }
-                }
-                Err(fault) => {
-                    #[cfg(feature = "mutant-sender")]
-                    if matches!(pending.kind, ReplyKind::End)
-                        && matches!(fault, Fault::NotCreator)
-                        && crate::log::sync::mutant::withdraws_unentitled()
-                    {
-                        if let Some(authority) = pending.end_authority.clone() {
-                            self.begin_metadata_mutant_withdrawal(
-                                room,
-                                metadata_save::MutantEndWithdrawal {
-                                    authority,
-                                    instance: pending.instance,
-                                    attachment: pending.epoch,
-                                    store: pending.store,
-                                    secret: pending._secret,
-                                    slot: pending._slot,
-                                    reply: pending.reply,
-                                },
-                            )
-                            .await;
-                            self.continue_deferred_retention(room, retention).await;
-                            if governance_owed {
-                                self.continue_deferred_governance(room, &shared, pending.epoch);
-                            }
-                            continue;
+                        )
+                        .await;
+                        self.continue_deferred_retention(room, retention).await;
+                        if governance_owed {
+                            self.continue_deferred_governance(room, &shared, pending.epoch);
                         }
+                        return;
                     }
-                    self.publish().await;
-                    let _ = pending.reply.send(Outcome::Failed(fault));
                 }
+                self.publish().await;
+                let _ = pending.reply.send(Outcome::Failed(fault));
             }
-            self.continue_deferred_retention(room, retention).await;
-            if governance_owed {
-                self.continue_deferred_governance(room, &shared, pending.epoch);
-            }
+        }
+        self.continue_deferred_retention(room, retention).await;
+        if governance_owed {
+            self.continue_deferred_governance(room, &shared, pending.epoch);
         }
     }
 

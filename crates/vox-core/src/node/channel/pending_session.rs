@@ -193,19 +193,22 @@ impl ChannelState {
                 && !crate::node::drive::is_key_changed(&content.session_id)
             {
                 use super::super::session_projection::{Query, Reply};
-                if !matches!(
-                    self.session_query(
-                        store,
-                        Query::Lookup {
-                            node: me,
-                            id: content.session_id.clone(),
-                        },
-                        1,
-                        now.get()
-                    ),
-                    Ok(Reply::Lookup(Some(_)))
+                match self.session_query(
+                    store,
+                    Query::Lookup {
+                        node: me,
+                        id: content.session_id.clone(),
+                    },
+                    1,
+                    now.get(),
                 ) {
-                    return Err(Error::StreamRefused(SESSION_NOT_OPEN));
+                    Ok(Reply::Lookup(Some(_))) => {}
+                    Err(reason) if reason == "the room is refreshing saved Sessions; retry" => {
+                        return Err(Error::StreamRefused(
+                            "the room is refreshing saved Sessions; retry",
+                        ));
+                    }
+                    _ => return Err(Error::StreamRefused(SESSION_NOT_OPEN)),
                 }
             }
         }

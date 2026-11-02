@@ -10,6 +10,136 @@ use crate::node::channel::session_projection::{
 use crate::node::store::Store;
 use std::collections::VecDeque;
 
+pub(super) enum IngressReason {
+    Native(std::sync::Weak<()>),
+    Publication {
+        token: u64,
+        task: tokio::task::AbortHandle,
+    },
+    Room,
+    Governance,
+    Projection,
+    Opening,
+    Authority,
+    Permanent,
+}
+#[derive(Clone, Copy)]
+pub(super) enum IngressProgress {
+    Room,
+    Governance,
+    Projection,
+    Opening,
+    Authority,
+}
+
+pub(super) struct IngressWait {
+    instance: Option<std::sync::Weak<tokio::sync::Mutex<ChannelState>>>,
+    attachment: u64,
+    reason: IngressReason,
+}
+impl Drop for IngressWait {
+    fn drop(&mut self) {
+        if let IngressReason::Publication { task, .. } = &self.reason {
+            task.abort();
+        }
+    }
+}
+
+impl Node {
+    pub(super) fn ingress_publication_ready(&mut self, room: Digest32, token: u64) {
+        let key = self.session_ingress_waits.iter().find_map(|(key, wait)| {
+            (key.0 == room && wait.attachment == self.delivery_epoch
+                && matches!(&wait.reason, IngressReason::Publication { token: held, .. } if *held == token)
+                && wait.instance.as_ref().and_then(std::sync::Weak::upgrade)
+                    .zip(self.channels.get(&room))
+                    .is_some_and(|(old, current)| Arc::ptr_eq(&old, current))).then(|| key.clone())
+        });
+        if let Some(key) = key {
+            self.session_ingress_waits.remove(&key);
+            self.ingress_scan_wake();
+        }
+    }
+
+    pub(super) fn ingress_scan_wake(&mut self) {
+        self.session_ingress_scan = 0;
+        self.session_ingress_wake.notify_one();
+    }
+
+    pub(super) fn ingress_room_progress(&mut self, room: Digest32, progress: IngressProgress) {
+        self.ingress_progress(room, progress, None);
+    }
+
+    fn ingress_progress(
+        &mut self,
+        room: Digest32,
+        progress: IngressProgress,
+        session: Option<&str>,
+    ) {
+        let mut wake = false;
+        let attachment = self.delivery_epoch;
+        let channels = &self.channels;
+        self.session_ingress_waits.retain(|key, wait| {
+            let matched = key.0 == room
+                && wait.attachment == attachment
+                && matches!(
+                    (&wait.reason, progress),
+                    (IngressReason::Room, IngressProgress::Room)
+                        | (IngressReason::Governance, IngressProgress::Governance)
+                        | (IngressReason::Projection, IngressProgress::Projection)
+                        | (IngressReason::Opening, IngressProgress::Opening)
+                        | (IngressReason::Authority, IngressProgress::Authority)
+                )
+                && (!matches!(progress, IngressProgress::Opening)
+                    || session == Some(key.1.as_str()))
+                && wait.instance.as_ref().is_none_or(|old| {
+                    old.upgrade()
+                        .zip(channels.get(&room))
+                        .is_some_and(|(old, current)| Arc::ptr_eq(&old, current))
+                });
+            wake |= matched;
+            !matched
+        });
+        if wake {
+            self.ingress_scan_wake();
+        }
+    }
+
+    pub(super) fn ingress_owner_finished(&mut self, room: Digest32, owner: &std::sync::Weak<()>) {
+        let next = self.pending_posts.get(&room).map(post_save::Pending::owner);
+        let mut wake = false;
+        let attachment = self.delivery_epoch;
+        let channels = &self.channels;
+        self.session_ingress_waits.retain(|key, wait| {
+            if key.0 != room {
+                return true;
+            }
+            let IngressReason::Native(held) = &wait.reason else {
+                return true;
+            };
+            if !std::sync::Weak::ptr_eq(held, owner) {
+                return true;
+            }
+            if let Some(next) = &next {
+                if !std::sync::Weak::ptr_eq(owner, next) {
+                    wait.reason = IngressReason::Native(next.clone());
+                }
+                return true;
+            }
+            wake |= wait.attachment == attachment
+                && wait
+                    .instance
+                    .as_ref()
+                    .and_then(std::sync::Weak::upgrade)
+                    .zip(channels.get(&room))
+                    .is_some_and(|(old, current)| Arc::ptr_eq(&old, current));
+            false
+        });
+        if wake {
+            self.ingress_scan_wake();
+        }
+    }
+}
+
 /// Only the direct command has the original one-bounded-governance-turn fallback.
 /// The original Session input moves through that prelude without copying its body.
 pub(super) struct Work {
@@ -232,12 +362,12 @@ struct DriveChain {
     remaining: VecDeque<DriveRelease>,
     ensure: bool,
     guard: Option<computer::ComputerPolicyGuard>,
-    retry_owed: bool,
+    retry_owed: BTreeSet<Digest32>,
 }
 
 enum After {
-    Append,
-    Ingress,
+    Append(String),
+    Ingress(String),
     Drive {
         ensure: bool,
         guard: Option<computer::ComputerPolicyGuard>,
@@ -270,12 +400,12 @@ impl SessionContinuation {
         }
     }
 
-    pub(super) fn append(instance: SharedChannel, attachment: u64) -> Self {
-        Self::new(instance, attachment, After::Append)
+    pub(super) fn append(instance: SharedChannel, attachment: u64, session: String) -> Self {
+        Self::new(instance, attachment, After::Append(session))
     }
 
-    pub(super) fn ingress(instance: SharedChannel, attachment: u64) -> Self {
-        Self::new(instance, attachment, After::Ingress)
+    pub(super) fn ingress(instance: SharedChannel, attachment: u64, session: String) -> Self {
+        Self::new(instance, attachment, After::Ingress(session))
     }
 
     pub(super) fn drive(
@@ -368,7 +498,9 @@ impl Node {
                 return None;
             }
         };
-        self.reserve_owned_outbound(context, bundle, target)
+        let selected = self.reserve_owned_outbound(context, bundle, target)?;
+        self.one_time_waits.remove(&(*room, target));
+        Some(selected)
     }
 
     /// Legacy session initiation has always allowed immediate signed-prekey fallback;
@@ -428,7 +560,7 @@ impl Node {
                 return;
             }
         };
-        let continuation = SessionContinuation::append(instance, self.delivery_epoch);
+        let continuation = SessionContinuation::append(instance, self.delivery_epoch, session);
         self.begin_pending_maintenance(
             room,
             maintenance_save::Work::DirectSession(write),
@@ -464,10 +596,34 @@ impl Node {
                 return false;
             }
         };
+        let key = (pending.room, pending.session.clone());
+        if self.session_ingress_waits.contains_key(&key) {
+            return false;
+        }
         let Some(instance) = self.channels.get(&pending.room).cloned() else {
+            self.session_ingress_waits.insert(
+                key,
+                IngressWait {
+                    instance: None,
+                    attachment: self.delivery_epoch,
+                    reason: IngressReason::Room,
+                },
+            );
             return false;
         };
-        if self.pending_posts.contains_key(&pending.room) {
+        if let Some(owner) = self
+            .pending_posts
+            .get(&pending.room)
+            .map(post_save::Pending::owner)
+        {
+            self.session_ingress_waits.insert(
+                key,
+                IngressWait {
+                    instance: Some(Arc::downgrade(&instance)),
+                    attachment: self.delivery_epoch,
+                    reason: IngressReason::Native(owner),
+                },
+            );
             return false;
         }
         let write = match SessionWrite::append(
@@ -481,17 +637,41 @@ impl Node {
                 self.session_ingress_error = Some(format!(
                     "Session activity is saved and waiting for its room: {error}"
                 ));
+                self.session_ingress_waits.insert(
+                    key,
+                    IngressWait {
+                        instance: Some(Arc::downgrade(&instance)),
+                        attachment: self.delivery_epoch,
+                        reason: IngressReason::Permanent,
+                    },
+                );
                 return false;
             }
         };
-        let continuation = SessionContinuation::ingress(instance, self.delivery_epoch);
-        self.begin_pending_maintenance(
-            pending.room,
-            maintenance_save::Work::Session(write),
-            maintenance_save::Continuation::Session(continuation),
-            None,
-        )
-        .await
+        let room = pending.room;
+        let continuation =
+            SessionContinuation::ingress(instance.clone(), self.delivery_epoch, key.1.clone());
+        let admitted = self
+            .begin_pending_maintenance(
+                room,
+                maintenance_save::Work::Session(write),
+                maintenance_save::Continuation::Session(continuation),
+                None,
+            )
+            .await;
+        if admitted {
+            if let Some(owner) = self.pending_posts.get(&room).map(post_save::Pending::owner) {
+                self.session_ingress_waits.insert(
+                    key,
+                    IngressWait {
+                        instance: Some(Arc::downgrade(&instance)),
+                        attachment: self.delivery_epoch,
+                        reason: IngressReason::Native(owner),
+                    },
+                );
+            }
+        }
+        admitted
     }
 
     /// Called at the end of the existing drive prerequisite chain, after actual upgrade,
@@ -544,13 +724,72 @@ impl Node {
         reply: Reply,
     ) {
         let fault = fault_of(&error);
-        if continuation.attached(self, &room)
-            && matches!(continuation.after, After::Ingress)
-            && !matches!(error, Error::RoomNotSynced)
-        {
-            self.session_ingress_error = Some(format!(
-                "Session activity is saved and waiting for its room: {error}"
-            ));
+        if continuation.attached(self, &room) && matches!(&continuation.after, After::Ingress(_)) {
+            let After::Ingress(session) = &continuation.after else {
+                unreachable!()
+            };
+            let reason = match (&error, fault) {
+                (Error::OwnHistoryBehind | Error::RoomNotSynced, _) => IngressReason::Room,
+                (
+                    Error::StreamRefused("the Session is not open yet; its activity waits for it"),
+                    _,
+                ) => IngressReason::Opening,
+                (Error::StreamRefused("the room is refreshing saved Sessions; retry"), _) => {
+                    IngressReason::Projection
+                }
+                (_, Fault::GovernanceRefreshing) => IngressReason::Governance,
+                (_, Fault::RoomPreparing) => IngressReason::Projection,
+                (_, Fault::RoomChangePending) => {
+                    let token = self.next_token;
+                    self.next_token += 1;
+                    let weak_room = Arc::downgrade(&continuation.instance);
+                    let weak_store = self
+                        .profile
+                        .as_ref()
+                        .map(|profile| Arc::downgrade(&profile.store_handle()));
+                    let tx = self.net_tx.clone();
+                    let task = self.spawn_join_housekeeping(async move {
+                        let Some(room_state) = weak_room.upgrade() else {
+                            return;
+                        };
+                        let Some(store) = weak_store.and_then(|store| store.upgrade()) else {
+                            return;
+                        };
+                        let channel = room_state.lock().await;
+                        let wake = channel.history_publication_wake();
+                        let busy = channel.history_publication_busy(&store);
+                        drop(channel);
+                        drop(room_state);
+                        drop(store);
+                        match busy {
+                            Ok(true) => wake.await,
+                            Ok(false) => {}
+                            Err(_) => return,
+                        }
+                        let _ = tx
+                            .send(NetEvent::IngressPublicationReady { room, token })
+                            .await;
+                    });
+                    IngressReason::Publication { token, task }
+                }
+                (_, Fault::ComputerPolicy) | (Error::ComputerPolicySuperseded, _) => {
+                    IngressReason::Authority
+                }
+                _ => IngressReason::Permanent,
+            };
+            self.session_ingress_waits.insert(
+                (room, session.clone()),
+                IngressWait {
+                    instance: Some(Arc::downgrade(&continuation.instance)),
+                    attachment: continuation.attachment,
+                    reason,
+                },
+            );
+            if !matches!(error, Error::RoomNotSynced) {
+                self.session_ingress_error = Some(format!(
+                    "Session activity is saved and waiting for its room: {error}"
+                ));
+            }
         }
         if let Some(reply) = reply {
             let _ = reply.send(Outcome::Failed(fault));
@@ -641,7 +880,7 @@ impl Node {
                     .await;
                 } else {
                     drop(reservation);
-                    chain.retry_owed = true;
+                    chain.retry_owed.insert(member);
                     self.next_owned_drive_release(
                         room, instance, attachment, lifetime, chain, reply,
                     )
@@ -658,14 +897,19 @@ impl Node {
             after,
             ..
         } = continuation;
-        let ingress = matches!(&after, After::Ingress);
+        let ingress = matches!(&after, After::Ingress(_));
         match (after, saved) {
-            (After::Append, SessionSaved::Appended(hash))
-            | (After::Ingress, SessionSaved::Appended(hash)) => {
+            (After::Append(session), SessionSaved::Appended(hash))
+            | (After::Ingress(session), SessionSaved::Appended(hash)) => {
                 self.note_local_append(&room);
                 self.say_session_news(&room).await;
+                if !ingress {
+                    self.ingress_progress(room, IngressProgress::Opening, Some(&session));
+                }
                 if ingress {
                     self.session_ingress_error = None;
+                    self.session_ingress_waits.remove(&(room, session));
+                    self.ingress_scan_wake();
                 }
                 if let Some(reply) = reply {
                     let _ = reply.send(Outcome::Appended(hash));
@@ -714,7 +958,7 @@ impl Node {
                             .collect(),
                         ensure,
                         guard,
-                        retry_owed: false,
+                        retry_owed: BTreeSet::new(),
                     };
                     self.next_owned_drive_release(
                         room, instance, attachment, lifetime, chain, reply,
@@ -865,7 +1109,7 @@ impl Node {
             // continuation checks authority again before any irreversible publication.
             let selected = self.select_owned_key_package(&room, release.member).await;
             let Some(selected) = selected else {
-                chain.retry_owed = true;
+                chain.retry_owed.insert(release.member);
                 continue;
             };
             let continuation = SessionContinuation {
@@ -890,12 +1134,15 @@ impl Node {
             .await;
             return;
         }
-        if chain.retry_owed {
-            // Unavailable prekeys leave the original marks owed. Only an existing real
-            // prekey/connection/ticker edge retries them; do not spin the same failed list.
-            if let Some(reply) = reply {
-                let _ = reply.send(Outcome::Done);
-            }
+        if !chain.retry_owed.is_empty() {
+            self.park_session_release(
+                room,
+                (instance, attachment, lifetime),
+                chain.ensure,
+                chain.guard,
+                chain.retry_owed,
+                reply,
+            );
             return;
         }
         // Every sent package's delivery mark is now durable. Revisit the real Drive state

@@ -55,6 +55,12 @@ impl Drop for Controller {
     }
 }
 
+enum CursorCommit {
+    Complete(bool),
+    /// No cursor transaction started; the existing publication wake owns resumption.
+    Busy,
+}
+
 /// Consume the inspection guard before acquiring the Store writer. The exact cursor CAS and
 /// captured grant still share one native transaction, and its pin lives through mirror install.
 fn commit_provider_cursor(
@@ -65,17 +71,39 @@ fn commit_provider_cursor(
     authorization: Digest32,
     expected: Option<KeyProviderCursor>,
     next: KeyProviderCursor,
-) -> crate::error::Result<bool> {
-    let Some(pending) =
-        guard.prepare_key_provider_cursor(store, provider, node, authorization, expected, next)?
-    else {
-        return Ok(false);
+) -> crate::error::Result<CursorCommit> {
+    let pending = match guard.prepare_key_provider_cursor(
+        store,
+        provider,
+        node,
+        authorization,
+        expected,
+        next,
+    ) {
+        Ok(Some(pending)) => pending,
+        Ok(None) => return Ok(CursorCommit::Complete(false)),
+        Err(Error::Profile("room publication is busy; retry this operation")) => {
+            return Ok(CursorCommit::Busy);
+        }
+        Err(error) => return Err(error),
     };
     let epoch = guard.epoch();
-    let instance = guard.history_instance(store)?;
+    let instance = match guard.history_instance(store) {
+        Ok(instance) => instance,
+        Err(Error::Profile("room publication is busy; retry this operation")) => {
+            return Ok(CursorCommit::Busy);
+        }
+        Err(error) => return Err(error),
+    };
     let shared = Arc::clone(tokio::sync::OwnedMutexGuard::mutex(&guard));
     let owner = Arc::new(());
-    let mut pin = guard.reserve_pending_write(store, Arc::clone(&owner))?;
+    let mut pin = match guard.reserve_pending_write(store, Arc::clone(&owner)) {
+        Ok(pin) => pin,
+        Err(Error::Profile("room publication is busy; retry this operation")) => {
+            return Ok(CursorCommit::Busy);
+        }
+        Err(error) => return Err(error),
+    };
     drop(guard);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pending.commit(store)));
     let mut guard = shared.blocking_lock();
@@ -109,7 +137,7 @@ fn commit_provider_cursor(
     let result = result.and_then(|committed| publication.map(|()| committed));
     drop(guard);
     drop(pin);
-    result
+    result.map(CursorCommit::Complete)
 }
 
 impl Node {
@@ -460,10 +488,26 @@ impl Node {
                     if !guard.is_member(&peer) || !guard.is_member(&node) {
                         return Ok(ScanResult::Ineligible);
                     }
-                    let instance = guard.history_instance(&store)?;
-                    let generation =
-                        authorization_generation(&store, node, room, instance, guard.epoch())?;
+                    // Subscribe before either read can observe a transient publication boundary.
                     let wake = guard.history_publication_wake();
+                    let instance = match guard.history_instance(&store) {
+                        Ok(instance) => instance,
+                        Err(Error::Profile("room publication is busy; retry this operation")) => {
+                            return Ok(ScanResult::Busy(wake));
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    let generation =
+                        match authorization_generation(&store, node, room, instance, guard.epoch())
+                        {
+                            Ok(generation) => generation,
+                            Err(Error::Profile(
+                                "room publication is busy; retry this operation",
+                            )) => {
+                                return Ok(ScanResult::Busy(wake));
+                            }
+                            Err(error) => return Err(error),
+                        };
                     if advance.is_some() || remote_advance.is_some() {
                         let Some(mut cursor) = held_cursor else {
                             return Ok(ScanResult::Superseded);
@@ -484,7 +528,7 @@ impl Node {
                             cursor.instance = remote_instance;
                             cursor.after = serial;
                         }
-                        return if commit_provider_cursor(
+                        return match commit_provider_cursor(
                             guard,
                             &store,
                             peer,
@@ -493,9 +537,11 @@ impl Node {
                             held_expected,
                             cursor,
                         )? {
-                            Ok(ScanResult::Advanced(cursor, advance.is_some()))
-                        } else {
-                            Ok(ScanResult::Superseded)
+                            CursorCommit::Complete(true) => {
+                                Ok(ScanResult::Advanced(cursor, advance.is_some()))
+                            }
+                            CursorCommit::Complete(false) => Ok(ScanResult::Superseded),
+                            CursorCommit::Busy => Ok(ScanResult::Busy(wake)),
                         };
                     }
                     if let Some((expected_instance, tip, remote_instance, page)) = remote_page {
@@ -537,7 +583,7 @@ impl Node {
                         }
                         cursor.instance = remote_instance;
                         cursor.after = serial;
-                        return if commit_provider_cursor(
+                        return match commit_provider_cursor(
                             guard,
                             &store,
                             peer,
@@ -546,9 +592,9 @@ impl Node {
                             held_expected,
                             cursor,
                         )? {
-                            Ok(ScanResult::Advanced(cursor, false))
-                        } else {
-                            Ok(ScanResult::Superseded)
+                            CursorCommit::Complete(true) => Ok(ScanResult::Advanced(cursor, false)),
+                            CursorCommit::Complete(false) => Ok(ScanResult::Superseded),
+                            CursorCommit::Busy => Ok(ScanResult::Busy(wake)),
                         };
                     }
                     let Some(peer_incarnation) = guard.history_inventory_incarnation(&peer) else {
@@ -587,12 +633,12 @@ impl Node {
                         if guard.history_publication_busy(&store)? {
                             return Ok(ScanResult::Busy(wake));
                         }
-                        return if commit_provider_cursor(
+                        return match commit_provider_cursor(
                             guard, &store, peer, node, generation, expected, cursor,
                         )? {
-                            Ok(ScanResult::Installed(cursor))
-                        } else {
-                            Ok(ScanResult::Superseded)
+                            CursorCommit::Complete(true) => Ok(ScanResult::Installed(cursor)),
+                            CursorCommit::Complete(false) => Ok(ScanResult::Superseded),
+                            CursorCommit::Busy => Ok(ScanResult::Busy(wake)),
                         };
                     }
                     // Repair a previously poisoned remote position without rewinding local debt.
@@ -605,12 +651,12 @@ impl Node {
                         if guard.history_publication_busy(&store)? {
                             return Ok(ScanResult::Busy(wake));
                         }
-                        return if commit_provider_cursor(
+                        return match commit_provider_cursor(
                             guard, &store, peer, node, generation, expected, cursor,
                         )? {
-                            Ok(ScanResult::Installed(cursor))
-                        } else {
-                            Ok(ScanResult::Superseded)
+                            CursorCommit::Complete(true) => Ok(ScanResult::Installed(cursor)),
+                            CursorCommit::Complete(false) => Ok(ScanResult::Superseded),
+                            CursorCommit::Busy => Ok(ScanResult::Busy(wake)),
                         };
                     }
                     if remote_turn

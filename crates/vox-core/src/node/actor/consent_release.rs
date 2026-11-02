@@ -20,6 +20,7 @@ struct Owed {
     trusted: Arc<BTreeSet<Digest32>>,
     asked_for: Option<Digest32>,
     lifetime: Option<Arc<Lifetime>>,
+    guard: Option<computer::ComputerPolicyGuard>,
     terminal: Option<oneshot::Sender<crate::error::Result<()>>>,
     stopped: bool,
     wake: Arc<tokio::sync::Notify>,
@@ -43,6 +44,10 @@ enum Stage {
     Vacant,
     Outbound(outbound::Stage),
     Rekeys(Box<rekeys::Target>),
+    RekeyGovernance {
+        rekey_after: Option<Digest32>,
+        history_after: Option<Digest32>,
+    },
     Hold(Route),
     Online {
         queue: mpsc::OwnedPermit<PairwiseJob>,
@@ -117,6 +122,22 @@ impl Continuation {
             && node.trust.history(&self.target) == self.history
             && node.trust_decision(&self.target) == self.decision
     }
+    fn rekey_authorized(&self, node: &Node, lifetime: &Lifetime) -> crate::error::Result<()> {
+        let guard = self.cursor.as_ref().and_then(|cursor| {
+            cursor
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .guard
+                .clone()
+        });
+        if let Some(guard) = guard {
+            guard.active(node.computer.as_ref())
+        } else if lifetime.authority.current() {
+            Ok(())
+        } else {
+            Err(Error::ComputerPolicySuperseded)
+        }
+    }
 }
 
 impl Node {
@@ -164,7 +185,8 @@ impl Node {
     }
 
     pub(super) async fn deliver_owed_consents(&mut self, asked_for: Option<Digest32>) {
-        self.begin_owned_consent_pass(asked_for, None, None).await;
+        self.begin_owned_consent_pass(asked_for, None, None, None)
+            .await;
     }
 
     pub(super) async fn deliver_through_log(&mut self, attempt: u64, owner: MemberReachOwner) {
@@ -222,6 +244,15 @@ impl Node {
         self.begin_owned_owed_consents_for(lifetime, None, reply)
             .await;
     }
+    pub(super) async fn begin_managed_owed_consents(
+        &mut self,
+        lifetime: Arc<Lifetime>,
+        guard: computer::ComputerPolicyGuard,
+        reply: oneshot::Sender<crate::error::Result<()>>,
+    ) {
+        self.begin_owned_consent_pass(None, Some(lifetime), Some(reply), Some(guard))
+            .await;
+    }
 
     /// As the original owed-consent pass, the requested identity is dialled once immediately;
     /// it does not filter out other admitted/trusted members' existing durable obligations.
@@ -231,7 +262,7 @@ impl Node {
         asked_for: Option<Digest32>,
         reply: oneshot::Sender<crate::error::Result<()>>,
     ) {
-        self.begin_owned_consent_pass(asked_for, Some(lifetime), Some(reply))
+        self.begin_owned_consent_pass(asked_for, Some(lifetime), Some(reply), None)
             .await;
     }
 
@@ -240,6 +271,7 @@ impl Node {
         asked_for: Option<Digest32>,
         lifetime: Option<Arc<Lifetime>>,
         terminal: Option<oneshot::Sender<crate::error::Result<()>>>,
+        guard: Option<computer::ComputerPolicyGuard>,
     ) {
         if self.net.is_none() || (lifetime.is_none() && !self.computer_authority_current()) {
             if let Some(terminal) = terminal {
@@ -260,6 +292,7 @@ impl Node {
             trusted: Arc::new(self.trust.trusted()),
             asked_for,
             lifetime,
+            guard,
             terminal,
             stopped: false,
             wake: Arc::clone(&self.post_save_wake),
@@ -807,6 +840,11 @@ impl Node {
                 return;
             }
         };
+        if matches!(&continuation.stage, Stage::RekeyGovernance { .. }) {
+            self.finish_rekey_governance(room, saved, lifetime, continuation, reply)
+                .await;
+            return;
+        }
         if let Saved::Consent(consent_save::Effect::Held(held)) = saved {
             if held.retained {
                 let _ = self

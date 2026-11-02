@@ -466,6 +466,7 @@ type RoomReturned = (
     crate::error::Result<Saved>,
 );
 pub(super) struct RoomPending {
+    pub(super) owner: Arc<()>,
     room: Digest32,
     epoch: u64,
     node: Digest32,
@@ -688,6 +689,7 @@ impl Node {
         self.pending_posts.insert(
             room,
             post_save::Pending::Metadata(RoomPending {
+                owner: Arc::new(()),
                 room,
                 epoch,
                 node,
@@ -959,6 +961,7 @@ impl Node {
                 if let Some(net) = self.net.as_ref() {
                     net.forget_board_exchange_room(&parsed.channel_id);
                 }
+                self.retire_parked_private_drive(&parsed.channel_id, Fault::ChannelNotOpen);
                 self.channels.insert(
                     parsed.channel_id,
                     Arc::new(tokio::sync::Mutex::new(*channel)),
@@ -968,6 +971,9 @@ impl Node {
         {
             return Err(Fault::ComputerPolicy);
         }
+        self.session_ingress_waits
+            .retain(|(room, _), _| *room != parsed.channel_id);
+        self.ingress_scan_wake();
         self.governance_work.wake_room(parsed.channel_id);
         self.request_admitted_recovery(parsed.channel_id);
         self.refresh_reachers().await;

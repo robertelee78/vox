@@ -278,12 +278,12 @@ jobs:
           if-no-files-found: error
       - uses: actions/upload-artifact@v4
         with:
-          name: vox-nonshipping-current-source-test-knobs-v0.4.13-aarch64-apple-darwin
+          name: vox-nonshipping-lower-version-test-knobs-aarch64-apple-darwin
           path: ${{ runner.temp }}/vox-candidates/output/lower-version-test-knobs/
           if-no-files-found: error
       - uses: actions/upload-artifact@v4
         with:
-          name: vox-nonshipping-current-source-test-knobs-v0.4.14-aarch64-apple-darwin
+          name: vox-nonshipping-current-source-test-knobs-aarch64-apple-darwin
           path: ${{ runner.temp }}/vox-candidates/output/current-test-knobs/
           if-no-files-found: error
 

@@ -262,6 +262,18 @@ impl Node {
         reply: Reply,
     ) {
         let attached = continuation.attached(self, &room);
+        if attached {
+            let peers: Vec<_> = self
+                .private_pulls
+                .iter()
+                .filter_map(|((candidate, peer), owner)| {
+                    (*candidate == room && owner.selecting && owner.task.is_none()).then_some(*peer)
+                })
+                .collect();
+            for peer in peers {
+                self.start_installed_private_pull(room, peer);
+            }
+        }
         let lifetime = continuation.lifetime();
         match continuation.after {
             After::Preparation(next) => self.reject_owned_preparation(room, error, *next, reply),
@@ -417,6 +429,16 @@ impl Node {
                     self.governance_work.wake_room(room);
                 }
                 let backfill = attempt.accepted.is_some_and(|accepted| accepted.changed);
+                if backfill && attempt.drive {
+                    if let Some(author) = attempt.author {
+                        self.retain_installed_private_pull(
+                            room,
+                            author,
+                            &continuation.instance,
+                            lifetime.authority.clone(),
+                        );
+                    }
+                }
                 if backfill {
                     continuation.attempt = Some(attempt);
                     self.governance_work.pending = true;
@@ -479,6 +501,11 @@ impl Node {
                 CommonWork::Packages(Work::Acknowledge(attempt))
             }
             (Stage::Acknowledge, CommonSaved::Packages(Saved::Attempted(attempt))) => {
+                if attempt.drive && attempt.accepted.is_some_and(|accepted| accepted.changed) {
+                    if let Some(author) = attempt.author {
+                        self.start_installed_private_pull(room, author);
+                    }
+                }
                 let peer = match &continuation.after {
                     After::Inbound(inbound) => Some(inbound.peer),
                     _ => None,

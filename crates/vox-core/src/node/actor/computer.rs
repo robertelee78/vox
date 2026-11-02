@@ -776,6 +776,24 @@ impl NodeHandle {
                 observed.apply_deadline(),
                 observed.return_deadline(),
             );
+            let applied = {
+                let view = self.view_rx.borrow();
+                (!view.locked
+                    && !view.locking
+                    && view
+                        .identity
+                        .as_ref()
+                        .is_some_and(|info| info.fingerprint == identity))
+                .then_some(view.computer_policy)
+                .flatten()
+            };
+            if applied.is_some_and(|(revision, expired)| {
+                computer.policy_current(revision, expired, identity)
+            }) && computer.policy_target_is(change.target())
+                && !superseded.is_retired()
+            {
+                return Ok(());
+            }
             match self
                 .reconcile_computer_current(change, Arc::clone(&superseded))
                 .await

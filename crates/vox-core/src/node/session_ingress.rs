@@ -541,6 +541,15 @@ fn from_snapshot(snapshot: &Snapshot, key: &Sek, node: &Digest32) -> Result<Dire
     Ok(d)
 }
 
+/// Count sessions with pending work in one unlocked profile snapshot.
+pub fn active_count(profile: &Profile) -> Result<usize> {
+    let key = key(profile)?;
+    let node = profile.fingerprint();
+    let snapshot = profile.store().snapshot()?;
+    let d = from_snapshot(&snapshot, &key, &node)?;
+    Ok(d.active.len())
+}
+
 /// Read one session's head using one snapshot. Round-robin selection avoids an unopened room
 /// blocking other sessions, and never loads a whole backlog after restart.
 pub fn pending(profile: &Profile, cursor: &mut usize) -> Result<Option<Pending>> {

@@ -446,7 +446,7 @@ impl Saved {
 type Returned = (Option<Arc<Lifetime>>, crate::error::Result<Completed>);
 pub(super) struct Pending {
     instance: SharedChannel,
-    owner: Arc<()>,
+    pub(super) owner: Arc<()>,
     store: Arc<Store>,
     epoch: u64,
     preparing: bool,
@@ -915,6 +915,33 @@ impl Node {
         };
         channel.note_publication_complete();
         drop(channel);
+        if installable
+            && matches!(
+                &result,
+                Ok(Saved::Projection(
+                    session_projection::ProjectionProgress::Sessions { advanced: true }
+                ))
+            )
+        {
+            self.ingress_room_progress(room, session_save::IngressProgress::Projection);
+            self.private_projection_advanced(room, &instance);
+        }
+        if installable
+            && matches!(
+                &result,
+                Ok(Saved::Governance(governance_save::Saved::Legacy {
+                    advanced: true,
+                    ..
+                })) | Ok(Saved::Governance(governance_save::Saved::Contiguous {
+                    pending: false
+                })) | Ok(Saved::Governance(governance_save::Saved::Backfill {
+                    placed: true,
+                    ..
+                }))
+            )
+        {
+            self.ingress_room_progress(room, session_save::IngressProgress::Governance);
+        }
         if let Some((room, target)) = held {
             self.consent_keys.remove(&room, &target);
         }

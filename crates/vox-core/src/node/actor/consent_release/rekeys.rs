@@ -15,6 +15,15 @@ pub(in crate::node::actor) enum RekeyAfter {
         reply: Reply,
     },
 }
+struct Selection {
+    room: Digest32,
+    instance: SharedChannel,
+    asked: bool,
+    lifetime: Option<Arc<Lifetime>>,
+    after: RekeyAfter,
+    rekey_after: Option<Digest32>,
+    history_after: Option<Digest32>,
+}
 
 struct Pass {
     room: Digest32,
@@ -84,16 +93,51 @@ impl Node {
             .await;
             return;
         }
+        let selection = Selection {
+            room,
+            instance,
+            asked,
+            lifetime,
+            after,
+            rekey_after: self.rekey_after.get(&room).copied(),
+            history_after: self.history_after.get(&room).copied(),
+        };
+        self.select_owned_rekeys(selection).await;
+    }
+
+    async fn select_owned_rekeys(&mut self, selection: Selection) {
+        let Selection {
+            room,
+            instance,
+            asked,
+            lifetime,
+            after,
+            rekey_after,
+            history_after,
+        } = selection;
         let selected = {
             let channel = instance.lock().await;
+            if let RekeyAfter::Consent { next, .. } = &after {
+                let validation = if !next.attached(self, &room) || !next.trusted(self) {
+                    Err(Error::Profile(
+                        "consent release attachment or trust changed",
+                    ))
+                } else if let Some(held) = &lifetime {
+                    next.rekey_authorized(self, held)
+                } else {
+                    Err(Error::ComputerPolicySuperseded)
+                };
+                if let Err(error) = validation {
+                    drop(channel);
+                    self.finish_owned_rekey_after(after, Err(error)).await;
+                    return;
+                }
+            }
             match self.profile.as_ref() {
                 Some(profile) => (|| -> crate::error::Result<_> {
-                    let owed = channel
-                        .owed_rekeys(profile.store(), self.rekey_after.get(&room).copied())?;
-                    let (history, history_next) = channel.owed_history_page(
-                        profile.store(),
-                        self.history_after.get(&room).copied(),
-                    )?;
+                    let owed = channel.owed_rekeys(profile.store(), rekey_after)?;
+                    let (history, history_next) =
+                        channel.owed_history_page(profile.store(), history_after)?;
                     Ok((owed, history, history_next))
                 })(),
                 None => Err(Error::AtRestLocked),
@@ -102,7 +146,26 @@ impl Node {
         let (owed, history, history_next) = match selected {
             Ok(selected) => selected,
             Err(error) => {
-                self.finish_owned_rekey_after(after, Err(error)).await;
+                match after {
+                    RekeyAfter::Consent { mut next, reply }
+                        if ChannelState::governance_refreshing(&error) =>
+                    {
+                        // The issue and outbound enqueue already committed. Retain their exact
+                        // consent owner and retry only these two unadvanced selection cursors.
+                        next.stage = super::Stage::RekeyGovernance {
+                            rekey_after,
+                            history_after,
+                        };
+                        self.begin_pending_maintenance(
+                            room,
+                            Work::Projection(crate::node::channel::session_projection::ProjectionWork::Governance),
+                            maintenance_save::Continuation::Consent(*next),
+                            reply,
+                        )
+                        .await;
+                    }
+                    after => self.finish_owned_rekey_after(after, Err(error)).await,
+                }
                 return;
             }
         };
@@ -140,6 +203,85 @@ impl Node {
             after,
         };
         self.advance_owned_rekey_pass(pass).await;
+    }
+
+    pub(super) async fn finish_rekey_governance(
+        &mut self,
+        room: Digest32,
+        saved: Saved,
+        lifetime: Arc<Lifetime>,
+        mut continuation: Continuation,
+        reply: Reply,
+    ) {
+        if let Err(error) = continuation.rekey_authorized(self, &lifetime) {
+            self.fail_owned_consent(room, error, continuation, reply)
+                .await;
+            return;
+        }
+        let progress = match saved {
+            Saved::Projection(
+                crate::node::channel::session_projection::ProjectionProgress::Governance(progress),
+            ) => progress,
+            _ => {
+                self.fail_owned_consent(
+                    room,
+                    Error::Profile("unexpected rekey governance completion"),
+                    continuation,
+                    reply,
+                )
+                .await;
+                return;
+            }
+        };
+        if !progress.ready {
+            if progress.pending {
+                self.begin_pending_maintenance(
+                    room,
+                    Work::Projection(
+                        crate::node::channel::session_projection::ProjectionWork::Governance,
+                    ),
+                    maintenance_save::Continuation::Consent(continuation),
+                    reply,
+                )
+                .await;
+            } else {
+                self.fail_owned_consent(
+                    room,
+                    Error::Profile("rekey governance projection stopped before readiness"),
+                    continuation,
+                    reply,
+                )
+                .await;
+            }
+            return;
+        }
+        let super::Stage::RekeyGovernance {
+            rekey_after,
+            history_after,
+        } = std::mem::replace(&mut continuation.stage, super::Stage::Vacant)
+        else {
+            self.fail_owned_consent(
+                room,
+                Error::Profile("rekey governance prerequisite missing"),
+                continuation,
+                reply,
+            )
+            .await;
+            return;
+        };
+        let selection = Selection {
+            room,
+            instance: Arc::clone(&continuation.instance),
+            asked: continuation.asked,
+            lifetime: Some(lifetime),
+            after: RekeyAfter::Consent {
+                next: Box::new(continuation),
+                reply,
+            },
+            rekey_after,
+            history_after,
+        };
+        self.select_owned_rekeys(selection).await;
     }
 
     async fn advance_owned_rekey_pass(&mut self, mut pass: Pass) {
@@ -621,7 +763,7 @@ impl Node {
             RekeyAfter::Automatic => {}
             RekeyAfter::Settlement { lifetime } => {
                 if result.is_ok() {
-                    Box::pin(self.begin_owned_consent_pass(None, Some(lifetime), None)).await;
+                    Box::pin(self.begin_owned_consent_pass(None, Some(lifetime), None, None)).await;
                 }
             }
             RekeyAfter::Consent { next, reply } => match result {

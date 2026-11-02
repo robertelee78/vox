@@ -5768,7 +5768,37 @@ pub async fn join(
                     None => println!("vox: bound {}", dir.display()),
                 }
             }
-            println!("     you read a member once you trust it and it trusts you:");
+            // Computer approval is separate from this room's membership and consent.
+            // Offer its authenticated local action without attributing any member's state to it.
+            use vox_core::node::daemonipc::{DaemonClient, DaemonFrame, DaemonRequest};
+            if let Ok(mut daemon) = DaemonClient::open(&paths.account().socket()).await {
+                if let Ok(DaemonFrame::ComputerStatus(json)) =
+                    daemon.request(DaemonRequest::ComputerStatus).await
+                {
+                    if let Ok(status) =
+                        serde_json::from_str::<vox_core::node::computer::ComputerStatus>(&json)
+                    {
+                        if let Some(p) = status.pairing.filter(|p| !p.approved_here) {
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map_or(0, |d| d.as_millis() as u64);
+                            if p.expires_ms > now_ms {
+                                println!(
+                                    "     Separate computer approval is pending here for {} ({}). \
+                                     Review it with `vox computer status`, then approve here with {} \
+                                     or use My Computers in Vox. This does not itself join a room.",
+                                    p.peer.name,
+                                    p.peer.fingerprint,
+                                    vox_text::shell::command(&["vox", "computer", "approve", &p.operation_id])
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            println!(
+                "     room reading needs membership, effective trust and reciprocal room consent:"
+            );
             if let Ok(parsed) = vox_core::node::link::InviteLink::parse(link) {
                 who_reads_whom(
                     &mut client,
@@ -5811,7 +5841,7 @@ async fn who_reads_whom(client: &mut IpcClient, channel_id: Digest32, node: &str
     };
     let keyring = match client.trusted("").await {
         Ok(Frame::Trusted { entries }) => crate::ident::names_of(entries),
-        _ => Vec::new(),
+        _ => return,
     };
     let me = client.me();
     // A member that trusts this node consents to it on the room's log, which reaches this node
@@ -5844,11 +5874,21 @@ async fn who_reads_whom(client: &mut IpcClient, channel_id: Digest32, node: &str
         let reading =
             crate::ident::Reading::of(keyring.iter().any(|(fp, _)| *fp == m), inbound.contains(&m));
         let name = crate::ident::name_in(&keyring, &m);
-        println!(
-            "     {} {name} — {}",
-            reading.glyph(),
-            reading.say(&name, &b32_encode(&m), &me_fp, node)
-        );
+        let advice = match reading {
+            crate::ident::Reading::Waiting => format!(
+                "you trust {name}; its room consent has not reached this node yet. \
+                 Check its membership and effective trust on the computer hosting node {}; \
+                 an individual grant is not needed if trust is already effective",
+                b32_encode(&m)
+            ),
+            crate::ident::Reading::NotInKeyring { trusts_you: false } => format!(
+                "not in this node's keyring; its room consent has not reached this node. \
+                 To trust it here, run {}; check its membership and effective trust separately",
+                vox_text::shell::node_command(&["vox", "trust", "add", &b32_encode(&m)], node)
+            ),
+            _ => reading.say(&name, &b32_encode(&m), &me_fp, node),
+        };
+        println!("     {} {name} — {advice}", reading.glyph());
     }
 }
 

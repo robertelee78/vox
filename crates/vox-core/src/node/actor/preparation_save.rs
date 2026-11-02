@@ -566,7 +566,7 @@ impl Node {
                     }
                     prepared.save.stage = Stage::Refresh;
                 }
-                (Stage::Upgrade, Saved::Private(private_save::Saved::UpgradeWaiting)) => {
+                (Stage::Upgrade, Saved::Private(private_save::Saved::UpgradeWaiting(_))) => {
                     if channel.session_upgrade_local_work() {
                         prepared.wait_on("restoring its Sessions", now.get());
                         prepared.save.lifetime = None;

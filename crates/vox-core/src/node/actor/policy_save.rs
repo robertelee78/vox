@@ -6,6 +6,7 @@ use super::trust_save::{
 };
 use super::*;
 use crate::node::channel::pending_trust::{TrustSaved, TrustWrite};
+use crate::node::channel::session_projection::{ProjectionProgress, ProjectionWork};
 use crate::node::store::Store;
 
 mod grant;
@@ -78,6 +79,7 @@ pub(super) struct ManagedTurn {
     revision: u64,
     expired: bool,
     stage: ManagedRoomStage,
+    governance_prerequisite: bool,
     terminal: oneshot::Sender<crate::error::Result<ManagedNotice>>,
 }
 
@@ -88,10 +90,6 @@ enum DriveStage {
         result: Option<oneshot::Receiver<Outcome>>,
     },
     Consents(oneshot::Receiver<crate::error::Result<()>>),
-    Private {
-        cursor: usize,
-        result: Option<oneshot::Receiver<Outcome>>,
-    },
 }
 pub(super) struct ManagedDrive {
     ready: ManagedReady,
@@ -994,6 +992,7 @@ impl Node {
             revision,
             expired,
             stage: ManagedRoomStage::Marks,
+            governance_prerequisite: false,
             terminal,
         };
         // Mark this exact room BEFORE any withdrawal rotates its sender. All other rooms still
@@ -1021,6 +1020,46 @@ impl Node {
                 return;
             }
         };
+        if turn.governance_prerequisite {
+            if let Err(error) = turn.guard.active(self.computer.as_ref()) {
+                self.fail_managed_turn(turn, error).await;
+                return;
+            }
+            match saved {
+                maintenance_save::Saved::Projection(ProjectionProgress::Governance(progress)) => {
+                    if !progress.ready && progress.pending {
+                        self.begin_pending_maintenance(
+                            room,
+                            maintenance_save::Work::Projection(ProjectionWork::Governance),
+                            maintenance_save::Continuation::Trust(TrustContinuation::Managed(turn)),
+                            None,
+                        )
+                        .await;
+                        return;
+                    }
+                    if !progress.ready {
+                        self.fail_managed_turn(
+                            turn,
+                            Error::Profile(
+                                "managed governance projection stopped before readiness",
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
+                    turn.governance_prerequisite = false;
+                    self.continue_managed_trust(turn).await;
+                }
+                _ => {
+                    self.fail_managed_turn(
+                        turn,
+                        Error::Profile("unexpected managed governance completion"),
+                    )
+                    .await;
+                }
+            }
+            return;
+        }
         let applied = match (&mut turn.stage, saved) {
             (ManagedRoomStage::Marks, maintenance_save::Saved::Trust(TrustSaved::Marked)) => {
                 turn.stage = ManagedRoomStage::Reconcile(Reconcile::new(
@@ -1130,6 +1169,16 @@ impl Node {
                     .await;
                 }
             }
+            Err(error) if ChannelState::governance_refreshing(&error) => {
+                turn.governance_prerequisite = true;
+                self.begin_pending_maintenance(
+                    room,
+                    maintenance_save::Work::Projection(ProjectionWork::Governance),
+                    maintenance_save::Continuation::Trust(TrustContinuation::Managed(turn)),
+                    None,
+                )
+                .await;
+            }
             Err(error) => self.fail_managed_turn(turn, error).await,
         }
     }
@@ -1186,6 +1235,7 @@ impl Node {
                 }
                 if pending.ready.expired {
                     self.publish().await;
+                    drop(save);
                     self.finish_managed_policy(pending).await;
                     return;
                 }
@@ -1209,10 +1259,11 @@ impl Node {
                             *cursor += 1;
                             *result = None;
                         }
-                        Ok(_) => {
-                            let _ = pending.reply.send(Err(Error::Profile(
-                                "managed key-package continuation failed",
-                            )));
+                        Ok(inner) => {
+                            let _ = pending.reply.send(Err(Error::AppRefused(format!(
+                                "room {} managed key-package continuation: {inner}",
+                                crate::node::link::b32_encode(&pending.ready.rooms[*cursor].room),
+                            ))));
                             return;
                         }
                         Err(oneshot::error::TryRecvError::Empty) => {
@@ -1233,8 +1284,12 @@ impl Node {
                 }
                 if *cursor == pending.ready.rooms.len() {
                     let (sender, receiver) = oneshot::channel();
-                    self.begin_owned_owed_consents(Arc::clone(&save), sender)
-                        .await;
+                    self.begin_managed_owed_consents(
+                        Arc::clone(&save),
+                        pending.ready.guard.clone(),
+                        sender,
+                    )
+                    .await;
                     pending.stage = DriveStage::Consents(receiver);
                 } else {
                     let room = &pending.ready.rooms[*cursor];
@@ -1256,76 +1311,27 @@ impl Node {
                 }
                 false
             }
-            DriveStage::Consents(receiver) => {
-                match receiver.try_recv() {
-                    Ok(Ok(())) => {
-                        pending.stage = DriveStage::Private {
-                            cursor: 0,
-                            result: None,
-                        }
-                    }
-                    Ok(Err(error)) => {
-                        let _ = pending.reply.send(Err(error));
-                        return;
-                    }
-                    Err(oneshot::error::TryRecvError::Empty) => {
-                        self.pending_policy = Some(Pending::ManagedDrive(pending));
-                        return;
-                    }
-                    Err(oneshot::error::TryRecvError::Closed) => {
-                        let _ = pending.reply.send(Err(Error::Profile(
-                            "managed consent completion owner stopped",
-                        )));
-                        return;
-                    }
-                }
-                true
-            }
-            DriveStage::Private { cursor, result } => {
-                if let Some(receiver) = result {
-                    match receiver.try_recv() {
-                        Ok(Outcome::Done) => {
-                            *cursor += 1;
-                            *result = None;
-                        }
-                        Ok(_) => {
-                            let _ = pending.reply.send(Err(Error::Profile(
-                                "managed private-key continuation failed",
-                            )));
-                            return;
-                        }
-                        Err(oneshot::error::TryRecvError::Empty) => {
-                            self.pending_policy = Some(Pending::ManagedDrive(pending));
-                            return;
-                        }
-                        Err(oneshot::error::TryRecvError::Closed) => {
-                            let _ = pending.reply.send(Err(Error::Profile(
-                                "managed private-key completion owner stopped",
-                            )));
-                            return;
-                        }
-                    }
-                }
-                if let Err(error) = pending.ready.guard.active(self.computer.as_ref()) {
-                    let _ = pending.reply.send(Err(error));
-                    return;
-                }
-                if *cursor == pending.ready.rooms.len() {
+            DriveStage::Consents(receiver) => match receiver.try_recv() {
+                Ok(Ok(())) => {
+                    drop(save);
                     self.finish_managed_policy(pending).await;
                     return;
                 }
-                let room = pending.ready.rooms[*cursor].room;
-                let (sender, receiver) = oneshot::channel();
-                *result = Some(receiver);
-                !self
-                    .begin_owned_private_drive(
-                        room,
-                        Some(pending.ready.guard.clone()),
-                        Some(Arc::clone(&save)),
-                        Some(sender),
-                    )
-                    .await
-            }
+                Ok(Err(error)) => {
+                    let _ = pending.reply.send(Err(error));
+                    return;
+                }
+                Err(oneshot::error::TryRecvError::Empty) => {
+                    self.pending_policy = Some(Pending::ManagedDrive(pending));
+                    return;
+                }
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    let _ = pending.reply.send(Err(Error::Profile(
+                        "managed consent completion owner stopped",
+                    )));
+                    return;
+                }
+            },
         };
         self.pending_policy = Some(Pending::ManagedDrive(pending));
         // A stage transition or immediate terminal refusal is a real causal edge. Native
@@ -1348,8 +1354,31 @@ impl Node {
             self.resume_own_key_donor_busy();
             self.resume_own_key_policy_waiting();
         }
-        let _ = pending.reply.send(result);
+        let rooms = pending
+            .ready
+            .rooms
+            .iter()
+            .map(|room| (room.room, Arc::clone(&room.instance)))
+            .collect::<Vec<_>>();
+        let guard = pending.ready.guard.clone();
+        let expired = pending.ready.expired;
+        release_rooms(&pending.ready.rooms, result.is_err()).await;
         drop(pending.ready);
+        let applied = result.is_ok();
+        if applied && !expired {
+            for (room, instance) in rooms {
+                if self
+                    .channels
+                    .get(&room)
+                    .is_some_and(|current| Arc::ptr_eq(current, &instance))
+                {
+                    self.ingress_room_progress(room, session_save::IngressProgress::Authority);
+                    self.begin_owned_private_drive(room, Some(guard.clone()), None, None)
+                        .await;
+                }
+            }
+        }
+        let _ = pending.reply.send(result);
     }
 }
 
