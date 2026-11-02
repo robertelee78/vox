@@ -22,6 +22,57 @@ enum DriveStage {
     Support,
     Query,
 }
+#[derive(Clone, Copy)]
+enum DriveWait {
+    Upgrade(pending_upgrade::UpgradeWait),
+    Support,
+    SupportPublication,
+    Publication,
+    Projection,
+    Native,
+}
+
+struct ReleaseWait {
+    instance: std::sync::Weak<tokio::sync::Mutex<ChannelState>>,
+    attachment: u64,
+    authority: computer::ComputerAuthority,
+    guard: Option<computer::ComputerPolicyGuard>,
+    reply: ActorReply,
+    ensure: bool,
+    missed: BTreeSet<Digest32>,
+    ready: BTreeSet<Digest32>,
+    deadlines: BTreeMap<Digest32, u64>,
+    token: u64,
+    tasks: Vec<tokio::task::AbortHandle>,
+}
+
+impl Drop for ReleaseWait {
+    fn drop(&mut self) {
+        for task in self.tasks.drain(..) {
+            task.abort();
+        }
+    }
+}
+
+struct RoomWake {
+    token: u64,
+    task: tokio::task::AbortHandle,
+}
+
+impl Drop for RoomWake {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+struct UpgradeObligation {
+    stage: DriveStage,
+    guard: Option<computer::ComputerPolicyGuard>,
+    authority: computer::ComputerAuthority,
+    prerequisite: DriveWait,
+    reply: ActorReply,
+    room_wait: Option<RoomWake>,
+    ready: bool,
+}
 
 pub(in crate::node::actor) struct ParkedPrivateDrive {
     instance: std::sync::Weak<tokio::sync::Mutex<ChannelState>>,
@@ -29,13 +80,51 @@ pub(in crate::node::actor) struct ParkedPrivateDrive {
     stage: DriveStage,
     guard: Option<computer::ComputerPolicyGuard>,
     authority: computer::ComputerAuthority,
+    releases: [Vec<ReleaseWait>; 2],
+    upgrades: Vec<UpgradeObligation>,
+    drive_active: bool,
+    busy_owner: Option<std::sync::Weak<()>>,
+    room_wait: Option<RoomWake>,
+    prerequisite: DriveWait,
     reply: ActorReply,
 }
 
 impl ParkedPrivateDrive {
-    fn retire(self, fault: Fault) {
-        if let Some(reply) = self.reply {
+    fn activate_upgrade(&mut self, at: usize) {
+        let next = self.upgrades.remove(at);
+        if self.drive_active {
+            self.upgrades.push(UpgradeObligation {
+                stage: self.stage,
+                guard: self.guard.take(),
+                authority: self.authority.clone(),
+                prerequisite: self.prerequisite,
+                reply: self.reply.take(),
+                room_wait: self.room_wait.take(),
+                ready: false,
+            });
+        }
+        self.stage = next.stage;
+        self.guard = next.guard;
+        self.authority = next.authority;
+        self.prerequisite = next.prerequisite;
+        self.reply = next.reply;
+        self.room_wait = next.room_wait;
+        self.drive_active = true;
+    }
+
+    fn retire(mut self, fault: Fault) {
+        for upgrade in &mut self.upgrades {
+            if let Some(reply) = upgrade.reply.take() {
+                let _ = reply.send(Outcome::Failed(fault));
+            }
+        }
+        if let Some(reply) = self.reply.take() {
             let _ = reply.send(Outcome::Failed(fault));
+        }
+        for release in self.releases.iter_mut().flatten() {
+            if let Some(reply) = release.reply.take() {
+                let _ = reply.send(Outcome::Failed(fault));
+            }
         }
     }
 }
@@ -119,6 +208,432 @@ impl Continuation {
 }
 
 impl Node {
+    pub(in crate::node::actor) async fn resume_private_drive_room_ready(
+        &mut self,
+        room: Digest32,
+        token: u64,
+    ) {
+        let busy = self.pending_posts.get(&room).map(post_save::Pending::owner);
+        let Some(parked) = self.parked_private_drives.get_mut(&room) else {
+            return;
+        };
+        if busy.is_some() {
+            parked.busy_owner = busy;
+        }
+        if parked
+            .room_wait
+            .as_ref()
+            .is_some_and(|wait| wait.token == token)
+        {
+            parked.room_wait = None;
+        } else if let Some(at) = parked.upgrades.iter().position(|item| {
+            item.room_wait
+                .as_ref()
+                .is_some_and(|wait| wait.token == token)
+        }) {
+            parked.upgrades[at].room_wait = None;
+            parked.upgrades[at].ready = true;
+            if parked.busy_owner.is_some() {
+                return;
+            }
+            parked.activate_upgrade(at);
+        } else {
+            return;
+        }
+        self.resume_parked_private_drive(room).await;
+    }
+
+    pub(in crate::node::actor) fn release_private_busy_owner(
+        &mut self,
+        room: Digest32,
+        owner: &std::sync::Weak<()>,
+        next: Option<std::sync::Weak<()>>,
+    ) -> bool {
+        let Some(parked) = self.parked_private_drives.get_mut(&room) else {
+            return false;
+        };
+        if parked
+            .busy_owner
+            .as_ref()
+            .is_some_and(|held| std::sync::Weak::ptr_eq(held, owner))
+        {
+            parked.busy_owner = next;
+            if parked.busy_owner.is_none() {
+                if let Some(at) = parked.upgrades.iter().position(|item| item.ready) {
+                    parked.activate_upgrade(at);
+                } else if !parked.drive_active && !parked.upgrades.is_empty() {
+                    parked.activate_upgrade(0);
+                }
+            }
+            parked.busy_owner.is_none()
+        } else {
+            false
+        }
+    }
+
+    pub(in crate::node::actor) fn session_release_recipients(
+        &self,
+        room: Digest32,
+    ) -> Vec<Digest32> {
+        self.parked_private_drives
+            .get(&room)
+            .map(|parked| {
+                parked
+                    .releases
+                    .iter()
+                    .flatten()
+                    .flat_map(|release| release.missed.iter().copied())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    pub(in crate::node::actor) fn session_release_tokens_for_peer(
+        &self,
+        peer: Digest32,
+    ) -> Vec<(Digest32, u64)> {
+        self.parked_private_drives
+            .iter()
+            .flat_map(|(room, parked)| {
+                parked
+                    .releases
+                    .iter()
+                    .flatten()
+                    .filter(move |release| release.missed.contains(&peer))
+                    .map(move |release| (*room, release.token))
+            })
+            .collect()
+    }
+
+    pub(in crate::node::actor) fn ready_session_release_recipients(
+        &self,
+        room: Digest32,
+    ) -> Vec<Digest32> {
+        self.parked_private_drives
+            .get(&room)
+            .map(|parked| {
+                parked
+                    .releases
+                    .iter()
+                    .flatten()
+                    .flat_map(|release| release.ready.iter().copied())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub(in crate::node::actor) fn park_session_release(
+        &mut self,
+        room: Digest32,
+        instance: SharedChannel,
+        attachment: u64,
+        lifetime: Arc<maintenance_save::Lifetime>,
+        ensure: bool,
+        guard: Option<computer::ComputerPolicyGuard>,
+        missed: BTreeSet<Digest32>,
+        reply: ActorReply,
+    ) {
+        if let Some(parked) = self.parked_private_drives.get(&room) {
+            if parked.attachment != attachment
+                || !parked
+                    .instance
+                    .upgrade()
+                    .is_some_and(|held| Arc::ptr_eq(&held, &instance))
+            {
+                if let Some(reply) = reply {
+                    let _ = reply.send(Outcome::Failed(Fault::ChannelNotOpen));
+                }
+                return;
+            }
+        }
+        let token = self.next_token;
+        self.next_token += 1;
+        let mut tasks = Vec::new();
+        let mut deadlines = BTreeMap::new();
+        for peer in &missed {
+            let notify = self.refused_otps.release_notifier(*peer);
+            let mut wake = Box::pin(Arc::clone(&notify).notified_owned());
+            wake.as_mut().enable();
+            let tx = self.net_tx.clone();
+            let member = *peer;
+            tasks.push(self.spawn_join_housekeeping(async move {
+                loop {
+                    wake.await;
+                    wake = Box::pin(Arc::clone(&notify).notified_owned());
+                    wake.as_mut().enable();
+                    if tx
+                        .send(NetEvent::PrivateReleaseDue {
+                            room,
+                            peer: member,
+                            token,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }));
+            if let Some(since) = self.one_time_waits.get(&(room, *peer)).copied() {
+                deadlines.insert(*peer, since);
+                let delay = since
+                    .saturating_add(ONE_TIME_WAIT_MS)
+                    .saturating_sub(self.now_ms().get());
+                let tx = self.net_tx.clone();
+                let peer = *peer;
+                tasks.push(self.spawn_join_housekeeping(async move {
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                    let _ = tx
+                        .send(NetEvent::PrivateReleaseDue { room, peer, token })
+                        .await;
+                }));
+            }
+        }
+        let initial: Vec<_> = missed.iter().copied().collect();
+        let tx = self.net_tx.clone();
+        tasks.push(self.spawn_join_housekeeping(async move {
+            for peer in initial {
+                if tx
+                    .send(NetEvent::PrivateReleaseDue { room, peer, token })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }));
+        let release = ReleaseWait {
+            instance: Arc::downgrade(&instance),
+            attachment,
+            authority: lifetime.authority.clone(),
+            guard,
+            reply,
+            ensure,
+            missed,
+            ready: BTreeSet::new(),
+            deadlines,
+            token,
+            tasks,
+        };
+        if let Some(parked) = self.parked_private_drives.get_mut(&room) {
+            parked.releases[usize::from(ensure)].push(release);
+        } else {
+            self.parked_private_drives.insert(
+                room,
+                ParkedPrivateDrive {
+                    instance: Arc::downgrade(&instance),
+                    attachment,
+                    stage: DriveStage::Query,
+                    guard: None,
+                    authority: lifetime.authority.clone(),
+                    releases: if ensure {
+                        [Vec::new(), vec![release]]
+                    } else {
+                        [vec![release], Vec::new()]
+                    },
+                    drive_active: false,
+                    upgrades: Vec::new(),
+                    busy_owner: None,
+                    room_wait: None,
+                    prerequisite: DriveWait::Projection,
+                    reply: None,
+                },
+            );
+        }
+    }
+
+    pub(in crate::node::actor) async fn wake_session_release(
+        &mut self,
+        room: Digest32,
+        peer: Digest32,
+        token: Option<u64>,
+    ) {
+        let matches = |release: &ReleaseWait| {
+            release.missed.contains(&peer) && token.is_none_or(|token| token == release.token)
+        };
+        let Some(parked) = self.parked_private_drives.get_mut(&room) else {
+            return;
+        };
+        if !parked.releases.iter().flatten().any(matches) {
+            return;
+        }
+        for release in parked
+            .releases
+            .iter_mut()
+            .flatten()
+            .filter(|release| matches(release))
+        {
+            release.ready.insert(peer);
+        }
+        if let Some(owner) = self.pending_posts.get(&room).map(post_save::Pending::owner) {
+            parked.busy_owner = Some(owner);
+            return;
+        }
+        let fault = parked
+            .releases
+            .iter()
+            .flatten()
+            .find(|release| matches(release))
+            .and_then(|release| {
+                if release.attachment != self.delivery_epoch
+                    || !release
+                        .instance
+                        .upgrade()
+                        .zip(self.channels.get(&room))
+                        .is_some_and(|(held, current)| Arc::ptr_eq(&held, current))
+                {
+                    Some(Fault::ChannelNotOpen)
+                } else if !release.authority.current()
+                    || release
+                        .guard
+                        .as_ref()
+                        .is_some_and(|guard| guard.active(self.computer.as_ref()).is_err())
+                {
+                    Some(Fault::ComputerPolicy)
+                } else {
+                    None
+                }
+            })
+            .or_else(|| (!self.computer_authority_current()).then_some(Fault::ComputerPolicy));
+        if let Some(fault) = fault {
+            if let Some(parked) = self.parked_private_drives.get_mut(&room) {
+                if let Some((slot, at)) =
+                    parked
+                        .releases
+                        .iter()
+                        .enumerate()
+                        .find_map(|(slot, entries)| {
+                            entries.iter().position(matches).map(|at| (slot, at))
+                        })
+                {
+                    let mut release = parked.releases[slot].remove(at);
+                    if let Some(reply) = release.reply.take() {
+                        let _ = reply.send(Outcome::Failed(fault));
+                    }
+                }
+            }
+            if self.parked_private_drives.get(&room).is_some_and(|parked| {
+                !parked.drive_active
+                    && parked.upgrades.is_empty()
+                    && parked.releases.iter().all(Vec::is_empty)
+            }) {
+                self.parked_private_drives.remove(&room);
+            }
+            let next = self.parked_private_drives.get(&room).and_then(|parked| {
+                parked
+                    .releases
+                    .iter()
+                    .flatten()
+                    .find(|release| release.ready.contains(&peer))
+                    .map(|release| release.token)
+            });
+            if let Some(next) = next {
+                let tx = self.net_tx.clone();
+                self.spawn_join_housekeeping(async move {
+                    let _ = tx
+                        .send(NetEvent::PrivateReleaseDue {
+                            room,
+                            peer,
+                            token: next,
+                        })
+                        .await;
+                });
+            }
+            return;
+        }
+        if self.prekeys.is_none()
+            || self
+                .delivery_bundle_waiting(&room, peer, true)
+                .await
+                .is_err()
+        {
+            let since = self.one_time_waits.get(&(room, peer)).copied();
+            let mut deadlines = Vec::new();
+            if let Some(parked) = self.parked_private_drives.get_mut(&room) {
+                for release in parked
+                    .releases
+                    .iter_mut()
+                    .flatten()
+                    .filter(|release| matches(release))
+                {
+                    release.ready.remove(&peer);
+                    if let Some(since) = since {
+                        if release.deadlines.get(&peer) != Some(&since) {
+                            release.deadlines.insert(peer, since);
+                            deadlines.push((release.token, since));
+                        }
+                    } else {
+                        release.deadlines.remove(&peer);
+                    }
+                }
+            }
+            for (release_token, since) in deadlines {
+                let delay = since
+                    .saturating_add(ONE_TIME_WAIT_MS)
+                    .saturating_sub(self.now_ms().get());
+                let tx = self.net_tx.clone();
+                let task = self.spawn_join_housekeeping(async move {
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                    let _ = tx
+                        .send(NetEvent::PrivateReleaseDue {
+                            room,
+                            peer,
+                            token: release_token,
+                        })
+                        .await;
+                });
+                if let Some(parked) = self.parked_private_drives.get_mut(&room) {
+                    if let Some(release) = parked
+                        .releases
+                        .iter_mut()
+                        .flatten()
+                        .find(|release| release.token == release_token)
+                    {
+                        release.tasks.push(task);
+                    } else {
+                        task.abort();
+                    }
+                } else {
+                    task.abort();
+                }
+            }
+            return;
+        }
+        let Some(parked) = self.parked_private_drives.get_mut(&room) else {
+            return;
+        };
+        let Some((slot, at)) = parked
+            .releases
+            .iter()
+            .enumerate()
+            .find_map(|(slot, entries)| entries.iter().position(matches).map(|at| (slot, at)))
+        else {
+            return;
+        };
+        let mut release = parked.releases[slot].remove(at);
+        let ensure = release.ensure;
+        let guard = release.guard.take();
+        let reply = release.reply.take();
+        if !parked.drive_active
+            && parked.upgrades.is_empty()
+            && parked.releases.iter().all(Vec::is_empty)
+        {
+            self.parked_private_drives.remove(&room);
+        }
+        drop(release);
+        self.begin_owned_session_drive_retained(room, ensure, guard, None, reply)
+            .await;
+        let next = self.pending_posts.get(&room).map(post_save::Pending::owner);
+        if let Some(parked) = self.parked_private_drives.get_mut(&room) {
+            if next.is_some() {
+                parked.busy_owner = next;
+            }
+        }
+    }
+
     pub(in crate::node::actor) fn retire_parked_private_drive(
         &mut self,
         room: &Digest32,
@@ -136,28 +651,83 @@ impl Node {
     }
 
     pub(in crate::node::actor) fn retire_stale_private_drives(&mut self) {
-        let stale: Vec<_> = self
-            .parked_private_drives
-            .iter()
-            .filter_map(|(room, parked)| {
-                (!parked.authority.current()
+        let computer = self.computer.as_ref();
+        self.parked_private_drives.retain(|_, parked| {
+            if parked.drive_active
+                && (!parked.authority.current()
                     || parked
                         .guard
                         .as_ref()
-                        .is_some_and(|guard| guard.active(self.computer.as_ref()).is_err()))
-                .then_some(*room)
-            })
-            .collect();
-        for room in stale {
-            self.retire_parked_private_drive(&room, Fault::ComputerPolicy);
-        }
+                        .is_some_and(|guard| guard.active(computer).is_err()))
+            {
+                parked.drive_active = false;
+                parked.room_wait = None;
+                if let Some(reply) = parked.reply.take() {
+                    let _ = reply.send(Outcome::Failed(Fault::ComputerPolicy));
+                }
+            }
+            parked.upgrades.retain_mut(|upgrade| {
+                if !upgrade.authority.current()
+                    || upgrade
+                        .guard
+                        .as_ref()
+                        .is_some_and(|guard| guard.active(computer).is_err())
+                {
+                    if let Some(reply) = upgrade.reply.take() {
+                        let _ = reply.send(Outcome::Failed(Fault::ComputerPolicy));
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
+            if !parked.drive_active && !parked.upgrades.is_empty() {
+                parked.activate_upgrade(0);
+            }
+            for entries in &mut parked.releases {
+                entries.retain_mut(|release| {
+                    if !release.authority.current()
+                        || release
+                            .guard
+                            .as_ref()
+                            .is_some_and(|guard| guard.active(computer).is_err())
+                    {
+                        if let Some(reply) = release.reply.take() {
+                            let _ = reply.send(Outcome::Failed(Fault::ComputerPolicy));
+                        }
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+            parked.drive_active
+                || !parked.upgrades.is_empty()
+                || parked.releases.iter().any(|entries| !entries.is_empty())
+        });
     }
 
     pub(in crate::node::actor) async fn resume_parked_private_drive(&mut self, room: Digest32) {
+        self.retire_stale_private_drives();
+        if self
+            .parked_private_drives
+            .get(&room)
+            .is_some_and(|parked| parked.busy_owner.is_some())
+        {
+            return;
+        }
+        if let Some(parked) = self.parked_private_drives.get_mut(&room) {
+            if !parked.drive_active && !parked.upgrades.is_empty() {
+                parked.activate_upgrade(0);
+            }
+            if !parked.drive_active {
+                return;
+            }
+        }
         if self.pending_posts.contains_key(&room) {
             return;
         }
-        let Some(parked) = self.parked_private_drives.remove(&room) else {
+        let Some(mut parked) = self.parked_private_drives.remove(&room) else {
             return;
         };
         let Some(instance) = parked.instance.upgrade() else {
@@ -180,29 +750,136 @@ impl Node {
                 .as_ref()
                 .is_some_and(|guard| guard.active(self.computer.as_ref()).is_err())
         {
-            parked.retire(Fault::ComputerPolicy);
+            parked.drive_active = false;
+            if let Some(reply) = parked.reply.take() {
+                let _ = reply.send(Outcome::Failed(Fault::ComputerPolicy));
+            }
+            if !parked.upgrades.is_empty()
+                || parked.releases.iter().any(|entries| !entries.is_empty())
+            {
+                self.parked_private_drives.insert(room, parked);
+            }
             return;
         }
-        let readiness = if let Some(profile) = self
+        let Some(profile) = self
             .profile
             .as_ref()
             .filter(|profile| profile.is_unlocked())
-        {
-            let channel = instance.lock().await;
-            channel
-                .legacy_cache_only(profile.store())
-                .and_then(|legacy| {
-                    if legacy {
-                        Err(Error::StreamRefused("legacy history is not current"))
-                    } else {
-                        channel
-                            .require_governance_ready(profile.store(), self.now_ms())
-                            .map(|_| ())
-                    }
-                })
-        } else {
-            Err(Error::AtRestLocked)
+        else {
+            parked.retire(Fault::Locked);
+            return;
         };
+        let store = profile.store_handle();
+        let Ok(mut channel) = instance.try_lock() else {
+            if parked.room_wait.is_none() {
+                let token = self.next_token;
+                self.next_token += 1;
+                let weak = Arc::downgrade(&instance);
+                let tx = self.net_tx.clone();
+                let task = self.spawn_join_housekeeping(async move {
+                    let Some(room_state) = weak.upgrade() else {
+                        return;
+                    };
+                    drop(room_state.lock().await);
+                    let _ = tx
+                        .send(NetEvent::PrivateDriveRoomReady { room, token })
+                        .await;
+                });
+                parked.room_wait = Some(RoomWake { token, task });
+            }
+            self.parked_private_drives.insert(room, parked);
+            return;
+        };
+        let mut eligible_for = |prerequisite| match prerequisite {
+            DriveWait::Native => Ok(true),
+            DriveWait::Upgrade(pending_upgrade::UpgradeWait::Governance) => {
+                channel.private_policy_ready(&store, self.now_ms().get())
+            }
+            DriveWait::Upgrade(pending_upgrade::UpgradeWait::LocalPreparation) => {
+                Ok(!channel.session_upgrade_local_work())
+            }
+            DriveWait::Upgrade(pending_upgrade::UpgradeWait::ControlEntry { author, seq }) => {
+                channel.private_control_entry_ready(&store, &author, seq)
+            }
+            DriveWait::Upgrade(pending_upgrade::UpgradeWait::ControlFrontier {
+                author,
+                through,
+            }) => channel.private_control_frontier_ready(&store, &author, through),
+            DriveWait::Support => self
+                .support_recipients_checked(&room, &channel, &store)
+                .map(|(ready, _)| ready),
+            DriveWait::SupportPublication => Ok(channel.is_settled()
+                && !channel.is_poisoned()
+                && channel.is_author(&channel.me())
+                && !channel.has_left(&channel.me())
+                && !channel.private_support_discovery_pending()),
+            DriveWait::Publication => channel.history_publication_busy(&store).map(|busy| !busy),
+            DriveWait::Projection => {
+                let me = channel.me();
+                match channel.session_query(
+                    &store,
+                    Query::HasOpen { node: me },
+                    1,
+                    self.now_ms().get(),
+                ) {
+                    Ok(SessionReply::HasOpen(_)) => Ok(true),
+                    Ok(_) => Err(Error::Profile(
+                        "private Session query returned an unexpected reply",
+                    )),
+                    Err(_) if channel.is_poisoned() => {
+                        Err(Error::Profile("private Session query failed"))
+                    }
+                    Err(_) => Ok(false),
+                }
+            }
+        };
+        let mut eligible = eligible_for(parked.prerequisite);
+        if matches!(&eligible, Ok(false)) {
+            for (at, upgrade) in parked.upgrades.iter().enumerate() {
+                if !upgrade.authority.current()
+                    || upgrade
+                        .guard
+                        .as_ref()
+                        .is_some_and(|guard| guard.active(self.computer.as_ref()).is_err())
+                {
+                    continue;
+                }
+                if matches!(eligible_for(upgrade.prerequisite), Ok(true)) {
+                    parked.activate_upgrade(at);
+                    eligible = Ok(true);
+                    break;
+                }
+            }
+        }
+        let readiness = channel.legacy_cache_only(&store).and_then(|legacy| {
+            if legacy {
+                Err(Error::StreamRefused("legacy history is not current"))
+            } else {
+                channel
+                    .require_governance_ready(&store, self.now_ms())
+                    .map(|_| ())
+            }
+        });
+        drop(channel);
+        match eligible {
+            Ok(true) => {}
+            Ok(false) => {
+                self.parked_private_drives.insert(room, parked);
+                return;
+            }
+            Err(error) => {
+                parked.drive_active = false;
+                if let Some(reply) = parked.reply.take() {
+                    let _ = reply.send(Outcome::Failed(fault_of(&error)));
+                }
+                if !parked.upgrades.is_empty()
+                    || parked.releases.iter().any(|entries| !entries.is_empty())
+                {
+                    self.parked_private_drives.insert(room, parked);
+                }
+                return;
+            }
+        }
         if let Err(error) = readiness {
             let fault = fault_of(&error);
             if matches!(
@@ -214,7 +891,15 @@ impl Node {
             ) {
                 self.parked_private_drives.insert(room, parked);
             } else {
-                parked.retire(fault);
+                parked.drive_active = false;
+                if let Some(reply) = parked.reply.take() {
+                    let _ = reply.send(Outcome::Failed(fault));
+                }
+                if !parked.upgrades.is_empty()
+                    || parked.releases.iter().any(|entries| !entries.is_empty())
+                {
+                    self.parked_private_drives.insert(room, parked);
+                }
             }
             return;
         }
@@ -237,16 +922,28 @@ impl Node {
             lifetime: None,
             after: After::Drive {
                 stage: parked.stage,
-                guard: parked.guard,
+                guard: parked.guard.take(),
             },
         };
+        let reply = parked.reply.take();
+        if !parked.upgrades.is_empty() || parked.releases.iter().any(|entries| !entries.is_empty())
+        {
+            parked.drive_active = false;
+            self.parked_private_drives.insert(room, parked);
+        }
         self.begin_pending_maintenance(
             room,
             work,
             maintenance_save::Continuation::Private(continuation),
-            parked.reply,
+            reply,
         )
         .await;
+        let next = self.pending_posts.get(&room).map(post_save::Pending::owner);
+        if let Some(parked) = self.parked_private_drives.get_mut(&room) {
+            if next.is_some() {
+                parked.busy_owner = next;
+            }
+        }
     }
 
     fn park_private_drive(
@@ -255,13 +952,37 @@ impl Node {
         lifetime: Arc<maintenance_save::Lifetime>,
         continuation: Continuation,
         reply: ActorReply,
+        prerequisite: DriveWait,
     ) {
         let After::Drive { stage, guard } = continuation.after else {
             return;
         };
-        if self.parked_private_drives.contains_key(&room) {
-            if let Some(reply) = reply {
-                let _ = reply.send(Outcome::Failed(Fault::RoomChangePending));
+        if let Some(parked) = self.parked_private_drives.get_mut(&room) {
+            if parked.attachment == continuation.attachment
+                && parked
+                    .instance
+                    .upgrade()
+                    .is_some_and(|held| Arc::ptr_eq(&held, &continuation.instance))
+            {
+                if parked.drive_active {
+                    parked.upgrades.push(UpgradeObligation {
+                        stage: parked.stage,
+                        guard: parked.guard.take(),
+                        authority: parked.authority.clone(),
+                        prerequisite: parked.prerequisite,
+                        reply: parked.reply.take(),
+                        room_wait: parked.room_wait.take(),
+                        ready: matches!(parked.prerequisite, DriveWait::Native),
+                    });
+                }
+                parked.stage = stage;
+                parked.guard = guard;
+                parked.authority = lifetime.authority.clone();
+                parked.prerequisite = prerequisite;
+                parked.reply = reply;
+                parked.drive_active = true;
+            } else if let Some(reply) = reply {
+                let _ = reply.send(Outcome::Failed(Fault::ChannelNotOpen));
             }
             return;
         }
@@ -271,6 +992,12 @@ impl Node {
                 instance: Arc::downgrade(&continuation.instance),
                 attachment: continuation.attachment,
                 stage,
+                releases: [Vec::new(), Vec::new()],
+                upgrades: Vec::new(),
+                drive_active: true,
+                busy_owner: None,
+                room_wait: None,
+                prerequisite,
                 guard,
                 authority: lifetime.authority.clone(),
                 reply,
@@ -384,11 +1111,129 @@ impl Node {
         lifetime: Option<Arc<maintenance_save::Lifetime>>,
         reply: ActorReply,
     ) -> bool {
-        if self.parked_private_drives.contains_key(&room) {
-            if let Some(reply) = reply {
-                let _ = reply.send(Outcome::Failed(Fault::RoomChangePending));
+        if self
+            .parked_private_drives
+            .get(&room)
+            .is_some_and(|parked| !parked.drive_active && parked.upgrades.is_empty())
+        {
+            let Some(instance) = self.channels.get(&room).cloned() else {
+                if let Some(reply) = reply {
+                    let _ = reply.send(Outcome::Failed(Fault::ChannelNotOpen));
+                }
+                return false;
+            };
+            if let Err(error) = self.owned_private_drive_guard(guard.as_ref(), lifetime.as_deref())
+            {
+                if let Some(reply) = reply {
+                    let _ = reply.send(Outcome::Failed(fault_of(&error)));
+                }
+                return false;
             }
-            return false;
+            let Some(authority) = lifetime
+                .as_ref()
+                .map(|held| held.authority.clone())
+                .or_else(|| self.computer_authority())
+            else {
+                if let Some(reply) = reply {
+                    let _ = reply.send(Outcome::Failed(Fault::ComputerPolicy));
+                }
+                return false;
+            };
+            let parked = self
+                .parked_private_drives
+                .get_mut(&room)
+                .expect("parked room");
+            if parked.attachment != self.delivery_epoch
+                || !parked
+                    .instance
+                    .upgrade()
+                    .is_some_and(|held| Arc::ptr_eq(&held, &instance))
+            {
+                if let Some(reply) = reply {
+                    let _ = reply.send(Outcome::Failed(Fault::ChannelNotOpen));
+                }
+                return false;
+            }
+            parked.drive_active = true;
+            parked.stage = DriveStage::Upgrade;
+            parked.guard = guard;
+            parked.authority = authority;
+            parked.reply = reply;
+            parked.prerequisite = DriveWait::Native;
+            parked.busy_owner = self.pending_posts.get(&room).map(post_save::Pending::owner);
+            drop(lifetime);
+            if parked.busy_owner.is_none() {
+                self.resume_parked_private_drive(room).await;
+            }
+            return true;
+        }
+        if self.parked_private_drives.contains_key(&room) {
+            if let Err(error) = self.owned_private_drive_guard(guard.as_ref(), lifetime.as_deref())
+            {
+                if let Some(reply) = reply {
+                    let _ = reply.send(Outcome::Failed(fault_of(&error)));
+                }
+                return false;
+            }
+            let Some(authority) = lifetime
+                .as_ref()
+                .map(|held| held.authority.clone())
+                .or_else(|| self.computer_authority())
+            else {
+                if let Some(reply) = reply {
+                    let _ = reply.send(Outcome::Failed(Fault::ComputerPolicy));
+                }
+                return false;
+            };
+            let Some(instance) = self.channels.get(&room) else {
+                if let Some(reply) = reply {
+                    let _ = reply.send(Outcome::Failed(Fault::ChannelNotOpen));
+                }
+                return false;
+            };
+            let parked = self
+                .parked_private_drives
+                .get_mut(&room)
+                .expect("parked room");
+            if parked.attachment != self.delivery_epoch
+                || !parked
+                    .instance
+                    .upgrade()
+                    .is_some_and(|held| Arc::ptr_eq(&held, instance))
+            {
+                if let Some(reply) = reply {
+                    let _ = reply.send(Outcome::Failed(Fault::ChannelNotOpen));
+                }
+                return false;
+            }
+            if guard.is_none()
+                && reply.is_none()
+                && ((parked.drive_active && parked.guard.is_none() && parked.reply.is_none())
+                    || parked
+                        .upgrades
+                        .iter()
+                        .any(|item| item.guard.is_none() && item.reply.is_none()))
+            {
+                return true;
+            }
+            parked.upgrades.push(UpgradeObligation {
+                stage: DriveStage::Upgrade,
+                guard,
+                authority,
+                prerequisite: DriveWait::Native,
+                reply,
+                room_wait: None,
+                ready: true,
+            });
+            let run = parked.busy_owner.is_none() && !self.pending_posts.contains_key(&room);
+            if run {
+                parked.activate_upgrade(parked.upgrades.len() - 1);
+            }
+            drop(lifetime);
+            if run {
+                self.resume_parked_private_drive(room).await;
+            }
+            return true;
         }
         let Some(instance) = self.channels.get(&room).cloned() else {
             if let Some(reply) = reply {
@@ -419,6 +1264,12 @@ impl Node {
                     instance: Arc::downgrade(&instance),
                     attachment: self.delivery_epoch,
                     stage: DriveStage::Upgrade,
+                    busy_owner: self.pending_posts.get(&room).map(post_save::Pending::owner),
+                    room_wait: None,
+                    prerequisite: DriveWait::Native,
+                    releases: [Vec::new(), Vec::new()],
+                    upgrades: Vec::new(),
+                    drive_active: true,
                     guard,
                     authority,
                     reply,
@@ -468,6 +1319,14 @@ impl Node {
                             instance: Arc::downgrade(&instance),
                             attachment: self.delivery_epoch,
                             stage: DriveStage::Upgrade,
+                            releases: [Vec::new(), Vec::new()],
+                            upgrades: Vec::new(),
+                            drive_active: true,
+                            busy_owner: None,
+                            room_wait: None,
+                            prerequisite: DriveWait::Upgrade(
+                                pending_upgrade::UpgradeWait::Governance,
+                            ),
                             guard,
                             authority,
                             reply,
@@ -809,6 +1668,13 @@ impl Node {
         reply: ActorReply,
         stage: DriveStage,
     ) {
+        let mut prerequisite = match stage {
+            DriveStage::Sessions | DriveStage::Support => DriveWait::Support,
+            DriveStage::Query => DriveWait::Projection,
+            DriveStage::Upgrade | DriveStage::Legacy => {
+                DriveWait::Upgrade(pending_upgrade::UpgradeWait::Governance)
+            }
+        };
         let next = match (stage, result) {
             (
                 DriveStage::Query,
@@ -820,6 +1686,15 @@ impl Node {
             }
             (DriveStage::Upgrade, maintenance_save::Saved::Private(Saved::Upgrade(saved))) => {
                 if saved.advance == SessionAdvance::Waiting {
+                    let Some(reason) = saved.wait else {
+                        self.reject_owned_private(
+                            Error::Profile("private upgrade wait reason missing"),
+                            continuation,
+                            reply,
+                        );
+                        return;
+                    };
+                    prerequisite = DriveWait::Upgrade(reason);
                     None
                 } else {
                     Some((
@@ -851,13 +1726,56 @@ impl Node {
                     finish_initial: false,
                 }),
             )),
+            (DriveStage::Upgrade, maintenance_save::Saved::Private(Saved::ExpiryUnavailable)) => {
+                let publication = {
+                    let channel = continuation.instance.lock().await;
+                    match channel.history_publication_busy(&lifetime.store) {
+                        Ok(true) => Some(channel.history_publication_wake()),
+                        Ok(false) => None,
+                        Err(error) => {
+                            drop(channel);
+                            self.reject_owned_private(error, continuation, reply);
+                            return;
+                        }
+                    }
+                };
+                let reason = if publication.is_some() {
+                    DriveWait::Publication
+                } else {
+                    DriveWait::Upgrade(pending_upgrade::UpgradeWait::Governance)
+                };
+                self.park_private_drive(room, lifetime, continuation, reply, reason);
+                let token = self.next_token;
+                self.next_token += 1;
+                let tx = self.net_tx.clone();
+                let task = self.spawn_join_housekeeping(async move {
+                    if let Some(wake) = publication {
+                        wake.await;
+                    }
+                    let _ = tx
+                        .send(NetEvent::PrivateDriveRoomReady { room, token })
+                        .await;
+                });
+                if let Some(parked) = self.parked_private_drives.get_mut(&room) {
+                    parked.room_wait = Some(RoomWake { token, task });
+                } else {
+                    task.abort();
+                }
+                return;
+            }
             (DriveStage::Upgrade, maintenance_save::Saved::Private(Saved::UpgradeComplete)) => {
                 Some((
                     DriveStage::Sessions,
                     maintenance_save::Work::Projection(ProjectionWork::Sessions),
                 ))
             }
-            (DriveStage::Upgrade, maintenance_save::Saved::Private(Saved::UpgradeWaiting)) => None,
+            (
+                DriveStage::Upgrade,
+                maintenance_save::Saved::Private(Saved::UpgradeWaiting(reason)),
+            ) => {
+                prerequisite = DriveWait::Upgrade(reason);
+                None
+            }
             (
                 DriveStage::Sessions,
                 maintenance_save::Saved::Projection(ProjectionProgress::Sessions {
@@ -939,6 +1857,7 @@ impl Node {
                         .await;
                     return;
                 }
+                prerequisite = DriveWait::SupportPublication;
                 None
             }
             (_, maintenance_save::Saved::Unavailable) => None,
@@ -958,7 +1877,7 @@ impl Node {
             continuation.lifetime = Some(lifetime);
             self.continue_private(room, work, continuation, reply).await;
         } else {
-            self.park_private_drive(room, lifetime, continuation, reply);
+            self.park_private_drive(room, lifetime, continuation, reply, prerequisite);
         }
     }
 
@@ -981,12 +1900,20 @@ impl Node {
         };
         let ensure = match answer {
             Ok(SessionReply::HasOpen(open)) => open,
-            _ => {
+            Err(_) => {
                 let mut continuation = continuation;
                 if let After::Drive { stage, .. } = &mut continuation.after {
                     *stage = DriveStage::Query;
                 }
-                self.park_private_drive(room, lifetime, continuation, reply);
+                self.park_private_drive(room, lifetime, continuation, reply, DriveWait::Projection);
+                return;
+            }
+            Ok(_) => {
+                self.reject_owned_private(
+                    Error::Profile("private Session query returned an unexpected reply"),
+                    continuation,
+                    reply,
+                );
                 return;
             }
         };

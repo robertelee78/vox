@@ -879,12 +879,13 @@ pub fn delivery_bundle(
 #[derive(Debug, Default)]
 pub struct RefusedOneTime {
     by_peer: std::collections::BTreeMap<Digest32, std::collections::VecDeque<OneTimeSelection>>,
+    released: std::collections::BTreeMap<Digest32, std::sync::Weak<tokio::sync::Notify>>,
 }
 
 #[derive(Debug)]
 struct OneTimeSelection {
     id: u64,
-    reservation: Option<std::sync::Arc<OneTimeOwner>>,
+    reservation: Option<(std::sync::Weak<OneTimeOwner>, std::sync::Arc<OneTimeState>)>,
 }
 
 enum OneTimeDisposition {
@@ -895,18 +896,15 @@ enum OneTimeDisposition {
 
 impl OneTimeSelection {
     fn disposition(&self) -> OneTimeDisposition {
-        let Some(owner) = &self.reservation else {
+        let Some((owner, state)) = &self.reservation else {
             return OneTimeDisposition::Named;
         };
-        if std::sync::Arc::strong_count(owner) > 1 {
+        if owner.upgrade().is_some() {
             return OneTimeDisposition::Protected;
         }
-        // An owner marks its receipt before releasing its Arc. Synchronize with that
-        // last release before deciding that the table's sole Arc is inactive/evictable.
-        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
-        if owner.uncertain.load(std::sync::atomic::Ordering::Acquire) {
+        if state.uncertain.load(std::sync::atomic::Ordering::Acquire) {
             OneTimeDisposition::Protected
-        } else if owner.named.load(std::sync::atomic::Ordering::Acquire) {
+        } else if state.named.load(std::sync::atomic::Ordering::Acquire) {
             OneTimeDisposition::Named
         } else {
             OneTimeDisposition::Inactive
@@ -923,16 +921,37 @@ impl OneTimeSelection {
 }
 
 #[derive(Debug)]
-struct OneTimeOwner {
+struct OneTimeState {
     uncertain: std::sync::atomic::AtomicBool,
     named: std::sync::atomic::AtomicBool,
 }
 
-impl OneTimeOwner {
+impl OneTimeState {
     fn mark_named(&self) {
         self.named.store(true, std::sync::atomic::Ordering::Release);
         self.uncertain
             .store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[derive(Debug)]
+struct OneTimeOwner {
+    state: std::sync::Arc<OneTimeState>,
+    released: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl Drop for OneTimeOwner {
+    fn drop(&mut self) {
+        // The last strong owner has already gone away: the table's Weak can no
+        // longer upgrade when a woken waiter checks eligibility.
+        if !self
+            .state
+            .uncertain
+            .load(std::sync::atomic::Ordering::Acquire)
+            && !self.state.named.load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.released.notify_waiters();
+        }
     }
 }
 
@@ -948,6 +967,7 @@ impl OneTimeReservation {
     /// retirement safe: this cannot insert an id into another profile's/current room's table.
     pub(crate) fn mark_uncertain(&self) {
         self.owner
+            .state
             .uncertain
             .store(true, std::sync::atomic::Ordering::Release);
     }
@@ -955,11 +975,26 @@ impl OneTimeReservation {
     /// Mark only a confirmed actual package/frame naming receipt, including detached native
     /// success. The original table retains that fact without touching another profile.
     pub(crate) fn mark_named(&self) {
-        self.owner.mark_named();
+        self.owner.state.mark_named();
     }
 }
 
 impl RefusedOneTime {
+    /// Keep one channel per live waiter or owner; dead weak entries are pruned on use.
+    pub(crate) fn release_notifier(
+        &mut self,
+        peer: Digest32,
+    ) -> std::sync::Arc<tokio::sync::Notify> {
+        self.released.retain(|_, notify| notify.strong_count() != 0);
+        let entry = self.released.entry(peer).or_default();
+        if let Some(notify) = entry.upgrade() {
+            return notify;
+        }
+        let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+        *entry = std::sync::Arc::downgrade(&notify);
+        notify
+    }
+
     fn trim(ids: &mut std::collections::VecDeque<OneTimeSelection>) {
         ids.retain(OneTimeSelection::active);
         let mut excess = ids
@@ -979,18 +1014,23 @@ impl RefusedOneTime {
     /// Reserve after the original bundle eligibility check, before handing work to a native
     /// worker. The same table serves selection, temporary ownership and actual named receipts.
     pub(crate) fn reserve(&mut self, peer: Digest32, prekey_id: u64) -> Option<OneTimeReservation> {
+        let released = self.release_notifier(peer);
         let ids = self.by_peer.entry(peer).or_default();
         Self::trim(ids);
         if ids.iter().any(|used| used.id == prekey_id) {
             return None;
         }
-        let owner = std::sync::Arc::new(OneTimeOwner {
+        let state = std::sync::Arc::new(OneTimeState {
             uncertain: std::sync::atomic::AtomicBool::new(false),
             named: std::sync::atomic::AtomicBool::new(false),
         });
+        let owner = std::sync::Arc::new(OneTimeOwner {
+            state: std::sync::Arc::clone(&state),
+            released,
+        });
         ids.push_back(OneTimeSelection {
             id: prekey_id,
-            reservation: Some(std::sync::Arc::clone(&owner)),
+            reservation: Some((std::sync::Arc::downgrade(&owner), state)),
         });
         Some(OneTimeReservation { owner })
     }
@@ -1000,10 +1040,9 @@ impl RefusedOneTime {
         let ids = self.by_peer.entry(peer).or_default();
         Self::trim(ids);
         if let Some(used) = ids.iter_mut().find(|used| used.id == prekey_id) {
-            if let Some(owner) = &used.reservation {
-                // Preserve the same Arc until every unfinished token is gone. Naming is
-                // not permission to evict a still-owned or uncertain selection.
-                owner.mark_named();
+            if let Some((_, state)) = &used.reservation {
+                // A named selection remains protected while its reservation is live.
+                state.mark_named();
             }
         } else {
             ids.push_back(OneTimeSelection {

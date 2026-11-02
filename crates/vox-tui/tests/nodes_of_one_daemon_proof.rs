@@ -1097,6 +1097,224 @@ fn paired_ready_nodes_read_both_ways_and_survive_reselection() {
     read(&a, "pair-ready-a", "paired-later-to-current-a");
 }
 
+/// FX-40/FX-44: an offline private Session reaches its paired driver without resubmission.
+#[test]
+#[ignore = "real binaries with production Argon2id; run in release with test-knobs"]
+fn private_session_opened_offline_reaches_its_paired_driver() {
+    watchdog::arm();
+    let driver = Account::new();
+    let worker = Account::new();
+    for (account, node) in [(&driver, "tail-driver"), (&worker, "tail-worker")] {
+        account.make_node(node);
+        let (ok, out, err) = account.run(&["node", "unlock", node, "--passphrase-file", "-"], PASS);
+        assert!(
+            ok,
+            "APPARATUS: stage protected Ready node {node}: {out}{err}"
+        );
+    }
+    computer(&driver, &["personal", "tail-driver"]);
+    computer(&worker, &["personal", "--clear"]);
+    let invitation = computer(&driver, &["invite"]);
+    let preview = computer(
+        &worker,
+        &[
+            "pair",
+            invitation["invite_link"].as_str().unwrap(),
+            "--preview",
+        ],
+    );
+    let operation = preview["pairing"]["operation_id"].as_str().unwrap();
+    computer(&worker, &["approve", operation]);
+    computer(&driver, &["approve", operation]);
+    assert!(
+        wait_until(CHANGE_SHOWN_WITHIN, || {
+            computer(&driver, &["status"])["state"] == "confirmed"
+                && computer(&worker, &["status"])["state"] == "confirmed"
+        }),
+        "APPARATUS: paired personal driver and non-personal worker did not become current"
+    );
+    let room = make_room(&worker, "tail-worker");
+    let (ok, out, err) = worker.run(&["room", "link", &room, "--node", "tail-worker"], "");
+    assert!(
+        ok,
+        "APPARATUS: obtain fresh two-member room link: {out}{err}"
+    );
+    let link = out.lines().find(|line| line.starts_with("vox://")).unwrap();
+    let (ok, out, err) = driver.run(
+        &[
+            "room",
+            "join",
+            link,
+            "--node",
+            "tail-driver",
+            "--passphrase-file",
+            "-",
+        ],
+        ROOM_PASS,
+    );
+    assert!(ok, "APPARATUS: driver joins the fresh room: {out}{err}");
+    let (ok, out, err) = worker.run(
+        &[
+            "room",
+            "post",
+            &room,
+            "tail-before-offline",
+            "--node",
+            "tail-worker",
+        ],
+        "",
+    );
+    assert!(
+        ok,
+        "APPARATUS: stage initial room synchronization: {out}{err}"
+    );
+    assert!(
+        wait_until(RETURN_WITHIN, || {
+            let (ok, out, _) = driver.run(&["room", "read", &room, "--node", "tail-driver"], "");
+            ok && out.contains("tail-before-offline")
+        }),
+        "APPARATUS: driver did not read the initial room post"
+    );
+
+    let peer_pid = driver.lock_pid().expect("APPARATUS: owned driver daemon");
+    stop_pid(peer_pid);
+    assert!(!alive(peer_pid), "APPARATUS: driver daemon did not stop");
+    for args in [
+        vec!["node", "lock", "tail-worker"],
+        vec!["node", "unlock", "tail-worker", "--passphrase-file", "-"],
+    ] {
+        let (ok, out, err) = worker.run(&args, PASS);
+        assert!(
+            ok,
+            "APPARATUS: restore protected worker room offline: {out}{err}"
+        );
+    }
+    // An empty listing is not absence while its public metadata reports unfinished work.
+    // Stage the local projection without supplying the offline peer's support discovery.
+    let mut offline_listing = (false, String::new(), String::new());
+    assert!(
+        wait_until(RETURN_WITHIN, || {
+            let current = computer(&worker, &["status"])["state"] == "confirmed";
+            let (readable, cached, _) =
+                worker.run(&["room", "read", &room, "--node", "tail-worker"], "");
+            offline_listing = worker.run(
+                &["room", "sessions", &room, "--node", "tail-worker", "--json"], "",
+            );
+            current && readable && cached.contains("tail-before-offline")
+                && offline_listing.0 && offline_listing.1.trim().is_empty()
+                && offline_listing.2.trim().is_empty()
+        }),
+        "APPARATUS: offline worker's local Session projection never became ready for the one original hook: stdout {}; stderr {}; worker log {}",
+        offline_listing.1, offline_listing.2, worker.log()
+    );
+
+    const SESSION: &str = "79979979-aaaa-4bbb-8ccc-000000001112";
+    const PROMPT: &str = "FX40-original-offline-session";
+    let transcript = worker._tmp.path().join("tail-transcript.jsonl");
+    std::fs::write(&transcript, "").expect("APPARATUS: synthetic Session transcript");
+    let payload = serde_json::json!({
+        "session_id": SESSION,
+        "hook_event_name": "UserPromptSubmit",
+        "cwd": worker._tmp.path(),
+        "transcript_path": transcript,
+        "prompt": PROMPT,
+    });
+    let mut hook = worker.cmd(&[
+        "agent",
+        "hook",
+        "--node",
+        "tail-worker",
+        "--room",
+        &room,
+        "--format",
+        "text",
+    ]);
+    let mut hook = hook
+        .env("CLAUDE_CODE_ENTRYPOINT", "cli")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("APPARATUS: start synthetic hook through shipped vox");
+    hook.stdin
+        .take()
+        .unwrap()
+        .write_all(payload.to_string().as_bytes())
+        .expect("APPARATUS: write the one original Session prompt");
+    let hook_output = hook
+        .wait_with_output()
+        .expect("APPARATUS: collect synthetic hook");
+    assert!(
+        wait_until(RETURN_WITHIN, || {
+            let (ok, out, _) = worker.run(
+                &[
+                    "room",
+                    "session",
+                    &room,
+                    SESSION,
+                    "--node",
+                    "tail-worker",
+                    "--json",
+                ],
+                "",
+            );
+            ok && out.contains(PROMPT)
+        }),
+        "APPARATUS: original offline Session was not locally committed; hook stdout {}; stderr {}",
+        String::from_utf8_lossy(&hook_output.stdout),
+        String::from_utf8_lossy(&hook_output.stderr)
+    );
+
+    let (ok, out, err) = driver.run(
+        &["node", "unlock", "tail-driver", "--passphrase-file", "-"],
+        PASS,
+    );
+    assert!(ok, "APPARATUS: restore the actual driver peer: {out}{err}");
+    let (ok, out, err) = driver.run(
+        &[
+            "room",
+            "post",
+            &room,
+            "tail-peer-returned",
+            "--node",
+            "tail-driver",
+        ],
+        "",
+    );
+    assert!(
+        ok,
+        "APPARATUS: returning driver connectivity control: {out}{err}"
+    );
+    assert!(
+        wait_until(RETURN_WITHIN, || {
+            let (ok, out, _) = worker.run(&["room", "read", &room, "--node", "tail-worker"], "");
+            ok && out.contains("tail-peer-returned")
+        }),
+        "APPARATUS: actual peer return was not established by a room round trip"
+    );
+    let mut shown = (false, String::new(), String::new());
+    let delivered = wait_until(RETURN_WITHIN, || {
+        shown = driver.run(
+            &[
+                "room",
+                "session",
+                &room,
+                SESSION,
+                "--node",
+                "tail-driver",
+                "--json",
+            ],
+            "",
+        );
+        shown.0 && shown.1.contains(PROMPT)
+    });
+    assert!(
+        delivered,
+        "PRODUCT: the paired driver could not read the original private Session after real peer return, without resubmitting it: stdout {}; stderr {}; worker log {}; driver log {}",
+        shown.1, shown.2, worker.log(), driver.log()
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn pair_computers(
     a: &Account,

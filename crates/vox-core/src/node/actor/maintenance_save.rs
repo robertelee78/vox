@@ -446,7 +446,7 @@ impl Saved {
 type Returned = (Option<Arc<Lifetime>>, crate::error::Result<Completed>);
 pub(super) struct Pending {
     instance: SharedChannel,
-    owner: Arc<()>,
+    pub(super) owner: Arc<()>,
     store: Arc<Store>,
     epoch: u64,
     preparing: bool,

@@ -5,12 +5,20 @@ use crate::atrest::sek::{Sek, WeakSek};
 use crate::log::entry::{EntryRead, EntryWrite};
 use crate::node::drive::DriveState;
 
+#[derive(Clone, Copy)]
+pub(crate) enum UpgradeWait {
+    Governance,
+    LocalPreparation,
+    ControlEntry { author: Digest32, seq: u64 },
+    ControlFrontier { author: Digest32, through: u64 },
+}
+
 /// Prerequisites use the existing maintenance owner, never a second task/queue convention.
 pub(crate) enum Preparation {
     Work(Box<PendingUpgrade>),
     ControlImport,
     PrivateExpiry,
-    Waiting,
+    Waiting(UpgradeWait),
     Complete,
 }
 
@@ -102,6 +110,7 @@ pub(crate) struct PendingUpgrade {
     maintenance: bool,
     cursor: Option<(Digest32, Cursor)>,
     incarnation: Option<Digest32>,
+    wait: Option<UpgradeWait>,
 }
 
 #[derive(Clone, Copy)]
@@ -114,6 +123,7 @@ pub(crate) struct CheckedRecord {
 
 pub(crate) struct Saved {
     pub(crate) advance: SessionAdvance,
+    pub(crate) wait: Option<UpgradeWait>,
     pub(crate) received: Option<Digest32>,
     pub(crate) session_rendered: usize,
     pub(crate) preview: Option<Option<SessionRow>>,
@@ -163,13 +173,13 @@ impl ChannelState {
             self.private_sessions.upgrading = false;
         }
         if !self.private_policy_ready(store, now.get())? {
-            return Ok(Preparation::Waiting);
+            return Ok(Preparation::Waiting(UpgradeWait::Governance));
         }
         if self.poisoned {
             return Err(self.save_failure());
         }
         if self.private_sessions.upgrading {
-            return Ok(Preparation::Waiting);
+            return Ok(Preparation::Waiting(UpgradeWait::LocalPreparation));
         }
         let work = if self.private_sessions.restoring {
             Work::Restore
@@ -177,7 +187,15 @@ impl ChannelState {
             return Ok(Preparation::ControlImport);
         } else if !self.current_session_controls_ready(store)? {
             if self.legacy_private_controls_ready(store)? {
-                return Ok(Preparation::Waiting);
+                for author in self.authors.keys() {
+                    if !self.current_session_control_ready(store, author)? {
+                        return Ok(Preparation::Waiting(UpgradeWait::ControlFrontier {
+                            author: *author,
+                            through: self.dag.verified_head(author),
+                        }));
+                    }
+                }
+                return Ok(Preparation::Waiting(UpgradeWait::Governance));
             }
             Work::Controls
         } else if self.private_sessions.legacy_work.is_some()
@@ -342,6 +360,7 @@ impl ChannelState {
             receive_persisting: false,
             cursor: None,
             incarnation: None,
+            wait: None,
         }))
     }
 
@@ -583,6 +602,7 @@ impl PendingUpgrade {
                 };
                 Ok(Saved {
                     advance,
+                    wait: self.wait,
                     received,
                     preview,
                     checked_wire,
@@ -728,6 +748,7 @@ impl PendingUpgrade {
                 .ok_or(Error::MalformedAtRest("Session control entry missing"))?;
             let hash = entry.entry_hash();
             if read.log_id(&hash)?.is_none() {
+                self.wait = Some(UpgradeWait::ControlEntry { author, seq });
                 return Ok(if advanced {
                     SessionAdvance::Advanced
                 } else {
@@ -756,11 +777,7 @@ impl PendingUpgrade {
                 self.controls_after = Some(author);
             }
         }
-        Ok(if advanced {
-            SessionAdvance::Advanced
-        } else {
-            SessionAdvance::Waiting
-        })
+        Ok(SessionAdvance::Advanced)
     }
     fn legacy_after(
         &self,
@@ -807,6 +824,10 @@ impl PendingUpgrade {
                     *verified,
                     self.controls_pending,
                 )? {
+                    self.wait = Some(UpgradeWait::ControlFrontier {
+                        author: *author,
+                        through: *verified,
+                    });
                     return Ok(SessionAdvance::Waiting);
                 }
             }
@@ -919,6 +940,7 @@ impl PendingUpgrade {
                     if ChannelState::authorization_refreshing(&error)
                         || governance::refreshing(&error)
                     {
+                        self.wait = Some(UpgradeWait::Governance);
                         return Ok(SessionAdvance::Waiting);
                     }
                     return Err(error);
@@ -1362,6 +1384,18 @@ impl PendingUpgrade {
                         || floor_index::refreshing(&error)
                         || matches!(&error, Error::StreamRefused(reason) if *reason == CONTROL_REFRESHING)
                     {
+                        self.wait = Some(
+                            if matches!(&error, Error::StreamRefused(reason) if *reason == CONTROL_REFRESHING)
+                            {
+                                let author = saved.record.message.header.author_id;
+                                UpgradeWait::ControlFrontier {
+                                    author,
+                                    through: self.heads.get(&author).copied().unwrap_or(0),
+                                }
+                            } else {
+                                UpgradeWait::Governance
+                            },
+                        );
                         return Ok(SessionAdvance::Waiting);
                     }
                     // Candidate authentication/content failures discard only unread wire;
@@ -1393,7 +1427,7 @@ impl PendingUpgrade {
         }
         next.next = self.progress.next;
         self.progress(store, sek, next)?;
-        Ok(SessionAdvance::Waiting)
+        Ok(SessionAdvance::Advanced)
     }
 }
 

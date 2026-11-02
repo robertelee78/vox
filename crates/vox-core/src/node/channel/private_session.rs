@@ -482,7 +482,7 @@ impl ChannelState {
     /// Whether the current Session control effects are complete at one author's exact head.
     /// Sparse control proofs deliberately omit ordinary/archive bodies, so their durable receipt
     /// replaces sequence contiguity only for signed Session floors and support declarations.
-    pub(super) fn current_session_control_ready(
+    pub(crate) fn current_session_control_ready(
         &self,
         store: &Store,
         author: &Digest32,
@@ -492,6 +492,27 @@ impl ChannelState {
         }
         let read = self.entries.read(store, &self.sek, &self.channel_id)?;
         self.current_session_control_ready_in(&read, author)
+    }
+    pub(crate) fn private_control_entry_ready(
+        &self,
+        store: &Store,
+        author: &Digest32,
+        seq: u64,
+    ) -> Result<bool> {
+        let read = self.entries.read(store, &self.sek, &self.channel_id)?;
+        let Some(entry) = read.get(author, seq)? else {
+            return Ok(false);
+        };
+        Ok(read.log_id(&entry.entry_hash())?.is_some())
+    }
+    pub(crate) fn private_control_frontier_ready(
+        &self,
+        store: &Store,
+        author: &Digest32,
+        through: u64,
+    ) -> Result<bool> {
+        Ok(self.dag.verified_head(author) >= through
+            && self.current_session_control_ready(store, author)?)
     }
 
     pub(super) fn current_session_control_ready_in(
@@ -543,7 +564,7 @@ impl ChannelState {
 
     // An incomplete governance projection must neither expire saved Session bodies nor
     // release them using a policy sampled before the current canonical room history.
-    pub(super) fn private_policy_ready(&self, store: &Store, now: u64) -> Result<bool> {
+    pub(crate) fn private_policy_ready(&self, store: &Store, now: u64) -> Result<bool> {
         #[cfg(feature = "test-knobs")]
         if private_policy_held() {
             // A proof holds the room here, as a Session-floor index behind its authors' heads

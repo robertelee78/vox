@@ -232,7 +232,7 @@ struct DriveChain {
     remaining: VecDeque<DriveRelease>,
     ensure: bool,
     guard: Option<computer::ComputerPolicyGuard>,
-    retry_owed: bool,
+    retry_owed: BTreeSet<Digest32>,
 }
 
 enum After {
@@ -641,7 +641,7 @@ impl Node {
                     .await;
                 } else {
                     drop(reservation);
-                    chain.retry_owed = true;
+                    chain.retry_owed.insert(member);
                     self.next_owned_drive_release(
                         room, instance, attachment, lifetime, chain, reply,
                     )
@@ -714,7 +714,7 @@ impl Node {
                             .collect(),
                         ensure,
                         guard,
-                        retry_owed: false,
+                        retry_owed: BTreeSet::new(),
                     };
                     self.next_owned_drive_release(
                         room, instance, attachment, lifetime, chain, reply,
@@ -865,7 +865,7 @@ impl Node {
             // continuation checks authority again before any irreversible publication.
             let selected = self.select_owned_key_package(&room, release.member).await;
             let Some(selected) = selected else {
-                chain.retry_owed = true;
+                chain.retry_owed.insert(release.member);
                 continue;
             };
             let continuation = SessionContinuation {
@@ -890,12 +890,17 @@ impl Node {
             .await;
             return;
         }
-        if chain.retry_owed {
-            // Unavailable prekeys leave the original marks owed. Only an existing real
-            // prekey/connection/ticker edge retries them; do not spin the same failed list.
-            if let Some(reply) = reply {
-                let _ = reply.send(Outcome::Done);
-            }
+        if !chain.retry_owed.is_empty() {
+            self.park_session_release(
+                room,
+                instance,
+                attachment,
+                lifetime,
+                chain.ensure,
+                chain.guard,
+                chain.retry_owed,
+                reply,
+            );
             return;
         }
         // Every sent package's delivery mark is now durable. Revisit the real Drive state

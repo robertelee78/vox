@@ -118,6 +118,14 @@ pub(super) enum Pending {
 }
 
 impl Pending {
+    pub(super) fn owner(&self) -> std::sync::Weak<()> {
+        match self {
+            Self::Append(pending) => Arc::downgrade(&pending.owner),
+            Self::Maintenance(pending) => Arc::downgrade(&pending.owner),
+            Self::Metadata(pending) => Arc::downgrade(&pending.owner),
+        }
+    }
+
     pub(super) fn owe_governance(&mut self, instance: &SharedChannel, attachment: u64) {
         match self {
             Self::Append(pending) => {

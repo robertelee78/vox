@@ -48,13 +48,14 @@ pub(super) enum Work {
 pub(super) enum Saved {
     Upgrade(Box<Native>),
     UpgradeComplete,
-    UpgradeWaiting,
+    UpgradeWaiting(pending_upgrade::UpgradeWait),
     Migration,
     MigrationSkipped,
     ControlImport,
     PrivateExpiry,
     Imported,
     Expired,
+    ExpiryUnavailable,
     Announcement { count: usize, complete: bool },
     Page(Page),
     Flow(Box<pending_upgrade::PageFlow>),
@@ -190,7 +191,9 @@ impl Work {
                     }),
                     pending_upgrade::Preparation::ControlImport => ready(Saved::ControlImport),
                     pending_upgrade::Preparation::PrivateExpiry => ready(Saved::PrivateExpiry),
-                    pending_upgrade::Preparation::Waiting => ready(Saved::UpgradeWaiting),
+                    pending_upgrade::Preparation::Waiting(reason) => {
+                        ready(Saved::UpgradeWaiting(reason))
+                    }
                     pending_upgrade::Preparation::Complete => ready(Saved::UpgradeComplete),
                 }
             }
@@ -204,17 +207,19 @@ impl Work {
                     None => ready(Saved::MigrationSkipped),
                 }
             }
-            Self::Import => channel
-                .prepare_pending_control_import(store, owner)?
-                .map(Prepared::Import),
-            Self::Expiry => channel
-                .prepare_pending_retention(
-                    store,
-                    owner,
-                    pending_retention::Step::PrivateExpiry,
-                    now,
-                )?
-                .map(|pending| Prepared::Expiry(Box::new(pending))),
+            Self::Import => match channel.prepare_pending_control_import(store, owner)? {
+                Some(pending) => Some(Prepared::Import(pending)),
+                None => ready(Saved::Imported),
+            },
+            Self::Expiry => match channel.prepare_pending_retention(
+                store,
+                owner,
+                pending_retention::Step::PrivateExpiry,
+                now,
+            )? {
+                Some(pending) => Some(Prepared::Expiry(Box::new(pending))),
+                None => ready(Saved::ExpiryUnavailable),
+            },
             Self::ScheduleReplay => Some(Prepared::Native {
                 pending: channel.prepare_pending_private_replay(store, owner, now)?,
                 kind: NativeKind::Upgrade,

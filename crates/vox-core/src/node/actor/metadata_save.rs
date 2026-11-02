@@ -466,6 +466,7 @@ type RoomReturned = (
     crate::error::Result<Saved>,
 );
 pub(super) struct RoomPending {
+    pub(super) owner: Arc<()>,
     room: Digest32,
     epoch: u64,
     node: Digest32,
@@ -688,6 +689,7 @@ impl Node {
         self.pending_posts.insert(
             room,
             post_save::Pending::Metadata(RoomPending {
+                owner: Arc::new(()),
                 room,
                 epoch,
                 node,

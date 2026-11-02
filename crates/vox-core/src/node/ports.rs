@@ -21,6 +21,7 @@
 //!   still needs a session after its turn goes to the tail.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
@@ -801,12 +802,20 @@ impl Queue {
 pub struct Slots {
     in_use: usize,
     per_peer: BTreeMap<Digest32, usize>,
+    changed: Arc<tokio::sync::Notify>,
 }
 
 /// The slot table as the actor and the workers share it.
 pub type SharedSlots = Arc<Mutex<Slots>>;
 
 impl Slots {
+    pub(crate) fn wake(slots: &SharedSlots) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> {
+        let notify = Arc::clone(&slots.lock().unwrap_or_else(PoisonError::into_inner).changed);
+        let mut wake = Box::pin(notify.notified_owned());
+        wake.as_mut().enable();
+        wake
+    }
+
     /// Whether an outbound session to `peer` may start.
     #[must_use]
     pub fn free_for(slots: &SharedSlots, peer: &Digest32) -> bool {
@@ -874,6 +883,7 @@ impl Drop for Slot {
                     s.per_peer.remove(&self.peer);
                 }
             }
+            s.changed.notify_waiters();
         }
         if let Some(f) = self.on_free.take() {
             f();
