@@ -1094,6 +1094,20 @@ lessons. It changes neither this record's decision status nor any requirement or
   identifies activity admission or proves this was that execution's cause. Runtime attribution
   MUST report the actual admission and first failed continuation boundary, not assume data loss.
 
+  A normal `dfee9d730` matrix run exposed a second opening boundary: one valid default hook
+  left saved activity waiting, while the durable registration's opening worker terminally
+  reported `stream refused: the room changed while reading; refresh and retry`. Its original
+  local body remained unobserved for sixty seconds. The rendered directory's revision can
+  invalidate a read snapshot without room replacement or permission loss. The opening worker's
+  existing readiness classification omitted that case. The retained diagnostic does not
+  distinguish its exact read-only lookup phase from subsequent attention resolution.
+  Those read-only opening phases MUST translate this exact snapshot-change refusal into a
+  scoped opening retry reason and obtain fresh state under the existing registration,
+  membership and lifecycle checks. They MUST NOT broaden the raw error into a generic retry
+  of `post` or any ambiguous mutation. Existing attempt bounds and opening-owner cadence remain;
+  original activity is not replayed, and actual lock, binding, permission and storage refusals
+  retain their meaning.
+
   A finite scan MUST cover the existing bounded inbox directory, including more than sixteen
   active Sessions, without spinning over an unchanged blocked set. A successful atomic
   append/inbox-head completion MUST advance its next head; unlock/restart MUST seed a scan only
