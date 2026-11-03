@@ -1145,13 +1145,29 @@ fn computer_pair_json_reviews_without_approving_the_peer() {
     );
     computer(&c, &["approve", fresh_op]);
     computer(&a, &["approve", fresh_op]);
+    let mut last = (
+        serde_json::Value::Null,
+        serde_json::Value::Null,
+        serde_json::Value::Null,
+    );
     assert!(
         wait_until(CHANGE_SHOWN_WITHIN, || {
-            computer(&a, &["status"])["state"] == "confirmed"
-                && computer(&b, &["status"])["state"] == "confirmed"
-                && computer(&c, &["status"])["state"] == "confirmed"
+            last = (
+                computer(&a, &["status"]),
+                computer(&b, &["status"]),
+                computer(&c, &["status"]),
+            );
+            last.0["state"] == "confirmed"
+                && last.1["state"] == "confirmed"
+                && last.2["state"] == "confirmed"
         }),
-        "PRODUCT: fresh bilateral enrollment after local retirement did not complete"
+        "PRODUCT: fresh bilateral enrollment after local retirement did not complete: {}; {}; {}; logs: {}; {}; {}",
+        last.0,
+        last.1,
+        last.2,
+        a.log(),
+        b.log(),
+        c.log()
     );
     assert!(
         wait_until(RETURN_WITHIN, || {

@@ -5463,17 +5463,17 @@ final class FirstRunProof: XCTestCase {
         ui.typeKey("k", modifierFlags: .command)
         type(ui, Key.id("palette-query"), "Admins", "the command palette")
         ui.typeKey(.return, modifierFlags: [])
-        let bobAdmin = Key.id("admin-bob")
-        if present(ui, bobAdmin, timeout: 10, "the Admins sheet must list bob") {
-            tap(ui, bobAdmin, "bob's admin switch")
+        if tap(ui, Key.showing("Make a Member Admin"), "the Admins member menu")
+            && tap(ui, Key.menuItem("bob"), "bob in the Admins member menu") {
             words(ui, Key.id("admin-confirm"), timeout: 10,
-                  "turning bob into an admin must ask first, saying what an admin can do",
+                  "choosing bob must ask first, saying what an admin can do",
                   until: { $0.contains("Make bob an admin?") && $0.contains("end this room for everyone") })
             tap(ui, Key.id("admin-confirm-cancel"), "Cancel")
             let listed = run(vox, ["room", "admin", "list", "--node", "alice", room], env: voxEnv).out
             XCTAssertFalse(listed.contains(bobFp) || listed.contains("bob"),
                            "PRODUCT: Cancel must make nobody an admin; `vox room admin list` says: \(listed)")
-            tap(ui, bobAdmin, "bob's admin switch")
+            tap(ui, Key.showing("Make a Member Admin"), "the Admins member menu")
+            tap(ui, Key.menuItem("bob"), "bob in the Admins member menu")
             tap(ui, Key.id("admin-confirm-make"), "Make Admin")
             var made = ""
             let madeUntil = Date().addingTimeInterval(15)

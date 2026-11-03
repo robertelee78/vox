@@ -589,19 +589,12 @@ pub(super) fn reserve_policy_rooms(
     store: &Arc<Store>,
     owner: Arc<()>,
     require_append: bool,
-    wait: bool,
 ) -> crate::error::Result<Vec<PolicyRoom>> {
     rooms.sort_by_key(|(room, _)| *room);
     let mut reserved: Vec<PolicyRoom> = Vec::with_capacity(rooms.len());
     let result = (|| {
         for (room, instance) in rooms {
-            let mut channel = if wait {
-                instance.blocking_lock()
-            } else {
-                instance
-                    .try_lock()
-                    .map_err(|_| Error::StreamRefused("a room change is pending"))?
-            };
+            let mut channel = instance.blocking_lock();
             if require_append {
                 channel.ensure_local_append_available(store)?;
             }

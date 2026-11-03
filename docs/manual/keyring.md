@@ -305,6 +305,8 @@ While a received removal is being applied, a room read can say `computer policy 
 retry`. Check `vox computer status` for the pending application; do not repeat the removal,
 regrant trust or restart the daemon to make that application finish. Read-only governance
 preparation resumes the existing application without replaying committed withdrawals.
+Brief room reads do not fail that application: its existing preparation waits for the room,
+without requiring another approval or a daemon restart.
 
 Copying a node folder does not transfer management. For an intentional move, the existing
 manager releases the exact node to one enrolled destination, then the destination approves:
