@@ -1,4 +1,4 @@
-//! IPC version 9: the daemon's side of the control socket (ADR-026 §4).
+//! IPC version 10: the daemon's side of the control socket (ADR-026 §4).
 //!
 //! One socket serves a data root's daemon and every node attached to it (C-1). A connection opens
 //! with the daemon's [`DaemonFrame::Hello`], which names the daemon's version and its attached
@@ -67,6 +67,7 @@ const T_SESSION_ACTIVITY: u64 = 4021;
 
 // Client → daemon: the opening frame.
 const T_USE: u64 = 4100;
+const T_USE_EXISTING: u64 = 4131;
 const T_REQ_NODES: u64 = 4101;
 const T_REQ_ATTACH: u64 = 4102;
 const T_REQ_DETACH: u64 = 4103;
@@ -184,6 +185,13 @@ pub enum AttachMode {
     /// Attach it implicitly if it is not attached, and hold it while this connection is open: a
     /// verb that holds a session (`serve`, `connect`, `up`, `forward`, `lan up`) or the TUI.
     Hold,
+    /// Act only as this exact already-attached incarnation, optionally holding it.
+    Existing {
+        /// Opaque identifier returned by the original `Using`.
+        attachment: Digest32,
+        /// Hold the attachment until this connection closes.
+        hold: bool,
+    },
 }
 
 /// The opening `Use`: the node this connection acts as (ADR-026 C-2).
@@ -197,7 +205,7 @@ pub struct UseNode {
     /// Whether, and how, to attach it if it is not attached.
     pub attach: AttachMode,
     /// The identity passphrase, for an attach this `Use` may cause; `None` for a node that needs
-    /// none, or for [`AttachMode::No`]. Resolved by the client, never by the daemon (C-6).
+    /// none, or for [`AttachMode::No`] and [`AttachMode::Existing`]. Resolved by the client (C-6).
     pub passphrase: Option<Zeroizing<String>>,
     /// Anchor specs (`--anchor`) the node is attached with, if this `Use` attaches it.
     pub anchors: Vec<String>,
@@ -514,7 +522,7 @@ impl SessionAdmission {
 /// names another node's secrets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refusal {
-    /// A one-shot verb's node is not attached; it must be attached first (L-2).
+    /// This connection cannot use the requested attachment; choose the node again or unlock it.
     NotAttached {
         /// The node.
         node: NodeName,
@@ -573,7 +581,7 @@ impl std::fmt::Display for Refusal {
         match self {
             Self::NotAttached { node } => write!(
                 f,
-                "node {node} is Locked; unlock it first: {}",
+                "node {node} is not attached to this connection; choose it again if Ready, or unlock it if Locked: {}",
                 vox_text::shell::command(&["vox", "node", "unlock", "--", node.as_str()])
             ),
             Self::NoSuchNode { node } => write!(f, "there is no node {node}"),
@@ -819,6 +827,8 @@ pub enum DaemonFrame {
         node: NodeName,
         /// Its identity's fingerprint, or `None` if it has none yet.
         me: Option<Digest32>,
+        /// Opaque identifier of this attachment incarnation.
+        attachment: Digest32,
         /// What attaching the node said, when this `Use` attached it: each line the daemon also
         /// logs (a skipped anchors line, a node carrying on with no anchor), for the client to
         /// print in the person's own terminal (PRD-001 R23, R36). Empty when it was attached.
@@ -915,6 +925,10 @@ fn fp(d: &mut Decoder<'_>, what: &'static str) -> Result<Option<Digest32>> {
     Digest32::try_from(b)
         .map(Some)
         .map_err(|_| Error::MalformedIpc(what))
+}
+
+fn attachment(d: &mut Decoder<'_>, what: &'static str) -> Result<Digest32> {
+    Digest32::try_from(d.bytes().map_err(malformed(what))?).map_err(|_| Error::MalformedIpc(what))
 }
 
 /// An optional secret: `[]` for none, `[text]` for one. A secret is never told apart from an empty
@@ -1140,15 +1154,25 @@ impl Opening {
     pub fn to_bytes(&self) -> Zeroizing<Vec<u8>> {
         let mut e = Encoder::for_secrets();
         match self {
-            Opening::Use(u) => {
-                e.array(5).uint(T_USE).text(u.node.as_str());
-                e.uint(match u.attach {
-                    AttachMode::No => ATTACH_NO,
-                    AttachMode::Hold => ATTACH_HOLD,
-                });
-                put_secret(&mut e, u.passphrase.as_ref());
-                put_texts(&mut e, &u.anchors);
-            }
+            Opening::Use(u) => match u.attach {
+                AttachMode::Existing { attachment, hold } => {
+                    e.array(4)
+                        .uint(T_USE_EXISTING)
+                        .text(u.node.as_str())
+                        .bytes(&attachment);
+                    e.uint(u64::from(hold));
+                }
+                mode => {
+                    e.array(5).uint(T_USE).text(u.node.as_str());
+                    e.uint(match mode {
+                        AttachMode::No => ATTACH_NO,
+                        AttachMode::Hold => ATTACH_HOLD,
+                        AttachMode::Existing { .. } => unreachable!(),
+                    });
+                    put_secret(&mut e, u.passphrase.as_ref());
+                    put_texts(&mut e, &u.anchors);
+                }
+            },
             Opening::Daemon(r) => match r {
                 DaemonRequest::Nodes => {
                     e.array(1).uint(T_REQ_NODES);
@@ -1372,6 +1396,15 @@ impl Opening {
                     anchors,
                 })
             }
+            (T_USE_EXISTING, 4) => Opening::Use(UseNode {
+                node: name(&mut d, "ipc use node")?,
+                attach: AttachMode::Existing {
+                    attachment: attachment(&mut d, "ipc use attachment")?,
+                    hold: flag(&mut d, "ipc use hold")?,
+                },
+                passphrase: None,
+                anchors: Vec::new(),
+            }),
             (T_REQ_NODES, 1) => Opening::Daemon(DaemonRequest::Nodes),
             (T_REQ_ATTACH, 6) => {
                 let node = name(&mut d, "ipc attach node")?;
@@ -1558,10 +1591,16 @@ impl DaemonFrame {
                     .uint(u64::from(*pid));
                 put_infos(&mut e, attached);
             }
-            DaemonFrame::Using { node, me, notes } => {
-                e.array(4).uint(T_USING).text(node.as_str());
+            DaemonFrame::Using {
+                node,
+                me,
+                attachment,
+                notes,
+            } => {
+                e.array(5).uint(T_USING).text(node.as_str());
                 put_fp(&mut e, me.as_ref());
                 put_texts(&mut e, notes);
+                e.bytes(attachment);
             }
             DaemonFrame::Refused(r) => {
                 e.array(2).uint(T_REFUSED);
@@ -1742,10 +1781,11 @@ impl DaemonFrame {
                     attached,
                 }
             }
-            (T_USING, 4) => DaemonFrame::Using {
+            (T_USING, 5) => DaemonFrame::Using {
                 node: name(&mut d, "ipc using node")?,
                 me: fp(&mut d, "ipc using identity")?,
                 notes: texts(&mut d, "ipc using notes")?,
+                attachment: attachment(&mut d, "ipc using attachment")?,
             },
             (T_REFUSED, 2) => DaemonFrame::Refused(refusal(&mut d)?),
             (T_NODES, 2) => DaemonFrame::Nodes(infos(&mut d)?),

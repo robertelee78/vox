@@ -49,6 +49,12 @@ starting or stopping; an unreadable saved record reports its reason instead of g
 **Ready** means the node is running and can work. **Locked** means its protected identity needs
 unlocking. `vox node lock` closes a protected node's connections, stops its services, wipes its
 keys from memory and forgets its remembered passphrase. Its rooms and keyring stay on disk.
+An already-open app or terminal connection must not silently start the node again or resume as
+a later unlock of the same identity. Unlock and choose the node again to open a fresh connection.
+In the Mac app, **Choose Node → Use This Node** opens a fresh connection even when you choose
+the same node. It preserves that node's local room and Session drafts and the current reply;
+the selected room reopens at General. A failed unlock or credential-store operation shows its
+actual result without discarding the draft.
 A node made with no passphrase always becomes Ready when Vox runs. Lock or Forget removes any
 remembered entry but cannot lock an identity that has no passphrase; Vox says it stays Ready.
 

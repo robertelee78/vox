@@ -291,7 +291,6 @@ final class AppModel: ObservableObject {
               !nodeActionInProgress, appNodeChoices.contains(where: {
                   $0.name == name && $0.fingerprint == expected
               }) else { secret.wipe(); return }
-        if old.me == expected { secret.wipe(); appNodeChooser = false; return }
         let generation = beginNodeRequest()
         nodeActionInProgress = true
         appNodeChoiceBusy = true
@@ -339,6 +338,20 @@ final class AppModel: ObservableObject {
             }
             self.client = connection
             enter(name, actual, connection)
+            if actual == old.me, let replacement = self.node {
+                // Only local drafts cross an explicit same-identity selection, never old reads
+                // or authority. Reopening the room starts at General as an ordinary room open.
+                if case let .room(room) = old.selection {
+                    if let reply = old.replyTo {
+                        old.roomDrafts[room, default: RoomDraft()].reply = reply
+                    } else {
+                        old.roomDrafts[room]?.reply = nil
+                    }
+                }
+                replacement.roomDrafts = old.roomDrafts
+                replacement.sessionDrafts = old.sessionDrafts
+                replacement.select(old.selection)
+            }
             appNodeChooser = false
             do {
                 let file = choiceFile(connection)
@@ -1060,7 +1073,7 @@ struct StartFailure: Error, Equatable {
         case .busy: return "Another copy of Vox is using this node"
         case .versionMismatch: return said
         case .unreachable: return "Vox can't reach its background service"
-        case .other: return "Vox couldn’t make this node Ready"
+        case .other: return "Vox couldn’t finish opening this node"
         }
     }
 

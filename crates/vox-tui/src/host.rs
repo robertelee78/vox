@@ -229,6 +229,8 @@ impl Drop for ComputerReconciliation {
 
 struct Attached {
     handle: NodeHandle,
+    /// Fresh opaque identifier for this particular published attachment.
+    attachment: Digest32,
     paths: Paths,
     /// Which attach this is: a release or a panic meant for an earlier one changes nothing.
     generation: u64,
@@ -282,6 +284,7 @@ enum Want {
 struct Granted {
     info: NodeInfo,
     handle: NodeHandle,
+    attachment: Digest32,
     detached: watch::Receiver<bool>,
     hold: Option<HolderGuard>,
     /// What attaching the node said, when this request attached it; empty when it was attached.
@@ -1519,16 +1522,37 @@ impl Router {
     /// # Errors
     /// The [`Refusal`] the client is told.
     pub async fn use_node(&self, u: UseNode) -> Result<Lease, Refusal> {
-        let want = match u.attach {
-            vox_core::node::daemonipc::AttachMode::No => Want::IfAttached,
-            vox_core::node::daemonipc::AttachMode::Hold => Want::Hold,
+        let g = match u.attach {
+            vox_core::node::daemonipc::AttachMode::Existing { attachment, hold } => {
+                let mut slots = lock(&self.inner.slots);
+                if self.inner.stopping.load(Ordering::SeqCst) {
+                    return Err(Refusal::Stopping);
+                }
+                match slots.get_mut(&u.node) {
+                    Some(Slot::Attached(a)) if a.attachment == attachment => {
+                        self.grant(&u.node, a, if hold { Want::Hold } else { Want::IfAttached })?
+                    }
+                    _ => {
+                        return Err(Refusal::NotAttached {
+                            node: u.node.clone(),
+                        })
+                    }
+                }
+            }
+            mode => {
+                let want = match mode {
+                    vox_core::node::daemonipc::AttachMode::No => Want::IfAttached,
+                    vox_core::node::daemonipc::AttachMode::Hold => Want::Hold,
+                    vox_core::node::daemonipc::AttachMode::Existing { .. } => unreachable!(),
+                };
+                self.want(&u.node, want, u.passphrase, Vec::new(), u.anchors)
+                    .await?
+            }
         };
-        let g = self
-            .want(&u.node, want, u.passphrase, Vec::new(), u.anchors)
-            .await?;
         let drive = (Arc::downgrade(&self.inner), u.node.clone());
         Ok(Lease {
             node: u.node,
+            attachment: g.attachment,
             handle: g.handle,
             detached: g.detached,
             hold: g
@@ -4200,6 +4224,7 @@ impl Router {
         Ok(Granted {
             info: info_of_attached(node, a),
             handle: a.handle.clone(),
+            attachment: a.attachment,
             detached: a.detached.subscribe(),
             hold,
             notes: Vec::new(),
@@ -4224,6 +4249,10 @@ impl Router {
         if !self.inner.account.nodes_on_disk().contains(node) {
             return Err(Refusal::NoSuchNode { node: node.clone() });
         }
+        // Allocate before starting any actor so an entropy failure follows the normal failed-start
+        // cleanup without leaving running work behind.
+        let attachment = vox_core::identity::rng::random_array::<32>()
+            .map_err(|e| failed(format!("could not identify the attachment: {e}")))?;
         let paths = self
             .inner
             .account
@@ -4449,6 +4478,7 @@ impl Router {
             Box::new(Attached {
                 handle,
                 paths,
+                attachment,
                 generation,
                 computer_reconciliation: None,
                 implicit: true,

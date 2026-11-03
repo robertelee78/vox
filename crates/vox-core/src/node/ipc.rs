@@ -74,7 +74,8 @@ use crate::node::api::{MessageRow, NodeEvent};
 /// with the daemon's hello and the client's `Use` or daemon request
 /// ([`crate::node::daemonipc`]); a request in flight when its node detaches is answered
 /// [`Frame::NodeDetached`].
-pub const PROTOCOL_VERSION: u64 = 9;
+/// 10: `Using` identifies the attachment incarnation; derived connections can require it.
+pub const PROTOCOL_VERSION: u64 = 10;
 
 /// Largest frame accepted in either direction.
 ///
@@ -6453,6 +6454,7 @@ pub const ACTOR_WITHIN: std::time::Duration = std::time::Duration::from_secs(60)
 async fn while_answering<T>(
     path: &Path,
     node: Option<&crate::node::paths::NodeName>,
+    attachment: Option<Digest32>,
     exchange: impl std::future::Future<Output = Result<T>>,
 ) -> Result<T> {
     tokio::pin!(exchange);
@@ -6463,20 +6465,27 @@ async fn while_answering<T>(
             out = &mut exchange => return out,
             alive = async {
                 tokio::time::sleep(ANSWER_WITHIN).await;
-                still_answering(path, node).await
+                still_answering(path, node, attachment).await
             } => alive?,
         }
     }
 }
 
 /// Whether the node at `path` greets a new connection and its actor answers a ping, or why not.
-/// On the daemon's socket the new connection uses `node`, never attaching it.
-async fn still_answering(path: &Path, node: Option<&crate::node::paths::NodeName>) -> Result<()> {
-    let opened = match node {
-        Some(node) => {
-            IpcClient::open_at(&NodeSocket::one_shot(path.to_owned(), node.clone())).await
+/// On the daemon's socket the new connection requires the same attachment.
+async fn still_answering(
+    path: &Path,
+    node: Option<&crate::node::paths::NodeName>,
+    attachment: Option<Digest32>,
+) -> Result<()> {
+    let opened = match (node, attachment) {
+        (Some(node), Some(attachment)) => {
+            let at = NodeSocket::one_shot(path.to_owned(), node.clone())
+                .for_attachment(attachment, false);
+            IpcClient::open_at(&at).await
         }
-        None => IpcClient::open(path).await,
+        (None, None) => IpcClient::open(path).await,
+        _ => return Err(Error::MalformedIpc("ipc attachment missing")),
     };
     let mut probe = match opened {
         Ok(c) => c,
@@ -7022,6 +7031,8 @@ fn request_name(request: &Request) -> String {
 pub struct Lease {
     /// The node.
     pub node: crate::node::paths::NodeName,
+    /// The exact attachment incarnation granted to this connection.
+    pub attachment: Digest32,
     /// Its handle.
     pub handle: NodeHandle,
     /// Turns `true` when the node detaches (L-3).
@@ -7237,6 +7248,7 @@ async fn serve_account<D: Dispatch>(
 pub async fn serve_node(mut stream: UnixStream, lease: Lease) -> Result<()> {
     let Lease {
         node,
+        attachment,
         handle,
         detached,
         hold,
@@ -7246,6 +7258,7 @@ pub async fn serve_node(mut stream: UnixStream, lease: Lease) -> Result<()> {
     let using = crate::node::daemonipc::DaemonFrame::Using {
         node: node.clone(),
         me: handle.view().identity.map(|i| i.fingerprint),
+        attachment,
         notes,
     };
     let wrote = write_frame(&mut stream, &using.to_bytes()).await;
@@ -9248,6 +9261,8 @@ pub(crate) async fn subscriber_gone(stream: &UnixStream) {
 pub struct IpcClient {
     stream: UnixStream,
     me: Option<Digest32>,
+    /// The daemon attachment this connection belongs to; absent on a direct node socket.
+    attachment: Option<Digest32>,
     /// Where the node listens, so a request that waits can check it is still answering.
     path: PathBuf,
     /// The node this connection acts as on the daemon's socket (ADR-026 C-2), which a check on a
@@ -9308,15 +9323,16 @@ impl NodeSocket {
         }
     }
 
-    /// The same node, for a connection that must not attach it: what a check on a waiting request
-    /// opens, and every connection after the first of a held verb, whose first holds it.
+    /// Connect only to this attachment incarnation, without retaining attach credentials.
     #[must_use]
-    pub fn attached_only(&self) -> Self {
-        Self {
+    pub fn for_attachment(&self, attachment: Digest32, hold: bool) -> Self {
+        let mut at = Self {
             waiting: self.waiting,
             expected_identity: self.expected_identity,
             ..Self::one_shot(self.path.clone(), self.using.node.clone())
-        }
+        };
+        at.using.attach = crate::node::daemonipc::AttachMode::Existing { attachment, hold };
+        at
     }
 }
 
@@ -9338,6 +9354,14 @@ pub async fn open_as(at: &NodeSocket) -> Result<(UnixStream, Option<Digest32>)> 
 pub async fn open_as_noting(
     at: &NodeSocket,
 ) -> Result<(UnixStream, Option<Digest32>, Vec<String>)> {
+    open_as_attached(at)
+        .await
+        .map(|(stream, me, _, notes)| (stream, me, notes))
+}
+
+async fn open_as_attached(
+    at: &NodeSocket,
+) -> Result<(UnixStream, Option<Digest32>, Digest32, Vec<String>)> {
     use crate::node::daemonipc::{DaemonClient, DaemonFrame, Opening};
     let DaemonClient { mut stream, .. } = DaemonClient::open_noting(&at.path, at.waiting).await?;
     // Wiped once sent: it may carry the identity passphrase (C-6).
@@ -9350,13 +9374,18 @@ pub async fn open_as_noting(
         return Err(hung_up(&at.path).await);
     };
     match DaemonFrame::from_bytes(&answer)? {
-        DaemonFrame::Using { me, notes, .. } => {
+        DaemonFrame::Using {
+            me,
+            attachment,
+            notes,
+            ..
+        } => {
             if at.expected_identity.is_some() && me != at.expected_identity {
                 return Err(Error::Ipc(IpcHandshake::Refused {
                     reason: "the selected node's identity changed; no node request was sent".into(),
                 }));
             }
-            Ok((stream, me, notes))
+            Ok((stream, me, attachment, notes))
         }
         DaemonFrame::Refused(r) => Err(Error::Ipc(IpcHandshake::Refused {
             reason: r.to_string(),
@@ -9449,6 +9478,12 @@ impl IpcClient {
         self.me
     }
 
+    /// The exact daemon attachment for this connection, or `None` for a direct node socket.
+    #[must_use]
+    pub fn attachment(&self) -> Option<Digest32> {
+        self.attachment
+    }
+
     /// The local node selected by this connection's `Use`, for contextual command output.
     #[must_use]
     pub fn node_name(&self) -> Option<&crate::node::paths::NodeName> {
@@ -9474,9 +9509,15 @@ impl IpcClient {
             return Err(Error::Ipc(IpcHandshake::ClosedBeforeHello));
         };
         match DaemonFrame::from_bytes(&answer)? {
-            DaemonFrame::Using { me, node, notes } => Ok(Ok(Self {
+            DaemonFrame::Using {
+                me,
+                node,
+                attachment,
+                notes,
+            } => Ok(Ok(Self {
                 stream,
                 me,
+                attachment: Some(attachment),
                 path: path.to_owned(),
                 node: Some(node),
                 notes,
@@ -9530,6 +9571,7 @@ impl IpcClient {
         Ok(Self {
             stream,
             me,
+            attachment: None,
             path: path.to_owned(),
             node: None,
             notes: Vec::new(),
@@ -9543,10 +9585,11 @@ impl IpcClient {
     /// # Errors
     /// As [`open_as`].
     pub async fn open_at(at: &NodeSocket) -> Result<Self> {
-        let (stream, me, notes) = open_as_noting(at).await?;
+        let (stream, me, attachment, notes) = open_as_attached(at).await?;
         Ok(Self {
             stream,
             me,
+            attachment: Some(attachment),
             path: at.path.clone(),
             node: Some(at.using.node.clone()),
             notes,
@@ -9594,7 +9637,11 @@ impl IpcClient {
         // it broken in that case too; only a complete exchange makes it reusable (WT-2).
         self.broken = true;
         let Self {
-            stream, path, node, ..
+            stream,
+            path,
+            node,
+            attachment,
+            ..
         } = self;
         let exchange = async {
             // Wiped once sent: it may carry a passphrase (V210-94).
@@ -9606,7 +9653,7 @@ impl IpcClient {
             };
             Frame::from_bytes(&body)
         };
-        let answering = while_answering(path, node.as_ref(), exchange);
+        let answering = while_answering(path, node.as_ref(), *attachment, exchange);
         let out = match answer_within {
             Some(within) => {
                 tokio::time::timeout(within, answering)
@@ -9644,7 +9691,11 @@ impl IpcClient {
         }
         self.broken = true;
         let Self {
-            stream, path, node, ..
+            stream,
+            path,
+            node,
+            attachment,
+            ..
         } = self;
         let exchange = async {
             if let Err(e) = write_frame(stream, body).await {
@@ -9655,7 +9706,7 @@ impl IpcClient {
                 None => Err(hung_up(path).await),
             }
         };
-        let answering = while_answering(path, node.as_ref(), exchange);
+        let answering = while_answering(path, node.as_ref(), *attachment, exchange);
         let out = match answer_within {
             Some(within) => {
                 tokio::time::timeout(within, answering)
