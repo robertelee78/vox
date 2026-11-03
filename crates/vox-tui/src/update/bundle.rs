@@ -206,7 +206,9 @@ impl BundleIdentity {
 
     fn matches(&self, current: &Self) -> bool {
         match (&self.stable, &current.stable) {
-            (Some(a), Some(b)) => self.inode == current.inode && a == b,
+            (Some(a), Some(b)) => {
+                self.device == current.device && self.inode == current.inode && a == b
+            }
             (None, Some(_)) | (None, None) => {
                 self.device == current.device && self.inode == current.inode
             }
