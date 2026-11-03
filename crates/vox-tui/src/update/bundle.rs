@@ -1791,7 +1791,8 @@ fn authenticate_readoption(apps: &Path, transition: &mut Transition) -> Result<(
     let before = bundle_identity(&active)?;
     let volume = vox_sockdrops::volume_uuid(apps)
         .map_err(|e| usage(format!("cannot identify installation volume: {e}")))?;
-    if before.inode != transition.target.inode
+    if before.device != transition.target.device
+        || before.inode != transition.target.inode
         || before
             .stable
             .as_ref()
