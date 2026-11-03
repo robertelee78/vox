@@ -676,7 +676,14 @@ impl Sink {
                 })
                 .and_then(|value| value.get("text").and_then(Value::as_str).map(str::to_owned));
             return self
-                .source_activity_expected(node, session, bodies, echo.as_deref(), expected, lifecycle)
+                .source_activity_expected(
+                    node,
+                    session,
+                    bodies,
+                    echo.as_deref(),
+                    expected,
+                    lifecycle,
+                )
                 .await
                 .admission;
         }
@@ -929,15 +936,30 @@ impl Sink {
                 // Shown, so the person knows it is there, but answered only at the terminal.
                 entry.insert("answerable".into(), json!(false));
                 entry.insert("why".into(), json!(why));
-                self.post_with_effects(node, session, crate::session_mirror::split(entry, "input"), None, None, Some(lifecycle))
-                    .await;
+                self.post_with_effects(
+                    node,
+                    session,
+                    crate::session_mirror::split(entry, "input"),
+                    None,
+                    None,
+                    Some(lifecycle),
+                )
+                .await;
                 None
             }
             Ok(id) => {
                 entry.insert("ref".into(), json!(id));
                 let admission = self
-                    .post_with_effects(node, session, crate::session_mirror::split(entry, "input"), None, None, Some(lifecycle))
-                    .await.admission;
+                    .post_with_effects(
+                        node,
+                        session,
+                        crate::session_mirror::split(entry, "input"),
+                        None,
+                        None,
+                        Some(lifecycle),
+                    )
+                    .await
+                    .admission;
                 if !matches!(
                     admission,
                     SessionAdmission::Committed { .. } | SessionAdmission::Held(_)
@@ -1215,8 +1237,16 @@ impl Sink {
             return None;
         }
         let admission = self
-            .post_with_effects(node, session, vec![Value::Object(m).to_string()], None, None, Some(lifecycle))
-            .await.admission;
+            .post_with_effects(
+                node,
+                session,
+                vec![Value::Object(m).to_string()],
+                None,
+                None,
+                Some(lifecycle),
+            )
+            .await
+            .admission;
         if !matches!(
             admission,
             SessionAdmission::Committed { .. } | SessionAdmission::Held(_)
@@ -1315,7 +1345,8 @@ impl Sink {
     async fn expire_all(&self, node: &NodeName, session: &str) {
         let entries = self.expired_entries(node, session);
         // The host calls session_end while holding this Session's lifecycle fence.
-        self.post_with_effects(node, session, entries, None, None, None).await;
+        self.post_with_effects(node, session, entries, None, None, None)
+            .await;
     }
 
     /// A member with drive answered `id` in the Session (the drive router calls this once it has

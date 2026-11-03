@@ -688,8 +688,7 @@ impl ChannelState {
                 && hops > 0
                 && matches!(
                     env.kind.as_str(),
-                    vox_agentcomms::envelope::work::ASK
-                        | vox_agentcomms::envelope::work::ASSIGN
+                    vox_agentcomms::envelope::work::ASK | vox_agentcomms::envelope::work::ASSIGN
                 ))
             || (answers
                 && hops > 0

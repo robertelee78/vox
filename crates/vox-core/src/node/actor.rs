@@ -4736,12 +4736,15 @@ impl SessionBatchSlot {
     ) -> oneshot::Receiver<crate::node::session_ingress::OwnedAdmission> {
         let (reply, receipt) = oneshot::channel();
         let (outer, outcome) = oneshot::channel();
-        self.0.send((NodeCommand::AcceptSessionBatch {
-            channel_id: room,
-            session_id: session,
-            bodies,
-            reply,
-        }, outer));
+        self.0.send((
+            NodeCommand::AcceptSessionBatch {
+                channel_id: room,
+                session_id: session,
+                bodies,
+                reply,
+            },
+            outer,
+        ));
         drop(outcome);
         receipt
     }
@@ -4886,18 +4889,28 @@ impl NodeHandle {
         room: Digest32,
         session: String,
         bodies: Vec<String>,
-    ) -> std::result::Result<oneshot::Receiver<crate::node::session_ingress::OwnedAdmission>, SessionBatchEnqueueError> {
+    ) -> std::result::Result<
+        oneshot::Receiver<crate::node::session_ingress::OwnedAdmission>,
+        SessionBatchEnqueueError,
+    > {
         match self.cmd_tx.clone().try_reserve_owned() {
             Ok(slot) => Ok(SessionBatchSlot(slot).send(room, session, bodies)),
             Err(mpsc::error::TrySendError::Full(_)) => Err(SessionBatchEnqueueError::Full(bodies)),
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(SessionBatchEnqueueError::Closed(bodies)),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(SessionBatchEnqueueError::Closed(bodies))
+            }
         }
     }
 
     /// Wait for command capacity without holding Session admission ordering.
     #[doc(hidden)]
     pub async fn reserve_session_batch_slot(&self) -> Option<SessionBatchSlot> {
-        self.cmd_tx.clone().reserve_owned().await.ok().map(SessionBatchSlot)
+        self.cmd_tx
+            .clone()
+            .reserve_owned()
+            .await
+            .ok()
+            .map(SessionBatchSlot)
     }
 
     /// Observe this exact actor's retirement and physical resource completion without keeping
@@ -7998,7 +8011,9 @@ impl Node {
                 use crate::node::session_ingress::{AdmissionError, OwnedAdmission};
                 let receipt = match result {
                     Ok(saved) => OwnedAdmission::Committed(saved),
-                    Err(AdmissionError::NotCommitted(error)) => OwnedAdmission::NotCommitted { error, bodies },
+                    Err(AdmissionError::NotCommitted(error)) => {
+                        OwnedAdmission::NotCommitted { error, bodies }
+                    }
                     Err(AdmissionError::Unconfirmed(error)) => OwnedAdmission::Unconfirmed(error),
                 };
                 let _ = reply.send(receipt);

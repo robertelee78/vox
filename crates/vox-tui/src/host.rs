@@ -396,11 +396,15 @@ impl Router {
         loop {
             let waiting = {
                 let holds = self.inner.posting.lock().await;
-                holds.sessions.get(&(node.clone(), session.to_owned()))
+                holds
+                    .sessions
+                    .get(&(node.clone(), session.to_owned()))
                     .and_then(|held| held.inflight.as_ref())
                     .map(|flight| flight.changed.subscribe())
             };
-            let Some(mut waiting) = waiting else { return; };
+            let Some(mut waiting) = waiting else {
+                return;
+            };
             let _ = waiting.wait_for(Option::is_some).await;
         }
     }
@@ -413,37 +417,59 @@ impl Router {
             {
                 let holds = self.inner.posting.lock().await;
                 if holds.blocked_nodes.contains_key(node)
-                    || holds.sessions.get(&key).is_none_or(|held|
-                        held.unconfirmed_room.is_some() || held.items.is_empty())
+                    || holds
+                        .sessions
+                        .get(&key)
+                        .is_none_or(|held| held.unconfirmed_room.is_some() || held.items.is_empty())
                 {
                     return;
                 }
             }
-            let Ok(permit) = self.inner.session_admissions.clone().acquire_owned().await else { return; };
+            let Ok(permit) = self.inner.session_admissions.clone().acquire_owned().await else {
+                return;
+            };
             let waiting = {
                 let mut holds = self.inner.posting.lock().await;
                 if holds.blocked_nodes.contains_key(node)
-                    || holds.sessions.get(&key).is_none_or(|held|
-                        held.unconfirmed_room.is_some() || held.items.is_empty())
+                    || holds
+                        .sessions
+                        .get(&key)
+                        .is_none_or(|held| held.unconfirmed_room.is_some() || held.items.is_empty())
                 {
                     return;
                 }
                 let attached = {
                     let slots = lock(&self.inner.slots);
                     match slots.get(node) {
-                        Some(Slot::Attached(a)) if Some(a.generation) == generation
-                            && !*a.detached.borrow() => Some((a.handle.clone(), a.generation)),
+                        Some(Slot::Attached(a))
+                            if Some(a.generation) == generation && !*a.detached.borrow() =>
+                        {
+                            Some((a.handle.clone(), a.generation))
+                        }
                         _ => None,
                     }
                 };
-                let Some((handle, generation)) = attached else { return; };
-                if holds.sessions.get(&key).is_some_and(|held| held.inflight.is_none()) {
-                    start_session_hold(self, &mut holds, &key, handle, generation, None, None, None, permit);
+                let Some((handle, generation)) = attached else {
+                    return;
+                };
+                if holds
+                    .sessions
+                    .get(&key)
+                    .is_some_and(|held| held.inflight.is_none())
+                {
+                    start_session_hold(
+                        self, &mut holds, &key, handle, generation, None, None, None, permit,
+                    );
                 }
-                holds.sessions.get(&key).and_then(|held| held.inflight.as_ref())
+                holds
+                    .sessions
+                    .get(&key)
+                    .and_then(|held| held.inflight.as_ref())
                     .map(|flight| flight.changed.subscribe())
             };
-            let Some(mut waiting) = waiting else { return; };
+            let Some(mut waiting) = waiting else {
+                return;
+            };
             match waiting.wait_for(Option::is_some).await {
                 Ok(done) if *done == Some(true) => {}
                 _ => return,
@@ -1582,7 +1608,10 @@ impl Router {
                 })?;
             let ingress = self.inner.posting.lock().await;
             if let Some(why) = ingress.blocked_nodes.get(node) {
-                return Err(Refusal::Failed { node: node.clone(), why: why.clone() });
+                return Err(Refusal::Failed {
+                    node: node.clone(),
+                    why: why.clone(),
+                });
             }
             let ending = lock(&self.inner.omp_ending);
             if ending.contains(&(node.clone(), session.session.clone())) {
@@ -1654,7 +1683,11 @@ impl Router {
         let lifecycle = self.session_lifecycle(node, &id);
         let _lifecycle = lifecycle.lock().await;
         self.settle_session_head(node, &id).await;
-        let previous = self.inner.account.node_paths(node).ok()
+        let previous = self
+            .inner
+            .account
+            .node_paths(node)
+            .ok()
             .and_then(|paths| crate::wake::registration(&paths, &id));
         let g = self
             .want(
@@ -1671,7 +1704,10 @@ impl Router {
         if let (Some(h), Ok(paths)) = (handle.as_ref(), self.inner.account.node_paths(node)) {
             let ingress = self.inner.posting.lock().await;
             if let Some(why) = ingress.blocked_nodes.get(node) {
-                return Err(Refusal::Failed { node: node.clone(), why: why.clone() });
+                return Err(Refusal::Failed {
+                    node: node.clone(),
+                    why: why.clone(),
+                });
             }
             let named = crate::wake::registration(&paths, &id).and_then(|r| r.room);
             if let Some(prefix) =
@@ -1697,10 +1733,18 @@ impl Router {
             .node_paths(node)
             .ok()
             .and_then(|p| crate::wake::registration(&p, &id));
-        if previous.as_ref().zip(stored.as_ref()).is_some_and(|(old, new)|
-            !old.same(new) || old.first_seen_ms != new.first_seen_ms || old.mirror != new.mirror)
+        if previous
+            .as_ref()
+            .zip(stored.as_ref())
+            .is_some_and(|(old, new)| {
+                !old.same(new) || old.first_seen_ms != new.first_seen_ms || old.mirror != new.mirror
+            })
         {
-            self.inner.posting.lock().await.suppress_source_effects(node, &id);
+            self.inner
+                .posting
+                .lock()
+                .await
+                .suppress_source_effects(node, &id);
         }
         let room = stored.as_ref().and_then(|r| r.room.clone());
         let mut joining = None;
@@ -2158,8 +2202,13 @@ impl Router {
                     continue;
                 }
                 let before = crate::wake::store_room(&paths, &s.session, &room_b32);
-                let Some(before) = before else { continue; };
-                if before.as_deref().is_some_and(|old| old != room_b32.as_str()) {
+                let Some(before) = before else {
+                    continue;
+                };
+                if before
+                    .as_deref()
+                    .is_some_and(|old| old != room_b32.as_str())
+                {
                     ingress.suppress_source_effects(&s.node, &s.session);
                 }
             }
@@ -3212,11 +3261,14 @@ impl Router {
         let (handle, generation) = {
             let slots = lock(&self.inner.slots);
             match slots.get(node) {
-                Some(Slot::Attached(attached)) if !*attached.detached.borrow() =>
-                    (attached.handle.clone(), attached.generation),
-                _ => return SessionAdmission::Refused(
-                    "the node is Locked; activity was not retained".into(),
-                ),
+                Some(Slot::Attached(attached)) if !*attached.detached.borrow() => {
+                    (attached.handle.clone(), attached.generation)
+                }
+                _ => {
+                    return SessionAdmission::Refused(
+                        "the node is Locked; activity was not retained".into(),
+                    )
+                }
             }
         };
         if self.session_destination(node, session) != Some(room) {
@@ -3227,26 +3279,43 @@ impl Router {
         let key = (node.clone(), session.to_owned());
         if held.sessions.contains_key(&key) {
             let result = held.hold(
-                key, room, bodies, "earlier activity is held only in memory".into(), effects,
+                key,
+                room,
+                bodies,
+                "earlier activity is held only in memory".into(),
+                effects,
             );
             self.inner.session_holds_wake.notify_one();
             return result;
         }
         let count = bodies.len();
-        if !held.can_hold_new(&key, &bodies, effects.as_ref())
-        {
+        if !held.can_hold_new(&key, &bodies, effects.as_ref()) {
             return SessionAdmission::Refused(
                 "Session admission recovery capacity is full; this batch was not retained".into(),
             );
         }
-        let result = held.hold(key.clone(), room, bodies, "physical admission is pending".into(), effects);
+        let result = held.hold(
+            key.clone(),
+            room,
+            bodies,
+            "physical admission is pending".into(),
+            effects,
+        );
         if !matches!(result, SessionAdmission::Held(_)) {
             return result;
         }
         let (reply, received) = tokio::sync::oneshot::channel();
-        if !start_session_hold(self, &mut held, &key, handle, generation,
-            expected.cloned(), Some(count), Some(reply), permit)
-        {
+        if !start_session_hold(
+            self,
+            &mut held,
+            &key,
+            handle,
+            generation,
+            expected.cloned(),
+            Some(count),
+            Some(reply),
+            permit,
+        ) {
             if let Some(session) = held.sessions.remove(&key) {
                 held.bytes -= session.bytes;
             }
@@ -3352,7 +3421,9 @@ impl Router {
                     _ = retry.tick() => None,
                     result = pending.next(), if !pending.is_empty() => result,
                 };
-                let Some(inner) = weak.upgrade() else { return; };
+                let Some(inner) = weak.upgrade() else {
+                    return;
+                };
                 let router = Router { inner };
                 let mut holds = router.inner.posting.lock().await;
                 let mut schedule = completion.is_none();
@@ -3366,25 +3437,36 @@ impl Router {
                     let keys: Vec<_> = holds.sessions.keys().cloned().collect();
                     for key in keys {
                         if holds.blocked_nodes.contains_key(&key.0)
-                            || holds.sessions.get(&key).is_none_or(|held|
-                                held.inflight.is_some() || held.unconfirmed_room.is_some())
+                            || holds.sessions.get(&key).is_none_or(|held| {
+                                held.inflight.is_some() || held.unconfirmed_room.is_some()
+                            })
                         {
                             continue;
                         }
                         let lifecycle = router.session_lifecycle(&key.0, &key.1);
-                        let Ok(_lifecycle) = lifecycle.try_lock_owned() else { continue; };
+                        let Ok(_lifecycle) = lifecycle.try_lock_owned() else {
+                            continue;
+                        };
                         let attached = {
                             let slots = lock(&router.inner.slots);
                             match slots.get(&key.0) {
-                                Some(Slot::Attached(a)) if !*a.detached.borrow() =>
-                                    Some((a.handle.clone(), a.generation)),
+                                Some(Slot::Attached(a)) if !*a.detached.borrow() => {
+                                    Some((a.handle.clone(), a.generation))
+                                }
                                 _ => None,
                             }
                         };
-                        let Some((handle, generation)) = attached else { continue; };
-                        let Ok(permit) = router.inner.session_admissions.clone().try_acquire_owned() else { break; };
-                        start_session_hold(&router, &mut holds, &key, handle, generation,
-                            None, None, None, permit);
+                        let Some((handle, generation)) = attached else {
+                            continue;
+                        };
+                        let Ok(permit) =
+                            router.inner.session_admissions.clone().try_acquire_owned()
+                        else {
+                            break;
+                        };
+                        start_session_hold(
+                            &router, &mut holds, &key, handle, generation, None, None, None, permit,
+                        );
                     }
                     for future in holds.ready.drain(..) {
                         pending.push(future);
@@ -3454,17 +3536,12 @@ impl Router {
                 .as_deref()
                 .and_then(|room| vox_core::node::link::b32_decode(room, "room").ok()),
         ) {
-            enqueue_session_end(
-                &mut ingress,
-                node,
-                room,
-                &expected.session,
-                "shutdown",
-            );
+            enqueue_session_end(&mut ingress, node, room, &expected.session, "shutdown");
         }
         drop(ingress);
         self.inner.session_holds_wake.notify_one();
-        self.finish_end_head(node, &expected.session, generation).await;
+        self.finish_end_head(node, &expected.session, generation)
+            .await;
         let going = {
             let mut slots = lock(&self.inner.slots);
             if matches!(slots.get(node), Some(Slot::Attached(a))
@@ -3472,7 +3549,9 @@ impl Router {
                     && a.holders == 0 && a.sessions.is_empty())
             {
                 begin_detach(&mut slots, node, &self.inner.defaults.computer)
-            } else { None }
+            } else {
+                None
+            }
         };
         drop(_ending);
         if let Some((attached, done)) = going {
@@ -3506,7 +3585,11 @@ impl Router {
         let lifecycle = self.session_lifecycle(node, session);
         let _lifecycle = lifecycle.lock().await;
         self.settle_session_head(node, session).await;
-        self.inner.posting.lock().await.suppress_source_effects(node, session);
+        self.inner
+            .posting
+            .lock()
+            .await
+            .suppress_source_effects(node, session);
         // Whatever it was asking, nobody can answer now.
         self.inner.sink.session_end(node, session).await;
         // Serialize against admissions/removal. Capture the room before removing the saved
@@ -3569,7 +3652,9 @@ impl Router {
                     && a.holders == 0 && a.sessions.is_empty())
             {
                 begin_detach(&mut slots, node, &self.inner.defaults.computer)
-            } else { None }
+            } else {
+                None
+            }
         };
         match going {
             Some((a, done)) => {
@@ -3817,8 +3902,14 @@ impl Router {
             } else {
                 None
             };
-            if let Some(why) = ingress.as_ref().and_then(|holds| holds.blocked_nodes.get(node)) {
-                return Err(Refusal::Failed { node: node.clone(), why: why.clone() });
+            if let Some(why) = ingress
+                .as_ref()
+                .and_then(|holds| holds.blocked_nodes.get(node))
+            {
+                return Err(Refusal::Failed {
+                    node: node.clone(),
+                    why: why.clone(),
+                });
             }
             let step = {
                 let mut slots = lock(&self.inner.slots);
@@ -3918,15 +4009,18 @@ impl Router {
                                         "its Ready publication lost the attaching node".into(),
                                     ));
                                 };
-                                let ingress = if pending.as_ref()
+                                let ingress = if pending
+                                    .as_ref()
                                     .is_some_and(|(_, want)| matches!(want, Want::Session(_)))
                                 {
                                     Some(self.inner.posting.lock().await)
                                 } else {
                                     None
                                 };
-                                let blocked = ingress.as_ref()
-                                    .and_then(|holds| holds.blocked_nodes.get(node)).cloned();
+                                let blocked = ingress
+                                    .as_ref()
+                                    .and_then(|holds| holds.blocked_nodes.get(node))
+                                    .cloned();
                                 let published = {
                                     let mut slots = lock(&self.inner.slots);
                                     handle.with_computer_application_settled(
@@ -3940,7 +4034,9 @@ impl Router {
                                             };
                                             a.implicit =
                                                 !a.unprotected && !matches!(w, Want::Explicit(_));
-                                            let mut granted = if matches!(w, Want::Session(_)) && blocked.is_some() {
+                                            let mut granted = if matches!(w, Want::Session(_))
+                                                && blocked.is_some()
+                                            {
                                                 Err(Refusal::Failed {
                                                     node: node.clone(),
                                                     why: blocked.clone().unwrap_or_default(),
@@ -4472,13 +4568,17 @@ impl Router {
             let waiting = {
                 let mut ingress = self.inner.posting.lock().await;
                 ingress.release_node(&node);
-                ingress.sessions.iter()
+                ingress
+                    .sessions
+                    .iter()
                     .filter(|((owner, _), _)| owner == &node)
                     .filter_map(|(_, held)| held.inflight.as_ref())
                     .next()
                     .map(|flight| flight.changed.subscribe())
             };
-            let Some(mut waiting) = waiting else { break; };
+            let Some(mut waiting) = waiting else {
+                break;
+            };
             let _ = waiting.wait_for(Option::is_some).await;
         }
         self.inner
@@ -5032,7 +5132,6 @@ const HELD_SESSIONS: usize = 256;
 const HELD_ITEMS: usize = 4096;
 const ALL_HELD_ITEMS: usize = 16384;
 
-
 // Charge actual retained String allocation plus conservative deque-slot/allocator overhead.
 // The separate item caps also bound metadata for valid tiny JSON objects.
 fn held_charge(body: &String) -> usize {
@@ -5049,13 +5148,12 @@ fn held_item_charge(item: &HeldItem) -> usize {
 const HELD_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
 // At most one generated loss notice per admission permit; unlike original activity it
 // has no retained body to charge. This is an explicit bounded metadata allowance.
-const NOTICE_BYTES: usize = 64 * (vox_core::node::session_ingress::MAX_BATCH_BYTES
-    + 4 * std::mem::size_of::<HeldItem>() + 32);
+const NOTICE_BYTES: usize = 64
+    * (vox_core::node::session_ingress::MAX_BATCH_BYTES + 4 * std::mem::size_of::<HeldItem>() + 32);
 
 type SessionKey = (NodeName, String);
-type SessionReceiptFuture = std::pin::Pin<Box<dyn Future<
-    Output = (SessionKey, Arc<()>, SessionReceipt),
-> + Send>>;
+type SessionReceiptFuture =
+    std::pin::Pin<Box<dyn Future<Output = (SessionKey, Arc<()>, SessionReceipt)> + Send>>;
 
 enum SessionReceipt {
     Physical(vox_core::node::session_ingress::OwnedAdmission),
@@ -5073,7 +5171,8 @@ struct InFlight {
     retiring: bool,
     cancel: Arc<tokio::sync::Notify>,
     changed: tokio::sync::watch::Sender<Option<bool>>,
-    waiter: Option<tokio::sync::oneshot::Sender<(vox_core::node::daemonipc::SessionAdmission, bool)>>,
+    waiter:
+        Option<tokio::sync::oneshot::Sender<(vox_core::node::daemonipc::SessionAdmission, bool)>>,
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
@@ -5113,13 +5212,21 @@ fn start_session_hold(
     generation: u64,
     expected: Option<crate::wake::Session>,
     direct_count: Option<usize>,
-    waiter: Option<tokio::sync::oneshot::Sender<(vox_core::node::daemonipc::SessionAdmission, bool)>>,
+    waiter: Option<
+        tokio::sync::oneshot::Sender<(vox_core::node::daemonipc::SessionAdmission, bool)>,
+    >,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> bool {
     use vox_core::node::actor::SessionBatchEnqueueError;
-    let Some(held) = holds.sessions.get_mut(key) else { return false; };
-    if held.inflight.is_some() || held.unconfirmed_room.is_some() { return false; }
-    let Some(front) = held.items.front() else { return false; };
+    let Some(held) = holds.sessions.get_mut(key) else {
+        return false;
+    };
+    if held.inflight.is_some() || held.unconfirmed_room.is_some() {
+        return false;
+    }
+    let Some(front) = held.items.front() else {
+        return false;
+    };
     let front_room = front.room;
     let front_effects = front.effects.is_some();
     let room = held.loss.as_ref().map_or(front_room, |loss| loss.room);
@@ -5130,7 +5237,9 @@ fn start_session_hold(
     }).to_string());
     let notice_only = notice.is_some();
     let notice_charge = notice.as_ref().map_or(0, held_charge);
-    if notice.as_ref().is_some_and(|body| body.len() > vox_core::node::session_ingress::MAX_BATCH_BYTES)
+    if notice
+        .as_ref()
+        .is_some_and(|body| body.len() > vox_core::node::session_ingress::MAX_BATCH_BYTES)
         || holds.notice_bytes + notice_charge > NOTICE_BYTES
     {
         return false;
@@ -5143,7 +5252,8 @@ fn start_session_hold(
         for item in &mut held.items {
             if item.room != room
                 || direct_count.is_some_and(|count| bodies.len() == count)
-                || (direct_count.is_none() && !bodies.is_empty()
+                || (direct_count.is_none()
+                    && !bodies.is_empty()
                     && (front_effects || item.effects.is_some()))
                 || bytes + item.body.len() > vox_core::node::session_ingress::MAX_BATCH_BYTES
                 || bodies.len() == vox_core::node::session_ingress::MAX_BATCH_ITEMS
@@ -5178,18 +5288,25 @@ fn start_session_hold(
                 if let (Some(slot), Some(inner)) = (slot, weak.upgrade()) {
                     let router = Router { inner };
                     let holds = router.inner.posting.lock().await;
-                    let current = holds.sessions.get(&future_key)
+                    let current = holds
+                        .sessions
+                        .get(&future_key)
                         .and_then(|held| held.inflight.as_ref())
-                        .is_some_and(|flight| Arc::ptr_eq(&flight.owner, &future_owner)
-                            && flight.generation == generation && !flight.retiring)
+                        .is_some_and(|flight| {
+                            Arc::ptr_eq(&flight.owner, &future_owner)
+                                && flight.generation == generation
+                                && !flight.retiring
+                        })
                         && !holds.blocked_nodes.contains_key(&future_key.0)
                         && matches!(lock(&router.inner.slots).get(&future_key.0),
                             Some(Slot::Attached(attached)) if attached.generation == generation
                                 && !*attached.detached.borrow())
-                        && expected.as_ref().is_none_or(|reg|
-                            router.current_omp_registration(&future_key.0, reg))
+                        && expected
+                            .as_ref()
+                            .is_none_or(|reg| router.current_omp_registration(&future_key.0, reg))
                         && (!require_current_destination
-                            || router.session_destination(&future_key.0, &future_key.1) == Some(room));
+                            || router.session_destination(&future_key.0, &future_key.1)
+                                == Some(room));
                     if current {
                         Ok(slot.send(room, future_key.1.clone(), bodies))
                     } else {
@@ -5211,15 +5328,27 @@ fn start_session_hold(
                     Ok(result) => SessionReceipt::Physical(result),
                     Err(_) => SessionReceipt::Lost,
                 }
-            },
-            Err(bodies) => SessionReceipt::NotEnqueued("the Session route or actor closed before enqueue".into(), bodies),
+            }
+            Err(bodies) => SessionReceipt::NotEnqueued(
+                "the Session route or actor closed before enqueue".into(),
+                bodies,
+            ),
         };
         (future_key, future_owner, result)
     };
     holds.notice_bytes += notice_charge;
     held.inflight = Some(InFlight {
-        owner, generation, room, count, notice: notice_only, notice_charge,
-        retiring: false, cancel, changed, waiter, _permit: permit,
+        owner,
+        generation,
+        room,
+        count,
+        notice: notice_only,
+        notice_charge,
+        retiring: false,
+        cancel,
+        changed,
+        waiter,
+        _permit: permit,
     });
     holds.ready.push(Box::pin(future));
     router.inner.session_holds_wake.notify_one();
@@ -5235,21 +5364,38 @@ async fn hold_session_receipt_for_proof(
     generation: u64,
     mut termination: vox_core::node::actor::NodeTermination,
 ) {
-    if std::env::var("VOX_TEST_OMP_RECEIPT_NODE").ok().as_deref() != Some(key.0.to_string().as_str())
-        || std::env::var("VOX_TEST_OMP_RECEIPT_SESSION").ok().as_deref() != Some(key.1.as_str())
+    if std::env::var("VOX_TEST_OMP_RECEIPT_NODE").ok().as_deref()
+        != Some(key.0.to_string().as_str())
+        || std::env::var("VOX_TEST_OMP_RECEIPT_SESSION")
+            .ok()
+            .as_deref()
+            != Some(key.1.as_str())
     {
         return;
     }
     let Some(path) = std::env::var_os("VOX_TEST_OMP_RECEIPT_HOLD_FILE")
-        .filter(|path| !path.is_empty()).map(std::path::PathBuf::from) else { return; };
-    if !path.exists() { return; }
+        .filter(|path| !path.is_empty())
+        .map(std::path::PathBuf::from)
+    else {
+        return;
+    };
+    if !path.exists() {
+        return;
+    }
     let mut engaged = path.as_os_str().to_owned();
     engaged.push(".engaged");
-    if let Err(error) = std::fs::write(std::path::PathBuf::from(engaged),
-        format!("node={}\nsession={}\ngeneration={generation}\nroom={}\n",
-            key.0, key.1, vox_core::node::link::b32_encode(&room)))
-    {
-        eprintln!("vox daemon: OMP receipt proof hold could not publish its engaged marker: {error}");
+    if let Err(error) = std::fs::write(
+        std::path::PathBuf::from(engaged),
+        format!(
+            "node={}\nsession={}\ngeneration={generation}\nroom={}\n",
+            key.0,
+            key.1,
+            vox_core::node::link::b32_encode(&room)
+        ),
+    ) {
+        eprintln!(
+            "vox daemon: OMP receipt proof hold could not publish its engaged marker: {error}"
+        );
         return;
     }
     while path.exists() {
@@ -5271,11 +5417,19 @@ fn complete_session_hold(
 ) -> bool {
     use vox_core::node::daemonipc::SessionAdmission;
     use vox_core::node::session_ingress::OwnedAdmission;
-    let Some(held) = holds.sessions.get_mut(key) else { return false; };
-    if !held.inflight.as_ref().is_some_and(|f| Arc::ptr_eq(&f.owner, owner)) {
+    let Some(held) = holds.sessions.get_mut(key) else {
+        return false;
+    };
+    if !held
+        .inflight
+        .as_ref()
+        .is_some_and(|f| Arc::ptr_eq(&f.owner, owner))
+    {
         return false;
     }
-    let Some(mut flight) = held.inflight.take() else { return false; };
+    let Some(mut flight) = held.inflight.take() else {
+        return false;
+    };
     holds.notice_bytes -= flight.notice_charge;
     let mut effects = None;
     let mut progressed = false;
@@ -5304,7 +5458,10 @@ fn complete_session_hold(
             if saved.first == 0 && saved.last == 0 {
                 SessionAdmission::Skipped
             } else {
-                SessionAdmission::Committed { first: saved.first, last: saved.last }
+                SessionAdmission::Committed {
+                    first: saved.first,
+                    last: saved.last,
+                }
             }
         }
         SessionReceipt::Physical(OwnedAdmission::NotCommitted { error, bodies }) => {
@@ -5464,7 +5621,6 @@ impl SessionHolds {
                 <= ALL_HELD_ITEMS
     }
 
-
     fn hold(
         &mut self,
         key: (NodeName, String),
@@ -5493,9 +5649,7 @@ impl SessionHolds {
                 .map_or(0, crate::session_sink::SourceEffects::charge);
         if let Some(held) = self.sessions.get(&key) {
             if held.inflight.is_some() {
-                if held.bytes + added > HELD_BYTES
-                    || held.items.len() + bodies.len() > HELD_ITEMS
-                {
+                if held.bytes + added > HELD_BYTES || held.items.len() + bodies.len() > HELD_ITEMS {
                     return SessionAdmission::Refused(
                         "a physical Session admission protects the earlier prefix; this batch was not retained".into(),
                     );
@@ -5596,7 +5750,6 @@ impl SessionHolds {
     }
 }
 
-
 // Source admission has already committed. Retiring its exact request tickets is not undone
 // by a later transcript-storage problem. Resolution rows use the existing charged hold and
 // one bounded storage attempt; this path never re-enters the Poster/admission mutex.
@@ -5654,7 +5807,6 @@ fn save_source_resolutions(
     }
 }
 
-
 async fn retire_session_room(
     handle: &NodeHandle,
     retirement: vox_core::node::session_ingress::Retirement,
@@ -5686,9 +5838,16 @@ fn enqueue_session_end(
     let bodies = vec![env.to_text()];
     let key = (node.clone(), session.to_owned());
     let outcome = held.hold(
-        key, room, bodies, "Session end is awaiting storage".into(), None,
+        key,
+        room,
+        bodies,
+        "Session end is awaiting storage".into(),
+        None,
     );
-    if !matches!(outcome, vox_core::node::daemonipc::SessionAdmission::Held(_)) {
+    if !matches!(
+        outcome,
+        vox_core::node::daemonipc::SessionAdmission::Held(_)
+    ) {
         eprintln!(
             "vox daemon: {node}: session {session}: end record is not confirmed saved: {outcome:?}"
         );

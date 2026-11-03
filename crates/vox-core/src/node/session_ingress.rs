@@ -255,12 +255,7 @@ fn session_in(batch: &Batch<'_>, key: &Sek, scope: &Digest32, name: &str) -> Res
 
 /// Validate, number and commit an entire batch. Preparation errors accept no new sequence
 /// or body; source receipts committed by earlier calls remain authoritative.
-pub fn admit(
-    profile: &Profile,
-    room: Digest32,
-    name: &str,
-    bodies: &[String],
-) -> AdmissionResult {
+pub fn admit(profile: &Profile, room: Digest32, name: &str, bodies: &[String]) -> AdmissionResult {
     if name.is_empty()
         || name.len() > crate::node::content::MAX_SESSION_ID_LEN
         || bodies.is_empty()
