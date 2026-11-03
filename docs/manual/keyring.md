@@ -271,6 +271,10 @@ invitation; if it already signed, wait until the incomplete attempt expires befo
 Closing locally cannot withdraw a signature already retained elsewhere. Both computers must
 approve the fresh operation.
 
+If trust changes while a replacement review is open, Vox refuses the stale confirmation.
+The app keeps that refusal below the **My Computers** heading, above the scrollable details;
+review the current state before trying again. A refusal is not a completed replacement.
+
 Every managed node can read the other managed nodes. A computer's selected personal node can
 drive nonpersonal nodes; personal nodes cannot drive each other. The daemon saves the app's
 selection, including when the app is closed. Once `robertgpt` is a Ready local node, a headless

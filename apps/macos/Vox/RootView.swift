@@ -335,17 +335,20 @@ private struct Welcome: View {
             + "share is your node's.")
             .secondaryText()
             .accessibilityIdentifier("welcome-why")
+        Text("Node name").eyebrow().secondaryText()
         TextField("Name", text: $name)
             .frame(width: Theme.scaled(320))
             .accessibilityIdentifier("new-node-name")
             .accessibilityLabel("Node name")
         Text("Lowercase letters, digits, dots, dashes and underscores.").secondaryText()
+        Text("Identity passphrase").eyebrow().secondaryText()
         SecureInput(holder: first, onEmpty: { noPassphrase = $0 }) {
             again.field.becomeFirstResponder()
         }
             .frame(width: Theme.scaled(320))
             .accessibilityIdentifier("new-node-passphrase")
             .accessibilityLabel("Identity passphrase")
+        Text("Identity passphrase again").eyebrow().secondaryText()
         SecureInput(holder: again) { submit() }
             .frame(width: Theme.scaled(320))
             .accessibilityIdentifier("new-node-passphrase-again")

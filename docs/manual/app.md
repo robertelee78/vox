@@ -20,8 +20,9 @@ nodes on this Mac are listed under **ON THIS MACHINE**, with **Unlock…** for e
    **Allow Vox in Login Items** with a button that opens System Settings. **Not Now** registers
    nothing, and Vox runs while the app is open. The same screen offers **Show Vox in the menu
    bar**.
-2. **Welcome to Vox.** With no node on this Mac yet, type a **Name** and the identity passphrase
-   twice, then choose **Make Node**. You may leave the passphrase empty. The form then says the
+2. **Welcome to Vox.** With no node on this Mac yet, fill in **Node name**, **Identity
+   passphrase** and **Identity passphrase again**, then choose **Make Node**. Each field keeps
+   its label visible while you type. You may leave the passphrase empty. The form then says the
    node's key is kept unencrypted. There is no backup of a node: if this Mac is lost, so is the
    node.
 3. **Which node are you?** With several nodes on this Mac, pick the one you post, trust and share

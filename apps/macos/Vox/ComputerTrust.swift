@@ -86,6 +86,16 @@ struct ComputerTrustView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: Space.s16) {
             Text("My Computers").font(.title2)
+            if let problem = model.actionProblem {
+                StateMark(kind: .danger, words: problem)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("computer-action-problem")
+            }
+            if let problem = model.problem {
+                StateMark(kind: .danger, words: problem)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("computer-connection-problem")
+            }
             ScrollView {
                 VStack(alignment: .leading, spacing: Space.s16) {
                     if let status = model.status {
@@ -218,14 +228,6 @@ struct ComputerTrustView: View {
                         }
                     } else if model.busy {
                         ProgressView("Reading computer trust…")
-                    }
-                    if let problem = model.actionProblem {
-                        StateMark(kind: .danger, words: problem)
-                            .accessibilityIdentifier("computer-action-problem")
-                    }
-                    if let problem = model.problem {
-                        StateMark(kind: .danger, words: problem)
-                            .accessibilityIdentifier("computer-connection-problem")
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
