@@ -27,6 +27,8 @@ pub struct PairingPreview {
     pub operation_id: String,
     /// Authenticated remote presentation.
     pub peer: ComputerIdentity,
+    /// Exact existing group to join, or None when this operation creates a new group.
+    pub proposed_group: Option<String>,
     /// Local approval has been durably recorded.
     pub approved_here: bool,
     /// Peer approval has been verified and retained.
@@ -39,6 +41,7 @@ impl From<core::PairingPreview> for PairingPreview {
         Self {
             operation_id: v.operation_id,
             peer: v.peer.into(),
+            proposed_group: v.proposed_group,
             approved_here: v.approved_here,
             approved_there: v.approved_there,
             expires_ms: v.expires_ms,

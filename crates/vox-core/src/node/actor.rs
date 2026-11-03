@@ -7223,6 +7223,7 @@ impl Node {
         // Preparation, cleanup, governance and package scans share one select slot. Rotate between
         // ready classes; each retains its own room cursor and yields after one bounded turn.
         let mut maintenance_next = 0u8;
+        let mut read_priority = true;
         // Parked events retain the original channel's admission credit. One event may
         // occupy the actor's ordinary in-hand slot if a sender wins that credit race;
         // stop receiving until it can run rather than inventing another queue budget.
@@ -7808,6 +7809,13 @@ impl Node {
                         self.publish().await;
                         continue;
                     }
+                    // Empty read and key-prune work both take a room's durable owner.
+                    // Alternate priority so neither can starve the other; advance the
+                    // read-room cursor only on its priority turn.
+                    if read_priority {
+                        self.flush_reads().await;
+                    }
+                    read_priority = !read_priority;
                     self.publication_pending |= !self.publish_waiters.is_empty();
                     self.publication_again |= !self.publish_waiters.is_empty();
                     // A joined sparse room that is not yet settled owes its settlement one
@@ -7880,8 +7888,6 @@ impl Node {
                     if self.sweep_retention().await {
                         self.publish().await;
                     }
-                    // A read record held back by the 5-second batch goes out when it is due.
-                    if self.flush_reads().await { self.publish().await; }
                     // A folded decision's count is written once its hour is over (ADR-028 D-1).
                     self.decisions.flush_folded((self.millis_clock)());
                 }

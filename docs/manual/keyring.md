@@ -221,10 +221,12 @@ passphrase; the computer commands start the daemon when needed. Run them in your
 not through an agent. Ready managed nodes apply the policy; Locked nodes need unlocking before
 they can apply it.
 
-Computer trust is an operator choice shared by the enrolled daemons. Add Computer in Vox.app,
-or `vox computer invite` on one computer followed by `vox computer pair` on the other with
-the actual invitation and `--preview`, shows the exact computers and operation for approval on
-both sides. Begin on the first computer:
+Computer trust is an operator choice shared by the enrolled daemons. Either computer may create
+the invitation: in Vox.app use Add Computer, or run `vox computer invite` on one computer and
+`vox computer pair` on the other. If one is already enrolled and the other is individual, the
+individual joins that existing group whichever computer issued the invitation. Two individual
+computers create a new group. If both already belong to the same group, pairing synchronizes
+their existing membership instead of creating another enrollment. Begin on either computer:
 
 ```sh
 vox computer status
@@ -232,12 +234,24 @@ vox computer invite
 ```
 
 Send the invitation to the other computer through your trusted channel. Paste the complete
-terminal command printed by `invite`, or paste the code into Add Computer. Review the
-authenticated identity and fixed policy, then explicitly approve on that computer. The
-inviting computer must also review and approve the same operation. Each surface names which
+terminal command printed by `invite`, or paste the code into Add Computer. Both sides show the
+authenticated peer, fixed policy and exact operation, and whether it creates a new group or joins
+the identified existing group. Check the entire group identifier when joining an existing group.
+Authentication of the code and peer permits this review; it does not grant permission or approve
+enrollment. Explicitly approve the same operation on each computer. Each surface names which
 computer must act next; approval on one side never substitutes for the other. `--preview`
 shows the proposal without approving it. Pairing grants no room membership; join the same
 room and verify a message both ways.
+
+If the daemon restarts after the authenticated invitation is claimed but before the proposal
+is recorded, the same computer can authenticate again; another computer cannot take over that
+claim. A recorded proposal and its approvals survive restart as the same operation. A changed
+operation or group needs a fresh review and both approvals; an approval is not transferred.
+Cancel an unused invitation or unapproved proposal on the computer where it is pending. Closing
+a window alone leaves it pending. A cancellation cannot withdraw an approval already signed
+and retained elsewhere; an incomplete signed attempt may need to expire before it can be closed.
+If Vox reports that the other computer's pairing software needs updating, update it and start a
+fresh pairing. A connection failure alone does not establish that an update is needed.
 
 If an authenticated computer is already in a different established group, Vox explains the
 conflict instead of calling it a bad signature. On the computer to move, review the affected

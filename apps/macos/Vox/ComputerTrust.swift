@@ -383,6 +383,19 @@ struct ComputerTrustView: View {
         } else if let preview = status.pairing, status.state != "quarantined" {
             Divider()
             identity(preview.peer, title: "Computer to add")
+            Text("Operation: \(preview.operationId)")
+                .font(Theme.mono).textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+                .accessibilityIdentifier("computer-pairing-operation")
+            if let group = preview.proposedGroup {
+                Text("Joins existing computer group: \(group)")
+                    .font(Theme.mono).textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("computer-pairing-proposed-group")
+            } else {
+                Text("Creates a new computer group.")
+                    .accessibilityIdentifier("computer-pairing-proposed-group")
+            }
             if expired(preview.expiresMs), !preview.approvedHere || !preview.approvedThere {
                 Text(preview.approvedHere
                      ? "The approval window has ended. You can close this attempt here. The other computer may have recorded approval; closing here does not remove its trust."

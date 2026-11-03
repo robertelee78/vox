@@ -426,9 +426,9 @@ pub struct Enrollment {
     pub expires: u64,
     /// Random incarnation nonce.
     pub nonce: Digest32,
-    /// Inviting installation, then joining installation.
+    /// For an ADD, the established sponsor then the joining installation; otherwise invitation order.
     pub computers: [Description; 2],
-    /// Fresh grant identities, in the same order.
+    /// For an ADD, the sponsor's active grant then the fresh joining grant.
     pub grants: [Digest32; 2],
     /// Both signatures of the identical canonical body, when approved.
     pub approvals: [Option<Signed>; 2],

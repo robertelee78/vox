@@ -1889,6 +1889,7 @@ fn pair_computers(
         late_fp,
         &other_agent,
         room,
+        operation,
         daemons,
     );
     // A policy write failure must stop previously working computer-derived authority, not leave
@@ -1951,6 +1952,255 @@ fn offline_for_enrollment(account: &Account, label: &str) {
     );
 }
 
+// A real management client reaches an established group's inviter but never proves the code.
+// Decode every pre-PoP field, rather than looking for a test-only disclosure marker.
+fn preauth_discloses_no_group_history(sponsor: &Account) {
+    use base64::Engine as _;
+    use vox_core::cbor::{Decoder, Encoder};
+    use vox_core::identity::composite::RootSigner as _;
+    use vox_core::nat::multiaddr::Multiaddr;
+    use vox_core::node::computer::{Description, PROTOCOL};
+    use vox_core::transport::framing::{read_frame, write_frame};
+    use vox_core::transport::streams::{open_typed, StreamKind};
+
+    let invitation = computer(sponsor, &["invite"]);
+    let link = invitation["invite_link"]
+        .as_str()
+        .expect("APPARATUS: sponsor invitation");
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(
+            link.strip_prefix("vox-computer://")
+                .expect("APPARATUS: invitation scheme"),
+        )
+        .expect("APPARATUS: decode sponsor invitation");
+    let mut d = Decoder::new(&bytes);
+    assert_eq!(d.array().unwrap(), 8, "APPARATUS: invitation shape");
+    assert_eq!(d.uint().unwrap(), PROTOCOL, "APPARATUS: invitation version");
+    let target: [u8; 32] = d.bytes().unwrap().try_into().unwrap();
+    let invite: [u8; 32] = d.bytes().unwrap().try_into().unwrap();
+    let _secret = d.bytes().unwrap();
+    let expires = d.uint().unwrap();
+    let count = d.array().unwrap();
+    let mut address = None;
+    for _ in 0..count {
+        let endpoint = Multiaddr::parse(d.text().unwrap()).expect("APPARATUS: invitation endpoint");
+        address = address.or_else(|| endpoint.socket_addr());
+    }
+    let _anchors = d.bytes().unwrap();
+    let transport = d.bytes().unwrap().to_vec();
+    d.finish().unwrap();
+    let address = address.expect("APPARATUS: sponsor invitation has no direct endpoint");
+    let signer = hostile::stranger(0xA7);
+    let description = Description {
+        public: signer.public_key().to_bytes().to_vec(),
+        name: "preauth-probe".into(),
+        installation: [0xA7; 32],
+    };
+    let rt = hostile::Rt::new();
+    rt.block_on(async {
+        let (_endpoint, connection) = hostile::connect(&signer, address, target).await;
+        let (mut send, mut recv) = open_typed(&connection, StreamKind::Computer)
+            .await
+            .expect("APPARATUS: open real computer management stream");
+        let mut hello = Encoder::new();
+        hello
+            .array(6)
+            .uint(PROTOCOL)
+            .uint(u64::from(connection.session().suite_id))
+            .uint(3)
+            .bytes(&description.encode())
+            .bytes(&invite)
+            .uint(30_000);
+        write_frame(&mut send, &hello.finish())
+            .await
+            .expect("APPARATUS: send management hello");
+        let echo = tokio::time::timeout(Duration::from_secs(15), read_frame(&mut recv, 64 * 1024))
+            .await
+            .expect("APPARATUS: management hello timed out")
+            .expect("APPARATUS: read management hello")
+            .expect("APPARATUS: management hello closed");
+        let mut d = Decoder::new(&echo);
+        assert_eq!(
+            d.array().expect("PRODUCT: malformed preauth hello"),
+            6,
+            "PRODUCT: unexpected preauth hello"
+        );
+        assert_eq!(
+            d.uint().expect("PRODUCT: malformed preauth version"),
+            PROTOCOL,
+            "PRODUCT: wrong preauth version"
+        );
+        assert_eq!(
+            d.uint().expect("PRODUCT: malformed preauth suite"),
+            u64::from(connection.session().suite_id),
+            "PRODUCT: wrong preauth suite"
+        );
+        assert_eq!(
+            d.uint().expect("PRODUCT: malformed preauth operation"),
+            3,
+            "PRODUCT: wrong preauth operation"
+        );
+        let inviter =
+            Description::decode(d.bytes().expect("PRODUCT: malformed inviter description"))
+                .expect("PRODUCT: invalid inviter description");
+        assert_eq!(
+            inviter
+                .fingerprint()
+                .expect("PRODUCT: invalid inviter fingerprint"),
+            target,
+            "PRODUCT: preauth hello names another inviter"
+        );
+        assert_eq!(
+            d.bytes().expect("PRODUCT: malformed invitation ID"),
+            invite,
+            "PRODUCT: wrong invitation ID"
+        );
+        assert_eq!(
+            d.uint().expect("PRODUCT: malformed preauth budget"),
+            30_000,
+            "PRODUCT: wrong preauth budget"
+        );
+        d.finish()
+            .expect("PRODUCT: preauth hello disclosed additional data");
+        let frame = tokio::time::timeout(Duration::from_secs(15), read_frame(&mut recv, 64 * 1024))
+            .await
+            .expect("APPARATUS: invitation challenge timed out")
+            .expect("APPARATUS: read invitation challenge")
+            .expect("APPARATUS: invitation challenge closed");
+        let mut d = Decoder::new(&frame);
+        assert_eq!(
+            d.array().expect("PRODUCT: malformed preauth response"),
+            3,
+            "PRODUCT: preauth response was not just an authentication challenge"
+        );
+        assert_eq!(
+            d.bytes().expect("PRODUCT: malformed preauth SID").len(),
+            16,
+            "PRODUCT: invalid preauth SID"
+        );
+        let challenge = d.bytes().expect("PRODUCT: malformed preauth challenge");
+        assert_eq!(
+            d.bytes().expect("PRODUCT: malformed preauth share").len(),
+            32,
+            "PRODUCT: invalid preauth share"
+        );
+        d.finish()
+            .expect("PRODUCT: preauth frame disclosed additional data");
+        let mut d = Decoder::new(challenge);
+        assert_eq!(
+            d.array().expect("PRODUCT: malformed preauth challenge"),
+            9,
+            "PRODUCT: preauth challenge included group history"
+        );
+        assert_eq!(
+            d.uint().expect("PRODUCT: malformed challenge operation"),
+            3,
+            "PRODUCT: wrong challenge operation"
+        );
+        assert_eq!(
+            d.uint().expect("PRODUCT: malformed challenge version"),
+            PROTOCOL,
+            "PRODUCT: wrong challenge version"
+        );
+        assert_eq!(
+            d.uint().expect("PRODUCT: malformed challenge suite"),
+            u64::from(connection.session().suite_id),
+            "PRODUCT: wrong challenge suite"
+        );
+        assert_eq!(
+            d.bytes().expect("PRODUCT: malformed challenge invitation"),
+            invite,
+            "PRODUCT: wrong challenge invitation"
+        );
+        assert_eq!(
+            d.uint().expect("PRODUCT: malformed challenge expiry"),
+            expires,
+            "PRODUCT: wrong challenge expiry"
+        );
+        assert_eq!(
+            d.bytes().expect("PRODUCT: malformed challenge nonce").len(),
+            32,
+            "PRODUCT: wrong challenge nonce"
+        );
+        assert_eq!(
+            d.bytes().expect("PRODUCT: malformed challenge inviter"),
+            inviter.encode(),
+            "PRODUCT: wrong challenge inviter"
+        );
+        assert_eq!(
+            d.bytes().expect("PRODUCT: malformed challenge redeemer"),
+            description.encode(),
+            "PRODUCT: wrong challenge redeemer"
+        );
+        assert_eq!(
+            d.bytes().expect("PRODUCT: malformed challenge transport"),
+            vox_core::hash::sha256(&transport),
+            "PRODUCT: wrong challenge transport binding"
+        );
+        d.finish()
+            .expect("PRODUCT: preauth challenge disclosed group authority");
+        let mut invalid = Encoder::new();
+        invalid.array(2).bytes(&[0; 32]).bytes(&[]);
+        write_frame(&mut send, &invalid.finish())
+            .await
+            .expect("APPARATUS: send invalid invitation PoP");
+        let refusal =
+            tokio::time::timeout(Duration::from_secs(15), read_frame(&mut recv, 64 * 1024))
+                .await
+                .expect("APPARATUS: invalid-PoP response timed out")
+                .expect("APPARATUS: read invalid-PoP response")
+                .expect("APPARATUS: invalid-PoP response closed");
+        let mut d = Decoder::new(&refusal);
+        assert_eq!(
+            d.array().expect("PRODUCT: malformed invalid-PoP response"),
+            2,
+            "PRODUCT: invalid PoP received group authority"
+        );
+        assert_eq!(
+            d.uint()
+                .expect("PRODUCT: invalid PoP received a non-refusal response"),
+            0,
+            "PRODUCT: invalid PoP received a non-refusal response"
+        );
+        let _ = d
+            .text()
+            .expect("PRODUCT: invalid PoP received a non-refusal response");
+        d.finish()
+            .expect("PRODUCT: invalid PoP refusal disclosed additional data");
+    });
+    let id = invitation["invite_id"]
+        .as_str()
+        .expect("APPARATUS: sponsor invite ID");
+    computer(sponsor, &["cancel", id]);
+}
+
+// Re-run the actual journey with only C's daemon selecting groups from the inviter. The
+// redeemer's independent validation must not be disabled to make the mutant advance.
+#[test]
+#[ignore = "real binary inviter-only mutant; run in release with test-knobs"]
+fn reverse_enrollment_rejects_inviter_only_mutant() {
+    test_knobs::require(&["VOX_TEST_COMPUTER_INVITER_ONLY_GROUP"]);
+    let output = Command::new(std::env::current_exe().expect("APPARATUS: proof executable"))
+        .args([
+            "--ignored",
+            "--exact",
+            "local_nodes_trust_each_other_without_a_prompt_and_remember_removals",
+            "--nocapture",
+        ])
+        .env("VOX_MUTANT_COMPUTER_INVITER_ONLY_GROUP", "1")
+        .output()
+        .expect("APPARATUS: start reverse enrollment mutant consumer");
+    let report = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.status.success()
+        && report.contains("[proof] reverse enrollment mutant boundary staged")
+        && report.contains("PRODUCT [reverse enrollment original-group authority]: third computer did not join the existing group"),
+        "APPARATUS: inviter-only mutant did not reach the original-group membership and effective-permission verdict: {report}");
+}
+
 // #800 extends this same trust journey through a non-founding member. The first computer is
 // deliberately offline for enrollment; its eventual application must come from signed history.
 #[allow(clippy::too_many_arguments)]
@@ -1963,11 +2213,23 @@ fn enroll_third(
     late_fp: &str,
     other_agent: &str,
     room: &str,
+    original_group: &str,
     daemons: &mut Vec<Daemon>,
 ) {
     let c = Account::new();
     let beast = c.make_node("codex-beast");
     let helper = c.make_node("opencode-beast");
+    let mutant = std::env::var("VOX_MUTANT_COMPUTER_INVITER_ONLY_GROUP").ok();
+    let daemon_env = if mutant.as_deref() == Some("1") {
+        test_knobs::require(&["VOX_TEST_COMPUTER_INVITER_ONLY_GROUP"]);
+        vec![("VOX_TEST_COMPUTER_INVITER_ONLY_GROUP", "1")]
+    } else {
+        Vec::new()
+    };
+    let mut c_daemon = Daemon::start(&c, &["--node", "codex-beast"], &daemon_env);
+    c_daemon.expect_apparatus_event("third computer node is Ready", |line| {
+        line.contains("codex-beast is Ready")
+    });
     for name in ["codex-beast", "opencode-beast"] {
         let (ok, out, err) = c.run(&["node", "attach", name, "--passphrase-file", "-"], PASS);
         assert!(
@@ -1992,15 +2254,7 @@ fn enroll_third(
     // Nothing starts on this account again until the explicit catch-up attach below.
     daemons.clear();
     offline_for_enrollment(a, "founder");
-    let invite = computer(b, &["invite"]);
-    let link = invite["invite_link"]
-        .as_str()
-        .expect("PRODUCT: enrolled member did not offer Add Computer");
-    let preview = computer(&c, &["pair", link, "--preview"]);
-    let op = preview["pairing"]["operation_id"].as_str().unwrap();
-    assert!(preview["computers"].as_array().unwrap().is_empty(),"PRODUCT: receiving an existing group's history enrolled the third computer before approval: {preview}");
-    computer(&c, &["approve", op]);
-    computer(b, &["approve", op]);
+    preauth_discloses_no_group_history(b);
     let ring = |account: &Account, name: &str| {
         let (ok, out, err) = account.run(&["trust", "list", "--node", name], "");
         assert!(
@@ -2009,16 +2263,101 @@ fn enroll_third(
         );
         out
     };
+    let no_early_authority = || {
+        let cs = computer(&c, &["status"]);
+        let bs = computer(b, &["status"]);
+        let c_ring = ring(&c, "codex-beast");
+        let b_ring = ring(b, "remote-agent");
+        assert!(
+            cs["computers"].as_array().is_some_and(Vec::is_empty)
+                && bs["computers"].as_array().is_some_and(|v| v.len() == 2)
+                && !c_ring.contains(remote)
+                && !c_ring.contains(&local[0])
+                && !b_ring.contains(&beast)
+                && !b_ring.contains(&helper),
+            "PRODUCT: reverse enrollment granted membership or effective Read/Drive before both approvals: C {cs}; B {bs}; C keyring {c_ring}; B keyring {b_ring}"
+        );
+    };
     let has = |shown: &str, fp: &str, drive: bool| {
         shown
             .lines()
             .any(|line| line.contains(fp) && line.contains("read + drive") == drive)
     };
-    assert!(wait_until(Duration::from_secs(60),|| {
-        let bs=computer(b,&["status"]);let cs=computer(&c,&["status"]);
-        bs["computers"].as_array().is_some_and(|v|v.len()==3)&&cs["computers"].as_array().is_some_and(|v|v.len()==3)
-            &&has(&ring(b,"remote-agent"),&beast,false)&&has(&ring(&c,"codex-beast"),remote,true)&&has(&ring(&c,"codex-beast"),&local[0],true)
-    }),"PRODUCT: third computer did not join the existing group through its non-founding member while the founder was offline: {}; {}",computer(b,&["status"]),computer(&c,&["status"]));
+    let assert_three_members = || {
+        assert!(wait_until(Duration::from_secs(60), || {
+            let bs = computer(b, &["status"]);
+            let cs = computer(&c, &["status"]);
+            bs["computers"].as_array().is_some_and(|v| v.len() == 3)
+                && cs["computers"].as_array().is_some_and(|v| v.len() == 3)
+                && has(&ring(b, "remote-agent"), &beast, false)
+                && has(&ring(&c, "codex-beast"), remote, true)
+                && has(&ring(&c, "codex-beast"), &local[0], true)
+        }), "PRODUCT [reverse enrollment original-group authority]: third computer did not join the existing group through its non-founding member while the founder was offline: {}; {}", computer(b, &["status"]), computer(&c, &["status"]));
+    };
+    let invite = computer(&c, &["invite"]);
+    let link = invite["invite_link"]
+        .as_str()
+        .expect("PRODUCT: individual computer did not offer Add Computer");
+    println!("[proof] reverse enrollment mutant boundary staged");
+    let (ok, out, err) = b.run(&["computer", "pair", link, "--preview", "--json"], "");
+    if !ok {
+        // An invalid selection can be rejected before a preview exists. It still fails the
+        // same end-to-end membership and effective-permission outcome, not a diagnostic match.
+        assert_three_members();
+        panic!(
+            "PRODUCT: grouped sponsor could not review the original-group enrollment: {out}{err}"
+        );
+    }
+    let preview: serde_json::Value = serde_json::from_str(&out)
+        .unwrap_or_else(|e| panic!("PRODUCT: invalid reverse enrollment preview: {e}: {out}"));
+    let op = preview["pairing"]["operation_id"]
+        .as_str()
+        .expect("PRODUCT: reverse enrollment omitted its operation")
+        .to_owned();
+    let proposed_group = preview["pairing"]["proposed_group"].clone();
+    assert!(
+        preview["pairing"]["approved_here"] == false
+            && preview["pairing"]["approved_there"] == false,
+        "PRODUCT: reverse enrollment preview contained an unsolicited approval: {preview}"
+    );
+    no_early_authority();
+    let approved = computer(&c, &["approve", &op]);
+    assert!(
+        approved["pairing"]["operation_id"] == op
+            && approved["pairing"]["approved_here"] == true
+            && approved["pairing"]["approved_there"] == false,
+        "PRODUCT: individual inviter did not record its exact sole approval: {approved}"
+    );
+    no_early_authority();
+    let _ = c_daemon.crash();
+    c_daemon = Daemon::start(&c, &["--node", "codex-beast"], &daemon_env);
+    c_daemon.expect_apparatus_event("third computer node is Ready after restart", |line| {
+        line.contains("codex-beast is Ready")
+    });
+    let (ok, out, err) = c.run(
+        &["node", "attach", "opencode-beast", "--passphrase-file", "-"],
+        PASS,
+    );
+    assert!(
+        ok,
+        "PRODUCT: third computer could not reattach its node: {out}{err}"
+    );
+    let resumed = computer(&c, &["status"]);
+    assert!(
+        resumed["pairing"]["operation_id"] == op
+            && resumed["pairing"]["peer"] == preview["this_computer"]
+            && resumed["pairing"]["proposed_group"] == proposed_group
+            && resumed["pairing"]["approved_here"] == true
+            && resumed["pairing"]["approved_there"] == false,
+        "PRODUCT: restarting the individual inviter lost or changed its exact operation and approval: before {approved}; after {resumed}"
+    );
+    no_early_authority();
+    computer(b, &["approve", &op]);
+    assert_eq!(
+        proposed_group, original_group,
+        "PRODUCT: reverse enrollment selected a group other than the original group"
+    );
+    assert_three_members();
     let pending = computer(b, &["status"]);
     assert!(
         pending["state"] != "confirmed"

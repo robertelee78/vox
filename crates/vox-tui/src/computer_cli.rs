@@ -395,6 +395,10 @@ fn show(
             p.approved_here,
             p.approved_there
         );
+        match &p.proposed_group {
+            Some(group) => println!("Joins existing computer group: {group}"),
+            None => println!("Creates a new computer group."),
+        }
         if p.expires_ms <= now_ms {
             println!(
                 "This incomplete attempt has expired. Close it on this computer: {}",

@@ -5937,7 +5937,7 @@ final class FirstRunProof: XCTestCase {
                                 env: voxEnv).out.split(separator: "\n") {
                     guard let row = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
                           row["text"] as? String == explicit else { continue }
-                    beforeReadBy = row["read_by"] as? [String]
+                    beforeReadBy = row["read_by"] == nil ? [] : row["read_by"] as? [String]
                 }
                 guard let beforeReadBy, !beforeReadBy.contains("alice") else {
                     throw Apparatus("bob must observe that the exact offscreen message is not yet acknowledged by alice")
