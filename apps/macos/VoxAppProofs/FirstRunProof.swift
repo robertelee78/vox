@@ -5463,7 +5463,7 @@ final class FirstRunProof: XCTestCase {
         ui.typeKey("k", modifierFlags: .command)
         type(ui, Key.id("palette-query"), "Admins", "the command palette")
         ui.typeKey(.return, modifierFlags: [])
-        if tap(ui, Key.showing("Make a Member Admin"), "the Admins member menu")
+        if tap(ui, Key.id("room-admin-member-menu"), "the Admins member menu")
             && tap(ui, Key.menuItem("bob"), "bob in the Admins member menu") {
             words(ui, Key.id("admin-confirm"), timeout: 10,
                   "choosing bob must ask first, saying what an admin can do",
@@ -5472,7 +5472,7 @@ final class FirstRunProof: XCTestCase {
             let listed = run(vox, ["room", "admin", "list", "--node", "alice", room], env: voxEnv).out
             XCTAssertFalse(listed.contains(bobFp) || listed.contains("bob"),
                            "PRODUCT: Cancel must make nobody an admin; `vox room admin list` says: \(listed)")
-            tap(ui, Key.showing("Make a Member Admin"), "the Admins member menu")
+            tap(ui, Key.id("room-admin-member-menu"), "the Admins member menu")
             tap(ui, Key.menuItem("bob"), "bob in the Admins member menu")
             tap(ui, Key.id("admin-confirm-make"), "Make Admin")
             var made = ""

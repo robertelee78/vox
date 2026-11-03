@@ -672,6 +672,7 @@ private struct AdminsSheet: View {
                         Button(member.name) { asking = member }
                     }
                 }.disabled(asking != nil)
+                    .accessibilityIdentifier("room-admin-member-menu")
             } else { ProgressView("Reading admins…") }
             if let member = asking {
                 StateMark(kind: .attention, words: "Make \(member.name) an admin? An admin can end this room for everyone and change its retention.")

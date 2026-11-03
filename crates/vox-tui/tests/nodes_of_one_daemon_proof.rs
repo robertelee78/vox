@@ -782,12 +782,17 @@ fn local_nodes_trust_each_other_without_a_prompt_and_remember_removals() {
         ok,
         "PRODUCT: automatically trusted node could not post: {out}{err}"
     );
+    let mut local_received = (false, String::new(), String::new());
     assert!(
         wait_until(Duration::from_secs(30), || {
-            let (ok, out, _) = a.run(&["room", "read", &room, "--node", person], "");
-            ok && out.contains(text)
+            local_received = a.run(&["room", "read", &room, "--node", person], "");
+            local_received.0 && local_received.1.contains(text)
         }),
-        "PRODUCT: personal node could not read its automatically trusted local member"
+        "PRODUCT: personal node could not read its automatically trusted local member: {:?}; reader status {:?}; writer status {:?}; log: {}",
+        local_received,
+        a.run(&["status", "--json", "--node", person], ""),
+        a.run(&["status", "--json", "--node", names[3]], ""),
+        a.log()
     );
 
     manual(&["trust", "remove", &fps[3], "--node", names[1]]);
@@ -1848,12 +1853,18 @@ fn pair_computers(
     let text = "computer trust works after explicit room admission";
     let (ok, out, err) = b.run(&["room", "post", room, text, "--node", "remote-agent"], "");
     assert!(ok, "PRODUCT: paired member could not post: {out}{err}");
+    let mut received = (false, String::new(), String::new());
     assert!(
-        wait_until(Duration::from_secs(30), || a
-            .run(&["room", "read", room, "--node", "agent-one"], "")
-            .1
-            .contains(text)),
-        "PRODUCT: computer-trusted member's room message did not become readable"
+        wait_until(Duration::from_secs(30), || {
+            received = a.run(&["room", "read", room, "--node", "agent-one"], "");
+            received.0 && received.1.contains(text)
+        }),
+        "PRODUCT: computer-trusted member's room message did not become readable: {:?}; reader status {:?}; writer status {:?}; logs: {}; {}",
+        received,
+        a.run(&["status", "--json", "--node", "agent-one"], ""),
+        b.run(&["status", "--json", "--node", "remote-agent"], ""),
+        a.log(),
+        b.log()
     );
     let before = ring(a, "agent-one");
     stop_pid(a.lock_pid().expect("APPARATUS: local scratch daemon"));
