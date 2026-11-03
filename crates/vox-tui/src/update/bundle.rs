@@ -1980,6 +1980,11 @@ fn recover_transition(apps: &Path, path: &Path) -> Result<Recovery, AppError> {
                 "readopted target changed; all files retained; contact Vox support",
             ));
         }
+        if transition.app_complete && !transition.daemon_complete && !transition.handoff_complete {
+            return Err(usage(
+                "legacy resumed handoff unsupported; all files retained; contact Vox support",
+            ));
+        }
     }
     if transition.candidate_preparation.is_some() {
         recover_candidate_preparation(apps, &transition)?;
