@@ -306,6 +306,13 @@ connectivity. Receipts do not prove that a computer is currently online, nor do 
 room membership, consent or Session access. Use `vox computer status --details` for complete
 identities, revisions, counters and optional node-management actions.
 
+If a computer-policy update meets room history that is still being saved, the daemon retains
+the accepted update until that exact publication settles instead of discarding it as a temporary
+busy error. Trust-dependent actions can report that computer policy is refreshing in the meantime.
+The same update then continues without another approval or manual node grants; already saved
+history remains available. Storage failures and changed authority remain errors, not successful
+policy application.
+
 To remove a computer, review its full fingerprint and nodes in `vox computer status --details`,
 then use the exact displayed frontier:
 

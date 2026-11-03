@@ -1394,6 +1394,8 @@ pub struct ChannelState {
     local_append_budget: Option<crate::log::history::LocalAppendBudget>,
     local_history: Option<local_history::Prepared>,
     pending_text: Option<Arc<()>>,
+    /// Live sparse request and its immutable Flow root; never persisted or used as authority.
+    history_publication_flow: Option<([u8; 16], [u8; 16])>,
     /// Exact publication completion/key-erasure edge for cleanup blocked behind this room.
     history_publication_changed: std::sync::Arc<tokio::sync::Notify>,
     role_owed: std::sync::Arc<role_owed::RoleOwed>,
@@ -2280,6 +2282,7 @@ impl ChannelState {
             local_append_budget: None,
             local_history: None,
             pending_text: None,
+            history_publication_flow: None,
             history_publication_changed: std::sync::Arc::new(tokio::sync::Notify::new()),
             role_owed: std::sync::Arc::new(role_owed::RoleOwed::default()),
             own_writer_gate: std::sync::Arc::new(own_writer_gate::Gate::default()),
@@ -2892,6 +2895,7 @@ impl ChannelState {
             local_append_budget: None,
             local_history: None,
             pending_text: None,
+            history_publication_flow: None,
             history_publication_changed: std::sync::Arc::new(tokio::sync::Notify::new()),
             role_owed: std::sync::Arc::new(role_owed::RoleOwed::default()),
             own_writer_gate: std::sync::Arc::new(own_writer_gate::Gate::default()),
@@ -3173,6 +3177,7 @@ impl ChannelState {
             local_append_budget: None,
             local_history: None,
             pending_text: None,
+            history_publication_flow: None,
             history_publication_changed: std::sync::Arc::new(tokio::sync::Notify::new()),
             role_owed: std::sync::Arc::new(role_owed::RoleOwed::default()),
             own_writer_gate: std::sync::Arc::new(own_writer_gate::Gate::default()),

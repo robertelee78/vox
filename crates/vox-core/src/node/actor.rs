@@ -5705,6 +5705,7 @@ struct OwnKeyComputerReady {
     rooms: Vec<(Digest32, SharedChannel)>,
     transitions: Option<Vec<crate::node::channel::own_writer_gate::Transition>>,
     publication: Option<crate::node::computer::ComputerPublicationTransition>,
+    preflight: crate::error::Result<Option<trust_save::PolicyPublicationBlocked>>,
     binding: crate::error::Result<()>,
     work: computer::OwnKeyPolicyWork,
 }
@@ -7765,6 +7766,7 @@ impl Node {
                     // no bounded actor-queue send or unrelated policy gate stands between a
                     // worker and its join.
                     self.accept_bounded_sync();
+                    self.complete_pending_policies().await;
                     self.publish().await;
                     self.schedule().await;
                 }
@@ -10817,6 +10819,7 @@ impl Node {
             NetEvent::OwnKeyComputerCancelled { owner } => {
                 self.own_key_computer_pending
                     .retain(|work| !Arc::ptr_eq(&work.owner, &owner));
+                self.cancel_policy_publication(&owner);
                 if let Some(flight) = &self.own_key_computer_flight {
                     if Arc::ptr_eq(&flight.owner, &owner) {
                         flight.fence.retire();
@@ -19391,6 +19394,7 @@ impl Node {
             rooms,
             transitions,
             publication,
+            preflight,
             binding,
             work,
         } = ready;
@@ -19410,6 +19414,16 @@ impl Node {
                 drop(transitions);
             } else if let Err(error) = work.guard.active(self.computer.as_ref()) {
                 let _ = work.reply.send(Err(error));
+            } else if let Err(error) = preflight {
+                let _ = work.reply.send(Err(error));
+            } else if !current {
+                drop(transitions);
+                self.own_key_computer_pending.push_front(work);
+            } else if let Ok(Some(blocked)) = preflight {
+                drop(transitions);
+                drop(publication);
+                drop(_secret);
+                self.wait_policy_publication(work, blocked).await;
             } else if let Err(error) = binding {
                 let _ = work.reply.send(Err(error));
             } else if current {
@@ -19467,6 +19481,15 @@ impl Node {
                 let _ = work.reply.send(Err(error));
                 continue;
             }
+            let already_current = self
+                .computer
+                .as_ref()
+                .and_then(|computer| computer.try_journal_writer())
+                .is_some_and(|_journal| self.policy_work_already_current(&work));
+            if already_current {
+                let _ = work.reply.send(Ok(()));
+                continue;
+            }
             work.targets.sort_unstable();
             let Ok(secret) = self.secret_work.clone().try_read_owned() else {
                 let _ = work.reply.send(Err(Error::AtRestLocked));
@@ -19495,6 +19518,7 @@ impl Node {
             let mut room_set_changed = self.own_key_room_set_changed.subscribe();
             let mut epoch_changed = self.pairwise_epoch.subscribe();
             let wake = Arc::clone(&self.own_key_transition_wake);
+            let inspection_store = self.profile.as_ref().map(|profile| profile.store_handle());
             let computer = self.computer.clone();
             let binding = self.profile.as_ref().map(|profile| {
                 let signer = profile.signer_arc();
@@ -19508,6 +19532,57 @@ impl Node {
                 (signer, name)
             });
             tokio::spawn(async move {
+                let (rooms, preflight) = match inspection_store {
+                    Some(store) => match tokio::task::spawn_blocking(move || {
+                        let result = trust_save::inspect_policy_rooms(&rooms, &store);
+                        (rooms, result)
+                    })
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => {
+                            if let Some(result) = completed.upgrade() {
+                                *result.lock().unwrap_or_else(|error| error.into_inner()) =
+                                    Some(OwnKeyComputerReady {
+                                        _secret: secret,
+                                        owner,
+                                        rooms: Vec::new(),
+                                        transitions: None,
+                                        publication: None,
+                                        preflight: Err(Error::Profile(
+                                            "Computer policy room inspection worker stopped",
+                                        )),
+                                        binding: Ok(()),
+                                        work,
+                                    });
+                                wake.notify_one();
+                            } else {
+                                let _ = work.reply.send(Err(Error::AtRestLocked));
+                            }
+                            return;
+                        }
+                    },
+                    None => (rooms, Ok(None)),
+                };
+                if preflight.as_ref().is_err() || matches!(&preflight, Ok(Some(_))) {
+                    if let Some(result) = completed.upgrade() {
+                        *result.lock().unwrap_or_else(|error| error.into_inner()) =
+                            Some(OwnKeyComputerReady {
+                                _secret: secret,
+                                owner,
+                                rooms,
+                                transitions: None,
+                                publication: None,
+                                preflight,
+                                binding: Ok(()),
+                                work,
+                            });
+                        wake.notify_one();
+                    } else {
+                        let _ = work.reply.send(Err(Error::AtRestLocked));
+                    }
+                    return;
+                }
                 let mut changes: Vec<_> = watches
                     .into_iter()
                     .map(|mut watch| {
@@ -19613,6 +19688,7 @@ impl Node {
                             transitions,
                             binding,
                             publication,
+                            preflight,
                             work,
                         });
                     wake.notify_one();

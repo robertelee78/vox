@@ -92,6 +92,8 @@ pub(crate) struct Received {
     /// inclusion and semantic settlement still have to complete before the archive can advance.
     pub(crate) role_ready: Option<(Digest32, u64, Digest32)>,
     pub(crate) body_progress: bool,
+    /// Local metadata admission found another publication, not a peer refusal or verifier yield.
+    pub(crate) local_publication_busy: bool,
     pub(crate) inventory: Option<Inventory>,
     pub(crate) key_availability: super::KeyAvailabilityResult,
     pub(crate) heads: Vec<super::HeadHint>,
@@ -112,6 +114,7 @@ impl Received {
             body_ready: None,
             role_ready: None,
             body_progress: false,
+            local_publication_busy: false,
             inventory: None,
             key_availability: None,
             heads: Vec::new(),
@@ -149,6 +152,7 @@ impl Receiver {
         deadline: tokio::time::Instant,
         work_committed: Arc<std::sync::atomic::AtomicBool>,
         own_head_observed: Arc<std::sync::atomic::AtomicBool>,
+        retirement_request: RequestId,
     ) -> Self {
         Self {
             source: Source::new(
@@ -160,6 +164,7 @@ impl Receiver {
                 deadline,
                 Some((node, generation)),
                 work_committed,
+                Some(retirement_request),
             ),
             generation,
             node,
@@ -518,6 +523,7 @@ impl Receiver {
                         )
                         .await?;
                     let Lookup::Found(staged) = staged else {
+                        result.local_publication_busy = matches!(staged, Lookup::Busy);
                         io.abort(WireError::SessionBusy);
                         result.status = Status::Busy;
                         return Ok(result);
@@ -1467,6 +1473,7 @@ impl Receiver {
         let job = record.job.clone();
         let committed = self.source.commit_ledger();
         let grant = self.grant();
+        let retirement_request = self.source.retirement_request()?;
         self.source
             .write_owned(
                 &job,
@@ -1502,9 +1509,14 @@ impl Receiver {
                         pending.cleanup(store, &committed, Some(binding), None),
                     ))
                 },
-                |room, _, (record, completed)| {
-                    let (done, _) = room.finish_history_publication(completed)?;
-                    Ok((record, done))
+                move |room, store, (record, completed)| {
+                    let finished = room.finish_history_publication(completed);
+                    let settled = room.settle_history_publication_flow(
+                        store,
+                        binding.request,
+                        retirement_request,
+                    );
+                    finished.and_then(|(done, _)| settled.map(|()| (record, done)))
                 },
             )
             .await
@@ -2262,9 +2274,10 @@ impl Receiver {
                 let received = self.received.clone();
                 let value = self
                     .source
-                    .write_owned(
+                    .begin_owned(
                         &job,
-                        (64 * 1024, 0, false),
+                        (64 * 1024, 0),
+                        request,
                         move |room, store| {
                             grant.check(room, store)?;
                             let instance = room.history_instance(store)?;

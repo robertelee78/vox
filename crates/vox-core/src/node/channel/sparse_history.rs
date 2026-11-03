@@ -1874,6 +1874,54 @@ impl ChannelState {
         Ok(self.history_read(store)?.sparse_publication_request())
     }
 
+    pub(crate) fn history_publication_flow_root(&self, request: [u8; 16]) -> Option<[u8; 16]> {
+        self.history_publication_flow
+            .filter(|(owned, _)| *owned == request)
+            .map(|(_, root)| root)
+    }
+
+    /// Called only under the room mutex after this Begin owns its physical reservation.
+    pub(crate) fn register_history_publication_flow(
+        &mut self,
+        store: &Store,
+        request: [u8; 16],
+        root: [u8; 16],
+    ) -> Result<()> {
+        if let Some((previous, previous_root)) = self.history_publication_flow {
+            if (previous, previous_root) != (request, root) {
+                self.settle_history_publication_flow(store, previous, previous_root)?;
+                if self.history_publication_flow.is_some() {
+                    return Err(Error::Profile(
+                        "sparse publication has another live Flow owner",
+                    ));
+                }
+            }
+        }
+        self.history_publication_flow = Some((request, root));
+        Ok(())
+    }
+
+    /// The physical worker has ended; only a committed read may release this exact binding.
+    pub(crate) fn settle_history_publication_flow(
+        &mut self,
+        store: &Store,
+        request: [u8; 16],
+        root: [u8; 16],
+    ) -> Result<()> {
+        if self.history_publication_flow != Some((request, root)) {
+            return Ok(());
+        }
+        let current = self
+            .entries
+            .read(store, &self.sek, &self.channel_id)?
+            .sparse_publication_request();
+        if current != Some(request) {
+            self.history_publication_flow = None;
+            self.history_publication_changed.notify_waiters();
+        }
+        Ok(())
+    }
+
     /// Subscribe under the room mutex before testing its actual publication owner. Only a
     /// committed completion or key erasure publishes this edge; no room guard is retained.
     pub(crate) fn history_publication_wake(

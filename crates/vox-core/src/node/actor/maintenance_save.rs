@@ -452,8 +452,9 @@ pub(super) struct Pending {
     preparing: bool,
     retention_owed: bool,
     governance_owed: bool,
-    result: Arc<std::sync::Mutex<Option<Returned>>>,
+    result: Arc<std::sync::Mutex<post_save::Completion<Returned>>>,
     task: tokio::task::JoinHandle<()>,
+    room_lock_wake: Option<post_save::PendingRoomLockWake>,
     continuation: Continuation,
     reply: Option<oneshot::Sender<Outcome>>,
 }
@@ -486,11 +487,13 @@ impl Pending {
 
     /// Retirement cannot abort a native commit or turn its real result into an unsent claim.
     pub(super) async fn retire(mut self) {
+        self.room_lock_wake = None;
         let _ = self.task.await;
         let returned = self
             .result
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .value
             .take();
         let (_lifetime, result) = match returned {
             Some((lifetime, Ok(done))) => {
@@ -683,7 +686,7 @@ impl Node {
             _ => None,
         };
         let owner = Arc::new(());
-        let result = Arc::new(std::sync::Mutex::new(None));
+        let result = Arc::new(std::sync::Mutex::new(post_save::Completion::new()));
         let worker_result = Arc::clone(&result);
         let wake = Arc::clone(&self.post_save_wake);
         let worker_instance = Arc::clone(&instance);
@@ -808,9 +811,10 @@ impl Node {
             let returned = worker
                 .await
                 .unwrap_or_else(|_| (None, Err(Error::Profile("native save owner stopped"))));
-            *worker_result
+            worker_result
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(returned);
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .value = Some(returned);
             wake.notify_one();
         });
         self.pending_posts.insert(
@@ -825,6 +829,7 @@ impl Node {
                 governance_owed: false,
                 result,
                 task,
+                room_lock_wake: None,
                 continuation,
                 reply,
             })),
@@ -840,16 +845,28 @@ impl Node {
             .result
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .value
             .take();
         let Some((lifetime, returned)) = returned else {
             return;
         };
         let instance = Arc::clone(&pending.instance);
         let Ok(mut channel) = instance.try_lock() else {
-            *pending
+            pending
                 .result
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((lifetime, returned));
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .value = Some((lifetime, returned));
+            if let Some(post_save::Pending::Maintenance(pending)) =
+                self.pending_posts.get_mut(&room)
+            {
+                post_save::PendingRoomLockWake::arm(
+                    &mut pending.room_lock_wake,
+                    &pending.result,
+                    &instance,
+                    &self.post_save_wake,
+                );
+            }
             return;
         };
         let current = pending.epoch == self.delivery_epoch

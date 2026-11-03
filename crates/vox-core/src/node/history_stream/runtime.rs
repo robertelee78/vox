@@ -362,6 +362,9 @@ pub(crate) struct Flow {
     /// derived; retirement ownership must not.
     retirement_request: RequestId,
     request: RequestId,
+    /// A popped task remains owned even while an archive keeps `request` at its demand root.
+    selected_request: Option<RequestId>,
+    retirement_root_cleaned: bool,
     cleanup_store: Arc<Store>,
     failed_settlement: Option<crate::node::store::ReceivedSettlement>,
     cleanup_budget: Arc<crate::node::history_budget::Budget>,
@@ -572,6 +575,8 @@ impl Flow {
             last_head: None,
             retirement_request: request,
             request,
+            selected_request: None,
+            retirement_root_cleaned: false,
             cleanup_store,
             failed_settlement: None,
             cleanup_budget,
@@ -751,6 +756,8 @@ impl Flow {
             last_head: None,
             retirement_request: request,
             request,
+            selected_request: None,
+            retirement_root_cleaned: false,
             cleanup_store,
             failed_settlement: None,
             cleanup_budget,
@@ -873,6 +880,7 @@ impl Flow {
     pub(crate) fn owns_request(&self, request: RequestId) -> bool {
         self.request == request
             || self.retirement_request == request
+            || self.selected_request == Some(request)
             || self.tasks.iter().any(|task| task.request == request)
             || self
                 .replay
@@ -1407,6 +1415,7 @@ impl Flow {
         let room = self.shared.clone();
         let store = self.cleanup_store.clone();
         let request = self.request;
+        let retirement_request = self.retirement_request;
         let instance = self.instance;
         let after = self.cleanup_after;
         let committed = Arc::clone(&self.work_committed);
@@ -1485,6 +1494,9 @@ impl Flow {
                 })(),
                 Err(_) => Err(Error::Profile("history retirement save worker stopped")),
             };
+            let settled =
+                channel.settle_history_publication_flow(&store, request, retirement_request);
+            let result = result.and_then(|slice| settled.map(|()| slice));
             channel.release_pending_text(&owner, false);
             let publication = if owns {
                 let released = channel.history_write_released(&store);
@@ -1536,12 +1548,7 @@ impl Flow {
                 // worker. The task/replay stack is the exact ownership set; an unrelated owner's
                 // publication remains untouched and is retried after its own causal completion.
                 if let Some(owner) = owner.filter(|owner| *owner != request) {
-                    let owned = self.retirement_request == owner
-                        || self.tasks.iter().any(|task| task.request == owner)
-                        || self
-                            .replay
-                            .as_ref()
-                            .is_some_and(|task| task.request == owner);
+                    let owned = self.owns_request(owner);
                     if owned {
                         self.request = owner;
                         self.cleanup_after = None;
@@ -1567,6 +1574,12 @@ impl Flow {
         // replay root already hold every suspended continuation; the current scalar covers the
         // operation that was popped when an error interrupted it.
         self.cleanup_after = None;
+        if self.archive && request == self.retirement_request {
+            self.retirement_root_cleaned = true;
+        }
+        if self.selected_request == Some(request) {
+            self.selected_request = None;
+        }
         self.tasks.retain(|task| task.request != request);
         if self
             .replay
@@ -1579,7 +1592,11 @@ impl Flow {
             .tasks
             .last()
             .map(|task| task.request)
-            .or_else(|| self.replay.as_ref().map(|task| task.request));
+            .or_else(|| self.replay.as_ref().map(|task| task.request))
+            .or(self.selected_request)
+            .or_else(|| {
+                (self.archive && !self.retirement_root_cleaned).then_some(self.retirement_request)
+            });
         if let Some(next) = next {
             self.request = next;
             Ok(RetirementStep::Progress)
@@ -1655,6 +1672,7 @@ impl Flow {
             deadline,
             Arc::clone(&self.work_committed),
             Arc::clone(&self.own_head_observed),
+            self.retirement_request,
         )
     }
 
@@ -1828,6 +1846,7 @@ impl Flow {
             deadline,
             Some((self.node, self.generation)),
             Arc::clone(&self.work_committed),
+            None,
         );
         if !self.initialized {
             let room = self.room;
@@ -1850,11 +1869,7 @@ impl Flow {
             return Ok(());
         }
         if self.publication_wait {
-            let owner = source
-                .read(job, 0, |channel, store| {
-                    Ok(Some(channel.history_publication_request(store)?))
-                })
-                .await?;
+            let owner = source.publication_owner(job).await?;
             match owner {
                 Lookup::Found(owner) => match owner.value {
                     None => {
@@ -1939,8 +1954,9 @@ impl Flow {
         } else {
             return Ok(());
         };
-        // Retirement's scalar always names the operation that can disappear from the bounded
-        // stack while this fallible turn executes. Suspended owners remain in tasks/replay.
+        self.selected_request = Some(task.request);
+        // Non-archive work follows its selected operation; an archive keeps its demand root.
+        // `selected_request` separately retains the popped owner through errors and panic.
         if !self.archive {
             self.request = task.request;
         }
@@ -1986,7 +2002,7 @@ impl Flow {
             self.brought = ordinary_brought.unwrap_or(false);
             brought
         });
-        match result {
+        let result = match result {
             Err(Error::HistoryCapacity(pressure)) => {
                 if let Some(task) = retry_task {
                     if announcement_task {
@@ -2045,7 +2061,11 @@ impl Flow {
                 Ok(())
             }
             result => result,
+        };
+        if result.is_ok() {
+            self.selected_request = None;
         }
+        result
     }
 
     /// Each fallible helper owns either the still-popped task or a more precise finalization
@@ -3098,14 +3118,8 @@ impl Flow {
                     ));
                 }
                 if result.status == Status::Busy {
-                    // Busy did not end the admitted request. Keep the exact body/page and its
-                    // continuation in this Flow; the actor parks the round and the port's Busy
-                    // edge retries this same owner. In particular, do not checkpoint/pause the
-                    // shipped archive request and require a person to resume work the peer only
-                    // deferred.
-                    // A Busy delivery may follow a committed body append but precede its
-                    // body_ready handoff (authorization/ACK metadata can yield). Preserve Busy
-                    // pacing and rebind this exact body from disk on the next allowed turn.
+                    // Retain the exact query/cursor. Peer Busy keeps its port pacing; a local
+                    // publication instead resumes through its owner or physical release.
                     let retry = Task {
                         operation: if body {
                             Operation::ResumeWire(query)
@@ -3115,7 +3129,28 @@ impl Flow {
                         ..task
                     };
                     self.push(retry)?;
+                    *retry_task = None;
                     self.waiting = true;
+                    if result.local_publication_busy {
+                        let readiness = source.publication_readiness(job).await?;
+                        if let Lookup::Found(readiness) = readiness {
+                            let readiness = readiness.value;
+                            self.publication_owner_wait = None;
+                            if !readiness.busy {
+                                self.waiting = false;
+                            } else if readiness
+                                .owner
+                                .is_some_and(|owner| self.prioritize_publication_owner(owner))
+                            {
+                                self.publication_wait = false;
+                                self.waiting = false;
+                            } else {
+                                self.publication_wait = readiness.owner.is_some();
+                                self.publication_owner_wait = readiness.owner;
+                                self.slot_wait = Some(readiness.wake);
+                            }
+                        }
+                    }
                     return Ok(());
                 }
                 if result.status == Status::EvidenceUnavailable {
@@ -3282,28 +3317,27 @@ impl Flow {
                     return Ok(());
                 }
                 if result.busy {
-                    // Local admission deliberately collapses disk pressure and an occupied
-                    // sparse publication into `busy`. Recover the durable distinction here,
-                    // after retaining this exact continuation: a newer local task must not
-                    // park ahead of an older task in this Flow that owns the publication.
-                    // No-owner remains ordinary capacity waiting; another Flow's owner is
-                    // left untouched and its completion is the causal room wake.
-                    let owner = source
-                        .read(job, 0, |channel, store| {
-                            Ok(Some(channel.history_publication_request(store)?))
-                        })
-                        .await?;
-                    if let Lookup::Found(owner) = owner {
-                        if let Some(owner) = owner.value.filter(|owner| *owner != task.request) {
-                            if self.prioritize_publication_owner(owner) {
+                    // Retain the exact continuation before distinguishing capacity waiting
+                    // from a physical publication, which may have no sparse request owner.
+                    let readiness = source.publication_readiness(job).await?;
+                    self.waiting = true;
+                    if let Lookup::Found(readiness) = readiness {
+                        let readiness = readiness.value;
+                        if readiness.busy && readiness.owner != Some(task.request) {
+                            if readiness
+                                .owner
+                                .is_some_and(|owner| self.prioritize_publication_owner(owner))
+                            {
+                                self.publication_wait = false;
                                 self.publication_owner_wait = None;
+                                self.waiting = false;
                                 return Ok(());
                             }
-                            self.publication_wait = true;
-                            self.publication_owner_wait = Some(owner);
+                            self.publication_wait = readiness.owner.is_some();
+                            self.publication_owner_wait = readiness.owner;
+                            self.slot_wait = Some(readiness.wake);
                         }
                     }
-                    self.waiting = true;
                     return Ok(());
                 }
                 if result.published.is_some() {

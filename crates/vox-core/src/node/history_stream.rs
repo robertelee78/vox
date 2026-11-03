@@ -126,6 +126,7 @@ pub(crate) async fn serve(
         deadline,
         None,
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        None,
     );
     let mut io =
         transport::Transport::new(send, recv, job, fence, deadline, availability_connection);
