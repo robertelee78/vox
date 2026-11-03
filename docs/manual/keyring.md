@@ -272,6 +272,11 @@ invitation; if it already signed, wait until the incomplete attempt expires befo
 Closing locally cannot withdraw a signature already retained elsewhere. Both computers must
 approve the fresh operation.
 
+In the app's confirmation sheet, review every affected identity in the scrollable list.
+**Copy Selected Identity** copies the complete selected name and fingerprint; selecting a row
+does not narrow which grants the confirmation affects. Escape or **Cancel** leaves authority
+unchanged. Replacement requires the separate explicit destructive action.
+
 If trust changes while a replacement review is open, Vox refuses the stale confirmation.
 This includes a later Read/Drive choice for a previously restored, covered node, even when the
 group frontier is unchanged. Review again rather than confirming the older affected grants.

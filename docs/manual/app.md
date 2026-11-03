@@ -354,6 +354,12 @@ Background status checks keep the controls available. If a status check is still
 choose an action, that action waits for the check; you do not need to choose it again. While your
 action is pending, the changing controls are disabled until it finishes.
 
+Group replacement, local retirement and computer removal open a separate confirmation sheet.
+Use the arrow keys or Page Down to review its affected identities, then Tab to
+**Copy Selected Identity**, **Cancel** or the explicit destructive action. Selecting an identity
+only navigates or chooses what to copy; confirmation still affects the complete reviewed scope.
+Return or Space on an identity does not approve the action. Escape cancels the sheet.
+
 ### Network settings
 
 **Settings › Network** lists manual anchors and each saved room's own sources, with reach from

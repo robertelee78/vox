@@ -296,47 +296,64 @@ struct ComputerTrustView: View {
                 await model.refresh()
             }
         }
-        .alert("Replace This Computer's Group?", isPresented: Binding(get: { replacement != nil }, set: { if !$0 { replacement = nil } }), presenting: replacement) { choice in
-            Button("Retire Old Group Locally", role: .destructive) {
-                replacement = nil
-                Task {
-                    await model.perform {
-                        try await $0.changeComputerBinding(action: "replace-group", node: choice.reviewId,
-                                                           destination: "", frontier: choice.frontier)
+        .sheet(isPresented: Binding(get: { replacement != nil }, set: { if !$0 { replacement = nil } })) {
+            if let choice = replacement {
+                ComputerTrustConfirmation(
+                    title: "Replace This Computer's Group?",
+                    message: "Retire the reviewed old group on this computer? Covered Read, Drive and individual grants are revoked locally. Identities, data and signed history remain. Unreachable computers may retain access and data.",
+                    affected: choice.affected,
+                    confirmLabel: "Retire Old Group Locally",
+                    confirmIdentifier: "computer-replacement-confirm",
+                    cancelIdentifier: "computer-replacement-decline",
+                    cancel: { replacement = nil },
+                    confirm: {
+                        replacement = nil
+                        Task {
+                            await model.perform {
+                                try await $0.changeComputerBinding(action: "replace-group", node: choice.reviewId,
+                                                                   destination: "", frontier: choice.frontier)
+                            }
+                            if model.status?.state == "individual", model.actionProblem == nil { handoff = choice }
+                        }
                     }
-                    if model.status?.state == "individual", model.actionProblem == nil { handoff = choice }
-                }
+                )
             }
-            .accessibilityIdentifier("computer-replacement-confirm")
-            Button("Cancel", role: .cancel) { replacement = nil }
-                .accessibilityIdentifier("computer-replacement-decline")
-        } message: { choice in
-            Text("Retire the reviewed old group on this computer? Covered Read, Drive and individual grants are revoked locally. Identities, data and signed history remain. Unreachable computers may retain access and data.\n\n" + choice.affected.joined(separator: "\n"))
         }
-        .alert("Finish Local Group Retirement?", isPresented: Binding(get: { retirement != nil }, set: { if !$0 { retirement = nil } }), presenting: retirement) { choice in
-            Button("Retire Group Locally", role: .destructive) {
-                retirement = nil
-                Task { await model.perform {
-                    try await $0.changeComputerBinding(action: "recover-group", node: choice.reviewId,
-                                                       destination: "", frontier: choice.frontier)
-                } }
+        .sheet(isPresented: Binding(get: { retirement != nil }, set: { if !$0 { retirement = nil } })) {
+            if let choice = retirement {
+                ComputerTrustConfirmation(
+                    title: "Finish Local Group Retirement?",
+                    message: "Retire the old group and its covered local grants? Identities, data and signed history remain. Unreachable computers may retain access and data.",
+                    affected: choice.affected,
+                    confirmLabel: "Retire Group Locally",
+                    cancel: { retirement = nil },
+                    confirm: {
+                        retirement = nil
+                        Task { await model.perform {
+                            try await $0.changeComputerBinding(action: "recover-group", node: choice.reviewId,
+                                                               destination: "", frontier: choice.frontier)
+                        } }
+                    }
+                )
             }
-            Button("Cancel", role: .cancel) { retirement = nil }
-        } message: { choice in
-            Text("Retire the old group and its covered local grants? Identities, data and signed history remain. Unreachable computers may retain access and data.\n\n" + choice.affected.joined(separator: "\n"))
         }
-        .alert("Remove Computer?", isPresented: Binding(get: { removal != nil }, set: { if !$0 { removal = nil } }), presenting: removal) { choice in
-            Button("Remove Computer", role: .destructive) {
-                let computer = choice.computer.fingerprint
-                let frontier = choice.frontier
-                removal = nil
-                Task { await model.perform { try await $0.removeComputer(computer: computer, frontier: frontier) } }
+        .sheet(isPresented: Binding(get: { removal != nil }, set: { if !$0 { removal = nil } })) {
+            if let choice = removal {
+                ComputerTrustConfirmation(
+                    title: "Remove Computer?",
+                    message: "Remove \(choice.computer.name) (\(choice.computer.fingerprint)) and all trust in its nodes, including individual grants made before pairing?",
+                    affected: choice.nodes.isEmpty ? ["No authenticated nodes are currently listed."] : choice.nodes.map { "\($0.name) · \($0.fingerprint)" },
+                    footnote: "Offline computers remain pending until they apply this removal. Data already received is not erased.",
+                    confirmLabel: "Remove Computer",
+                    cancel: { removal = nil },
+                    confirm: {
+                        let computer = choice.computer.fingerprint
+                        let frontier = choice.frontier
+                        removal = nil
+                        Task { await model.perform { try await $0.removeComputer(computer: computer, frontier: frontier) } }
+                    }
+                )
             }
-            Button("Cancel", role: .cancel) { removal = nil }
-        } message: { choice in
-            Text("Remove \(choice.computer.name) (\(choice.computer.fingerprint)) and all trust in its nodes, including individual grants made before pairing?\n\n"
-                 + (choice.nodes.isEmpty ? "No authenticated nodes are currently listed." : choice.nodes.map { "\($0.name) · \($0.fingerprint)" }.joined(separator: "\n"))
-                 + "\n\nOffline computers remain pending until they apply this removal. Data already received is not erased.")
         }
         .alert("Change Node Management?", isPresented: Binding(get: { bindingChoice != nil }, set: { if !$0 { bindingChoice = nil } }), presenting: bindingChoice) { choice in
             Button(choice.binding.action == "release" ? "Release Node" : "Approve Here") {
@@ -629,5 +646,86 @@ struct ComputerTrustView: View {
         NSPasteboard.general.clearContents()
         if NSPasteboard.general.setString(text, forType: .string) { copied = said }
         else { copied = "The clipboard could not be updated. Select and copy the code." }
+    }
+}
+
+private struct ComputerTrustConfirmation: View {
+    let title: String
+    let message: String
+    let affected: [String]
+    var footnote: String? = nil
+    let confirmLabel: String
+    var confirmIdentifier = "computer-confirm"
+    var cancelIdentifier = "computer-confirm-cancel"
+    let cancel: () -> Void
+    let confirm: () -> Void
+    @State private var inspected: Int?
+    @State private var copyNotice: String?
+
+    init(title: String, message: String, affected: [String], footnote: String? = nil,
+         confirmLabel: String, confirmIdentifier: String = "computer-confirm",
+         cancelIdentifier: String = "computer-confirm-cancel",
+         cancel: @escaping () -> Void, confirm: @escaping () -> Void) {
+        self.title = title
+        self.message = message
+        self.affected = affected
+        _inspected = State(initialValue: affected.indices.first)
+        self.footnote = footnote
+        self.confirmLabel = confirmLabel
+        self.confirmIdentifier = confirmIdentifier
+        self.cancelIdentifier = cancelIdentifier
+        self.cancel = cancel
+        self.confirm = confirm
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Space.s16) {
+            Text(title).title()
+            Text(message).fixedSize(horizontal: false, vertical: true)
+            List(selection: $inspected) {
+                ForEach(affected.indices, id: \.self) { index in
+                    Text(affected[index])
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .tag(index)
+                }
+            }
+            .listStyle(.plain)
+            .scrollContentBackground(.hidden)
+            .frame(height: Theme.scaled(200))
+            if let footnote {
+                Text(footnote).fixedSize(horizontal: false, vertical: true)
+            }
+            Button("Copy Selected Identity") {
+                guard let inspected, affected.indices.contains(inspected) else { return }
+                NSPasteboard.general.clearContents()
+                if NSPasteboard.general.setString(affected[inspected], forType: .string) {
+                    copyNotice = "Copied selected identity."
+                } else {
+                    copyNotice = "The clipboard could not be updated."
+                }
+            }
+            .buttonStyle(VoxButtonStyle())
+            .disabled(inspected.map { affected.indices.contains($0) } != true)
+            .accessibilityIdentifier("computer-confirm-copy")
+            if let copyNotice {
+                Text(copyNotice).secondaryText().fixedSize(horizontal: false, vertical: true)
+            }
+            HStack {
+                Button("Cancel", role: .cancel, action: cancel)
+                    .keyboardShortcut(.cancelAction)
+                    .accessibilityLabel("Cancel")
+                    .accessibilityIdentifier(cancelIdentifier)
+                Button(confirmLabel, role: .destructive, action: confirm)
+                    .accessibilityLabel(confirmLabel)
+                    .accessibilityIdentifier(confirmIdentifier)
+            }
+            .buttonStyle(VoxButtonStyle())
+        }
+        .padding(Space.s24)
+        .frame(width: Theme.scaled(440))
+        .font(Theme.text)
+        .panelSurface()
+        .onChange(of: inspected) { _ in copyNotice = nil }
     }
 }
