@@ -683,6 +683,14 @@ impl ChannelState {
             && hops > 0
             && !spoke
             && !vox_agentcomms::envelope::is_plumbing(&env.kind))
+            || (!env.from.is_empty()
+                && addressed
+                && hops > 0
+                && matches!(
+                    env.kind.as_str(),
+                    vox_agentcomms::envelope::work::ASK
+                        | vox_agentcomms::envelope::work::ASSIGN
+                ))
             || (answers
                 && hops > 0
                 && !["ack", "status", "hello", "bye", "ping", "pong"].contains(&env.kind.as_str())))

@@ -772,12 +772,18 @@ been observed. Bundle inspection is **not** a hands-on reference pass. A
 working, safe environment for this exact build remains necessary.
 
 As separately identified supplemental evidence only, the running native
-`/Applications/Tern.app` reports version/build 0.9.10. Read-only macOS
-accessibility enumeration of its existing menu bar showed Tern, File, Edit,
-View, Window and Help; View includes Hide Sidebar, Show Files and Reveal
-Active File, and the Tern menu includes Settings and Quit and Keep Windows.
-No window contents, session or theme controls were inspected or changed.
-These observations do not establish anything about the build 77 wrapper.
+`/Applications/Tern.app` reports version/build 0.9.10. Its process path was
+checked independently of the shared bundle identifier. Read-only macOS
+accessibility enumeration returned Settings, Hide Sidebar, Show Files and
+Reveal Active File. AXPress on the returned Settings item succeeded, but a
+subsequent window query showed no Settings or Preferences window. Other menu
+entries had uncertain application attribution; returned labels alone are
+not proof of available functionality. No private pane or session content was
+read or captured, and no settings or session contents were changed.
+Embedded executable strings mention a theme picker, Follow omp, contrast
+correction and tool folding; these are static bundled text, not observed
+controls, working behavior or accessibility evidence. None of these
+supplemental observations establishes anything about the build 77 wrapper.
 
 [Tern's first-party page](https://stencil.so/tern), read and viewed on
 2026-11-02, is a published demonstration, not evidence about this installed

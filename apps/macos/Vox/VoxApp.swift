@@ -23,19 +23,18 @@ struct VoxApp: App {
 
     var body: some Scene {
         Window("Vox", id: "main") {
-            RootView(model: model)
-                // A vox:// room link opened anywhere (Mail, Messages, a browser) opens the Join
-                // sheet with it filled in; joining still takes the room's passphrase and a click.
-                .onOpenURL { model.openLink($0) }
-                // Every view's text in the app's face and size; drawn again when the size
-                // changes (View > Bigger, Smaller, Actual Size).
-                .font(Theme.text)
-                .controlSize(Theme.controls)
-                .buttonStyle(VoxButtonStyle())
-                .id(model.textScale)
-                // The sidebar (260) and the inspector (240) leave the room 400 or more: room
-                // for the composer's field beside its To: and Urgent controls.
-                .frame(minWidth: 900, minHeight: 360)
+            WindowMinimumLayout {
+                RootView(model: model)
+                    // A vox:// room link opened anywhere (Mail, Messages, a browser) opens the Join
+                    // sheet with it filled in; joining still takes the room's passphrase and a click.
+                    .onOpenURL { model.openLink($0) }
+                    // Every view's text in the app's face and size; drawn again when the size
+                    // changes (View > Bigger, Smaller, Actual Size).
+                    .font(Theme.text)
+                    .controlSize(Theme.controls)
+                    .buttonStyle(VoxButtonStyle())
+                    .id(model.textScale)
+            }
                 // Dark is the one theme (ADR-028 L-2).
                 .preferredColorScheme(.dark)
         }
@@ -47,7 +46,6 @@ struct VoxApp: App {
                 .font(Theme.text)
                 .controlSize(Theme.controls)
                 .buttonStyle(VoxButtonStyle())
-                .id(model.textScale)
                 .preferredColorScheme(.dark)
         }
         // Off until the person turns it on (M-22). Its image is the Vox mark as a template
@@ -64,6 +62,30 @@ struct VoxApp: App {
                 .preferredColorScheme(.dark)
         }
         .menuBarExtraStyle(.window)
+    }
+}
+
+/// Preserve the content's own minimum while keeping the window's existing size floor.
+private struct WindowMinimumLayout: Layout {
+    private let minimum = CGSize(width: 900, height: 360)
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        guard let child = subviews.first else { return minimum }
+        func offered(_ value: CGFloat?, floor: CGFloat) -> CGFloat? {
+            guard let value else { return nil }
+            guard value.isFinite else { return value }
+            return max(value, floor)
+        }
+        let size = child.sizeThatFits(ProposedViewSize(
+            width: offered(proposal.width, floor: minimum.width),
+            height: offered(proposal.height, floor: minimum.height)))
+        return CGSize(width: max(size.width, minimum.width),
+                      height: max(size.height, minimum.height))
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        subviews.first?.place(at: bounds.origin, anchor: .topLeading,
+                              proposal: ProposedViewSize(width: bounds.width, height: bounds.height))
     }
 }
 

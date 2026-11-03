@@ -343,6 +343,10 @@ colour alone. It follows **Increase Contrast**, **Reduce Motion** and **Reduce T
 System Settings, Accessibility, Display. **View > Bigger**, **Smaller** and **Actual Size** change
 the conversation's size, up to twice the usual.
 
+In **Vox > Settings…**, Tab and Shift-Tab move through the controls and scroll the focused
+control into view. Changing conversation size keeps the Settings window's focus and open sheets;
+the picker also follows changes made through the View menu.
+
 ### Network settings
 
 **Settings › Network** lists manual anchors and each saved room's own sources, with reach from

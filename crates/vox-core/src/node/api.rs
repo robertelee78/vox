@@ -1363,7 +1363,7 @@ pub enum NodeCommand {
         /// Unnumbered shared-format activity, within the ingress batch bound.
         bodies: Vec<String>,
         /// Exact committed range, or the saving/refusal error. Never a network receipt.
-        reply: tokio::sync::oneshot::Sender<crate::node::session_ingress::AdmissionResult>,
+        reply: tokio::sync::oneshot::Sender<crate::node::session_ingress::OwnedAdmission>,
     },
     /// Finish a hosted daemon's ordered cleanup after it retired this room's volatile tails
     /// and session bindings. Does not delete room history or reset persistent counters.

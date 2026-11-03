@@ -218,8 +218,8 @@ they are not a defence against one that lies.
   **and** is `urgent`, has hops left (§9), was not posted by that session, and does not answer a
   reply chain that session already spoke in (V210-121). An urgent broadcast MUST wake nobody.
   *Amended by ADR-029 TA-3:* a message addressed to one session wakes only that session.
-  Ordinary room conversation gains the separate, non-urgent attention path in §6.15. Other
-  messages wait for the next turn unless §6.9 applies.
+  Ordinary room conversation and directed agent requests gain the separate, non-urgent attention
+  path in §6.15. Other messages wait for the next turn unless §6.9 applies.
 - **6.3 (M19.5, M19.5b).** The drain MUST be a harness hook, not a skill instruction:
 
   | Harness | Drain at turn start | Wake |
@@ -326,6 +326,15 @@ below. Repository binding (ADR-029), thread audiences and pause (ADR-033) still 
   becomes a conversation request. A malformed/unsupported envelope is shown as such and MUST NOT
   acquire automatic attention by losing its invalid metadata. A forged session marker can only
   change this delivery default; it establishes neither identity nor authority.
+- **RA-2a. Directed agent requests.** A valid session-origin message with nonempty `from`, type
+  `ask` or `assign`, and explicit recipients MUST be offered to each matching eligible existing
+  Session through RA-5's safe-boundary adapter, without requiring or inferring urgency. Node-only
+  recipients reach eligible Sessions on that node; a Session recipient narrows that audience.
+  A distinct directed follow-up request MUST remain eligible after that Session spoke in its
+  reply chain, while the effective chain hop budget still applies. Own posts, exhausted hops,
+  terminal answers/acknowledgements, plumbing and undirected agent announcements MUST NOT gain
+  attention through this rule. Origin and authority remain unchanged. Notice dispatch does not
+  establish a safe interruption point: the existing adapter MUST enforce RA-5 for a busy Session.
 - **RA-3. Posting.** Every supported posting path invoked from a harness MUST stamp its actual
   registered sending session, including plain-text posts and replies. It MUST reject a conflicting
   supplied session instead of speaking as it. A person's app/TUI/terminal post outside a harness

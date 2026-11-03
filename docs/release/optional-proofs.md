@@ -373,6 +373,27 @@ unknown. Ordinary text append and sender-key admission have their own use-bounda
 
 `VOX_TEST_HOLD_INCOMING_CONSENT_FILE=<path>`: the marker contains the full room, author and recipient fingerprints, separated by spaces. The exact signed consent waits before writer admission while independent sender-key delivery proceeds. An atomically published sibling, `path.with_extension("entered")`, records those fingerprints and the actual entry hash; the proof checks that hash against the author's shipped hash view. Removing the marker releases that same consent. The retained-row journey uses one render page plus one row, within the automatic live suffix, and compares `envelope.body` rather than the encoded envelope in `text`. Same `test-knobs` rule.
 
+`VOX_TEST_OMP_RECEIPT_HOLD_FILE=<path>` with `VOX_TEST_OMP_RECEIPT_NODE=<node>` and
+`VOX_TEST_OMP_RECEIPT_SESSION=<session>` parks consumption of the exact enqueued Session admission's
+physical receipt while the marker exists. `<path>.engaged` records node, Session, attachment
+generation and room. The actor remains free to commit and serve unrelated commands; this stages
+receipt-consumer delay, **not** physical-store latency. Removing the marker releases the original
+receipt; physical actor termination also releases the hold. The marker is staging evidence only:
+the original and subsequent private Session bodies at actual consumers supply the verdict. Same
+`test-knobs` rule.
+
+The v0.4.16 receipt-ownership spike used three unmodified OMP 18.16.0 native-extension
+clients in one scratch room, each bound through `vox agent room` under its own node and
+actual Session ID. Every Vox command set scratch `VOX_DATA_DIR` and `VOX_CONFIG_DIR`;
+the CLI was a release-profile build with `test-knobs`. While one exact receipt was held,
+the original tool result and a later reply had to remain readable through the authorized
+`vox room session --json --details` consumer, and another Session had to answer independently.
+After release, both original and later bodies were retained. Restoring only the historical
+two-second receipt timeout in a detached inverse lost the later consumer body and failed
+the same assertion. This was an uncommitted real-client spike, not a new CI proof or evidence
+of store latency, lifecycle recovery, or signed-release acceptance. See #1140 for its
+source-bound receipts and separate lifecycle acceptance.
+
 `VOX_TEST_HOLD_PACKAGES_FILE=<path>`: while the marker exists, every sender-key acceptance entrance is held: the retained-package worker, room preparation, and live pairwise delivery. The first interception creates `<path>.engaged`; this alone does not prove a saved body. Committed recipient package bodies append 64-byte raw room/author records to that same receipt. The FX-22 proof requires both exact authors in every room, with zero received generations, before stopping either source. Retained packages stay queued; a live sender receives not-accepted and retains/retries delivery. Removing the marker and driving the shipped trust command replays local packages. Same `test-knobs` rule.
 
 `VOX_TEST_HOLD_RENDER_FILE=<path>`: an empty marker parks existing render work. A 96-byte marker containing a raw room id and two raw author ids parks that room and is renamed with `.ready` appended when both exact sender keys are held. A 64-byte marker containing a raw room id and one raw author id lets a bounded native turn run, then is renamed with `.engaged` appended only after that author's visible rows commit and the completed save successfully publishes its saved-read view. Later turns then park. The FX-22 proof reads only shipped status and exact room rows for its verdict; these marker states only establish and freeze the causal boundary. Same `test-knobs` rule.

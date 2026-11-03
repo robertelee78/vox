@@ -1179,6 +1179,15 @@ lessons. It changes neither this record's decision status nor any requirement or
   Source review and a bounded spike cover exact-owner wake matching, parked-resource release,
   restart recovery and finite multi-head scanning; they MUST NOT create a mechanism CI gate.
 
+  The original local admission retains its exact physical receipt independently of the
+  requesting connection. A slow actor is not an unknown commit: only an uncertain transaction
+  or loss of the enqueued receipt makes acceptance unknown, and that batch must not be replayed.
+  The bounded volatile tail protects and charges the submitted prefix while its original bodies
+  belong to the actor; a definite noncommit returns them to the same tail. Other Sessions and
+  node shutdown must not wait behind its receipt under daemon-wide posting serialization.
+  Room retirement blocks new old-room work and settles enqueued old owners before
+  completing the durable retirement.
+
 - **FX-48.** Recipient-key recovery MUST retain already-available work when a publication
   snapshot or precommit provider-cursor reservation is temporarily busy. The existing
   publication wake MUST be subscribed before the recovery worker reads its history instance

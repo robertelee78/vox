@@ -4712,6 +4712,41 @@ pub struct NodeHandle {
     decisions: crate::node::decisions::DecisionLog,
 }
 
+/// A Session batch that has not entered the actor's command queue.
+#[doc(hidden)]
+pub enum SessionBatchEnqueueError {
+    /// The queue is full; the caller still owns every body.
+    Full(Vec<String>),
+    /// The actor has closed its command queue; no command was submitted.
+    Closed(Vec<String>),
+}
+
+/// A reserved actor command slot. Its owner must revalidate its Session route before sending.
+#[doc(hidden)]
+pub struct SessionBatchSlot(mpsc::OwnedPermit<(NodeCommand, oneshot::Sender<Outcome>)>);
+
+impl SessionBatchSlot {
+    /// Send one batch into this reserved slot and return its physical admission receipt.
+    #[doc(hidden)]
+    pub fn send(
+        self,
+        room: Digest32,
+        session: String,
+        bodies: Vec<String>,
+    ) -> oneshot::Receiver<crate::node::session_ingress::OwnedAdmission> {
+        let (reply, receipt) = oneshot::channel();
+        let (outer, outcome) = oneshot::channel();
+        self.0.send((NodeCommand::AcceptSessionBatch {
+            channel_id: room,
+            session_id: session,
+            bodies,
+            reply,
+        }, outer));
+        drop(outcome);
+        receipt
+    }
+}
+
 /// Existing read/control admission, independent of parked store writers. Status carries
 /// its own typed reply; commands retain their ordinary outcome without an extra allocation.
 pub(crate) struct ReadRequest {
@@ -4844,6 +4879,27 @@ impl std::fmt::Debug for KeyringWindow {
 }
 
 impl NodeHandle {
+    /// Submit a Session batch only if a command slot is immediately available.
+    #[doc(hidden)]
+    pub fn try_enqueue_session_batch(
+        &self,
+        room: Digest32,
+        session: String,
+        bodies: Vec<String>,
+    ) -> std::result::Result<oneshot::Receiver<crate::node::session_ingress::OwnedAdmission>, SessionBatchEnqueueError> {
+        match self.cmd_tx.clone().try_reserve_owned() {
+            Ok(slot) => Ok(SessionBatchSlot(slot).send(room, session, bodies)),
+            Err(mpsc::error::TrySendError::Full(_)) => Err(SessionBatchEnqueueError::Full(bodies)),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(SessionBatchEnqueueError::Closed(bodies)),
+        }
+    }
+
+    /// Wait for command capacity without holding Session admission ordering.
+    #[doc(hidden)]
+    pub async fn reserve_session_batch_slot(&self) -> Option<SessionBatchSlot> {
+        self.cmd_tx.clone().reserve_owned().await.ok().map(SessionBatchSlot)
+    }
+
     /// Observe this exact actor's retirement and physical resource completion without keeping
     /// its Store, keys or worker leases alive.
     #[must_use]
@@ -5356,6 +5412,7 @@ impl NodeHandle {
         if matches!(
             &command,
             NodeCommand::Ping
+                | NodeCommand::Shutdown
                 | NodeCommand::Status { .. }
                 | NodeCommand::PreparePost { .. }
                 | NodeCommand::Attention {
@@ -7931,14 +7988,20 @@ impl Node {
                                 profile,
                                 channel_id,
                                 &session_id,
-                                bodies,
+                                &bodies,
                             )
                         })
                 };
                 if result.is_ok() {
                     self.ingress_scan_wake();
                 }
-                let _ = reply.send(result);
+                use crate::node::session_ingress::{AdmissionError, OwnedAdmission};
+                let receipt = match result {
+                    Ok(saved) => OwnedAdmission::Committed(saved),
+                    Err(AdmissionError::NotCommitted(error)) => OwnedAdmission::NotCommitted { error, bodies },
+                    Err(AdmissionError::Unconfirmed(error)) => OwnedAdmission::Unconfirmed(error),
+                };
+                let _ = reply.send(receipt);
                 Outcome::Done
             }
             NodeCommand::RetireSessionRoom { retirement, reply } => {

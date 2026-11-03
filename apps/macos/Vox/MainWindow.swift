@@ -185,7 +185,7 @@ private struct Sidebar: View {
         VStack(spacing: 0) {
         List(selection: Binding(get: { model.sidebarSelection },
                                 set: { s in
-                                    model.selectFromSidebar(s) { [weak model] in
+                                    model.selectFromSidebar(s) { [weak model = model] in
                                         guard let model else { return false }
                                         return AppModel.shared.node === model
                                     }

@@ -297,7 +297,6 @@ final class AppModel: ObservableObject {
         appNodeChoiceBusy = true
         defer { nodeActionInProgress = false; appNodeChoiceBusy = false }
         var prospective: VoxClient?
-        var committed = false
         do {
             let passphrase = try secret.passphrase()
             defer { passphrase.wipe() }
@@ -318,7 +317,6 @@ final class AppModel: ObservableObject {
             }
             // Only an authenticated, still-selected request changes the daemon's personal role.
             let selected = try await connection.selectPersonalNode(node: name)
-            committed = true
             guard ownsNodeRequest(original, generation), self.node === old else {
                 // The role committed while another request superseded this one. Capture that
                 // request's generation: never revive this choice or write its local mirror.
@@ -373,7 +371,6 @@ final class AppModel: ObservableObject {
             if let prospective { await prospective.close() }
             guard ownsNodeRequest(original, generation), self.node === old else { return }
             appNodeChoiceSaid = sentence(error)
-            if committed { await reach() }
         }
     }
 
