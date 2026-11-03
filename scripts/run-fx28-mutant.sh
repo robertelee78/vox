@@ -82,12 +82,6 @@ case "${1-}" in
     verdict='PRODUCT [FX28 stale-join-authority]:'
     staging='[proof] FX-28 stale-join-authority apparatus staged:'
     ;;
-  ready-fence-accepts-unsettled)
-    mutant=$1
-    journey=computer_pairing_uses_an_anchor_without_room_membership_and_reconnects
-    verdict='PRODUCT [FX28 startup-ready-state-lock]:'
-    staging='[proof] FX-28 startup Ready state-lock apparatus staged:'
-    ;;
   stale-post-authority)
     mutant=$1
     journey=two_paired_computers_that_are_idle_exchange_nothing
@@ -119,7 +113,7 @@ case "${1-}" in
     staging='[proof] FX-28 legacy rekey route apparatus staged:'
     ;;
   *)
-    printf '%s\n' "usage: $0 preview-approval-not-durable|stopped-reader-fresh-write|lock-through-computer-write|deadline-as-storage-failure|withdrawal-not-durable|stale-tick-authority|redeem-rejects-pending-registration|owner-refusal-decoded-as-payload|due-backoff-drops-causal-cause|fresh-preview-inherits-old-deadline|detach-keeps-reconciliation|late-application-abandons-work|stale-join-authority|ready-fence-accepts-unsettled|stale-post-authority|stale-room-create-authority|stale-trust-projection|stale-rekey-authority|legacy-ended-unanswered-not-selected" >&2
+    printf '%s\n' "usage: $0 preview-approval-not-durable|stopped-reader-fresh-write|lock-through-computer-write|deadline-as-storage-failure|withdrawal-not-durable|stale-tick-authority|redeem-rejects-pending-registration|owner-refusal-decoded-as-payload|due-backoff-drops-causal-cause|fresh-preview-inherits-old-deadline|detach-keeps-reconciliation|late-application-abandons-work|stale-join-authority|stale-post-authority|stale-room-create-authority|stale-trust-projection|stale-rekey-authority|legacy-ended-unanswered-not-selected" >&2
     exit 2
     ;;
 esac

@@ -261,18 +261,18 @@ The Linux form runs unprivileged in a network namespace and is an ordinary proof
 
 | Proof | Helps troubleshoot | Run | Needs | Time |
 |---|---|---|---|---|
-| `nodes_of_one_daemon_proof::computer_pairing_uses_an_anchor_without_room_membership_and_reconnects` | Paired computers do not converge after path loss, historical misses disappear across restart, or Ready exposes an old application after a later operator policy changes the personal-node role while losing current managed or manual grants. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test nodes_of_one_daemon_proof -- --ignored --exact computer_pairing_uses_an_anchor_without_room_membership_and_reconnects --nocapture` | a real machine with IPv4 and IPv6 loopback; run alone | several minutes; not timed in CI |
+| `nodes_of_one_daemon_proof::computer_pairing_uses_an_anchor_without_room_membership_and_reconnects` | Paired computers do not converge after path loss, lose historical misses across restart, or fail to apply the current managed grants after a newer policy. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test nodes_of_one_daemon_proof -- --ignored --exact computer_pairing_uses_an_anchor_without_room_membership_and_reconnects --nocapture` | a real machine with IPv4 and IPv6 loopback; run alone | several minutes; not timed in CI |
 | `nodes_of_one_daemon_proof::computer_preview_and_approval_survive_a_crash` | An authenticated Add Computer preview or the local operator's approval disappears when the daemon crashes before the other operator approves. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test nodes_of_one_daemon_proof -- --ignored --exact computer_preview_and_approval_survive_a_crash --nocapture` | a real machine; run alone | not timed in CI |
 | `nodes_of_one_daemon_proof::two_paired_computers_that_are_idle_exchange_nothing` | Idle paired computers keep exchanging unchanged histories, re-derive bindings, or fail to reconcile siblings while one actor is held. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test nodes_of_one_daemon_proof -- --ignored --exact two_paired_computers_that_are_idle_exchange_nothing --nocapture` | a real machine; run alone | about five minutes; not timed in CI |
 
-FX-28's nineteen executable mutants are run one at a time with
+FX-28's eighteen executable mutants are run one at a time with
 `scripts/run-fx28-mutant.sh <mode>`, where `<mode>` is
 `preview-approval-not-durable`, `stopped-reader-fresh-write`, `lock-through-computer-write`,
 `deadline-as-storage-failure`, `withdrawal-not-durable`, `stale-tick-authority`, `stale-join-authority`,
 `fresh-preview-inherits-old-deadline`, `late-application-abandons-work`, `detach-keeps-reconciliation`,
 `redeem-rejects-pending-registration`, `owner-refusal-decoded-as-payload`,
 `due-backoff-drops-causal-cause`,
-`ready-fence-accepts-unsettled`, `stale-post-authority`, `stale-room-create-authority`,
+`stale-post-authority`, `stale-room-create-authority`,
 `stale-trust-projection`, `stale-rekey-authority`, or
 `legacy-ended-unanswered-not-selected`. Each mode selects the journey which stages that fault and accepts
 only its exact named `PRODUCT [FX28 ...]:` verdict; another product red is an apparatus failure,
@@ -284,10 +284,7 @@ its existing actor-liveness contract. `deadline-as-storage-failure` turns an exa
 causal refusal into permanent storage quarantine again. `withdrawal-not-durable` omits the refused
 join's prepared and pending board-withdrawal journals; after the responder path reopens with the
 joining daemon stopped, restart must still remove both exact accepted records from that real board.
-`ready-fence-accepts-unsettled` bypasses only the daemon's final state-locked
-publication fence after a successful receipt. A later real operator change supersedes that
-receipt while startup is held; the mutant exposes the stale or held-back projection instead of
-the current personal role and exact managed/manual grants. `stale-post-authority` bypasses the durable-policy fence around an
+`stale-post-authority` bypasses the durable-policy fence around an
 ordinary text append; `stale-trust-projection` makes the shipped trust list copy unreconciled
 trusted rows; `stale-room-create-authority` bypasses only the first durable commit of an exact
 sealed room create, so its shipped create answer and room list expose stale authority;

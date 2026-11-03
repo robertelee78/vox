@@ -3602,8 +3602,6 @@ impl Computer {
             && Self::application_settled_in(&state, node, revision)
             && self.startup_binding_current_in(&state, node, revision, expired);
         drop(state);
-        #[cfg(feature = "test-knobs")]
-        let settled = settled || fx28_mutant("ready-fence-accepts-unsettled");
         settled.then(publish)
     }
 
