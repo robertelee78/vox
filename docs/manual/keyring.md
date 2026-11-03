@@ -272,6 +272,8 @@ Closing locally cannot withdraw a signature already retained elsewhere. Both com
 approve the fresh operation.
 
 If trust changes while a replacement review is open, Vox refuses the stale confirmation.
+This includes a later Read/Drive choice for a previously restored, covered node, even when the
+group frontier is unchanged. Review again rather than confirming the older affected grants.
 The app keeps that refusal below the **My Computers** heading, above the scrollable details;
 review the current state before trying again. A refusal is not a completed replacement.
 

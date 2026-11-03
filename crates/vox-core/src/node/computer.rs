@@ -3790,9 +3790,9 @@ impl Computer {
         }
         Ok(!managers.iter().any(|m| s.quarantined.contains(m)))
     }
-    /// The ordinary explicit Trust command after retirement chooses individual mode. Journal
-    /// that local choice before its keyring write; a failed write grants nothing and can be
-    /// retried. A peer that Computer policy never covered needs no Computer journal entry.
+    /// Explicit trust choices after retirement choose individual mode. Journal each later choice
+    /// too, so a replacement review cannot discard a grant changed after review. A failed keyring
+    /// write grants nothing; a peer never covered by Computer policy needs no journal entry.
     pub(crate) fn individual_choice(
         &self,
         node: Digest32,
@@ -3804,7 +3804,14 @@ impl Computer {
             return Ok(());
         };
         if !plan.denied.contains(&peer) {
-            return Ok(());
+            let state = lock(&self.state);
+            if !state
+                .individual
+                .get(&node)
+                .is_some_and(|peers| peers.contains_key(&peer))
+            {
+                return Ok(());
+            }
         }
         if !self.individual_permitted(node, &peer)? {
             return Err(Error::SignatureInvalid);
