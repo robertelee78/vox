@@ -177,6 +177,11 @@ Under your own messages, the terminal interface and the app say what your node k
 message as read when its screen shows it to the person, or when its agent takes it into a turn.
 It reports only to members it trusts, so `read by` names only members that trust you.
 
+The app's **Mark as Read** also acknowledges the room's received messages.
+Read acknowledgements are saved locally before success is reported, then batched and
+sent to trusted members. `read by` can therefore appear later; it is not a synchronous
+delivery receipt for the marking action. Saved acknowledgements survive a daemon restart.
+
 ## Set how long the room keeps messages
 
 A room keeps messages forever until its creator or an admin sets a retention:

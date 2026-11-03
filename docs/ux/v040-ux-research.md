@@ -766,24 +766,165 @@ On this Mac, `open -n '/Applications/Tern 2.app'` failed with LaunchServices
 error -10670; opening the wrapped `Tern.app` failed with “incorrect executable
 format”. The executable is arm64 with an iOS platform load command, not a
 native macOS binary. No conclusion about the failure's deeper cause is
-established. No installed runtime OMP interaction, permission prompt, theme
-preview/apply/revert/persistence, focus, empty/error or reconnect state has
-been observed. Bundle inspection is **not** a hands-on reference pass. A
-working, safe environment for this exact build remains necessary.
+established. These findings concern the original build 77 reference only;
+bundle inspection is **not** a hands-on pass for that wrapper. The operator
+subsequently selected native 0.9.10 as the primary reference and required
+the isolated VM study below; the two builds are not interchangeable.
 
-As separately identified supplemental evidence only, the running native
-`/Applications/Tern.app` reports version/build 0.9.10. Its process path was
-checked independently of the shared bundle identifier. Read-only macOS
-accessibility enumeration returned Settings, Hide Sidebar, Show Files and
-Reveal Active File. AXPress on the returned Settings item succeeded, but a
-subsequent window query showed no Settings or Preferences window. Other menu
-entries had uncertain application attribution; returned labels alone are
-not proof of available functionality. No private pane or session content was
-read or captured, and no settings or session contents were changed.
-Embedded executable strings mention a theme picker, Follow omp, contrast
-correction and tool folding; these are static bundled text, not observed
-controls, working behavior or accessibility evidence. None of these
-supplemental observations establishes anything about the build 77 wrapper.
+The earlier host-side, read-only supplemental observation of
+`/Applications/Tern.app` identified native 0.9.10 by its process path.
+Accessibility returned Settings, Hide Sidebar, Show Files and Reveal Active
+File; pressing Settings did not produce a Settings window. Other menu entries
+had uncertain application attribution. Embedded strings about themes, Follow
+omp, contrast and tool folding are static text, not observed controls or
+working behavior. No private pane or session content was captured.
+
+**Primary installed reference, isolated guest, 2026-11-02:** A copy of only
+native `/Applications/Tern.app` ran at
+`/tmp/tern-0910-vm-study/Tern.app`, version **0.9.10**, bundle build
+**0.9.10**, on macOS **26.6.2 (25G83)** in the pinned
+`vox-v0416-update-f6254de00` VM. Its fresh guest home and XDG and Vox roots
+were isolated; no profiles or credentials were copied. Guest captures and AX
+results are in the v0.4.16 evidence directory as `tern-vm-01-initial.png`,
+`tern-vm-05-gate.png`, `tern-vm-06-settings-attempt.png`,
+`tern-vm-07-pane-attempt.png`, `tern-vm-01-ax.txt`,
+`tern-vm-03-settings-ax.txt`, and `tern-vm-06-settings-result-ax.txt`.
+
+The actual first-run sheet said “Tern is better with omp. Install it?” and
+offered **Not Now** and **Install omp**, explaining that Tern can install and
+update the terminal coding agent. Not Now was chosen at this stage. The
+next screen said “Tern is in closed beta”,
+asks for a Stencil account with beta access, explains browser sign-in, and
+offers **Sign in with Stencil** and **Request access**. Its centered card uses
+a clear title, concise explanation, prominent primary button and subordinate
+access route on a restrained light surface. This is an observed **access
+gate**, not an observed OMP permission request or a product failure.
+
+The enabled Tern menu **Settings…** was pressed and Command-comma attempted;
+the gate remained and no Settings window appeared. Escape and an AX press on
+the underlying Pane menu likewise did not expose a pane; attempting Switch
+session did not dismiss the gate. The AX tree listed Shell block, Terminal,
+Terminal input, Pane menu, Switch session, a home tab, New tab, Files, Split
+right/down, Find, Run a command and Inbox behind the gate. These are exposed
+accessibility elements, **not** proof of visible, usable, or populated
+session/tool presentation while gated.
+
+The operator subsequently signed into Stencil in the guest and installed
+OMP; the guest beta gate was no longer present. The installed executable
+`/Users/admin/.local/bin/omp --version` reported **omp/18.16.0**. In the
+authenticated native 0.9.10 app, Settings opened as a resizable right pane,
+with searchable, AX-labelled category icons. General describes shell, new
+tabs and splits. Appearance displays a grid of named theme swatches, with
+**light** selected, and explains: “Hover a theme to try it on the whole
+window; click to keep it.” It also says “Following omp” and identifies
+titanium for dark and light for light. Hovering **alabaster** visibly changed
+the agent pane and Settings colors while the **light** radio remained selected;
+moving away restored the prior appearance. Clicking alabaster selected it;
+after closing and reopening Settings, it was still selected. After selecting
+alabaster again, normally quitting the copied guest app, and relaunching that
+same copy with the same isolated HOME, XDG and Vox roots, Appearance still
+reported alabaster selected. **Follow omp** then restored the initial
+“Following omp” state. This establishes restart persistence for that theme
+and fixture, not Escape-to-revert behavior. Guest captures
+`tern-vm-theme-baseline.png`, `tern-vm-theme-hover.png`,
+`tern-vm-theme-hover-exit.png`, `tern-vm-before-restart-theme.png`,
+`tern-vm-after-restart-theme.png` and `tern-vm-after-restart-follow.png`,
+and corresponding AX records, capture the states. No measured contrast
+compliance is implied.
+
+The first OMP setup listed providers as “Not configured” before the operator
+completed provider sign-in; that earlier state is no longer a blocker. In a
+new agent tab started in `/tmp/tern-0910-vm-study/research-project`, actual
+OMP 18.16.0 with the displayed **Opus 5.5** model completed four turns. The
+first showed the prompt as a distinct bubble, a **Write notes.txt** tool with
+one visible line, a **Read notes.txt** row and a prose response, followed by
+duration, token and cost information. The second showed a **Bash** command,
+its scratch-directory output and green check plus **Done**, and a failed
+**Read nonexistent.txt** row with a red icon and the actual not-found reason.
+The agent also repeated that failure in prose. The third displayed a longer
+numbered answer with bold leads and inline code. The composer showed the model,
+working-directory breadcrumb and context-use indicator; the tab gained a
+task-derived title. The actual accessible tree included named Write/Bash
+buttons with “done”, a failed Read group, the message field, model switch,
+and the relevant text. An AX press on the earlier single-line Bash row did not
+establish a visible collapse; that did not establish that multiline disclosure
+was unavailable.
+Returning to the scratch agent tab after opening a separate blank tab retained the transcript.
+Screenshots `tern-vm-scratch-omp-start.png`, `tern-vm-scratch-turn.png`,
+`tern-vm-scratch-error.png`, `tern-vm-long-response.png` and
+`tern-vm-tab-return.png`, and matching AX files, are guest evidence.
+
+An additional real turn captured **Working** with elapsed time and a stop
+control, followed by the answer and duration/token/cost metadata
+(`tern-vm-loading.png`, `tern-vm-completed.png`). Command-comma opened
+Settings; successive Tabs moved focus through General, Shell, its shell radio,
+Current directory, Start folder and other visible controls
+(`tern-vm-settings-tabs-ax.txt`). In the agent composer eight Tab and eight
+Shift-Tab presses left AX focus on Terminal input. A denied Write row could be
+focused programmatically, showing a visible outline; Space did not establish
+a disclosure change (`tern-vm-tool-focus-before.png`,
+`tern-vm-tool-focus-space.png`). These attempts alone did not establish a
+keyboard-only route.
+
+In the stricter scratch session, the model created a real 20-line
+`field-notes.txt`, then ran the individually approved `cat field-notes.txt`.
+The Write preview showed “14 more lines · Show all” with **Ctrl-O**; the Bash
+result initially showed “10 earlier lines” and lines 11–20. Pressing Ctrl-O
+displayed all 20 lines and a “Tool output expansion: enabled” toast; pressing
+it again restored the abbreviated result and said expansion was disabled.
+This is an observed keyboard-only global output-expansion toggle, not proof
+that Tab reaches each individual tool row. Guest screenshots
+`tern-vm-multiline-collapsed.png`, `tern-vm-multiline-ctrl-o.png` and
+`tern-vm-multiline-recollapsed.png`, with their AX records, show the sequence.
+
+In a **new** scratch session with OMP's documented per-process
+`--approval-mode=always-ask`, a scratch Read completed without a prompt. A
+scratch Write produced a real **Allow tool: write** panel naming the path and
+content, with **Approve**, **Approve write for this session**, **Deny** and
+Details controls. Two Down arrows selected Deny and Return denied the request.
+The resulting tool row explicitly said “Tool call denied by user: write” and
+the agent reported it had not created the file. These are observations of that
+specific stricter session, not claims about all default approval policy.
+`tern-vm-permission-write.png`, `tern-vm-permission-deny-selected.png`,
+`tern-vm-permission-denied.png` and the corresponding AX files are the evidence.
+
+After normal quit/relaunch the previous Tern tabs did not return automatically;
+a toast said “Ephemeral: No such file or directory (os error 2)”. The cause is
+not established. Starting OMP with `--continue` in the same scratch directory
+restored the recorded scratch transcript (`tern-vm-resume-scratch2.png`);
+this is OMP session recovery, not Tern daemon reconnect. Tern's actual Sessions
+Settings said **“Unavailable: programs here end with this window”** for its
+daemon (`tern-vm-sessions-settings.png`, `tern-vm-sessions-settings-ax.txt`).
+A working session daemon in the isolated fixture is the missing prerequisite
+for observing Tern's daemon detach/reconnect; no cause for its unavailability
+was established. The fixture's displayed socket was absent and its **Start at
+login** checkbox was enabled but off; it was left unchanged. The installed
+`tern help` describes `tern daemon [--socket PATH] [--login]` and says windows
+start it; `tern daemon --help` returned only that usage and exit 2
+(`tern-vm-tern-cli-help.txt`, `tern-vm-daemon-cli-help.txt`,
+`tern-vm-daemon-socket.txt`). First-party
+[architecture](https://docs.stencil.so/tern/concepts/architecture.md) and
+[debugging](https://docs.stencil.so/tern/guides/debugging.md) documentation
+describe daemon-attached versus window-only modes and a separate socket, but
+those are documentation claims, not proof that a daemon started or reconnected
+in this fixture. This is a Tern reference/apparatus limit, not a Vox failure.
+
+Comprehensive focus, selection, accessibility settings and daemon reconnect
+remain outside these observations. The primary study is bounded, not a complete
+examination of every requested state. Scratch turns did not open private
+projects or pre-existing user sessions; the researcher did not copy or inspect
+credentials.
+
+**Guest-observed decision map (0.9.10/build 0.9.10 only):**
+
+| Actual reference observation | Decision, existing Vox consumer and consent | Real-product acceptance |
+|---|---|---|
+| Optional OMP installation sheet explains its effect and provides Not Now. | **Adapt** explicit consequence and refusal language for #1134 / Main's existing onboarding and Session surfaces; **reject** an automatic install or another OMP runner. Keep the operator's computer approval and existing Read/Drive boundaries. | In scratch Vox, keyboard and mouse must expose the explanation and allow refusal without changing trust or installing anything. |
+| Beta gate separates a prominent sign-in action from a secondary access request and names the prerequisite. | **Adapt** concise prerequisite and next-step hierarchy in #1134 / Main's existing onboarding and empty states, without copying beta branding or implying unavailable access is a product error. Never expose account or private Session details. | Exercise actual missing-prerequisite and recovery paths at narrow and ordinary widths, with keyboard and VoiceOver. |
+| Appearance offers labelled swatches, hover preview, pointer-leave restore, a selection and Follow omp; selected alabaster survived an app restart. | **Adapt** clear selected-state and consequence language for #1135 / Main's existing shared-token surfaces; **defer** theme-selector adoption. ADR-028's existing dark-only rules remain authoritative. | Independently check supported Vox surfaces, focus and contrast under #1136; do not generalize one guest's restart result to other installations. |
+| Actual scratch turns distinguish prompt, tool name/file, displayed result, completed Bash, failed Read, Working and completion, with model, directory, context and per-turn metrics; Ctrl-O expanded and recollapsed a 20-line tool result. | **Adapt** compact status plus keyboard-accessible expandable detail on #1134 / Sessions.swift's existing activity and Details, and preserve model/context only where supported. **Reject** another OMP runner and extrapolation from a global toggle to individual row focus. Private tool content remains limited to Drive-authorized members. | Exercise existing Vox Session activity with actual success, failure and long content, keyboard and mouse, and verify the exact Read/Drive admission boundaries. |
+| A stricter scratch OMP session showed the exact Write request, once/session approval and Deny; keyboard denial produced an explicit denied result. | **Adapt** explicit request scope and refusal outcomes where supported by #1134 / SessionDrive; **reject** adding generic approval actions unsupported by Vox's existing OMP adapter or changing computer trust. | Verify real supported Vox refusals and Read/Drive admission without claiming it can approve unsupported OMP actions. |
+| Scratch transcript survived switching tabs and, after app restart, OMP `--continue`; the Tern daemon was unavailable in this fixture. | **Adapt** legible hierarchy and truthful continuity in #1134 / Sessions.swift and SessionPages.swift; **reject inference** that daemon reconnect was verified. | Switch real authorized scratch Sessions, preserve selected identity and older-window position, and separately disconnect/recover before claiming reconnection. |
 
 [Tern's first-party page](https://stencil.so/tern), read and viewed on
 2026-11-02, is a published demonstration, not evidence about this installed
@@ -802,7 +943,7 @@ shortcut, `settings.json` persistence and Follow omp clearing those choices.
 It describes related terminal, chrome, widget and OMP-chat tokens and claims
 legibility adjustments including 4.5:1 secondary text and 3:1 accent. Custom
 CSS can override styling, and mobile themes are local to that device. These
-are documentation claims, not observations or measurements of build 77.
+are documentation claims, not observations or measurements of either installed build.
 The lesson for Vox is to evaluate every shared surface and semantic role
 together; neither the CSS extension mechanism nor a new theme engine is
 approved. The [SDK overview](https://docs.stencil.so/tern/) also explicitly
