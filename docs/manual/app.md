@@ -92,8 +92,9 @@ Progress and the result appear in the status bar; stay in the room to see its fr
 This does not answer Session requests or accept trust offers, so their **@!** or badge may remain.
 Messages received after the captured acknowledgement boundary remain unread until shown or marked.
 
-The room-wide summary separates addressed, new and coordination messages. The sidebar badge counts
-addressed plus new messages; only when those are zero does it count waiting requests and trust
+The room-wide summary separates addressed, new and coordination messages, wrapping at narrow
+widths so the counts remain readable beside **Mark as Read**. The sidebar badge counts addressed
+plus new messages; only when those are zero does it count waiting requests and trust
 offers. **About unread and history** explains the difference and flags a count limited to the
 newest 1,000 rows. To read earlier content, scroll up or use **History > Load older history**:
 cached messages first, then an explicit peer-history request when needed. **End** returns to the

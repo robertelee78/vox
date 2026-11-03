@@ -1044,7 +1044,7 @@ private struct RoomUnreadBar: View {
             HStack(alignment: .firstTextBaseline, spacing: Space.s8) {
                 Text("Room-wide: \(room.addressed) addressed · \(room.new) new · \(room.coordination) coordination")
                     .secondaryText()
-                    .lineLimit(1).truncationMode(.middle)
+                    .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .layoutPriority(-1)
                     .help("Room-wide: \(room.addressed) addressed · \(room.new) new · \(room.coordination) coordination")
