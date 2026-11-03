@@ -1270,8 +1270,9 @@ impl Management {
                 .cloned();
             if let Some(review) = review {
                 self.computer.change(|s| {
-                    if !s.cancelled.contains_key(&id) {
-                        s.cancelled.insert(id, review.intent);
+                    if let std::collections::btree_map::Entry::Vacant(entry) = s.cancelled.entry(id)
+                    {
+                        entry.insert(review.intent);
                         s.advance_journal()?;
                     }
                     Ok(())
@@ -5016,10 +5017,10 @@ fn check_enrollment_authority(s: &State, g: &Enrollment) -> Result<()> {
     let sponsor = g.computers[0].fingerprint()?;
     if !authority.complete
         || authority.quarantined.contains(&sponsor)
-        || !authority
+        || authority
             .members
             .get(&g.grants[0])
-            .is_some_and(|grant| grant.computer.fingerprint().ok() == Some(sponsor))
+            .is_none_or(|grant| grant.computer.fingerprint().ok() != Some(sponsor))
     {
         return Err(Error::Profile(
             "the sponsor's group authority is removed or suspended",

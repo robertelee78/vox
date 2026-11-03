@@ -458,7 +458,13 @@ impl Router {
                     .is_some_and(|held| held.inflight.is_none())
                 {
                     start_session_hold(
-                        self, &mut holds, &key, handle, generation, None, None, None, permit,
+                        self,
+                        &mut holds,
+                        &key,
+                        (handle, generation, None),
+                        None,
+                        None,
+                        permit,
                     );
                 }
                 holds
@@ -538,8 +544,7 @@ impl Router {
                                                 &session,
                                                 room,
                                                 bodies,
-                                                effects,
-                                                lifecycle,
+                                                (effects, lifecycle),
                                                 (expected.as_deref(), &mut fresh),
                                             )
                                             .await;
@@ -3222,11 +3227,14 @@ impl Router {
         session: &str,
         room: Digest32,
         bodies: Vec<String>,
-        effects: Option<crate::session_sink::SourceEffects>,
-        lifecycle: Option<tokio::sync::OwnedMutexGuard<()>>,
+        source: (
+            Option<crate::session_sink::SourceEffects>,
+            Option<tokio::sync::OwnedMutexGuard<()>>,
+        ),
         fence: (Option<&crate::wake::Session>, &mut bool),
     ) -> vox_core::node::daemonipc::SessionAdmission {
         let (expected, fresh) = fence;
+        let (effects, lifecycle) = source;
         use vox_core::node::{
             daemonipc::SessionAdmission,
             session_ingress::{MAX_BATCH_BYTES, MAX_BATCH_ITEMS},
@@ -3309,9 +3317,7 @@ impl Router {
             self,
             &mut held,
             &key,
-            handle,
-            generation,
-            expected.cloned(),
+            (handle, generation, expected.cloned()),
             Some(count),
             Some(reply),
             permit,
@@ -3465,7 +3471,13 @@ impl Router {
                             break;
                         };
                         start_session_hold(
-                            &router, &mut holds, &key, handle, generation, None, None, None, permit,
+                            &router,
+                            &mut holds,
+                            &key,
+                            (handle, generation, None),
+                            None,
+                            None,
+                            permit,
                         );
                     }
                     for future in holds.ready.drain(..) {
@@ -5208,15 +5220,14 @@ fn start_session_hold(
     router: &Router,
     holds: &mut SessionHolds,
     key: &SessionKey,
-    handle: NodeHandle,
-    generation: u64,
-    expected: Option<crate::wake::Session>,
+    target: (NodeHandle, u64, Option<crate::wake::Session>),
     direct_count: Option<usize>,
     waiter: Option<
         tokio::sync::oneshot::Sender<(vox_core::node::daemonipc::SessionAdmission, bool)>,
     >,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> bool {
+    let (handle, generation, expected) = target;
     use vox_core::node::actor::SessionBatchEnqueueError;
     let Some(held) = holds.sessions.get_mut(key) else {
         return false;
@@ -5648,12 +5659,12 @@ impl SessionHolds {
                 .as_ref()
                 .map_or(0, crate::session_sink::SourceEffects::charge);
         if let Some(held) = self.sessions.get(&key) {
-            if held.inflight.is_some() {
-                if held.bytes + added > HELD_BYTES || held.items.len() + bodies.len() > HELD_ITEMS {
-                    return SessionAdmission::Refused(
-                        "a physical Session admission protects the earlier prefix; this batch was not retained".into(),
-                    );
-                }
+            if held.inflight.is_some()
+                && (held.bytes + added > HELD_BYTES || held.items.len() + bodies.len() > HELD_ITEMS)
+            {
+                return SessionAdmission::Refused(
+                    "a physical Session admission protects the earlier prefix; this batch was not retained".into(),
+                );
             }
         }
         let prior = self.sessions.get(&key).map_or(0, |s| s.bytes);
