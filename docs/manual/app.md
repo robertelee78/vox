@@ -349,6 +349,11 @@ In **Vox > Settings…**, Tab and Shift-Tab move through the controls and scroll
 control into view. Changing conversation size keeps the Settings window's focus and open sheets;
 the picker also follows changes made through the View menu.
 
+In **My Computers**, Tab and Shift-Tab also reveal controls that are outside the scroll viewport.
+Background status checks keep the controls available. If a status check is still running when you
+choose an action, that action waits for the check; you do not need to choose it again. While your
+action is pending, the changing controls are disabled until it finishes.
+
 ### Network settings
 
 **Settings › Network** lists manual anchors and each saved room's own sources, with reach from

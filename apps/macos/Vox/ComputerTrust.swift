@@ -11,28 +11,34 @@ private final class ComputerTrustModel: ObservableObject {
     @Published private(set) var problem: String?
     @Published private(set) var actionProblem: String?
     private var client: VoxClient?
+    private var working = false
     /// One operator action may wait behind the active refresh; refreshes never queue.
     private var waitingOperator: CheckedContinuation<Void, Never>?
 
     func perform(refreshing: Bool = false, _ request: (VoxClient) async throws -> ComputerStatus) async {
-        if busy {
+        if working {
             if refreshing { return }
             guard waitingOperator == nil else {
                 actionProblem = "Another computer change is already waiting. Try again when it finishes."
                 return
             }
-            await withCheckedContinuation { waitingOperator = $0 }
-            // The prior operation keeps busy set while handing ownership directly to us.
-        } else {
             busy = true
+            await withCheckedContinuation { waitingOperator = $0 }
+            // The prior operation keeps ownership while handing it directly to us.
+        } else {
+            working = true
         }
-        if !refreshing { actionProblem = nil }
+        if !refreshing {
+            busy = true
+            actionProblem = nil
+        }
         defer {
             if let next = waitingOperator {
                 waitingOperator = nil
                 next.resume()
             } else {
-                busy = false
+                working = false
+                if busy { busy = false }
             }
         }
         do {
@@ -60,6 +66,14 @@ private final class ComputerTrustModel: ObservableObject {
     }
 }
 
+private enum ComputerTrustFocus: Hashable {
+    case policyDetails, computerDetails(String), remove(String), exchangeDetails(String)
+    case managementDetails, transfer(String), binding(String), retirement
+    case conflictCloseCommand, conflictFreshCommand, replace, closeConflict, conflictInput, reviewConflict
+    case otherApproval, approve, thisApproval, copyCode, copyCommand, begin, input, preview
+    case handoffClose, handoffInvite, cancel
+}
+
 struct ComputerTrustView: View {
     @Environment(\.dismiss) private var dismiss
     @StateObject private var model = ComputerTrustModel()
@@ -70,6 +84,7 @@ struct ComputerTrustView: View {
     @State private var replacement: ComputerGroupConflict?
     @State private var handoff: ComputerGroupConflict?
     @State private var retirement: ComputerGroupRetirement?
+    @FocusState private var focused: ComputerTrustFocus?
 
     private struct BindingChoice {
         let binding: ComputerBindingAction
@@ -96,141 +111,165 @@ struct ComputerTrustView: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .accessibilityIdentifier("computer-connection-problem")
             }
-            ScrollView {
-                VStack(alignment: .leading, spacing: Space.s16) {
-                    if let status = model.status {
-                        identity(status.thisComputer, title: "This computer")
-                        Text("Computer trust covers this Vox installation and its nodes.")
-                            .secondaryText()
-                        Text(status.policy)
-                            .fixedSize(horizontal: false, vertical: true)
-                            .accessibilityIdentifier("computer-trust-policy")
-                        DisclosureGroup("Identity and policy details") {
-                            Text("Policy revision \(status.revision)")
-                                .font(Theme.mono).secondaryText()
-                                .accessibilityIdentifier("computer-policy-revision")
-                        }
-                        if !model.reachable {
-                            Text("Last known state. Checking with Vox…").secondaryText()
-                        }
-                        if let problem = status.problem {
-                            StateMark(kind: .danger, words: problem)
-                                .accessibilityIdentifier("computer-pairing-problem")
-                        }
-                        ForEach(status.topology, id: \.self) { line in
-                            Text(line).fixedSize(horizontal: false, vertical: true)
-                        }
-                        pairing(status)
-                        if !status.pendingNodes.isEmpty {
-                            Text("Waiting for these nodes to become Ready or apply computer trust:")
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: Space.s16) {
+                        if let status = model.status {
+                            identity(status.thisComputer, title: "This computer")
+                            Text("Computer trust covers this Vox installation and its nodes.")
                                 .secondaryText()
-                            Text(status.pendingNodes.joined(separator: ", "))
-                                .textSelection(.enabled)
-                                .accessibilityIdentifier("computer-pending-nodes")
-                        }
-                        if !status.computers.isEmpty {
-                            Divider()
-                            Text("Enrolled computers").eyebrow()
-                            ForEach(status.applications, id: \.computer.fingerprint) { application in
-                                VStack(alignment: .leading, spacing: Space.s4) {
-                                    Text(application.computer.name).font(.headline)
-                                    DisclosureGroup("Identity and node details") {
-                                        identity(application.computer, title: application.computer.name)
-                                        ForEach(status.nodes.filter { $0.computer == application.computer.fingerprint }, id: \.fingerprint) { node in
-                                            VStack(alignment: .leading, spacing: Space.s4) {
-                                                Text(node.name).font(.headline)
-                                                Text(node.fingerprint).font(Theme.mono).textSelection(.enabled)
-                                                    .fixedSize(horizontal: false, vertical: true)
-                                                Text(node.personal ? "Personal node · can drive non-personal nodes" : "Managed node · read access")
-                                                    .secondaryText()
-                                                if let revision = node.bindingRevision, let derived = node.bindingDerivedMs {
-                                                    Text("Binding derived at policy revision \(revision) · Unix ms \(derived)")
-                                                        .font(Theme.mono).secondaryText()
-                                                        .accessibilityIdentifier("computer-binding-evidence-" + node.fingerprint)
+                            Text(status.policy)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .accessibilityIdentifier("computer-trust-policy")
+                            DisclosureGroup("Identity and policy details") {
+                                Text("Policy revision \(status.revision)")
+                                    .font(Theme.mono).secondaryText()
+                                    .accessibilityIdentifier("computer-policy-revision")
+                            }
+                            .focused($focused, equals: .policyDetails)
+                            .id(ComputerTrustFocus.policyDetails)
+                            if !model.reachable {
+                                Text("Last known state. Checking with Vox…").secondaryText()
+                            }
+                            if let problem = status.problem {
+                                StateMark(kind: .danger, words: problem)
+                                    .accessibilityIdentifier("computer-pairing-problem")
+                            }
+                            ForEach(status.topology, id: \.self) { line in
+                                Text(line).fixedSize(horizontal: false, vertical: true)
+                            }
+                            VStack(alignment: .leading, spacing: Space.s16) {
+                                pairing(status)
+                            }
+                            .focusSection()
+                            if !status.pendingNodes.isEmpty {
+                                Text("Waiting for these nodes to become Ready or apply computer trust:")
+                                    .secondaryText()
+                                Text(status.pendingNodes.joined(separator: ", "))
+                                    .textSelection(.enabled)
+                                    .accessibilityIdentifier("computer-pending-nodes")
+                            }
+                            if !status.computers.isEmpty {
+                                Divider()
+                                Text("Enrolled computers").eyebrow()
+                                ForEach(status.applications, id: \.computer.fingerprint) { application in
+                                    VStack(alignment: .leading, spacing: Space.s4) {
+                                        Text(application.computer.name).font(.headline)
+                                        DisclosureGroup("Identity and node details") {
+                                            identity(application.computer, title: application.computer.name)
+                                            ForEach(status.nodes.filter { $0.computer == application.computer.fingerprint }, id: \.fingerprint) { node in
+                                                VStack(alignment: .leading, spacing: Space.s4) {
+                                                    Text(node.name).font(.headline)
+                                                    Text(node.fingerprint).font(Theme.mono).textSelection(.enabled)
+                                                        .fixedSize(horizontal: false, vertical: true)
+                                                    Text(node.personal ? "Personal node · can drive non-personal nodes" : "Managed node · read access")
+                                                        .secondaryText()
+                                                    if let revision = node.bindingRevision, let derived = node.bindingDerivedMs {
+                                                        Text("Binding derived at policy revision \(revision) · Unix ms \(derived)")
+                                                            .font(Theme.mono).secondaryText()
+                                                            .accessibilityIdentifier("computer-binding-evidence-" + node.fingerprint)
+                                                    }
                                                 }
                                             }
                                         }
-                                    }
-                                    Button(application.computer.fingerprint == status.thisComputer.fingerprint
-                                           ? "Remove This Computer" : "Remove Computer") {
-                                        removal = RemovalChoice(computer: application.computer, frontier: status.frontier,
-                                            nodes: status.nodes.filter { $0.computer == application.computer.fingerprint })
-                                    }
-                                    .disabled(model.busy || !model.reachable || status.state == "removed" || status.state == "quarantined")
-                                    .accessibilityIdentifier("computer-remove-" + application.computer.fingerprint)
-                                    Text(applicationState(application, status: status))
-                                        .secondaryText()
-                                        .accessibilityIdentifier("computer-application-" + application.computer.fingerprint)
-                                    Text(application.computer.fingerprint == status.thisComputer.fingerprint
-                                         ? "Connectivity: this computer"
-                                         : application.exchangeInFlight
-                                         ? "Connectivity: exchange in progress; current reachability unknown"
-                                         : application.exchangeFailures > 0
-                                         ? "Connectivity: last exchange failed; current reachability unknown"
-                                         : "Connectivity: current reachability unknown")
-                                        .secondaryText()
-                                    DisclosureGroup("Exchange diagnostics") {
-                                    Text("Exchanged \(application.exchanges) time(s) in \(application.exchangeAttempts) attempt(s) · \(application.exchangeFailures) failed in a row")
-                                        .font(Theme.mono).secondaryText()
-                                        .accessibilityIdentifier("computer-exchange-counts-" + application.computer.fingerprint)
-                                    Text(convergenceEvidence(application))
-                                        .font(Theme.mono).secondaryText()
-                                        .accessibilityIdentifier("computer-convergence-" + application.computer.fingerprint)
-                                    if let exchange = application.lastStartedExchange {
-                                        Text("Last started exchange: sent revision \(exchange.sentRevision), merged revision \(exchange.mergedRevision), Unix ms \(exchange.atMs)")
+                                        .focused($focused, equals: .computerDetails(application.computer.fingerprint))
+                                        .id(ComputerTrustFocus.computerDetails(application.computer.fingerprint))
+                                        Button(application.computer.fingerprint == status.thisComputer.fingerprint
+                                               ? "Remove This Computer" : "Remove Computer") {
+                                            removal = RemovalChoice(computer: application.computer, frontier: status.frontier,
+                                                nodes: status.nodes.filter { $0.computer == application.computer.fingerprint })
+                                        }
+                                        .disabled(model.busy || !model.reachable || status.state == "removed" || status.state == "quarantined")
+                                        .accessibilityIdentifier("computer-remove-" + application.computer.fingerprint)
+                                        .focused($focused, equals: .remove(application.computer.fingerprint))
+                                        .id(ComputerTrustFocus.remove(application.computer.fingerprint))
+                                        Text(applicationState(application, status: status))
+                                            .secondaryText()
+                                            .accessibilityIdentifier("computer-application-" + application.computer.fingerprint)
+                                        Text(application.computer.fingerprint == status.thisComputer.fingerprint
+                                             ? "Connectivity: this computer"
+                                             : application.exchangeInFlight
+                                             ? "Connectivity: exchange in progress; current reachability unknown"
+                                             : application.exchangeFailures > 0
+                                             ? "Connectivity: last exchange failed; current reachability unknown"
+                                             : "Connectivity: current reachability unknown")
+                                            .secondaryText()
+                                        DisclosureGroup("Exchange diagnostics") {
+                                        Text("Exchanged \(application.exchanges) time(s) in \(application.exchangeAttempts) attempt(s) · \(application.exchangeFailures) failed in a row")
                                             .font(Theme.mono).secondaryText()
-                                    }
-                                    if let exchange = application.lastAnsweredExchange {
-                                        Text("Last answered exchange: sent revision \(exchange.sentRevision), merged revision \(exchange.mergedRevision), Unix ms \(exchange.atMs)")
+                                            .accessibilityIdentifier("computer-exchange-counts-" + application.computer.fingerprint)
+                                        Text(convergenceEvidence(application))
                                             .font(Theme.mono).secondaryText()
+                                            .accessibilityIdentifier("computer-convergence-" + application.computer.fingerprint)
+                                        if let exchange = application.lastStartedExchange {
+                                            Text("Last started exchange: sent revision \(exchange.sentRevision), merged revision \(exchange.mergedRevision), Unix ms \(exchange.atMs)")
+                                                .font(Theme.mono).secondaryText()
+                                        }
+                                        if let exchange = application.lastAnsweredExchange {
+                                            Text("Last answered exchange: sent revision \(exchange.sentRevision), merged revision \(exchange.mergedRevision), Unix ms \(exchange.atMs)")
+                                                .font(Theme.mono).secondaryText()
+                                        }
+                                        }
+                                        .focused($focused, equals: .exchangeDetails(application.computer.fingerprint))
+                                        .id(ComputerTrustFocus.exchangeDetails(application.computer.fingerprint))
                                     }
-                                    }
+                                    .focusSection()
                                 }
                             }
-                        }
-                        if !status.bindingActions.isEmpty {
-                            Divider()
-                            DisclosureGroup("Optional node management") {
-                            ForEach(status.bindingActions, id: \.node) { binding in
-                                VStack(alignment: .leading, spacing: Space.s4) {
-                                    Text(binding.name).font(.headline)
-                                    Text(binding.node).font(Theme.mono).textSelection(.enabled)
-                                    Text("Manager: " + binding.computer).font(Theme.mono).secondaryText()
-                                    if binding.action == "release" {
-                                        Menu("Transfer Node To…") {
-                                            ForEach(status.computers.filter { $0.fingerprint != status.thisComputer.fingerprint }, id: \.fingerprint) { destination in
-                                                Button(destination.name + " · " + destination.fingerprint) {
-                                                    bindingChoice = BindingChoice(binding: binding, destination: destination.fingerprint, frontier: status.frontier)
+                            if !status.bindingActions.isEmpty {
+                                Divider()
+                                DisclosureGroup("Optional node management") {
+                                ForEach(status.bindingActions, id: \.node) { binding in
+                                    VStack(alignment: .leading, spacing: Space.s4) {
+                                        Text(binding.name).font(.headline)
+                                        Text(binding.node).font(Theme.mono).textSelection(.enabled)
+                                        Text("Manager: " + binding.computer).font(Theme.mono).secondaryText()
+                                        if binding.action == "release" {
+                                            Menu("Transfer Node To…") {
+                                                ForEach(status.computers.filter { $0.fingerprint != status.thisComputer.fingerprint }, id: \.fingerprint) { destination in
+                                                    Button(destination.name + " · " + destination.fingerprint) {
+                                                        bindingChoice = BindingChoice(binding: binding, destination: destination.fingerprint, frontier: status.frontier)
+                                                    }
                                                 }
                                             }
+                                            .disabled(model.busy || !model.reachable)
+                                            .focused($focused, equals: .transfer(binding.node))
+                                            .id(ComputerTrustFocus.transfer(binding.node))
+                                        } else {
+                                            Button(binding.action == "transfer" ? "Accept Transfer Here" : "Recover Node Here") {
+                                                bindingChoice = BindingChoice(binding: binding, destination: "", frontier: status.frontier)
+                                            }
+                                            .disabled(model.busy || !model.reachable)
+                                            .focused($focused, equals: .binding(binding.node))
+                                            .id(ComputerTrustFocus.binding(binding.node))
                                         }
-                                        .disabled(model.busy || !model.reachable)
-                                    } else {
-                                        Button(binding.action == "transfer" ? "Accept Transfer Here" : "Recover Node Here") {
-                                            bindingChoice = BindingChoice(binding: binding, destination: "", frontier: status.frontier)
-                                        }
-                                        .disabled(model.busy || !model.reachable)
                                     }
                                 }
+                                Text("A transfer needs a signed release from its previous manager. Recovery needs retained removal or fault evidence. After approving here, unlock the node's local vault normally to sign its new binding. A copied name or fingerprint is never proof of management.")
+                                    .secondaryText()
+                                }
+                                .focused($focused, equals: .managementDetails)
+                                .id(ComputerTrustFocus.managementDetails)
                             }
-                            Text("A transfer needs a signed release from its previous manager. Recovery needs retained removal or fault evidence. After approving here, unlock the node's local vault normally to sign its new binding. A copied name or fingerprint is never proof of management.")
-                                .secondaryText()
+                            if !status.removed.isEmpty {
+                                Divider()
+                                Text("Removed computers").eyebrow()
+                                ForEach(status.removed, id: \.fingerprint) { computer in
+                                    identity(computer, title: computer.name)
+                                }
+                                Text("Removal stops new read and drive access when each remaining computer applies it. Unreachable computers remain pending; already received data is not erased. Rejoining requires a new approval. You can deliberately trust an individual node afterward.")
+                                    .secondaryText()
                             }
+                        } else if model.problem == nil {
+                            ProgressView("Reading computer trust…")
                         }
-                        if !status.removed.isEmpty {
-                            Divider()
-                            Text("Removed computers").eyebrow()
-                            ForEach(status.removed, id: \.fingerprint) { computer in
-                                identity(computer, title: computer.name)
-                            }
-                            Text("Removal stops new read and drive access when each remaining computer applies it. Unreachable computers remain pending; already received data is not erased. Rejoining requires a new approval. You can deliberately trust an individual node afterward.")
-                                .secondaryText()
-                        }
-                    } else if model.busy {
-                        ProgressView("Reading computer trust…")
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .focusSection()
+                .onChange(of: focused) { target in
+                    if let target { proxy.scrollTo(target) }
+                }
             }
             HStack {
                 Button("Refresh") { Task { await model.refresh() } }
@@ -242,6 +281,7 @@ struct ComputerTrustView: View {
                     .keyboardShortcut(.cancelAction)
                     .accessibilityIdentifier("computer-done")
             }
+            .focusSection()
         }
         .padding(Space.s24)
         .frame(width: Theme.scaled(600), height: Theme.scaled(600))
@@ -337,6 +377,8 @@ struct ComputerTrustView: View {
             Button("Review Local Retirement…") { retirement = review }
                 .disabled(model.busy || !model.reachable)
                 .accessibilityIdentifier("computer-retirement-review")
+                .focused($focused, equals: .retirement)
+                .id(ComputerTrustFocus.retirement)
         } else if let conflict = status.conflict, status.state != "quarantined" {
             Divider()
             identity(conflict.peer, title: "Authenticated computer in a different group")
@@ -356,25 +398,35 @@ struct ComputerTrustView: View {
                     copy(shellCommand(words: ["vox", "computer", "cancel", conflict.operationId]),
                          said: "Close command copied for \(conflict.peer.name).")
                 }
+                .focused($focused, equals: .conflictCloseCommand)
+                .id(ComputerTrustFocus.conflictCloseCommand)
                 Button("Copy Fresh Invitation Command") {
                     copy(shellCommand(words: ["vox", "computer", "invite"]), said: "Invitation command copied.")
                 }
+                .focused($focused, equals: .conflictFreshCommand)
+                .id(ComputerTrustFocus.conflictFreshCommand)
             }
             Button("Review Group Replacement…") { replacement = conflict }
                 .disabled(model.busy || !model.reachable || expired(conflict.expiresMs))
                 .accessibilityIdentifier("computer-replace-group")
+                .focused($focused, equals: .replace)
+                .id(ComputerTrustFocus.replace)
             Button("Keep Current Group and Close This Review") {
                 let operation = conflict.operationId
                 Task { await model.perform { try await $0.cancelComputerPairing(operationId: operation) } }
             }
             .disabled(model.busy || !model.reachable)
             .accessibilityIdentifier("computer-conflict-close")
+            .focused($focused, equals: .closeConflict)
+            .id(ComputerTrustFocus.closeConflict)
             Text("This closes the review only on this computer. It cannot withdraw an invitation or signature recorded on \(conflict.peer.name).")
                 .secondaryText()
             TextField("Pairing code to review again", text: $link)
                 .textFieldStyle(.roundedBorder)
                 .privacySensitive()
                 .accessibilityIdentifier("computer-conflict-input")
+                .focused($focused, equals: .conflictInput)
+                .id(ComputerTrustFocus.conflictInput)
             Button("Review Code Again") {
                 let code = link.trimmingCharacters(in: .whitespacesAndNewlines)
                 link = ""
@@ -382,6 +434,8 @@ struct ComputerTrustView: View {
             }
             .disabled(model.busy || !model.reachable || link.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             .accessibilityIdentifier("computer-conflict-review-again")
+            .focused($focused, equals: .reviewConflict)
+            .id(ComputerTrustFocus.reviewConflict)
         } else if let preview = status.pairing, status.state != "quarantined" {
             Divider()
             identity(preview.peer, title: "Computer to add")
@@ -414,6 +468,8 @@ struct ComputerTrustView: View {
                         copy(shellCommand(words: ["vox", "computer", "approve", preview.operationId]),
                              said: "Approval command copied for \(preview.peer.name).")
                     }
+                    .focused($focused, equals: .otherApproval)
+                    .id(ComputerTrustFocus.otherApproval)
                 }
             } else {
                 Text("Confirm this computer and the permissions above.")
@@ -426,10 +482,14 @@ struct ComputerTrustView: View {
                 .buttonStyle(.voxPrimary)
                 .disabled(model.busy || !model.reachable || expired(preview.expiresMs))
                 .accessibilityIdentifier("computer-pairing-approve")
+                .focused($focused, equals: .approve)
+                .id(ComputerTrustFocus.approve)
                 Button("Copy This Computer's Approval Command") {
                     copy(shellCommand(words: ["vox", "computer", "approve", preview.operationId]),
                          said: "Approval command copied for this computer.")
                 }
+                .focused($focused, equals: .thisApproval)
+                .id(ComputerTrustFocus.thisApproval)
             }
         } else if let invitation = status.inviteLink, status.state != "quarantined" {
             Divider()
@@ -440,10 +500,14 @@ struct ComputerTrustView: View {
             HStack {
                 Button("Copy Pairing Code") { copy(invitation, said: "Pairing code copied.") }
                     .accessibilityIdentifier("computer-copy-code")
+                    .focused($focused, equals: .copyCode)
+                    .id(ComputerTrustFocus.copyCode)
                 Button("Copy Terminal Command") {
                     copy(shellCommand(words: ["vox", "computer", "pair", invitation]), said: "Terminal command copied.")
                 }
                 .accessibilityIdentifier("computer-copy-command")
+                .focused($focused, equals: .copyCommand)
+                .id(ComputerTrustFocus.copyCommand)
             }
             Text("For a computer without the app, paste the terminal command into its own terminal.")
                 .secondaryText()
@@ -466,11 +530,15 @@ struct ComputerTrustView: View {
             .disabled(model.busy || !model.reachable)
             .disabled(status.state == "removed")
             .accessibilityIdentifier("computer-pairing-begin")
+            .focused($focused, equals: .begin)
+            .id(ComputerTrustFocus.begin)
             Text("Or use a code from your other computer").eyebrow()
             TextField("Pairing code", text: $link)
                 .textFieldStyle(.roundedBorder)
                 .privacySensitive()
                 .accessibilityIdentifier("computer-pairing-input")
+                .focused($focused, equals: .input)
+                .id(ComputerTrustFocus.input)
             Button("Review Computer") {
                 let code = link.trimmingCharacters(in: .whitespacesAndNewlines)
                 link = ""
@@ -478,6 +546,8 @@ struct ComputerTrustView: View {
             }
             .disabled(model.busy || !model.reachable || link.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             .accessibilityIdentifier("computer-pairing-preview")
+            .focused($focused, equals: .preview)
+            .id(ComputerTrustFocus.preview)
         }
         if let handoff, status.state == "individual" {
             Text("On \(handoff.peer.name), \(handoff.inviterApproved && !expired(handoff.expiresMs) ? "wait until the signed proposal expires, then " : "")close the old proposal and create a fresh invitation. If it was signed after review, wait for expiry before closing. Bring the fresh invitation here and approve on both computers. Closing cannot withdraw a signature already recorded elsewhere.")
@@ -485,9 +555,13 @@ struct ComputerTrustView: View {
             Button("Copy Command to Close Old Proposal") {
                 copy(shellCommand(words: ["vox", "computer", "cancel", handoff.operationId]), said: "Close command copied for \(handoff.peer.name).")
             }
+            .focused($focused, equals: .handoffClose)
+            .id(ComputerTrustFocus.handoffClose)
             Button("Copy Command to Create Fresh Invitation") {
                 copy(shellCommand(words: ["vox", "computer", "invite"]), said: "Invitation command copied for \(handoff.peer.name).")
             }
+            .focused($focused, equals: .handoffInvite)
+            .id(ComputerTrustFocus.handoffInvite)
         }
         let approvedHere = status.pairing?.approvedHere == true
         let closeExpired = approvedHere && status.pairing?.approvedThere != true
@@ -499,6 +573,8 @@ struct ComputerTrustView: View {
             }
             .disabled(model.busy || !model.reachable)
             .accessibilityIdentifier("computer-pairing-cancel")
+            .focused($focused, equals: .cancel)
+            .id(ComputerTrustFocus.cancel)
             Text(closeExpired
                  ? "Closing this attempt lets you start a new pairing here. It cannot withdraw the approval already sent to the other computer."
                  : "Closing this window leaves the pairing pending. Cancel Pairing cancels this unused code.")
