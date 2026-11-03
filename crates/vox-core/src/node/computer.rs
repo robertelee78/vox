@@ -1645,11 +1645,13 @@ impl State {
                     .any(|interval| interval.grants.contains(grant))
             })
         });
-        let policy_changed = first_activation
+        let folded = first_activation
             || self.members != next.members
             || self.rosters != next.rosters
             || self.quarantined != next.quarantined;
-        if policy_changed || self.reaches != next.reaches {
+        // Pending rosters authenticate pairing, but do not change the active operator policy.
+        let policy_changed = self.genesis.is_some() && folded;
+        if folded || self.reaches != next.reaches {
             let revision = self.revision.checked_add(1).ok_or_else(bad)?;
             if self.genesis.is_some() {
                 let mut active: BTreeMap<Digest32, BTreeSet<Digest32>> = BTreeMap::new();
@@ -2733,6 +2735,7 @@ impl Computer {
                     && s.policy_revision == applied
                     && Self::revision_expired(&s) == expired)
                     && if Self::revision_expired(&s)
+                        || s.genesis.is_none()
                         || s.grant(&self.signer.fingerprint()).is_none()
                     {
                         // Expiry revokes the missed revision's managed grants; it does not make the
@@ -3548,7 +3551,7 @@ impl Computer {
         revision: u64,
         expired: bool,
     ) -> bool {
-        (state.genesis.is_none() && state.intervals.is_empty())
+        state.genesis.is_none()
             || expired
             || state.grant(&self.signer.fingerprint()).is_none()
             || state
@@ -4401,7 +4404,10 @@ impl Computer {
             || Self::revision_expired(held) != Self::revision_expired(next)
             || held.genesis.is_some() != next.genesis.is_some()
             || held.intervals.is_empty() != next.intervals.is_empty()
-            || held.grant(&self.signer.fingerprint()) != next.grant(&self.signer.fingerprint())
+            || ((held.genesis.is_some() || next.genesis.is_some()) && {
+                let local = self.signer.fingerprint();
+                held.grant(&local) != next.grant(&local)
+            })
             || held.applied != next.applied
             || held.prepared != next.prepared
             || held.derived != next.derived
@@ -4432,6 +4438,7 @@ impl Computer {
                         && applied == state.policy_revision
                         && Self::revision_expired(&state) == expired
                         && if Self::revision_expired(&state)
+                            || state.genesis.is_none()
                             || state.grant(&self.signer.fingerprint()).is_none()
                         {
                             Self::application_settled_in(&state, &node, applied)

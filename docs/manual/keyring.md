@@ -246,8 +246,9 @@ the identified existing group. Check the entire group identifier when joining an
 Authentication of the code and peer permits this review; it does not grant permission or approve
 enrollment. Explicitly approve the same operation on each computer. Each surface names which
 computer must act next; approval on one side never substitutes for the other. `--preview`
-shows the proposal without approving it. Pairing grants no room membership; join the same
-room and verify a message both ways.
+shows the proposal without approving it. Until computer trust is established, reviewing a code
+preserves individual node trust, including choices made after retiring an old group. Pairing grants
+no room membership; join the same room and verify a message both ways.
 
 If the daemon restarts after the authenticated invitation is claimed but before the proposal
 is recorded, the same computer can authenticate again; another computer cannot take over that
