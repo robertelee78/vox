@@ -2721,11 +2721,11 @@ impl Management {
             let s = lock(&self.computer.state);
             let local_group = validate_offer(&s, &local_offer)?;
             let expected = if remote_group.is_some() {
-                [peer.clone(), self.computer.description()]
+                [peer.clone(), s.description.clone()]
             } else if local_group.is_some() {
-                [self.computer.description(), peer.clone()]
+                [s.description.clone(), peer.clone()]
             } else {
-                [peer.clone(), self.computer.description()]
+                [peer.clone(), s.description.clone()]
             };
             if g.computers != expected {
                 return Err(Error::SignatureInvalid);
@@ -2747,9 +2747,7 @@ impl Management {
                 {
                     return Err(Error::SignatureInvalid);
                 }
-            } else if g.group.is_some()
-                || g.computers != [peer.clone(), self.computer.description()]
-            {
+            } else if g.group.is_some() || g.computers != [peer.clone(), s.description.clone()] {
                 return Err(Error::SignatureInvalid);
             }
         }

@@ -164,9 +164,17 @@ func rowSays(_ sentence: String) -> NSPredicate {
 /// What an element says to VoiceOver: its label, else its value (a Text's words), else its title
 /// (a menu button's).
 func shown(_ element: XCUIElement) -> String {
-    if !element.label.isEmpty { return element.label }
+    let label = element.label
+    if !label.isEmpty { return label }
     if let value = element.value as? String, !value.isEmpty { return value }
     // A menu button's words are its title.
+    return element.title
+}
+
+/// Read a resolved snapshot without re-querying an element that may have disappeared.
+func snapshotShown(_ element: XCUIElementSnapshot) -> String {
+    if !element.label.isEmpty { return element.label }
+    if let value = element.value as? String, !value.isEmpty { return value }
     return element.title
 }
 
@@ -286,6 +294,8 @@ final class FirstRunProof: XCTestCase {
     private var daemon: Started?
     /// Dora's daemon, a peer whose clock is behind (step 3d): apparatus, stopped with the case.
     private var peer: Started?
+    /// Erin and Fay are unpaired remote members, never eligible for alice's local trust rule.
+    private var trustPeer: Started?
     /// Runs what the runner's sandbox forbids: every `vox`, the files, the echo services.
     private var stager: Stager!
     /// When another app took the foreground from a running Vox, and which: a display change or a
@@ -357,6 +367,7 @@ final class FirstRunProof: XCTestCase {
         if let watchingForeground { NSWorkspace.shared.notificationCenter.removeObserver(watchingForeground) }
         if let watchingVox { NSWorkspace.shared.notificationCenter.removeObserver(watchingVox) }
         peer?.terminate()
+        trustPeer?.terminate()
         daemon?.terminate()
         // The person's clipboard back, exactly as it was.
         let board = NSPasteboard.general
@@ -5362,43 +5373,86 @@ final class FirstRunProof: XCTestCase {
                       "PRODUCT: the window must take the room's name as its title; it is \"\(ui.windows.firstMatch.title)\"")
 
         // Who you can't read yet, and why: erin joins, and neither she nor alice has trusted the
-        // other; then erin trusts alice, and the line says so and offers her offer.
+        // other; then erin trusts alice, and the line says so and offers her offer. These members
+        // need a separate account: this computer's personal alice automatically trusts eligible
+        // local nodes, so a local erin would stop being an untrusted newcomer.
+        let trustRoot = scratch.appendingPathComponent("trust-host")
+        let trustHome = trustRoot.appendingPathComponent("home").path
+        let trustKeychain = trustRoot.appendingPathComponent("identity.keychain-db").path
+        let madeTrustHome = stager.run(["/bin/mkdir", "-p", trustHome], env: [:])
+        let madeTrustKeychain = stager.run(["/usr/bin/security", "create-keychain", "-p", "", trustKeychain],
+                                          env: ["HOME": trustHome])
+        guard madeTrustHome.status == 0, madeTrustKeychain.status == 0 else {
+            throw Apparatus("the remote trust account's private HOME/Keychain could not be staged")
+        }
+        let trustEnv = ["VOX_DATA_DIR": trustRoot.appendingPathComponent("data").path,
+                        "VOX_CONFIG_DIR": trustRoot.appendingPathComponent("config").path,
+                        "VOX_PROXY": "127.0.0.1:0", "HOME": trustHome, "VOX_TEST_KEYCHAIN": trustKeychain]
+        trustPeer = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: trustEnv,
+                              until: "vox daemon: control socket")
         let erinPass = scratch.appendingPathComponent("erin.pass").path
         try stager.write(Data("erin identity\n".utf8), to: erinPass)
         try staged(vox, ["node", "create", "erin"],
-                   env: voxEnv.merging(["VOX_IDENTITY_PASSPHRASE": "erin identity"]) { $1 })
-        try staged(vox, ["node", "attach", "erin", "--passphrase-file", erinPass], env: voxEnv)
-        let erinFp = try line(staged(vox, ["id", "--node", "erin"], env: voxEnv)) { $0.count == 52 }
+                   env: trustEnv.merging(["VOX_IDENTITY_PASSPHRASE": "erin identity"]) { $1 })
+        try staged(vox, ["node", "attach", "erin", "--passphrase-file", erinPass], env: trustEnv)
+        let erinFp = try line(staged(vox, ["id", "--node", "erin"], env: trustEnv)) { $0.count == 52 }
         let erinLink = try line(staged(vox, ["room", "link", "--node", "alice", room], env: voxEnv)) {
             $0.hasPrefix("vox://")
         }
         try staged(vox, ["room", "join", "--node", "erin", "--passphrase-file", roomPass, erinLink],
-                   env: voxEnv)
+                   env: trustEnv)
+        func trustGap(_ members: [(name: String, fingerprint: String, trustsAlice: Bool)]) -> Premise {
+            Premise("the remote members are in mission, outside alice's keyring, with the staged trust directions") {
+                let roster = self.run(vox, ["room", "roster", "--node", "alice", room], env: voxEnv)
+                let ours = self.run(vox, ["trust", "list", "--node", "alice"], env: voxEnv)
+                var holds = roster.status == 0 && ours.status == 0
+                var said = "alice roster (\(roster.status)): \(roster.out); alice keyring (\(ours.status)): \(ours.out)"
+                for member in members {
+                    let theirs = self.run(vox, ["trust", "list", "--node", member.name], env: trustEnv)
+                    let trustsAlice = theirs.out.split(separator: "\n").contains { $0.hasPrefix(aliceFp + " ") }
+                    holds = holds && roster.out.contains(member.fingerprint)
+                        && !ours.out.split(separator: "\n").contains { $0.hasPrefix(member.fingerprint + " ") }
+                        && theirs.status == 0 && trustsAlice == member.trustsAlice
+                    said += "; \(member.name) \(member.fingerprint) keyring (\(theirs.status)): \(theirs.out)"
+                }
+                return (holds, said)
+            }
+        }
         let erinShort = String(erinFp.prefix(12))
         let banner = Key.id("trust-banner")
         words(ui, banner, timeout: 60,
-              "erin joined and nobody trusted anybody: the room must say \"You and \(erinShort) can't read each other yet\"",
-              until: { $0.contains(erinShort) && $0.contains("can't read each other") })
+              "remote erin and alice have not trusted each other: the room must name erin and explain why they cannot read each other",
+              until: { $0.contains(erinShort) && $0.contains("can't read each other") },
+              premise: trustGap([("erin", erinFp, false)]))
         try staged(vox, ["trust", "add", "--node", "erin", aliceFp, "--name", "alice",
-                         "--identity-passphrase-file", erinPass], env: voxEnv)
+                         "--identity-passphrase-file", erinPass], env: trustEnv)
+        let erinOffer = trustGap([("erin", erinFp, true)])
         words(ui, banner, timeout: 60,
-              "erin trusts alice now: the room must say \"\(erinShort) trusts you. Trust \(erinShort) too\"",
-              until: { $0.contains("\(erinShort) trusts you") })
+              "remote erin trusts alice now: the room must name erin's incoming trust and explain that alice must trust her too",
+              until: { $0.contains(erinShort) && $0.contains("trusts you") && $0.contains("too") },
+              premise: erinOffer)
+        let offerPremise = Premise("erin's untrusted offer is available to alice") {
+            let (gap, said) = erinOffer.read()
+            let offers = self.run(vox, ["trust", "offers", "--node", "alice"], env: voxEnv)
+            return (gap && offers.status == 0 && offers.out.contains(erinFp),
+                    "\(said); alice offers (\(offers.status)): \(offers.out)")
+        }
         present(ui, Key.id("trust-banner-offer"), timeout: 10,
-                "the line must offer erin's trust offer, \"Trust \(erinShort)…\"")
+                "the trust guidance must offer to review erin's trust offer", premise: offerPremise)
         // With two members alice can't read, the line names both (D4): fay joins too.
         let fayPass = scratch.appendingPathComponent("fay.pass").path
         try stager.write(Data("fay identity\n".utf8), to: fayPass)
         try staged(vox, ["node", "create", "fay"],
-                   env: voxEnv.merging(["VOX_IDENTITY_PASSPHRASE": "fay identity"]) { $1 })
-        try staged(vox, ["node", "attach", "fay", "--passphrase-file", fayPass], env: voxEnv)
-        let fayFp = try line(staged(vox, ["id", "--node", "fay"], env: voxEnv)) { $0.count == 52 }
+                   env: trustEnv.merging(["VOX_IDENTITY_PASSPHRASE": "fay identity"]) { $1 })
+        try staged(vox, ["node", "attach", "fay", "--passphrase-file", fayPass], env: trustEnv)
+        let fayFp = try line(staged(vox, ["id", "--node", "fay"], env: trustEnv)) { $0.count == 52 }
         try staged(vox, ["room", "join", "--node", "fay", "--passphrase-file", roomPass, erinLink],
-                   env: voxEnv)
+                   env: trustEnv)
         let fayShort = String(fayFp.prefix(12))
         words(ui, banner, timeout: 60,
-              "erin and fay can't read alice: the line must name them both, \"… \(erinShort) … \(fayShort) aren't reading each other with you yet\"",
-              until: { $0.contains(erinShort) && $0.contains(fayShort) && $0.contains("aren't reading each other with you yet") })
+              "remote erin and fay cannot read alice: the room must name both members and explain that reading needs both sides' trust",
+              until: { $0.contains(erinShort) && $0.contains(fayShort) && $0.contains("reading needs both sides") },
+              premise: trustGap([("erin", erinFp, true), ("fay", fayFp, false)]))
 
         // The Dock badge (P17) is not checked here: macOS exposes no Dock badge to lsappinfo or to
         // XCUITest (the Dock's item has an empty label and value with a badge set, 2026-10-09), so
@@ -6472,10 +6526,9 @@ final class FirstRunProof: XCTestCase {
         // (15c, D9) A message of alice's no member's node holds says so, then where it is.
         try staged(vox, ["node", "detach", "bob"], env: voxEnv)
         try staged(vox, ["node", "detach", "dave"], env: daveEnv)
-        // erin and fay joined in (5) and hold what alice posts; detached too, no member's node is
-        // up to take WHERE-15.
-        try staged(vox, ["node", "detach", "erin"], env: voxEnv)
-        try staged(vox, ["node", "detach", "fay"], env: voxEnv)
+        // Erin and Fay are remote members from (5d); stop their nodes on their own account too.
+        try staged(vox, ["node", "detach", "erin"], env: trustEnv)
+        try staged(vox, ["node", "detach", "fay"], env: trustEnv)
         try staged(vox, ["room", "post", "--node", "alice", room, "WHERE-15"], env: voxEnv)
         var whereId = ""
         for row in run(vox, ["room", "read", "--node", "alice", "--json", room], env: voxEnv).out
@@ -6718,7 +6771,8 @@ final class FirstRunProof: XCTestCase {
         // with a content tab row may retain an empty native navigation-title text element.
         let window = ui.windows.firstMatch
         guard window.waitForExistence(timeout: 5),
-              window.staticTexts.allElementsBoundByIndex.contains(where: { !shown($0).isEmpty }) else {
+              window.staticTexts.allElementsBoundByIndex.compactMap({ try? $0.snapshot() })
+                .contains(where: { !snapshotShown($0).isEmpty }) else {
             XCTFail("APPARATUS: XCTest reads no words in what Vox shows, so nothing in it can be checked",
                     file: file, line: line)
             return false
@@ -6735,9 +6789,10 @@ final class FirstRunProof: XCTestCase {
     /// The words in everything the app shows, each text's identifier with them: what a PRODUCT
     /// red quotes.
     private func onScreen(_ ui: XCUIApplication) -> String {
-        containers(ui).flatMap { $0.staticTexts.allElementsBoundByIndex.prefix(120) }.map { e -> String in
-            let words = shown(e)
-            return e.identifier.isEmpty || words.isEmpty ? words : "\(e.identifier): \(words)"
+        containers(ui).flatMap { $0.staticTexts.allElementsBoundByIndex.prefix(120) }
+        .compactMap { try? $0.snapshot() }.map { snapshot -> String in
+            let words = snapshotShown(snapshot)
+            return snapshot.identifier.isEmpty || words.isEmpty ? words : "\(snapshot.identifier): \(words)"
         }
         .filter { !$0.isEmpty }.joined(separator: " | ")
     }
@@ -7037,35 +7092,55 @@ final class FirstRunProof: XCTestCase {
 
     private func words(_ ui: XCUIApplication, _ key: Key, timeout: TimeInterval, _ product: String,
                        until holds: (String) -> Bool = { _ in true }, field: Bool = false,
-                       sibling: Key? = nil,
+                       sibling: Key? = nil, premise: Premise? = nil,
                        file: StaticString = #filePath, line: UInt = #line) -> String? {
-        let read = field ? typed : shown
+        // One immutable snapshot per read: a live query can disappear between `exists` and
+        // `label` (the trust banner does when trust becomes mutual). Poll only snapshots that
+        // resolve; at the deadline, missing and snapshot failures still get attributed below.
+        let read: (XCUIElementSnapshot) -> String = {
+            field ? (($0.value as? String) ?? "") : snapshotShown($0)
+        }
         guard windowReadable(ui, file: file, line: line) else { return nil }
         let end = Date().addingTimeInterval(timeout)
         var last = ""
-        var seen = false
         repeat {
-            if let e = locate(ui, key) {
-                seen = true
-                last = read(e)
+            if let e = locate(ui, key), let snapshot = try? e.snapshot() {
+                last = read(snapshot)
                 if (field || !last.isEmpty) && holds(last) { return last }
             }
             Thread.sleep(forTimeInterval: 0.25)
         } while Date() < end
-        if !seen, let e = locateEverywhere(ui, key) {
-            seen = true
-            last = read(e)
-            if (field || !last.isEmpty) && holds(last) { return last }
+        guard let e = locateEverywhere(ui, key) else {
+            missing(ui, key, product, premise: premise, sibling: sibling, file: file, line: line)
+            return nil
         }
-        if !seen {
-            missing(ui, key, product, sibling: sibling, file: file, line: line)
-        } else if last.isEmpty && !field {
+        do {
+            last = read(try e.snapshot())
+        } catch {
+            keepTree(ui, "\(key) could not be snapshotted")
+            XCTFail("APPARATUS: XCTest found \(key) but could not read its snapshot: \(error)",
+                    file: file, line: line)
+            return nil
+        }
+        if (field || !last.isEmpty) && holds(last) { return last }
+        var held = ""
+        if let premise {
+            let (holds, said) = premise.read()
+            guard holds else {
+                keepTree(ui, "\(key)'s staging did not hold")
+                XCTFail("APPARATUS (staging not achieved): \(product); \(premise.what) does not hold: \(said); the app shows \(last.debugDescription)",
+                        file: file, line: line)
+                return nil
+            }
+            held = "; \(premise.what), as the daemon says: \(said)"
+        }
+        if last.isEmpty && !field {
             keepTree(ui, "\(key) could not be read")
             XCTFail("APPARATUS: \(key) is shown and XCTest reads neither its label nor its value",
                     file: file, line: line)
         } else {
             keepTree(ui, "\(key) showed the wrong words")
-            XCTFail("PRODUCT: \(product); it shows \"\(last)\"", file: file, line: line)
+            XCTFail("PRODUCT: \(product)\(held); it shows \"\(last)\"", file: file, line: line)
         }
         return nil
     }
