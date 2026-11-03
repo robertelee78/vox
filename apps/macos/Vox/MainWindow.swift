@@ -647,7 +647,7 @@ private struct RoomRow: View {
                 if count > 0 {
                     Text("\(count)")
                         .font(Theme.small).fontWeight(.semibold).monospacedDigit()
-                        .foregroundStyle(waits ? VoxTokens.Colors.bgBase : VoxTokens.Colors.textPrimary)
+                        .foregroundStyle(VoxTokens.Colors.bgBase)
                         .padding(.horizontal, 6).frame(minWidth: 18, minHeight: 18)
                         .background(Capsule().fill(waits ? VoxTokens.Colors.accent : VoxTokens.Colors.accentDeep))
                         .help(room.unreadScanLimited
