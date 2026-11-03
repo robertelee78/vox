@@ -967,6 +967,23 @@ lessons. It changes neither this record's decision status nor any requirement or
   idempotent. Expired or canceled attempts MUST offer truthful local closure and MUST NOT
   claim withdrawal of signed authority already recorded elsewhere.
 
+  Pairing handoffs MUST provide complete safely quoted actions for the named acting computer,
+  without including invitation secrets in diagnostic output. Configured computer policy MUST
+  identify all group members and the direct mutual Read and personal-to-non-personal Drive
+  relationships; it MUST NOT imply that a member relays through the inviter. Applied receipts,
+  current connectivity, room membership and consent, and Session access are separate facts.
+  A prior successful exchange does not establish present reachability. Full identities and
+  diagnostic evidence remain available in details and JSON.
+
+  A different established group MUST be distinguished from an authentication failure only
+  after the invitation's proof and complete signed group history establish the inviter's
+  current positive membership. A replacement MUST be explicitly reviewed against all affected
+  local authority, including retained bindings and individual choices, and the exact reviewed
+  state MUST be rechecked before self-removal. Local retirement is a second durable operation
+  bound to the first operation's returned frontier; an intervening change requires new review.
+  Neither local retirement nor closure claims remote erasure or withdrawal of a retained
+  signature. A new group requires a fresh invitation and independent approval on both computers.
+
   A room with a local authenticated computer approval pending MUST offer the existing computer
   review, not only a keyring edit or an unqualified instruction to wait for the other node.
   The notice MUST keep room membership, reciprocal room consent and computer approval

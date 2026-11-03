@@ -790,6 +790,7 @@ final class NodeModel: ObservableObject {
                      "family-lan": "Updating the family LAN…",
                      "create-room": "Creating the room…", "join-room": "Joining the room…",
                      "copy-link": "Reading the room link…", "leave": "Leaving the room…",
+                     "mark-room-read": "Marking received room messages as read…",
                      "retention": "Setting retention…", "step-retention": "Setting Session step retention…",
                      "rename": "Renaming the room…",
                      "admins": "Updating room admins…", "copy": "Copying…",
@@ -2743,6 +2744,7 @@ final class NodeModel: ObservableObject {
             let count = try await client.markRoomRead(room: room, node: actor)
             guard !Task.isCancelled, me == actor, nodeObservationEpoch == epoch,
                   rooms.contains(where: { $0.id == room }) else { return }
+            scheduleUnread(room)
             report(operation: operation, done: count == 0
                    ? "No received messages from other members to mark read in this room."
                    : "Room marked as read.")

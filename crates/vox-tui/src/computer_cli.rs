@@ -10,9 +10,9 @@ pub enum ComputerCmd {
     /// Release this node to one enrolled computer, or approve its transfer/recovery here.
     Binding {
         /// release requires --destination; transfer accepts its signed release; recover requires removal/fault evidence.
-        #[arg(value_parser = ["release", "transfer", "recover", "recover-group"])]
+        #[arg(value_parser = ["release", "transfer", "recover"])]
         action: String,
-        /// Full node fingerprint; use group for recover-group.
+        /// Full node fingerprint.
         node: String,
         #[arg(long, default_value = "")]
         destination: String,
@@ -54,6 +54,9 @@ pub enum ComputerCmd {
         /// Print the same public status record used by Vox.app.
         #[arg(long)]
         json: bool,
+        /// Include full identities, revisions and diagnostic evidence.
+        #[arg(long)]
+        details: bool,
     },
     /// Make one expiring invitation, as Add Computer does in Vox.app.
     Invite {
@@ -90,6 +93,13 @@ pub enum ComputerCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Review and finish local retirement of a removed computer group.
+    Retire {
+        #[command(flatten)]
+        account: AccountArgs,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Drive the operator's requested account operation, checking the agent mark before any writes.
@@ -97,6 +107,9 @@ pub async fn run(command: ComputerCmd) -> Result<(), AppError> {
     if !matches!(&command, ComputerCmd::Status { .. }) {
         operator_only()?;
     }
+    let details = matches!(&command, ComputerCmd::Status { details: true, .. });
+    let retire = matches!(&command, ComputerCmd::Retire { .. });
+    let include_invitation = matches!(&command, ComputerCmd::Invite { .. });
     let (account, json, request, prompt) = match command {
         ComputerCmd::Binding {
             action,
@@ -143,7 +156,7 @@ pub async fn run(command: ComputerCmd) -> Result<(), AppError> {
             },
             false,
         ),
-        ComputerCmd::Status { account, json } => {
+        ComputerCmd::Status { account, json, .. } => {
             (account, json, DaemonRequest::ComputerStatus, false)
         }
         ComputerCmd::Invite { account, json } => {
@@ -182,6 +195,9 @@ pub async fn run(command: ComputerCmd) -> Result<(), AppError> {
             DaemonRequest::ComputerCancel { operation },
             false,
         ),
+        ComputerCmd::Retire { account, json } => {
+            (account, json, DaemonRequest::ComputerStatus, false)
+        }
     };
     let root = vox_core::node::paths::Account::of(
         account.data_dir.as_deref(),
@@ -191,26 +207,66 @@ pub async fn run(command: ComputerCmd) -> Result<(), AppError> {
     crate::daemon_client::ensure_daemon(&root, account.listen, &account.anchors).await?;
     let mut client = DaemonClient::open(&root.socket()).await?;
     let mut status = ask(&mut client, request).await?;
+    if retire {
+        let review = status.retirement.clone().ok_or_else(|| {
+            AppError::Usage("there is no removed computer group to retire locally".into())
+        })?;
+        eprintln!("Retiring this group removes covered local Read, Drive and individual grants. Computer/node identities, local data and signed history remain. Unreachable computers may retain access and data.");
+        for item in &review.affected {
+            eprintln!("  {item}");
+        }
+        if !confirm("Retire this reviewed group on this computer? [y/N] ").await? {
+            return Err(AppError::Usage(
+                "local retirement declined; no trust was changed".into(),
+            ));
+        }
+        let mut retirement = DaemonClient::open(&root.socket()).await?;
+        status = ask(
+            &mut retirement,
+            DaemonRequest::ComputerBinding {
+                action: "recover-group".into(),
+                node: review.review_id,
+                destination: String::new(),
+                frontier: review.frontier,
+            },
+        )
+        .await?;
+    }
     if prompt {
-        show(&status, false, json)?;
+        show(&status, false, json, false, false)?;
+        if let Some(conflict) = status.conflict.clone() {
+            let yes = confirm("Retire this computer's reviewed old group locally? [y/N] ").await?;
+            if !yes {
+                return Err(AppError::Usage(
+                    "group replacement declined; no trust was changed".into(),
+                ));
+            }
+            let mut replacement = DaemonClient::open(&root.socket()).await?;
+            status = ask(
+                &mut replacement,
+                DaemonRequest::ComputerBinding {
+                    action: "replace-group".into(),
+                    node: conflict.review_id,
+                    destination: String::new(),
+                    frontier: conflict.frontier,
+                },
+            )
+            .await?;
+            if conflict.inviter_approved {
+                eprintln!("On {}, wait until the signed incomplete proposal expires at Unix ms {}; closing it cannot withdraw a signature retained elsewhere.", conflict.peer.name, conflict.expires_ms);
+            }
+            eprintln!("On {}, close the old proposal with:\n  {}\nIf it was signed after review, wait until expiry before closing; closing cannot withdraw a retained signature. Then create a fresh invitation with:\n  {}\nBring that fresh invitation here and approve on both computers.",
+                conflict.peer.name,
+                vox_text::shell::command(&["vox", "computer", "cancel", &conflict.operation_id]),
+                vox_text::shell::command(&["vox", "computer", "invite"]));
+            return show(&status, json, false, details, false);
+        }
         let proposal = status.pairing.as_ref().ok_or_else(|| {
             AppError::Usage("no authenticated computer was offered for approval".into())
         })?;
         if !proposal.approved_here {
             let operation = proposal.operation_id.clone();
-            let yes = tokio::task::spawn_blocking(|| -> std::io::Result<bool> {
-                use std::io::Write as _;
-                eprint!("Trust this computer with this policy? [y/N] ");
-                std::io::stderr().flush()?;
-                let mut input = String::new();
-                std::io::stdin().read_line(&mut input)?;
-                Ok(matches!(
-                    input.trim().to_ascii_lowercase().as_str(),
-                    "y" | "yes"
-                ))
-            })
-            .await
-            .map_err(|_| AppError::Usage("computer approval input stopped".into()))??;
+            let yes = confirm("Trust this computer with this policy? [y/N] ").await?;
             if !yes {
                 return Err(AppError::Usage(
                     "computer pairing was not approved; no new local approval was made".into(),
@@ -222,7 +278,23 @@ pub async fn run(command: ComputerCmd) -> Result<(), AppError> {
             status = ask(&mut approval, DaemonRequest::ComputerApprove { operation }).await?;
         }
     }
-    show(&status, json, false)
+    show(&status, json, false, details, include_invitation)
+}
+async fn confirm(prompt: &'static str) -> Result<bool, AppError> {
+    tokio::task::spawn_blocking(move || -> std::io::Result<bool> {
+        use std::io::Write as _;
+        eprint!("{prompt}");
+        std::io::stderr().flush()?;
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        Ok(matches!(
+            input.trim().to_ascii_lowercase().as_str(),
+            "y" | "yes"
+        ))
+    })
+    .await
+    .map_err(|_| AppError::Usage("computer approval input stopped".into()))?
+    .map_err(Into::into)
 }
 async fn ask(
     client: &mut DaemonClient,
@@ -237,7 +309,13 @@ async fn ask(
         )),
     }
 }
-fn show(status: &ComputerStatus, json: bool, to_stderr: bool) -> Result<(), AppError> {
+fn show(
+    status: &ComputerStatus,
+    json: bool,
+    to_stderr: bool,
+    details: bool,
+    include_invitation: bool,
+) -> Result<(), AppError> {
     if json {
         println!(
             "{}",
@@ -258,15 +336,55 @@ fn show(status: &ComputerStatus, json: bool, to_stderr: bool) -> Result<(), AppE
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64);
-    println!(
-        "{}  {}\ninstallation {}\ncomputer trust: {}\npolicy revision {}",
-        status.this_computer.name,
-        status.this_computer.fingerprint,
-        status.this_computer.installation,
-        status.state,
-        status.revision
-    );
+    if details || status.pairing.is_some() {
+        println!(
+            "{}  {}\ninstallation {}\ncomputer trust: {}\npolicy revision {}",
+            status.this_computer.name,
+            status.this_computer.fingerprint,
+            status.this_computer.installation,
+            status.state,
+            status.revision
+        );
+    } else {
+        println!(
+            "{} · computer trust: {}",
+            status.this_computer.name, status.state
+        );
+    }
     println!("{}", status.policy);
+    if let Some(conflict) = &status.conflict {
+        println!("Authenticated computer {} · {}\ninstallation {} is already in a different established group.",
+            conflict.peer.name, conflict.peer.fingerprint, conflict.peer.installation);
+        println!(
+            "Current group: {}\nProposed group: {}",
+            conflict.current_group, conflict.proposed_group
+        );
+        println!("Replacing locally revokes covered group Read and personal-to-managed-node Drive, including covered individual grants. Computer/node identities, local data and signed history remain. Unreachable computers may retain access and data; this does not erase or revoke them remotely.");
+        for item in &conflict.affected {
+            println!("  {item}");
+        }
+        if conflict.inviter_approved {
+            println!("The inviter already signed the proposal; wait until Unix ms {} before closing it there. Closing cannot withdraw an already-recorded signature.", conflict.expires_ms);
+        }
+        if conflict.expires_ms <= now_ms {
+            println!("The proposal expired. On {}, close it with {} and create a fresh invitation with {}.",
+                conflict.peer.name,
+                vox_text::shell::command(&["vox", "computer", "cancel", &conflict.operation_id]),
+                vox_text::shell::command(&["vox", "computer", "invite"]));
+        } else {
+            println!(
+                "To replace, review this invitation interactively on {}.",
+                status.this_computer.name
+            );
+        }
+        println!("To keep the current group and close this review on {}, run {}. This does not withdraw the invitation or signature on {}.",
+            status.this_computer.name,
+            vox_text::shell::command(&["vox", "computer", "cancel", &conflict.operation_id]),
+            conflict.peer.name);
+    }
+    if status.retirement.is_some() {
+        println!("This computer was removed from its previous group. Review and finish its local retirement with: vox computer retire");
+    }
     if let Some(p) = &status.pairing {
         println!(
             "{}  {}\ninstallation {}\noperation {}\napproved here: {}; approved there: {}",
@@ -305,7 +423,7 @@ fn show(status: &ComputerStatus, json: bool, to_stderr: bool) -> Result<(), AppE
             println!("Both approvals are recorded; enrollment has not completed here yet.");
         }
     }
-    if let Some(link) = &status.invite_link {
+    if let Some(link) = status.invite_link.as_ref().filter(|_| include_invitation) {
         println!(
             "Run in the other computer's own terminal:\n  {}",
             vox_text::shell::command(&["vox", "computer", "pair", link])
@@ -316,6 +434,39 @@ fn show(status: &ComputerStatus, json: bool, to_stderr: bool) -> Result<(), AppE
             "Cancel: {}",
             vox_text::shell::command(&["vox", "computer", "cancel", id])
         );
+    }
+    for line in &status.topology {
+        println!("Policy: {line}");
+    }
+    if !details {
+        for application in &status.applications {
+            let applied = if application.confirmed {
+                "application confirmed"
+            } else {
+                "application pending"
+            };
+            let connectivity =
+                if application.computer.fingerprint == status.this_computer.fingerprint {
+                    "this computer"
+                } else if application.exchange_in_flight {
+                    "exchange in progress; current connectivity unknown"
+                } else if application.exchange_failures > 0 {
+                    "last exchange failed; current connectivity unknown"
+                } else if application.last_exchange_ms.is_some() {
+                    "previously exchanged; current connectivity unknown"
+                } else {
+                    "connectivity unknown"
+                };
+            println!("{}: {applied}; {connectivity}", application.computer.name);
+        }
+        for pending in &status.pending_nodes {
+            println!("Pending application: {pending}");
+        }
+        if let Some(why) = &status.problem {
+            println!("Current problem: {why}");
+        }
+        println!("For full identities and diagnostics: vox computer status --details");
+        return Ok(());
     }
     for application in &status.applications {
         // The last exchange this daemon started and the last it answered, each with the policy

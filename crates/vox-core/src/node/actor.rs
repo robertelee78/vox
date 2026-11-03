@@ -5166,6 +5166,36 @@ impl NodeHandle {
         ])
     }
 
+    pub(crate) async fn session_selection_revision(
+        &self,
+        channel_id: Digest32,
+    ) -> std::result::Result<Digest32, String> {
+        use crate::node::channel::session_projection::{Query, Reply};
+        let Reply::SelectionRevision(revision) = self
+            .session_projection(channel_id, Query::SelectionRevision)
+            .await?
+        else {
+            return Err("unexpected Session selection revision answer".into());
+        };
+        let (view, current) = self.coherent_view();
+        let detail = view
+            .open_channels
+            .iter()
+            .find(|room| room.channel_id == channel_id)
+            .ok_or("the room is not open")?;
+        Ok(crate::hash::sha256_concat(&[
+            b"vox/session-selection-view/v1",
+            &self.display_incarnation,
+            &channel_id,
+            &revision,
+            &[u8::from(detail.pause.paused)],
+            &detail.pause.by,
+            &detail.pause.at_millis.to_be_bytes(),
+            &detail.governance_revision.to_be_bytes(),
+            &[u8::from(current)],
+        ]))
+    }
+
     /// An opaque token for the authoritative selected history and current display names.
     /// The actor reads the sealed revision under the same gate and room lock as Find; a
     /// busy room cannot substitute an older published watch value. No rows are collected.

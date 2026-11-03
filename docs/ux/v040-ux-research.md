@@ -747,3 +747,119 @@ Branch v030/rearch-tui at 355f6ffa: ADR-001, 005, 007, 014, 015, 017, 020, 023, 
 
 Research only. Nothing in this report is built or decided; it is input to the decider's interview, the UX ADR and the rewrite of ADR-014.
 
+
+## Tern and existing OMP integration — v0.4.16 study (2026-11-02)
+
+This is research input for #1137, #1134 and #1135, not an approved design or
+evidence of a finished usability pass. ADR-028's dark-only palette and its
+semantic, accessible shared tokens remain authoritative. An independently
+reviewed immutable study revision, not downstream implementation or release
+closure, is the prerequisite for Tern-derived implementation choices.
+
+### Sources and limits
+
+The specified `/Applications/Tern 2.app/Wrapper/Tern.app/Info.plist` identifies
+bundle `so.stencil.tern`, version 0.9.8, build 77, `iPhoneOS` platform,
+supporting Mac (`MacFamily20,1`). The running `tern` process resolves to the
+different `/Applications/Tern.app`; it was not substituted for this build.
+On this Mac, `open -n '/Applications/Tern 2.app'` failed with LaunchServices
+error -10670; opening the wrapped `Tern.app` failed with “incorrect executable
+format”. The executable is arm64 with an iOS platform load command, not a
+native macOS binary. No conclusion about the failure's deeper cause is
+established. No installed runtime OMP interaction, permission prompt, theme
+preview/apply/revert/persistence, focus, empty/error or reconnect state has
+been observed. Bundle inspection is **not** a hands-on reference pass. A
+working, safe environment for this exact build remains necessary.
+
+As separately identified supplemental evidence only, the running native
+`/Applications/Tern.app` reports version/build 0.9.10. Read-only macOS
+accessibility enumeration of its existing menu bar showed Tern, File, Edit,
+View, Window and Help; View includes Hide Sidebar, Show Files and Reveal
+Active File, and the Tern menu includes Settings and Quit and Keep Windows.
+No window contents, session or theme controls were inspected or changed.
+These observations do not establish anything about the build 77 wrapper.
+
+[Tern's first-party page](https://stencil.so/tern), read and viewed on
+2026-11-02, is a published demonstration, not evidence about this installed
+build. Its sample OMP pane shows prompt and reply, an Edit with file and diff
+counts, Done and duration, a Bash action/result, Working, and model and working
+directory. Its daemon scene depicts reconnect and named host/pane context.
+Its theme scene depicts a searchable list with `↑↓` preview, `↵` apply and
+`esc` restore; the page claims Tern wears OMP themes. The demonstration does
+not establish installed behavior, persistence, actual permission requests,
+accessible focus, measured contrast, or all loading and failure states.
+Gradients in the marketing hero are not a recommendation for Vox chrome.
+
+The first-party [custom theme guide](https://docs.stencil.so/tern/guides/themes.md)
+documents separate light/dark selections, choosing in Settings or via a
+shortcut, `settings.json` persistence and Follow omp clearing those choices.
+It describes related terminal, chrome, widget and OMP-chat tokens and claims
+legibility adjustments including 4.5:1 secondary text and 3:1 accent. Custom
+CSS can override styling, and mobile themes are local to that device. These
+are documentation claims, not observations or measurements of build 77.
+The lesson for Vox is to evaluate every shared surface and semantic role
+together; neither the CSS extension mechanism nor a new theme engine is
+approved. The [SDK overview](https://docs.stencil.so/tern/) also explicitly
+notes plugins can write files and spawn processes, so a plugin is not a
+read-only inspection apparatus.
+
+Vox already has an OMP integration: `crates/vox-tui/assets/omp-extension.ts`
+publishes native messages, tool start/results and turn events;
+`crates/vox-tui/src/omp_mirror.rs` follows the exact authenticated native
+Session route. `docs/manual/sessions.md` describes private text/file Drive,
+abort, and the explicit refusal of unsupported generic slash, approval and
+question actions. `apps/macos/Vox/Sessions.swift` and `SessionDrive.swift`
+present authorized Session tabs, activity, Details and controls;
+`SessionPages.swift` keeps an older window from being replaced by live output.
+These are source observations, not a claim of successful runtime validation.
+
+### Evidence to decision and consumer
+
+| Published pattern and decision | Vox proposal and owner | Security and real-product validation |
+|---|---|---|
+| Compact tool activity and explicit completion: **adapt**, not its branding. | #1134 / Main: assess the existing one-line tool summary and expandable Details against long input, output and failure; do not introduce another OMP runner. | In an actual OMP Session, open and close Details by keyboard and mouse; compare tool success and failure. Only a Drive-authorized member may see private activity. |
+| OMP pane names its model and directory: **adapt** contextual clarity, not unsupported claims. | #1134 / Main: keep the acting node, selected Session and attributed Session name/ID clear in tabs and composer; do not invent a working directory from the demo. | Switch between real authorized Sessions and inspect VoiceOver destination; keep remote names and IDs identified as claims. |
+| Reconnection scene: **adapt** truthful state presentation, not a promise of identical recovery. | #1134 / Main: retain existing older/newer navigation, pause, loading, offline and delivery-unknown wording; inspect how each actually renders. | Disconnect and recover scratch participants, verify an older window stays pinned and unknown delivery is not presented as success. |
+| Theme list, preview and restore: **defer**, not an authorization for a selector. | #1135 / Main: measure actual rendered text, disabled controls, boundaries, focus, selection and error in the supported dark theme; correct approved defects with existing shared tokens. | Record actual foreground/background samples and contrast ratios, sizes, state and accessibility settings. A new theme choice, persistence or palette rule requires explicit product and canonical design review. |
+| Visible keyboard hints: **adapt**. | #1134 / SessionDrive owner: reviewed and authorized hint, full request refusal in the scrollable timeline, and bounded disclosure for complete composer delivery details. | Exercise multiline input, send, refusal and unknown delivery with keyboard and mouse at narrow/wide sizes and conversation scaling; retain exact Drive admission and no automatic retry. |
+| Restrained layout: **adapt** only where actual use demonstrates friction. | #1134 / Settings owner: evaluate a scrollable settings body for short windows; preserve control order, existing tokens and sheets. | Complete Settings and return from sheets by keyboard, pointer and VoiceOver at normal and short heights; no change to settings semantics. |
+| Visible resize/navigation affordances: **adapt** within native controls. | #1134 / Columns owner: independently reviewed VoiceOver adjustment uses existing bounds and persistence; a VoiceOver action alone does not satisfy ordinary keyboard resizing, which must also have an operable path. | Independently exercise pointer, ordinary keyboard and VoiceOver increments at bounds and after reopening. |
+| Permissions are not shown by the published OMP example: **reject inference**. | Pairing owner and Main: retain operator-only computer approval, exact authenticated identity, Read/Drive and private Session visibility. | Verify authorized versus read-only behavior on the real product; do not weaken signatures or add actions the OMP adapter cannot perform. |
+
+The operator reported hidden Mark as Read and expert-heavy onboarding. Those
+are concrete discovery/hierarchy inputs, not measured contrast findings.
+Main owns `MainWindow.swift`, `Timeline.swift`, `Composer.swift` and
+`NodeModel.swift`: make the unread action discoverable under #1132 and
+independently inspect long content, keyboard focus, selection and acting
+identity without changing authorization. `ComputerTrust.swift` belongs to
+the pairing owner. `Sessions.swift` owns its existing activity rendering;
+its baseline should be exercised before changing it.
+
+One signed v0.4.15 baseline screenshot captured by Main in the isolated guest
+(`baseline-room-selected.png`, v0.4.16 evidence directory) shows a 900×449
+window: First Services, collapsed Room Activity, Timeline and two history
+controls occupy the upper room area, leaving approximately 130 pixels for
+the timeline. In the same isolated app at 200% conversation size
+(`baseline-room-200.png`), room tabs and history controls also enlarge,
+history labels truncate, the timeline is not visible and Send is clipped by
+the inspector. This is an observed compact-window product failure, not an
+inference about other sizes. Source inspection locates the scale modifier on
+the entire centre column in `MainWindow.swift`, outside the timeline and
+composer. Main owns the corrective design. In the 100% image, modal
+foreground and surface pixel
+samples converted from its embedded Display ICC profile to sRGB give 16.50:1
+for timeline primary text (240,236,228) on (12,13,15), 7.08:1 for sidebar
+secondary text (168,162,153) on (22,23,26), and 7.27:1 for inspector
+secondary text on (19,20,23), using WCAG relative luminance. These single
+image color samples do not establish rendered compliance across controls,
+antialiasing, disabled, focus, selection, error or accessibility states.
+
+For #1136, an independent person must use the integrated native app and
+existing journeys with **both** scratch `VOX_DATA_DIR` and `VOX_CONFIG_DIR`:
+first run, selected identity, room/unread, authorized OMP Session, long
+content, empty/loading/offline/error/completed states, narrow and wide sizes,
+mouse, keyboard, VoiceOver, Increase Contrast, Reduce Transparency and Reduce
+Motion. Compare before/after and complete tasks rather than relying on
+screenshots. Classify each observed failure as PRODUCT or APPARATUS. Beyond
+the limited image samples above, no contrast compliance, native task
+completion or independent acceptance is claimed by this research.

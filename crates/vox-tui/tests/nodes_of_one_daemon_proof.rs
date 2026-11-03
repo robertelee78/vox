@@ -898,6 +898,12 @@ fn computer_pair_json_reviews_without_approving_the_peer() {
     watchdog::arm();
     let a = Account::new();
     let b = Account::new();
+    for (account, name) in [(&a, "move-destination-a"), (&b, "move-destination-b")] {
+        account.make_node(name);
+        let (ok, out, err) = account.run(&["node", "unlock", name, "--passphrase-file", "-"], PASS);
+        assert!(ok, "APPARATUS: ready destination node {name}: {out}{err}");
+        computer(account, &["personal", name]);
+    }
     let invitation = computer(&a, &["invite"]);
     let link = invitation["invite_link"]
         .as_str()
@@ -939,6 +945,266 @@ fn computer_pair_json_reviews_without_approving_the_peer() {
                 && shown["computers"].as_array().is_some_and(Vec::is_empty),
             "PRODUCT: declining or EOF recorded approval or enrollment: {shown}"
         );
+    }
+    let operation = reviewed["pairing"]["operation_id"]
+        .as_str()
+        .expect("APPARATUS: authenticated pairing omitted its operation");
+    let repeat = computer(&b, &["approve", operation]);
+    assert!(
+        repeat["pairing"]["approved_here"] == true && repeat["pairing"]["approved_there"] == false,
+        "PRODUCT: repeating approval on one computer falsely completed the other side: {repeat}"
+    );
+    computer(&a, &["approve", operation]);
+    assert!(
+        wait_until(CHANGE_SHOWN_WITHIN, || {
+            computer(&a, &["status"])["state"] == "confirmed"
+                && computer(&b, &["status"])["state"] == "confirmed"
+        }),
+        "APPARATUS: first scratch group did not converge for conflict staging"
+    );
+    let c = Account::new();
+    let d = Account::new();
+    c.make_node("move-incoming");
+    let (ok, out, err) = c.run(
+        &["node", "unlock", "move-incoming", "--passphrase-file", "-"],
+        PASS,
+    );
+    assert!(ok, "APPARATUS: ready incoming node: {out}{err}");
+    computer(&c, &["personal", "move-incoming"]);
+    let old_peer = d.make_node("move-old-peer");
+    let (ok, out, err) = d.run(
+        &["node", "unlock", "move-old-peer", "--passphrase-file", "-"],
+        PASS,
+    );
+    assert!(ok, "APPARATUS: ready the old-group peer: {out}{err}");
+    computer(&d, &["personal", "move-old-peer"]);
+    let old = computer(&c, &["invite"]);
+    let old_link = old["invite_link"]
+        .as_str()
+        .expect("APPARATUS: second group has no invitation");
+    let proposal = computer(&d, &["pair", old_link, "--preview"]);
+    let old_op = proposal["pairing"]["operation_id"]
+        .as_str()
+        .expect("APPARATUS: second group has no operation");
+    computer(&d, &["approve", old_op]);
+    computer(&c, &["approve", old_op]);
+    assert!(
+        wait_until(CHANGE_SHOWN_WITHIN, || {
+            computer(&c, &["status"])["state"] == "confirmed"
+                && computer(&d, &["status"])["state"] == "confirmed"
+        }),
+        "APPARATUS: second scratch group did not converge for conflict staging"
+    );
+    let old_room = make_room(&c, "move-incoming");
+    let (ok, out, err) = c.run(&["room", "link", &old_room, "--node", "move-incoming"], "");
+    assert!(ok, "APPARATUS: old-group room link unavailable: {out}{err}");
+    let old_room_link = out
+        .lines()
+        .find(|line| line.starts_with("vox://"))
+        .expect("APPARATUS: old-group room link missing")
+        .to_owned();
+    let (ok, out, err) = d.run(
+        &[
+            "room",
+            "join",
+            &old_room_link,
+            "--node",
+            "move-old-peer",
+            "--passphrase-file",
+            "-",
+        ],
+        ROOM_PASS,
+    );
+    assert!(
+        ok,
+        "APPARATUS: stage the old peer's joined room: {out}{err}"
+    );
+    let (ok, out, err) = c.run(
+        &[
+            "room",
+            "post",
+            &old_room,
+            "old-group-before",
+            "--node",
+            "move-incoming",
+        ],
+        "",
+    );
+    assert!(
+        ok,
+        "APPARATUS: stage the old-group communication baseline: {out}{err}"
+    );
+    assert!(
+        wait_until(RETURN_WITHIN, || {
+            let (ok, out, _) = d.run(&["room", "read", &old_room, "--node", "move-old-peer"], "");
+            ok && out.contains("old-group-before")
+        }),
+        "APPARATUS: the old peer could not read the baseline message before retirement"
+    );
+    let room = make_room(&a, "move-destination-a");
+    let (ok, room_link, err) = a.run(&["room", "link", &room, "--node", "move-destination-a"], "");
+    assert!(ok, "APPARATUS: destination room link unavailable: {err}");
+    let room_link = room_link
+        .lines()
+        .find(|line| line.starts_with("vox://"))
+        .expect("APPARATUS: destination room link missing")
+        .to_owned();
+    for (account, name) in [(&b, "move-destination-b"), (&c, "move-incoming")] {
+        let (ok, out, err) = account.run(
+            &[
+                "room",
+                "join",
+                &room_link,
+                "--node",
+                name,
+                "--passphrase-file",
+                "-",
+            ],
+            ROOM_PASS,
+        );
+        assert!(ok, "APPARATUS: stage shared room for {name}: {out}{err}");
+    }
+    let before = computer(&c, &["status"]);
+    let invitation = computer(&a, &["invite"]);
+    let link = invitation["invite_link"]
+        .as_str()
+        .expect("APPARATUS: destination invitation missing");
+    // Alter only the PAKE secret: a reachable invitation with bad proof is not a trusted conflict.
+    use base64::Engine as _;
+    let mut wrong = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(
+            link.strip_prefix("vox-computer://")
+                .expect("APPARATUS: invitation scheme"),
+        )
+        .expect("APPARATUS: decode invitation");
+    let secret = {
+        let mut decoder = vox_core::cbor::Decoder::new(&wrong);
+        decoder.array().unwrap();
+        decoder.uint().unwrap();
+        decoder.bytes().unwrap();
+        decoder.bytes().unwrap();
+        decoder.bytes().unwrap().to_vec()
+    };
+    let at = wrong
+        .windows(secret.len())
+        .position(|window| window == secret)
+        .expect("APPARATUS: invitation secret not found");
+    wrong[at] ^= 1;
+    let wrong = format!(
+        "vox-computer://{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(wrong)
+    );
+    let (ok, out, err) = c.run(&["computer", "pair", &wrong, "--preview", "--json"], "");
+    assert!(!ok && !format!("{out}{err}").contains("group-conflict"),
+        "PRODUCT: a wrong pairing secret was accepted or classified as an authenticated group conflict");
+    assert_eq!(
+        computer(&c, &["status"])["computers"],
+        before["computers"],
+        "PRODUCT: wrong-secret review changed the old group"
+    );
+    let conflict = computer(&c, &["pair", link, "--preview"]);
+    assert!(conflict["state"] == "group-conflict"
+        && conflict["conflict"]["peer"] == invitation["this_computer"]
+        && conflict["pairing"].is_null()
+        && conflict["computers"] == before["computers"],
+        "PRODUCT: authenticated different groups were not refused without altering current membership: {conflict}");
+    let (ok, out, err) = c.run(&["computer", "pair", link], "no\n");
+    assert!(
+        !ok,
+        "PRODUCT: declining replacement reported success: {out}{err}"
+    );
+    let after = computer(&c, &["status"]);
+    assert!(
+        after["computers"] == before["computers"],
+        "PRODUCT: declining replacement changed old group membership: {after}"
+    );
+    let old_proposal = conflict["conflict"]["operation_id"]
+        .as_str()
+        .expect("APPARATUS: conflict did not identify the inviter's proposal")
+        .to_owned();
+    let identity = before["this_computer"].clone();
+    let (ok, out, err) = c.run(&["computer", "pair", link], "yes\n");
+    assert!(ok, "PRODUCT: explicit group replacement failed: {out}{err}");
+    let retired = computer(&c, &["status"]);
+    assert!(
+        retired["state"] == "individual" && retired["this_computer"] == identity,
+        "PRODUCT: local retirement did not preserve the computer identity: {retired}"
+    );
+    computer(&a, &["cancel", &old_proposal]);
+    let fresh = computer(&a, &["invite"]);
+    let fresh_link = fresh["invite_link"]
+        .as_str()
+        .expect("APPARATUS: fresh invitation missing");
+    let fresh_preview = computer(&c, &["pair", fresh_link, "--preview"]);
+    let fresh_op = fresh_preview["pairing"]["operation_id"]
+        .as_str()
+        .expect("PRODUCT: fresh preview omitted the authenticated operation");
+    assert_ne!(
+        fresh_op, old_proposal,
+        "PRODUCT: replacement reused the rejected proposal"
+    );
+    computer(&c, &["approve", fresh_op]);
+    computer(&a, &["approve", fresh_op]);
+    assert!(
+        wait_until(CHANGE_SHOWN_WITHIN, || {
+            computer(&a, &["status"])["state"] == "confirmed"
+                && computer(&b, &["status"])["state"] == "confirmed"
+                && computer(&c, &["status"])["state"] == "confirmed"
+        }),
+        "PRODUCT: fresh bilateral enrollment after local retirement did not complete"
+    );
+    assert!(
+        wait_until(RETURN_WITHIN, || {
+            let (ok, out, _) = c.run(&["trust", "list", "--node", "move-incoming"], "");
+            ok && !out.contains(&old_peer)
+        }),
+        "PRODUCT: the replaced computer retained its old peer's covered grant"
+    );
+    let (ok, out, err) = c.run(
+        &[
+            "room",
+            "post",
+            &old_room,
+            "old-group-after-retirement",
+            "--node",
+            "move-incoming",
+        ],
+        "",
+    );
+    assert!(
+        ok,
+        "PRODUCT: the preserved old room was unusable after local retirement: {out}{err}"
+    );
+    let leaked = wait_until(RETURN_WITHIN, || {
+        let (ok, out, _) = d.run(&["room", "read", &old_room, "--node", "move-old-peer"], "");
+        ok && out.contains("old-group-after-retirement")
+    });
+    assert!(
+        !leaked,
+        "PRODUCT: the old-group peer read a fresh post after its covered grant was retired"
+    );
+    for (account, name, message) in [
+        (&a, "move-destination-a", "move-after-a"),
+        (&b, "move-destination-b", "move-after-b"),
+        (&c, "move-incoming", "move-after-c"),
+    ] {
+        let (ok, out, err) = account.run(&["room", "post", &room, message, "--node", name], "");
+        assert!(
+            ok,
+            "PRODUCT: {name} could not post after replacement: {out}{err}"
+        );
+    }
+    for (account, name, messages) in [
+        (&a, "move-destination-a", ["move-after-b", "move-after-c"]),
+        (&b, "move-destination-b", ["move-after-a", "move-after-c"]),
+        (&c, "move-incoming", ["move-after-a", "move-after-b"]),
+    ] {
+        let mut shown = String::new();
+        assert!(wait_until(RETURN_WITHIN, || {
+            let (ok, out, _) = account.run(&["room", "read", &room, "--node", name], "");
+            shown = out;
+            ok && messages.iter().all(|message| shown.contains(message))
+        }), "PRODUCT: {name} could not read fresh posts from both other computers after replacement: {shown}");
     }
 }
 
@@ -1781,6 +2047,18 @@ fn enroll_third(
         );
     }
     assert!(wait_until(Duration::from_secs(60),||has(&ring(a,"agent-one"),&beast,false)&&has(&ring(a,"agent-one"),&helper,false)),"PRODUCT: the third computer's signed enrollment did not propagate to the original member without the sponsor: {}",ring(a,"agent-one"));
+    let (ok, shown, err) = a.run(&["computer", "status"], "");
+    assert!(
+        ok,
+        "PRODUCT: computer trust summary was unavailable: {shown}{err}"
+    );
+    assert!(
+        shown.contains("mutual Read directly")
+            && shown.lines().any(|line| line.contains("personal can Drive:") && line.contains("codex-beast"))
+            && shown.contains("Personal nodes do not automatically Drive other personal nodes")
+            && shown.contains("Room membership, consent and Session access are separate"),
+        "PRODUCT: the normal computer status did not explain direct personal-to-Beast policy and its limits: {shown}"
+    );
     for (account, name, personal) in [
         (a, "personal", true),
         (a, "agent-one", false),
@@ -4618,7 +4896,8 @@ fn enrolled_computers_follow_node_changes_and_retire_removed_authority() {
             );
         }
     }
-    binding(&b, "recover-group", "group", "");
+    let (ok, out, err) = b.run(&["computer", "retire"], "yes\n");
+    assert!(ok, "PRODUCT: reviewed local retirement failed: {out}{err}");
     assert!(
         computer(&b, &["status"])["computers"]
             .as_array()
@@ -4636,7 +4915,8 @@ fn enrolled_computers_follow_node_changes_and_retire_removed_authority() {
             == "removed"),
         "PRODUCT: locally removed manager did not retain retirement evidence"
     );
-    binding(&a, "recover-group", "group", "");
+    let (ok, out, err) = a.run(&["computer", "retire"], "yes\n");
+    assert!(ok, "PRODUCT: reviewed local retirement failed: {out}{err}");
     enroll(&b, &a, "PRODUCT");
     assert!(
         wait_until(Duration::from_secs(30), || computer(&a, &["status"])

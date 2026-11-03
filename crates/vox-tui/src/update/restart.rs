@@ -412,6 +412,10 @@ async fn restart_checked(
             ));
         }
         require_daemon_executable(after.pid, helper)?;
+        println!(
+            "the vox daemon runs vox {} (pid {}), and its remembered nodes are Ready",
+            after.version, after.pid
+        );
         let missing = attached
             .iter()
             .filter(|name| {

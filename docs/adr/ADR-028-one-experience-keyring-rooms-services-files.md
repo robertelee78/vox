@@ -195,6 +195,16 @@ by any of them (ADR-001: there is no typed agent or human).
 - **R-8.** Unread MUST have three levels per room: addressed to this node (from `to`), new, and
   coordination traffic (counted only, ADR-020 6.6). A key MUST jump to the next room with a message
   addressed to this node.
+- **R-8a.** The native room-message view MUST expose a room-wide unread summary and explicit
+  **Mark as Read** beside it, including tagged views, with the same captured-room action in the
+  Room menu and command palette (⇧⌘U). It MUST acknowledge received messages from other members
+  through the captured arrival boundary, including other tags, thread replies and unloaded
+  received history; it MUST NOT answer Session requests, accept trust offers or acknowledge later
+  arrivals. Successful acknowledgement MUST schedule the existing guarded authoritative unread
+  summary reader so the current room updates without navigation or optimistic counter clearing.
+  Progress and done/refused/unknown results MUST remain accessible in the existing status surface.
+  The explanation MUST distinguish addressed/new/coordination messages from waiting attention,
+  state scan limits, and retain the existing explicit cached/peer history and thread/tag routes.
 - **R-9.** A reply MUST quote one level (the message named by `re`), and selecting the quote MUST
   jump to it. There MUST be no thread pane.
 - **R-10.** Notifications MUST be grouped by room and MUST hide message text by default.

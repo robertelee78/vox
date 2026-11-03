@@ -129,6 +129,7 @@ pub(crate) struct TextPage {
 
 #[derive(Clone)]
 pub(crate) enum Query {
+    SelectionRevision,
     Waiting,
     Pending {
         after: Option<crate::node::sessions::PendingCursor>,
@@ -174,6 +175,7 @@ pub(crate) enum Query {
 }
 
 pub(crate) enum Reply {
+    SelectionRevision(Digest32),
     Waiting(u64),
     Pending {
         targets: Vec<crate::node::sessions::PendingTarget>,
@@ -517,6 +519,34 @@ impl ChannelState {
             !read.header.ready
                 || read.header.published != Some((public, read.header.private_generation))
         }) || self.needs_session_upgrade();
+        if matches!(&query, Query::SelectionRevision) {
+            let mut hash = Sha256::new();
+            hash.update(b"vox/session-selection/v1");
+            hash.update(view.history_instance());
+            hash.update(public.to_be_bytes());
+            hash.update(
+                read.as_ref()
+                    .map_or(0, |r| r.header.private_generation)
+                    .to_be_bytes(),
+            );
+            hash.update(self.legacy_sessions.display_revision().to_be_bytes());
+            hash.update([u8::from(published.is_some())]);
+            if let Some((public, private)) = published {
+                hash.update(public.to_be_bytes());
+                hash.update(private.to_be_bytes());
+            }
+            hash.update(drive_basis(&authors, &refreshing));
+            hash.update([u8::from(read.as_ref().is_some_and(|r| r.header.ready))]);
+            hash.update([u8::from(self.needs_session_upgrade())]);
+            hash.update(self.effective_retention().to_be_bytes());
+            hash.update(self.effective_step_retention().to_be_bytes());
+            let members = self.members();
+            hash.update((members.len() as u64).to_be_bytes());
+            for member in members {
+                hash.update(member);
+            }
+            return Ok(Reply::SelectionRevision(hash.finalize().into()));
+        }
         let revision = Revision {
             incarnation: self.gen.clone(),
             published,
@@ -557,6 +587,7 @@ impl ChannelState {
         let Some(read) = read else {
             // No fold has run here yet: nothing is known, and every answer says so.
             return match query {
+                Query::SelectionRevision => unreachable!("selection revision answered above"),
                 Query::Waiting => Ok(Reply::Waiting(0)),
                 Query::Pending { .. } => Ok(Reply::Pending {
                     targets: Vec::new(),
@@ -611,6 +642,7 @@ impl ChannelState {
         };
         let mut retired_remaining = PAGE_ROWS;
         match query {
+            Query::SelectionRevision => unreachable!("selection revision answered above"),
             Query::Summary {
                 opening,
                 revision: previous,

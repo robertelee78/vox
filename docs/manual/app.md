@@ -84,6 +84,27 @@ A message stops being unread once at least half of it has been in view, with the
 The Dock icon shows how many things wait on you. Right-click a room, node or member to copy its
 name or fingerprint.
 
+**Mark as Read**, below the room tabs, acknowledges received messages across the whole room:
+other tags, thread replies and received history outside the displayed page included. Use the
+button, **Room > Mark Room as Read** (⇧⌘U), the command palette, or the room's right-click menu.
+Progress and the result appear in the status bar; stay in the room to see its fresh unread count.
+This does not answer Session requests or accept trust offers, so their **@!** or badge may remain.
+Messages received after the captured acknowledgement boundary remain unread until shown or marked.
+
+The room-wide summary separates addressed, new and coordination messages. The sidebar badge counts
+addressed plus new messages; only when those are zero does it count waiting requests and trust
+offers. **About unread and history** explains the difference and flags a count limited to the
+newest 1,000 rows. To read earlier content, scroll up or use **History > Load older history**:
+cached messages first, then an explicit peer-history request when needed. **End** returns to the
+newest cached messages; **History > Load newest history** requests peer history, rather than
+abandoning a pinned older view. Use **Tags > All messages** and open thread replies for content
+outside a filtered view.
+ 
+Conversation text size scales the timeline and composer, not the room's navigation controls.
+The timeline retains a 120-point minimum viewport. The room composer grows to four visible
+lines, then scrolls within the complete draft; this is not a text-length limit. Return sends
+the draft and Shift-Return adds a newline.
+
 ### A repository with no room
 
 When an agent session starts in a repository Vox has no room for, a banner across the window says

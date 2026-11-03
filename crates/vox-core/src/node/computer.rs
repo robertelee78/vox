@@ -24,8 +24,9 @@ use zeroize::Zeroizing;
 mod pairing;
 mod publication_gate;
 pub use pairing::{
-    ComputerApplication, ComputerBindingAction, ComputerIdentity, ComputerNode, ComputerStatus,
-    ExchangeRecord, Management, PairingPreview, COMPUTER_PAIR_WITHIN,
+    ComputerApplication, ComputerBindingAction, ComputerGroupConflict, ComputerGroupRetirement,
+    ComputerIdentity, ComputerNode, ComputerStatus, ExchangeRecord, Management, PairingPreview,
+    COMPUTER_PAIR_WITHIN,
 };
 
 /// A trust change must either be applied by an attached node or make that node visibly no longer

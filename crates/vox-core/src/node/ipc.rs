@@ -407,6 +407,9 @@ const T_SESSIONS_PAGE: u64 = 5438;
 const SESSIONS_PAGE_REFRESHING: usize = 1024;
 /// Exact Session metadata, using the existing bounded SessionsPage reply.
 const T_SESSION_LOOKUP: u64 = 8721;
+/// Opaque selection basis, independent of ordinary Session activity.
+const T_SESSION_SELECTION_REVISION_REQ: u64 = 89901;
+const T_SESSION_SELECTION_REVISION: u64 = 89902;
 const T_SESSIONS_WAITING_REQ: u64 = 8722;
 const T_SESSIONS_WAITING: u64 = 8723;
 const T_SESSIONS_PENDING_REQ: u64 = 8726;
@@ -870,6 +873,11 @@ pub enum Request {
     },
     /// Exact number of answerable requests across every currently readable open Session.
     SessionsWaiting {
+        /// The room.
+        channel_id: Digest32,
+    },
+    /// Current consistency basis for bounded Session selection.
+    SessionSelectionRevision {
         /// The room.
         channel_id: Digest32,
     },
@@ -1689,6 +1697,11 @@ impl Request {
             }
             Request::SessionsWaiting { channel_id } => {
                 e.array(2).uint(T_SESSIONS_WAITING_REQ).bytes(channel_id);
+            }
+            Request::SessionSelectionRevision { channel_id } => {
+                e.array(2)
+                    .uint(T_SESSION_SELECTION_REVISION_REQ)
+                    .bytes(channel_id);
             }
             Request::SessionLookup {
                 channel_id,
@@ -2753,6 +2766,11 @@ impl Request {
                 d.finish()?;
                 Ok(Request::SessionsWaiting { channel_id })
             }
+            (T_SESSION_SELECTION_REVISION_REQ, 2) => {
+                let channel_id = digest(&mut d)?;
+                d.finish()?;
+                Ok(Request::SessionSelectionRevision { channel_id })
+            }
             (T_SESSION_JOIN, 3) => {
                 let channel_id = digest(&mut d)?;
                 let node = digest(&mut d)?;
@@ -3425,6 +3443,11 @@ pub enum Frame {
         /// yet: it shows what was last published, and a later page may show more.
         provisional: bool,
     },
+    /// Opaque consistency basis for bounded Session selection.
+    SessionSelectionRevision {
+        /// The room's selection basis.
+        revision: Digest32,
+    },
     /// The exact current number of answerable requests across all open Sessions.
     SessionsWaiting {
         /// Exact current-room answerable request count, not only the displayed page.
@@ -3873,6 +3896,11 @@ impl Frame {
                     e.bytes(member);
                 }
                 e.uint(u64::from(*provisional));
+            }
+            Frame::SessionSelectionRevision { revision } => {
+                e.array(2)
+                    .uint(T_SESSION_SELECTION_REVISION)
+                    .bytes(revision);
             }
             Frame::SessionsWaiting { waiting } => {
                 e.array(2).uint(T_SESSIONS_WAITING).uint(*waiting);
@@ -5079,6 +5107,11 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 more,
                 refreshing,
                 provisional,
+            });
+        }
+        (T_SESSION_SELECTION_REVISION, 2) => {
+            return Ok(Frame::SessionSelectionRevision {
+                revision: digest(d)?,
             });
         }
         (T_SESSIONS_PENDING, 3) => {
@@ -7527,6 +7560,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         | Request::SessionsWaiting { channel_id, .. }
         | Request::SessionsPending { channel_id, .. }
         | Request::SessionLookup { channel_id, .. }
+        | Request::SessionSelectionRevision { channel_id, .. }
         | Request::SessionLifecycle { channel_id, .. }
         | Request::Pull { channel_id, .. }
         | Request::PullStates { channel_id, .. }
@@ -8596,6 +8630,12 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 reason: other.to_string(),
             },
         },
+        Request::SessionSelectionRevision { channel_id } => {
+            match handle.session_selection_revision(channel_id).await {
+                Ok(revision) => Frame::SessionSelectionRevision { revision },
+                Err(reason) => Frame::Error { reason },
+            }
+        }
         Request::SessionsPending { channel_id, after } => {
             use crate::node::channel::session_projection::{Query, Reply};
             match handle
@@ -9870,6 +9910,16 @@ impl IpcClient {
     ) -> Result<Frame> {
         let reply = self
             .request(&Request::SessionsPage { channel_id, after })
+            .await?;
+        Ok(self.older_daemon(reply))
+    }
+
+    pub(crate) async fn session_selection_revision(
+        &mut self,
+        channel_id: Digest32,
+    ) -> Result<Frame> {
+        let reply = self
+            .request(&Request::SessionSelectionRevision { channel_id })
             .await?;
         Ok(self.older_daemon(reply))
     }

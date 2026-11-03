@@ -55,6 +55,8 @@ extension VoxAction {
         let driven = node?.shownSession.flatMap { $0.canDrive && $0.open ? $0 : nil }
         // A keyring row selected, in the keyring view: what Compare, Rename and Remove act on.
         let picked = node?.selection == .keyring && node?.keyringSelected != nil
+        let readRoom = node?.roomOnScreen, readActor = node?.me
+        let readEpoch = node?.observationToken
         let digits: [VoxAction] = (1...9).map { n in
             VoxAction("View", "Room \(n)", KeyEquivalent(Character("\(n)")), enabled: live) {
                 Task { await node?.showRoom(at: n) }
@@ -77,6 +79,15 @@ extension VoxAction {
             },
             VoxAction("Room", "Copy Room Link", "l", enabled: inRoom) {
                 Task { await node?.copyRoomLink() }
+            },
+            VoxAction("Room", "Mark Room as Read", "u", [.command, .shift],
+                      enabled: inRoom && !inSession && node?.progress(of: "mark-room-read") == nil) {
+                guard let node, let room = readRoom, let actor = readActor, let epoch = readEpoch,
+                      node.acceptsObservation(epoch, actor: actor) else { return }
+                Task {
+                    guard node.acceptsObservation(epoch, actor: actor) else { return }
+                    await node.markRoomRead(room)
+                }
             },
             VoxAction("Room", "Pause…", enabled: inRoom) { node?.sheet = .pause },
             VoxAction("Room", "Resume…", enabled: inRoom) { node?.sheet = .resume },

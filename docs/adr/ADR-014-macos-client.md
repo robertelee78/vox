@@ -244,6 +244,19 @@ F-9–F-11; RR-1, RR-3, RR-4 (RR-2 is the daemon's); D-3; L-1–L-10; W-1–W-6;
   The implementation MUST use supported macOS filesystem interfaces and preserve Apple code
   signing and update-security policy; it MUST NOT weaken platform protections, require sudo,
   or ask the operator to repair an ordinarily refused filesystem transition.
+  Persisted filesystem identities MUST use the volume's persistent UUID, full-width object
+  number and birth time; a changed transient device number alone MUST NOT strand the same
+  object. Missing or malformed durable evidence, a different object or volume, or invalid
+  archive authority MUST retain the transaction and refuse rather than weaken verification.
+  Old journals MUST NOT be assigned a fabricated historical volume identity. A committed
+  archive-bearing legacy transaction with completed app handoff and missing daemon handoff MAY
+  readopt the present target only after authenticating the exact signed payload and rollback
+  authority, recording a new durable receipt, and preserving the original identity evidence.
+  This is present-payload authorization, not proof of historical filesystem identity. A
+  committed rollback MUST use its authenticated local prior archive without requiring network.
+  Unsafe or ambiguous recovery MUST preserve its evidence and direct the operator to support,
+  not require editing the journal. A previous-version caller can acquire this recovery only
+  through a verified newer updater or another already-installed engine containing it.
   Sparkle 2.10.1's released installer is the researched reference, not an assumed drop-in
   transaction API. Its public updater does not supply Vox's pinned local-archive, single-owner
   journal and explicit offline-rollback interface. The implementation MUST NOT silently drop

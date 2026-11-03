@@ -13,6 +13,15 @@ struct SettingsView: View {
     @State private var showingNetwork = false
 
     var body: some View {
+        ScrollView { settings }
+            .frame(idealHeight: 605)
+            .frame(width: Theme.scaled(460), alignment: .topLeading)
+            .contentSurface()
+            .sheet(isPresented: $showingComputers) { ComputerTrustView() }
+            .sheet(isPresented: $showingNetwork) { NetworkSettingsView() }
+    }
+
+    private var settings: some View {
         VStack(alignment: .leading, spacing: Space.s20) {
             if !app.agentSetups.isEmpty {
                 setting {
@@ -101,10 +110,7 @@ struct SettingsView: View {
             }
         }
         .padding(Space.s24)
-        .frame(width: Theme.scaled(460), alignment: .topLeading)
-        .contentSurface()
-        .sheet(isPresented: $showingComputers) { ComputerTrustView() }
-        .sheet(isPresented: $showingNetwork) { NetworkSettingsView() }
+        .frame(maxWidth: .infinity, alignment: .topLeading)
     }
 
     /// One setting: its control, then what it does in secondary text.

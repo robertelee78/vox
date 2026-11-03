@@ -30,6 +30,40 @@ pub async fn revision(client: &mut IpcClient, room: Digest32) -> Result<Digest32
         .ok_or_else(|| "the room is not open".into())
 }
 
+async fn selection_revision(client: &mut IpcClient, room: Digest32) -> Result<Digest32, String> {
+    match client
+        .session_selection_revision(room)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        Frame::SessionSelectionRevision { revision } => Ok(revision),
+        Frame::Error { reason } => Err(reason),
+        Frame::NodeDetached { node } => Err(format!("the connection to node {node} ended")),
+        _ => Err("the node did not answer its Session selection state".into()),
+    }
+}
+
+#[cfg(feature = "test-knobs")]
+async fn hold_selection_for_proof() -> Result<(), String> {
+    let Some(path) = std::env::var_os("VOX_TEST_SESSION_SELECTION_HOLD_FILE")
+        .filter(|path| !path.is_empty())
+        .map(std::path::PathBuf::from)
+    else {
+        return Ok(());
+    };
+    let reached = path.with_extension("reached");
+    std::fs::write(&reached, b"reached").map_err(|e| {
+        format!(
+            "Session selection proof could not mark {}: {e}",
+            reached.display()
+        )
+    })?;
+    while path.exists() {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    Ok(())
+}
+
 /// Resolve an explicit id, id prefix or name, preserving the shared resolver's precedence.
 /// One logical metadata page and at most two candidate rows are retained. A legal member field
 /// is kept whole; this does not impose an artificial metadata length limit.
@@ -96,7 +130,9 @@ async fn select(
             "name a Session: its id, the first 8 or more characters of it, or its name".into(),
         );
     }
-    let stamp = revision(client, room).await?;
+    let stamp = selection_revision(client, room).await?;
+    #[cfg(feature = "test-knobs")]
+    hold_selection_for_proof().await?;
     let prefix = typed.chars().count() >= 8;
     let mut by_id = None;
     let mut by_name = None;
@@ -130,7 +166,7 @@ async fn select(
         };
         // A changing room cannot keep this explicit lookup following a growing tail forever.
         // Each bounded page belongs to the same observed projection generation.
-        if revision(client, room).await? != stamp {
+        if selection_revision(client, room).await? != stamp {
             return Err("the room's Sessions changed while selecting; try again".into());
         }
         let next = sessions.last().map(|s| s.opening);
@@ -182,12 +218,48 @@ async fn select(
         }
         after = next;
     }
-    let (count, selected) = if id_count != 0 {
-        (id_count, by_id)
+    let (count, selected, matched_id) = if id_count != 0 {
+        (id_count, by_id, true)
     } else {
-        (name_count, by_name)
+        (name_count, by_name, false)
     };
-    if revision(client, room).await? != stamp {
+    let selected = if count == 1 {
+        let row = selected.ok_or("the node did not answer the Session selection")?;
+        match client
+            .session_lookup(room, row.node, row.id.clone())
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            Frame::SessionsPage {
+                mut sessions,
+                more: false,
+                ..
+            } if sessions.len() == 1 => {
+                let current = sessions.remove(0);
+                if current.node != row.node
+                    || current.id != row.id
+                    || current.opening != row.opening
+                    || (matched_id
+                        && !(current.id == typed || (prefix && current.id.starts_with(typed))))
+                    || (!matched_id && current.name.as_deref() != Some(typed))
+                {
+                    return Err("the room's Sessions changed while selecting; try again".into());
+                }
+                Some(current)
+            }
+            Frame::Error { reason } => return Err(reason),
+            Frame::NodeDetached { node } => {
+                return Err(format!("the connection to node {node} ended"))
+            }
+            Frame::SessionsPage { .. } => {
+                return Err("the room's Sessions changed while selecting; try again".into())
+            }
+            _ => return Err("the node did not answer the latest Session opening".into()),
+        }
+    } else {
+        selected
+    };
+    if selection_revision(client, room).await? != stamp {
         return Err("the room's Sessions changed while selecting; try again".into());
     }
     match (count, selected) {

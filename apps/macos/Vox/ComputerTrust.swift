@@ -67,6 +67,9 @@ struct ComputerTrustView: View {
     @State private var copied: String?
     @State private var removal: RemovalChoice?
     @State private var bindingChoice: BindingChoice?
+    @State private var replacement: ComputerGroupConflict?
+    @State private var handoff: ComputerGroupConflict?
+    @State private var retirement: ComputerGroupRetirement?
 
     private struct BindingChoice {
         let binding: ComputerBindingAction
@@ -92,15 +95,20 @@ struct ComputerTrustView: View {
                         Text(status.policy)
                             .fixedSize(horizontal: false, vertical: true)
                             .accessibilityIdentifier("computer-trust-policy")
-                        Text("Policy revision \(status.revision)")
-                            .font(Theme.mono).secondaryText()
-                            .accessibilityIdentifier("computer-policy-revision")
+                        DisclosureGroup("Identity and policy details") {
+                            Text("Policy revision \(status.revision)")
+                                .font(Theme.mono).secondaryText()
+                                .accessibilityIdentifier("computer-policy-revision")
+                        }
                         if !model.reachable {
                             Text("Last known state. Checking with Vox…").secondaryText()
                         }
                         if let problem = status.problem {
                             StateMark(kind: .danger, words: problem)
                                 .accessibilityIdentifier("computer-pairing-problem")
+                        }
+                        ForEach(status.topology, id: \.self) { line in
+                            Text(line).fixedSize(horizontal: false, vertical: true)
                         }
                         pairing(status)
                         if !status.pendingNodes.isEmpty {
@@ -115,19 +123,21 @@ struct ComputerTrustView: View {
                             Text("Enrolled computers").eyebrow()
                             ForEach(status.applications, id: \.computer.fingerprint) { application in
                                 VStack(alignment: .leading, spacing: Space.s4) {
-                                    identity(application.computer, title: application.computer.name)
-                                    ForEach(status.nodes.filter { $0.computer == application.computer.fingerprint }, id: \.fingerprint) { node in
-                                        VStack(alignment: .leading, spacing: Space.s4) {
-                                            Text(node.name).font(.headline)
-                                            Text(node.fingerprint).font(Theme.mono).textSelection(.enabled)
-                                                .fixedSize(horizontal: false, vertical: true)
-                                            Text(node.personal ? "Personal node · can drive non-personal nodes" : "Managed node · read access")
-                                                .secondaryText()
-                                            if let revision = node.bindingRevision,
-                                               let derived = node.bindingDerivedMs {
-                                                Text("Binding derived at policy revision \(revision) · Unix ms \(derived)")
-                                                    .font(Theme.mono).secondaryText()
-                                                    .accessibilityIdentifier("computer-binding-evidence-" + node.fingerprint)
+                                    Text(application.computer.name).font(.headline)
+                                    DisclosureGroup("Identity and node details") {
+                                        identity(application.computer, title: application.computer.name)
+                                        ForEach(status.nodes.filter { $0.computer == application.computer.fingerprint }, id: \.fingerprint) { node in
+                                            VStack(alignment: .leading, spacing: Space.s4) {
+                                                Text(node.name).font(.headline)
+                                                Text(node.fingerprint).font(Theme.mono).textSelection(.enabled)
+                                                    .fixedSize(horizontal: false, vertical: true)
+                                                Text(node.personal ? "Personal node · can drive non-personal nodes" : "Managed node · read access")
+                                                    .secondaryText()
+                                                if let revision = node.bindingRevision, let derived = node.bindingDerivedMs {
+                                                    Text("Binding derived at policy revision \(revision) · Unix ms \(derived)")
+                                                        .font(Theme.mono).secondaryText()
+                                                        .accessibilityIdentifier("computer-binding-evidence-" + node.fingerprint)
+                                                }
                                             }
                                         }
                                     }
@@ -141,6 +151,15 @@ struct ComputerTrustView: View {
                                     Text(applicationState(application, status: status))
                                         .secondaryText()
                                         .accessibilityIdentifier("computer-application-" + application.computer.fingerprint)
+                                    Text(application.computer.fingerprint == status.thisComputer.fingerprint
+                                         ? "Connectivity: this computer"
+                                         : application.exchangeInFlight
+                                         ? "Connectivity: exchange in progress; current reachability unknown"
+                                         : application.exchangeFailures > 0
+                                         ? "Connectivity: last exchange failed; current reachability unknown"
+                                         : "Connectivity: current reachability unknown")
+                                        .secondaryText()
+                                    DisclosureGroup("Exchange diagnostics") {
                                     Text("Exchanged \(application.exchanges) time(s) in \(application.exchangeAttempts) attempt(s) · \(application.exchangeFailures) failed in a row")
                                         .font(Theme.mono).secondaryText()
                                         .accessibilityIdentifier("computer-exchange-counts-" + application.computer.fingerprint)
@@ -155,12 +174,13 @@ struct ComputerTrustView: View {
                                         Text("Last answered exchange: sent revision \(exchange.sentRevision), merged revision \(exchange.mergedRevision), Unix ms \(exchange.atMs)")
                                             .font(Theme.mono).secondaryText()
                                     }
+                                    }
                                 }
                             }
                         }
                         if !status.bindingActions.isEmpty {
                             Divider()
-                            Text("Node management").eyebrow()
+                            DisclosureGroup("Optional node management") {
                             ForEach(status.bindingActions, id: \.node) { binding in
                                 VStack(alignment: .leading, spacing: Space.s4) {
                                     Text(binding.name).font(.headline)
@@ -185,6 +205,7 @@ struct ComputerTrustView: View {
                             }
                             Text("A transfer needs a signed release from its previous manager. Recovery needs retained removal or fault evidence. After approving here, unlock the node's local vault normally to sign its new binding. A copied name or fingerprint is never proof of management.")
                                 .secondaryText()
+                            }
                         }
                         if !status.removed.isEmpty {
                             Divider()
@@ -233,6 +254,35 @@ struct ComputerTrustView: View {
                 await model.refresh()
             }
         }
+        .alert("Replace This Computer's Group?", isPresented: Binding(get: { replacement != nil }, set: { if !$0 { replacement = nil } }), presenting: replacement) { choice in
+            Button("Retire Old Group Locally", role: .destructive) {
+                replacement = nil
+                Task {
+                    await model.perform {
+                        try await $0.changeComputerBinding(action: "replace-group", node: choice.reviewId,
+                                                           destination: "", frontier: choice.frontier)
+                    }
+                    if model.status?.state == "individual", model.actionProblem == nil { handoff = choice }
+                }
+            }
+            .accessibilityIdentifier("computer-replacement-confirm")
+            Button("Cancel", role: .cancel) { replacement = nil }
+                .accessibilityIdentifier("computer-replacement-decline")
+        } message: { choice in
+            Text("Retire the reviewed old group on this computer? Covered Read, Drive and individual grants are revoked locally. Identities, data and signed history remain. Unreachable computers may retain access and data.\n\n" + choice.affected.joined(separator: "\n"))
+        }
+        .alert("Finish Local Group Retirement?", isPresented: Binding(get: { retirement != nil }, set: { if !$0 { retirement = nil } }), presenting: retirement) { choice in
+            Button("Retire Group Locally", role: .destructive) {
+                retirement = nil
+                Task { await model.perform {
+                    try await $0.changeComputerBinding(action: "recover-group", node: choice.reviewId,
+                                                       destination: "", frontier: choice.frontier)
+                } }
+            }
+            Button("Cancel", role: .cancel) { retirement = nil }
+        } message: { choice in
+            Text("Retire the old group and its covered local grants? Identities, data and signed history remain. Unreachable computers may retain access and data.\n\n" + choice.affected.joined(separator: "\n"))
+        }
         .alert("Remove Computer?", isPresented: Binding(get: { removal != nil }, set: { if !$0 { removal = nil } }), presenting: removal) { choice in
             Button("Remove Computer", role: .destructive) {
                 let computer = choice.computer.fingerprint
@@ -256,24 +306,18 @@ struct ComputerTrustView: View {
             }
             Button("Cancel", role: .cancel) { bindingChoice = nil }
         } message: { choice in
-            Text(choice.binding.action == "recover-group"
-                 ? "Abandon this removed group here and purge its covered grants before starting a fresh pairing? Signed history and the retired group identity remain recorded so old updates cannot restore it. This does not remove trust or erase data on unreachable computers."
-                 : "Node: \(choice.binding.name)\n\(choice.binding.node)\nPrevious manager: \(choice.binding.computer)\n"
+            Text("Node: \(choice.binding.name)\n\(choice.binding.node)\nPrevious manager: \(choice.binding.computer)\n"
                  + (choice.binding.action == "release"
                     ? "Release only to \(choice.destination). This computer relinquishes the binding and automatic policy for this node. The destination must approve and unlock it."
                     : "Approve \(choice.binding.action) to this computer using the retained signed evidence. No trust is applied until the node signs with its unlocked local vault. If its key was compromised, create a fresh node instead."))
         }
-        .onDisappear { link = ""; copied = nil; removal = nil; bindingChoice = nil }
+        .onDisappear { link = ""; copied = nil; removal = nil; bindingChoice = nil; replacement = nil; retirement = nil; handoff = nil }
     }
 
     @ViewBuilder private func pairing(_ status: ComputerStatus) -> some View {
         if status.state == "removed" {
             Text("This computer was removed. Its automatic group trust is being revoked. To rejoin, use a new pairing code from a remaining member and approve again.")
                 .accessibilityIdentifier("computer-trust-removed")
-            Button("Abandon This Group Locally…") {
-                bindingChoice = BindingChoice(binding: ComputerBindingAction(node: "group", name: "This group", computer: status.thisComputer.fingerprint, action: "recover-group"), destination: "", frontier: status.frontier)
-            }
-            .disabled(model.busy || !model.reachable)
         } else if status.state == "quarantined" {
             Text("Computer trust is suspended.")
                 .accessibilityIdentifier("computer-trust-quarantined")
@@ -284,7 +328,59 @@ struct ComputerTrustView: View {
             Text("Computer trust was approved. Waiting for it to be applied across the group.")
                 .accessibilityIdentifier("computer-trust-applying")
         }
-        if let preview = status.pairing, status.state != "quarantined" {
+        if let review = status.retirement {
+            Text("This computer was removed from its previous group. Review the remaining local retirement before starting a fresh pairing.")
+                .secondaryText()
+            ForEach(review.affected, id: \.self) { Text($0).textSelection(.enabled) }
+            Button("Review Local Retirement…") { retirement = review }
+                .disabled(model.busy || !model.reachable)
+                .accessibilityIdentifier("computer-retirement-review")
+        } else if let conflict = status.conflict, status.state != "quarantined" {
+            Divider()
+            identity(conflict.peer, title: "Authenticated computer in a different group")
+            Text("Current group: \(conflict.currentGroup)\nProposed group: \(conflict.proposedGroup)")
+                .font(Theme.mono).textSelection(.enabled)
+            Text("Replacing locally revokes covered Read, personal-to-managed-node Drive and covered individual grants. Identities, local data and signed history remain. Unreachable computers may retain access and data.")
+                .fixedSize(horizontal: false, vertical: true)
+            ForEach(conflict.affected, id: \.self) { Text($0).textSelection(.enabled) }
+            if conflict.inviterApproved {
+                Text("The proposal is already signed on \(conflict.peer.name). Wait until \(Date(timeIntervalSince1970: Double(conflict.expiresMs) / 1_000).formatted()) before closing it there. Closing does not withdraw a signature already retained elsewhere.")
+                    .secondaryText()
+            }
+            if expired(conflict.expiresMs) {
+                Text("This proposal has expired. Close it on the inviting computer and review a fresh invitation before replacing this group.")
+                    .secondaryText()
+                Button("Copy Close Command for \(conflict.peer.name)") {
+                    copy(shellCommand(words: ["vox", "computer", "cancel", conflict.operationId]),
+                         said: "Close command copied for \(conflict.peer.name).")
+                }
+                Button("Copy Fresh Invitation Command") {
+                    copy(shellCommand(words: ["vox", "computer", "invite"]), said: "Invitation command copied.")
+                }
+            }
+            Button("Review Group Replacement…") { replacement = conflict }
+                .disabled(model.busy || !model.reachable || expired(conflict.expiresMs))
+                .accessibilityIdentifier("computer-replace-group")
+            Button("Keep Current Group and Close This Review") {
+                let operation = conflict.operationId
+                Task { await model.perform { try await $0.cancelComputerPairing(operationId: operation) } }
+            }
+            .disabled(model.busy || !model.reachable)
+            .accessibilityIdentifier("computer-conflict-close")
+            Text("This closes the review only on this computer. It cannot withdraw an invitation or signature recorded on \(conflict.peer.name).")
+                .secondaryText()
+            TextField("Pairing code to review again", text: $link)
+                .textFieldStyle(.roundedBorder)
+                .privacySensitive()
+                .accessibilityIdentifier("computer-conflict-input")
+            Button("Review Code Again") {
+                let code = link.trimmingCharacters(in: .whitespacesAndNewlines)
+                link = ""
+                Task { await model.perform { try await $0.previewComputerPairing(link: code) } }
+            }
+            .disabled(model.busy || !model.reachable || link.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            .accessibilityIdentifier("computer-conflict-review-again")
+        } else if let preview = status.pairing, status.state != "quarantined" {
             Divider()
             identity(preview.peer, title: "Computer to add")
             if expired(preview.expiresMs), !preview.approvedHere || !preview.approvedThere {
@@ -296,8 +392,14 @@ struct ComputerTrustView: View {
             } else if preview.approvedHere {
                 Text(preview.approvedThere
                      ? "Both computers approved. Waiting for applied confirmation."
-                     : "Approved here. Confirm on the other computer to continue.")
+                     : "Approved here. Confirm on \(preview.peer.name) (\(preview.peer.fingerprint)) to continue.")
                     .accessibilityIdentifier("computer-pairing-waiting")
+                if !preview.approvedThere {
+                    Button("Copy Other Computer's Approval Command") {
+                        copy(shellCommand(words: ["vox", "computer", "approve", preview.operationId]),
+                             said: "Approval command copied for \(preview.peer.name).")
+                    }
+                }
             } else {
                 Text("Confirm this computer and the permissions above.")
                 Button("Trust This Computer") {
@@ -309,6 +411,10 @@ struct ComputerTrustView: View {
                 .buttonStyle(.voxPrimary)
                 .disabled(model.busy || !model.reachable || expired(preview.expiresMs))
                 .accessibilityIdentifier("computer-pairing-approve")
+                Button("Copy This Computer's Approval Command") {
+                    copy(shellCommand(words: ["vox", "computer", "approve", preview.operationId]),
+                         said: "Approval command copied for this computer.")
+                }
             }
         } else if let invitation = status.inviteLink, status.state != "quarantined" {
             Divider()
@@ -357,6 +463,16 @@ struct ComputerTrustView: View {
             }
             .disabled(model.busy || !model.reachable || link.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             .accessibilityIdentifier("computer-pairing-preview")
+        }
+        if let handoff, status.state == "individual" {
+            Text("On \(handoff.peer.name), \(handoff.inviterApproved && !expired(handoff.expiresMs) ? "wait until the signed proposal expires, then " : "")close the old proposal and create a fresh invitation. If it was signed after review, wait for expiry before closing. Bring the fresh invitation here and approve on both computers. Closing cannot withdraw a signature already recorded elsewhere.")
+                .fixedSize(horizontal: false, vertical: true)
+            Button("Copy Command to Close Old Proposal") {
+                copy(shellCommand(words: ["vox", "computer", "cancel", handoff.operationId]), said: "Close command copied for \(handoff.peer.name).")
+            }
+            Button("Copy Command to Create Fresh Invitation") {
+                copy(shellCommand(words: ["vox", "computer", "invite"]), said: "Invitation command copied for \(handoff.peer.name).")
+            }
         }
         let approvedHere = status.pairing?.approvedHere == true
         let closeExpired = approvedHere && status.pairing?.approvedThere != true

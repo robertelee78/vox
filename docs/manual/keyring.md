@@ -231,13 +231,25 @@ vox computer status
 vox computer invite
 ```
 
-Send the actual invitation to the other computer through your trusted channel. There, construct
-`vox computer pair` with that entire quoted invitation and `--preview`. Read the computers,
-nodes and trust changes it names. To approve, use the complete `vox computer approve` command
-for that exact operation on **each** computer. Copy the commands from the actual output, keeping
-the acting computer distinct; no node selector changes which computer approves. Read
-`vox computer status` on both afterwards: a proposal or pending confirmation is not completed
-enrollment. Pairing grants no room membership; join the same room and verify a message both ways.
+Send the invitation to the other computer through your trusted channel. Paste the complete
+terminal command printed by `invite`, or paste the code into Add Computer. Review the
+authenticated identity and fixed policy, then explicitly approve on that computer. The
+inviting computer must also review and approve the same operation. Each surface names which
+computer must act next; approval on one side never substitutes for the other. `--preview`
+shows the proposal without approving it. Pairing grants no room membership; join the same
+room and verify a message both ways.
+
+If an authenticated computer is already in a different established group, Vox explains the
+conflict instead of calling it a bad signature. On the computer to move, review the affected
+identities and grants and explicitly choose local replacement. Declining changes no trust.
+To keep the existing group, close the review on this computer using the button or the complete
+`vox computer cancel` command shown there. That local closure prevents reuse of that proposal
+here; it does not cancel or withdraw a signature on the inviting computer.
+This preserves identities, local data and signed history; unreachable computers may retain
+old access and data. On the inviting computer, close its old proposal and create a fresh
+invitation; if it already signed, wait until the incomplete attempt expires before closing.
+Closing locally cannot withdraw a signature already retained elsewhere. Both computers must
+approve the fresh operation.
 
 Every managed node can read the other managed nodes. A computer's selected personal node can
 drive nonpersonal nodes; personal nodes cannot drive each other. The daemon saves the app's
@@ -256,12 +268,14 @@ vox computer personal --clear
 ```
 
 The roster follows node creation, rename and removal. Fingerprints establish identity; names
-only label it. Local aliases survive presented-name changes. Status shows the current policy and
-which computers have confirmed applying it. An offline computer remains pending until it
-reconnects and applies the signed update. A Locked local node must be unlocked to apply it.
+only label it. Local aliases survive presented-name changes. Status shows configured direct
+group Read and personal-to-nonpersonal Drive separately from application receipts and observed
+connectivity. Receipts do not prove that a computer is currently online, nor do they establish
+room membership, consent or Session access. Use `vox computer status --details` for complete
+identities, revisions, counters and optional node-management actions.
 
-To remove a computer, review its full fingerprint and nodes in `vox computer status`, then use
-the exact displayed frontier:
+To remove a computer, review its full fingerprint and nodes in `vox computer status --details`,
+then use the exact displayed frontier:
 
 Construct `vox computer remove` with the intended computer's full fingerprint from that
 status, and its current frontier in `--confirm`. Both values come from the actual status;
@@ -293,11 +307,11 @@ manager is lost, remove it first, then explicitly approve recovery on the destin
 `vox computer binding recover` with the actual node fingerprint and the current destination
 frontier in `--confirm`. Recovery retains the old binding and removal evidence. If a node key was compromised, use a new node identity instead.
 
-If this computer has been removed and the old group cannot be continued, explicitly abandon
-that group locally with `vox computer binding recover-group`, the literal argument `group`,
-and the current frontier from `vox computer status` in `--confirm`.
-This retires its old authority and removes covered grants before any fresh pairing. It does
-not erase other computers' data or silently recreate the old membership.
+If this computer has been removed and the old group cannot be continued, use
+`vox computer retire`. Review the computers and covered authority and confirm explicitly;
+Vox checks that the reviewed state has not changed before retiring it locally. This preserves
+identities, data and signed history and removes covered grants before a fresh pairing. It does
+not erase data or claim revocation on unreachable computers.
 
 ## Trust from the TUI
 

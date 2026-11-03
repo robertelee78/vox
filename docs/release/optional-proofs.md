@@ -62,6 +62,7 @@ be reported as a derived spike, with its source/dispatcher hashes, not as the un
 VOX_DATA_DIR=/absolute/scratch/data VOX_CONFIG_DIR=/absolute/scratch/config \
 VOX_PROOF_PREVIOUS_SHIPPED_APP=/absolute/signed-prior/Vox.app \
 VOX_PROOF_SHIPPED_APP=/absolute/signed-candidate/Vox.app \
+VOX_PROOF_LEGACY_PRODUCER_APP=/absolute/signed-old-producer/Vox.app \
 cargo test --release -p vox-tui --features optional-proofs,test-knobs \
   --test update_proof -- --ignored --exact \
   an_update_and_rollback_leave_one_launchable_vox --nocapture
@@ -74,6 +75,11 @@ the downloaded target, so a knob compiled only into the prior or test runner can
 The journey checks the supplied helpers as an apparatus precondition. Developer ID sign and
 notarize both complete bundles before supplying them; change neither after signing. Record
 the source delta, versions, feature selections, artifact digests and Apple's receipts.
+The legacy producer is a separately source-bound old updater artifact, with a version strictly
+between the prior and candidate, signed and notarized with its original helper. It must support
+the existing test-knob release transport. Without `VOX_PROOF_LEGACY_PRODUCER_APP` the ordinary
+update/rollback cases still run, but the old-journal cases are not exercised. Record the old
+source revision, build features, exact artifact digest and notarization receipt independently.
 
 This source-bound interruption proof is not normal-artifact release-trust evidence. Record
 the untouched public-prior → normal public-candidate upgrade separately, using the published
@@ -85,6 +91,29 @@ The existing journey drives `install.sh`, the physically installed helpers, an o
 retirement and replacement, identifier launches, two version-changing offline rollbacks, and
 real interruption immediately after exchange followed by offline source restoration. Its
 consumer assertions require the saved message and Ready remembered node after each transition.
+The interrupted case also substitutes a separately copied, still-signed bundle and requires
+the installed updater to refuse it. It then restores the original object, preserves the
+original journal bytes, perturbs its two diagnostic device fields in scratch, and requires
+successful recovery and real profile use. This is object-substitution and device-perturbation
+sensitivity evidence, not evidence of a reboot or volume remount.
+
+For retained device-number recovery, preserve the genuine old updater's original journal and
+source/artifact receipts. Use an old producer, not a current build with a changed version or a
+handwritten journal. Stage its committed archive-bearing handoff with the app already complete
+and daemon incomplete, then invoke the installed old helper's ordinary `vox update` against a
+newer corrected signed engine. Record both profile roots, selected artifacts, command output,
+the saved node fingerprint and room identity, existing message read, and a new post/read. Observe
+the historical app handoff separately from any later legitimate update handoff. A scratch-only
+device-field perturbation is an apparatus sensitivity check, not evidence of a reboot/remount.
+With the old producer supplied, the journey holds the scratch node's UDP address after the
+old daemon releases it, so the real producer can retain a failed daemon handoff. It confirms
+the native app handoff, quits that replacement, and checks recovery does not launch another
+app. It runs once with the unmodified journal and once with a scratch-only device perturbation;
+the latter also exercises corrupted archive and signature refusals and a changed readoption
+target. Failure to occupy the address or obtain the required journal is APPARATUS, not proof.
+Run invalid archive, changed receipt, copied-object and different-volume refusals separately;
+retain their state and distinguish product refusals from staging failures. A rollback recovery
+must also be measured offline against its locally retained prior archive.
 
 Run the real precommit filesystem-refusal/partial-delete restoration and genuine already-used
 legacy incomplete-journal scenarios separately under the same signed trust and scratch rules.

@@ -19,6 +19,12 @@ mod macos {
             error: *mut std::ffi::c_char,
             error_capacity: usize,
         ) -> i32;
+        fn vox_volume_uuid(
+            path: *const std::ffi::c_char,
+            result: *mut u8,
+            error: *mut std::ffi::c_char,
+            error_capacity: usize,
+        ) -> i32;
     }
 
     fn input(path: &Path) -> Result<CString, String> {
@@ -28,6 +34,29 @@ mod macos {
     fn message(buffer: &[u8]) -> String {
         let end = buffer.iter().position(|&b| b == 0).unwrap_or(buffer.len());
         String::from_utf8_lossy(&buffer[..end]).into_owned()
+    }
+
+    /// Read the persistent UUID of the volume containing `path`.
+    pub fn volume_uuid(path: &Path) -> Result<[u8; 16], String> {
+        let path = input(path)?;
+        let mut result = [0u8; 16];
+        let mut error = [0u8; 4096];
+        // SAFETY: all buffers remain live for the synchronous native call.
+        let ok = unsafe {
+            vox_volume_uuid(
+                path.as_ptr(),
+                result.as_mut_ptr(),
+                error.as_mut_ptr().cast(),
+                error.len(),
+            )
+        };
+        if ok == 0 {
+            Err(message(&error))
+        } else if result == [0; 16] {
+            Err("persistent volume UUID is zero".into())
+        } else {
+            Ok(result)
+        }
     }
 
     /// Create a Foundation replacement directory on the volume containing `path`.
@@ -71,4 +100,4 @@ mod macos {
 }
 
 #[cfg(target_os = "macos")]
-pub use macos::{remove_item, replacement_directory};
+pub use macos::{remove_item, replacement_directory, volume_uuid};
