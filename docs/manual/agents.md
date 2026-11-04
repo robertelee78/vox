@@ -168,6 +168,11 @@ The doctor prints one line per check, `ok`, `warn` or `fail`, with a `fix:` wher
 checks the node, the room, each harness's hook or plugin, session records, trust in each
 direction and versions. It exits nonzero on a `fail`. It starts nothing and posts nothing.
 
+For Oh My Pi, a wake endpoint that answers identifies the exact live client, even while a
+native request or room notice is in progress. The check does not admit a notice, reset the
+route, or prove that the model consumed a message. A busy client is not an ended conversation;
+confirm actual delivery with a correlated room reply as described below.
+
 To ask whether the agent's node has live sessions, run this from your own node:
 
 ```sh

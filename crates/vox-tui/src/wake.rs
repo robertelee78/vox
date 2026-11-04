@@ -277,6 +277,7 @@ async fn current_client_route(client: &AttentionClient, session: &str) -> Option
     let reply: serde_json::Value = serde_json::from_str(&line).ok()?;
     let hex = reply["route"].as_str()?;
     if reply["outcome"].as_str() != Some("available")
+        || reply["admission"].as_bool() == Some(false)
         || reply["session"].as_str() != Some(session)
         || reply["client"].as_str() != Some(client.client.as_str())
         || hex.len() != 64
