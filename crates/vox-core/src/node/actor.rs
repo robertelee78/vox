@@ -11009,6 +11009,11 @@ impl Node {
                     .as_ref()
                     .is_some_and(|n| n.manager().existing(&peer).is_none());
                 if unconnected {
+                    // Keep the failed member's current room demand on its normal port, so
+                    // the existing unreachable backoff can pace the next sync reach.
+                    if let Some((_, owner)) = member_owner {
+                        self.ensure_port(&owner.room, &peer).await;
+                    }
                     let rooms: Vec<Digest32> = self
                         .ports
                         .keys()
@@ -15565,6 +15570,15 @@ impl Node {
             for peer in &peers {
                 pairs.insert((room, *peer));
             }
+            // A retained exact-author reroute may need an offline member's port.
+            // Do not revive flows from an older room instance.
+            if let Some(current) = self.channels.get(&room) {
+                for flow in self.bounded_sync.reroute_targets(room) {
+                    if Arc::ptr_eq(current, &flow.shared) {
+                        pairs.insert((room, flow.peer));
+                    }
+                }
+            }
         }
         let fresh_peers = std::mem::take(&mut self.discover_peers);
         for peer in &fresh_peers {
@@ -18162,10 +18176,24 @@ impl Node {
         let room = *channel_id;
         let tx = self.net_tx.clone();
         let generation = net.manager().network_generation();
+        let board = net.board_endpoints(&room, &peer);
+        let fallback = if board.is_empty() {
+            self.peer_book.endpoints(&peer)
+        } else {
+            Default::default()
+        };
         tokio::spawn(async move {
-            // This node's board record, or a connected board's when it holds none yet (V210-122,
-            // V030-22).
-            let endpoints = net.member_endpoints(&room, peer).await;
+            // Prefer the current local or connected board; the peerbook is a last resort.
+            let endpoints = if board.is_empty() {
+                let current = net.member_endpoints(&room, peer).await;
+                if current.is_empty() {
+                    fallback
+                } else {
+                    current
+                }
+            } else {
+                board
+            };
             if net.manager().network_generation() != generation {
                 return;
             }

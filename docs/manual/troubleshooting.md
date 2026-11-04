@@ -1,6 +1,6 @@
 # Troubleshooting by symptom
 
-Applies to Vox v0.4.10.
+Applies to Vox v0.4.16.
 
 Find the message or behaviour you see, then follow its steps. Each entry says what the symptom
 means, what to check, how to fix it, and how to confirm the fix.
@@ -288,6 +288,12 @@ vox: the network changed: addresses came: 10.9.1.7; went: 10.9.0.1; IPv4 default
   also behind NAT reaches you only through an anchor.
 - `vox status` on both sides: is the peer `connected`, and `direct` or relayed?
 - A VPN, a firewall or a captive portal can block UDP.
+
+After an ordinary daemon restart, a failed first connection does not require another restart
+or a replacement post. Vox retains the room's pending recovery and tries the member again,
+using current room addresses before previously authenticated peer addresses. Keep the entitled
+member online and provide a reachable network path; retained work cannot make a blocked path
+reachable. Do not regrant trust, leave and rejoin, or reset the profile to force recovery.
 
 **Fix:** sign in to the captive portal, allow UDP, or give both sides an anchor they can reach.
 

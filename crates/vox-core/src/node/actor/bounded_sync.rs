@@ -1011,6 +1011,23 @@ impl Controller {
     pub(super) fn completion_wake(&self) -> Arc<tokio::sync::Notify> {
         Arc::clone(&self.completion_wake)
     }
+    /// Exact author targets of retained reroutes, not physical or retiring work.
+    pub(super) fn reroute_targets(&self, room: Digest32) -> impl Iterator<Item = &Flow> + '_ {
+        self.ready
+            .iter()
+            .flatten()
+            .chain(self.deferred.iter())
+            .filter(move |flow| {
+                flow.room == room
+                    && flow.route_origin.is_some()
+                    && !flow.route_complete
+                    && flow
+                        .request_fence
+                        .as_ref()
+                        .is_none_or(|fence| !fence.is_retired())
+            })
+    }
+
     /// A retained current/archive continuation is itself demand on its exact room/peer port.
     /// Port request generations describe external wakes; an independent clean exchange may
     /// consume one while this continuation is between bounded slices. Do not let that scalar
@@ -3694,6 +3711,9 @@ impl Node {
                     port.clear_service_backoff(work.service);
                 } else {
                     self.discover_rooms.insert(work.room);
+                    // This completion can be accepted after discovery in the current
+                    // schedule pass. Retain an exact wake for the next discovery pass.
+                    self.availability_wake.notify_one();
                 }
                 crate::node::status::SyncBook::with(&self.sync_book, work.room, target, |counts| {
                     counts.backoff = None
