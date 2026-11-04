@@ -555,8 +555,10 @@ export default function vox(pi) {
     const { record, index } = matched[0]
     const snapshot = record?.fence || fence()
     if (!snapshot || !fenced(snapshot)) return { messages }
+    // Only requests belonging to this new native step can acknowledge its marker.
+    providerActive = 0
     const op = { fence: snapshot, record, child: null, injected: false, done: false,
-      marker: "vox-context-" + randomBytes(32).toString("hex"), ambiguous: providerActive !== 0, matched: false }
+      marker: "vox-context-" + randomBytes(32).toString("hex"), ambiguous: false, matched: false }
     operation = op
     if (record) record.state = "preparing"
     try {
@@ -597,18 +599,6 @@ export default function vox(pi) {
     if (count === 1 && !op.matched) op.matched = true
     else op.ambiguous = true
   })
-  pi.on("after_provider_response", event => {
-    const op = operation
-    if (op?.injected && !op.ordinary && op.matched) {
-      let commit = providerActive === 1 && !op.ambiguous && event.status >= 200 && event.status < 300 && fenced(op.fence)
-      if (commit) {
-        try { pi.appendEntry(CONTEXT_ACCEPTED, { id: op.record.id, marker: op.marker }) }
-        catch { commit = false }
-      }
-      finish(op, commit ? "commit" : null)
-    }
-    providerActive = Math.max(0, providerActive - 1)
-  })
   pi.on("message_end", event => {
     const op = operation
     if (op?.ordinary && event.message?.role === "custom"
@@ -618,6 +608,20 @@ export default function vox(pi) {
       observeOrdinary()
     }
     const m = event.message
+    if (m?.role === "assistant") {
+      if (op?.injected && !op.ordinary && op.matched) {
+        // HTTP headers are not a completion signal for every transport (Codex uses WebSocket).
+        // Unknown stop reasons remain uncertain rather than acknowledging an unproved delivery.
+        let commit = providerActive === 1 && !op.ambiguous && fenced(op.fence)
+          && !m.errorMessage && ["stop", "toolUse", "length"].includes(m.stopReason)
+        if (commit) {
+          try { pi.appendEntry(CONTEXT_ACCEPTED, { id: op.record.id, marker: op.marker }) }
+          catch { commit = false }
+        }
+        finish(op, commit ? "commit" : null)
+      }
+      providerActive = 0
+    }
     if (m?.role !== "user" && m?.role !== "assistant") return
     const text = Array.isArray(m.content) ? m.content.filter(part => part.type === "text").map(part => part.text).join("") : typeof m.content === "string" ? m.content : ""
     if (text) publish({ type: m.role === "user" ? "user" : "reply", text })
