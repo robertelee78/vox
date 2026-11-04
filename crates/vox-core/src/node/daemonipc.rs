@@ -1997,11 +1997,28 @@ pub struct DaemonClient {
 /// daemon: the connection is already closed when this value is returned.
 #[derive(Debug)]
 pub struct DaemonGreeting {
+    /// The protocol advertised in this greeting, not permission to issue requests.
+    pub protocol: u64,
     /// Its release.
     pub version: String,
     /// The process serving the checked, own-user socket.
     pub pid: u32,
     /// Nodes it greeted with.
+    pub attached: Vec<NodeInfo>,
+}
+
+/// An authenticated daemon greeting whose connection stays held without a request capability.
+/// Keeping the stream prevents a detached replacement from retiring while its nodes prepare.
+#[derive(Debug)]
+pub struct DaemonObservation {
+    stream: tokio::net::UnixStream,
+    /// The advertised control protocol; callers deciding readiness must check it.
+    pub protocol: u64,
+    /// The daemon's release.
+    pub version: String,
+    /// The process serving the checked, own-user socket.
+    pub pid: u32,
+    /// Nodes attached when it greeted.
     pub attached: Vec<NodeInfo>,
 }
 
@@ -2011,6 +2028,7 @@ impl DaemonClient {
     pub async fn observe(path: &std::path::Path) -> Result<DaemonGreeting> {
         let d = Self::observe_held(path).await?;
         Ok(DaemonGreeting {
+            protocol: d.protocol,
             version: d.version,
             pid: d.pid,
             attached: d.attached,
@@ -2020,7 +2038,7 @@ impl DaemonClient {
     /// Observe a local daemon across release versions while retaining its connection.
     /// The updater holds this greeting while it waits for remembered nodes, so a newly
     /// restarted detached daemon with no Ready node cannot retire as idle underneath it.
-    pub async fn observe_held(path: &std::path::Path) -> Result<Self> {
+    pub async fn observe_held(path: &std::path::Path) -> Result<DaemonObservation> {
         let d = Self::greet(path, None).await?;
         // A restart may signal this process. Bind the Hello pid to the kernel's peer identity,
         // rather than trusting a number supplied in the greeting or in a stale lock file.
@@ -2060,16 +2078,27 @@ impl DaemonClient {
     /// As [`DaemonClient::open`].
     pub async fn open_noting(path: &std::path::Path, waiting: Option<fn()>) -> Result<Self> {
         let daemon = Self::greet(path, waiting).await?;
+        if daemon.protocol != crate::node::ipc::PROTOCOL_VERSION {
+            return Err(Error::Ipc(crate::error::IpcHandshake::Protocol {
+                mine: crate::node::ipc::PROTOCOL_VERSION,
+                theirs: daemon.protocol,
+            }));
+        }
         if daemon.version != env!("CARGO_PKG_VERSION") {
             return Err(Error::Ipc(crate::error::IpcHandshake::Version {
                 mine: env!("CARGO_PKG_VERSION").into(),
                 theirs: daemon.version,
             }));
         }
-        Ok(daemon)
+        Ok(Self {
+            stream: daemon.stream,
+            version: daemon.version,
+            pid: daemon.pid,
+            attached: daemon.attached,
+        })
     }
 
-    async fn greet(path: &std::path::Path, waiting: Option<fn()>) -> Result<Self> {
+    async fn greet(path: &std::path::Path, waiting: Option<fn()>) -> Result<DaemonObservation> {
         use crate::error::IpcHandshake;
         use crate::node::ipc::{connect_own, read_frame, silent, ANSWER_WITHIN, PROTOCOL_VERSION};
         let greeted = tokio::time::timeout(ANSWER_WITHIN, async {
@@ -2107,16 +2136,13 @@ impl DaemonClient {
                 version,
                 pid,
                 attached,
-            }) if protocol == PROTOCOL_VERSION => Ok(Self {
+            }) => Ok(DaemonObservation {
                 stream,
+                protocol,
                 version,
                 pid,
                 attached,
             }),
-            Ok(DaemonFrame::Hello { protocol, .. }) => Err(Error::Ipc(IpcHandshake::Protocol {
-                mine: PROTOCOL_VERSION,
-                theirs: protocol,
-            })),
             _ => Err(Error::Ipc(IpcHandshake::NotHello)),
         }
     }
