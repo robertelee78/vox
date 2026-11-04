@@ -232,6 +232,11 @@ input and activity require the separate Drive grant. A queued wake or private re
 confirmed native delivery, a provider response is not proof of understanding, and a terminal
 reply is not a posted room answer.
 
+OMP confirms provider-bound room context from its native completed assistant response, including a
+response that calls a tool, rather than relying on HTTP-response headers. Accepted context stays
+available across tool steps and later turns, including with WebSocket-backed models. Aborted,
+errored or ambiguous requests remain unconfirmed.
+
 ## Hand an agent a file
 
 With the actual file saved as `plan.txt` in your current directory, run as your node:
