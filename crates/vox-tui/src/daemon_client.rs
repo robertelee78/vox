@@ -76,7 +76,14 @@ pub async fn ensure_daemon(
         }
         Err(_) => {}
     }
-    start_daemon(&std::env::current_exe()?, account, listen, anchors).await
+    start_daemon(
+        &std::env::current_exe()?,
+        account,
+        listen,
+        anchors,
+        env!("CARGO_PKG_VERSION"),
+    )
+    .await
 }
 
 /// Find or begin a daemon for an agent hook, without making the model's turn wait for network
@@ -118,6 +125,7 @@ pub async fn ensure_daemon_for_hook(
         account,
         listen,
         anchors,
+        env!("CARGO_PKG_VERSION"),
         remaining,
         true,
     )
@@ -125,8 +133,8 @@ pub async fn ensure_daemon_for_hook(
     .map(|answer| answer.map_or(HookDaemon::Starting, |_| HookDaemon::Ready))
 }
 
-/// Start `exe` as `account`'s daemon, detached, listening on `listen`, and wait for it to answer:
-/// [`ensure_daemon`]'s start, and `vox update`'s restart onto the vox it put in place.
+/// Start `exe` as `account`'s daemon, detached, listening on `listen`, and wait for `expected_version`:
+/// [`ensure_daemon`]'s current version, or `vox update`'s selected upgrade or rollback version.
 ///
 /// # Errors
 /// As [`ensure_daemon`].
@@ -135,12 +143,21 @@ pub async fn start_daemon(
     account: &Account,
     listen: std::net::SocketAddr,
     anchors: &[String],
+    expected_version: &str,
 ) -> Result<Daemon, AppError> {
     // This path serves interactive commands and update handoffs, which require a definitive
     // answer rather than an agent hook's bounded "still starting" result.
-    start_daemon_bounded(exe, account, listen, anchors, START_WITHIN, false)
-        .await
-        .map(Option::unwrap)
+    start_daemon_bounded(
+        exe,
+        account,
+        listen,
+        anchors,
+        expected_version,
+        START_WITHIN,
+        false,
+    )
+    .await
+    .map(Option::unwrap)
 }
 
 /// Start the daemon and wait up to `within` for its socket. When `pending_ok`, an otherwise healthy
@@ -151,6 +168,7 @@ async fn start_daemon_bounded(
     account: &Account,
     listen: std::net::SocketAddr,
     anchors: &[String],
+    expected_version: &str,
     within: Duration,
     pending_ok: bool,
 ) -> Result<Option<Daemon>, AppError> {
@@ -205,7 +223,9 @@ async fn start_daemon_bounded(
         if !remaining.is_zero()
             && matches!(
                 tokio::time::timeout(remaining, DaemonClient::observe(&socket)).await,
-                Ok(Ok(daemon)) if daemon.protocol == vox_core::node::ipc::PROTOCOL_VERSION
+                Ok(Ok(daemon)) if daemon.version == expected_version
+                    && (expected_version != env!("CARGO_PKG_VERSION")
+                        || daemon.protocol == vox_core::node::ipc::PROTOCOL_VERSION)
             )
         {
             break Ok(Some(Daemon::Started));
@@ -220,7 +240,9 @@ async fn start_daemon_bounded(
                     if !remaining.is_zero()
                         && matches!(
                             tokio::time::timeout(remaining, DaemonClient::observe(&socket)).await,
-                            Ok(Ok(daemon)) if daemon.protocol == vox_core::node::ipc::PROTOCOL_VERSION
+                            Ok(Ok(daemon)) if daemon.version == expected_version
+                                && (expected_version != env!("CARGO_PKG_VERSION")
+                                    || daemon.protocol == vox_core::node::ipc::PROTOCOL_VERSION)
                         )
                     {
                         break Ok(Some(Daemon::Running));
