@@ -205,7 +205,7 @@ async fn start_daemon_bounded(
         if !remaining.is_zero()
             && matches!(
                 tokio::time::timeout(remaining, DaemonClient::observe(&socket)).await,
-                Ok(Ok(_))
+                Ok(Ok(daemon)) if daemon.protocol == vox_core::node::ipc::PROTOCOL_VERSION
             )
         {
             break Ok(Some(Daemon::Started));
@@ -220,7 +220,7 @@ async fn start_daemon_bounded(
                     if !remaining.is_zero()
                         && matches!(
                             tokio::time::timeout(remaining, DaemonClient::observe(&socket)).await,
-                            Ok(Ok(_))
+                            Ok(Ok(daemon)) if daemon.protocol == vox_core::node::ipc::PROTOCOL_VERSION
                         )
                     {
                         break Ok(Some(Daemon::Running));

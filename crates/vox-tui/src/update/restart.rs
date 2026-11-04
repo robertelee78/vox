@@ -21,7 +21,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use vox_core::node::daemonipc::{DaemonClient, NodeState};
+use vox_core::node::daemonipc::{DaemonClient, DaemonObservation, NodeState};
 use vox_core::node::paths::{Account, NodeName};
 
 /// How long the old daemon is given to stop: it detaches every node first, each within its own
@@ -605,7 +605,7 @@ async fn wait_for_replacement(
     now: &str,
     previous_pid: Option<u32>,
     kept: &[NodeName],
-) -> Result<DaemonClient, crate::app::AppError> {
+) -> Result<DaemonObservation, crate::app::AppError> {
     use crate::app::AppError;
     let socket = account.socket();
     let t0 = Instant::now();
@@ -614,7 +614,10 @@ async fn wait_for_replacement(
     let mut _held_after = None;
     loop {
         if let Ok(daemon) = DaemonClient::observe_held(&socket).await {
-            if daemon.version == now && Some(daemon.pid) != previous_pid {
+            if daemon.protocol == vox_core::node::ipc::PROTOCOL_VERSION
+                && daemon.version == now
+                && Some(daemon.pid) != previous_pid
+            {
                 let pending =
                     kept.iter()
                         .filter(|name| {
