@@ -71,9 +71,13 @@ process retroactively.
 
 The update restarts the daemon onto the new version, so update when it is safe to interrupt your
 rooms and services. Every node stops as the daemon stops. The new daemon makes each remembered
-node Ready again. For any other node, the update prints the command that makes it Ready, such as
-`vox node unlock robertgpt`. A daemon started in a terminal ends; its replacement runs detached
-on the same configured address and anchors.
+node Ready again. If a previously Ready node is left Locked, Vox prints an **ACTION REQUIRED ON
+THIS COMPUTER** block with its exact unlock command, such as `vox node unlock -- robertgpt`.
+The standalone updater and rollback print that block after their final installation messages.
+Run the command on the computer named by the block to resume that node's rooms and connections;
+nodes that were already Locked are not listed as a new interruption. Unlocking does not promise
+that a passphrase will be remembered for another restart. A daemon started in a terminal ends;
+its replacement runs detached on the same configured address and anchors.
 
 On a Mac, update and rollback quit and relaunch the app from the installation being changed if
 it was running. They preserve that app's profile even when the updater uses different data,

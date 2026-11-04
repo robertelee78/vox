@@ -323,7 +323,9 @@ pub(super) fn restart_daemon_checked(
         .enable_all()
         .build()?;
     let required = matches!(intent, Some(DaemonIntent::Running { .. }));
-    rt.block_on(restart_checked(account, helper, now, required, intent))
+    let detached = rt.block_on(restart_checked(account, helper, now, required, intent))?;
+    say_detached(&detached);
+    Ok(detached)
 }
 
 /// The explicit repair offered when a client finds a daemon of a different release.
@@ -332,13 +334,14 @@ pub(crate) fn restart_current(account: &Account) -> Result<(), crate::app::AppEr
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    rt.block_on(restart_checked(
+    let detached = rt.block_on(restart_checked(
         account,
         &helper,
         env!("CARGO_PKG_VERSION"),
         true,
         None,
     ))?;
+    say_detached(&detached);
     Ok(())
 }
 
@@ -425,7 +428,6 @@ async fn restart_checked(
             })
             .map(|name| NodeName::parse(name).map_err(|e| AppError::Usage(e.to_string())))
             .collect::<Result<Vec<_>, _>>()?;
-        say_detached(&missing);
         return Ok(missing);
     }
     let Some(before) = before else {
@@ -458,7 +460,6 @@ async fn restart_checked(
             })
             .map(|name| NodeName::parse(name).map_err(|e| AppError::Usage(e.to_string())))
             .collect::<Result<Vec<_>, _>>()?;
-        say_detached(&missing);
         return Ok(missing);
     };
     let started = how_started(before.pid);
@@ -556,7 +557,6 @@ async fn restart_checked(
                 .any(|n| &n.name == a && n.state == NodeState::Attached)
         })
         .collect::<Vec<_>>();
-    say_detached(&missing);
     Ok(missing)
 }
 
@@ -708,13 +708,16 @@ async fn held_names(
 }
 
 /// Name each node the restart left detached, with the command that attaches it again.
-fn say_detached(nodes: &[NodeName]) {
-    for node in nodes {
-        println!(
-            "node {node} is Locked, as the daemon remembers no passphrase for it; unlock it \
-             again with `vox node unlock {node}`"
-        );
+pub(super) fn say_detached(nodes: &[NodeName]) {
+    if nodes.is_empty() {
+        return;
     }
+    eprintln!("\nACTION REQUIRED ON THIS COMPUTER");
+    eprintln!("These previously Ready nodes are now Locked; no passphrase was remembered:");
+    for node in nodes {
+        eprintln!("  {node}: vox node unlock -- {node}");
+    }
+    eprintln!("Unlock them on this computer to resume their rooms and connections.\n");
 }
 
 /// Whether process `pid` has ended within `bound`.
