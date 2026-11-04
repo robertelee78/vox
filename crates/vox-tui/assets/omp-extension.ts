@@ -117,6 +117,16 @@ export default function vox(pi) {
     return [...notices.values()].some(record =>
       record.state === "queued" || record.state === "preparing" || record.state === "dispatched")
   }
+  function admissionAvailable() {
+    if (operation) return false
+    let retained = 0
+    for (const record of notices.values()) {
+      if (record.state === "committed" || record.state === "cancelled") continue
+      if (record.state === "queued" || record.state === "preparing" || record.state === "dispatched") return false
+      retained++
+    }
+    return retained < MAX_NOTICES
+  }
   function queue(id, source, text) {
     if (queueBusy() || notices.has(id) || notices.size >= MAX_NOTICES || operation || !current()) return false
     const stamp = fence()
@@ -376,7 +386,7 @@ export default function vox(pi) {
           // A probe observes this exact route; it must not retire it or perform queue admission.
           // Temporary native work is not an ended conversation. Notice admission stays separate.
           reply(current() && msg.session === session && !poisoned
-            ? { outcome: "available", session, route, client: route } : { outcome: "unavailable" })
+            ? { outcome: "available", session, route, client: route, admission: admissionAvailable() } : { outcome: "unavailable" })
           sock.end(); return
         }
         if (msg?.type === "subscribe") {
