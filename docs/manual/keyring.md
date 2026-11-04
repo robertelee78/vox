@@ -49,6 +49,12 @@ starting or stopping; an unreadable saved record reports its reason instead of g
 **Ready** means the node is running and can work. **Locked** means its protected identity needs
 unlocking. `vox node lock` closes a protected node's connections, stops its services, wipes its
 keys from memory and forgets its remembered passphrase. Its rooms and keyring stay on disk.
+An already-open app or terminal connection must not silently start the node again or resume as
+a later unlock of the same identity. Unlock and choose the node again to open a fresh connection.
+In the Mac app, **Choose Node → Use This Node** opens a fresh connection even when you choose
+the same node. It preserves that node's local room and Session drafts and the current reply;
+the selected room reopens at General. A failed unlock or credential-store operation shows its
+actual result without discarding the draft.
 A node made with no passphrase always becomes Ready when Vox runs. Lock or Forget removes any
 remembered entry but cannot lock an identity that has no passphrase; Vox says it stays Ready.
 
@@ -221,23 +227,61 @@ passphrase; the computer commands start the daemon when needed. Run them in your
 not through an agent. Ready managed nodes apply the policy; Locked nodes need unlocking before
 they can apply it.
 
-Computer trust is an operator choice shared by the enrolled daemons. Add Computer in Vox.app,
-or `vox computer invite` on one computer followed by `vox computer pair` on the other with
-the actual invitation and `--preview`, shows the exact computers and operation for approval on
-both sides. Begin on the first computer:
+Computer trust is an operator choice shared by the enrolled daemons. Either computer may create
+the invitation: in Vox.app use Add Computer, or run `vox computer invite` on one computer and
+`vox computer pair` on the other. If one is already enrolled and the other is individual, the
+individual joins that existing group whichever computer issued the invitation. Two individual
+computers create a new group. If both already belong to the same group, pairing synchronizes
+their existing membership instead of creating another enrollment. Begin on either computer:
 
 ```sh
 vox computer status
 vox computer invite
 ```
 
-Send the actual invitation to the other computer through your trusted channel. There, construct
-`vox computer pair` with that entire quoted invitation and `--preview`. Read the computers,
-nodes and trust changes it names. To approve, use the complete `vox computer approve` command
-for that exact operation on **each** computer. Copy the commands from the actual output, keeping
-the acting computer distinct; no node selector changes which computer approves. Read
-`vox computer status` on both afterwards: a proposal or pending confirmation is not completed
-enrollment. Pairing grants no room membership; join the same room and verify a message both ways.
+Send the invitation to the other computer through your trusted channel. Paste the complete
+terminal command printed by `invite`, or paste the code into Add Computer. Both sides show the
+authenticated peer, fixed policy and exact operation, and whether it creates a new group or joins
+the identified existing group. Check the entire group identifier when joining an existing group.
+Authentication of the code and peer permits this review; it does not grant permission or approve
+enrollment. Explicitly approve the same operation on each computer. Each surface names which
+computer must act next; approval on one side never substitutes for the other. `--preview`
+shows the proposal without approving it. Until computer trust is established, reviewing a code
+preserves individual node trust, including choices made after retiring an old group. Pairing grants
+no room membership; join the same room and verify a message both ways.
+
+If the daemon restarts after the authenticated invitation is claimed but before the proposal
+is recorded, the same computer can authenticate again; another computer cannot take over that
+claim. A recorded proposal and its approvals survive restart as the same operation. A changed
+operation or group needs a fresh review and both approvals; an approval is not transferred.
+Cancel an unused invitation or unapproved proposal on the computer where it is pending. Closing
+a window alone leaves it pending. A cancellation cannot withdraw an approval already signed
+and retained elsewhere; an incomplete signed attempt may need to expire before it can be closed.
+If Vox reports that the other computer's pairing software needs updating, update it and start a
+fresh pairing. A connection failure alone does not establish that an update is needed.
+
+If an authenticated computer is already in a different established group, Vox explains the
+conflict instead of calling it a bad signature. On the computer to move, review the affected
+identities and grants and explicitly choose local replacement. Declining changes no trust.
+To keep the existing group, close the review on this computer using the button or the complete
+`vox computer cancel` command shown there. That local closure prevents reuse of that proposal
+here; it does not cancel or withdraw a signature on the inviting computer.
+This preserves identities, local data and signed history; unreachable computers may retain
+old access and data. On the inviting computer, close its old proposal and create a fresh
+invitation; if it already signed, wait until the incomplete attempt expires before closing.
+Closing locally cannot withdraw a signature already retained elsewhere. Both computers must
+approve the fresh operation.
+
+In the app's confirmation sheet, review every affected identity in the scrollable list.
+**Copy Selected Identity** copies the complete selected name and fingerprint; selecting a row
+does not narrow which grants the confirmation affects. Escape or **Cancel** leaves authority
+unchanged. Replacement requires the separate explicit destructive action.
+
+If trust changes while a replacement review is open, Vox refuses the stale confirmation.
+This includes a later Read/Drive choice for a previously restored, covered node, even when the
+group frontier is unchanged. Review again rather than confirming the older affected grants.
+The app keeps that refusal below the **My Computers** heading, above the scrollable details;
+review the current state before trying again. A refusal is not a completed replacement.
 
 Every managed node can read the other managed nodes. A computer's selected personal node can
 drive nonpersonal nodes; personal nodes cannot drive each other. The daemon saves the app's
@@ -256,12 +300,21 @@ vox computer personal --clear
 ```
 
 The roster follows node creation, rename and removal. Fingerprints establish identity; names
-only label it. Local aliases survive presented-name changes. Status shows the current policy and
-which computers have confirmed applying it. An offline computer remains pending until it
-reconnects and applies the signed update. A Locked local node must be unlocked to apply it.
+only label it. Local aliases survive presented-name changes. Status shows configured direct
+group Read and personal-to-nonpersonal Drive separately from application receipts and observed
+connectivity. Receipts do not prove that a computer is currently online, nor do they establish
+room membership, consent or Session access. Use `vox computer status --details` for complete
+identities, revisions, counters and optional node-management actions.
 
-To remove a computer, review its full fingerprint and nodes in `vox computer status`, then use
-the exact displayed frontier:
+If a computer-policy update meets room history that is still being saved, the daemon retains
+the accepted update until that exact publication settles instead of discarding it as a temporary
+busy error. Trust-dependent actions can report that computer policy is refreshing in the meantime.
+The same update then continues without another approval or manual node grants; already saved
+history remains available. Storage failures and changed authority remain errors, not successful
+policy application.
+
+To remove a computer, review its full fingerprint and nodes in `vox computer status --details`,
+then use the exact displayed frontier:
 
 Construct `vox computer remove` with the intended computer's full fingerprint from that
 status, and its current frontier in `--confirm`. Both values come from the actual status;
@@ -277,6 +330,8 @@ While a received removal is being applied, a room read can say `computer policy 
 retry`. Check `vox computer status` for the pending application; do not repeat the removal,
 regrant trust or restart the daemon to make that application finish. Read-only governance
 preparation resumes the existing application without replaying committed withdrawals.
+Brief room reads do not fail that application: its existing preparation waits for the room,
+without requiring another approval or a daemon restart.
 
 Copying a node folder does not transfer management. For an intentional move, the existing
 manager releases the exact node to one enrolled destination, then the destination approves:
@@ -293,11 +348,11 @@ manager is lost, remove it first, then explicitly approve recovery on the destin
 `vox computer binding recover` with the actual node fingerprint and the current destination
 frontier in `--confirm`. Recovery retains the old binding and removal evidence. If a node key was compromised, use a new node identity instead.
 
-If this computer has been removed and the old group cannot be continued, explicitly abandon
-that group locally with `vox computer binding recover-group`, the literal argument `group`,
-and the current frontier from `vox computer status` in `--confirm`.
-This retires its old authority and removes covered grants before any fresh pairing. It does
-not erase other computers' data or silently recreate the old membership.
+If this computer has been removed and the old group cannot be continued, use
+`vox computer retire`. Review the computers and covered authority and confirm explicitly;
+Vox checks that the reviewed state has not changed before retiring it locally. This preserves
+identities, data and signed history and removes covered grants before a fresh pairing. It does
+not erase data or claim revocation on unreachable computers.
 
 ## Trust from the TUI
 

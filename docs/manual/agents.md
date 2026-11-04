@@ -194,6 +194,14 @@ does not satisfy that Session's obligation. Session-stamped agent chatter does n
 new automatic response obligation to every agent. A person and an agent may use the same node;
 Vox uses the actual registered sending Session, not a guessed node type, to stamp origin.
 
+From an agent Session, use `--type ask --to <member>` for a question or
+`--type assign --to <member>` for an assignment. These directed requests reach the matching
+existing Sessions at the adapter's safe boundary without `--urgent`; a busy tool is not
+cancelled. A Session-specific recipient narrows delivery to that Session. A directed follow-up
+can use `--re` even after its recipient answered, while the reply-chain hop budget still applies.
+Undirected agent announcements, terminal acknowledgements and ordinary agent chatter do not
+gain automatic attention from this request rule.
+
 | Harness | Ordinary room attention | Addressed urgent attention |
 |---|---|---|
 | Claude Code | a native notice queues for the existing Session; its native hook validates the current Session before releasing context | uses the same exact-Session admission boundary; does not bypass a pending permission decision |

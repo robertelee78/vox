@@ -1705,7 +1705,7 @@ struct Held {
     attachment: Arc<()>,
     node: NodeName,
     client: IpcClient,
-    /// For further connections as the same node; they attach nothing.
+    /// Further connections can only reach this same attachment incarnation.
     at: NodeSocket,
     /// The forwards this app made, by the address each is bound at: each on a connection of its
     /// own, which carries it until it is stopped or the node is let go of.
@@ -1735,8 +1735,11 @@ impl Held {
         if !self.client.is_broken() {
             return Ok(());
         }
-        let mut again = self.at.clone();
-        again.using.attach = AttachMode::Hold;
+        let attachment = self
+            .client
+            .attachment()
+            .ok_or_else(|| failed("the daemon did not identify the app's node attachment"))?;
+        let again = self.at.for_attachment(attachment, true);
         self.client = IpcClient::open_at(&again)
             .await
             .map_err(|e| {
@@ -2109,7 +2112,21 @@ fn answered(frame: Frame) -> Result<Frame, VoxError> {
         {
             Err(VoxError::PassphraseNeeded { reason })
         }
-        Frame::Error { reason } => Err(failed(reason)),
+        Frame::Error { reason } => {
+            // Join replies retain a named fault for terminal clients. Explain that same fault
+            // in the app, preserving the daemon's step and responder diagnostics after it.
+            if reason.starts_with("Failed(") {
+                if let Some(fault) = vox_core::node::api::Fault::from_explanation(&reason) {
+                    let mut explanation = fault.explain().to_owned();
+                    if let Some((_, detail)) = reason.split_once('\n') {
+                        explanation.push('\n');
+                        explanation.push_str(detail);
+                    }
+                    return Err(failed(explanation));
+                }
+            }
+            Err(failed(reason))
+        }
         other => Ok(other),
     }
 }
@@ -3645,12 +3662,16 @@ impl VoxClient {
                 .await
                 .map_err(|e| attach_said(&socket, &name, e))?
                 .with_answer_bound(REQUEST_WITHIN);
+            let attachment = client
+                .attachment()
+                .ok_or_else(|| failed("the daemon did not identify the app's node attachment"))?;
+            let at = at.for_attachment(attachment, false);
             let me = client.me().map(|f| b32_encode(&f)).unwrap_or_default();
             *slot = Some(Held {
                 attachment: Arc::new(()),
                 node: name,
                 client,
-                at: at.attached_only(),
+                at,
                 forwards: HashMap::new(),
                 lans: HashMap::new(),
             });
@@ -5528,12 +5549,11 @@ impl VoxClient {
     pub async fn forward(&self, address: String, local: String) -> Result<String, VoxError> {
         let held = Arc::clone(&self.held);
         self.on_rt(async move {
-            let at = held
-                .lock()
-                .await
-                .as_ref()
-                .map(|h| h.at.clone())
-                .ok_or_else(not_attached)?;
+            let (at, attachment) = {
+                let slot = held.lock().await;
+                let h = slot.as_ref().ok_or_else(not_attached)?;
+                (h.at.clone(), Arc::clone(&h.attachment))
+            };
             let resolve = || async {
                 vox_core::node::nameipc::resolve(&at, &address)
                     .await
@@ -5580,12 +5600,12 @@ impl VoxClient {
                 other => return Err(unexpected(&other)),
             };
             match held.lock().await.as_mut() {
-                Some(h) => {
+                Some(h) if Arc::ptr_eq(&attachment, &h.attachment) => {
                     h.forwards.insert(bound.clone(), carrier);
                     Ok(bound)
                 }
-                // Let go of while the forward was being made: its connection ends it.
-                None => Err(not_attached()),
+                // A release or replacement ends this forward with its carrier.
+                _ => Err(not_attached()),
             }
         })
         .await
@@ -6477,7 +6497,7 @@ impl VoxClient {
         };
         let held = Arc::clone(&self.held);
         self.on_rt(async move {
-            let (at, node, trusted, action, shown) = {
+            let (at, attachment, node, trusted, action, shown) = {
                 let mut slot = held.lock().await;
                 let h = slot.as_mut().ok_or_else(not_attached)?;
                 h.mend().await?;
@@ -6512,7 +6532,14 @@ impl VoxClient {
                     }
                     _ => action,
                 };
-                (h.at.clone(), row.node, trusted, action, shown)
+                (
+                    h.at.clone(),
+                    Arc::clone(&h.attachment),
+                    row.node,
+                    trusted,
+                    action,
+                    shown,
+                )
             };
             // The app gate opens a stream only between nodes that trust each other; a member
             // with drive trusts the session's node already, since it reads the Session only
@@ -6555,7 +6582,12 @@ impl VoxClient {
                 };
             // A file not taken is served to no one, so not served at all.
             if let (Some(tag), false) = (file_tag, answer.ok) {
-                if let Some(h) = held.lock().await.as_mut() {
+                if let Some(h) = held
+                    .lock()
+                    .await
+                    .as_mut()
+                    .filter(|h| Arc::ptr_eq(&h.attachment, &attachment))
+                {
                     let _ = ask(
                         &mut h.client,
                         &Request::ShareStop {
@@ -6883,12 +6915,11 @@ impl VoxClient {
         let channel_id = digest(&room, "room id")?;
         let held = Arc::clone(&self.held);
         self.on_rt(async move {
-            let at = held
-                .lock()
-                .await
-                .as_ref()
-                .map(|h| h.at.clone())
-                .ok_or_else(not_attached)?;
+            let (at, attachment) = {
+                let slot = held.lock().await;
+                let h = slot.as_ref().ok_or_else(not_attached)?;
+                (h.at.clone(), Arc::clone(&h.attachment))
+            };
             let (mut stream, _) = vox_core::node::ipc::open_as(&at)
                 .await
                 .map_err(|e| failed(format!("the vox daemon stopped answering: {e}")))?;
@@ -6950,11 +6981,11 @@ impl VoxClient {
                 drop(stream);
             });
             match held.lock().await.as_mut() {
-                Some(h) => {
+                Some(h) if Arc::ptr_eq(&attachment, &h.attachment) => {
                     h.lans.insert(channel_id, Lan { stop, said });
                     Ok(first)
                 }
-                None => Err(not_attached()),
+                _ => Err(not_attached()),
             }
         })
         .await

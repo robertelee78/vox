@@ -559,6 +559,7 @@ struct Running {
     archive: Option<(stream::RequestId, Digest32)>,
     lane: crate::node::history_budget::Lane,
     retirement_key: RetirementKey,
+    policy_retire: Option<RequestId>,
     fence: Arc<crate::transport::stream_transport::Fence>,
     /// Exclusive ownership stays outside the fallible worker future. The supervised outer task
     /// observes its JoinError and the actor reclaims this exact Flow even when the worker panics.
@@ -893,6 +894,7 @@ pub(super) struct Controller {
     retiring: VecDeque<Flow>,
     cleanup: Option<Cleanup>,
     retirement_waiting: BTreeMap<RetirementKey, RetirementWaiting>,
+    policy_retirement: Option<RetirementKey>,
     retirement_failed: std::collections::BTreeSet<RetirementKey>,
     /// The synchronous old-controller driver must not compete with the replacement actor
     /// for the shared actor Notify's single retained permit.
@@ -1784,6 +1786,9 @@ impl Controller {
             Ok(RetirementStep::Done) => {
                 self.retirement_waiting.remove(&key);
                 self.retirement_failed.remove(&key);
+                if self.policy_retirement == Some(key) {
+                    self.policy_retirement = None;
+                }
                 clear_retirement_error(&self.retirement_ledger, key);
             }
             Ok(RetirementStep::Progress) => self.retiring.push_back(flow),
@@ -1894,9 +1899,10 @@ impl Controller {
             let key = retirement_key(candidate);
             !self.retirement_waiting.contains_key(&key)
                 && !self.retirement_failed.contains(&key)
-                && awaited_publications.iter().any(|(waiting_room, owner)| {
-                    *waiting_room == candidate.room && candidate.owns_request(*owner)
-                })
+                && (self.policy_retirement == Some(key)
+                    || awaited_publications.iter().any(|(waiting_room, owner)| {
+                        *waiting_room == candidate.room && candidate.owns_request(*owner)
+                    }))
         });
         let Some(at) = owner.or_else(|| {
             self.retiring.iter().position(|candidate| {
@@ -2070,6 +2076,7 @@ impl Controller {
             cleanup: None,
             retirement_waiting: BTreeMap::new(),
             retirement_failed: BTreeSet::new(),
+            policy_retirement: None,
             retirement_changed: Arc::clone(&self.retirement_changed),
             retirement_ledger: Arc::clone(&self.retirement_ledger),
             completion_wake: Arc::clone(&self.completion_wake),
@@ -2986,6 +2993,158 @@ impl Node {
         )
     }
 
+    /// Transfer only the Flow identified by a room's durable publication binding.
+    pub(super) fn retire_policy_publication(
+        &mut self,
+        room: Digest32,
+        instance: [u8; 16],
+        request: RequestId,
+        root: RequestId,
+    ) -> crate::error::Result<()> {
+        let matches = |key: &RetirementKey| {
+            key.room == room && key.instance == instance && key.request == root
+        };
+        let running = self
+            .bounded_sync
+            .running
+            .iter()
+            .flatten()
+            .filter(|work| matches(&work.retirement_key))
+            .count();
+        let ready = self
+            .bounded_sync
+            .ready
+            .iter()
+            .flatten()
+            .filter(|flow| matches(&retirement_key(flow)))
+            .count();
+        let deferred = self
+            .bounded_sync
+            .deferred
+            .iter()
+            .filter(|flow| matches(&retirement_key(flow)))
+            .count();
+        let retiring = self
+            .bounded_sync
+            .retiring
+            .iter()
+            .filter(|flow| matches(&retirement_key(flow)))
+            .count();
+        let cleanup = usize::from(
+            self.bounded_sync
+                .cleanup
+                .as_ref()
+                .is_some_and(|cleanup| matches(&cleanup.key)),
+        );
+        if running + ready + deferred + retiring + cleanup != 1 {
+            return Err(Error::Profile(
+                "history publication has no unique Flow owner",
+            ));
+        }
+        if let Some(work) = self
+            .bounded_sync
+            .running
+            .iter_mut()
+            .flatten()
+            .find(|work| matches(&work.retirement_key))
+        {
+            self.bounded_sync.policy_retirement = Some(work.retirement_key);
+            work.policy_retire = Some(request);
+            work.fence.retire();
+            return Ok(());
+        }
+        if let Some(slot) = self.bounded_sync.ready.iter_mut().find(|slot| {
+            slot.as_ref()
+                .is_some_and(|flow| matches(&retirement_key(flow)))
+        }) {
+            if !slot.as_ref().is_some_and(|flow| flow.owns_request(request)) {
+                return Err(Error::Profile(
+                    "history publication request differs from its Flow",
+                ));
+            }
+            let Some(mut flow) = slot.take() else {
+                return Err(Error::Profile(
+                    "matched ready history publication Flow disappeared",
+                ));
+            };
+            self.bounded_sync.policy_retirement = Some(retirement_key(&flow));
+            self.settle_archive_exit(
+                &mut flow,
+                "Computer policy changed during history publication",
+            );
+            self.dispose_rearming_hint(flow);
+            return Ok(());
+        }
+        if let Some(at) = self
+            .bounded_sync
+            .deferred
+            .iter()
+            .position(|flow| matches(&retirement_key(flow)))
+        {
+            if !self.bounded_sync.deferred[at].owns_request(request) {
+                return Err(Error::Profile(
+                    "history publication request differs from its Flow",
+                ));
+            }
+            let Some(mut flow) = self.bounded_sync.deferred.remove(at) else {
+                return Err(Error::Profile(
+                    "matched deferred history publication Flow disappeared",
+                ));
+            };
+            self.bounded_sync.policy_retirement = Some(retirement_key(&flow));
+            self.settle_archive_exit(
+                &mut flow,
+                "Computer policy changed during history publication",
+            );
+            self.dispose_rearming_hint(flow);
+            return Ok(());
+        }
+        if let Some(flow) = self
+            .bounded_sync
+            .retiring
+            .iter()
+            .find(|flow| matches(&retirement_key(flow)))
+        {
+            if !flow.owns_request(request) {
+                return Err(Error::Profile(
+                    "history publication request differs from its retiring Flow",
+                ));
+            }
+        }
+        let Some(key) = self
+            .bounded_sync
+            .retiring
+            .iter()
+            .find(|flow| matches(&retirement_key(flow)))
+            .map(retirement_key)
+            .or_else(|| {
+                self.bounded_sync
+                    .cleanup
+                    .as_ref()
+                    .filter(|cleanup| matches(&cleanup.key))
+                    .map(|cleanup| cleanup.key)
+            })
+        else {
+            return Err(Error::Profile(
+                "matched history publication retirement owner disappeared",
+            ));
+        };
+        if self.bounded_sync.retirement_failed.contains(&key) {
+            return Err(Error::Profile(
+                "history publication retirement requires recovery",
+            ));
+        }
+        self.bounded_sync.policy_retirement = Some(key);
+        self.bounded_sync.poll_cleanup();
+        Ok(())
+    }
+
+    pub(super) fn policy_publication_retirement_failed(&self) -> bool {
+        self.bounded_sync
+            .policy_retirement
+            .is_some_and(|key| self.bounded_sync.retirement_failed.contains(&key))
+    }
+
     /// Resume the exact retained Flow that owns a durable room publication. A waiter knows the
     /// request identity from disk; routing that causal edge to the owner's port avoids both a
     /// room-wide wake storm and retrying the waiter while the only productive Flow sleeps.
@@ -3137,6 +3296,9 @@ impl Node {
             }) {
                 self.sched_rooms.insert(work.room);
             }
+            // A policy intent captured this exact sparse request and immutable Running root
+            // before retiring the fence. The physical worker may have settled that request and
+            // removed it from the Flow before returning; its absence now is not an owner error.
             let valid = current
                 && !work.fence.is_retired()
                 && self
@@ -3213,7 +3375,10 @@ impl Node {
             // Authorization and local-durability exits carry ownership themselves. Handle them
             // even when the trust edit also retired the port/fence; generic stale disposal would
             // otherwise discard the only hint, required root, or archive controller dispatch.
-            if flow.authorization_changed || flow.local_retry.is_some() {
+            if flow.authorization_changed
+                || flow.local_retry.is_some()
+                || work.policy_retire.is_some()
+            {
                 if let Some(seq) = flow.mine_held.take() {
                     self.held_notes.push((work.room, work.peer, seq));
                 }
@@ -3764,6 +3929,7 @@ impl Node {
             // the exponential cap even though capacity has just made progress. Transport, policy
             // and no-progress backoffs retain their distinct meaning.
             if let Some(wake) = flow.slot_wait.take() {
+                let publication_owner = flow.publication_owner_wait();
                 let mut admission = AdmissionWork::from_flow(&flow);
                 admission.lane = crate::node::history_budget::Lane::Control;
                 let waiting = ByteWait {
@@ -3785,6 +3951,9 @@ impl Node {
                     admission,
                     waiting,
                 );
+                if let Some(owner) = publication_owner {
+                    self.wake_publication_owner(work.room, owner);
+                }
                 continue;
             }
             if let Some(pressure) = flow.byte_pressure.take() {
@@ -5294,6 +5463,7 @@ impl Node {
             archive,
             lane,
             retirement_key: running_retirement_key,
+            policy_retire: None,
             fence,
             flow,
             result,

@@ -474,7 +474,10 @@ pub async fn show_attention(
         }
         Ok(cursor.after)
     }).transpose()?;
-    let at = crate::client::one_shot(paths)?;
+    let attachment = client
+        .attachment()
+        .ok_or_else(|| AppError::Usage("the daemon did not identify the node attachment".into()))?;
+    let at = crate::client::one_shot(paths)?.for_attachment(attachment, false);
     let page = attention_page(&at, &selected, after)
         .await
         .map_err(AppError::Usage)?;

@@ -111,6 +111,14 @@ struct ColumnDivider: View {
             .accessibilityElement()
             .accessibilityLabel("Inspector width")
             .accessibilityValue("\(Int(width)) points")
+            .accessibilityAdjustableAction { direction in
+                switch direction {
+                case .increment: width = Swift.min(width + Space.s4, side.max)
+                case .decrement: width = Swift.max(width - Space.s4, side.min)
+                @unknown default: return
+                }
+                Columns.remember(side, width)
+            }
             .accessibilityIdentifier("inspector-divider")
     }
 }

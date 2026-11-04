@@ -6,6 +6,7 @@
   Opus technical approval and implementation, acceptance and delivery are recorded on the
   source-bound issues, separately from decision status. Each product requirement MUST land
   with its proof (ADR-018) in a small release (FX-19).
+  FX-52's 2026-11-02 pairing design is approved; implementation and acceptance are separate.
 - **Date**: 2026-10-19; amended 2026-10-20 (FX-22–FX-27, the daemon's CPU); amended
   2026-10-20 (FX-28–FX-34: the idle daemon's disk and CPU, measured on v0.4.9, the own-feed
   recovery ruling of 2026-10-19, a retention change that poisoned a room, and a node on Linux
@@ -28,7 +29,8 @@
   (FX-44, FX-48, FX-50: shared consumer-sensitive inverse, separate from internal-path evidence);
   amended 2026-11-02 (FX-51: post-issued-consent rekey selection through governance readiness);
   amended 2026-11-02 (FX-48: precommit provider-cursor preparation and reservation readiness);
-  amended 2026-11-02 (FX-47: local Session projection demand independent of peer-support waits)
+  amended 2026-11-02 (FX-47: local Session projection demand independent of peer-support waits);
+  amended 2026-11-02 (FX-52: direction-independent authenticated computer enrollment)
 - **Deciders**: Robert E. Lee
 - **Tags**: trust, daemon identity, sessions, presence, agent comms, sync, health, releases
 - **Related**: ADR-018, ADR-020, ADR-026, ADR-029, ADR-031, ADR-033, ADR-034, ADR-035, ADR-036,
@@ -967,6 +969,23 @@ lessons. It changes neither this record's decision status nor any requirement or
   idempotent. Expired or canceled attempts MUST offer truthful local closure and MUST NOT
   claim withdrawal of signed authority already recorded elsewhere.
 
+  Pairing handoffs MUST provide complete safely quoted actions for the named acting computer,
+  without including invitation secrets in diagnostic output. Configured computer policy MUST
+  identify all group members and the direct mutual Read and personal-to-non-personal Drive
+  relationships; it MUST NOT imply that a member relays through the inviter. Applied receipts,
+  current connectivity, room membership and consent, and Session access are separate facts.
+  A prior successful exchange does not establish present reachability. Full identities and
+  diagnostic evidence remain available in details and JSON.
+
+  A different established group MUST be distinguished from an authentication failure only
+  after the invitation's proof and complete signed group history establish the inviter's
+  current positive membership. A replacement MUST be explicitly reviewed against all affected
+  local authority, including retained bindings and individual choices, and the exact reviewed
+  state MUST be rechecked before self-removal. Local retirement is a second durable operation
+  bound to the first operation's returned frontier; an intervening change requires new review.
+  Neither local retirement nor closure claims remote erasure or withdrawal of a retained
+  signature. A new group requires a fresh invitation and independent approval on both computers.
+
   A room with a local authenticated computer approval pending MUST offer the existing computer
   review, not only a keyring edit or an unqualified instruction to wait for the other node.
   The notice MUST keep room membership, reciprocal room consent and computer approval
@@ -1162,6 +1181,15 @@ lessons. It changes neither this record's decision status nor any requirement or
   Source review and a bounded spike cover exact-owner wake matching, parked-resource release,
   restart recovery and finite multi-head scanning; they MUST NOT create a mechanism CI gate.
 
+  The original local admission retains its exact physical receipt independently of the
+  requesting connection. A slow actor is not an unknown commit: only an uncertain transaction
+  or loss of the enqueued receipt makes acceptance unknown, and that batch must not be replayed.
+  The bounded volatile tail protects and charges the submitted prefix while its original bodies
+  belong to the actor; a definite noncommit returns them to the same tail. Other Sessions and
+  node shutdown must not wait behind its receipt under daemon-wide posting serialization.
+  Room retirement blocks new old-room work and settles enqueued old owners before
+  completing the durable retirement.
+
 - **FX-48.** Recipient-key recovery MUST retain already-available work when a publication
   snapshot or precommit provider-cursor reservation is temporarily busy. The existing
   publication wake MUST be subscribed before the recovery worker reads its history instance
@@ -1331,6 +1359,49 @@ lessons. It changes neither this record's decision status nor any requirement or
   diagnostics MUST verify exact stage/receipt ownership, unchanged failed-read cursors,
   fresh authorization, resource release and single publication; these are not mechanism gates.
 
+- **FX-52.** Computer enrollment MUST preserve an established group regardless of which of
+  its member or the individual installation issues the invitation. Two individuals create a
+  new genesis. For an ADD, the authenticated active existing-group sponsor and its exact grant
+  occupy slot 0 and the joining installation and its fresh grant occupy slot 1, independent of
+  transport roles. Two active members of the same group synchronize instead of creating an ADD;
+  different established groups require the existing explicit local replacement review and a
+  fresh pairing, never automatic merging. Removed, suspended, retired or faulted participation
+  MUST NOT be treated as a fresh individual.
+
+  Pairing operation 3 MUST first authenticate the invitation and peer using a separate
+  `vox/computer-auth/v1` CPace/PoP challenge bound to operation, persisted protocol, suite,
+  invitation, identities and transport, before disclosing any group history or publishing an
+  enrollment preview. Authenticated group offers MUST validate signed authority together with
+  locally known same-incarnation removal and fork evidence. Valid negative evidence MUST be
+  applied and reported as the actual authority refusal, not masked as a bad signature; unrelated
+  group authority MUST NOT be adopted. The final enrollment MUST separately complete the
+  existing group-bound CPace/PoPs over the exact canonical operation and sponsor authority.
+  Authentication is not approval: each operator MUST explicitly approve that exact operation,
+  and the joining group authority MUST NOT activate before both approvals and a valid ADD.
+  CLI and app review MUST identify the authenticated peer, fixed permissions, exact operation,
+  and whether it creates a group or joins the exact identified existing group. Raw sponsor
+  grants need not be exposed.
+
+  Invitation claim and final recording MUST recheck expiry, cancellation, authority and the
+  singular pending operation at their transaction boundaries. A claimed invitation survives
+  restart for the same authenticated redeemer; a recorded operation survives with the same
+  grants, staged evidence and approvals. Cancellation cannot resurrect a late result or
+  withdraw a signature already held elsewhere. A changed group, sponsor, grant or operation
+  requires fresh review and approval, not rebasing a signature. Obsolete pairing operation 1
+  receives a truthful software-update refusal without secret or group disclosure; an
+  unexplained connection close MUST NOT be called a version mismatch. Ordinary exchange
+  operation 2 remains unchanged.
+
+  Acceptance MUST extend the three-computer journey with the fresh computer issuing the
+  invitation and a grouped member redeeming while the other member is offline. It MUST show
+  no group-derived permission before approval, no enrollment after one approval, recovery of
+  the exact recorded operation after restart, both approvals joining the original group, the
+  effective Read/Drive policy and later catch-up without another pairing. Room admission
+  remains separate. An inviter-only selection inverse and an authorization inverse MUST fail
+  their product assertions; a client without successful invitation PoP MUST receive no group
+  history. Failure to stage that client is an apparatus failure, not a confidentiality proof.
+
+
 ## Unchanged rulings
 
 The decider confirmed these on 2026-10-19 ("that still sounds right to me"): no human/agent
@@ -1372,6 +1443,7 @@ Narrow successor amendments. Requirements not named here remain in force.
 | FX-28, FX-40: still-current managed application retains its original continuation | FX-49 preserves the committed prefix through the exact read-only governance prerequisite without poisoning or terminalizing the application |
 | FX-44: an installed authorized receiver retains its actual read demand | FX-50 retains the receiver's page obligation through a temporarily unprojected opening, without changing floors or replacing a sender-drive obligation |
 | FX-28, FX-49: managed application preserves its committed prefix across derived reads | FX-51 retains the original post-issued-consent continuation through rekey-selection governance readiness without repeating issue or outbound enqueue |
+| ADR-035 computer enrollment and FX-2: exact two-sided approval and group-bound enrollment | Preserved; FX-52 makes group selection independent of invitation direction without weakening authentication-before-history |
 | ADR-034 §5 "Health is true" (HL-1, HL-2), PRD-001 R35 | The lane's completed rounds are completed syncs (FX-16); the control socket answers under sync load (FX-17) |
 
 ## Implementation order and related work

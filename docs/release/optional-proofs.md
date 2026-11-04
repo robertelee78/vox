@@ -62,6 +62,7 @@ be reported as a derived spike, with its source/dispatcher hashes, not as the un
 VOX_DATA_DIR=/absolute/scratch/data VOX_CONFIG_DIR=/absolute/scratch/config \
 VOX_PROOF_PREVIOUS_SHIPPED_APP=/absolute/signed-prior/Vox.app \
 VOX_PROOF_SHIPPED_APP=/absolute/signed-candidate/Vox.app \
+VOX_PROOF_LEGACY_PRODUCER_APP=/absolute/signed-old-producer/Vox.app \
 cargo test --release -p vox-tui --features optional-proofs,test-knobs \
   --test update_proof -- --ignored --exact \
   an_update_and_rollback_leave_one_launchable_vox --nocapture
@@ -74,6 +75,11 @@ the downloaded target, so a knob compiled only into the prior or test runner can
 The journey checks the supplied helpers as an apparatus precondition. Developer ID sign and
 notarize both complete bundles before supplying them; change neither after signing. Record
 the source delta, versions, feature selections, artifact digests and Apple's receipts.
+The legacy producer is a separately source-bound old updater artifact, with a version strictly
+between the prior and candidate, signed and notarized with its original helper. It must support
+the existing test-knob release transport. Without `VOX_PROOF_LEGACY_PRODUCER_APP` the ordinary
+update/rollback cases still run, but the old-journal cases are not exercised. Record the old
+source revision, build features, exact artifact digest and notarization receipt independently.
 
 This source-bound interruption proof is not normal-artifact release-trust evidence. Record
 the untouched public-prior → normal public-candidate upgrade separately, using the published
@@ -85,6 +91,29 @@ The existing journey drives `install.sh`, the physically installed helpers, an o
 retirement and replacement, identifier launches, two version-changing offline rollbacks, and
 real interruption immediately after exchange followed by offline source restoration. Its
 consumer assertions require the saved message and Ready remembered node after each transition.
+The interrupted case also substitutes a separately copied, still-signed bundle and requires
+the installed updater to refuse it. It then restores the original object, preserves the
+original journal bytes, perturbs its two diagnostic device fields in scratch, and requires
+successful recovery and real profile use. This is object-substitution and device-perturbation
+sensitivity evidence, not evidence of a reboot or volume remount.
+
+For retained device-number recovery, preserve the genuine old updater's original journal and
+source/artifact receipts. Use an old producer, not a current build with a changed version or a
+handwritten journal. Stage its committed archive-bearing handoff with the app already complete
+and daemon incomplete, then invoke the installed old helper's ordinary `vox update` against a
+newer corrected signed engine. Record both profile roots, selected artifacts, command output,
+the saved node fingerprint and room identity, existing message read, and a new post/read. Observe
+the historical app handoff separately from any later legitimate update handoff. A scratch-only
+device-field perturbation is an apparatus sensitivity check, not evidence of a reboot/remount.
+With the old producer supplied, the journey holds the scratch node's UDP address after the
+old daemon releases it, so the real producer can retain a failed daemon handoff. It confirms
+the native app handoff, quits that replacement, and checks recovery does not launch another
+app. It runs once with the unmodified journal and once with a scratch-only device perturbation;
+the latter also exercises corrupted archive and signature refusals and a changed readoption
+target. Failure to occupy the address or obtain the required journal is APPARATUS, not proof.
+Run invalid archive, changed receipt, copied-object and different-volume refusals separately;
+retain their state and distinguish product refusals from staging failures. A rollback recovery
+must also be measured offline against its locally retained prior archive.
 
 Run the real precommit filesystem-refusal/partial-delete restoration and genuine already-used
 legacy incomplete-journal scenarios separately under the same signed trust and scratch rules.
@@ -232,18 +261,18 @@ The Linux form runs unprivileged in a network namespace and is an ordinary proof
 
 | Proof | Helps troubleshoot | Run | Needs | Time |
 |---|---|---|---|---|
-| `nodes_of_one_daemon_proof::computer_pairing_uses_an_anchor_without_room_membership_and_reconnects` | Paired computers do not converge after path loss, historical misses disappear across restart, or Ready exposes an old application after a later operator policy changes the personal-node role while losing current managed or manual grants. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test nodes_of_one_daemon_proof -- --ignored --exact computer_pairing_uses_an_anchor_without_room_membership_and_reconnects --nocapture` | a real machine with IPv4 and IPv6 loopback; run alone | several minutes; not timed in CI |
+| `nodes_of_one_daemon_proof::computer_pairing_uses_an_anchor_without_room_membership_and_reconnects` | Paired computers do not converge after path loss, lose historical misses across restart, or fail to apply the current managed grants after a newer policy. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test nodes_of_one_daemon_proof -- --ignored --exact computer_pairing_uses_an_anchor_without_room_membership_and_reconnects --nocapture` | a real machine with IPv4 and IPv6 loopback; run alone | several minutes; not timed in CI |
 | `nodes_of_one_daemon_proof::computer_preview_and_approval_survive_a_crash` | An authenticated Add Computer preview or the local operator's approval disappears when the daemon crashes before the other operator approves. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test nodes_of_one_daemon_proof -- --ignored --exact computer_preview_and_approval_survive_a_crash --nocapture` | a real machine; run alone | not timed in CI |
 | `nodes_of_one_daemon_proof::two_paired_computers_that_are_idle_exchange_nothing` | Idle paired computers keep exchanging unchanged histories, re-derive bindings, or fail to reconcile siblings while one actor is held. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test nodes_of_one_daemon_proof -- --ignored --exact two_paired_computers_that_are_idle_exchange_nothing --nocapture` | a real machine; run alone | about five minutes; not timed in CI |
 
-FX-28's nineteen executable mutants are run one at a time with
+FX-28's eighteen executable mutants are run one at a time with
 `scripts/run-fx28-mutant.sh <mode>`, where `<mode>` is
 `preview-approval-not-durable`, `stopped-reader-fresh-write`, `lock-through-computer-write`,
 `deadline-as-storage-failure`, `withdrawal-not-durable`, `stale-tick-authority`, `stale-join-authority`,
 `fresh-preview-inherits-old-deadline`, `late-application-abandons-work`, `detach-keeps-reconciliation`,
 `redeem-rejects-pending-registration`, `owner-refusal-decoded-as-payload`,
 `due-backoff-drops-causal-cause`,
-`ready-fence-accepts-unsettled`, `stale-post-authority`, `stale-room-create-authority`,
+`stale-post-authority`, `stale-room-create-authority`,
 `stale-trust-projection`, `stale-rekey-authority`, or
 `legacy-ended-unanswered-not-selected`. Each mode selects the journey which stages that fault and accepts
 only its exact named `PRODUCT [FX28 ...]:` verdict; another product red is an apparatus failure,
@@ -255,10 +284,7 @@ its existing actor-liveness contract. `deadline-as-storage-failure` turns an exa
 causal refusal into permanent storage quarantine again. `withdrawal-not-durable` omits the refused
 join's prepared and pending board-withdrawal journals; after the responder path reopens with the
 joining daemon stopped, restart must still remove both exact accepted records from that real board.
-`ready-fence-accepts-unsettled` bypasses only the daemon's final state-locked
-publication fence after a successful receipt. A later real operator change supersedes that
-receipt while startup is held; the mutant exposes the stale or held-back projection instead of
-the current personal role and exact managed/manual grants. `stale-post-authority` bypasses the durable-policy fence around an
+`stale-post-authority` bypasses the durable-policy fence around an
 ordinary text append; `stale-trust-projection` makes the shipped trust list copy unreconciled
 trusted rows; `stale-room-create-authority` bypasses only the first durable commit of an exact
 sealed room create, so its shipped create answer and room list expose stale authority;
@@ -343,6 +369,27 @@ unknown. Ordinary text append and sender-key admission have their own use-bounda
 `VOX_TEST_FOLD_HOLD_FILE=<path>`: while that file exists, no room's governance fold advances in that daemon. A proof stages "received but not folded" with it, drives an egress, and removes the file to see the recovery. Only a `vox` built with `test-knobs` reads it; without it the proof stops at `CANNOT MEASURE` naming the knob.
 
 `VOX_TEST_HOLD_INCOMING_CONSENT_FILE=<path>`: the marker contains the full room, author and recipient fingerprints, separated by spaces. The exact signed consent waits before writer admission while independent sender-key delivery proceeds. An atomically published sibling, `path.with_extension("entered")`, records those fingerprints and the actual entry hash; the proof checks that hash against the author's shipped hash view. Removing the marker releases that same consent. The retained-row journey uses one render page plus one row, within the automatic live suffix, and compares `envelope.body` rather than the encoded envelope in `text`. Same `test-knobs` rule.
+
+`VOX_TEST_OMP_RECEIPT_HOLD_FILE=<path>` with `VOX_TEST_OMP_RECEIPT_NODE=<node>` and
+`VOX_TEST_OMP_RECEIPT_SESSION=<session>` parks consumption of the exact enqueued Session admission's
+physical receipt while the marker exists. `<path>.engaged` records node, Session, attachment
+generation and room. The actor remains free to commit and serve unrelated commands; this stages
+receipt-consumer delay, **not** physical-store latency. Removing the marker releases the original
+receipt; physical actor termination also releases the hold. The marker is staging evidence only:
+the original and subsequent private Session bodies at actual consumers supply the verdict. Same
+`test-knobs` rule.
+
+The v0.4.16 receipt-ownership spike used three unmodified OMP 18.16.0 native-extension
+clients in one scratch room, each bound through `vox agent room` under its own node and
+actual Session ID. Every Vox command set scratch `VOX_DATA_DIR` and `VOX_CONFIG_DIR`;
+the CLI was a release-profile build with `test-knobs`. While one exact receipt was held,
+the original tool result and a later reply had to remain readable through the authorized
+`vox room session --json --details` consumer, and another Session had to answer independently.
+After release, both original and later bodies were retained. Restoring only the historical
+two-second receipt timeout in a detached inverse lost the later consumer body and failed
+the same assertion. This was an uncommitted real-client spike, not a new CI proof or evidence
+of store latency, lifecycle recovery, or signed-release acceptance. See #1140 for its
+source-bound receipts and separate lifecycle acceptance.
 
 `VOX_TEST_HOLD_PACKAGES_FILE=<path>`: while the marker exists, every sender-key acceptance entrance is held: the retained-package worker, room preparation, and live pairwise delivery. The first interception creates `<path>.engaged`; this alone does not prove a saved body. Committed recipient package bodies append 64-byte raw room/author records to that same receipt. The FX-22 proof requires both exact authors in every room, with zero received generations, before stopping either source. Retained packages stay queued; a live sender receives not-accepted and retains/retries delivery. Removing the marker and driving the shipped trust command replays local packages. Same `test-knobs` rule.
 

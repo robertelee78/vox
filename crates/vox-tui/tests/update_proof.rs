@@ -2046,40 +2046,66 @@ impl Drop for HeldApp {
 struct ScratchDaemonCleanup(PathBuf);
 
 #[cfg(all(target_os = "macos", feature = "optional-proofs"))]
-impl Drop for ScratchDaemonCleanup {
-    fn drop(&mut self) {
-        let stop = || -> Result<(), String> {
-            let data = self.0.join("data");
-            let config = self.0.join("config");
-            let account = vox_core::node::paths::Account::of(Some(&data), Some(&config))
-                .map_err(|e| e.to_string())?;
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| e.to_string())?;
-            let hello = match rt.block_on(vox_core::node::daemonipc::DaemonClient::observe(
-                &account.socket(),
-            )) {
-                Ok(hello) => hello,
-                Err(vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Unreachable {
-                    ..
-                })) => return Ok(()),
-                Err(e) => return Err(e.to_string()),
-            };
-            Command::new("/bin/kill")
+impl ScratchDaemonCleanup {
+    fn stop(&self) -> Result<(), String> {
+        let data = self.0.join("data");
+        let config = self.0.join("config");
+        let account = vox_core::node::paths::Account::of(Some(&data), Some(&config))
+            .map_err(|e| e.to_string())?;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string())?;
+        let hello = match rt.block_on(vox_core::node::daemonipc::DaemonClient::observe(
+            &account.socket(),
+        )) {
+            Ok(hello) => Some(hello),
+            Err(vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Unreachable {
+                ..
+            })) => None,
+            Err(e) => return Err(e.to_string()),
+        };
+        let had_daemon = hello.is_some();
+        if let Some(hello) = hello {
+            let status = Command::new("/bin/kill")
                 .args(["-TERM", &hello.pid.to_string()])
                 .status()
                 .map_err(|e| e.to_string())?;
-            // The daemon owns this lock for its physical lifetime, including store shutdown.
-            let lock = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(account.lock_file())
-                .map_err(|e| e.to_string())?;
-            rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive)
-                .map_err(|e| e.to_string())
+            if !status.success() {
+                return Err(format!("cannot stop scratch daemon pid {}", hello.pid));
+            }
+        }
+        // The daemon owns this lock for its physical lifetime, including store shutdown.
+        let lock = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(account.lock_file())
+        {
+            Ok(lock) => lock,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !had_daemon => return Ok(()),
+            Err(e) => return Err(e.to_string()),
         };
-        if let Err(error) = stop() {
+        rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive)
+            .map_err(|e| e.to_string())?;
+        match rt.block_on(vox_core::node::daemonipc::DaemonClient::observe(
+            &account.socket(),
+        )) {
+            Err(vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Unreachable {
+                ..
+            })) => Ok(()),
+            Ok(hello) => Err(format!(
+                "scratch daemon pid {} still answers after shutdown",
+                hello.pid
+            )),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
+impl Drop for ScratchDaemonCleanup {
+    fn drop(&mut self) {
+        if let Err(error) = self.stop() {
             let message = format!("APPARATUS: scratch daemon cleanup not confirmed: {error}");
             if std::thread::panicking() {
                 eprintln!("{message}");
@@ -2116,6 +2142,7 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
         std::env::var_os("VOX_PROOF_SHIPPED_APP")
             .expect("APPARATUS: missing exact signed candidate artifact"),
     );
+    let legacy_producer = std::env::var_os("VOX_PROOF_LEGACY_PRODUCER_APP").map(PathBuf::from);
     let before_version = plist_value(&prior, "CFBundleShortVersionString")
         .unwrap_or_else(|e| panic!("APPARATUS: {e}"));
     let after_version = plist_value(&candidate, "CFBundleShortVersionString")
@@ -2163,6 +2190,27 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
         &candidate,
         &[("stable", None)],
     );
+    let legacy_tree = tmpdir();
+    let legacy_release = legacy_producer.as_ref().map(|legacy| {
+        shipped_notarized(legacy).unwrap_or_else(|e| panic!("APPARATUS: legacy producer: {e}"));
+        let version = plist_value(legacy, "CFBundleShortVersionString")
+            .unwrap_or_else(|e| panic!("APPARATUS: legacy producer: {e}"));
+        let parsed = semver::Version::parse(&version).expect("APPARATUS: legacy producer version");
+        assert!(
+            parsed > prior_semver && parsed < candidate_semver,
+            "APPARATUS: legacy producer version must lie between prior and candidate"
+        );
+        bundle_release_app(legacy_tree.path(), &version, legacy, &[("stable", None)]);
+        // The corrected updater must be able to authenticate that exact retained release.
+        bundle_release_app(candidate_tree.path(), &version, legacy, &[("stable", None)]);
+        bundle_release_app(
+            candidate_tree.path(),
+            &after_version,
+            &candidate,
+            &[("stable", None)],
+        );
+        release_server::serve(legacy_tree.path()).expect("APPARATUS: serve old journal producer")
+    });
     let prior_release =
         release_server::serve(prior_tree.path()).expect("APPARATUS: serve prior signed artifact");
     let release =
@@ -2170,7 +2218,17 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
     let mut claims = Vec::new();
     let mut receipts = BTreeMap::new();
 
-    for scenario in ["update-and-rollback", "interrupted-publish"] {
+    let scenarios: &[&str] = if legacy_release.is_some() {
+        &[
+            "update-and-rollback",
+            "interrupted-publish",
+            "legacy-handoff",
+            "legacy-handoff-device",
+        ]
+    } else {
+        &["update-and-rollback", "interrupted-publish"]
+    };
+    for &scenario in scenarios {
         let scratch = tempfile::Builder::new()
             .prefix("vox-m29a-")
             .tempdir_in("/Users/Shared")
@@ -2231,10 +2289,20 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
             ("VOX_NO_SKILL_INSTALL", "1"),
             ("VOX_TEST_KEYCHAIN", keychain_arg),
         ];
+        let listen = if scenario.starts_with("legacy-handoff") {
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0")
+                .expect("APPARATUS: reserve scratch daemon address");
+            socket
+                .local_addr()
+                .expect("APPARATUS: scratch daemon address")
+                .to_string()
+        } else {
+            "127.0.0.1:0".to_owned()
+        };
         let mut daemon = vox_command(
             &helper,
             home,
-            &["daemon", "--no-node", "--listen", "127.0.0.1:0"],
+            &["daemon", "--no-node", "--listen", &listen],
             &env,
         )
         .stdout(std::process::Stdio::piped())
@@ -2296,8 +2364,15 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
             "PRODUCT (staging): saved post: {}",
             said(&posted)
         );
+        let initial_id = vox(&helper, home, &["id", "--node", "kept"], &env);
+        assert!(
+            initial_id.status.success() && !initial_id.stdout.is_empty(),
+            "PRODUCT (staging): node identity unavailable: {}",
+            said(&initial_id)
+        );
         let profile_intact = || {
             let status = vox(&helper, home, &["status", "--node", "kept", "--json"], &env);
+            let identity = vox(&helper, home, &["id", "--node", "kept"], &env);
             let read = vox(
                 &helper,
                 home,
@@ -2307,6 +2382,8 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
             status.status.success()
                 && serde_json::from_slice::<serde_json::Value>(&status.stdout)
                     .is_ok_and(|v| v["status"] == "Ready")
+                && identity.status.success()
+                && identity.stdout == initial_id.stdout
                 && read.status.success()
                 && String::from_utf8_lossy(&read.stdout)
                     .lines()
@@ -2316,6 +2393,256 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
             profile_intact(),
             "PRODUCT (staging): saved message or Ready node unavailable"
         );
+
+        if scenario.starts_with("legacy-handoff") {
+            let historical_app = HeldApp::launch(home, &active, &cleanup.bundles);
+            // Occupy this scratch node's actual UDP listen address only after the old
+            // daemon releases it. The old updater, not this test, writes the retained
+            // committed journal when its replacement cannot reattach the node.
+            let address: std::net::SocketAddr = listen.parse().expect("APPARATUS: listen address");
+            let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+            let blocker = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+                while std::time::Instant::now() < deadline {
+                    if stop_rx.try_recv().is_ok() {
+                        return false;
+                    }
+                    if let Ok(socket) = std::net::UdpSocket::bind(address) {
+                        let _ = stop_rx.recv_timeout(std::time::Duration::from_secs(120));
+                        drop(socket);
+                        return true;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                false
+            });
+            let old_base = &legacy_release
+                .as_ref()
+                .expect("APPARATUS: old release")
+                .base;
+            let old_env: Vec<_> = env
+                .iter()
+                .copied()
+                .filter(|(key, _)| *key != "VOX_TEST_RELEASE_BASE")
+                .chain([("VOX_TEST_RELEASE_BASE", old_base.as_str())])
+                .collect();
+            let interrupted = vox(&helper, home, &["update"], &old_env);
+            let _ = stop_tx.send(());
+            assert!(
+                blocker.join().expect("APPARATUS: join port blocker"),
+                "APPARATUS: could not occupy the released scratch UDP address"
+            );
+            let journal = apps.join(".Vox.app.publishing/transition.json");
+            let original = std::fs::read(&journal).unwrap_or_else(|e| {
+                panic!(
+                    "APPARATUS: old updater produced no retained journal: {e}; {}",
+                    said(&interrupted)
+                )
+            });
+            let mut transition: serde_json::Value =
+                serde_json::from_slice(&original).expect("APPARATUS: parse old updater journal");
+            assert!(
+                !interrupted.status.success()
+                    && transition.get("identity_format").is_none()
+                    && transition["archive"]["legacy"] == false
+                    && transition["archive"]["phase"] == "HandingOff"
+                    && transition["app_complete"] == true
+                    && transition["daemon_complete"] == false,
+                "APPARATUS: old updater did not produce the required committed handoff: {}",
+                said(&interrupted)
+            );
+            println!(
+                "APPARATUS: genuine old journal before perturbation ({scenario}): {}",
+                String::from_utf8_lossy(&original)
+            );
+            // Confirm the old producer really handed off a running native app, then
+            // quit that replacement as the user might before a later recovery.
+            historical_app.finish_handoff();
+            std::fs::write(home.join("old-updater-original-transition.json"), &original)
+                .expect("APPARATUS: preserve genuine old journal");
+            if scenario == "legacy-handoff-device" {
+                let device = transition["target"]["device"]
+                    .as_u64()
+                    .expect("APPARATUS: old target device");
+                transition["target"]["device"] = serde_json::Value::from(device ^ 1);
+                std::fs::write(
+                    &journal,
+                    serde_json::to_vec(&transition).expect("APPARATUS: encode device perturbation"),
+                )
+                .expect("APPARATUS: perturb old scratch journal");
+                {
+                    use std::io::{Read as _, Seek as _, Write as _};
+                    let archive = apps.join(".Vox.app.rollback.zip");
+                    let mut file = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&archive)
+                        .expect("APPARATUS: open scratch rollback archive");
+                    let mut first = [0u8; 1];
+                    file.read_exact(&mut first)
+                        .expect("APPARATUS: read rollback archive");
+                    file.seek(std::io::SeekFrom::Start(0))
+                        .expect("APPARATUS: seek rollback archive");
+                    file.write_all(&[first[0] ^ 1])
+                        .expect("APPARATUS: corrupt scratch archive");
+                    file.sync_all()
+                        .expect("APPARATUS: sync corrupt scratch archive");
+                    let rejected = vox(&helper, home, &["update"], &env);
+                    claims.push(claim(
+                        "bundle.legacy_readoption_rejects_invalid_archive",
+                        !rejected.status.success() && journal.is_file(),
+                        format!(
+                            "invalid archive refusal {}: {}",
+                            rejected.status,
+                            said(&rejected)
+                        ),
+                    ));
+                    file.seek(std::io::SeekFrom::Start(0))
+                        .expect("APPARATUS: seek rollback archive");
+                    file.write_all(&first)
+                        .expect("APPARATUS: restore scratch archive");
+                    file.sync_all()
+                        .expect("APPARATUS: sync restored scratch archive");
+                }
+                // Preserve the target directory object while invalidating its signed
+                // contents, then restore the exact bytes before the successful journey.
+                let plist = active.join("Contents/Info.plist");
+                let pristine = std::fs::read(&plist).expect("APPARATUS: read signed plist");
+                let mut altered = pristine.clone();
+                altered.push(b' ');
+                std::fs::write(&plist, altered).expect("APPARATUS: alter scratch signed plist");
+                assert!(
+                    signed(&active).is_err(),
+                    "APPARATUS: scratch signature remained valid"
+                );
+                let rejected = vox(&helper, home, &["update"], &env);
+                claims.push(claim(
+                    "bundle.legacy_readoption_rejects_invalid_signature",
+                    !rejected.status.success() && journal.is_file(),
+                    format!(
+                        "invalid signature refusal {}: {}",
+                        rejected.status,
+                        said(&rejected)
+                    ),
+                ));
+                std::fs::write(&plist, pristine).expect("APPARATUS: restore exact signed plist");
+                assert!(
+                    signed(&active).is_ok(),
+                    "APPARATUS: restoring plist did not restore signature"
+                );
+                _daemons
+                    .stop()
+                    .expect("APPARATUS: stop and observe absence of the scratch daemon");
+                // Force a second real daemon refusal after readoption has been
+                // persisted, then substitute the target before retrying.
+                let held_port = std::net::UdpSocket::bind(address)
+                    .expect("APPARATUS: hold scratch UDP address for receipt retry");
+                let partial = vox(&helper, home, &["update"], &env);
+                let saved = std::fs::read(&journal).expect("APPARATUS: retained receipt journal");
+                let saved: serde_json::Value = serde_json::from_slice(&saved)
+                    .expect("APPARATUS: parse retained receipt journal");
+                assert!(
+                    !partial.status.success() && saved["readoption_target"].is_object(),
+                    "APPARATUS: could not stage a persisted readoption receipt: {}",
+                    said(&partial)
+                );
+                _daemons
+                    .stop()
+                    .expect("APPARATUS: stop scratch daemon after receipt staging");
+                let held = home.join("readoption-original.app");
+                std::fs::rename(&active, &held).expect("APPARATUS: hold readopted target");
+                let copy = Command::new("/usr/bin/ditto")
+                    .arg(&held)
+                    .arg(&active)
+                    .output()
+                    .expect("APPARATUS: copy readopted target");
+                assert!(
+                    copy.status.success() && signed(&active).is_ok(),
+                    "APPARATUS: signed readoption substitution failed: {}",
+                    said(&copy)
+                );
+                let rejected = vox(&helper, home, &["update"], &env);
+                claims.push(claim(
+                    "bundle.changed_readoption_target_is_refused",
+                    !rejected.status.success() && journal.is_file(),
+                    format!(
+                        "changed receipt target refusal {}: {}",
+                        rejected.status,
+                        said(&rejected)
+                    ),
+                ));
+                std::fs::remove_dir_all(&active).expect("APPARATUS: remove scratch substitution");
+                std::fs::rename(&held, &active).expect("APPARATUS: restore readopted target");
+                drop(held_port);
+            }
+            let recovered = vox(&helper, home, &["update"], &env);
+            let output = said(&recovered);
+            let legacy_version = plist_value(
+                legacy_producer.as_ref().expect("APPARATUS: old producer"),
+                "CFBundleShortVersionString",
+            )
+            .expect("APPARATUS: old producer version");
+            claims.push(claim(
+                &format!("bundle.{scenario}.reports_repair_and_upgrade"),
+                output.contains(&format!("CLI and app Vox {legacy_version}"))
+                    && output.contains("app handoff recorded complete")
+                    && output.contains("daemon handoff recorded complete")
+                    && output.contains(&format!("Vox {after_version}")),
+                output.clone(),
+            ));
+            let running = Command::new("/usr/bin/swift")
+                .args(["-e", "import AppKit; print(NSWorkspace.shared.runningApplications.filter { $0.bundleIdentifier == \"us.vox.app\" }.count)"])
+                .output().expect("APPARATUS: inspect running native applications");
+            assert!(
+                running.status.success(),
+                "APPARATUS: native application observation failed"
+            );
+            claims.push(claim(
+                &format!("bundle.{scenario}.does_not_replay_completed_app_handoff"),
+                String::from_utf8_lossy(&running.stdout).trim() == "0",
+                format!(
+                    "running Vox apps after recovery: {}",
+                    String::from_utf8_lossy(&running.stdout)
+                ),
+            ));
+            let new_message = "updater proof post after legacy recovery";
+            let posted_after = vox(
+                &helper,
+                home,
+                &["room", "post", &room, new_message, "--node", "kept"],
+                &env,
+            );
+            let read_after = vox(
+                &helper,
+                home,
+                &["room", "read", &room, "--node", "kept"],
+                &env,
+            );
+            claims.push(claim(
+                &format!("bundle.{scenario}.recovers_and_preserves_real_use"),
+                recovered.status.success()
+                    && app_says(&active) == after_version
+                    && reports(&helper) == format!("vox {after_version}")
+                    && profile_intact()
+                    && posted_after.status.success()
+                    && read_after.status.success()
+                    && String::from_utf8_lossy(&read_after.stdout).contains(new_message),
+                format!(
+                    "old producer: {}\nrecovery: {}\npost: {}\nread: {}",
+                    said(&interrupted),
+                    said(&recovered),
+                    said(&posted_after),
+                    said(&read_after)
+                ),
+            ));
+            receipts.insert(
+                scenario.to_owned(),
+                format!("old={}\nrecovery={}", said(&interrupted), said(&recovered)),
+            );
+            let _ = daemon.kill();
+            let _ = daemon.wait();
+            continue;
+        }
 
         if scenario == "interrupted-publish" {
             let cut_env: Vec<_> = env
@@ -2339,11 +2666,65 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
                 ("VOX_NO_SKILL_INSTALL", "1"),
                 ("VOX_TEST_KEYCHAIN", keychain_arg),
             ];
+            // A byte-identical signed copy is a different filesystem object. Keep the
+            // interrupted original so the same real updater can subsequently recover it.
+            let held = home.join("held-original.app");
+            std::fs::rename(&active, &held).expect("APPARATUS: hold interrupted bundle");
+            let copied = Command::new("/usr/bin/ditto")
+                .arg(&held)
+                .arg(&active)
+                .output()
+                .expect("APPARATUS: copy signed interrupted bundle");
+            assert!(
+                copied.status.success() && signed(&active).is_ok(),
+                "APPARATUS: could not make a signed substituted bundle: {}",
+                said(&copied)
+            );
+            let refused = vox(&helper, home, &["update"], &offline);
+            claims.push(claim(
+                "bundle.substituted_signed_object_is_refused",
+                !refused.status.success() && app_says(&active) == after_version,
+                format!(
+                    "substitution refusal {}: {}",
+                    refused.status,
+                    said(&refused)
+                ),
+            ));
+            std::fs::remove_dir_all(&active).expect("APPARATUS: remove substituted scratch copy");
+            std::fs::rename(&held, &active).expect("APPARATUS: restore interrupted original");
+            // Apparatus sensitivity only: this does not simulate or claim a remount.
+            // Preserve the original journal bytes before perturbing diagnostic device fields.
+            let journal = apps.join(".Vox.app.publishing/transition.json");
+            let original = std::fs::read(&journal).expect("APPARATUS: read retained journal");
+            std::fs::write(
+                home.join("transition-before-device-perturbation.json"),
+                &original,
+            )
+            .expect("APPARATUS: preserve original retained journal");
+            let mut staged: serde_json::Value = serde_json::from_slice(&original)
+                .expect("APPARATUS: parse updater-produced journal");
+            for role in ["source", "target"] {
+                let identity = &mut staged[role];
+                assert!(
+                    identity["stable"].is_object(),
+                    "APPARATUS: candidate did not produce durable identity"
+                );
+                let device = identity["device"]
+                    .as_u64()
+                    .expect("APPARATUS: recorded device");
+                identity["device"] = serde_json::Value::from(device ^ 1);
+            }
+            std::fs::write(
+                &journal,
+                serde_json::to_vec(&staged).expect("APPARATUS: encode journal"),
+            )
+            .expect("APPARATUS: perturb scratch journal device");
             let repaired = vox(&helper, home, &["update"], &offline);
             let text = said(&repaired);
             claims.push(claim(
                 "bundle.precommit_recovery_restores_the_original",
-                app_says(&active) == before_version
+                repaired.status.success()
+                    && app_says(&active) == before_version
                     && reports(&helper) == format!("vox {before_version}")
                     && signed(&active).is_ok()
                     && profile_intact(),

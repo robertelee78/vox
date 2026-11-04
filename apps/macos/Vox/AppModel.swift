@@ -291,13 +291,11 @@ final class AppModel: ObservableObject {
               !nodeActionInProgress, appNodeChoices.contains(where: {
                   $0.name == name && $0.fingerprint == expected
               }) else { secret.wipe(); return }
-        if old.me == expected { secret.wipe(); appNodeChooser = false; return }
         let generation = beginNodeRequest()
         nodeActionInProgress = true
         appNodeChoiceBusy = true
         defer { nodeActionInProgress = false; appNodeChoiceBusy = false }
         var prospective: VoxClient?
-        var committed = false
         do {
             let passphrase = try secret.passphrase()
             defer { passphrase.wipe() }
@@ -318,7 +316,6 @@ final class AppModel: ObservableObject {
             }
             // Only an authenticated, still-selected request changes the daemon's personal role.
             let selected = try await connection.selectPersonalNode(node: name)
-            committed = true
             guard ownsNodeRequest(original, generation), self.node === old else {
                 // The role committed while another request superseded this one. Capture that
                 // request's generation: never revive this choice or write its local mirror.
@@ -341,6 +338,20 @@ final class AppModel: ObservableObject {
             }
             self.client = connection
             enter(name, actual, connection)
+            if actual == old.me, let replacement = self.node {
+                // Only local drafts cross an explicit same-identity selection, never old reads
+                // or authority. Reopening the room starts at General as an ordinary room open.
+                if case let .room(room) = old.selection {
+                    if let reply = old.replyTo {
+                        old.roomDrafts[room, default: RoomDraft()].reply = reply
+                    } else {
+                        old.roomDrafts[room]?.reply = nil
+                    }
+                }
+                replacement.roomDrafts = old.roomDrafts
+                replacement.sessionDrafts = old.sessionDrafts
+                replacement.select(old.selection)
+            }
             appNodeChooser = false
             do {
                 let file = choiceFile(connection)
@@ -373,7 +384,6 @@ final class AppModel: ObservableObject {
             if let prospective { await prospective.close() }
             guard ownsNodeRequest(original, generation), self.node === old else { return }
             appNodeChoiceSaid = sentence(error)
-            if committed { await reach() }
         }
     }
 
@@ -1063,7 +1073,7 @@ struct StartFailure: Error, Equatable {
         case .busy: return "Another copy of Vox is using this node"
         case .versionMismatch: return said
         case .unreachable: return "Vox can't reach its background service"
-        case .other: return "Vox couldn’t make this node Ready"
+        case .other: return "Vox couldn’t finish opening this node"
         }
     }
 

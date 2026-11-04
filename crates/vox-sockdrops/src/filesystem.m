@@ -36,6 +36,28 @@ int vox_replacement_directory(const char *path, char *result, size_t result_capa
     }
 }
 
+int vox_volume_uuid(const char *path, unsigned char *result,
+                    char *error_buffer, size_t error_capacity) {
+    @autoreleasepool {
+        NSURL *url = [NSURL fileURLWithFileSystemRepresentation:path isDirectory:YES relativeToURL:nil];
+        id value = nil;
+        NSError *error = nil;
+        if (![url getResourceValue:&value forKey:NSURLVolumeUUIDStringKey error:&error]) {
+            vox_error(error, error_buffer, error_capacity);
+            return 0;
+        }
+        NSUUID *uuid = [value isKindOfClass:[NSString class]]
+            ? [[NSUUID alloc] initWithUUIDString:value] : nil;
+        if (!uuid) {
+            if (error_capacity) snprintf(error_buffer, error_capacity, "persistent volume UUID is unavailable or invalid");
+            return 0;
+        }
+        [uuid getUUIDBytes:result];
+        [uuid release];
+        return 1;
+    }
+}
+
 int vox_remove_item(const char *path, char *error_buffer, size_t error_capacity) {
     @autoreleasepool {
         NSURL *url = [NSURL fileURLWithFileSystemRepresentation:path isDirectory:YES relativeToURL:nil];

@@ -62,6 +62,13 @@ mod watchdog;
 
 use support::{resource, until, Out, Worker};
 
+/// Run a coordinating verb as a person naming a session, not as a registered harness.
+fn coordinate(w: &Worker, session: &str, args: &[&str]) -> Out {
+    let mut args = args.to_vec();
+    args.extend(["--session", session]);
+    w.vox_env(None, &[("PI_SESSION_ID", "")], &args, None)
+}
+
 /// The viewer-independent part of a board: what every node must agree on.
 fn agreed(b: &serde_json::Value) -> serde_json::Value {
     let mut rs = b["resources"].as_array().cloned().unwrap_or_default();
@@ -198,12 +205,12 @@ fn a_handoff_moves_ownership_by_fingerprint_and_every_node_agrees() {
     }
 
     // ---- (1) ownership is per session ----
-    let o = bob.vox(Some("b1"), &["room", "claim", r, "own-1"]);
+    let o = coordinate(bob, "b1", &["room", "claim", r, "own-1"]);
     assert!(
         o.ok && o.stdout.contains("you hold own-1"),
         "PRODUCT: bob/b1's claim must say it holds own-1: {o:?}"
     );
-    let o = bob.vox(Some("b2"), &["room", "claim", r, "own-1"]);
+    let o = coordinate(bob, "b2", &["room", "claim", r, "own-1"]);
     assert_eq!(
         o.code,
         Some(1),
@@ -213,7 +220,7 @@ fn a_handoff_moves_ownership_by_fingerprint_and_every_node_agrees() {
         o.stderr.contains("held by") && o.stderr.contains("/b1"),
         "PRODUCT: the losing session must be told bob/b1 holds it: {o:?}"
     );
-    let o = bob.vox(Some("b2"), &["room", "release", r, "own-1"]);
+    let o = coordinate(bob, "b2", &["room", "release", r, "own-1"]);
     assert_eq!(
         o.code,
         Some(1),
@@ -228,10 +235,11 @@ fn a_handoff_moves_ownership_by_fingerprint_and_every_node_agrees() {
     );
 
     // ---- (2) untargeted handoff, completed by a bob session ----
-    let o = alice.vox(Some("a1"), &["room", "claim", r, "h-any"]);
+    let o = coordinate(alice, "a1", &["room", "claim", r, "h-any"]);
     assert!(o.ok, "PRODUCT: alice/a1 could not claim h-any: {o:?}");
-    let o = alice.vox(
-        Some("a1"),
+    let o = coordinate(
+        alice,
+        "a1",
         &["room", "handoff", r, "h-any", "--to", b_prefix],
     );
     assert!(
@@ -248,13 +256,13 @@ fn a_handoff_moves_ownership_by_fingerprint_and_every_node_agrees() {
             w.name
         );
     }
-    let o = alice.vox(Some("a2"), &["room", "claim", r, "h-any"]);
+    let o = coordinate(alice, "a2", &["room", "claim", r, "h-any"]);
     assert_eq!(
         o.code,
         Some(1),
         "PRODUCT: a non-recipient must not take a reserved item: {o:?}"
     );
-    let o = bob.vox(Some("b2"), &["room", "claim", r, "h-any"]);
+    let o = coordinate(bob, "b2", &["room", "claim", r, "h-any"]);
     assert!(
         o.ok && o.stdout.contains("you hold h-any"),
         "PRODUCT: the recipient's claim completes it: {o:?}"
@@ -266,7 +274,7 @@ fn a_handoff_moves_ownership_by_fingerprint_and_every_node_agrees() {
         "h-any",
         held_by(&b_fp, "b2"),
     );
-    let o = alice.vox(Some("a1"), &["room", "release", r, "h-any"]);
+    let o = coordinate(alice, "a1", &["room", "release", r, "h-any"]);
     assert_eq!(
         o.code,
         Some(1),
@@ -274,10 +282,11 @@ fn a_handoff_moves_ownership_by_fingerprint_and_every_node_agrees() {
     );
 
     // ---- (3) a session-targeted handoff ----
-    let o = alice.vox(Some("a1"), &["room", "claim", r, "h-targeted"]);
+    let o = coordinate(alice, "a1", &["room", "claim", r, "h-targeted"]);
     assert!(o.ok, "PRODUCT: alice/a1 could not claim h-targeted: {o:?}");
-    let o = alice.vox(
-        Some("a1"),
+    let o = coordinate(
+        alice,
+        "a1",
         &[
             "room",
             "handoff",
@@ -297,25 +306,26 @@ fn a_handoff_moves_ownership_by_fingerprint_and_every_node_agrees() {
         "h-targeted",
         |x| x.is_some_and(|x| x["state"] == "pending" && x["to_session"] == "b2"),
     );
-    let o = bob.vox(Some("b1"), &["room", "claim", r, "h-targeted"]);
+    let o = coordinate(bob, "b1", &["room", "claim", r, "h-targeted"]);
     assert_eq!(
         o.code,
         Some(1),
         "PRODUCT: the other session of the recipient harness must not complete it: {o:?}"
     );
-    let o = bob.vox(Some("b1"), &["room", "decline", r, "h-targeted"]);
+    let o = coordinate(bob, "b1", &["room", "decline", r, "h-targeted"]);
     assert_eq!(o.code, Some(1), "PRODUCT: …nor decline it: {o:?}");
-    let o = bob.vox(Some("b2"), &["room", "claim", r, "h-targeted"]);
+    let o = coordinate(bob, "b2", &["room", "claim", r, "h-targeted"]);
     assert!(
         o.ok && o.stdout.contains("you hold h-targeted"),
         "PRODUCT: the named session's claim must complete the handoff: {o:?}"
     );
 
     // ---- (4) a decline frees; it does not return to the sender ----
-    let o = alice.vox(Some("a1"), &["room", "claim", r, "h-decline"]);
+    let o = coordinate(alice, "a1", &["room", "claim", r, "h-decline"]);
     assert!(o.ok, "PRODUCT: alice/a1 could not claim h-decline: {o:?}");
-    let o = alice.vox(
-        Some("a1"),
+    let o = coordinate(
+        alice,
+        "a1",
         &["room", "handoff", r, "h-decline", "--to", b_prefix],
     );
     assert!(o.ok, "PRODUCT: the handoff of h-decline failed: {o:?}");
@@ -326,7 +336,7 @@ fn a_handoff_moves_ownership_by_fingerprint_and_every_node_agrees() {
         "h-decline",
         |x| x.is_some_and(|x| x["state"] == "pending"),
     );
-    let o = bob.vox(Some("b1"), &["room", "decline", r, "h-decline"]);
+    let o = coordinate(bob, "b1", &["room", "decline", r, "h-decline"]);
     assert!(
         o.ok && o.stdout.contains("it is free"),
         "PRODUCT: a decline must say the item is free: {o:?}"
@@ -338,19 +348,20 @@ fn a_handoff_moves_ownership_by_fingerprint_and_every_node_agrees() {
         resource(&b, "h-decline").is_none(),
         "PRODUCT: a declined item must be free, NOT back with the sender: {b}"
     );
-    let o = alice.vox(Some("a2"), &["room", "claim", r, "h-decline"]);
+    let o = coordinate(alice, "a2", &["room", "claim", r, "h-decline"]);
     assert!(
         o.ok && o.stdout.contains("you hold h-decline"),
         "PRODUCT: a fresh claim by a third session must take the declined item: {o:?}"
     );
 
     // ---- (5) a no-TTL claim's handoff still lapses ----
-    let o = alice.vox(Some("a1"), &["room", "claim", r, "h-expiry"]);
+    let o = coordinate(alice, "a1", &["room", "claim", r, "h-expiry"]);
     assert!(o.ok, "PRODUCT: a claim with no --ttl failed: {o:?}");
     // The deadline is read from vox's own answer, so the lapse is checked against the
     // clock it is computed on — not against a sleep that a slow runner can outlast.
-    let o = alice.vox(
-        Some("a1"),
+    let o = coordinate(
+        alice,
+        "a1",
         &[
             "room", "handoff", r, "h-expiry", "--to", b_prefix, "--ttl", "3", "--json",
         ],
@@ -398,13 +409,13 @@ fn a_handoff_moves_ownership_by_fingerprint_and_every_node_agrees() {
     let anchor_d = room.anchor_pid();
     room.stop(1);
     let alice = &room.workers[0];
-    let first = alice.vox(Some("a1"), &["room", "claim", r, "h-order"]);
+    let first = coordinate(alice, "a1", &["room", "claim", r, "h-order"]);
     // The anchor holds the room's entries too, and would serve bob alice's claim.
     signal(alice_d, "-STOP", "alice's daemon");
     signal(anchor_d, "-STOP", "the anchor");
     room.restart(1);
     let (alice, bob) = (&room.workers[0], &room.workers[1]);
-    let second = bob.vox(Some("b1"), &["room", "claim", r, "h-order"]);
+    let second = coordinate(bob, "b1", &["room", "claim", r, "h-order"]);
     signal(alice_d, "-CONT", "alice's daemon");
     signal(anchor_d, "-CONT", "the anchor");
     // Bob is stopped, so alice's claim cannot be agreed: it is posted, and she is told it is not

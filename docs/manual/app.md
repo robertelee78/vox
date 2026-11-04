@@ -20,8 +20,9 @@ nodes on this Mac are listed under **ON THIS MACHINE**, with **Unlock…** for e
    **Allow Vox in Login Items** with a button that opens System Settings. **Not Now** registers
    nothing, and Vox runs while the app is open. The same screen offers **Show Vox in the menu
    bar**.
-2. **Welcome to Vox.** With no node on this Mac yet, type a **Name** and the identity passphrase
-   twice, then choose **Make Node**. You may leave the passphrase empty. The form then says the
+2. **Welcome to Vox.** With no node on this Mac yet, fill in **Node name**, **Identity
+   passphrase** and **Identity passphrase again**, then choose **Make Node**. Each field keeps
+   its label visible while you type. You may leave the passphrase empty. The form then says the
    node's key is kept unencrypted. There is no backup of a node: if this Mac is lost, so is the
    node.
 3. **Which node are you?** With several nodes on this Mac, pick the one you post, trust and share
@@ -83,6 +84,28 @@ A message stops being unread once at least half of it has been in view, with the
 **Next Room That Needs You** (⌘J or Control-N) opens the next room where something waits on you.
 The Dock icon shows how many things wait on you. Right-click a room, node or member to copy its
 name or fingerprint.
+
+**Mark as Read**, below the room tabs, acknowledges received messages across the whole room:
+other tags, thread replies and received history outside the displayed page included. Use the
+button, **Room > Mark Room as Read** (⇧⌘U), the command palette, or the room's right-click menu.
+Progress and the result appear in the status bar; stay in the room to see its fresh unread count.
+This does not answer Session requests or accept trust offers, so their **@!** or badge may remain.
+Messages received after the captured acknowledgement boundary remain unread until shown or marked.
+
+The room-wide summary separates addressed, new and coordination messages, wrapping at narrow
+widths so the counts remain readable beside **Mark as Read**. The sidebar badge counts addressed
+plus new messages; only when those are zero does it count waiting requests and trust
+offers. **About unread and history** explains the difference and flags a count limited to the
+newest 1,000 rows. To read earlier content, scroll up or use **History > Load older history**:
+cached messages first, then an explicit peer-history request when needed. **End** returns to the
+newest cached messages; **History > Load newest history** requests peer history, rather than
+abandoning a pinned older view. Use **Tags > All messages** and open thread replies for content
+outside a filtered view.
+ 
+Conversation text size scales the timeline and composer, not the room's navigation controls.
+The timeline retains a 120-point minimum viewport. The room composer grows to four visible
+lines, then scrolls within the complete draft; this is not a text-length limit. Return sends
+the draft and Shift-Return adds a newline.
 
 ### A repository with no room
 
@@ -321,6 +344,21 @@ The app is dark only. Text meets a contrast of at least 4.5:1, and a selection i
 colour alone. It follows **Increase Contrast**, **Reduce Motion** and **Reduce Transparency** in
 System Settings, Accessibility, Display. **View > Bigger**, **Smaller** and **Actual Size** change
 the conversation's size, up to twice the usual.
+
+In **Vox > Settings…**, Tab and Shift-Tab move through the controls and scroll the focused
+control into view. Changing conversation size keeps the Settings window's focus and open sheets;
+the picker also follows changes made through the View menu.
+
+In **My Computers**, Tab and Shift-Tab also reveal controls that are outside the scroll viewport.
+Background status checks keep the controls available. If a status check is still running when you
+choose an action, that action waits for the check; you do not need to choose it again. While your
+action is pending, the changing controls are disabled until it finishes.
+
+Group replacement, local retirement and computer removal open a separate confirmation sheet.
+Use the arrow keys or Page Down to review its affected identities, then Tab to
+**Copy Selected Identity**, **Cancel** or the explicit destructive action. Selecting an identity
+only navigates or chooses what to copy; confirmation still affects the complete reviewed scope.
+Return or Space on an identity does not approve the action. Escape cancels the sheet.
 
 ### Network settings
 

@@ -134,6 +134,9 @@ struct SessionComposer: View {
                     .accessibilityIdentifier("session-stop-confirm")
                 Button("Cancel", role: .cancel) {}
             }
+            Text("Return sends · Shift-Return starts a new line")
+                .voxFont(VoxTokens.Fonts.appSmall).secondaryText()
+                .fixedSize(horizontal: false, vertical: true)
             if sending { ProgressView("Sending to \(session.label)…").controlSize(.small) }
             if interrupting { ProgressView("Interrupting \(session.label)…").controlSize(.small) }
             if stopping { ProgressView("Stopping \(session.label)…").controlSize(.small) }
@@ -145,6 +148,14 @@ struct SessionComposer: View {
                     .lineLimit(3)
                     .textSelection(.enabled)
                     .accessibilityIdentifier("session-said")
+                DisclosureGroup("Delivery details") {
+                    ScrollView {
+                        Text(said).secondaryText().textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .accessibilityIdentifier("session-delivery-details")
+                    }
+                    .frame(maxHeight: 80)
+                }
             }
         }
         .voxPadding(Space.s12)
@@ -258,7 +269,7 @@ struct RequestView: View {
                 if request.isQuestion { question } else { approval }
                 if busy { ProgressView("Sending your answer…").controlSize(.small) }
                 if !said.isEmpty {
-                    Text(said).secondaryText().lineLimit(3).textSelection(.enabled)
+                    Text(said).secondaryText().textSelection(.enabled)
                         .accessibilityIdentifier("request-said-\(request.reference)")
                 }
             }

@@ -158,6 +158,9 @@ A resumed OMP conversation keeps its native Session ID but has a new Vox opening
 listing may include its earlier ended opening. ID/name lookup selects the newest opening for
 that node and ID; an ended earlier opening does not make the resumed conversation ambiguous.
 Different matching Sessions are still refused rather than guessed.
+Unrelated Session activity does not invalidate an otherwise unchanged selection. A change to the
+matching Sessions or their authority can still make a selection refuse; choose again from the
+current room listing rather than sending to a different Session.
 
 `vox room session` takes a Session's ID (at least eight characters) or its name, and prints one
 line per thing the session did:

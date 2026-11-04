@@ -24,8 +24,9 @@ use zeroize::Zeroizing;
 mod pairing;
 mod publication_gate;
 pub use pairing::{
-    ComputerApplication, ComputerBindingAction, ComputerIdentity, ComputerNode, ComputerStatus,
-    ExchangeRecord, Management, PairingPreview, COMPUTER_PAIR_WITHIN,
+    ComputerApplication, ComputerBindingAction, ComputerGroupConflict, ComputerGroupRetirement,
+    ComputerIdentity, ComputerNode, ComputerStatus, ExchangeRecord, Management, PairingPreview,
+    COMPUTER_PAIR_WITHIN,
 };
 
 /// A trust change must either be applied by an attached node or make that node visibly no longer
@@ -425,9 +426,9 @@ pub struct Enrollment {
     pub expires: u64,
     /// Random incarnation nonce.
     pub nonce: Digest32,
-    /// Inviting installation, then joining installation.
+    /// For an ADD, the established sponsor then the joining installation; otherwise invitation order.
     pub computers: [Description; 2],
-    /// Fresh grant identities, in the same order.
+    /// For an ADD, the sponsor's active grant then the fresh joining grant.
     pub grants: [Digest32; 2],
     /// Both signatures of the identical canonical body, when approved.
     pub approvals: [Option<Signed>; 2],
@@ -1644,11 +1645,13 @@ impl State {
                     .any(|interval| interval.grants.contains(grant))
             })
         });
-        let policy_changed = first_activation
+        let folded = first_activation
             || self.members != next.members
             || self.rosters != next.rosters
             || self.quarantined != next.quarantined;
-        if policy_changed || self.reaches != next.reaches {
+        // Pending rosters authenticate pairing, but do not change the active operator policy.
+        let policy_changed = self.genesis.is_some() && folded;
+        if folded || self.reaches != next.reaches {
             let revision = self.revision.checked_add(1).ok_or_else(bad)?;
             if self.genesis.is_some() {
                 let mut active: BTreeMap<Digest32, BTreeSet<Digest32>> = BTreeMap::new();
@@ -2732,6 +2735,7 @@ impl Computer {
                     && s.policy_revision == applied
                     && Self::revision_expired(&s) == expired)
                     && if Self::revision_expired(&s)
+                        || s.genesis.is_none()
                         || s.grant(&self.signer.fingerprint()).is_none()
                     {
                         // Expiry revokes the missed revision's managed grants; it does not make the
@@ -3547,7 +3551,7 @@ impl Computer {
         revision: u64,
         expired: bool,
     ) -> bool {
-        (state.genesis.is_none() && state.intervals.is_empty())
+        state.genesis.is_none()
             || expired
             || state.grant(&self.signer.fingerprint()).is_none()
             || state
@@ -3598,8 +3602,6 @@ impl Computer {
             && Self::application_settled_in(&state, node, revision)
             && self.startup_binding_current_in(&state, node, revision, expired);
         drop(state);
-        #[cfg(feature = "test-knobs")]
-        let settled = settled || fx28_mutant("ready-fence-accepts-unsettled");
         settled.then(publish)
     }
 
@@ -3789,9 +3791,9 @@ impl Computer {
         }
         Ok(!managers.iter().any(|m| s.quarantined.contains(m)))
     }
-    /// The ordinary explicit Trust command after retirement chooses individual mode. Journal
-    /// that local choice before its keyring write; a failed write grants nothing and can be
-    /// retried. A peer that Computer policy never covered needs no Computer journal entry.
+    /// Explicit trust choices after retirement choose individual mode. Journal each later choice
+    /// too, so a replacement review cannot discard a grant changed after review. A failed keyring
+    /// write grants nothing; a peer never covered by Computer policy needs no journal entry.
     pub(crate) fn individual_choice(
         &self,
         node: Digest32,
@@ -3803,7 +3805,14 @@ impl Computer {
             return Ok(());
         };
         if !plan.denied.contains(&peer) {
-            return Ok(());
+            let state = lock(&self.state);
+            if !state
+                .individual
+                .get(&node)
+                .is_some_and(|peers| peers.contains_key(&peer))
+            {
+                return Ok(());
+            }
         }
         if !self.individual_permitted(node, &peer)? {
             return Err(Error::SignatureInvalid);
@@ -4393,7 +4402,10 @@ impl Computer {
             || Self::revision_expired(held) != Self::revision_expired(next)
             || held.genesis.is_some() != next.genesis.is_some()
             || held.intervals.is_empty() != next.intervals.is_empty()
-            || held.grant(&self.signer.fingerprint()) != next.grant(&self.signer.fingerprint())
+            || ((held.genesis.is_some() || next.genesis.is_some()) && {
+                let local = self.signer.fingerprint();
+                held.grant(&local) != next.grant(&local)
+            })
             || held.applied != next.applied
             || held.prepared != next.prepared
             || held.derived != next.derived
@@ -4424,6 +4436,7 @@ impl Computer {
                         && applied == state.policy_revision
                         && Self::revision_expired(&state) == expired
                         && if Self::revision_expired(&state)
+                            || state.genesis.is_none()
                             || state.grant(&self.signer.fingerprint()).is_none()
                         {
                             Self::application_settled_in(&state, &node, applied)

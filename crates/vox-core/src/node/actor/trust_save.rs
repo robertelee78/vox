@@ -584,26 +584,93 @@ pub(super) struct PolicyRoom {
     _pin: crate::node::channel::history::PendingHistoryRead,
 }
 
+pub(super) struct PolicyPublicationBlocked {
+    pub(super) room: Digest32,
+    pub(super) instance: SharedChannel,
+    pub(super) history_instance: [u8; 16],
+    pub(super) sparse: Option<([u8; 16], [u8; 16])>,
+    pub(super) wake: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + Sync>>,
+}
+
+pub(super) enum PolicyRooms {
+    Reserved(Vec<PolicyRoom>),
+    Blocked(PolicyPublicationBlocked),
+}
+
+pub(super) fn inspect_policy_rooms(
+    rooms: &[(Digest32, SharedChannel)],
+    store: &Store,
+) -> crate::error::Result<Option<PolicyPublicationBlocked>> {
+    use crate::node::channel::pending_text::PolicyBlocker;
+    for (room, instance) in rooms {
+        let channel = instance.blocking_lock();
+        let blocked = match channel.policy_publication_blocker(store)? {
+            None => continue,
+            Some(PolicyBlocker::Physical(wake)) => (None, wake),
+            Some(PolicyBlocker::Sparse {
+                request,
+                root,
+                wake,
+            }) => (Some((request, root)), wake),
+        };
+        let history_instance = channel.history_instance(store)?;
+        return Ok(Some(PolicyPublicationBlocked {
+            room: *room,
+            instance: Arc::clone(instance),
+            history_instance,
+            sparse: blocked.0,
+            wake: blocked.1,
+        }));
+    }
+    Ok(None)
+}
+
 pub(super) fn reserve_policy_rooms(
     mut rooms: Vec<(Digest32, SharedChannel)>,
     store: &Arc<Store>,
     owner: Arc<()>,
     require_append: bool,
-    wait: bool,
-) -> crate::error::Result<Vec<PolicyRoom>> {
+    managed: bool,
+) -> crate::error::Result<PolicyRooms> {
     rooms.sort_by_key(|(room, _)| *room);
     let mut reserved: Vec<PolicyRoom> = Vec::with_capacity(rooms.len());
     let result = (|| {
         for (room, instance) in rooms {
-            let mut channel = if wait {
-                instance.blocking_lock()
-            } else {
-                instance
-                    .try_lock()
-                    .map_err(|_| Error::StreamRefused("a room change is pending"))?
-            };
+            let mut channel = instance.blocking_lock();
             if require_append {
                 channel.ensure_local_append_available(store)?;
+            }
+            if managed {
+                use crate::node::channel::pending_text::PolicyBlocker;
+                match channel.policy_publication_blocker(store)? {
+                    None => {}
+                    Some(PolicyBlocker::Physical(wake)) => {
+                        let history_instance = channel.history_instance(store)?;
+                        drop(channel);
+                        return Ok(Some(PolicyPublicationBlocked {
+                            room,
+                            instance,
+                            history_instance,
+                            sparse: None,
+                            wake,
+                        }));
+                    }
+                    Some(PolicyBlocker::Sparse {
+                        request,
+                        root,
+                        wake,
+                    }) => {
+                        let history_instance = channel.history_instance(store)?;
+                        drop(channel);
+                        return Ok(Some(PolicyPublicationBlocked {
+                            room,
+                            instance,
+                            history_instance,
+                            sparse: Some((request, root)),
+                            wake,
+                        }));
+                    }
+                }
             }
             let pin = channel.reserve_pending_write(store, Arc::clone(&owner))?;
             drop(channel);
@@ -614,19 +681,23 @@ pub(super) fn reserve_policy_rooms(
                 _pin: pin,
             });
         }
-        Ok(())
+        Ok(None)
     })();
-    if let Err(error) = result {
-        // Physical preparation worker only. A concurrent nondisk reader can briefly own a room;
-        // waiting for that reader here is not actor/Store/Computer.state ownership.
-        for room in &mut reserved {
-            room.instance
-                .blocking_lock()
-                .release_pending_text(&room.owner, false);
+    match result {
+        Ok(None) => Ok(PolicyRooms::Reserved(reserved)),
+        outcome => {
+            for room in &mut reserved {
+                room.instance
+                    .blocking_lock()
+                    .release_pending_text(&room.owner, false);
+            }
+            match outcome {
+                Ok(Some(blocked)) => Ok(PolicyRooms::Blocked(blocked)),
+                Err(error) => Err(error),
+                Ok(None) => unreachable!(),
+            }
         }
-        return Err(error);
     }
-    Ok(reserved)
 }
 
 impl Node {

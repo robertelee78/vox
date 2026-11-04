@@ -27,6 +27,8 @@ pub struct PairingPreview {
     pub operation_id: String,
     /// Authenticated remote presentation.
     pub peer: ComputerIdentity,
+    /// Exact existing group to join, or None when this operation creates a new group.
+    pub proposed_group: Option<String>,
     /// Local approval has been durably recorded.
     pub approved_here: bool,
     /// Peer approval has been verified and retained.
@@ -39,9 +41,54 @@ impl From<core::PairingPreview> for PairingPreview {
         Self {
             operation_id: v.operation_id,
             peer: v.peer.into(),
+            proposed_group: v.proposed_group,
             approved_here: v.approved_here,
             approved_there: v.approved_there,
             expires_ms: v.expires_ms,
+        }
+    }
+}
+/// Authenticated refusal of a proposal for a different established group.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ComputerGroupConflict {
+    pub peer: ComputerIdentity,
+    pub current_group: String,
+    pub proposed_group: String,
+    pub operation_id: String,
+    pub inviter_approved: bool,
+    pub expires_ms: u64,
+    pub affected: Vec<String>,
+    pub review_id: String,
+    pub frontier: String,
+}
+impl From<core::ComputerGroupConflict> for ComputerGroupConflict {
+    fn from(v: core::ComputerGroupConflict) -> Self {
+        Self {
+            peer: v.peer.into(),
+            current_group: v.current_group,
+            proposed_group: v.proposed_group,
+            operation_id: v.operation_id,
+            inviter_approved: v.inviter_approved,
+            expires_ms: v.expires_ms,
+            affected: v.affected,
+            review_id: v.review_id,
+            frontier: v.frontier,
+        }
+    }
+}
+/// Fresh local retirement review after this computer was removed.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ComputerGroupRetirement {
+    pub review_id: String,
+    pub frontier: String,
+    pub affected: Vec<String>,
+}
+impl From<core::ComputerGroupRetirement> for ComputerGroupRetirement {
+    fn from(v: core::ComputerGroupRetirement) -> Self {
+        Self {
+            review_id: v.review_id,
+            frontier: v.frontier,
+            affected: v.affected,
         }
     }
 }
@@ -179,12 +226,18 @@ pub struct ComputerStatus {
     pub invite_expires_ms: Option<u64>,
     /// Authenticated candidate, if any.
     pub pairing: Option<PairingPreview>,
+    /// Authenticated different-group conflict, never an approval.
+    pub conflict: Option<ComputerGroupConflict>,
+    /// Current review of locally retiring a removed group.
+    pub retirement: Option<ComputerGroupRetirement>,
     /// Explicitly enrolled installations.
     pub computers: Vec<ComputerIdentity>,
     /// Each enrolled member’s exact-frontier application receipt.
     pub applications: Vec<ComputerApplication>,
     /// Authenticated roster and selected personal roles.
     pub nodes: Vec<ComputerNode>,
+    /// Current configured policy topology, separate from application and connectivity.
+    pub topology: Vec<String>,
     /// Explicit source-release or destination transfer/recovery choices.
     pub binding_actions: Vec<ComputerBindingAction>,
     /// Removed members; remote erasure is never asserted.
@@ -211,9 +264,12 @@ impl From<core::ComputerStatus> for ComputerStatus {
             invite_id: v.invite_id,
             invite_expires_ms: v.invite_expires_ms,
             pairing: v.pairing.map(Into::into),
+            conflict: v.conflict.map(Into::into),
+            retirement: v.retirement.map(Into::into),
             computers: v.computers.into_iter().map(Into::into).collect(),
             applications: v.applications.into_iter().map(Into::into).collect(),
             nodes: v.nodes.into_iter().map(Into::into).collect(),
+            topology: v.topology,
             binding_actions: v.binding_actions.into_iter().map(Into::into).collect(),
             removed: v.removed.into_iter().map(Into::into).collect(),
             frontier: v.frontier,

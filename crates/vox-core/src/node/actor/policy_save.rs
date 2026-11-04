@@ -16,8 +16,22 @@ mod headless;
 type Reply = Option<oneshot::Sender<Outcome>>;
 struct Returned {
     continuation: PolicyContinuation,
-    completed: crate::error::Result<PolicyCompleted>,
+    completed: NativeOutcome,
     rooms: Vec<PolicyRoom>,
+}
+
+// Keep the existing completion inline rather than allocating on every native policy result.
+#[allow(clippy::large_enum_variant)]
+enum NativeOutcome {
+    Completed(crate::error::Result<PolicyCompleted>),
+    Blocked(trust_save::PolicyPublicationBlocked),
+}
+
+pub(super) struct PublicationWaiting {
+    work: computer::OwnKeyPolicyWork,
+    task: tokio::task::JoinHandle<()>,
+    ready: Arc<std::sync::atomic::AtomicBool>,
+    sparse: bool,
 }
 pub(super) struct NativePending {
     store: Arc<Store>,
@@ -31,6 +45,7 @@ pub(super) struct NativePending {
 
 pub(super) enum Pending {
     Native(NativePending),
+    Publication(PublicationWaiting),
     TrustProgress {
         room: Digest32,
         continuation: TrustContinuation,
@@ -100,6 +115,10 @@ pub(super) struct ManagedDrive {
 impl Pending {
     pub(super) async fn retire(self) {
         match self {
+            Self::Publication(pending) => {
+                pending.task.abort();
+                let _ = pending.work.reply.send(Err(Error::AtRestLocked));
+            }
             Self::Native(pending) => pending.retire().await,
             Self::TrustProgress {
                 room,
@@ -222,6 +241,136 @@ impl Node {
             || !self.own_key_computer_pending.is_empty()
     }
 
+    pub(super) fn cancel_policy_publication(&mut self, owner: &Arc<()>) {
+        if matches!(&self.pending_policy, Some(Pending::Publication(waiting))
+            if Arc::ptr_eq(&waiting.work.owner, owner))
+        {
+            if let Some(Pending::Publication(waiting)) = self.pending_policy.take() {
+                waiting.task.abort();
+            }
+        }
+    }
+
+    pub(super) fn policy_work_already_current(&self, work: &computer::OwnKeyPolicyWork) -> bool {
+        let Some(identity) = self
+            .startup_identity_info()
+            .map(|identity| identity.fingerprint)
+        else {
+            return false;
+        };
+        let Some(computer) = self.computer.as_ref() else {
+            return false;
+        };
+        let Some((revision, expired)) = self.applied_computer_policy() else {
+            return false;
+        };
+        let view_current = {
+            let view = self.view_tx.borrow();
+            !view.locked
+                && !view.locking
+                && view
+                    .identity
+                    .as_ref()
+                    .is_some_and(|info| info.fingerprint == identity)
+                && view.computer_policy == Some((revision, expired))
+        };
+        view_current
+            && computer.policy_current(revision, expired, identity)
+            && work.guard.active(self.computer.as_ref()).is_ok()
+    }
+
+    fn park_policy_until(
+        &mut self,
+        work: computer::OwnKeyPolicyWork,
+        prerequisite: impl std::future::Future<Output = ()> + Send + 'static,
+        sparse: bool,
+    ) {
+        let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let signal = Arc::clone(&ready);
+        let wake = Arc::clone(&self.post_save_wake);
+        let mut rooms_changed = self.own_key_room_set_changed.subscribe();
+        let mut epoch_changed = self.pairwise_epoch.subscribe();
+        let task = tokio::spawn(async move {
+            tokio::select! {
+                _ = prerequisite => {}
+                _ = rooms_changed.changed() => {}
+                _ = epoch_changed.changed() => {}
+            }
+            signal.store(true, std::sync::atomic::Ordering::Release);
+            wake.notify_one();
+        });
+        self.pending_policy = Some(Pending::Publication(PublicationWaiting {
+            work,
+            task,
+            ready,
+            sparse,
+        }));
+    }
+
+    pub(super) async fn wait_policy_publication(
+        &mut self,
+        work: computer::OwnKeyPolicyWork,
+        mut blocked: trust_save::PolicyPublicationBlocked,
+    ) {
+        if work.reply.is_closed() {
+            return;
+        }
+        let Some(computer) = self.computer.clone() else {
+            let _ = work.reply.send(Err(Error::AtRestLocked));
+            return;
+        };
+        let Some(journal) = computer.try_journal_writer() else {
+            self.park_policy_until(work, async move { computer.wait_writer().await }, false);
+            return;
+        };
+        if let Err(error) = work.guard.active(Some(&computer)) {
+            drop(journal);
+            let _ = work.reply.send(Err(error));
+            return;
+        }
+        if self.policy_work_already_current(&work) {
+            drop(journal);
+            let _ = work.reply.send(Ok(()));
+            return;
+        }
+        if let Err(error) = computer.storage_ready() {
+            drop(journal);
+            let _ = work.reply.send(Err(error));
+            return;
+        }
+        if !self
+            .channels
+            .get(&blocked.room)
+            .is_some_and(|room| Arc::ptr_eq(room, &blocked.instance))
+        {
+            drop(journal);
+            self.own_key_computer_pending.push_front(work);
+            self.start_own_key_computer_drain();
+            return;
+        }
+        let retirement = blocked.sparse.map(|(request, root)| {
+            self.retire_policy_publication(blocked.room, blocked.history_instance, request, root)
+        });
+        drop(journal);
+        if let Some(Err(error)) = retirement {
+            let released = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(
+                    std::future::Future::poll(blocked.wake.as_mut(), cx).is_ready(),
+                )
+            })
+            .await;
+            if released {
+                self.own_key_computer_pending.push_front(work);
+                self.start_own_key_computer_drain();
+            } else {
+                let _ = work.reply.send(Err(error));
+            }
+            return;
+        }
+        let sparse = blocked.sparse.is_some();
+        self.park_policy_until(work, blocked.wake, sparse);
+    }
+
     pub(super) async fn begin_pending_policy(
         &mut self,
         mut policy: Policy,
@@ -340,9 +489,9 @@ impl Node {
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Returned {
                             continuation,
-                            completed: Err(Error::Profile(
+                            completed: NativeOutcome::Completed(Err(Error::Profile(
                                 "computer policy changed before policy admission",
-                            )),
+                            ))),
                             rooms: Vec::new(),
                         });
                         wake.notify_one();
@@ -384,22 +533,30 @@ impl Node {
                         }
                     }
                     if reserves_rooms && rooms.is_empty() {
-                        rooms = trust_save::reserve_policy_rooms(
+                        match trust_save::reserve_policy_rooms(
                             worker_instances,
                             &save.store,
                             worker_owner,
                             require_append,
-                            grant_decision || require_append,
-                        )?;
+                            managed,
+                        )? {
+                            trust_save::PolicyRooms::Reserved(held) => rooms = held,
+                            trust_save::PolicyRooms::Blocked(blocked) => {
+                                return Ok(NativeOutcome::Blocked(blocked));
+                            }
+                        }
                     }
                     if let Policy::Grant { floor, .. } = &mut policy {
                         for room in &rooms {
                             *floor = (*floor).max(room.instance.blocking_lock().newest_mint_seq());
                         }
                     }
-                    Ok(policy.run(&save.store, save.signer.as_ref()))
+                    Ok(NativeOutcome::Completed(Ok(
+                        policy.run(&save.store, save.signer.as_ref())
+                    )))
                 }))
-                .unwrap_or_else(|_| Err(Error::Profile("native policy worker stopped")));
+                .unwrap_or_else(|_| Err(Error::Profile("native policy worker stopped")))
+                .unwrap_or_else(|error| NativeOutcome::Completed(Err(error)));
                 Returned {
                     continuation,
                     completed,
@@ -432,6 +589,25 @@ impl Node {
         };
         let pending = match pending {
             Pending::Native(pending) => pending,
+            Pending::Publication(pending) => {
+                if pending.work.reply.is_closed() {
+                    pending.task.abort();
+                } else if let Err(error) = pending.work.guard.active(self.computer.as_ref()) {
+                    pending.task.abort();
+                    let _ = pending.work.reply.send(Err(error));
+                } else if pending.ready.load(std::sync::atomic::Ordering::Acquire) {
+                    self.own_key_computer_pending.push_front(pending.work);
+                    self.start_own_key_computer_drain();
+                } else if pending.sparse && self.policy_publication_retirement_failed() {
+                    pending.task.abort();
+                    let _ = pending.work.reply.send(Err(Error::Profile(
+                        "history publication retirement requires recovery",
+                    )));
+                } else {
+                    self.pending_policy = Some(Pending::Publication(pending));
+                }
+                return;
+            }
             Pending::TrustProgress {
                 room,
                 continuation,
@@ -517,7 +693,29 @@ impl Node {
             finish_detached_policy(returned, pending.reply).await;
             return;
         }
-        let resume = match returned.completed {
+        let completed = match returned.completed {
+            NativeOutcome::Completed(completed) => completed,
+            NativeOutcome::Blocked(blocked) => {
+                match returned.continuation {
+                    PolicyContinuation::Managed {
+                        lifetime,
+                        work,
+                        reservations,
+                    } => {
+                        release_rooms(&reservations, false).await;
+                        drop(lifetime);
+                        self.wait_policy_publication(work, blocked).await;
+                    }
+                    continuation => finish_rejected_policy(
+                        continuation,
+                        Error::Profile("unexpected policy publication blocker"),
+                        pending.reply,
+                    ),
+                }
+                return;
+            }
+        };
+        let resume = match completed {
             Ok(completed) => {
                 self.finish_owned_policy(completed, returned.continuation, returned.rooms)
             }
@@ -1733,7 +1931,14 @@ impl Node {
 
 async fn finish_detached_policy(returned: Returned, reply: Reply) {
     release_rooms(&returned.rooms, true).await;
-    match (returned.completed, returned.continuation) {
+    let completed = match returned.completed {
+        NativeOutcome::Completed(completed) => completed,
+        NativeOutcome::Blocked(_) => {
+            finish_rejected_policy(returned.continuation, Error::AtRestLocked, reply);
+            return;
+        }
+    };
+    match (completed, returned.continuation) {
         (
             Ok(PolicyCompleted::Recorded),
             PolicyContinuation::FinishGrant {

@@ -704,12 +704,6 @@ impl DaemonCore {
         };
         let first = using(None);
         let tx = self.tx.clone();
-        // The event stream does not hold the node: the request connection does, and a node is
-        // let go when that one closes, however the TUI ends.
-        let events_use = UseNode {
-            attach: AttachMode::No,
-            ..using(None)
-        };
         let mut unlock_notes = Vec::new();
         let opened = until_stopped(&self.rt, &self.stop, async {
             if let Some(passphrase) = passphrase {
@@ -750,9 +744,17 @@ impl DaemonCore {
                 Ok(Err(refusal)) => return Ok(Err(refusal)),
                 Err(e) => return Err(e),
             };
-            // The node's events, on a connection of their own: a subscribed connection serves no
-            // more requests. The node is attached by now, so this one needs no passphrase.
-            let mut events = match IpcClient::open_node(&socket, events_use).await? {
+            let Some(attachment) = client.attachment() else {
+                return Ok(Err(Refusal::Failed {
+                    node: self.node.clone(),
+                    why: "the daemon did not identify the node attachment".into(),
+                }));
+            };
+            // The event connection does not hold the node and must use this exact attachment.
+            let events_at =
+                vox_core::node::ipc::NodeSocket::one_shot(socket.clone(), self.node.clone())
+                    .for_attachment(attachment, false);
+            let mut events = match IpcClient::open_node(&socket, events_at.using).await? {
                 Ok(c) => c,
                 Err(refusal) => return Ok(Err(refusal)),
             };
@@ -2164,6 +2166,10 @@ impl DaemonCore {
         self.attention_dirty = false;
         self.attention_later = next;
         self.attention_selected = Some(selected.clone());
+        let Some(attachment) = self.conn.as_ref().and_then(|conn| conn.client.attachment()) else {
+            self.attention_error = Some("the daemon did not identify the node attachment".into());
+            return;
+        };
         let paths = match self.account.node_paths(&self.node) {
             Ok(paths) => paths,
             Err(e) => {
@@ -2172,7 +2178,7 @@ impl DaemonCore {
             }
         };
         let mut at = match crate::client::one_shot(&paths) {
-            Ok(at) => at,
+            Ok(at) => at.for_attachment(attachment, false),
             Err(e) => {
                 self.attention_error = Some(e.to_string());
                 return;

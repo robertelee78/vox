@@ -88,6 +88,20 @@ struct LegacyPreparation {
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Transition {
+    #[serde(default, deserialize_with = "deserialize_identity_format")]
+    identity_format: IdentityFormat,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    identity_history: Option<IdentityHistory>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    readoption_target: Option<BundleIdentity>,
     kind: TransitionKind,
     version: String,
     source: BundleIdentity,
@@ -120,11 +134,201 @@ enum TransitionKind {
     Refresh,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct StableIdentity {
+    volume: [u8; 16],
+    birth_seconds: i64,
+    birth_nanoseconds: i64,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct BundleIdentity {
     device: u64,
     inode: u64,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    stable: Option<StableIdentity>,
+}
+
+fn deserialize_present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
+#[derive(Clone, Copy, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+enum IdentityFormat {
+    #[default]
+    #[serde(rename = "original-legacy")]
+    OriginalLegacy,
+    #[serde(rename = "durable-v1")]
+    Durable,
+    #[serde(rename = "legacy-continuation-v1")]
+    LegacyContinuation,
+}
+
+fn deserialize_identity_format<'de, D>(deserializer: D) -> Result<IdentityFormat, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let format = <IdentityFormat as serde::Deserialize>::deserialize(deserializer)?;
+    if format == IdentityFormat::OriginalLegacy {
+        return Err(serde::de::Error::custom(
+            "original legacy identity format must be absent",
+        ));
+    }
+    Ok(format)
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IdentityHistory {
+    roles: [Option<BundleIdentity>; 10],
+    durable_roles: std::cell::Cell<u16>,
+}
+
+impl BundleIdentity {
+    fn valid(&self) -> bool {
+        self.inode != 0
+            && self.stable.as_ref().is_none_or(|stable| {
+                stable.volume != [0; 16]
+                    && stable.birth_seconds > 0
+                    && (0..1_000_000_000).contains(&stable.birth_nanoseconds)
+            })
+    }
+
+    fn matches(&self, current: &Self) -> bool {
+        match (&self.stable, &current.stable) {
+            (Some(a), Some(b)) => self.inode == current.inode && a == b,
+            (None, Some(_)) | (None, None) => {
+                self.device == current.device && self.inode == current.inode
+            }
+            (Some(_), None) => false,
+        }
+    }
+}
+
+fn saved_matches(saved: Option<&BundleIdentity>, current: &BundleIdentity) -> bool {
+    saved.is_some_and(|identity| identity.matches(current))
+}
+
+impl Transition {
+    fn identities(&self) -> [Option<&BundleIdentity>; 10] {
+        [
+            Some(&self.source),
+            Some(&self.target),
+            self.archive
+                .as_ref()
+                .and_then(|a| a.legacy_superseded_identity.as_ref()),
+            self.archive.as_ref().and_then(|a| a.restoration.as_ref()),
+            self.archive
+                .as_ref()
+                .and_then(|a| a.restoration_directory.as_ref()),
+            self.candidate_preparation.as_ref().map(|a| &a.directory),
+            self.candidate_preparation
+                .as_ref()
+                .and_then(|a| a.staged.as_ref()),
+            self.candidate_preparation
+                .as_ref()
+                .and_then(|a| a.verification_directory.as_ref()),
+            self.legacy_preparation.as_ref().map(|a| &a.directory),
+            self.legacy_preparation
+                .as_ref()
+                .and_then(|a| a.verification_directory.as_ref()),
+        ]
+    }
+
+    fn validate_identities(&self, writing: bool) -> Result<(), AppError> {
+        let roles = self.identities();
+        if roles.iter().flatten().any(|identity| !identity.valid()) {
+            return Err(usage("invalid transition identity; all files retained"));
+        }
+        match self.identity_format {
+            IdentityFormat::OriginalLegacy => {
+                if self.identity_history.is_some()
+                    || self.readoption_target.is_some()
+                    || roles
+                        .iter()
+                        .flatten()
+                        .any(|identity| identity.stable.is_some())
+                {
+                    return Err(usage(
+                        "invalid original legacy identity format; all files retained",
+                    ));
+                }
+            }
+            IdentityFormat::Durable => {
+                if self.identity_history.is_some()
+                    || self.readoption_target.is_some()
+                    || roles
+                        .iter()
+                        .flatten()
+                        .any(|identity| identity.stable.is_none())
+                {
+                    return Err(usage("invalid durable identity format; all files retained"));
+                }
+            }
+            IdentityFormat::LegacyContinuation => {
+                let history = self
+                    .identity_history
+                    .as_ref()
+                    .ok_or_else(|| usage("missing legacy identity history; all files retained"))?;
+                let mut mask = history.durable_roles.get();
+                if history.roles[0].is_none()
+                    || history.roles[1].is_none()
+                    || mask & !0x03ff != 0
+                    || history
+                        .roles
+                        .iter()
+                        .flatten()
+                        .any(|v| !v.valid() || v.stable.is_some())
+                {
+                    return Err(usage("invalid legacy identity history; all files retained"));
+                }
+                for (index, identity) in roles.into_iter().enumerate() {
+                    if let Some(identity) = identity {
+                        let bit = 1 << index;
+                        if identity.stable.is_some() {
+                            if !writing && mask & bit == 0 {
+                                return Err(usage("unrecorded fresh identity; all files retained"));
+                            }
+                            mask |= bit;
+                        } else if mask & bit != 0 || history.roles[index].as_ref() != Some(identity)
+                        {
+                            return Err(usage(
+                                "legacy identity changed or downgraded; all files retained",
+                            ));
+                        }
+                    }
+                }
+                if let Some(target) = &self.readoption_target {
+                    if !target.valid() || target.stable.is_none() {
+                        return Err(usage("invalid readoption identity; all files retained"));
+                    }
+                }
+                if writing {
+                    history.durable_roles.set(mask);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn continue_legacy(&mut self) {
+        let roles = self.identities().map(|role| role.cloned());
+        self.identity_history = Some(IdentityHistory {
+            roles,
+            durable_roles: std::cell::Cell::new(0),
+        });
+        self.identity_format = IdentityFormat::LegacyContinuation;
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -163,6 +367,7 @@ fn replacement_directory(active: &Path) -> Result<PathBuf, AppError> {
 }
 
 fn bundle_identity(path: &Path) -> Result<BundleIdentity, AppError> {
+    use std::os::macos::fs::MetadataExt as _;
     use std::os::unix::fs::MetadataExt as _;
     let metadata = fs::symlink_metadata(path)
         .map_err(|e| usage(format!("cannot inspect {}: {e}", path.display())))?;
@@ -172,10 +377,37 @@ fn bundle_identity(path: &Path) -> Result<BundleIdentity, AppError> {
             path.display()
         )));
     }
-    Ok(BundleIdentity {
+    let volume = vox_sockdrops::volume_uuid(path)
+        .map_err(|e| usage(format!("cannot identify volume of {}: {e}", path.display())))?;
+    let after = fs::symlink_metadata(path)
+        .map_err(|e| usage(format!("cannot reinspect {}: {e}", path.display())))?;
+    if !after.is_dir()
+        || metadata.dev() != after.dev()
+        || metadata.ino() != after.ino()
+        || metadata.st_birthtime() != after.st_birthtime()
+        || metadata.st_birthtime_nsec() != after.st_birthtime_nsec()
+    {
+        return Err(usage(format!(
+            "{} changed during identity capture",
+            path.display()
+        )));
+    }
+    let identity = BundleIdentity {
         device: metadata.dev(),
         inode: metadata.ino(),
-    })
+        stable: Some(StableIdentity {
+            volume,
+            birth_seconds: metadata.st_birthtime(),
+            birth_nanoseconds: metadata.st_birthtime_nsec(),
+        }),
+    };
+    if !identity.valid() {
+        return Err(usage(format!(
+            "{} has no valid durable identity",
+            path.display()
+        )));
+    }
+    Ok(identity)
 }
 
 fn path_exists(path: &Path) -> Result<bool, AppError> {
@@ -188,6 +420,7 @@ fn path_exists(path: &Path) -> Result<bool, AppError> {
 
 fn write_transition_in(journal: &Path, transition: &Transition) -> Result<(), AppError> {
     use std::io::Write as _;
+    transition.validate_identities(true)?;
     let mut temporary = tempfile::Builder::new()
         .prefix("transition.")
         .tempfile_in(journal)
@@ -257,6 +490,9 @@ fn transition_record(
     let (daemon, daemon_process) =
         super::restart::capture_daemon_state(&account, &active.join(HELPER))?;
     Ok(Transition {
+        identity_format: IdentityFormat::Durable,
+        identity_history: None,
+        readoption_target: None,
         kind,
         version: version.to_owned(),
         source: bundle_identity(source)?,
@@ -351,7 +587,7 @@ fn stage_candidate(
         .as_ref()
         .ok_or_else(|| usage("missing candidate preparation authority"))?;
     if candidate != unpacked.join(BUNDLE)
-        || bundle_identity(&unpacked)? != preparation.directory
+        || !preparation.directory.matches(&bundle_identity(&unpacked)?)
         || path_exists(&staged)?
     {
         return Err(usage(
@@ -393,8 +629,8 @@ fn prepare_transition(
         .candidate_preparation
         .as_ref()
         .ok_or_else(|| usage("missing candidate preparation authority"))?;
-    if preparing.source != transition.source
-        || preparation.staged.as_ref() != Some(&transition.target)
+    if !preparing.source.matches(&transition.source)
+        || !saved_matches(preparation.staged.as_ref(), &transition.target)
         || candidate != apps.join(PARTIAL)
     {
         return Err(usage(
@@ -496,7 +732,7 @@ fn repair_locked(apps: &Path, exe: &Path) -> Result<bool, AppError> {
         journaled_refresh(apps, &active, &now)?;
     }
     shell_setup_from(apps, exe)?;
-    repaired.say_without_swap();
+    repaired.say_without_swap(apps)?;
     Ok(true)
 }
 
@@ -649,8 +885,10 @@ pub(super) fn apply(
     }
     if !failures.is_empty() {
         return Err(usage(format!(
-            "Vox {} is installed; transition incomplete: {}; run `vox update` for local repair",
+            "CLI and app Vox {} are installed; transition incomplete (app handoff: {}; daemon handoff: {}): {}; run `vox update` for local repair",
             vox.version_text,
+            if transition.app_complete { "complete" } else { "incomplete" },
+            if transition.daemon_complete { "complete" } else { "incomplete" },
             failures.join("; ")
         )));
     }
@@ -675,7 +913,7 @@ pub(super) fn rollback(apps: &Path, exe: &Path) -> Result<(), AppError> {
             journaled_refresh(apps, &active, &now)?;
         }
         shell_setup_from(apps, exe)?;
-        repaired.say_without_swap();
+        repaired.say_without_swap(apps)?;
         return Ok(());
     }
     let authority = read_rollback_authority(apps)?
@@ -723,7 +961,9 @@ pub(super) fn rollback(apps: &Path, exe: &Path) -> Result<(), AppError> {
     }
     if !failures.is_empty() {
         return Err(usage(format!(
-            "rollback to Vox {now} is in place; handoff incomplete; do not repeat --rollback: {}",
+            "CLI and app Vox {now} are installed; rollback incomplete (app handoff: {}; daemon handoff: {}); do not repeat --rollback: {}",
+            if transition.app_complete { "complete" } else { "incomplete" },
+            if transition.daemon_complete { "complete" } else { "incomplete" },
             failures.join("; ")
         )));
     }
@@ -788,8 +1028,8 @@ fn stop_transaction(
 fn publish(apps: &Path, transition: &mut Transition) -> Result<(), AppError> {
     let active = apps.join(BUNDLE);
     let staged = apps.join(PARTIAL);
-    if bundle_identity(&active)? != transition.source
-        || bundle_identity(&staged)? != transition.target
+    if !transition.source.matches(&bundle_identity(&active)?)
+        || !transition.target.matches(&bundle_identity(&staged)?)
     {
         return Err(usage(
             "bundle identities changed before exchange; all files retained",
@@ -807,8 +1047,8 @@ fn publish(apps: &Path, transition: &mut Transition) -> Result<(), AppError> {
         .ok_or_else(|| usage("missing archive transaction authority"))?
         .phase = FilesystemPhase::Exchanged;
     write_transition(apps, transition)?;
-    if bundle_identity(&active)? != transition.target
-        || bundle_identity(&staged)? != transition.source
+    if !transition.target.matches(&bundle_identity(&active)?)
+        || !transition.source.matches(&bundle_identity(&staged)?)
     {
         return Err(usage(
             "bundle identities changed after exchange; all files retained",
@@ -821,8 +1061,8 @@ fn publish(apps: &Path, transition: &mut Transition) -> Result<(), AppError> {
         .phase = FilesystemPhase::Retiring;
     write_transition(apps, transition)?;
     launch_services(false, &staged).map_err(usage)?;
-    if bundle_identity(&active)? != transition.target
-        || bundle_identity(&staged)? != transition.source
+    if !transition.target.matches(&bundle_identity(&active)?)
+        || !transition.source.matches(&bundle_identity(&staged)?)
     {
         return Err(usage(
             "bundle identities changed before retirement; all files retained",
@@ -1340,7 +1580,9 @@ fn recover_candidate_preparation(apps: &Path, transition: &Transition) -> Result
     if !matches!(transition.kind, TransitionKind::Refresh)
         || transition.archive.is_some()
         || transition.source != transition.target
-        || bundle_identity(&apps.join(BUNDLE))? != transition.source
+        || !transition
+            .source
+            .matches(&bundle_identity(&apps.join(BUNDLE))?)
     {
         return Err(usage(
             "candidate preparation active identity changed; all files retained",
@@ -1348,12 +1590,14 @@ fn recover_candidate_preparation(apps: &Path, transition: &Transition) -> Result
     }
     let unpacked = apps.join(UNPACK_PARTIAL);
     let staged = apps.join(PARTIAL);
-    if path_exists(&unpacked)? && bundle_identity(&unpacked)? != preparation.directory {
+    if path_exists(&unpacked)? && !preparation.directory.matches(&bundle_identity(&unpacked)?) {
         return Err(usage(
             "candidate preparation directory identity changed; all files retained",
         ));
     }
-    if path_exists(&staged)? && preparation.staged.as_ref() != Some(&bundle_identity(&staged)?) {
+    if path_exists(&staged)?
+        && !saved_matches(preparation.staged.as_ref(), &bundle_identity(&staged)?)
+    {
         return Err(usage(
             "staged candidate identity changed; all files retained",
         ));
@@ -1374,7 +1618,7 @@ fn recover_candidate_preparation(apps: &Path, transition: &Transition) -> Result
                 ));
             }
             if path_exists(parent)? {
-                if &bundle_identity(parent)? != identity {
+                if !identity.matches(&bundle_identity(parent)?) {
                     return Err(usage(
                         "snapshot verification directory identity changed; all files retained",
                     ));
@@ -1422,13 +1666,272 @@ fn recover_candidate_preparation(apps: &Path, transition: &Transition) -> Result
     finish_journal(apps)
 }
 
+fn code_directory_hash(path: &Path) -> Result<String, AppError> {
+    let output = Command::new("/usr/bin/codesign")
+        .args(["--display", "--verbose=4"])
+        .arg(path)
+        .output()
+        .map_err(AppError::Io)?;
+    if !output.status.success()
+        || output.stderr.len() > super::MAX_SIGNING_INFO_BYTES
+        || !output.stdout.is_empty()
+    {
+        return Err(usage(format!(
+            "cannot inspect code signature at {}",
+            path.display()
+        )));
+    }
+    let text = std::str::from_utf8(&output.stderr)
+        .map_err(|_| usage("code signature information is not UTF-8"))?;
+    let hash = super::unique_value(text, "CDHash=")?;
+    if hash.is_empty() || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(usage("invalid code directory hash"));
+    }
+    Ok(hash.to_owned())
+}
+
+fn retained_release_error(error: AppError, version: &str) -> AppError {
+    let temporary = matches!(&error, AppError::Usage(message)
+        if message.starts_with("update transport failed:") || message.contains("is not published"));
+    if temporary {
+        usage(format!("cannot obtain retained release {version}: {error}; restore release access and run `vox update`"))
+    } else {
+        usage(format!("cannot authenticate retained release {version}: {error}; all files retained; contact Vox support"))
+    }
+}
+
+fn unsafe_recovery(error: AppError) -> AppError {
+    usage(format!("{error}; all files retained; contact Vox support"))
+}
+
+fn readoption_shape(apps: &Path, transition: &Transition) -> Result<(), AppError> {
+    let archive = transition
+        .archive
+        .as_ref()
+        .ok_or_else(|| usage("readoption has no archive authority; all files retained"))?;
+    if transition.identity_format != IdentityFormat::LegacyContinuation
+        || transition
+            .identity_history
+            .as_ref()
+            .is_none_or(|history| history.durable_roles.get() != 0)
+        || transition.source.stable.is_some()
+        || transition.target.stable.is_some()
+        || !matches!(
+            transition.kind,
+            TransitionKind::Update | TransitionKind::Rollback
+        )
+        || archive.legacy
+        || !matches!(
+            archive.phase,
+            FilesystemPhase::FilesystemCommitted | FilesystemPhase::HandingOff
+        )
+        || transition.candidate_preparation.is_some()
+        || transition.legacy_preparation.is_some()
+        || archive.restoration.is_some()
+        || archive.restoration_directory.is_some()
+        || archive.restoration_path.is_some()
+        || archive.legacy_path.is_some()
+        || archive.legacy_superseded.is_some()
+        || archive.legacy_superseded_identity.is_some()
+        || transition.legacy_no_handoff
+        || !transition.app_complete
+        || (transition.readoption_target.is_none()
+            && (transition.daemon_complete || transition.handoff_complete))
+    {
+        return Err(usage(
+            "ambiguous legacy transition; retain all files and contact Vox support",
+        ));
+    }
+    for path in [
+        apps.join(PARTIAL),
+        apps.join(UNPACK_PARTIAL),
+        apps.join(PREVIOUS),
+        apps.join(PUBLISHING).join(BUNDLE),
+        apps.join(PUBLISHING).join("legacy-work"),
+        apps.join(PUBLISHING).join(SOURCE_ARCHIVE),
+        apps.join(PUBLISHING).join("source.json"),
+        apps.join(PUBLISHING).join("legacy-superseded.zip"),
+    ] {
+        if path_exists(&path)? {
+            return Err(usage(format!(
+                "conflicting transition item {} retained; contact Vox support",
+                path.display()
+            )));
+        }
+    }
+    let journal = apps.join(PUBLISHING);
+    let prior_zip = journal.join(PRIOR_ARCHIVE);
+    let prior_record = journal.join(PRIOR_AUTHORITY);
+    match archive.previous_archive.as_ref() {
+        Some(prior) => {
+            if !path_exists(&prior_zip)?
+                || !path_exists(&prior_record)?
+                || read_archive_record(&prior_record)? != *prior
+                || !archive_matches(&prior_zip, prior)?
+            {
+                return Err(usage(
+                    "prior rollback authority changed; all files retained; contact Vox support",
+                ));
+            }
+        }
+        None if path_exists(&prior_zip)? || path_exists(&prior_record)? => {
+            return Err(usage(
+                "unexpected prior rollback authority; all files retained; contact Vox support",
+            ));
+        }
+        None => {}
+    }
+    Ok(())
+}
+
+fn authenticate_readoption(apps: &Path, transition: &mut Transition) -> Result<(), AppError> {
+    use std::io::{Seek as _, SeekFrom};
+    readoption_shape(apps, transition)?;
+    let active = apps.join(BUNDLE);
+    let before = bundle_identity(&active)?;
+    let volume = vox_sockdrops::volume_uuid(apps)
+        .map_err(|e| usage(format!("cannot identify installation volume: {e}")))?;
+    if before.inode != transition.target.inode
+        || before
+            .stable
+            .as_ref()
+            .is_none_or(|stable| stable.volume != volume)
+    {
+        return Err(usage("legacy target inode or installation volume changed; all files retained; contact Vox support"));
+    }
+    let archive = transition
+        .archive
+        .as_ref()
+        .ok_or_else(|| usage("missing archive authority; all files retained"))?;
+    if read_rollback_authority(apps)
+        .map_err(unsafe_recovery)?
+        .as_ref()
+        != Some(&archive.source_archive)
+    {
+        return Err(usage(
+            "rollback authority changed; all files retained; contact Vox support",
+        ));
+    }
+    let scratch = tempfile::Builder::new()
+        .prefix("vox-recovery-auth.")
+        .tempdir()
+        .map_err(AppError::Io)?;
+    let source_dir = scratch.path().join("source");
+    let target_dir = scratch.path().join("target");
+    fs::create_dir(&source_dir).map_err(AppError::Io)?;
+    fs::create_dir(&target_dir).map_err(AppError::Io)?;
+    extract_archive(
+        &apps.join(ROLLBACK_ARCHIVE),
+        &archive.source_archive,
+        &source_dir,
+    )
+    .map_err(unsafe_recovery)?;
+    let reference = match transition.kind {
+        TransitionKind::Rollback => {
+            let authority = archive.previous_archive.as_ref().ok_or_else(|| {
+                usage("missing prior rollback authority; all files retained; contact Vox support")
+            })?;
+            let journal = apps.join(PUBLISHING);
+            if read_archive_record(&journal.join(PRIOR_AUTHORITY))? != *authority {
+                return Err(usage(
+                    "prior rollback record changed; all files retained; contact Vox support",
+                ));
+            }
+            extract_archive(&journal.join(PRIOR_ARCHIVE), authority, &target_dir)?
+        }
+        TransitionKind::Update => {
+            let channel = super::Marker::read(&apps.join(super::MARKER_NAME))?.channel;
+            let record = fetch_app_record_at(&channel, target_triple(), &transition.version)
+                .map_err(|e| retained_release_error(e, &transition.version))?;
+            let mut file = tempfile::tempfile().map_err(AppError::Io)?;
+            download_asset(
+                &record,
+                &format!("Vox-{}-{}.zip", record.version_text, record.target),
+                &mut file,
+            )
+            .map_err(|e| retained_release_error(e, &transition.version))?;
+            file.seek(SeekFrom::Start(0)).map_err(AppError::Io)?;
+            let output = Command::new("/usr/bin/ditto")
+                .args(["-x", "-k", "-"])
+                .stdin(std::process::Stdio::from(file))
+                .arg(&target_dir)
+                .output()
+                .map_err(AppError::Io)?;
+            if !output.status.success() {
+                return Err(usage(format!(
+                    "cannot extract retained release: {}; all files retained",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )));
+            }
+            let mut entries = fs::read_dir(&target_dir).map_err(AppError::Io)?;
+            let entry = entries
+                .next()
+                .transpose()
+                .map_err(AppError::Io)?
+                .ok_or_else(|| usage("retained release archive is empty"))?;
+            if entry.file_name() != BUNDLE
+                || entries.next().transpose().map_err(AppError::Io)?.is_some()
+            {
+                return Err(usage(
+                    "retained release archive has unexpected contents; all files retained",
+                ));
+            }
+            let reference = target_dir.join(BUNDLE);
+            bundle_identity(&reference)?;
+            if apple_required() {
+                verify_apple(&active, &reference).map_err(unsafe_recovery)?;
+            }
+            reference
+        }
+        TransitionKind::Refresh => return Err(usage("refresh cannot be readopted")),
+    };
+    let mut target_authority = archive.source_archive.clone();
+    target_authority.version = transition.version.clone();
+    verify_local_bundle(&reference, &target_authority).map_err(unsafe_recovery)?;
+    verify_local_bundle(&active, &target_authority).map_err(unsafe_recovery)?;
+    for (installed, expected) in [
+        (active.clone(), reference.clone()),
+        (active.join(HELPER), reference.join(HELPER)),
+    ] {
+        if code_directory_hash(&installed)? != code_directory_hash(&expected)? {
+            return Err(usage(format!(
+                "signed payload differs at {}; all files retained; contact Vox support",
+                installed.display()
+            )));
+        }
+    }
+    if sha256_of(&active.join(HELPER))? != sha256_of(&reference.join(HELPER))? {
+        return Err(usage("installed helper differs from retained release; all files retained; contact Vox support"));
+    }
+    let after = bundle_identity(&active)?;
+    let after_volume = vox_sockdrops::volume_uuid(apps)
+        .map_err(|e| usage(format!("cannot identify installation volume: {e}")))?;
+    if !before.matches(&after) || before.device != after.device || volume != after_volume {
+        return Err(usage(
+            "target changed during authentication; all files retained; contact Vox support",
+        ));
+    }
+    transition.readoption_target = Some(after);
+    write_transition(apps, transition)
+}
+
 /// Recover using the bundle identities and owned handoff captured before the app was stopped.
 fn recover_transition(apps: &Path, path: &Path) -> Result<Recovery, AppError> {
     use std::os::unix::ffi::OsStringExt as _;
     let bytes =
         fs::read(path).map_err(|e| usage(format!("cannot read {}: {e}", path.display())))?;
-    let mut transition: Transition = serde_json::from_slice(&bytes)
-        .map_err(|e| usage(format!("cannot parse {}: {e}", path.display())))?;
+    let mut transition: Transition = serde_json::from_slice(&bytes).map_err(|e| {
+        usage(format!(
+            "cannot parse {}: {e}; all files retained; contact Vox support",
+            path.display()
+        ))
+    })?;
+    transition
+        .validate_identities(false)
+        .map_err(unsafe_recovery)?;
+    if transition.identity_format == IdentityFormat::OriginalLegacy {
+        transition.continue_legacy();
+    }
     let valid_root = |bytes: &[u8]| {
         !bytes.contains(&0)
             && PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec())).is_absolute()
@@ -1461,6 +1964,23 @@ fn recover_transition(apps: &Path, path: &Path) -> Result<Recovery, AppError> {
             path.display()
         )));
     }
+    if let Some(receipt) = transition.readoption_target.as_ref() {
+        readoption_shape(apps, &transition)?;
+        let current = bundle_identity(&apps.join(BUNDLE))?;
+        let volume = vox_sockdrops::volume_uuid(apps)
+            .map_err(|e| usage(format!("cannot identify installation volume: {e}")))?;
+        if !receipt.matches(&current)
+            || current.inode != transition.target.inode
+            || current
+                .stable
+                .as_ref()
+                .is_none_or(|stable| stable.volume != volume)
+        {
+            return Err(usage(
+                "readopted target changed; all files retained; contact Vox support",
+            ));
+        }
+    }
     if transition.candidate_preparation.is_some() {
         recover_candidate_preparation(apps, &transition)?;
         return Ok(Recovery {
@@ -1472,7 +1992,9 @@ fn recover_transition(apps: &Path, path: &Path) -> Result<Recovery, AppError> {
     }
     if transition.archive.is_none()
         && !matches!(transition.kind, TransitionKind::Refresh)
-        && bundle_identity(&apps.join(BUNDLE))? == transition.source
+        && transition
+            .source
+            .matches(&bundle_identity(&apps.join(BUNDLE))?)
     {
         let previous = apps.join(PREVIOUS);
         let kept = apps.join(PUBLISHING).join(BUNDLE);
@@ -1486,7 +2008,7 @@ fn recover_transition(apps: &Path, path: &Path) -> Result<Recovery, AppError> {
         }
         let staged = apps.join(PARTIAL);
         if matches!(transition.kind, TransitionKind::Update) && path_exists(&staged)? {
-            if bundle_identity(&staged)? != transition.target {
+            if !transition.target.matches(&bundle_identity(&staged)?) {
                 return Err(usage(
                     "legacy candidate identity changed; all bundles retained",
                 ));
@@ -1501,7 +2023,7 @@ fn recover_transition(apps: &Path, path: &Path) -> Result<Recovery, AppError> {
         }
         if path_exists(&previous)? {
             if matches!(transition.kind, TransitionKind::Rollback)
-                && bundle_identity(&previous)? != transition.target
+                && !transition.target.matches(&bundle_identity(&previous)?)
             {
                 return Err(usage(
                     "legacy rollback identity changed; all bundles retained",
@@ -1517,7 +2039,9 @@ fn recover_transition(apps: &Path, path: &Path) -> Result<Recovery, AppError> {
     }
     if transition.archive.is_none()
         && !matches!(transition.kind, TransitionKind::Refresh)
-        && bundle_identity(&apps.join(BUNDLE))? == transition.target
+        && transition
+            .target
+            .matches(&bundle_identity(&apps.join(BUNDLE))?)
     {
         prepare_legacy_migration(apps, &mut transition)?;
     }
@@ -1527,6 +2051,22 @@ fn recover_transition(apps: &Path, path: &Path) -> Result<Recovery, AppError> {
             && archive.phase != FilesystemPhase::HandingOff
     }) {
         resume_legacy_migration(apps, &mut transition)?;
+    }
+    if transition.readoption_target.is_none()
+        && transition.identity_format == IdentityFormat::LegacyContinuation
+        && transition.target.stable.is_none()
+        && transition.archive.as_ref().is_some_and(|archive| {
+            !archive.legacy
+                && matches!(
+                    archive.phase,
+                    FilesystemPhase::FilesystemCommitted | FilesystemPhase::HandingOff
+                )
+        })
+        && !transition
+            .target
+            .matches(&bundle_identity(&apps.join(BUNDLE))?)
+    {
+        authenticate_readoption(apps, &mut transition)?;
     }
     if let Some(archive) = transition.archive.as_ref() {
         if !matches!(
@@ -1541,12 +2081,28 @@ fn recover_transition(apps: &Path, path: &Path) -> Result<Recovery, AppError> {
                 ..Recovery::default()
             });
         }
-        if bundle_identity(&apps.join(BUNDLE))? != transition.target
-            || read_rollback_authority(apps)?.as_ref() != Some(&archive.source_archive)
+        if !transition
+            .target
+            .matches(&bundle_identity(&apps.join(BUNDLE))?)
+            && !saved_matches(
+                transition.readoption_target.as_ref(),
+                &bundle_identity(&apps.join(BUNDLE))?,
+            )
+            || read_rollback_authority(apps)
+                .map_err(unsafe_recovery)?
+                .as_ref()
+                != Some(&archive.source_archive)
         {
             return Err(usage(
-                "committed archive transaction identity changed; all files retained",
+                "committed archive transaction identity changed; all files retained; contact Vox support",
             ));
+        }
+        if !archive.source_archive.fixture_identity {
+            let mut target_authority = archive.source_archive.clone();
+            target_authority.version = transition.version.clone();
+            verify_local_bundle(&apps.join(BUNDLE), &target_authority).map_err(|error| {
+                usage(format!("installed committed bundle failed authentication: {error}; all files retained; contact Vox support"))
+            })?;
         }
     }
     if transition.legacy_no_handoff {
@@ -1567,19 +2123,22 @@ fn recover_transition(apps: &Path, path: &Path) -> Result<Recovery, AppError> {
     }
     let active = apps.join(BUNDLE);
     let current = bundle_identity(&active)?;
-    let committed =
-        if matches!(transition.kind, TransitionKind::Refresh) && current == transition.source {
-            false
-        } else if current == transition.target {
-            true
-        } else if current == transition.source {
-            false
-        } else {
-            return Err(usage(format!(
-                "ambiguous transition {}: active bundle identity changed; no bundles removed",
-                path.display()
-            )));
-        };
+    let committed = if matches!(transition.kind, TransitionKind::Refresh)
+        && transition.source.matches(&current)
+    {
+        false
+    } else if transition.target.matches(&current)
+        || saved_matches(transition.readoption_target.as_ref(), &current)
+    {
+        true
+    } else if transition.source.matches(&current) {
+        false
+    } else {
+        return Err(usage(format!(
+            "ambiguous transition {}: active bundle identity changed; no bundles removed",
+            path.display()
+        )));
+    };
     let now = app_version(&active).ok_or_else(|| {
         usage(format!(
             "cannot identify installed version at {}",
@@ -1646,7 +2205,9 @@ fn recover_transition(apps: &Path, path: &Path) -> Result<Recovery, AppError> {
     }
     if !errors.is_empty() {
         return Err(usage(format!(
-            "Vox {now} is installed; transition remains incomplete{}: {}; run `vox update` for local repair",
+            "CLI and app Vox {now} are installed; handoff incomplete (app: {}; daemon: {}){}: {}; run `vox update` for local repair",
+            if transition.app_complete { "complete" } else { "incomplete" },
+            if transition.daemon_complete { "complete" } else { "incomplete" },
             if committed && matches!(transition.kind, TransitionKind::Rollback) {
                 "; do not repeat --rollback"
             } else { "" },
@@ -1660,6 +2221,10 @@ fn recover_transition(apps: &Path, path: &Path) -> Result<Recovery, AppError> {
     Ok(Recovery {
         interrupted_publish: true,
         handoff_done: true,
+        daemon_was_running: Some(matches!(
+            &transition.daemon,
+            super::restart::DaemonIntent::Running { .. }
+        )),
         ..Recovery::default()
     })
 }
@@ -1671,6 +2236,7 @@ struct Recovery {
     handoff_done: bool,
     legacy_migrated: bool,
     retired_removed: usize,
+    daemon_was_running: Option<bool>,
 }
 
 impl Recovery {
@@ -1678,8 +2244,18 @@ impl Recovery {
         !self.interrupted_publish && self.retired_removed == 0
     }
 
-    fn say_without_swap(&self) {
-        print!("vox: recovered an earlier app transition;");
+    fn say_without_swap(&self, apps: &Path) -> Result<(), AppError> {
+        let version = app_version(&apps.join(BUNDLE))
+            .ok_or_else(|| usage("cannot identify the repaired app version"))?;
+        print!("vox: recovered an earlier transition; CLI and app Vox {version}");
+        if self.daemon_was_running.is_some() {
+            print!("; app handoff recorded complete");
+        }
+        match self.daemon_was_running {
+            Some(true) => print!("; daemon handoff recorded complete"),
+            Some(false) => print!("; daemon was not required by captured startup intent"),
+            None => {}
+        }
         if self.retired_removed > 0 {
             print!(
                 " removed {} retired bundle(s) no process still used;",
@@ -1687,6 +2263,7 @@ impl Recovery {
             );
         }
         println!();
+        Ok(())
     }
 }
 
@@ -1748,7 +2325,7 @@ fn unpack(
         .candidate_preparation
         .as_ref()
         .ok_or_else(|| usage("missing candidate preparation authority"))?;
-    if bundle_identity(&unpacked)? != preparation.directory {
+    if !preparation.directory.matches(&bundle_identity(&unpacked)?) {
         return Err(usage("candidate preparation directory identity changed"));
     }
     let out = Command::new("/usr/bin/ditto")
@@ -2141,9 +2718,9 @@ fn restore_source_filesystem(apps: &Path, transition: &mut Transition) -> Result
         .as_ref()
         .ok_or_else(|| usage("missing archive transaction authority"))?;
     restore_previous_authority(apps, archive)?;
-    let is_restored = archive.restoration.as_ref() == Some(&current);
-    if current != transition.source && !is_restored {
-        if current != transition.target {
+    let is_restored = saved_matches(archive.restoration.as_ref(), &current);
+    if !transition.source.matches(&current) && !is_restored {
+        if !transition.target.matches(&current) {
             return Err(usage(
                 "active bundle identity is ambiguous; all recovery authority retained",
             ));
@@ -2158,13 +2735,16 @@ fn restore_source_filesystem(apps: &Path, transition: &mut Transition) -> Result
                     .parent()
                     .ok_or_else(|| usage("invalid restoration path"))?;
                 if path_exists(parent)? {
-                    if archive.restoration_directory.as_ref() != Some(&bundle_identity(parent)?) {
+                    if !saved_matches(
+                        archive.restoration_directory.as_ref(),
+                        &bundle_identity(parent)?,
+                    ) {
                         return Err(usage(
                             "restoration directory identity changed; all files retained",
                         ));
                     }
                     if archive.restoration.is_some() && path_exists(&path)? {
-                        if archive.restoration.as_ref() != Some(&bundle_identity(&path)?) {
+                        if !saved_matches(archive.restoration.as_ref(), &bundle_identity(&path)?) {
                             return Err(usage(
                                 "restoration staging identity changed; all files retained",
                             ));
@@ -2234,7 +2814,7 @@ fn restore_source_filesystem(apps: &Path, transition: &mut Transition) -> Result
             write_transition(apps, transition)?;
             path
         };
-        if bundle_identity(&active)? != transition.target {
+        if !transition.target.matches(&bundle_identity(&active)?) {
             return Err(usage("active bundle changed before restoration exchange"));
         }
         swap(&restore_path, &active)?;
@@ -2245,7 +2825,9 @@ fn restore_source_filesystem(apps: &Path, transition: &mut Transition) -> Result
         .as_ref()
         .ok_or_else(|| usage("missing archive transaction authority"))?;
     let current = bundle_identity(&active)?;
-    if current != transition.source && archive.restoration.as_ref() != Some(&current) {
+    if !transition.source.matches(&current)
+        && !saved_matches(archive.restoration.as_ref(), &current)
+    {
         return Err(usage("restored bundle identity does not match journal"));
     }
     verify_local_bundle(&active, &archive.source_archive)?;
@@ -2253,15 +2835,18 @@ fn restore_source_filesystem(apps: &Path, transition: &mut Transition) -> Result
         let path = PathBuf::from(std::ffi::OsString::from_vec(bytes.clone()));
         if let Some(parent) = path.parent() {
             if path_exists(parent)? {
-                if archive.restoration_directory.as_ref() != Some(&bundle_identity(parent)?) {
+                if !saved_matches(
+                    archive.restoration_directory.as_ref(),
+                    &bundle_identity(parent)?,
+                ) {
                     return Err(usage(
                         "restoration directory identity changed; all files retained",
                     ));
                 }
                 if path_exists(&path)? {
                     let identity = bundle_identity(&path)?;
-                    if identity != transition.target
-                        && archive.restoration.as_ref() != Some(&identity)
+                    if !transition.target.matches(&identity)
+                        && !saved_matches(archive.restoration.as_ref(), &identity)
                     {
                         return Err(usage(
                             "restoration staging bundle identity changed; all files retained",
@@ -2286,7 +2871,7 @@ fn restore_source_filesystem(apps: &Path, transition: &mut Transition) -> Result
     }
     if path_exists(&staged)? {
         let identity = bundle_identity(&staged)?;
-        if identity != transition.source && identity != transition.target {
+        if !transition.source.matches(&identity) && !transition.target.matches(&identity) {
             return Err(usage("staged bundle identity changed; all files retained"));
         }
         launch_services(false, &staged).map_err(usage)?;
@@ -2325,7 +2910,7 @@ fn clear_legacy_preparation(apps: &Path, transition: &mut Transition) -> Result<
                     ));
                 }
                 if path_exists(parent)? {
-                    if &bundle_identity(parent)? != identity {
+                    if !identity.matches(&bundle_identity(parent)?) {
                         return Err(usage(
                             "legacy verification directory identity changed; all files retained",
                         ));
@@ -2349,7 +2934,7 @@ fn clear_legacy_preparation(apps: &Path, transition: &mut Transition) -> Result<
             }
         }
         if path_exists(&work)? {
-            if bundle_identity(&work)? != preparation.directory {
+            if !preparation.directory.matches(&bundle_identity(&work)?) {
                 return Err(usage(
                     "legacy staging directory identity changed; all files retained",
                 ));
@@ -2482,7 +3067,7 @@ fn prepare_legacy_migration(apps: &Path, transition: &mut Transition) -> Result<
     use std::os::unix::ffi::OsStrExt as _;
     let journal = apps.join(PUBLISHING);
     let active = apps.join(BUNDLE);
-    if bundle_identity(&active)? != transition.target {
+    if !transition.target.matches(&bundle_identity(&active)?) {
         return Err(usage(
             "legacy journal does not identify the active committed bundle; authority retained",
         ));
@@ -2504,7 +3089,7 @@ fn prepare_legacy_migration(apps: &Path, transition: &mut Transition) -> Result<
     let mut source = None;
     for path in &possible {
         if path_exists(path)?
-            && bundle_identity(path)? == transition.source
+            && transition.source.matches(&bundle_identity(path)?)
             && source.replace(path.clone()).is_some()
         {
             return Err(usage(
@@ -2568,7 +3153,7 @@ fn finish_legacy_staging(apps: &Path, transition: &mut Transition) -> Result<(),
         .ok_or_else(|| usage("missing legacy archive authority"))?;
     let journal = apps.join(PUBLISHING);
     let work = journal.join("legacy-work");
-    if path_exists(&work)? && bundle_identity(&work)? != preparation.directory {
+    if path_exists(&work)? && !preparation.directory.matches(&bundle_identity(&work)?) {
         return Err(usage(
             "legacy staging directory identity changed; all authority retained",
         ));
@@ -2622,7 +3207,10 @@ fn finish_legacy_staging(apps: &Path, transition: &mut Transition) -> Result<(),
 fn resume_legacy_migration(apps: &Path, transition: &mut Transition) -> Result<(), AppError> {
     use std::os::unix::ffi::OsStringExt as _;
     let journal = apps.join(PUBLISHING);
-    if bundle_identity(&apps.join(BUNDLE))? != transition.target {
+    if !transition
+        .target
+        .matches(&bundle_identity(&apps.join(BUNDLE))?)
+    {
         return Err(usage(
             "legacy active bundle identity changed; all files retained",
         ));
@@ -2632,7 +3220,11 @@ fn resume_legacy_migration(apps: &Path, transition: &mut Transition) -> Result<(
         .archive
         .as_ref()
         .ok_or_else(|| usage("missing legacy archive authority"))?;
-    if !archive.legacy || bundle_identity(&apps.join(BUNDLE))? != transition.target {
+    if !archive.legacy
+        || !transition
+            .target
+            .matches(&bundle_identity(&apps.join(BUNDLE))?)
+    {
         return Err(usage(
             "legacy active bundle identity changed; all files retained",
         ));
@@ -2667,13 +3259,19 @@ fn resume_legacy_migration(apps: &Path, transition: &mut Transition) -> Result<(
         }
         let old = journal.join(BUNDLE);
         if path_exists(&old)? {
-            if archive.legacy_superseded_identity.as_ref() != Some(&bundle_identity(&old)?) {
+            if !saved_matches(
+                archive.legacy_superseded_identity.as_ref(),
+                &bundle_identity(&old)?,
+            ) {
                 return Err(usage(
                     "superseded legacy bundle identity changed; all retained",
                 ));
             }
             launch_services(false, &old).map_err(usage)?;
-            if archive.legacy_superseded_identity.as_ref() != Some(&bundle_identity(&old)?) {
+            if !saved_matches(
+                archive.legacy_superseded_identity.as_ref(),
+                &bundle_identity(&old)?,
+            ) {
                 return Err(usage(
                     "superseded legacy bundle identity changed before retirement",
                 ));
@@ -2683,11 +3281,11 @@ fn resume_legacy_migration(apps: &Path, transition: &mut Transition) -> Result<(
         }
     }
     if path_exists(&path)? {
-        if bundle_identity(&path)? != transition.source {
+        if !transition.source.matches(&bundle_identity(&path)?) {
             return Err(usage("legacy source bundle identity changed; all retained"));
         }
         launch_services(false, &path).map_err(usage)?;
-        if bundle_identity(&path)? != transition.source {
+        if !transition.source.matches(&bundle_identity(&path)?) {
             return Err(usage(
                 "legacy source bundle identity changed before retirement",
             ));
@@ -3339,7 +3937,9 @@ fn restore_source_and_handoff(
         .as_ref()
         .ok_or_else(|| usage("missing archive transaction authority"))?;
     let identity = bundle_identity(&active)?;
-    if identity != transition.source && archive.restoration.as_ref() != Some(&identity) {
+    if !transition.source.matches(&identity)
+        && !saved_matches(archive.restoration.as_ref(), &identity)
+    {
         return Err(usage(format!(
             "source restoration failed: {}",
             filesystem

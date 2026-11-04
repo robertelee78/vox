@@ -4712,6 +4712,44 @@ pub struct NodeHandle {
     decisions: crate::node::decisions::DecisionLog,
 }
 
+/// A Session batch that has not entered the actor's command queue.
+#[doc(hidden)]
+pub enum SessionBatchEnqueueError {
+    /// The queue is full; the caller still owns every body.
+    Full(Vec<String>),
+    /// The actor has closed its command queue; no command was submitted.
+    Closed(Vec<String>),
+}
+
+/// A reserved actor command slot. Its owner must revalidate its Session route before sending.
+#[doc(hidden)]
+pub struct SessionBatchSlot(mpsc::OwnedPermit<(NodeCommand, oneshot::Sender<Outcome>)>);
+
+impl SessionBatchSlot {
+    /// Send one batch into this reserved slot and return its physical admission receipt.
+    #[doc(hidden)]
+    pub fn send(
+        self,
+        room: Digest32,
+        session: String,
+        bodies: Vec<String>,
+    ) -> oneshot::Receiver<crate::node::session_ingress::OwnedAdmission> {
+        let (reply, receipt) = oneshot::channel();
+        let (outer, outcome) = oneshot::channel();
+        self.0.send((
+            NodeCommand::AcceptSessionBatch {
+                channel_id: room,
+                session_id: session,
+                bodies,
+                reply,
+            },
+            outer,
+        ));
+        drop(outcome);
+        receipt
+    }
+}
+
 /// Existing read/control admission, independent of parked store writers. Status carries
 /// its own typed reply; commands retain their ordinary outcome without an extra allocation.
 pub(crate) struct ReadRequest {
@@ -4844,6 +4882,37 @@ impl std::fmt::Debug for KeyringWindow {
 }
 
 impl NodeHandle {
+    /// Submit a Session batch only if a command slot is immediately available.
+    #[doc(hidden)]
+    pub fn try_enqueue_session_batch(
+        &self,
+        room: Digest32,
+        session: String,
+        bodies: Vec<String>,
+    ) -> std::result::Result<
+        oneshot::Receiver<crate::node::session_ingress::OwnedAdmission>,
+        SessionBatchEnqueueError,
+    > {
+        match self.cmd_tx.clone().try_reserve_owned() {
+            Ok(slot) => Ok(SessionBatchSlot(slot).send(room, session, bodies)),
+            Err(mpsc::error::TrySendError::Full(_)) => Err(SessionBatchEnqueueError::Full(bodies)),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(SessionBatchEnqueueError::Closed(bodies))
+            }
+        }
+    }
+
+    /// Wait for command capacity without holding Session admission ordering.
+    #[doc(hidden)]
+    pub async fn reserve_session_batch_slot(&self) -> Option<SessionBatchSlot> {
+        self.cmd_tx
+            .clone()
+            .reserve_owned()
+            .await
+            .ok()
+            .map(SessionBatchSlot)
+    }
+
     /// Observe this exact actor's retirement and physical resource completion without keeping
     /// its Store, keys or worker leases alive.
     #[must_use]
@@ -5166,6 +5235,36 @@ impl NodeHandle {
         ])
     }
 
+    pub(crate) async fn session_selection_revision(
+        &self,
+        channel_id: Digest32,
+    ) -> std::result::Result<Digest32, String> {
+        use crate::node::channel::session_projection::{Query, Reply};
+        let Reply::SelectionRevision(revision) = self
+            .session_projection(channel_id, Query::SelectionRevision)
+            .await?
+        else {
+            return Err("unexpected Session selection revision answer".into());
+        };
+        let (view, current) = self.coherent_view();
+        let detail = view
+            .open_channels
+            .iter()
+            .find(|room| room.channel_id == channel_id)
+            .ok_or("the room is not open")?;
+        Ok(crate::hash::sha256_concat(&[
+            b"vox/session-selection-view/v1",
+            &self.display_incarnation,
+            &channel_id,
+            &revision,
+            &[u8::from(detail.pause.paused)],
+            &detail.pause.by,
+            &detail.pause.at_millis.to_be_bytes(),
+            &detail.governance_revision.to_be_bytes(),
+            &[u8::from(current)],
+        ]))
+    }
+
     /// An opaque token for the authoritative selected history and current display names.
     /// The actor reads the sealed revision under the same gate and room lock as Find; a
     /// busy room cannot substitute an older published watch value. No rows are collected.
@@ -5326,6 +5425,7 @@ impl NodeHandle {
         if matches!(
             &command,
             NodeCommand::Ping
+                | NodeCommand::Shutdown
                 | NodeCommand::Status { .. }
                 | NodeCommand::PreparePost { .. }
                 | NodeCommand::Attention {
@@ -5605,6 +5705,7 @@ struct OwnKeyComputerReady {
     rooms: Vec<(Digest32, SharedChannel)>,
     transitions: Option<Vec<crate::node::channel::own_writer_gate::Transition>>,
     publication: Option<crate::node::computer::ComputerPublicationTransition>,
+    preflight: crate::error::Result<Option<trust_save::PolicyPublicationBlocked>>,
     binding: crate::error::Result<()>,
     work: computer::OwnKeyPolicyWork,
 }
@@ -7123,6 +7224,7 @@ impl Node {
         // Preparation, cleanup, governance and package scans share one select slot. Rotate between
         // ready classes; each retains its own room cursor and yields after one bounded turn.
         let mut maintenance_next = 0u8;
+        let mut read_priority = true;
         // Parked events retain the original channel's admission credit. One event may
         // occupy the actor's ordinary in-hand slot if a sender wins that credit race;
         // stop receiving until it can run rather than inventing another queue budget.
@@ -7664,6 +7766,7 @@ impl Node {
                     // no bounded actor-queue send or unrelated policy gate stands between a
                     // worker and its join.
                     self.accept_bounded_sync();
+                    self.complete_pending_policies().await;
                     self.publish().await;
                     self.schedule().await;
                 }
@@ -7708,6 +7811,13 @@ impl Node {
                         self.publish().await;
                         continue;
                     }
+                    // Empty read and key-prune work both take a room's durable owner.
+                    // Alternate priority so neither can starve the other; advance the
+                    // read-room cursor only on its priority turn.
+                    if read_priority {
+                        self.flush_reads().await;
+                    }
+                    read_priority = !read_priority;
                     self.publication_pending |= !self.publish_waiters.is_empty();
                     self.publication_again |= !self.publish_waiters.is_empty();
                     // A joined sparse room that is not yet settled owes its settlement one
@@ -7780,8 +7890,6 @@ impl Node {
                     if self.sweep_retention().await {
                         self.publish().await;
                     }
-                    // A read record held back by the 5-second batch goes out when it is due.
-                    if self.flush_reads().await { self.publish().await; }
                     // A folded decision's count is written once its hour is over (ADR-028 D-1).
                     self.decisions.flush_folded((self.millis_clock)());
                 }
@@ -7901,14 +8009,22 @@ impl Node {
                                 profile,
                                 channel_id,
                                 &session_id,
-                                bodies,
+                                &bodies,
                             )
                         })
                 };
                 if result.is_ok() {
                     self.ingress_scan_wake();
                 }
-                let _ = reply.send(result);
+                use crate::node::session_ingress::{AdmissionError, OwnedAdmission};
+                let receipt = match result {
+                    Ok(saved) => OwnedAdmission::Committed(saved),
+                    Err(AdmissionError::NotCommitted(error)) => {
+                        OwnedAdmission::NotCommitted { error, bodies }
+                    }
+                    Err(AdmissionError::Unconfirmed(error)) => OwnedAdmission::Unconfirmed(error),
+                };
+                let _ = reply.send(receipt);
                 Outcome::Done
             }
             NodeCommand::RetireSessionRoom { retirement, reply } => {
@@ -10703,6 +10819,7 @@ impl Node {
             NetEvent::OwnKeyComputerCancelled { owner } => {
                 self.own_key_computer_pending
                     .retain(|work| !Arc::ptr_eq(&work.owner, &owner));
+                self.cancel_policy_publication(&owner);
                 if let Some(flight) = &self.own_key_computer_flight {
                     if Arc::ptr_eq(&flight.owner, &owner) {
                         flight.fence.retire();
@@ -19277,6 +19394,7 @@ impl Node {
             rooms,
             transitions,
             publication,
+            preflight,
             binding,
             work,
         } = ready;
@@ -19296,6 +19414,16 @@ impl Node {
                 drop(transitions);
             } else if let Err(error) = work.guard.active(self.computer.as_ref()) {
                 let _ = work.reply.send(Err(error));
+            } else if let Err(error) = preflight {
+                let _ = work.reply.send(Err(error));
+            } else if !current {
+                drop(transitions);
+                self.own_key_computer_pending.push_front(work);
+            } else if let Ok(Some(blocked)) = preflight {
+                drop(transitions);
+                drop(publication);
+                drop(_secret);
+                self.wait_policy_publication(work, blocked).await;
             } else if let Err(error) = binding {
                 let _ = work.reply.send(Err(error));
             } else if current {
@@ -19353,6 +19481,15 @@ impl Node {
                 let _ = work.reply.send(Err(error));
                 continue;
             }
+            let already_current = self
+                .computer
+                .as_ref()
+                .and_then(|computer| computer.try_journal_writer())
+                .is_some_and(|_journal| self.policy_work_already_current(&work));
+            if already_current {
+                let _ = work.reply.send(Ok(()));
+                continue;
+            }
             work.targets.sort_unstable();
             let Ok(secret) = self.secret_work.clone().try_read_owned() else {
                 let _ = work.reply.send(Err(Error::AtRestLocked));
@@ -19381,6 +19518,7 @@ impl Node {
             let mut room_set_changed = self.own_key_room_set_changed.subscribe();
             let mut epoch_changed = self.pairwise_epoch.subscribe();
             let wake = Arc::clone(&self.own_key_transition_wake);
+            let inspection_store = self.profile.as_ref().map(|profile| profile.store_handle());
             let computer = self.computer.clone();
             let binding = self.profile.as_ref().map(|profile| {
                 let signer = profile.signer_arc();
@@ -19394,6 +19532,57 @@ impl Node {
                 (signer, name)
             });
             tokio::spawn(async move {
+                let (rooms, preflight) = match inspection_store {
+                    Some(store) => match tokio::task::spawn_blocking(move || {
+                        let result = trust_save::inspect_policy_rooms(&rooms, &store);
+                        (rooms, result)
+                    })
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => {
+                            if let Some(result) = completed.upgrade() {
+                                *result.lock().unwrap_or_else(|error| error.into_inner()) =
+                                    Some(OwnKeyComputerReady {
+                                        _secret: secret,
+                                        owner,
+                                        rooms: Vec::new(),
+                                        transitions: None,
+                                        publication: None,
+                                        preflight: Err(Error::Profile(
+                                            "Computer policy room inspection worker stopped",
+                                        )),
+                                        binding: Ok(()),
+                                        work,
+                                    });
+                                wake.notify_one();
+                            } else {
+                                let _ = work.reply.send(Err(Error::AtRestLocked));
+                            }
+                            return;
+                        }
+                    },
+                    None => (rooms, Ok(None)),
+                };
+                if preflight.as_ref().is_err() || matches!(&preflight, Ok(Some(_))) {
+                    if let Some(result) = completed.upgrade() {
+                        *result.lock().unwrap_or_else(|error| error.into_inner()) =
+                            Some(OwnKeyComputerReady {
+                                _secret: secret,
+                                owner,
+                                rooms,
+                                transitions: None,
+                                publication: None,
+                                preflight,
+                                binding: Ok(()),
+                                work,
+                            });
+                        wake.notify_one();
+                    } else {
+                        let _ = work.reply.send(Err(Error::AtRestLocked));
+                    }
+                    return;
+                }
                 let mut changes: Vec<_> = watches
                     .into_iter()
                     .map(|mut watch| {
@@ -19499,6 +19688,7 @@ impl Node {
                             transitions,
                             binding,
                             publication,
+                            preflight,
                             work,
                         });
                     wake.notify_one();

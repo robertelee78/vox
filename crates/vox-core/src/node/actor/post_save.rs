@@ -163,6 +163,59 @@ impl Pending {
     }
 }
 
+pub(super) struct Completion<T> {
+    pub(super) value: Option<T>,
+    waiting_for_room: bool,
+}
+
+impl<T> Completion<T> {
+    pub(super) fn new() -> Self {
+        Self {
+            value: None,
+            waiting_for_room: false,
+        }
+    }
+}
+
+pub(super) struct PendingRoomLockWake(tokio::task::JoinHandle<()>);
+
+impl PendingRoomLockWake {
+    pub(super) fn arm<T: Send + 'static>(
+        slot: &mut Option<Self>,
+        result: &Arc<std::sync::Mutex<Completion<T>>>,
+        instance: &SharedChannel,
+        wake: &Arc<tokio::sync::Notify>,
+    ) {
+        let mut completed = result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if completed.waiting_for_room {
+            return;
+        }
+        completed.waiting_for_room = true;
+        drop(completed);
+        let result = Arc::clone(result);
+        let instance = Arc::clone(instance);
+        let wake = Arc::clone(wake);
+        *slot = Some(Self(tokio::spawn(async move {
+            let guard = instance.lock_owned().await;
+            drop(guard);
+            // Mark the release edge before notifying: the actor may run before this task ends.
+            result
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .waiting_for_room = false;
+            wake.notify_one();
+        })));
+    }
+}
+
+impl Drop for PendingRoomLockWake {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 pub(super) struct AppendPending {
     instance: SharedChannel,
     owner: Arc<()>,
@@ -170,8 +223,9 @@ pub(super) struct AppendPending {
     epoch: u64,
     retention_owed: bool,
     governance_owed: bool,
-    result: Arc<std::sync::Mutex<Option<Returned>>>,
+    result: Arc<std::sync::Mutex<Completion<Returned>>>,
     task: tokio::task::JoinHandle<()>,
+    room_lock_wake: Option<PendingRoomLockWake>,
     reply: oneshot::Sender<Outcome>,
     kind: ReplyKind,
     #[cfg(feature = "mutant-sender")]
@@ -420,7 +474,7 @@ impl Node {
             });
         #[cfg(not(feature = "test-knobs"))]
         let force_rotation = false;
-        let result = Arc::new(std::sync::Mutex::new(None));
+        let result = Arc::new(std::sync::Mutex::new(Completion::new()));
         let output = Arc::clone(&result);
         let wake = Arc::clone(&self.post_save_wake);
         let worker_store = Arc::clone(&store);
@@ -574,9 +628,10 @@ impl Node {
         });
         let task = tokio::spawn(async move {
             let returned = worker.await.unwrap_or(Err(Fault::Storage));
-            *output
+            output
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(returned);
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .value = Some(returned);
             wake.notify_one();
         });
         self.pending_posts.insert(
@@ -590,6 +645,7 @@ impl Node {
                 governance_owed: false,
                 result,
                 task,
+                room_lock_wake: None,
                 reply,
                 kind,
                 #[cfg(feature = "mutant-sender")]
@@ -639,6 +695,7 @@ impl Node {
             .result
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .value
             .take();
         let Some(returned) = returned else {
             return;
@@ -650,10 +707,19 @@ impl Node {
                 .is_some_and(|current| Arc::ptr_eq(current, &pending.instance));
         let shared = Arc::clone(&pending.instance);
         let Ok(mut channel) = shared.try_lock() else {
-            *pending
+            pending
                 .result
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(returned);
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .value = Some(returned);
+            if let Some(Pending::Append(pending)) = self.pending_posts.get_mut(&room) {
+                PendingRoomLockWake::arm(
+                    &mut pending.room_lock_wake,
+                    &pending.result,
+                    &shared,
+                    &self.post_save_wake,
+                );
+            }
             return;
         };
         let pending = self.pending_posts.remove(&room);
@@ -888,6 +954,7 @@ impl Node {
                     continue;
                 }
             };
+            drop(pending.room_lock_wake);
             tokio::spawn(async move {
                 let _secret = pending._secret;
                 let _slot = pending._slot;
@@ -896,6 +963,7 @@ impl Node {
                     .result
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .value
                     .take();
                 let outcome = match returned {
                     Some(Ok((completed, _publication, withdrawal))) => match completed.result {

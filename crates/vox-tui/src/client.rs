@@ -412,11 +412,11 @@ pub struct Pass {
 }
 
 /// A verb's hold on its node: the connection that holds it, and the socket further
-/// connections reach it by, which never attach.
+/// connections use for the same attachment.
 pub struct Held {
     /// The holding connection; requests go over it.
     pub client: IpcClient,
-    /// For more connections as the same node (a subscription, a proxy): they attach nothing.
+    /// For connections to this attachment (a subscription, a proxy), without a new hold.
     pub at: NodeSocket,
     /// The node's fingerprint.
     pub me: Option<Digest32>,
@@ -497,11 +497,11 @@ pub async fn hold(
         eprintln!("vox: {note}");
     }
     let me = client.me();
-    Ok(Held {
-        client,
-        at: at.attached_only(),
-        me,
-    })
+    let attachment = client
+        .attachment()
+        .ok_or_else(|| AppError::Usage("the daemon did not identify the node attachment".into()))?;
+    let at = at.for_attachment(attachment, false);
+    Ok(Held { client, at, me })
 }
 
 /// Attach this verb's node so that it stays attached after the verb ends, if it is not attached

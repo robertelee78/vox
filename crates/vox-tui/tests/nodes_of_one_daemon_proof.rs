@@ -782,12 +782,17 @@ fn local_nodes_trust_each_other_without_a_prompt_and_remember_removals() {
         ok,
         "PRODUCT: automatically trusted node could not post: {out}{err}"
     );
+    let mut local_received = (false, String::new(), String::new());
     assert!(
         wait_until(Duration::from_secs(30), || {
-            let (ok, out, _) = a.run(&["room", "read", &room, "--node", person], "");
-            ok && out.contains(text)
+            local_received = a.run(&["room", "read", &room, "--node", person], "");
+            local_received.0 && local_received.1.contains(text)
         }),
-        "PRODUCT: personal node could not read its automatically trusted local member"
+        "PRODUCT: personal node could not read its automatically trusted local member: {:?}; reader status {:?}; writer status {:?}; log: {}",
+        local_received,
+        a.run(&["status", "--json", "--node", person], ""),
+        a.run(&["status", "--json", "--node", names[3]], ""),
+        a.log()
     );
 
     manual(&["trust", "remove", &fps[3], "--node", names[1]]);
@@ -898,6 +903,12 @@ fn computer_pair_json_reviews_without_approving_the_peer() {
     watchdog::arm();
     let a = Account::new();
     let b = Account::new();
+    for (account, name) in [(&a, "move-destination-a"), (&b, "move-destination-b")] {
+        account.make_node(name);
+        let (ok, out, err) = account.run(&["node", "unlock", name, "--passphrase-file", "-"], PASS);
+        assert!(ok, "APPARATUS: ready destination node {name}: {out}{err}");
+        computer(account, &["personal", name]);
+    }
     let invitation = computer(&a, &["invite"]);
     let link = invitation["invite_link"]
         .as_str()
@@ -939,6 +950,282 @@ fn computer_pair_json_reviews_without_approving_the_peer() {
                 && shown["computers"].as_array().is_some_and(Vec::is_empty),
             "PRODUCT: declining or EOF recorded approval or enrollment: {shown}"
         );
+    }
+    let operation = reviewed["pairing"]["operation_id"]
+        .as_str()
+        .expect("APPARATUS: authenticated pairing omitted its operation");
+    let repeat = computer(&b, &["approve", operation]);
+    assert!(
+        repeat["pairing"]["approved_here"] == true && repeat["pairing"]["approved_there"] == false,
+        "PRODUCT: repeating approval on one computer falsely completed the other side: {repeat}"
+    );
+    computer(&a, &["approve", operation]);
+    assert!(
+        wait_until(CHANGE_SHOWN_WITHIN, || {
+            computer(&a, &["status"])["state"] == "confirmed"
+                && computer(&b, &["status"])["state"] == "confirmed"
+        }),
+        "APPARATUS: first scratch group did not converge for conflict staging"
+    );
+    let c = Account::new();
+    let d = Account::new();
+    c.make_node("move-incoming");
+    let (ok, out, err) = c.run(
+        &["node", "unlock", "move-incoming", "--passphrase-file", "-"],
+        PASS,
+    );
+    assert!(ok, "APPARATUS: ready incoming node: {out}{err}");
+    computer(&c, &["personal", "move-incoming"]);
+    let old_peer = d.make_node("move-old-peer");
+    let (ok, out, err) = d.run(
+        &["node", "unlock", "move-old-peer", "--passphrase-file", "-"],
+        PASS,
+    );
+    assert!(ok, "APPARATUS: ready the old-group peer: {out}{err}");
+    computer(&d, &["personal", "move-old-peer"]);
+    let old = computer(&c, &["invite"]);
+    let old_link = old["invite_link"]
+        .as_str()
+        .expect("APPARATUS: second group has no invitation");
+    let proposal = computer(&d, &["pair", old_link, "--preview"]);
+    let old_op = proposal["pairing"]["operation_id"]
+        .as_str()
+        .expect("APPARATUS: second group has no operation");
+    computer(&d, &["approve", old_op]);
+    computer(&c, &["approve", old_op]);
+    assert!(
+        wait_until(CHANGE_SHOWN_WITHIN, || {
+            computer(&c, &["status"])["state"] == "confirmed"
+                && computer(&d, &["status"])["state"] == "confirmed"
+        }),
+        "APPARATUS: second scratch group did not converge for conflict staging"
+    );
+    let old_room = make_room(&c, "move-incoming");
+    let (ok, out, err) = c.run(&["room", "link", &old_room, "--node", "move-incoming"], "");
+    assert!(ok, "APPARATUS: old-group room link unavailable: {out}{err}");
+    let old_room_link = out
+        .lines()
+        .find(|line| line.starts_with("vox://"))
+        .expect("APPARATUS: old-group room link missing")
+        .to_owned();
+    let (ok, out, err) = d.run(
+        &[
+            "room",
+            "join",
+            &old_room_link,
+            "--node",
+            "move-old-peer",
+            "--passphrase-file",
+            "-",
+        ],
+        ROOM_PASS,
+    );
+    assert!(
+        ok,
+        "APPARATUS: stage the old peer's joined room: {out}{err}"
+    );
+    let (ok, out, err) = c.run(
+        &[
+            "room",
+            "post",
+            &old_room,
+            "old-group-before",
+            "--node",
+            "move-incoming",
+        ],
+        "",
+    );
+    assert!(
+        ok,
+        "APPARATUS: stage the old-group communication baseline: {out}{err}"
+    );
+    assert!(
+        wait_until(RETURN_WITHIN, || {
+            let (ok, out, _) = d.run(&["room", "read", &old_room, "--node", "move-old-peer"], "");
+            ok && out.contains("old-group-before")
+        }),
+        "APPARATUS: the old peer could not read the baseline message before retirement"
+    );
+    let room = make_room(&a, "move-destination-a");
+    let (ok, room_link, err) = a.run(&["room", "link", &room, "--node", "move-destination-a"], "");
+    assert!(ok, "APPARATUS: destination room link unavailable: {err}");
+    let room_link = room_link
+        .lines()
+        .find(|line| line.starts_with("vox://"))
+        .expect("APPARATUS: destination room link missing")
+        .to_owned();
+    for (account, name) in [(&b, "move-destination-b"), (&c, "move-incoming")] {
+        let (ok, out, err) = account.run(
+            &[
+                "room",
+                "join",
+                &room_link,
+                "--node",
+                name,
+                "--passphrase-file",
+                "-",
+            ],
+            ROOM_PASS,
+        );
+        assert!(ok, "APPARATUS: stage shared room for {name}: {out}{err}");
+    }
+    let before = computer(&c, &["status"]);
+    let invitation = computer(&a, &["invite"]);
+    let link = invitation["invite_link"]
+        .as_str()
+        .expect("APPARATUS: destination invitation missing");
+    // Alter only the PAKE secret: a reachable invitation with bad proof is not a trusted conflict.
+    use base64::Engine as _;
+    let mut wrong = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(
+            link.strip_prefix("vox-computer://")
+                .expect("APPARATUS: invitation scheme"),
+        )
+        .expect("APPARATUS: decode invitation");
+    let secret = {
+        let mut decoder = vox_core::cbor::Decoder::new(&wrong);
+        decoder.array().unwrap();
+        decoder.uint().unwrap();
+        decoder.bytes().unwrap();
+        decoder.bytes().unwrap();
+        decoder.bytes().unwrap().to_vec()
+    };
+    let at = wrong
+        .windows(secret.len())
+        .position(|window| window == secret)
+        .expect("APPARATUS: invitation secret not found");
+    wrong[at] ^= 1;
+    let wrong = format!(
+        "vox-computer://{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(wrong)
+    );
+    let (ok, out, err) = c.run(&["computer", "pair", &wrong, "--preview", "--json"], "");
+    assert!(!ok && !format!("{out}{err}").contains("group-conflict"),
+        "PRODUCT: a wrong pairing secret was accepted or classified as an authenticated group conflict");
+    assert_eq!(
+        computer(&c, &["status"])["computers"],
+        before["computers"],
+        "PRODUCT: wrong-secret review changed the old group"
+    );
+    let conflict = computer(&c, &["pair", link, "--preview"]);
+    assert!(conflict["state"] == "group-conflict"
+        && conflict["conflict"]["peer"] == invitation["this_computer"]
+        && conflict["pairing"].is_null()
+        && conflict["computers"] == before["computers"],
+        "PRODUCT: authenticated different groups were not refused without altering current membership: {conflict}");
+    let (ok, out, err) = c.run(&["computer", "pair", link], "no\n");
+    assert!(
+        !ok,
+        "PRODUCT: declining replacement reported success: {out}{err}"
+    );
+    let after = computer(&c, &["status"]);
+    assert!(
+        after["computers"] == before["computers"],
+        "PRODUCT: declining replacement changed old group membership: {after}"
+    );
+    let old_proposal = conflict["conflict"]["operation_id"]
+        .as_str()
+        .expect("APPARATUS: conflict did not identify the inviter's proposal")
+        .to_owned();
+    let identity = before["this_computer"].clone();
+    let (ok, out, err) = c.run(&["computer", "pair", link], "yes\n");
+    assert!(ok, "PRODUCT: explicit group replacement failed: {out}{err}");
+    let retired = computer(&c, &["status"]);
+    assert!(
+        retired["state"] == "individual" && retired["this_computer"] == identity,
+        "PRODUCT: local retirement did not preserve the computer identity: {retired}"
+    );
+    computer(&a, &["cancel", &old_proposal]);
+    let fresh = computer(&a, &["invite"]);
+    let fresh_link = fresh["invite_link"]
+        .as_str()
+        .expect("APPARATUS: fresh invitation missing");
+    let fresh_preview = computer(&c, &["pair", fresh_link, "--preview"]);
+    let fresh_op = fresh_preview["pairing"]["operation_id"]
+        .as_str()
+        .expect("PRODUCT: fresh preview omitted the authenticated operation");
+    assert_ne!(
+        fresh_op, old_proposal,
+        "PRODUCT: replacement reused the rejected proposal"
+    );
+    computer(&c, &["approve", fresh_op]);
+    computer(&a, &["approve", fresh_op]);
+    let mut last = (
+        serde_json::Value::Null,
+        serde_json::Value::Null,
+        serde_json::Value::Null,
+    );
+    assert!(
+        wait_until(CHANGE_SHOWN_WITHIN, || {
+            last = (
+                computer(&a, &["status"]),
+                computer(&b, &["status"]),
+                computer(&c, &["status"]),
+            );
+            last.0["state"] == "confirmed"
+                && last.1["state"] == "confirmed"
+                && last.2["state"] == "confirmed"
+        }),
+        "PRODUCT: fresh bilateral enrollment after local retirement did not complete: {}; {}; {}; logs: {}; {}; {}",
+        last.0,
+        last.1,
+        last.2,
+        a.log(),
+        b.log(),
+        c.log()
+    );
+    assert!(
+        wait_until(RETURN_WITHIN, || {
+            let (ok, out, _) = c.run(&["trust", "list", "--node", "move-incoming"], "");
+            ok && !out.contains(&old_peer)
+        }),
+        "PRODUCT: the replaced computer retained its old peer's covered grant"
+    );
+    let (ok, out, err) = c.run(
+        &[
+            "room",
+            "post",
+            &old_room,
+            "old-group-after-retirement",
+            "--node",
+            "move-incoming",
+        ],
+        "",
+    );
+    assert!(
+        ok,
+        "PRODUCT: the preserved old room was unusable after local retirement: {out}{err}"
+    );
+    let leaked = wait_until(RETURN_WITHIN, || {
+        let (ok, out, _) = d.run(&["room", "read", &old_room, "--node", "move-old-peer"], "");
+        ok && out.contains("old-group-after-retirement")
+    });
+    assert!(
+        !leaked,
+        "PRODUCT: the old-group peer read a fresh post after its covered grant was retired"
+    );
+    for (account, name, message) in [
+        (&a, "move-destination-a", "move-after-a"),
+        (&b, "move-destination-b", "move-after-b"),
+        (&c, "move-incoming", "move-after-c"),
+    ] {
+        let (ok, out, err) = account.run(&["room", "post", &room, message, "--node", name], "");
+        assert!(
+            ok,
+            "PRODUCT: {name} could not post after replacement: {out}{err}"
+        );
+    }
+    for (account, name, messages) in [
+        (&a, "move-destination-a", ["move-after-b", "move-after-c"]),
+        (&b, "move-destination-b", ["move-after-a", "move-after-c"]),
+        (&c, "move-incoming", ["move-after-a", "move-after-b"]),
+    ] {
+        let mut shown = String::new();
+        assert!(wait_until(RETURN_WITHIN, || {
+            let (ok, out, _) = account.run(&["room", "read", &room, "--node", name], "");
+            shown = out;
+            ok && messages.iter().all(|message| shown.contains(message))
+        }), "PRODUCT: {name} could not read fresh posts from both other computers after replacement: {shown}");
     }
 }
 
@@ -1566,12 +1853,18 @@ fn pair_computers(
     let text = "computer trust works after explicit room admission";
     let (ok, out, err) = b.run(&["room", "post", room, text, "--node", "remote-agent"], "");
     assert!(ok, "PRODUCT: paired member could not post: {out}{err}");
+    let mut received = (false, String::new(), String::new());
     assert!(
-        wait_until(Duration::from_secs(30), || a
-            .run(&["room", "read", room, "--node", "agent-one"], "")
-            .1
-            .contains(text)),
-        "PRODUCT: computer-trusted member's room message did not become readable"
+        wait_until(Duration::from_secs(30), || {
+            received = a.run(&["room", "read", room, "--node", "agent-one"], "");
+            received.0 && received.1.contains(text)
+        }),
+        "PRODUCT: computer-trusted member's room message did not become readable: {:?}; reader status {:?}; writer status {:?}; logs: {}; {}",
+        received,
+        a.run(&["status", "--json", "--node", "agent-one"], ""),
+        b.run(&["status", "--json", "--node", "remote-agent"], ""),
+        a.log(),
+        b.log()
     );
     let before = ring(a, "agent-one");
     stop_pid(a.lock_pid().expect("APPARATUS: local scratch daemon"));
@@ -1623,6 +1916,7 @@ fn pair_computers(
         late_fp,
         &other_agent,
         room,
+        operation,
         daemons,
     );
     // A policy write failure must stop previously working computer-derived authority, not leave
@@ -1685,6 +1979,255 @@ fn offline_for_enrollment(account: &Account, label: &str) {
     );
 }
 
+// A real management client reaches an established group's inviter but never proves the code.
+// Decode every pre-PoP field, rather than looking for a test-only disclosure marker.
+fn preauth_discloses_no_group_history(sponsor: &Account) {
+    use base64::Engine as _;
+    use vox_core::cbor::{Decoder, Encoder};
+    use vox_core::identity::composite::RootSigner as _;
+    use vox_core::nat::multiaddr::Multiaddr;
+    use vox_core::node::computer::{Description, PROTOCOL};
+    use vox_core::transport::framing::{read_frame, write_frame};
+    use vox_core::transport::streams::{open_typed, StreamKind};
+
+    let invitation = computer(sponsor, &["invite"]);
+    let link = invitation["invite_link"]
+        .as_str()
+        .expect("APPARATUS: sponsor invitation");
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(
+            link.strip_prefix("vox-computer://")
+                .expect("APPARATUS: invitation scheme"),
+        )
+        .expect("APPARATUS: decode sponsor invitation");
+    let mut d = Decoder::new(&bytes);
+    assert_eq!(d.array().unwrap(), 8, "APPARATUS: invitation shape");
+    assert_eq!(d.uint().unwrap(), PROTOCOL, "APPARATUS: invitation version");
+    let target: [u8; 32] = d.bytes().unwrap().try_into().unwrap();
+    let invite: [u8; 32] = d.bytes().unwrap().try_into().unwrap();
+    let _secret = d.bytes().unwrap();
+    let expires = d.uint().unwrap();
+    let count = d.array().unwrap();
+    let mut address = None;
+    for _ in 0..count {
+        let endpoint = Multiaddr::parse(d.text().unwrap()).expect("APPARATUS: invitation endpoint");
+        address = address.or_else(|| endpoint.socket_addr());
+    }
+    let _anchors = d.bytes().unwrap();
+    let transport = d.bytes().unwrap().to_vec();
+    d.finish().unwrap();
+    let address = address.expect("APPARATUS: sponsor invitation has no direct endpoint");
+    let signer = hostile::stranger(0xA7);
+    let description = Description {
+        public: signer.public_key().to_bytes().to_vec(),
+        name: "preauth-probe".into(),
+        installation: [0xA7; 32],
+    };
+    let rt = hostile::Rt::new();
+    rt.block_on(async {
+        let (_endpoint, connection) = hostile::connect(&signer, address, target).await;
+        let (mut send, mut recv) = open_typed(&connection, StreamKind::Computer)
+            .await
+            .expect("APPARATUS: open real computer management stream");
+        let mut hello = Encoder::new();
+        hello
+            .array(6)
+            .uint(PROTOCOL)
+            .uint(u64::from(connection.session().suite_id))
+            .uint(3)
+            .bytes(&description.encode())
+            .bytes(&invite)
+            .uint(30_000);
+        write_frame(&mut send, &hello.finish())
+            .await
+            .expect("APPARATUS: send management hello");
+        let echo = tokio::time::timeout(Duration::from_secs(15), read_frame(&mut recv, 64 * 1024))
+            .await
+            .expect("APPARATUS: management hello timed out")
+            .expect("APPARATUS: read management hello")
+            .expect("APPARATUS: management hello closed");
+        let mut d = Decoder::new(&echo);
+        assert_eq!(
+            d.array().expect("PRODUCT: malformed preauth hello"),
+            6,
+            "PRODUCT: unexpected preauth hello"
+        );
+        assert_eq!(
+            d.uint().expect("PRODUCT: malformed preauth version"),
+            PROTOCOL,
+            "PRODUCT: wrong preauth version"
+        );
+        assert_eq!(
+            d.uint().expect("PRODUCT: malformed preauth suite"),
+            u64::from(connection.session().suite_id),
+            "PRODUCT: wrong preauth suite"
+        );
+        assert_eq!(
+            d.uint().expect("PRODUCT: malformed preauth operation"),
+            3,
+            "PRODUCT: wrong preauth operation"
+        );
+        let inviter =
+            Description::decode(d.bytes().expect("PRODUCT: malformed inviter description"))
+                .expect("PRODUCT: invalid inviter description");
+        assert_eq!(
+            inviter
+                .fingerprint()
+                .expect("PRODUCT: invalid inviter fingerprint"),
+            target,
+            "PRODUCT: preauth hello names another inviter"
+        );
+        assert_eq!(
+            d.bytes().expect("PRODUCT: malformed invitation ID"),
+            invite,
+            "PRODUCT: wrong invitation ID"
+        );
+        assert_eq!(
+            d.uint().expect("PRODUCT: malformed preauth budget"),
+            30_000,
+            "PRODUCT: wrong preauth budget"
+        );
+        d.finish()
+            .expect("PRODUCT: preauth hello disclosed additional data");
+        let frame = tokio::time::timeout(Duration::from_secs(15), read_frame(&mut recv, 64 * 1024))
+            .await
+            .expect("APPARATUS: invitation challenge timed out")
+            .expect("APPARATUS: read invitation challenge")
+            .expect("APPARATUS: invitation challenge closed");
+        let mut d = Decoder::new(&frame);
+        assert_eq!(
+            d.array().expect("PRODUCT: malformed preauth response"),
+            3,
+            "PRODUCT: preauth response was not just an authentication challenge"
+        );
+        assert_eq!(
+            d.bytes().expect("PRODUCT: malformed preauth SID").len(),
+            16,
+            "PRODUCT: invalid preauth SID"
+        );
+        let challenge = d.bytes().expect("PRODUCT: malformed preauth challenge");
+        assert_eq!(
+            d.bytes().expect("PRODUCT: malformed preauth share").len(),
+            32,
+            "PRODUCT: invalid preauth share"
+        );
+        d.finish()
+            .expect("PRODUCT: preauth frame disclosed additional data");
+        let mut d = Decoder::new(challenge);
+        assert_eq!(
+            d.array().expect("PRODUCT: malformed preauth challenge"),
+            9,
+            "PRODUCT: preauth challenge included group history"
+        );
+        assert_eq!(
+            d.uint().expect("PRODUCT: malformed challenge operation"),
+            3,
+            "PRODUCT: wrong challenge operation"
+        );
+        assert_eq!(
+            d.uint().expect("PRODUCT: malformed challenge version"),
+            PROTOCOL,
+            "PRODUCT: wrong challenge version"
+        );
+        assert_eq!(
+            d.uint().expect("PRODUCT: malformed challenge suite"),
+            u64::from(connection.session().suite_id),
+            "PRODUCT: wrong challenge suite"
+        );
+        assert_eq!(
+            d.bytes().expect("PRODUCT: malformed challenge invitation"),
+            invite,
+            "PRODUCT: wrong challenge invitation"
+        );
+        assert_eq!(
+            d.uint().expect("PRODUCT: malformed challenge expiry"),
+            expires,
+            "PRODUCT: wrong challenge expiry"
+        );
+        assert_eq!(
+            d.bytes().expect("PRODUCT: malformed challenge nonce").len(),
+            32,
+            "PRODUCT: wrong challenge nonce"
+        );
+        assert_eq!(
+            d.bytes().expect("PRODUCT: malformed challenge inviter"),
+            inviter.encode(),
+            "PRODUCT: wrong challenge inviter"
+        );
+        assert_eq!(
+            d.bytes().expect("PRODUCT: malformed challenge redeemer"),
+            description.encode(),
+            "PRODUCT: wrong challenge redeemer"
+        );
+        assert_eq!(
+            d.bytes().expect("PRODUCT: malformed challenge transport"),
+            vox_core::hash::sha256(&transport),
+            "PRODUCT: wrong challenge transport binding"
+        );
+        d.finish()
+            .expect("PRODUCT: preauth challenge disclosed group authority");
+        let mut invalid = Encoder::new();
+        invalid.array(2).bytes(&[0; 32]).bytes(&[]);
+        write_frame(&mut send, &invalid.finish())
+            .await
+            .expect("APPARATUS: send invalid invitation PoP");
+        let refusal =
+            tokio::time::timeout(Duration::from_secs(15), read_frame(&mut recv, 64 * 1024))
+                .await
+                .expect("APPARATUS: invalid-PoP response timed out")
+                .expect("APPARATUS: read invalid-PoP response")
+                .expect("APPARATUS: invalid-PoP response closed");
+        let mut d = Decoder::new(&refusal);
+        assert_eq!(
+            d.array().expect("PRODUCT: malformed invalid-PoP response"),
+            2,
+            "PRODUCT: invalid PoP received group authority"
+        );
+        assert_eq!(
+            d.uint()
+                .expect("PRODUCT: invalid PoP received a non-refusal response"),
+            0,
+            "PRODUCT: invalid PoP received a non-refusal response"
+        );
+        let _ = d
+            .text()
+            .expect("PRODUCT: invalid PoP received a non-refusal response");
+        d.finish()
+            .expect("PRODUCT: invalid PoP refusal disclosed additional data");
+    });
+    let id = invitation["invite_id"]
+        .as_str()
+        .expect("APPARATUS: sponsor invite ID");
+    computer(sponsor, &["cancel", id]);
+}
+
+// Re-run the actual journey with only C's daemon selecting groups from the inviter. The
+// redeemer's independent validation must not be disabled to make the mutant advance.
+#[test]
+#[ignore = "real binary inviter-only mutant; run in release with test-knobs"]
+fn reverse_enrollment_rejects_inviter_only_mutant() {
+    test_knobs::require(&["VOX_TEST_COMPUTER_INVITER_ONLY_GROUP"]);
+    let output = Command::new(std::env::current_exe().expect("APPARATUS: proof executable"))
+        .args([
+            "--ignored",
+            "--exact",
+            "local_nodes_trust_each_other_without_a_prompt_and_remember_removals",
+            "--nocapture",
+        ])
+        .env("VOX_MUTANT_COMPUTER_INVITER_ONLY_GROUP", "1")
+        .output()
+        .expect("APPARATUS: start reverse enrollment mutant consumer");
+    let report = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.status.success()
+        && report.contains("[proof] reverse enrollment mutant boundary staged")
+        && report.contains("PRODUCT [reverse enrollment original-group authority]: third computer did not join the existing group"),
+        "APPARATUS: inviter-only mutant did not reach the original-group membership and effective-permission verdict: {report}");
+}
+
 // #800 extends this same trust journey through a non-founding member. The first computer is
 // deliberately offline for enrollment; its eventual application must come from signed history.
 #[allow(clippy::too_many_arguments)]
@@ -1697,11 +2240,23 @@ fn enroll_third(
     late_fp: &str,
     other_agent: &str,
     room: &str,
+    original_group: &str,
     daemons: &mut Vec<Daemon>,
 ) {
     let c = Account::new();
     let beast = c.make_node("codex-beast");
     let helper = c.make_node("opencode-beast");
+    let mutant = std::env::var("VOX_MUTANT_COMPUTER_INVITER_ONLY_GROUP").ok();
+    let daemon_env = if mutant.as_deref() == Some("1") {
+        test_knobs::require(&["VOX_TEST_COMPUTER_INVITER_ONLY_GROUP"]);
+        vec![("VOX_TEST_COMPUTER_INVITER_ONLY_GROUP", "1")]
+    } else {
+        Vec::new()
+    };
+    let mut c_daemon = Daemon::start(&c, &["--node", "codex-beast"], &daemon_env);
+    c_daemon.expect_apparatus_event("third computer node is Ready", |line| {
+        line.contains("codex-beast is Ready")
+    });
     for name in ["codex-beast", "opencode-beast"] {
         let (ok, out, err) = c.run(&["node", "attach", name, "--passphrase-file", "-"], PASS);
         assert!(
@@ -1726,15 +2281,7 @@ fn enroll_third(
     // Nothing starts on this account again until the explicit catch-up attach below.
     daemons.clear();
     offline_for_enrollment(a, "founder");
-    let invite = computer(b, &["invite"]);
-    let link = invite["invite_link"]
-        .as_str()
-        .expect("PRODUCT: enrolled member did not offer Add Computer");
-    let preview = computer(&c, &["pair", link, "--preview"]);
-    let op = preview["pairing"]["operation_id"].as_str().unwrap();
-    assert!(preview["computers"].as_array().unwrap().is_empty(),"PRODUCT: receiving an existing group's history enrolled the third computer before approval: {preview}");
-    computer(&c, &["approve", op]);
-    computer(b, &["approve", op]);
+    preauth_discloses_no_group_history(b);
     let ring = |account: &Account, name: &str| {
         let (ok, out, err) = account.run(&["trust", "list", "--node", name], "");
         assert!(
@@ -1743,16 +2290,101 @@ fn enroll_third(
         );
         out
     };
+    let no_early_authority = || {
+        let cs = computer(&c, &["status"]);
+        let bs = computer(b, &["status"]);
+        let c_ring = ring(&c, "codex-beast");
+        let b_ring = ring(b, "remote-agent");
+        assert!(
+            cs["computers"].as_array().is_some_and(Vec::is_empty)
+                && bs["computers"].as_array().is_some_and(|v| v.len() == 2)
+                && !c_ring.contains(remote)
+                && !c_ring.contains(&local[0])
+                && !b_ring.contains(&beast)
+                && !b_ring.contains(&helper),
+            "PRODUCT: reverse enrollment granted membership or effective Read/Drive before both approvals: C {cs}; B {bs}; C keyring {c_ring}; B keyring {b_ring}"
+        );
+    };
     let has = |shown: &str, fp: &str, drive: bool| {
         shown
             .lines()
             .any(|line| line.contains(fp) && line.contains("read + drive") == drive)
     };
-    assert!(wait_until(Duration::from_secs(60),|| {
-        let bs=computer(b,&["status"]);let cs=computer(&c,&["status"]);
-        bs["computers"].as_array().is_some_and(|v|v.len()==3)&&cs["computers"].as_array().is_some_and(|v|v.len()==3)
-            &&has(&ring(b,"remote-agent"),&beast,false)&&has(&ring(&c,"codex-beast"),remote,true)&&has(&ring(&c,"codex-beast"),&local[0],true)
-    }),"PRODUCT: third computer did not join the existing group through its non-founding member while the founder was offline: {}; {}",computer(b,&["status"]),computer(&c,&["status"]));
+    let assert_three_members = || {
+        assert!(wait_until(Duration::from_secs(60), || {
+            let bs = computer(b, &["status"]);
+            let cs = computer(&c, &["status"]);
+            bs["computers"].as_array().is_some_and(|v| v.len() == 3)
+                && cs["computers"].as_array().is_some_and(|v| v.len() == 3)
+                && has(&ring(b, "remote-agent"), &beast, false)
+                && has(&ring(&c, "codex-beast"), remote, true)
+                && has(&ring(&c, "codex-beast"), &local[0], true)
+        }), "PRODUCT [reverse enrollment original-group authority]: third computer did not join the existing group through its non-founding member while the founder was offline: {}; {}", computer(b, &["status"]), computer(&c, &["status"]));
+    };
+    let invite = computer(&c, &["invite"]);
+    let link = invite["invite_link"]
+        .as_str()
+        .expect("PRODUCT: individual computer did not offer Add Computer");
+    println!("[proof] reverse enrollment mutant boundary staged");
+    let (ok, out, err) = b.run(&["computer", "pair", link, "--preview", "--json"], "");
+    if !ok {
+        // An invalid selection can be rejected before a preview exists. It still fails the
+        // same end-to-end membership and effective-permission outcome, not a diagnostic match.
+        assert_three_members();
+        panic!(
+            "PRODUCT: grouped sponsor could not review the original-group enrollment: {out}{err}"
+        );
+    }
+    let preview: serde_json::Value = serde_json::from_str(&out)
+        .unwrap_or_else(|e| panic!("PRODUCT: invalid reverse enrollment preview: {e}: {out}"));
+    let op = preview["pairing"]["operation_id"]
+        .as_str()
+        .expect("PRODUCT: reverse enrollment omitted its operation")
+        .to_owned();
+    let proposed_group = preview["pairing"]["proposed_group"].clone();
+    assert!(
+        preview["pairing"]["approved_here"] == false
+            && preview["pairing"]["approved_there"] == false,
+        "PRODUCT: reverse enrollment preview contained an unsolicited approval: {preview}"
+    );
+    no_early_authority();
+    let approved = computer(&c, &["approve", &op]);
+    assert!(
+        approved["pairing"]["operation_id"] == op
+            && approved["pairing"]["approved_here"] == true
+            && approved["pairing"]["approved_there"] == false,
+        "PRODUCT: individual inviter did not record its exact sole approval: {approved}"
+    );
+    no_early_authority();
+    let _ = c_daemon.crash();
+    c_daemon = Daemon::start(&c, &["--node", "codex-beast"], &daemon_env);
+    c_daemon.expect_apparatus_event("third computer node is Ready after restart", |line| {
+        line.contains("codex-beast is Ready")
+    });
+    let (ok, out, err) = c.run(
+        &["node", "attach", "opencode-beast", "--passphrase-file", "-"],
+        PASS,
+    );
+    assert!(
+        ok,
+        "PRODUCT: third computer could not reattach its node: {out}{err}"
+    );
+    let resumed = computer(&c, &["status"]);
+    assert!(
+        resumed["pairing"]["operation_id"] == op
+            && resumed["pairing"]["peer"] == preview["this_computer"]
+            && resumed["pairing"]["proposed_group"] == proposed_group
+            && resumed["pairing"]["approved_here"] == true
+            && resumed["pairing"]["approved_there"] == false,
+        "PRODUCT: restarting the individual inviter lost or changed its exact operation and approval: before {approved}; after {resumed}"
+    );
+    no_early_authority();
+    computer(b, &["approve", &op]);
+    assert_eq!(
+        proposed_group, original_group,
+        "PRODUCT: reverse enrollment selected a group other than the original group"
+    );
+    assert_three_members();
     let pending = computer(b, &["status"]);
     assert!(
         pending["state"] != "confirmed"
@@ -1781,6 +2413,18 @@ fn enroll_third(
         );
     }
     assert!(wait_until(Duration::from_secs(60),||has(&ring(a,"agent-one"),&beast,false)&&has(&ring(a,"agent-one"),&helper,false)),"PRODUCT: the third computer's signed enrollment did not propagate to the original member without the sponsor: {}",ring(a,"agent-one"));
+    let (ok, shown, err) = a.run(&["computer", "status"], "");
+    assert!(
+        ok,
+        "PRODUCT: computer trust summary was unavailable: {shown}{err}"
+    );
+    assert!(
+        shown.contains("mutual Read directly")
+            && shown.lines().any(|line| line.contains("personal can Drive:") && line.contains("codex-beast"))
+            && shown.contains("Personal nodes do not automatically Drive other personal nodes")
+            && shown.contains("Room membership, consent and Session access are separate"),
+        "PRODUCT: the normal computer status did not explain direct personal-to-Beast policy and its limits: {shown}"
+    );
     for (account, name, personal) in [
         (a, "personal", true),
         (a, "agent-one", false),
@@ -2040,8 +2684,6 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         "VOX_TEST_HOLD_COMPUTER_RETRY_READY_FILE",
         "VOX_TEST_HOLD_COMPUTER_OPERATOR_RESERVED_FILE",
         "VOX_TEST_HOLD_COMPUTER_ANSWER_AFTER_MERGE_FILE",
-        "VOX_TEST_HOLD_AFTER_COMPUTER_APPLICATION_RECEIPT_FILE",
-        "VOX_TEST_HOLD_COMPUTER_RECONCILE_SEND_FILE",
         "VOX_TEST_HOLD_COMPUTER_REGISTRATION_FILE",
         "VOX_TEST_FX28_MUTANT",
     ]);
@@ -2147,30 +2789,6 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         answer_after_merge_arm.display(),
         answer_after_merge_engaged.display(),
         answer_after_merge_release.display()
-    );
-    let application_receipt_arm = b.data.join("hold-after-computer-application-receipt");
-    let application_receipt_engaged = b.data.join("held-after-computer-application-receipt");
-    let application_receipt_release = b
-        .data
-        .join("release-after-computer-application-receipt.sock");
-    let application_receipt_fault = b.data.join("fault-after-computer-application-receipt");
-    let application_receipt_spec = format!(
-        "{}\t{}\t{}\t{}",
-        application_receipt_arm.display(),
-        application_receipt_engaged.display(),
-        application_receipt_release.display(),
-        application_receipt_fault.display()
-    );
-    let receipt_reconcile_arm = b.data.join("hold-receipt-race-reconcile-send");
-    let receipt_reconcile_engaged = b.data.join("held-receipt-race-reconcile-send");
-    let receipt_reconcile_release = b.data.join("release-receipt-race-reconcile-send.sock");
-    let receipt_reconcile_fault = b.data.join("fault-receipt-race-reconcile-send");
-    let receipt_reconcile_spec = format!(
-        "{}\t{}\t{}\t{}",
-        receipt_reconcile_arm.display(),
-        receipt_reconcile_engaged.display(),
-        receipt_reconcile_release.display(),
-        receipt_reconcile_fault.display()
     );
     let start = |account: &Account, listen: &str, anchor: &str, env: &[(&str, &str)]| {
         let mut daemon = Daemon::start(
@@ -3222,236 +3840,6 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
             "PRODUCT: computer transport introduced a room: {out}{err}"
         );
     }
-
-    // Policy reconciliation preserves ordinary, unrelated manual trust. Keep one such trust
-    // in the returning node so every Ready assertion below distinguishes a correctly reconciled
-    // keyring from both (a) a stale managed grant and (b) the empty held-back projection shown
-    // while reconciliation is unfinished. This makes the final Ready-fence mutant observable in
-    // the shipped `vox trust list`, rather than mistaking an empty fail-closed view for success.
-    let outsider = Account::new();
-    let manual_outsider = outsider.make_node("manual-outsider");
-    let (ok, out, err) = b.run(
-        &[
-            "trust",
-            "add",
-            &manual_outsider,
-            "--name",
-            "manual-outsider",
-            "--node",
-            "after-remote-anchor-b",
-        ],
-        "",
-    );
-    assert!(
-        ok,
-        "PRODUCT: unrelated manual trust was refused while Computer policy was current: {out}{err}"
-    );
-
-    // The exact applied receipt for R is held before Ready. A real later operator change
-    // supplies R+1 while the node is still attaching. Its final Ready fence must reconcile the
-    // current policy, including the new personal-node role, without losing unrelated manual
-    // trust. A sender's historical missed exchange is not authority over this receiver.
-    let (locked, locked_out, locked_err) = b.run(&["node", "lock", "after-remote-anchor-b"], "");
-    assert!(
-        locked,
-        "APPARATUS: Lock bob before applied-receipt supersession: {locked_out}{locked_err}"
-    );
-    stop_pid(right.child.id());
-    right
-        .child
-        .wait()
-        .expect("APPARATUS: stop right before applied-receipt supersession");
-    right = start(
-        &b,
-        "[::1]:0",
-        &v6,
-        &[
-            (
-                "VOX_TEST_HOLD_AFTER_COMPUTER_APPLICATION_RECEIPT_FILE",
-                &application_receipt_spec,
-            ),
-            (
-                "VOX_TEST_HOLD_COMPUTER_RECONCILE_SEND_FILE",
-                &receipt_reconcile_spec,
-            ),
-        ],
-    );
-    assert!(
-        !application_receipt_engaged.exists()
-            && !application_receipt_fault.exists()
-            && !receipt_reconcile_engaged.exists()
-            && !receipt_reconcile_fault.exists(),
-        "APPARATUS: earlier receipt supersession staging left a marker"
-    );
-    let receipt_node = a.make_node("applied-before-policy-superseded");
-    let receipt_policy_started = Instant::now();
-    let (ok, out, err) = a.run(
-        &[
-            "node",
-            "attach",
-            "applied-before-policy-superseded",
-            "--passphrase-file",
-            "-",
-        ],
-        PASS,
-    );
-    assert!(ok, "PRODUCT: attach receipt supersession node: {out}{err}");
-    let receipt_policy_deadline = receipt_policy_started + RETURN_WITHIN;
-    loop {
-        let status = computer(&b, &["status"]);
-        if status["nodes"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .any(|node| {
-                node["computer"] == a_id
-                    && node["name"] == "applied-before-policy-superseded"
-                    && node["fingerprint"] == receipt_node
-            })
-        {
-            break;
-        }
-        assert!(
-            daemon_alive(left.child.id()) && daemon_alive(right.child.id())
-                && Instant::now() < receipt_policy_deadline,
-            "APPARATUS: receiver did not show the exact policy needed to stage the held receipt: {status}"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    std::fs::write(&application_receipt_arm, &receipt_node)
-        .expect("APPARATUS: arm exact successful receipt before Ready");
-    let mut receipt_attach = b
-        .cmd(&[
-            "node",
-            "attach",
-            "after-remote-anchor-b",
-            "--passphrase-file",
-            "-",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("APPARATUS: start bob attach for receipt supersession");
-    receipt_attach
-        .stdin
-        .take()
-        .expect("APPARATUS: receipt attach stdin")
-        .write_all(PASS.as_bytes())
-        .expect("APPARATUS: type receipt attach passphrase");
-    wait_for_command_marker(
-        &application_receipt_engaged,
-        &mut receipt_attach,
-        right.child.id(),
-        Instant::now() + RETURN_WITHIN,
-        "the exact R application receipt before Ready",
-    );
-    if application_receipt_fault.is_file() {
-        panic!(
-            "APPARATUS: applied-receipt hold failed: {}",
-            std::fs::read_to_string(&application_receipt_fault).unwrap_or_default()
-        );
-    }
-    let receipt_race_revision = computer(&b, &["status"])["revision"]
-        .as_u64()
-        .expect("APPARATUS: receiver status omitted its local policy revision");
-    assert_eq!(
-        std::fs::read_to_string(&application_receipt_engaged)
-            .expect("APPARATUS: read exact applied receipt"),
-        format!("{bob}\t{receipt_race_revision}\t{receipt_node}"),
-        "APPARATUS: receipt marker named another node, receiver revision or grant"
-    );
-    let replacement_started = Instant::now();
-    computer(&a, &["personal", "anchor-return-second"]);
-    let replacement_deadline = replacement_started + RETURN_WITHIN;
-    let ready_revision = loop {
-        let status = computer(&b, &["status"]);
-        let second_personal = status["nodes"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .any(|node| {
-                node["computer"] == a_id
-                    && node["name"] == "anchor-return-second"
-                    && node["personal"] == true
-            });
-        let revision = status["revision"].as_u64().unwrap_or(0);
-        if second_personal && revision > receipt_race_revision {
-            break revision;
-        }
-        assert!(
-            daemon_alive(left.child.id()) && daemon_alive(right.child.id())
-                && Instant::now() < replacement_deadline,
-            "APPARATUS: later operator personal-node policy did not reach the receiver while R's Ready was held: {status}"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    };
-    // Only the mutant may need the post-Attached reconciliation. Keep its exact R+1 send
-    // parked so it cannot repair a prematurely published Ready before the shipped trust read.
-    // A correct startup is already current and need not consume this arm.
-    std::fs::write(&receipt_reconcile_arm, format!("{bob}\t{ready_revision}"))
-        .expect("APPARATUS: arm exact later reconciliation after Ready");
-    std::os::unix::net::UnixStream::connect(&application_receipt_release)
-        .expect("APPARATUS: release R receipt into the final current-policy Ready fence");
-    println!(
-        "[proof] FX-28 startup Ready state-lock apparatus staged: node {bob}, receipt revision {receipt_race_revision}, current receiver revision {ready_revision}, personal node anchor-return-second"
-    );
-    let receipt_attached = receipt_attach
-        .wait_with_output()
-        .expect("APPARATUS: collect receipt-superseded attach");
-    assert!(
-        receipt_attached.status.success(),
-        "PRODUCT [FX28 startup-ready-reconcile]: bob did not become Ready under the later operator policy: {}{}",
-        String::from_utf8_lossy(&receipt_attached.stdout),
-        String::from_utf8_lossy(&receipt_attached.stderr)
-    );
-    let mut current_grants: Vec<(&str, &str)> = final_grants
-        .iter()
-        .map(|(fp, grant)| {
-            (
-                *fp,
-                if *fp == second.as_str() {
-                    "read + drive"
-                } else if *fp == first.as_str() {
-                    "read"
-                } else {
-                    *grant
-                },
-            )
-        })
-        .collect();
-    current_grants.push((receipt_node.as_str(), "read"));
-    current_grants.push((manual_outsider.as_str(), "read"));
-    let ready_status = computer(&b, &["status"]);
-    let (_, grants, grant_error) = b.run(&["trust", "list", "--node", "after-remote-anchor-b"], "");
-    if receipt_reconcile_fault.is_file() {
-        panic!(
-            "APPARATUS: later reconciliation hold failed: {}",
-            std::fs::read_to_string(&receipt_reconcile_fault).unwrap_or_default()
-        );
-    }
-    if receipt_reconcile_engaged.is_file() {
-        assert_eq!(
-            std::fs::read_to_string(&receipt_reconcile_engaged)
-                .expect("APPARATUS: read exact later reconciliation marker"),
-            format!("{bob}\t{ready_revision}"),
-            "APPARATUS: later reconciliation marker named another node or policy revision"
-        );
-    }
-    let role_current = ready_status["nodes"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|node| node["computer"] == a_id && node["personal"] == true)
-        .map(|node| node["name"].as_str().unwrap_or_default())
-        .collect::<Vec<_>>();
-    assert!(
-        ready_status["revision"].as_u64() == Some(ready_revision)
-            && roster_current(&ready_status, &["after-remote-anchor-b"])
-            && role_current.as_slice() == ["anchor-return-second"]
-            && exact_grants(&b, "after-remote-anchor-b", &current_grants),
-        "PRODUCT [FX28 startup-ready-state-lock]: Ready did not expose current receiver revision {ready_revision}, exact later personal role, and all managed/manual grants: status {ready_status}; trust {grants}; error {grant_error}"
-    );
 
     drop((left, right, relay));
 }
@@ -4618,7 +5006,8 @@ fn enrolled_computers_follow_node_changes_and_retire_removed_authority() {
             );
         }
     }
-    binding(&b, "recover-group", "group", "");
+    let (ok, out, err) = b.run(&["computer", "retire"], "yes\n");
+    assert!(ok, "PRODUCT: reviewed local retirement failed: {out}{err}");
     assert!(
         computer(&b, &["status"])["computers"]
             .as_array()
@@ -4636,7 +5025,8 @@ fn enrolled_computers_follow_node_changes_and_retire_removed_authority() {
             == "removed"),
         "PRODUCT: locally removed manager did not retain retirement evidence"
     );
-    binding(&a, "recover-group", "group", "");
+    let (ok, out, err) = a.run(&["computer", "retire"], "yes\n");
+    assert!(ok, "PRODUCT: reviewed local retirement failed: {out}{err}");
     enroll(&b, &a, "PRODUCT");
     assert!(
         wait_until(Duration::from_secs(30), || computer(&a, &["status"])

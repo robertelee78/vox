@@ -56,6 +56,24 @@ impl From<Error> for AdmissionError {
 /// Receipt for one durable batch admission.
 pub type AdmissionResult = std::result::Result<Committed, AdmissionError>;
 
+/// Physical actor receipt. Only a definite noncommit returns the original batch for
+/// the existing bounded storage-failure tail; an uncertain commit is never replayed.
+#[doc(hidden)]
+#[derive(Debug)]
+pub enum OwnedAdmission {
+    /// The batch committed, including any suppressed or duplicate source coordinates.
+    Committed(Committed),
+    /// No commit began; ownership of the original bodies returns to the caller.
+    NotCommitted {
+        /// The definite preparation or storage failure.
+        error: Error,
+        /// The original, unmodified input allocations.
+        bodies: Vec<String>,
+    },
+    /// A commit was attempted but its outcome is not known.
+    Unconfirmed(Error),
+}
+
 /// One exact room-deletion cleanup, distinct from a later deletion of the same room.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Retirement {
@@ -237,12 +255,7 @@ fn session_in(batch: &Batch<'_>, key: &Sek, scope: &Digest32, name: &str) -> Res
 
 /// Validate, number and commit an entire batch. Preparation errors accept no new sequence
 /// or body; source receipts committed by earlier calls remain authoritative.
-pub fn admit(
-    profile: &Profile,
-    room: Digest32,
-    name: &str,
-    bodies: Vec<String>,
-) -> AdmissionResult {
+pub fn admit(profile: &Profile, room: Digest32, name: &str, bodies: &[String]) -> AdmissionResult {
     if name.is_empty()
         || name.len() > crate::node::content::MAX_SESSION_ID_LEN
         || bodies.is_empty()
@@ -273,7 +286,7 @@ pub fn admit(
     let mut receipts_changed = false;
     for body in bodies {
         let serde_json::Value::Object(mut object) =
-            serde_json::from_str(&body).map_err(|_| bad())?
+            serde_json::from_str(body).map_err(|_| bad())?
         else {
             return Err(Error::Profile("Session activity must be a JSON object").into());
         };

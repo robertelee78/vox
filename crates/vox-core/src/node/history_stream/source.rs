@@ -1,5 +1,6 @@
 //! Bounded disk reads used by one response. No pinned read or room lock crosses network I/O.
 
+use std::future::Future;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -88,6 +89,12 @@ pub(super) enum Lookup<T> {
     Missing,
 }
 
+pub(super) struct PublicationReadiness {
+    pub(super) busy: bool,
+    pub(super) owner: Option<RequestId>,
+    pub(super) wake: std::pin::Pin<Box<dyn Future<Output = ()> + Send + Sync>>,
+}
+
 /// Capacity for an exact read, reserved before the durable operation it must follow. It owns
 /// no room lock or store snapshot; the actual read still checks current lifecycle and authority.
 pub(super) struct PreparedRead {
@@ -116,6 +123,7 @@ pub(super) struct Source {
     // Only a server clone bound to Control/Head(peer) may return a departed peer receipt.
     own_head_receipt: bool,
     work_committed: Arc<AtomicBool>,
+    retirement_request: Option<RequestId>,
 }
 
 impl Source {
@@ -238,6 +246,7 @@ impl Source {
         deadline: Instant,
         authorization: Option<(Digest32, Digest32)>,
         work_committed: Arc<AtomicBool>,
+        retirement_request: Option<RequestId>,
     ) -> Self {
         Self {
             room,
@@ -249,6 +258,7 @@ impl Source {
             authorization,
             own_head_receipt: false,
             work_committed,
+            retirement_request,
         }
     }
 
@@ -260,6 +270,11 @@ impl Source {
 
     pub(super) fn commit_ledger(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.work_committed)
+    }
+
+    pub(super) fn retirement_request(&self) -> Result<RequestId> {
+        self.retirement_request
+            .ok_or(Error::Profile("history Begin has no Flow retirement owner"))
     }
 
     pub(super) fn for_own_head_receipt(&self) -> Self {
@@ -288,8 +303,51 @@ impl Source {
         T: Send + 'static,
         F: FnOnce(&mut ChannelState, &Store) -> Result<Option<T>> + Send + 'static,
     {
-        self.read_charged(job, envelope, DIRECTORY_ENVELOPE, read)
-            .await
+        self.read_charged(
+            job,
+            envelope,
+            DIRECTORY_ENVELOPE,
+            ReadBoundary::Observing,
+            read,
+        )
+        .await
+    }
+
+    /// Settle retained local publication work without spending another wire deadline.
+    /// Subscribe and sample under the same room guard; cancellation and access still apply.
+    pub(super) async fn publication_readiness(
+        &self,
+        job: &Job,
+    ) -> Result<Lookup<PublicationReadiness>> {
+        self.read_charged(
+            job,
+            0,
+            DIRECTORY_ENVELOPE,
+            ReadBoundary::Committed,
+            |room, store| {
+                let wake = room.history_publication_wake();
+                let busy = room.history_publication_busy(store)?;
+                let owner = if busy {
+                    room.history_publication_request(store)?
+                } else {
+                    None
+                };
+                Ok(Some(PublicationReadiness { busy, owner, wake }))
+            },
+        )
+        .await
+    }
+
+    /// Recheck a retained sparse owner without allocating an unused wake subscription.
+    pub(super) async fn publication_owner(&self, job: &Job) -> Result<Lookup<Option<RequestId>>> {
+        self.read_charged(
+            job,
+            0,
+            DIRECTORY_ENVELOPE,
+            ReadBoundary::Committed,
+            |room, store| Ok(Some(room.history_publication_request(store)?)),
+        )
+        .await
     }
 
     /// A body envelope includes directory decoding and temporary ciphertext/plaintext copies.
@@ -310,7 +368,8 @@ impl Source {
             .checked_sub(retained)
             .filter(|temporary| *temporary >= DIRECTORY_ENVELOPE)
             .ok_or(Error::SizeLimitExceeded("history body envelope"))?;
-        self.read_charged(job, retained, temporary, read).await
+        self.read_charged(job, retained, temporary, ReadBoundary::Observing, read)
+            .await
     }
 
     /// Reuse a working envelope already owned by an assembled record. The owned guard must
@@ -330,10 +389,16 @@ impl Source {
         G: Send + Sync + 'static,
         F: FnOnce(&mut ChannelState, &Store, &G) -> Result<Option<T>> + Send + 'static,
     {
-        self.read_charged(job, envelope, 0, move |room, store| {
-            let value = read(room, store, &guard)?;
-            Ok(value.map(|value| (guard, value)))
-        })
+        self.read_charged(
+            job,
+            envelope,
+            0,
+            ReadBoundary::Observing,
+            move |room, store| {
+                let value = read(room, store, &guard)?;
+                Ok(value.map(|value| (guard, value)))
+            },
+        )
         .await
     }
 
@@ -381,13 +446,14 @@ impl Source {
         job: &Job,
         envelope: usize,
         temporary: usize,
+        boundary: ReadBoundary,
         read: F,
     ) -> Result<Lookup<T>>
     where
         T: Send + 'static,
         F: FnOnce(&mut ChannelState, &Store) -> Result<Option<T>> + Send + 'static,
     {
-        self.current()?;
+        self.current_at(boundary)?;
         let admission = match self.reserve_read(job, envelope, temporary).await {
             Ok(Some(admission)) => admission,
             Ok(None) => return Ok(Lookup::Busy),
@@ -398,8 +464,7 @@ impl Source {
             }
             Err(error) => return Err(error),
         };
-        self.read_reserved(admission, ReadBoundary::Observing, read)
-            .await
+        self.read_reserved(admission, boundary, read).await
     }
 
     async fn read_reserved<T, F>(
@@ -483,7 +548,32 @@ impl Source {
         let Some(admission) = self.reserve_read(job, allocation.0, allocation.1).await? else {
             return Ok(Lookup::Busy);
         };
-        self.write_owned_reserved(admission, allocation.2, None, prepare, run, install)
+        self.write_owned_reserved(admission, allocation.2, None, None, prepare, run, install)
+            .await
+    }
+
+    pub(super) async fn begin_owned<P, T, O, Prepare, Run, Install>(
+        &self,
+        job: &Job,
+        allocation: (usize, usize),
+        request: RequestId,
+        prepare: Prepare,
+        run: Run,
+        install: Install,
+    ) -> Result<Lookup<O>>
+    where
+        P: Send + 'static,
+        T: Send + 'static,
+        O: Send + 'static,
+        Prepare: FnOnce(&mut ChannelState, &Store) -> Result<P> + Send + 'static,
+        Run: FnOnce(P, &Store) -> Result<T> + Send + 'static,
+        Install: FnOnce(&mut ChannelState, &Store, T) -> Result<O> + Send + 'static,
+    {
+        self.current()?;
+        let Some(admission) = self.reserve_read(job, allocation.0, allocation.1).await? else {
+            return Ok(Lookup::Busy);
+        };
+        self.write_owned_reserved(admission, false, None, Some(request), prepare, run, install)
             .await
     }
 
@@ -520,6 +610,7 @@ impl Source {
                 admission,
                 false,
                 Some(instance),
+                None,
                 prepare,
                 run,
                 move |room, store, completed| {
@@ -536,11 +627,13 @@ impl Source {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn write_owned_reserved<P, T, O, Prepare, Run, Install>(
         &self,
         admission: PreparedRead,
         publication: bool,
         continuation: Option<[u8; 16]>,
+        begin: Option<RequestId>,
         prepare: Prepare,
         run: Run,
         install: Install,
@@ -553,6 +646,9 @@ impl Source {
         Run: FnOnce(P, &Store) -> Result<T> + Send + 'static,
         Install: FnOnce(&mut ChannelState, &Store, T) -> Result<O> + Send + 'static,
     {
+        let publication_flow = begin
+            .map(|request| self.retirement_request().map(|root| (request, root)))
+            .transpose()?;
         let mut room = loop {
             let room = if continuation.is_some() {
                 self.room.clone().lock_owned().await
@@ -600,67 +696,72 @@ impl Source {
         let owner = Arc::new(());
         let mut pin =
             room.reserve_pending_history_write(&self.store, Arc::clone(&owner), publication)?;
+        if let Some((request, root)) = publication_flow {
+            if let Err(error) = room.register_history_publication_flow(&self.store, request, root) {
+                room.release_pending_text(&owner, false);
+                return Err(error);
+            }
+        }
         drop(room);
         let source = self.clone();
+        let recovery_room = Arc::clone(&self.room);
+        let recovery_store = Arc::clone(&self.store);
+        let recovery_owner = Arc::clone(&owner);
         let task = tokio::task::spawn_blocking(move || {
             let PreparedRead { charge, scratch } = admission;
-            let input_source = source.clone();
-            let input_owner = Arc::clone(&owner);
-            let input_epoch = source.epoch;
-            let input_authorization = source.authorization;
-            let metadata_source = source.clone();
-            let metadata_owner = Arc::clone(&owner);
-            let metadata_instance = Arc::clone(&input_instance);
-            let input = crate::node::channel::semantic_projection::SelectedReceiverInput::new(
-                move |slot| {
-                    let room = input_source.room.blocking_lock();
-                    room.classification_receiver_bytes(
-                        slot,
-                        &input_owner,
-                        input_epoch,
-                        &input_instance,
-                    )
-                },
-                move |slot, iteration| {
-                    let room = metadata_source.room.blocking_lock();
-                    room.classification_receiver_metadata(
-                        slot,
-                        iteration,
-                        &metadata_owner,
-                        input_epoch,
-                        &metadata_instance,
-                    )
-                },
-                move |batch| {
-                    if let Some((node, generation)) = input_authorization {
-                        if super::authorization_generation_in(
-                            batch,
-                            node,
-                            input_channel,
-                            room_instance,
+            // Every physical callback and its room guard unwind before failure releases the
+            // exact reservation. Dropping the async waiter never cancels this native owner.
+            let completed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let input_source = source.clone();
+                let input_owner = Arc::clone(&owner);
+                let input_epoch = source.epoch;
+                let input_authorization = source.authorization;
+                let metadata_source = source.clone();
+                let metadata_owner = Arc::clone(&owner);
+                let metadata_instance = Arc::clone(&input_instance);
+                let input = crate::node::channel::semantic_projection::SelectedReceiverInput::new(
+                    move |slot| {
+                        let room = input_source.room.blocking_lock();
+                        room.classification_receiver_bytes(
+                            slot,
+                            &input_owner,
                             input_epoch,
-                        )? != generation
-                        {
-                            return Err(Error::StreamRefused(super::AUTHORIZATION_CHANGED));
+                            &input_instance,
+                        )
+                    },
+                    move |slot, iteration| {
+                        let room = metadata_source.room.blocking_lock();
+                        room.classification_receiver_metadata(
+                            slot,
+                            iteration,
+                            &metadata_owner,
+                            input_epoch,
+                            &metadata_instance,
+                        )
+                    },
+                    move |batch| {
+                        if let Some((node, generation)) = input_authorization {
+                            if super::authorization_generation_in(
+                                batch,
+                                node,
+                                input_channel,
+                                room_instance,
+                                input_epoch,
+                            )? != generation
+                            {
+                                return Err(Error::StreamRefused(super::AUTHORIZATION_CHANGED));
+                            }
                         }
-                    }
-                    Ok(())
-                },
-            );
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                input.scope(|| run(pending, &source.store))
-            }));
-            let mut panicked = result.is_err();
-            let mut room = source.room.blocking_lock();
-            let owns = room.owns_pending_history_write(&owner);
-            if owns {
-                // A callback can commit evidence and subsequently report a verified conflict.
-                // Invalidate even on that honest failure; the pin still serves the prior view
-                // until this exact physical completion releases its publication reservation.
-                room.history_index_committed();
-            }
-            let result = match result {
-                Ok(result) => result.and_then(|value| {
+                        Ok(())
+                    },
+                );
+                let saved = input.scope(|| run(pending, &source.store));
+                let mut room = source.room.blocking_lock();
+                let owns = room.owns_pending_history_write(&owner);
+                if owns {
+                    room.history_index_committed();
+                }
+                let result = saved.and_then(|value| {
                     if !owns {
                         return Err(Error::Unreachable("history publication owner changed"));
                     }
@@ -669,40 +770,46 @@ impl Source {
                     {
                         return Err(Error::Unreachable("history publication room changed"));
                     }
-                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        install(&mut room, &source.store, value)
-                    })) {
-                        Ok(result) => result,
-                        Err(_) => {
-                            panicked = true;
-                            Err(Error::Profile("history publication install stopped"))
-                        }
+                    install(&mut room, &source.store, value)
+                });
+                room.release_pending_text(&owner, false);
+                let publication = if owns {
+                    let released = room.history_write_released(&source.store);
+                    let published = room
+                        .publish_history_read(Arc::clone(&source.store))
+                        .map(|_| ());
+                    if published.is_err() {
+                        pin.retain_saved_read();
                     }
-                }),
-                Err(_) => Err(Error::Profile("history save worker stopped")),
-            };
-            if panicked {
-                if let Err(error) = &result {
-                    room.fail_pending_history_write(&owner, error);
+                    released.and(published)
+                } else {
+                    Ok(())
+                };
+                let settled = if let Some((request, root)) = publication_flow {
+                    room.settle_history_publication_flow(&source.store, request, root)
+                } else {
+                    Ok(())
+                };
+                result.and_then(|value| publication.and(settled).map(|()| value))
+            }));
+            let result = match completed {
+                Ok(result) => result,
+                Err(_) => {
+                    let error = Error::Profile("history save worker stopped");
+                    let mut room = source.room.blocking_lock();
+                    if room.owns_pending_history_write(&owner) {
+                        room.history_index_committed();
+                        room.fail_pending_history_write(&owner, &error);
+                    }
+                    room.release_pending_text(&owner, false);
+                    let settled = if let Some((request, root)) = publication_flow {
+                        room.settle_history_publication_flow(&source.store, request, root)
+                    } else {
+                        Ok(())
+                    };
+                    settled.and(Err(error))
                 }
-            }
-            room.release_pending_text(&owner, false);
-            let publication = if owns {
-                let released = room.history_write_released(&source.store);
-                // A logical failure may follow committed evidence. Replace the saved
-                // publication under the room lock before dropping its old snapshot pin.
-                let published = room
-                    .publish_history_read(Arc::clone(&source.store))
-                    .map(|_| ());
-                if published.is_err() {
-                    pin.retain_saved_read();
-                }
-                released.and(published)
-            } else {
-                Ok(())
             };
-            let result = result.and_then(|value| publication.map(|()| value));
-            drop(room);
             drop(pin);
             drop(scratch);
             result.map(|value| {
@@ -712,8 +819,29 @@ impl Source {
                 })
             })
         });
-        task.await
-            .map_err(|_| Error::Unreachable("history save completion stopped"))?
+        match task.await {
+            Ok(result) => result,
+            Err(_) => {
+                // A native task canceled before starting owns no commit, but its room pin was
+                // reserved already. A joined failure, never an aborted waiter, settles it.
+                tokio::task::spawn_blocking(move || -> Result<()> {
+                    let error = Error::Unreachable("history save completion stopped");
+                    let mut room = recovery_room.blocking_lock();
+                    if room.owns_pending_history_write(&recovery_owner) {
+                        room.history_index_committed();
+                        room.fail_pending_history_write(&recovery_owner, &error);
+                    }
+                    room.release_pending_text(&recovery_owner, false);
+                    if let Some((request, root)) = publication_flow {
+                        room.settle_history_publication_flow(&recovery_store, request, root)?;
+                    }
+                    Ok(())
+                })
+                .await
+                .map_err(|_| Error::Unreachable("history save cleanup stopped"))??;
+                Err(Error::Unreachable("history save completion stopped"))
+            }
+        }
     }
 
     pub(super) async fn write_admission<T, F>(
@@ -755,7 +883,8 @@ impl Source {
 
     pub(super) async fn authorize(&self, job: &Job) -> Result<bool> {
         Ok(matches!(
-            self.read_charged(job, 0, 0, |_, _| Ok(Some(()))).await?,
+            self.read_charged(job, 0, 0, ReadBoundary::Observing, |_, _| Ok(Some(())))
+                .await?,
             Lookup::Found(_)
         ))
     }

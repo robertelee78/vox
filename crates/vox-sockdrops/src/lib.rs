@@ -32,7 +32,7 @@
 #[cfg(target_os = "macos")]
 mod filesystem;
 #[cfg(target_os = "macos")]
-pub use filesystem::{remove_item, replacement_directory};
+pub use filesystem::{remove_item, replacement_directory, volume_uuid};
 
 use std::io;
 

@@ -15,6 +15,8 @@ use quinn::{RecvStream, SendStream};
 use std::time::Duration;
 
 const PAIR_DOMAIN: &[u8] = b"vox/computer-pair/v1\0";
+const AUTH_DOMAIN: &[u8] = b"vox/computer-auth/v1";
+const PAIR_OP: u64 = 3;
 const PATIENCE: Duration = Duration::from_secs(15);
 const MANAGEMENT_SLOTS: usize = 8;
 /// **Test-only** (`test-knobs`): `<arm path>\t<engaged path>`. The arm contains the policy revision
@@ -101,12 +103,54 @@ pub struct PairingPreview {
     pub operation_id: String,
     /// The other authenticated installation.
     pub peer: ComputerIdentity,
+    /// Existing group being joined; absent only when creating a new group.
+    pub proposed_group: Option<String>,
     /// This operator's approval is already durably recorded.
     pub approved_here: bool,
     /// The peer's composite approval is already durably recorded.
     pub approved_there: bool,
     /// Invitation expiry, Unix milliseconds.
     pub expires_ms: u64,
+}
+/// An authenticated invitation from a different established computer group.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ComputerGroupConflict {
+    /// Authenticated inviting computer.
+    pub peer: ComputerIdentity,
+    /// Current signed group incarnation.
+    pub current_group: String,
+    /// Proposed signed group incarnation.
+    pub proposed_group: String,
+    /// Exact proposal on the inviting computer.
+    pub operation_id: String,
+    /// Whether the inviter already signed this proposal.
+    pub inviter_approved: bool,
+    /// Deadline for the proposal.
+    pub expires_ms: u64,
+    /// Reviewed local authority and covered node identities.
+    pub affected: Vec<String>,
+    /// Opaque review identifier for this exact local snapshot.
+    pub review_id: String,
+    /// Signed local frontier shown for diagnostics.
+    pub frontier: String,
+}
+/// Review of the authority still covered by a locally removed group.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ComputerGroupRetirement {
+    /// Opaque review identifier bound to the retained local authority snapshot.
+    pub review_id: String,
+    /// Exact signed frontier the retirement transaction must still observe.
+    pub frontier: String,
+    /// Computer and node authority covered by this local retirement.
+    pub affected: Vec<String>,
+}
+
+#[derive(Clone)]
+struct ConflictReview {
+    public: ComputerGroupConflict,
+    intent: Enrollment,
+    snapshot: Digest32,
+    revision: u64,
 }
 /// One completed exchange of pairing state with a computer, as `vox computer status` dates it
 /// (ADR-038 FX-28): when it completed, this daemon's policy revision it sent, and this daemon's
@@ -224,12 +268,21 @@ pub struct ComputerStatus {
     pub invite_expires_ms: Option<u64>,
     /// Authenticated candidate, never populated from an unproved name or fingerprint.
     pub pairing: Option<PairingPreview>,
+    /// Authenticated different-group refusal, not an approvable enrollment.
+    #[serde(default)]
+    pub conflict: Option<ComputerGroupConflict>,
+    /// Fresh review needed to finish local retirement after self-removal.
+    #[serde(default)]
+    pub retirement: Option<ComputerGroupRetirement>,
     /// Explicitly enrolled computers.
     pub computers: Vec<ComputerIdentity>,
     /// Per-member application; unreachable members never get a fabricated acknowledgement.
     pub applications: Vec<ComputerApplication>,
     /// Current authenticated roster and personal roles.
     pub nodes: Vec<ComputerNode>,
+    /// Configured directed group policy, independent of application and current reachability.
+    #[serde(default)]
+    pub topology: Vec<String>,
     /// Explicit binding operations supported by retained signed evidence.
     pub binding_actions: Vec<ComputerBindingAction>,
     /// Former members retained as removal history, never acknowledgement of remote erasure.
@@ -352,7 +405,11 @@ pub struct Management {
     /// waits for every computer, so a slow one delays no other (#989).
     inflight: Mutex<BTreeMap<Digest32, Flight>>,
     slots: Arc<tokio::sync::Semaphore>,
-    problem: Mutex<Option<String>>,
+    closed_problem: Mutex<Option<String>>,
+    retry_problem: Mutex<Option<(BackgroundOwner, String)>>,
+    application_problem: Mutex<Option<(BackgroundOwner, String)>>,
+    conflict: Mutex<Option<ConflictReview>>,
+    review_gate: Mutex<()>,
     unavailable_nodes: Mutex<Vec<String>>,
     pending_nodes: Mutex<BTreeMap<String, PendingNodeApplication>>,
     transport_cache: Mutex<BTreeMap<(Digest32, Digest32), RegisteredLease>>,
@@ -374,6 +431,25 @@ pub struct Management {
     /// At most one authenticated reachability waiter per failing computer. Its one stream is
     /// retained by QUIC through a transient path outage and wakes retry when the path carries it.
     reachability_waiters: Mutex<BTreeMap<Digest32, (u64, tokio::task::AbortHandle)>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct BackgroundOwner {
+    group: Option<Digest32>,
+    operation: Option<Digest32>,
+    policy_revision: u64,
+}
+
+fn background_owner(s: &State) -> BackgroundOwner {
+    BackgroundOwner {
+        group: s.group(),
+        operation: s
+            .pending
+            .as_ref()
+            .filter(|pending| !enrolled(s, pending))
+            .map(Enrollment::operation),
+        policy_revision: s.policy_revision,
+    }
 }
 
 /// One user-visible local application result, owned by the exact durable policy target whose
@@ -414,6 +490,8 @@ struct Exchanged {
     involved: bool,
     /// The last failure's words, while failures stand.
     problem: Option<String>,
+    /// Exact group and incomplete operation owning the last failure.
+    owner: Option<(Option<Digest32>, Option<Digest32>)>,
     /// Revision whose causal deadline was missed, whether or not repair has completed yet.
     missed_revision: Option<u64>,
     /// The state which was repaired only after its causal deadline. Its completed exchange is
@@ -589,7 +667,7 @@ impl Drop for Attempt {
 const EXCHANGE_FALLBACK: Duration = COMPUTER_QUIET_EXCHANGE_AFTER;
 /// An authenticated no-state-change request held on a failed peer's QUIC connection. Its stream
 /// is written once; QUIC wakes it on delivery when a transient path becomes reachable again.
-const REACHABILITY_WAKE_OP: u64 = 3;
+const REACHABILITY_WAKE_OP: u64 = 4;
 /// An operator's enrollment ceremony may carry a long retained history, but never holds its
 /// explicit command forever. Ordinary convergence uses [`COMPUTER_RETURN_SHOWN_WITHIN`].
 pub const COMPUTER_PAIR_WITHIN: Duration = Duration::from_secs(600);
@@ -716,6 +794,28 @@ impl Management {
     /// Sign a receipt only for the exact locally applied policy and authenticated roster frontier.
     /// The remote receipt is a separate statement: offline peers remain pending.
     pub fn record_application(&self) -> Result<()> {
+        let owner = background_owner(&lock(&self.computer.state));
+        let result = self.record_application_inner();
+        let state = lock(&self.computer.state);
+        if background_owner(&state) == owner {
+            let mut problem = lock(&self.application_problem);
+            match &result {
+                Err(error) => *problem = Some((owner, error.to_string())),
+                Ok(()) => {
+                    let local = self.computer.signer.fingerprint();
+                    if state.receipts.get(&local).is_some_and(|receipt| {
+                        valid_receipt(&state, &local, receipt).unwrap_or(false)
+                    }) && problem.as_ref().is_some_and(|(held, _)| *held == owner)
+                    {
+                        *problem = None;
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    fn record_application_inner(&self) -> Result<()> {
         let target = self.computer.policy_target();
         if lock(&self.pending_nodes)
             .values()
@@ -794,6 +894,8 @@ impl Management {
         }
         net.policy().replace(policy);
         let (current_policy_revision, durable_misses) = computer.missed_exchanges();
+        let state_for_misses = lock(&computer.state);
+        let local_for_misses = computer.signer.fingerprint();
         let exchanged: BTreeMap<_, _> = durable_misses
             .into_iter()
             .filter(|(_, (revision, _))| *revision == current_policy_revision)
@@ -808,6 +910,7 @@ impl Management {
                         // existing operational repair path without creating a new causal clock.
                         deadline: (!repaired).then(std::time::Instant::now),
                         deadline_policy_revision: (!repaired).then_some(revision),
+                        owner: Some(failure_owner(&state_for_misses, &local_for_misses, &peer)),
                         problem: (!repaired).then(|| {
                             "the exchange did not finish before its causal convergence deadline"
                                 .into()
@@ -819,7 +922,7 @@ impl Management {
                 )
             })
             .collect();
-        let problem = exchanged.values().find_map(|record| record.problem.clone());
+        drop(state_for_misses);
         let me = Arc::new(Self {
             computer,
             net,
@@ -827,7 +930,11 @@ impl Management {
             serving: Mutex::new(Default::default()),
             inflight: Mutex::new(BTreeMap::new()),
             slots: Arc::new(tokio::sync::Semaphore::new(MANAGEMENT_SLOTS)),
-            problem: Mutex::new(problem),
+            closed_problem: Mutex::new(None),
+            retry_problem: Mutex::new(None),
+            application_problem: Mutex::new(None),
+            conflict: Mutex::new(None),
+            review_gate: Mutex::new(()),
             unavailable_nodes: Mutex::new(Vec::new()),
             pending_nodes: Mutex::new(BTreeMap::new()),
             transport_cache: Mutex::new(BTreeMap::new()),
@@ -869,12 +976,24 @@ impl Management {
                 let released = wake.notified();
                 tokio::pin!(released);
                 released.as_mut().enable();
-                let next = match me.retry().await {
-                    Ok(next) => next,
-                    Err(e) => {
-                        *lock(&me.problem) = Some(e.to_string());
-                        Some(std::time::Instant::now() + EXCHANGE_FALLBACK)
+                let owner = background_owner(&lock(&me.computer.state));
+                let result = me.retry().await;
+                {
+                    let state = lock(&me.computer.state);
+                    if background_owner(&state) == owner {
+                        let mut problem = lock(&me.retry_problem);
+                        match &result {
+                            Ok(_) if problem.as_ref().is_some_and(|(held, _)| *held == owner) => {
+                                *problem = None
+                            }
+                            Err(error) => *problem = Some((owner, error.to_string())),
+                            _ => {}
+                        }
                     }
+                }
+                let next = match result {
+                    Ok(next) => next,
+                    Err(_) => Some(std::time::Instant::now() + EXCHANGE_FALLBACK),
                 };
                 drop(me);
                 let deadline = async {
@@ -918,9 +1037,7 @@ impl Management {
                             // exact later journal edge is what makes the receipt eligible. The
                             // operation is idempotent, and a newly created receipt advances the
                             // journal once so it is sent rather than polled for.
-                            if let Err(error) = me.record_application() {
-                                *lock(&me.problem) = Some(error.to_string());
-                            }
+                            let _ = me.record_application();
                         }
                         // A durable receipt/reach/pairing payload moved without changing node
                         // authority. Re-evaluate the exchange need at that exact edge; the
@@ -1073,6 +1190,7 @@ impl Management {
     }
     /// Begin one bounded invitation. Existing pending approval must be cancelled explicitly first.
     pub fn begin(&self) -> Result<ComputerStatus> {
+        let _review_guard = lock(&self.review_gate);
         let endpoints = self.net.local_endpoints()?;
         let id = random_array()?;
         let secret = Zeroizing::new(random_array()?);
@@ -1092,7 +1210,7 @@ impl Management {
             if s.pending.as_ref().is_some_and(|p| !enrolled(s, p))
                 || s.invitations
                     .iter()
-                    .any(|i| !i.cancelled && i.expires > now() && i.target.is_none())
+                    .any(|i| !i.cancelled && i.expires > now() && !invitation_finished(s, i))
             {
                 return Err(Error::Profile(
                     "a computer pairing is already pending; cancel it before making another code",
@@ -1121,6 +1239,8 @@ impl Management {
             });
             Ok(())
         })?;
+        *lock(&self.closed_problem) = None;
+        *lock(&self.conflict) = None;
         // An invitation changes transport leases even when it does not move policy revision.
         self.transport_wake.notify_one();
         let mut status = self.status()?;
@@ -1142,6 +1262,28 @@ impl Management {
     /// Cancel a current uncommitted operation. Signed completed enrollment is never undone here.
     pub fn cancel(&self, operation: &str) -> Result<ComputerStatus> {
         let id = crate::node::link::b32_decode(operation, "computer pairing operation")?;
+        {
+            let _review_guard = lock(&self.review_gate);
+            let review = lock(&self.conflict)
+                .as_ref()
+                .filter(|review| review.public.operation_id == operation)
+                .cloned();
+            if let Some(review) = review {
+                self.computer.change(|s| {
+                    if let std::collections::btree_map::Entry::Vacant(entry) = s.cancelled.entry(id)
+                    {
+                        entry.insert(review.intent);
+                        s.advance_journal()?;
+                    }
+                    Ok(())
+                })?;
+                *lock(&self.conflict) = None;
+                *lock(&self.closed_problem) = Some(
+                    "Conflict review closed locally. The inviting computer may retain its proposal or signature; this did not withdraw it there.".into(),
+                );
+                return self.status();
+            }
+        }
         let closed_expired = self.computer.change(|s| {
             if s.pending.as_ref().is_some_and(|g| (g.operation()==id || s.invitations.iter().any(|i| i.id==id && i.nonce==g.nonce)) && enrolled(s,g)) || s.genesis.as_ref().is_some_and(|g|g.operation()==id) {
                 return Err(Error::Profile("this pairing is established; cancellation does not remove computer trust"));
@@ -1190,7 +1332,7 @@ impl Management {
             Ok(locally_approved)
         })?;
         if closed_expired {
-            *lock(&self.problem) = Some("Expired attempt closed on this computer. Its signed intent remains retained and cannot activate here. The other computer may have recorded approval; this does not remove trust there.".into());
+            *lock(&self.closed_problem) = Some("Expired attempt closed on this computer. Its signed intent remains retained and cannot activate here. The other computer may have recorded approval; this does not remove trust there.".into());
         }
         // Cancellation revokes transport even when no policy revision moved.
         self.transport_wake.notify_one();
@@ -1222,6 +1364,16 @@ impl Management {
         }
         {
             let s = lock(&self.computer.state);
+            if s.invitations.iter().any(|i| {
+                !i.cancelled
+                    && i.expires > now()
+                    && i.target.is_some()
+                    && !invitation_finished(&s, i)
+            }) {
+                return Err(Error::Profile(
+                    "another authenticated computer pairing is pending; cancel it first",
+                ));
+            }
             // A fresh authenticated invitation can carry a removal this offline computer
             // has not learned yet. The merge below still refuses an already-active target,
             // another group, and every unapproved enrollment.
@@ -1387,6 +1539,7 @@ impl Management {
         // acknowledge, pace, repair or replace an ordinary outbound exchange obligation.
         drop(reserved);
         paired?;
+        *lock(&self.closed_problem) = None;
         self.status()
     }
     /// Record this operator's signature of exactly the previewed operation; retry is idempotent.
@@ -1418,6 +1571,9 @@ impl Management {
                 return Err(Error::Profile(
                     "computer pairing code expired; no trust was established",
                 ));
+            }
+            if let Some(pending) = s.pending.as_ref() {
+                check_enrollment_authority(s, pending)?;
             }
             let g = s.pending.as_mut().ok_or(Error::Profile(
                 "no authenticated computer pairing is awaiting approval",
@@ -1455,7 +1611,12 @@ impl Management {
         expected: &str,
     ) -> Result<ComputerStatus> {
         if action == "recover-group" {
-            return self.recover_group(expected);
+            let _review_guard = lock(&self.review_gate);
+            let snapshot = crate::node::link::b32_decode(node, "retirement review")?;
+            return self.recover_group(expected, None, Some(snapshot));
+        }
+        if action == "replace-group" {
+            return self.replace_group(node, expected);
         }
         let node = crate::node::link::fingerprint_input(node, "node fingerprint")?;
         let local = self.computer.signer.fingerprint();
@@ -1510,10 +1671,18 @@ impl Management {
 
     /// Deliberate local abandonment after removal/fault. Retired history remains pinned against
     /// replay. Every old covered grant is journalled for purge before any new group can apply.
-    fn recover_group(&self, expected: &str) -> Result<ComputerStatus> {
+    fn recover_group(
+        &self,
+        expected: &str,
+        expected_revision: Option<u64>,
+        expected_snapshot: Option<Digest32>,
+    ) -> Result<ComputerStatus> {
         let local = self.computer.signer.fingerprint();
         self.computer.change(|s| {
-            if frontier(s) != expected {
+            if frontier(s) != expected
+                || expected_revision.is_some_and(|revision| revision != s.revision)
+                || expected_snapshot.is_some_and(|snapshot| snapshot != sha256(&s.body()))
+            {
                 return Err(Error::Profile(
                     "computer trust changed; review local recovery again",
                 ));
@@ -1551,7 +1720,54 @@ impl Management {
             }
             Ok(())
         })?;
+        *lock(&self.conflict) = None;
+        *lock(&self.closed_problem) = None;
         self.status()
+    }
+    /// Explicitly retire the exact authority reviewed after a foreign-group refusal.
+    fn replace_group(&self, token: &str, expected: &str) -> Result<ComputerStatus> {
+        let _review_guard = lock(&self.review_gate);
+        let review = lock(&self.conflict).clone().ok_or(Error::Profile(
+            "the group replacement review is no longer available; review the invitation again",
+        ))?;
+        if review.public.review_id != token || review.public.frontier != expected {
+            return Err(Error::Profile(
+                "the group replacement review changed; review it again",
+            ));
+        }
+        if review.public.expires_ms <= now() {
+            return Err(Error::Profile("the reviewed proposal expired; close it on the inviting computer and review a fresh invitation"));
+        }
+        let local = self.computer.signer.fingerprint();
+        let (post_frontier, post_revision) = self.computer.change(|s| {
+            if review.public.expires_ms <= now() {
+                return Err(Error::Profile("the reviewed proposal expired; review a fresh invitation"));
+            }
+            if frontier(s) != expected || s.revision != review.revision || sha256(&s.body()) != review.snapshot {
+                return Err(Error::Profile("computer authority changed; review the replacement again"));
+            }
+            if s.genesis.is_none() || s.grant(&local).is_none() {
+                return Err(Error::Profile("this computer is no longer an active member; review local retirement"));
+            }
+            if s.pending.as_ref().is_some_and(|pending| {
+                !enrolled(s, pending) && side(pending, &local).ok()
+                    .is_some_and(|side| pending.approvals[side].is_some())
+            }) {
+                return Err(Error::Profile("a different local pairing already has your signed approval; wait for its result or close it after expiry before replacing the group"));
+            }
+            let mut grants: Vec<_> = s.members.iter().filter_map(|(id, grant)|
+                (grant.computer.fingerprint().ok() == Some(local)).then_some(*id)).collect();
+            grants.sort();
+            if grants.is_empty() { return Err(Error::Profile("this computer is not an active group member")); }
+            let mut body = Encoder::new();
+            body.array(3).bytes(&local).array(grants.len());
+            for grant in grants { body.bytes(&grant); }
+            body.bytes(&s.rosters.get(&local).map(Control::id).unwrap_or([0; 32]));
+            let event = Control::sign(s, "remove", body.finish(), self.computer.signer.as_ref())?;
+            s.retain_roster(event)?;
+            Ok((frontier(s), s.revision))
+        })?;
+        self.recover_group(&post_frontier, Some(post_revision), None)
     }
 
     /// Confirm removal against the exact displayed signed frontier and affected roster.
@@ -1588,6 +1804,7 @@ impl Management {
                 Ok(PairingPreview {
                     operation_id: text_id(&g.operation()),
                     peer: ComputerIdentity::of(&g.computers[1 - at])?,
+                    proposed_group: g.group.as_ref().map(text_id),
                     approved_here: g.approvals[at].is_some(),
                     approved_there: g.approvals[1 - at].is_some(),
                     expires_ms: g.expires,
@@ -1667,7 +1884,11 @@ impl Management {
                     exchanges: record.count,
                     exchange_attempts: record.attempts,
                     exchange_in_flight: inflight.contains(id),
-                    exchange_failures: record.failures,
+                    exchange_failures: if record.owner == Some(failure_owner(&s, &local, id)) {
+                        record.failures
+                    } else {
+                        0
+                    },
                     missed_revision: missed.map(|(revision, _)| revision),
                     repaired_late: missed.is_some_and(|(_, repaired)| repaired),
                     convergence_state: convergence_state.into(),
@@ -1699,6 +1920,41 @@ impl Management {
                     binding_derived_ms: derived.map(|d| d.at_ms),
                 });
             }
+        }
+        let mut topology = Vec::new();
+        if s.genesis.is_some() && s.grant(&local).is_some() && s.quarantined.is_empty() {
+            let names: Vec<_> = descriptions.values().map(|d| d.name.clone()).collect();
+            if !names.is_empty() {
+                topology.push(format!(
+                    "Group members: {}. Their managed nodes have mutual Read directly, not through the inviter.",
+                    names.join(", ")
+                ));
+            }
+            let computer_names: BTreeMap<_, _> = descriptions
+                .iter()
+                .map(|(id, description)| (text_id(id), description.name.as_str()))
+                .collect();
+            for source in nodes.iter().filter(|node| node.personal) {
+                let targets: Vec<_> = nodes
+                    .iter()
+                    .filter(|node| !node.personal)
+                    .map(|node| {
+                        let computer = computer_names
+                            .get(&node.computer)
+                            .copied()
+                            .unwrap_or("unknown computer");
+                        format!("{} ({computer})", node.name)
+                    })
+                    .collect();
+                if !targets.is_empty() {
+                    topology.push(format!(
+                        "{} can Drive: {}.",
+                        source.name,
+                        targets.join(", ")
+                    ));
+                }
+            }
+            topology.push("Personal nodes do not automatically Drive other personal nodes. Room membership, consent and Session access are separate.".into());
         }
         let mut binding_actions = Vec::new();
         if s.genesis.is_some() && s.grant(&local).is_some() {
@@ -1732,6 +1988,15 @@ impl Management {
                 }
             }
         }
+        let retirement = if s.genesis.is_some() && s.grant(&local).is_none() {
+            Some(ComputerGroupRetirement {
+                review_id: text_id(&sha256(&s.body())),
+                frontier: frontier(&s),
+                affected: affected_authority(&s)?,
+            })
+        } else {
+            None
+        };
         let mut former = BTreeMap::new();
         if let Some(g) = &s.genesis {
             for description in &g.computers {
@@ -1762,8 +2027,17 @@ impl Management {
         let expired = applications
             .iter()
             .any(|application| application.convergence_state == "expired");
+        let conflict = lock(&self.conflict)
+            .as_ref()
+            .filter(|_| s.genesis.is_some() && s.grant(&local).is_some() && !busy)
+            .map(|review| review.public.clone());
         let state = if storage_failed || !s.quarantined.is_empty() {
             "quarantined"
+        } else if conflict
+            .as_ref()
+            .is_some_and(|review| review.expires_ms > now())
+        {
+            "group-conflict"
         } else if s.genesis.is_some() && s.grant(&local).is_none() && !busy {
             "removed"
         } else if busy && pairing.as_ref().is_some_and(|p| !p.approved_here) {
@@ -1793,12 +2067,15 @@ impl Management {
             invite_id: invitation.map(|i| text_id(&i.id)),
             invite_expires_ms: invitation.map(|i| i.expires),
             pairing,
+            conflict,
+            retirement,
             computers: descriptions
                 .values()
                 .map(ComputerIdentity::of)
                 .collect::<Result<_>>()?,
             applications,
             nodes,
+            topology,
             binding_actions,
             removed: former
                 .values()
@@ -1814,7 +2091,29 @@ impl Management {
             } else if !s.quarantined.is_empty() {
                 Some("Conflicting computer authority is quarantined; retained signed evidence requires operator recovery.".into())
             } else {
-                lock(&self.problem).clone()
+                exchanged
+                    .iter()
+                    .find_map(|(peer, record)| {
+                        ((descriptions.contains_key(peer) || pending_involves(&s, &local, peer))
+                            && record.owner == Some(failure_owner(&s, &local, peer)))
+                        .then(|| record.problem.clone())
+                        .flatten()
+                    })
+                    .or_else(|| {
+                        let owner = background_owner(&s);
+                        lock(&self.application_problem)
+                            .as_ref()
+                            .filter(|(held, _)| *held == owner)
+                            .map(|(_, words)| words.clone())
+                    })
+                    .or_else(|| {
+                        let owner = background_owner(&s);
+                        lock(&self.retry_problem)
+                            .as_ref()
+                            .filter(|(held, _)| *held == owner)
+                            .map(|(_, words)| words.clone())
+                    })
+                    .or_else(|| lock(&self.closed_problem).clone())
             },
         })
     }
@@ -2242,6 +2541,43 @@ impl Management {
         self.serve(Arc::clone(&conn));
         Ok(conn)
     }
+    /// Apply authenticated same-incarnation removal/fork evidence before refusing discovery.
+    fn apply_discovery_removal(
+        &self,
+        offer: &[u8],
+        peer: Digest32,
+        deadline: std::time::Instant,
+    ) -> Result<()> {
+        let local = self.computer.signer.fingerprint();
+        let removed = self.computer.change_until(deadline, |s| {
+            let Some(candidate) = validate_offer(s, offer)? else {
+                return Ok(false);
+            };
+            if s.genesis.as_ref().map(Enrollment::incarnation)
+                != candidate.genesis.as_ref().map(Enrollment::incarnation)
+            {
+                return Ok(false);
+            }
+            let negative = [local, peer]
+                .iter()
+                .any(|id| s.grant(id).is_some() && offered_grant(&candidate, id).is_none());
+            if !negative {
+                return Ok(false);
+            }
+            // Complete same-incarnation ancestry is required to authenticate the negative record.
+            for (id, record) in candidate.history {
+                s.history.insert(id, record);
+            }
+            s.fold_history()?;
+            Ok(true)
+        })?;
+        if removed {
+            return Err(Error::Profile(
+                "computer group authority was removed or suspended",
+            ));
+        }
+        Ok(())
+    }
     /// Authenticate the inviting computer and durably retain its preview. The initiator sends
     /// identity proof, not an ordinary policy snapshot, and therefore returns no sent revision.
     async fn pair(
@@ -2258,18 +2594,108 @@ impl Management {
         let remaining_ms = wire_budget(deadline);
         write_frame_until(
             &mut send,
-            &hello(1, &self.computer.description(), &link.invite, remaining_ms),
+            &hello(
+                PAIR_OP,
+                &self.computer.description(),
+                &link.invite,
+                remaining_ms,
+            ),
             deadline,
         )
         .await?;
         let (op, peer, _, echoed_remaining_ms) =
             read_response_hello_until(&mut recv, &conn, deadline).await?;
-        if op != 1 || echoed_remaining_ms != remaining_ms {
+        if op != PAIR_OP || echoed_remaining_ms != remaining_ms {
             return Err(bad());
         }
+        // Authenticate both identities before receiving or disclosing any group history.
         let f = response_frame_until(&mut recv, deadline).await?;
         let mut d = Decoder::new(&f);
         arity(&mut d, 3)?;
+        let auth_sid = d.bytes()?.to_vec();
+        if auth_sid.len() != 16 {
+            return Err(bad());
+        }
+        let challenge = AuthChallenge::decode(d.bytes()?)?;
+        let remote_share: [u8; 32] = d.bytes()?.try_into().map_err(|_| bad())?;
+        d.finish()?;
+        if challenge.invite != link.invite
+            || challenge.expires != link.expires
+            || challenge.inviter != peer
+            || challenge.redeemer != self.computer.description()
+            || challenge.transport != sha256(link.transport.as_ref())
+        {
+            return Err(bad());
+        }
+        let auth_context = challenge.context();
+        let (state, share) = cpace::CpaceState::start_with_context(
+            link.secret.as_ref(),
+            &auth_context,
+            conn.session().suite_id,
+            &auth_sid,
+        )?;
+        let isk = state.finish(&remote_share)?;
+        let transcript = pop::transcript_hash(
+            &[auth_context.as_slice(), &auth_sid].concat(),
+            isk.as_ref(),
+            &share,
+            &remote_share,
+        );
+        let proof =
+            pop::IdentityProof::create(self.computer.signer.as_ref(), &auth_context, &transcript)?;
+        let mut e = Encoder::new();
+        e.array(2)
+            .bytes(&share)
+            .bytes(&pop::seal_pop(isk.as_ref(), &proof)?);
+        write_frame_until(&mut send, &e.finish(), deadline).await?;
+        let f = response_frame_until(&mut recv, deadline).await?;
+        let mut d = Decoder::new(&f);
+        arity(&mut d, 2)?;
+        let proof = pop::open_pop(isk.as_ref(), d.bytes()?)?;
+        pop::verify(&proof, &auth_context, &transcript, &link.target)?;
+        let remote_offer = d.bytes()?.to_vec();
+        d.finish()?;
+        self.apply_discovery_removal(&remote_offer, link.target, deadline)?;
+        let (remote_group, local_offer) = {
+            let s = lock(&self.computer.state);
+            (validate_offer(&s, &remote_offer)?, group_offer(&s)?)
+        };
+        if remote_group
+            .as_ref()
+            .is_some_and(|s| offered_grant(s, &link.target).is_none())
+        {
+            return Err(Error::Profile(
+                "the inviting computer's group authority is removed or suspended",
+            ));
+        }
+        write_frame_until(&mut send, &local_offer, deadline).await?;
+        let f = response_frame_until(&mut recv, deadline).await?;
+        let mut d = Decoder::new(&f);
+        let items = d.array()?;
+        if items == 1 {
+            let snapshot = d.bytes()?.to_vec();
+            d.finish()?;
+            let reply = self.computer.change_until(deadline, |s| {
+                let group = remote_group.as_ref().ok_or_else(bad)?;
+                if s.genesis.as_ref().map(Enrollment::incarnation)
+                    != group.genesis.as_ref().map(Enrollment::incarnation)
+                    || offered_grant(group, &self.computer.signer.fingerprint()).is_none()
+                    || offered_grant(group, &link.target).is_none()
+                {
+                    return Err(Error::Profile("same-group membership is no longer active"));
+                }
+                merge(s, &snapshot, link.target, self.computer.signer.as_ref())?;
+                let mut copy = s.clone();
+                copy.pending = None;
+                exchange(&copy, &link.target)
+            })?;
+            write_frame_until(&mut send, &reply, deadline).await?;
+            let _ = send.finish();
+            return Ok(());
+        }
+        if items != 3 {
+            return Err(bad());
+        }
         let sid = d.bytes()?.to_vec();
         if sid.len() != 16 {
             return Err(bad());
@@ -2278,11 +2704,53 @@ impl Management {
         let remote_share: [u8; 32] = d.bytes()?.try_into().map_err(|_| bad())?;
         d.finish()?;
         if g.expires != link.expires
-            || g.computers[0] != peer
-            || g.computers[1] != self.computer.description()
+            || g.nonce != challenge.nonce
+            || side(&g, &link.target).is_err()
+            || side(&g, &self.computer.signer.fingerprint()).is_err()
             || g.approvals.iter().any(Option::is_some)
         {
             return Err(bad());
+        }
+        let expected_joiner = fresh_grant(&challenge.nonce, &g.computers[1].fingerprint()?);
+        if g.grants[1] != expected_joiner
+            || (g.group.is_none()
+                && g.grants[0] != fresh_grant(&challenge.nonce, &g.computers[0].fingerprint()?))
+        {
+            return Err(Error::SignatureInvalid);
+        }
+        {
+            let s = lock(&self.computer.state);
+            let local_group = validate_offer(&s, &local_offer)?;
+            let expected = if remote_group.is_some() {
+                [peer.clone(), s.description.clone()]
+            } else if local_group.is_some() {
+                [s.description.clone(), peer.clone()]
+            } else {
+                [peer.clone(), s.description.clone()]
+            };
+            if g.computers != expected {
+                return Err(Error::SignatureInvalid);
+            }
+            if local_group.is_none()
+                && remote_group.as_ref().is_some_and(|group| {
+                    offered_grant(group, &self.computer.signer.fingerprint()).is_some()
+                })
+            {
+                return Err(Error::Profile(
+                    "foreign group history cannot restore this computer's membership",
+                ));
+            }
+            let sponsor = remote_group.as_ref().or(local_group.as_ref());
+            if let Some(group) = sponsor {
+                let genesis = group.genesis.as_ref().ok_or_else(bad)?;
+                if g.group != Some(genesis.incarnation())
+                    || offered_grant(group, &g.computers[0].fingerprint()?) != Some(g.grants[0])
+                {
+                    return Err(Error::SignatureInvalid);
+                }
+            } else if g.group.is_some() || g.computers != [peer.clone(), s.description.clone()] {
+                return Err(Error::SignatureInvalid);
+            }
         }
         let ci = context(&link.invite, &link.transport, &g);
         let (state, share) = cpace::CpaceState::start_with_context(
@@ -2311,6 +2779,27 @@ impl Management {
         pop::verify(&proof, &ci, &transcript, &link.target)?;
         let exchange = d.bytes()?.to_vec();
         d.finish()?;
+        let _review_guard = lock(&self.review_gate);
+        let review = {
+            let s = lock(&self.computer.state);
+            if s.policy_revision != expected_policy_revision {
+                return Err(Error::Profile(
+                    "this computer's policy changed while pairing ran; review again",
+                ));
+            }
+            match (s.genesis.as_ref(), g.group) {
+                (Some(current), Some(proposed)) if current.incarnation() != proposed => Some(
+                    authenticated_group_conflict(&s, &exchange, &g, link.target)?,
+                ),
+                _ => None,
+            }
+        };
+        if let Some(review) = review {
+            *lock(&self.conflict) = Some(review);
+            let _ = send.finish();
+            return Ok(());
+        }
+        *lock(&self.conflict) = None;
         self.computer.change_until(deadline, |s| {
             // The initiator sent identity proof, not its ordinary journal. Receipt and reach
             // movement is harmless, but changed operator policy must not install this preview.
@@ -2319,6 +2808,21 @@ impl Management {
                 return Err(Error::Profile(
                     "this computer's policy changed while pairing ran, so the pairing was superseded; try again",
                 ));
+            }
+            if link.expires <= now() || s.cancelled.contains_key(&g.operation())
+                || s.cancelled_links.iter().any(|closed| closed.as_str() == url)
+                || s.retired_groups.contains_key(&g.incarnation()) {
+                return Err(Error::Profile("this pairing expired or was closed locally"));
+            }
+            let sponsor = validate_offer(s, &remote_offer)?
+                .or(validate_offer(s, &local_offer)?);
+            if let Some(group) = sponsor {
+                if g.group != group.genesis.as_ref().map(Enrollment::incarnation)
+                    || offered_grant(&group, &g.computers[0].fingerprint()?) != Some(g.grants[0]) {
+                    return Err(Error::Profile("the sponsor's group authority changed while pairing"));
+                }
+            } else if g.group.is_some() {
+                return Err(Error::Profile("the sponsor's group authority is unavailable"));
             }
             let before = s.revision;
             let before_pending = s.pending.as_ref().map(Enrollment::encode);
@@ -2367,9 +2871,14 @@ impl Management {
         }
         let deadline = match op {
             REACHABILITY_WAKE_OP => std::time::Instant::now() + PATIENCE,
-            1 if remaining_ms > 0 => local_deadline(remaining_ms, COMPUTER_PAIR_WITHIN),
+            PAIR_OP if remaining_ms > 0 => local_deadline(remaining_ms, COMPUTER_PAIR_WITHIN),
             2 if remaining_ms > 0 => local_deadline(remaining_ms, COMPUTER_RETURN_SHOWN_WITHIN),
-            1 | 2 => return Err(bad()),
+            1 => {
+                return Err(Error::Profile(
+                    "this computer requires updated pairing software; update both computers",
+                ))
+            }
+            PAIR_OP | 2 => return Err(bad()),
             _ => return Err(bad()),
         };
         // An error response belongs to the request's already-owned clock. The server must not
@@ -2409,24 +2918,200 @@ impl Management {
             self.record_answered(conn.peer_id(), merged, policy_revision, involved)?;
             return Ok(());
         }
-        let (invite, mut g) = {
+        let (invite, initial_policy_revision) = {
             let s = lock(&self.computer.state);
-            let i=s.invitations.iter().find(|i|i.id==id&&!i.cancelled&&i.expires>now()).ok_or(Error::Profile("computer pairing code expired, cancelled, or unknown; no new trust was established"))?;
+            let i = s.invitations.iter().find(|i| i.id == id && !i.cancelled && i.expires > now())
+                .ok_or(Error::Profile("computer pairing code expired, cancelled, or unknown; no new trust was established"))?;
             if i.target.is_some_and(|t| t != conn.peer_id()) {
                 return Err(Error::Profile(
                     "computer pairing code was already consumed by another identity",
                 ));
             }
+            (i.clone(), s.policy_revision)
+        };
+        let challenge = AuthChallenge {
+            invite: id,
+            expires: invite.expires,
+            nonce: invite.nonce,
+            inviter: self.computer.description(),
+            redeemer: peer.clone(),
+            transport: sha256(invite.transport.as_ref()),
+        };
+        let auth_context = challenge.context();
+        let auth_sid = cpace::fresh_sid()?;
+        let (auth_state, auth_share) = cpace::CpaceState::start_with_context(
+            invite.secret.as_ref(),
+            &auth_context,
+            conn.session().suite_id,
+            &auth_sid,
+        )?;
+        let mut e = Encoder::new();
+        e.array(3)
+            .bytes(&auth_sid)
+            .bytes(&challenge.encode())
+            .bytes(&auth_share);
+        write_frame_until(send, &e.finish(), deadline).await?;
+        let f = frame_until(recv, deadline).await?;
+        let mut d = Decoder::new(&f);
+        arity(&mut d, 2)?;
+        let remote_share: [u8; 32] = d.bytes()?.try_into().map_err(|_| bad())?;
+        let sealed = d.bytes()?;
+        d.finish()?;
+        let isk = auth_state.finish(&remote_share)?;
+        let transcript = pop::transcript_hash(
+            &[auth_context.as_slice(), &auth_sid].concat(),
+            isk.as_ref(),
+            &auth_share,
+            &remote_share,
+        );
+        let proof = pop::open_pop(isk.as_ref(), sealed)?;
+        pop::verify(&proof, &auth_context, &transcript, &conn.peer_id())?;
+        self.computer.change_until(deadline, |s| {
+            let i = s
+                .invitations
+                .iter_mut()
+                .find(|i| i.id == id && !i.cancelled && i.expires > now())
+                .ok_or(Error::Profile(
+                    "computer pairing code expired or was cancelled",
+                ))?;
+            if i.target.is_some_and(|target| target != conn.peer_id()) {
+                return Err(Error::Profile("computer pairing code was already consumed"));
+            }
+            i.target = Some(conn.peer_id());
+            Ok(())
+        })?;
+        let local_offer = group_offer(&lock(&self.computer.state))?;
+        let proof =
+            pop::IdentityProof::create(self.computer.signer.as_ref(), &auth_context, &transcript)?;
+        let mut e = Encoder::new();
+        e.array(2)
+            .bytes(&pop::seal_pop(isk.as_ref(), &proof)?)
+            .bytes(&local_offer);
+        write_frame_until(send, &e.finish(), deadline).await?;
+        let remote_offer = frame_until(recv, deadline).await?;
+        self.apply_discovery_removal(&remote_offer, conn.peer_id(), deadline)?;
+        let same_group = {
+            let s = lock(&self.computer.state);
+            let remote = validate_offer(&s, &remote_offer)?;
+            remote.as_ref().is_some_and(|r| {
+                s.genesis.as_ref().map(Enrollment::incarnation)
+                    == r.genesis.as_ref().map(Enrollment::incarnation)
+                    && offered_grant(r, &self.computer.signer.fingerprint()).is_some()
+                    && offered_grant(r, &conn.peer_id()).is_some()
+            })
+        };
+        if same_group {
+            let payload = {
+                let s = lock(&self.computer.state);
+                let mut copy = s.clone();
+                copy.pending = None;
+                exchange(&copy, &conn.peer_id())?
+            };
+            let mut e = Encoder::new();
+            e.array(1).bytes(&payload);
+            write_frame_until(send, &e.finish(), deadline).await?;
+            let reply = frame_until(recv, deadline).await?;
+            self.computer.change_until(deadline, |s| {
+                let i = s
+                    .invitations
+                    .iter()
+                    .find(|i| {
+                        i.id == id
+                            && !i.cancelled
+                            && i.expires > now()
+                            && i.target == Some(conn.peer_id())
+                    })
+                    .ok_or(Error::Profile(
+                        "computer pairing code expired or was cancelled",
+                    ))?;
+                let _ = i;
+                merge(s, &reply, conn.peer_id(), self.computer.signer.as_ref())?;
+                if let Some(i) = s.invitations.iter_mut().find(|i| i.id == id) {
+                    i.cancelled = true;
+                }
+                Ok(())
+            })?;
+            return Ok(());
+        }
+        let mut g = {
+            let s = lock(&self.computer.state);
+            let remote_group = validate_offer(&s, &remote_offer)?;
+            let local_group = validate_offer(&s, &local_offer)?;
+            let local_id = self.computer.signer.fingerprint();
+            if remote_group
+                .as_ref()
+                .is_some_and(|group| offered_grant(group, &conn.peer_id()).is_none())
+            {
+                return Err(Error::Profile(
+                    "the other computer's group authority is removed or suspended",
+                ));
+            }
+            if local_group.is_none()
+                && remote_group
+                    .as_ref()
+                    .is_some_and(|group| offered_grant(group, &local_id).is_some())
+            {
+                return Err(Error::Profile(
+                    "foreign group history cannot restore this computer's membership",
+                ));
+            }
+            if remote_group.is_none()
+                && local_group
+                    .as_ref()
+                    .is_some_and(|group| offered_grant(group, &conn.peer_id()).is_some())
+            {
+                return Err(Error::Profile("the other computer already has group membership and must recover it explicitly"));
+            }
+            let (group, computers, grants) = if let Some(group) = local_group.as_ref() {
+                let sponsor = offered_grant(group, &local_id).ok_or(Error::Profile(
+                    "this computer's group authority is removed or suspended",
+                ))?;
+                (
+                    Some(group.genesis.as_ref().ok_or_else(bad)?.incarnation()),
+                    [s.description.clone(), peer.clone()],
+                    [sponsor, fresh_grant(&invite.nonce, &conn.peer_id())],
+                )
+            } else if let Some(group) = remote_group.as_ref() {
+                let sponsor = offered_grant(group, &conn.peer_id()).ok_or(Error::Profile(
+                    "the other computer's group authority is removed or suspended",
+                ))?;
+                (
+                    Some(group.genesis.as_ref().ok_or_else(bad)?.incarnation()),
+                    [peer.clone(), s.description.clone()],
+                    [sponsor, fresh_grant(&invite.nonce, &local_id)],
+                )
+            } else {
+                (
+                    None,
+                    [s.description.clone(), peer.clone()],
+                    [
+                        fresh_grant(&invite.nonce, &local_id),
+                        fresh_grant(&invite.nonce, &conn.peer_id()),
+                    ],
+                )
+            };
+            #[cfg(feature = "test-knobs")]
+            let (group, computers, grants) =
+                if std::env::var_os("VOX_TEST_COMPUTER_INVITER_ONLY_GROUP").is_some()
+                    && local_group.is_none()
+                {
+                    (
+                        None,
+                        [s.description.clone(), peer.clone()],
+                        [
+                            fresh_grant(&invite.nonce, &local_id),
+                            fresh_grant(&invite.nonce, &conn.peer_id()),
+                        ],
+                    )
+                } else {
+                    (group, computers, grants)
+                };
             let g = Enrollment {
-                group: s.genesis.as_ref().map(Enrollment::incarnation),
-                expires: i.expires,
-                nonce: i.nonce,
-                computers: [s.description.clone(), peer],
-                grants: [
-                    s.grant(&self.computer.signer.fingerprint())
-                        .unwrap_or(i.grants[0]),
-                    i.grants[1],
-                ],
+                group,
+                expires: invite.expires,
+                nonce: invite.nonce,
+                computers,
+                grants,
                 approvals: [None, None],
             };
             if s.pending
@@ -2437,7 +3122,7 @@ impl Management {
                     "another computer enrollment is already recorded",
                 ));
             }
-            (i.clone(), g)
+            g
         };
         let sid = cpace::fresh_sid()?;
         let ci = context(&id, &invite.transport, &g);
@@ -2465,41 +3150,90 @@ impl Management {
         );
         let proof = pop::open_pop(isk.as_ref(), sealed)?;
         pop::verify(&proof, &ci, &transcript, &conn.peer_id())?;
-        let recorded = self.computer.change_until(deadline, |s| {
-            let before_revision = s.revision;
-            let before_pending = s.pending.as_ref().map(Enrollment::encode);
-            let i = s
-                .invitations
-                .iter_mut()
-                .find(|i| i.id == id && !i.cancelled && i.expires > now())
-                .ok_or(Error::Profile(
-                    "computer pairing code expired or was cancelled",
-                ))?;
-            if i.target.is_some_and(|t| t != conn.peer_id()) {
-                return Err(Error::Profile("computer pairing code was already consumed"));
-            }
-            if s.pending.as_ref().is_some_and(|p| p.body() != g.body()) {
-                return Err(Error::Profile("another enrollment is already recorded"));
-            }
-            i.target = Some(conn.peer_id());
-            if let Some(p) = s.pending.as_ref() {
-                g.approvals = p.approvals.clone();
-            }
-            s.pending = Some(g);
-            s.pending_expires = invite.expires;
-            if s.pending.as_ref().map(Enrollment::encode) != before_pending
-                && s.revision == before_revision
-            {
-                s.advance_journal()?;
-            }
-            // The state sent back, encoded with the pairing just recorded, and its revision.
-            Ok((
-                s.revision,
-                s.policy_revision,
-                pending_involves(s, &self.computer.signer.fingerprint(), &conn.peer_id()),
-                exchange(s, &conn.peer_id())?,
-            ))
-        })?;
+        let recorded = {
+            let _review_guard = lock(&self.review_gate);
+            let recorded = self.computer.change_until(deadline, |s| {
+                let before_revision = s.revision;
+                if s.policy_revision != initial_policy_revision {
+                    return Err(Error::Profile(
+                        "this computer's policy changed while pairing; review again",
+                    ));
+                }
+                if s.cancelled.contains_key(&g.operation())
+                    || s.retired_groups.contains_key(&g.incarnation())
+                {
+                    return Err(Error::Profile(
+                        "this enrollment attempt was closed or its group retired",
+                    ));
+                }
+                let sponsor = if s.genesis.is_some() {
+                    validate_offer(s, &local_offer)?
+                } else {
+                    validate_offer(s, &remote_offer)?
+                };
+                if let Some(group) = sponsor.as_ref() {
+                    if g.group != group.genesis.as_ref().map(Enrollment::incarnation)
+                        || offered_grant(group, &g.computers[0].fingerprint()?) != Some(g.grants[0])
+                    {
+                        return Err(Error::Profile(
+                            "the sponsor's group authority changed while pairing",
+                        ));
+                    }
+                } else if g.group.is_some() {
+                    return Err(Error::Profile(
+                        "the sponsor's group authority is unavailable",
+                    ));
+                }
+                let before_pending = s.pending.as_ref().map(Enrollment::encode);
+                let i = s
+                    .invitations
+                    .iter_mut()
+                    .find(|i| i.id == id && !i.cancelled && i.expires > now())
+                    .ok_or(Error::Profile(
+                        "computer pairing code expired or was cancelled",
+                    ))?;
+                if i.target.is_some_and(|t| t != conn.peer_id()) {
+                    return Err(Error::Profile("computer pairing code was already consumed"));
+                }
+                if s.pending.as_ref().is_some_and(|p| p.body() != g.body()) {
+                    return Err(Error::Profile("another enrollment is already recorded"));
+                }
+                i.target = Some(conn.peer_id());
+                if let Some(p) = s.pending.as_ref() {
+                    g.approvals = p.approvals.clone();
+                }
+                if s.genesis.is_none() {
+                    if let Some(group) = sponsor {
+                        s.group_genesis = group.genesis;
+                        for (id, record) in group.history {
+                            s.history.insert(id, record);
+                        }
+                    }
+                }
+                s.pending = Some(g);
+                s.pending_expires = invite.expires;
+                if s.genesis.is_none() && s.group_genesis.is_some() {
+                    // Persist the exact derived projection expected when this staged history is
+                    // reopened; without genesis it confers no managed-node permissions.
+                    s.fold_history()?;
+                }
+                if s.pending.as_ref().map(Enrollment::encode) != before_pending
+                    && s.revision == before_revision
+                {
+                    s.advance_journal()?;
+                }
+                // The state sent back, encoded with the pairing just recorded, and its revision.
+                Ok((
+                    s.revision,
+                    s.policy_revision,
+                    pending_involves(s, &self.computer.signer.fingerprint(), &conn.peer_id()),
+                    exchange(s, &conn.peer_id())?,
+                ))
+            })?;
+            *lock(&self.conflict) = None;
+            *lock(&self.closed_problem) = None;
+            recorded
+        };
         let (revision, policy_revision, involved, payload) = recorded;
         let proof = pop::IdentityProof::create(self.computer.signer.as_ref(), &ci, &transcript)?;
         let mut e = Encoder::new();
@@ -2720,21 +3454,13 @@ impl Management {
             // A later journal revision changes the payload, not the deadline owned by an older
             // unfinished cause. `mark_retry` carries that earliest clock onto the current state.
             retry_ready.retain(|peer, _| known.contains(peer));
-            let mut changed = false;
             for (peer, record) in exchanged.iter_mut() {
                 if !known.contains(peer) && (record.failures > 0 || record.problem.is_some()) {
                     record.failures = 0;
                     record.deadline = None;
                     record.deadline_policy_revision = None;
                     record.problem = None;
-                    changed = true;
                 }
-            }
-            if changed {
-                *lock(&self.problem) = exchanged
-                    .values()
-                    .filter(|r| r.failures > 0)
-                    .find_map(|r| r.problem.clone());
             }
             peers.retain(|peer| {
                 // A repair which completed after its deadline remains a visible miss for that
@@ -2756,7 +3482,6 @@ impl Management {
                             record.missed_revision = None;
                             record.repaired_late = None;
                         }
-                        changed = true;
                     }
                 }
                 let record = exchanged.get(peer).cloned().unwrap_or_default();
@@ -2866,12 +3591,6 @@ impl Management {
                 }
                 true
             });
-            if changed {
-                *lock(&self.problem) = exchanged
-                    .values()
-                    .filter(|r| r.failures > 0)
-                    .find_map(|r| r.problem.clone());
-            }
             drop(retry_ready);
             drop(exchanged);
             // Reserved under one lock, after every other filter: a computer already in
@@ -2964,6 +3683,14 @@ impl Management {
                     // A round counts from its start: one in flight, or cut, is a round too.
                     let mut exchanged = lock(&self.exchanged);
                     let record = exchanged.entry(*peer).or_default();
+                    let owner = failure_owner(&s, &local, peer);
+                    if record.owner != Some(owner) {
+                        record.failures = 0;
+                        record.problem = None;
+                        record.deadline = None;
+                        record.deadline_policy_revision = None;
+                        record.owner = Some(owner);
+                    }
                     record.attempts = record.attempts.saturating_add(1);
                     true
                 });
@@ -3363,10 +4090,6 @@ impl Management {
                 }
             }
         }
-        *lock(&self.problem) = exchanged
-            .values()
-            .filter(|r| r.failures > 0)
-            .find_map(|r| r.problem.clone());
         drop(exchanged);
         if let Some((covered_revision, covered_policy_revision)) = covered_retry {
             let mut ready = lock(&self.retry_ready);
@@ -4057,10 +4780,6 @@ impl Management {
             sent_revision: revision,
             merged_revision: revision,
         });
-        *lock(&self.problem) = exchanged
-            .values()
-            .filter(|record| record.failures > 0)
-            .find_map(|record| record.problem.clone());
         drop(exchanged);
         let mut ready = lock(&self.retry_ready);
         if ready.get(&peer).is_some_and(|mark| {
@@ -4090,11 +4809,224 @@ fn pending_involves(s: &State, local: &Digest32, peer: &Digest32) -> bool {
         })
         .is_some_and(|id| id.ok().as_ref() == Some(peer))
 }
+fn failure_owner(
+    s: &State,
+    local: &Digest32,
+    peer: &Digest32,
+) -> (Option<Digest32>, Option<Digest32>) {
+    let operation = (s.grant(peer).is_none() && pending_involves(s, local, peer))
+        .then(|| s.pending.as_ref().map(Enrollment::operation))
+        .flatten();
+    (s.group(), operation)
+}
 fn side(g: &Enrollment, id: &Digest32) -> Result<usize> {
     g.computers
         .iter()
         .position(|d| d.fingerprint().ok() == Some(*id))
         .ok_or(Error::SignatureInvalid)
+}
+/// Invitation authentication is not an enrollment and carries no group authority.
+struct AuthChallenge {
+    invite: Digest32,
+    expires: u64,
+    nonce: Digest32,
+    inviter: Description,
+    redeemer: Description,
+    transport: Digest32,
+}
+
+impl AuthChallenge {
+    fn encode(&self) -> Vec<u8> {
+        let mut e = Encoder::new();
+        e.array(9)
+            .uint(PAIR_OP)
+            .uint(PROTOCOL)
+            .uint(u64::from(crate::suite::VOX_SUITE_1.id))
+            .bytes(&self.invite)
+            .uint(self.expires)
+            .bytes(&self.nonce)
+            .bytes(&self.inviter.encode())
+            .bytes(&self.redeemer.encode())
+            .bytes(&self.transport);
+        e.finish()
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut d = Decoder::new(bytes);
+        arity(&mut d, 9)?;
+        if d.uint()? != PAIR_OP
+            || d.uint()? != PROTOCOL
+            || d.uint()? != u64::from(crate::suite::VOX_SUITE_1.id)
+        {
+            return Err(bad());
+        }
+        let challenge = Self {
+            invite: digest(&mut d)?,
+            expires: d.uint()?,
+            nonce: digest(&mut d)?,
+            inviter: Description::decode(d.bytes()?)?,
+            redeemer: Description::decode(d.bytes()?)?,
+            transport: digest(&mut d)?,
+        };
+        d.finish()?;
+        Ok(challenge)
+    }
+
+    fn context(&self) -> Vec<u8> {
+        [AUTH_DOMAIN, &sha256(&self.encode())].concat()
+    }
+}
+
+/// Pending intents and provisional genesis never establish offered membership.
+fn group_offer(s: &State) -> Result<Vec<u8>> {
+    // An unrelated pending intent is checked at final admission. It is not offered as authority.
+    let mut e = Encoder::new();
+    if let Some(genesis) = &s.genesis {
+        let local = s.description.fingerprint()?;
+        if s.grant(&local).is_none() || !s.quarantined.is_empty() || !s.history_complete() {
+            return Err(Error::Profile(
+                "this computer's group authority is removed or suspended",
+            ));
+        }
+        e.array(2).bytes(&genesis.encode());
+        let records: Vec<_> = s
+            .history
+            .iter()
+            .filter(|(_, r)| {
+                r.event()
+                    .ok()
+                    .is_some_and(|v| v.group == genesis.incarnation())
+            })
+            .collect();
+        e.array(records.len());
+        for (id, record) in records {
+            e.array(2).bytes(id).bytes(&record.signed.encode());
+        }
+    } else {
+        if !s.quarantined.is_empty() {
+            return Err(Error::Profile(
+                "this computer has outstanding or suspended group authority",
+            ));
+        }
+        e.array(2).bytes(&[]).array(0);
+    }
+    Ok(e.finish())
+}
+
+/// Verify signed ancestry in a detached state, including locally retained same-group evidence.
+fn validate_offer(s: &State, bytes: &[u8]) -> Result<Option<State>> {
+    let mut d = Decoder::new(bytes);
+    arity(&mut d, 2)?;
+    let encoded = d.bytes()?;
+    if encoded.is_empty() {
+        if count(&mut d)? != 0 {
+            return Err(bad());
+        }
+        d.finish()?;
+        return Ok(None);
+    }
+    let genesis = Enrollment::decode(encoded)?;
+    genesis.verify(true)?;
+    let group = genesis.incarnation();
+    if genesis.group.is_some() || s.retired_groups.contains_key(&group) {
+        return Err(Error::Profile(
+            "this computer group was retired or is invalid",
+        ));
+    }
+    if s.genesis
+        .as_ref()
+        .is_some_and(|current| current.incarnation() == group && current != &genesis)
+    {
+        return Err(Error::SignatureInvalid);
+    }
+    let mut detached = s.clone();
+    detached.genesis = Some(genesis);
+    detached.group_genesis = None;
+    detached.pending = None;
+    detached
+        .history
+        .retain(|_, r| r.event().ok().is_some_and(|v| v.group == group));
+    for _ in 0..count(&mut d)? {
+        arity(&mut d, 2)?;
+        let id = digest(&mut d)?;
+        let record = Control {
+            signed: Signed::decode(d.bytes()?)?,
+        };
+        if id != record.id() || record.event()?.group != group {
+            return Err(Error::SignatureInvalid);
+        }
+        record.verify(&group)?;
+        if detached.history.len() >= MAX_RECORDS && !detached.history.contains_key(&id) {
+            return Err(Error::Profile(HISTORY_FULL));
+        }
+        if detached.history.get(&id).is_some_and(|old| old != &record) {
+            return Err(bad());
+        }
+        detached.history.insert(id, record);
+    }
+    d.finish()?;
+    let authority = detached.derive()?;
+    if !authority.complete {
+        return Err(Error::Profile(
+            "computer group history is incomplete or suspended",
+        ));
+    }
+    detached.members = authority.members;
+    detached.quarantined = authority.quarantined;
+    Ok(Some(detached))
+}
+
+fn fresh_grant(nonce: &Digest32, identity: &Digest32) -> Digest32 {
+    sha256_concat(&[b"vox/computer-invitation-grant/v1\0", nonce, identity])
+}
+
+fn offered_grant(s: &State, id: &Digest32) -> Option<Digest32> {
+    if s.quarantined.contains(id) {
+        return None;
+    }
+    s.members.iter().find_map(|(grant, member)| {
+        (member.computer.fingerprint().ok() == Some(*id)).then_some(*grant)
+    })
+}
+
+fn check_enrollment_authority(s: &State, g: &Enrollment) -> Result<()> {
+    if s.cancelled.contains_key(&g.operation()) || s.retired_groups.contains_key(&g.incarnation()) {
+        return Err(Error::Profile(
+            "this enrollment was closed or its group retired",
+        ));
+    }
+    let Some(group) = g.group else {
+        if s.genesis.is_some() {
+            return Err(Error::Profile(
+                "a different computer group is already established",
+            ));
+        }
+        return Ok(());
+    };
+    if s.genesis
+        .as_ref()
+        .or(s.group_genesis.as_ref())
+        .map(Enrollment::incarnation)
+        != Some(group)
+    {
+        return Err(Error::Profile(
+            "the proposed group authority is unavailable",
+        ));
+    }
+    let authority = s.derive()?;
+    let sponsor = g.computers[0].fingerprint()?;
+    if !authority.complete
+        || authority.quarantined.contains(&sponsor)
+        || authority
+            .members
+            .get(&g.grants[0])
+            .is_none_or(|grant| grant.computer.fingerprint().ok() != Some(sponsor))
+    {
+        return Err(Error::Profile(
+            "the sponsor's group authority is removed or suspended",
+        ));
+    }
+    Ok(())
 }
 fn context(invite: &Digest32, transport: &Digest32, g: &Enrollment) -> Vec<u8> {
     let mut e = Encoder::new();
@@ -4239,6 +5171,20 @@ fn enrolled(s: &State, g: &Enrollment) -> bool {
         })
     }
 }
+
+fn invitation_finished(s: &State, invite: &Invitation) -> bool {
+    if invite.target.is_none() {
+        return false;
+    }
+    s.genesis.as_ref().is_some_and(|g| g.nonce == invite.nonce)
+        || s.history.values().any(|record| {
+            record
+                .event()
+                .ok()
+                .and_then(|event| event.addition)
+                .is_some_and(|addition| addition.nonce == invite.nonce)
+        })
+}
 fn activate(s: &mut State, signer: &dyn RootSigner) -> Result<()> {
     let Some(g) = s.pending.clone() else {
         return Ok(());
@@ -4259,6 +5205,14 @@ fn activate(s: &mut State, signer: &dyn RootSigner) -> Result<()> {
             s.revision = s.revision.checked_add(1).ok_or_else(bad)?;
             s.policy_revision = s.revision;
             s.receipts.clear();
+        } else if s
+            .genesis
+            .as_ref()
+            .is_some_and(|current| current.operation() != g.operation())
+        {
+            return Err(Error::Profile(
+                "a different computer group is already established",
+            ));
         }
     } else {
         if !enrolled(s, &g) && signer.fingerprint() == g.computers[0].fingerprint()? {
@@ -4327,6 +5281,170 @@ fn exchange(s: &State, peer: &Digest32) -> Result<Vec<u8>> {
     }
     Ok(e.finish())
 }
+/// Validate a foreign group's complete signed evidence without publishing it locally.
+fn authenticated_group_conflict(
+    s: &State,
+    bytes: &[u8],
+    proposal: &Enrollment,
+    peer: Digest32,
+) -> Result<ConflictReview> {
+    let proposed = proposal.group.ok_or_else(bad)?;
+    if s.retired_groups.contains_key(&proposed) {
+        return Err(Error::Profile(
+            "this group was retired locally; old signed state cannot reactivate it",
+        ));
+    }
+    let current = s.genesis.as_ref().ok_or_else(bad)?;
+    let mut d = Decoder::new(bytes);
+    arity(&mut d, 5)?;
+    let genesis = Enrollment::decode(d.bytes()?)?;
+    genesis.verify(true)?;
+    if genesis.group.is_some() || genesis.incarnation() != proposed {
+        return Err(Error::SignatureInvalid);
+    }
+    if s.cancelled.contains_key(&proposal.operation())
+        || s.cancelled.contains_key(&genesis.operation())
+    {
+        return Err(Error::Profile(
+            "this enrollment attempt was closed locally; its retained intent cannot activate",
+        ));
+    }
+    let pending = Enrollment::decode(d.bytes()?)?;
+    if pending.body() != proposal.body() || pending.approvals[1].is_some() {
+        return Err(Error::SignatureInvalid);
+    }
+    pending.verify(false)?;
+    let mut detached = s.clone();
+    detached.genesis = Some(genesis);
+    detached.group_genesis = None;
+    detached.pending = None;
+    let mut retained = BTreeMap::new();
+    for (id, record) in &s.history {
+        if record.event()?.group == proposed {
+            retained.insert(*id, record.clone());
+        }
+    }
+    detached.history = retained;
+    let n = count(&mut d)?;
+    for _ in 0..n {
+        arity(&mut d, 2)?;
+        let id = digest(&mut d)?;
+        let control = Control {
+            signed: Signed::decode(d.bytes()?)?,
+        };
+        if id != control.id() {
+            return Err(bad());
+        }
+        if control.event()?.group != proposed {
+            return Err(Error::SignatureInvalid);
+        }
+        match detached.history.entry(id) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(control);
+            }
+            std::collections::btree_map::Entry::Occupied(entry) if entry.get() == &control => {}
+            std::collections::btree_map::Entry::Occupied(_) => return Err(bad()),
+        }
+    }
+    let authority = detached.derive()?;
+    if !authority.complete
+        || !authority.quarantined.is_empty()
+        || !authority
+            .members
+            .values()
+            .any(|grant| grant.computer.fingerprint().ok() == Some(peer))
+    {
+        return Err(Error::SignatureInvalid);
+    }
+    for _ in 0..count(&mut d)? {
+        arity(&mut d, 2)?;
+        let author = digest(&mut d)?;
+        let receipt = Signed::decode(d.bytes()?)?;
+        receipt.verify(b"vox/computer-applied/v1\0", &author)?;
+    }
+    match count(&mut d)? {
+        0 => {}
+        1 => {
+            arity(&mut d, 3)?;
+            let _ = d.uint()?;
+            if d.uint()? > 1 {
+                return Err(bad());
+            }
+            let _ = digest(&mut d)?;
+        }
+        _ => return Err(bad()),
+    }
+    d.finish()?;
+    let affected = affected_authority(s)?;
+    Ok(ConflictReview {
+        public: ComputerGroupConflict {
+            peer: ComputerIdentity::of(&proposal.computers[0])?,
+            current_group: text_id(&current.incarnation()),
+            proposed_group: text_id(&proposed),
+            operation_id: text_id(&proposal.operation()),
+            inviter_approved: pending.approvals[0].is_some(),
+            expires_ms: proposal.expires,
+            affected,
+            review_id: text_id(&random_array()?),
+            frontier: frontier(s),
+        },
+        intent: pending,
+        snapshot: sha256(&s.body()),
+        revision: s.revision,
+    })
+}
+fn affected_authority(s: &State) -> Result<Vec<String>> {
+    let accepted = s.accepted_history()?;
+    let mut affected = BTreeSet::new();
+    for description in s.descriptions().values() {
+        affected.insert(format!(
+            "Computer {} · {}",
+            description.name,
+            text_id(&description.fingerprint()?)
+        ));
+    }
+    if let Some(genesis) = &s.genesis {
+        for description in &genesis.computers {
+            affected.insert(format!(
+                "Retained computer {} · {}",
+                description.name,
+                text_id(&description.fingerprint()?)
+            ));
+        }
+    }
+    for (id, record) in &s.history {
+        if accepted.contains(id) {
+            let event = record.event()?;
+            if let Some(addition) = &event.addition {
+                let description = &addition.computers[1];
+                affected.insert(format!(
+                    "Retained computer {} · {}",
+                    description.name,
+                    text_id(&description.fingerprint()?)
+                ));
+            }
+            for binding in &event.bindings {
+                let node = binding.verify(&event.author, &event.group)?;
+                affected.insert(format!(
+                    "Covered node {} · {}",
+                    binding.name,
+                    text_id(&node)
+                ));
+            }
+        }
+    }
+    for (node, peers) in &s.individual {
+        for peer in peers.keys() {
+            affected.insert(format!(
+                "Recorded individual choice {} → {}",
+                text_id(node),
+                text_id(peer)
+            ));
+        }
+    }
+    Ok(affected.into_iter().collect())
+}
+
 fn merge(s: &mut State, bytes: &[u8], peer: Digest32, signer: &dyn RootSigner) -> Result<()> {
     let local = s.description.fingerprint()?;
     // A fresh preview can target an already-enrolled installation. Capture its exact current

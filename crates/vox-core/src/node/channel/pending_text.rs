@@ -168,9 +168,54 @@ impl CompletedText {
     }
 }
 
+pub(crate) enum PolicyBlocker {
+    Physical(std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + Sync>>),
+    Sparse {
+        request: [u8; 16],
+        root: [u8; 16],
+        wake: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + Sync>>,
+    },
+}
+
 impl ChannelState {
     pub(crate) fn post_pending(&self) -> bool {
         self.pending_text.is_some()
+    }
+
+    /// Inspect a managed-policy prerequisite while holding the room mutex.
+    pub(crate) fn policy_publication_blocker(
+        &self,
+        store: &Store,
+    ) -> Result<Option<PolicyBlocker>> {
+        if self.poisoned {
+            return Err(self.save_failure());
+        }
+        if self.post_pending() {
+            let wake = self.history_publication_wake();
+            if self.post_pending() {
+                return Ok(Some(PolicyBlocker::Physical(wake)));
+            }
+        }
+        let read = self.entries.read(store, &self.sek, &self.channel_id)?;
+        if read.publication_busy() {
+            let wake = self.history_publication_wake();
+            if read.publication_busy() {
+                let request = read.sparse_publication_request().ok_or(Error::Profile(
+                    "history publication has no sparse request owner",
+                ))?;
+                let root = self
+                    .history_publication_flow_root(request)
+                    .ok_or(Error::Profile(
+                        "history publication has no live Flow binding",
+                    ))?;
+                return Ok(Some(PolicyBlocker::Sparse {
+                    request,
+                    root,
+                    wake,
+                }));
+            }
+        }
+        Ok(None)
     }
 
     /// Reserve only publication ownership; incoming repair has no local-author prerequisites.

@@ -48,8 +48,8 @@ pub use client::{
     TrustedNode, UnreadLevel, VoxClient,
 };
 pub use computer::{
-    ComputerApplication, ComputerBindingAction, ComputerIdentity, ComputerNode, ComputerStatus,
-    ExchangeRecord, PairingPreview,
+    ComputerApplication, ComputerBindingAction, ComputerGroupConflict, ComputerGroupRetirement,
+    ComputerIdentity, ComputerNode, ComputerStatus, ExchangeRecord, PairingPreview,
 };
 
 /// Anything that went wrong, with the core's reason.

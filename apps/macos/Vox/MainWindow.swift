@@ -185,7 +185,7 @@ private struct Sidebar: View {
         VStack(spacing: 0) {
         List(selection: Binding(get: { model.sidebarSelection },
                                 set: { s in
-                                    model.selectFromSidebar(s) { [weak model] in
+                                    model.selectFromSidebar(s) { [weak model = model] in
                                         guard let model else { return false }
                                         return AppModel.shared.node === model
                                     }
@@ -647,7 +647,7 @@ private struct RoomRow: View {
                 if count > 0 {
                     Text("\(count)")
                         .font(Theme.small).fontWeight(.semibold).monospacedDigit()
-                        .foregroundStyle(waits ? VoxTokens.Colors.bgBase : VoxTokens.Colors.textPrimary)
+                        .foregroundStyle(VoxTokens.Colors.bgBase)
                         .padding(.horizontal, 6).frame(minWidth: 18, minHeight: 18)
                         .background(Capsule().fill(waits ? VoxTokens.Colors.accent : VoxTokens.Colors.accentDeep))
                         .help(room.unreadScanLimited
@@ -1034,6 +1034,69 @@ private enum TimelineEnd {
     static let id = "timeline-end"
 }
 
+private struct RoomUnreadBar: View {
+    @ObservedObject var model: NodeModel
+    let room: NodeModel.Room
+    @State private var helpShown = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Space.s4) {
+            HStack(alignment: .firstTextBaseline, spacing: Space.s8) {
+                Text("Room-wide: \(room.addressed) addressed · \(room.new) new · \(room.coordination) coordination")
+                    .secondaryText()
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .layoutPriority(-1)
+                    .help("Room-wide: \(room.addressed) addressed · \(room.new) new · \(room.coordination) coordination")
+                    .accessibilityLabel("Room-wide: \(room.addressed) addressed, \(room.new) new, \(room.coordination) coordination")
+                    .accessibilityIdentifier("room-unread-summary")
+                Button("Mark as Read") {
+                    let target = room.id, actor = model.me, epoch = model.observationToken
+                    Task {
+                        guard model.acceptsObservation(epoch, actor: actor) else { return }
+                        await model.markRoomRead(target)
+                    }
+                }
+                .fixedSize()
+                .disabled(model.progress(of: "mark-room-read") != nil || model.ended != nil)
+                .help("Mark all received messages from other members in \(room.name) as read, including other tags, thread replies and history outside this page. Does not answer Session requests or accept trust offers. ⇧⌘U")
+                .accessibilityLabel("Mark all received messages in \(room.name) as read")
+                .accessibilityIdentifier("room-mark-read")
+                Button { helpShown = true } label: { Image(systemName: "info.circle") }
+                    .buttonStyle(.borderless)
+                    .help("About unread and history")
+                    .accessibilityLabel("About unread and history")
+                    .accessibilityIdentifier("room-unread-help")
+                    .popover(isPresented: $helpShown) {
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: Space.s4) {
+                                Text("@ means unread messages addressed to you. @! means urgent addressed messages or a waiting Session request. The sidebar counts addressed and new messages; when there are none, it counts waiting requests and trust offers. Coordination is counted separately.")
+                                Text("Mark as Read covers this whole room, including other tags, thread replies and received history outside this page. It does not answer requests or accept trust offers; that attention can remain.")
+                                Text("To read instead, scroll up or use History → Load older history. It reads cached older messages first, then explicitly requests peer history when needed. End returns to the newest cached messages; Load newest history requests peer history. Use Tags → All messages and open thread replies to reach filtered content.")
+                                if room.unreadScanLimited {
+                                    Text("Unread counts cover the newest 1,000 rows only. Older activity has not been counted.")
+                                }
+                            }
+                            .secondaryText()
+                            .fixedSize(horizontal: false, vertical: true)
+                            .textSelection(.enabled)
+                            .padding(Space.s12)
+                        }
+                        .frame(width: 360, height: 240)
+                        .panelSurface()
+                    }
+            }
+            if room.waiting > 0 || room.offered > 0 {
+                Text("Separate attention: \(room.waiting) waiting Session requests · \(room.offered) trust offers")
+                    .secondaryText()
+            }
+        }
+        .voxFont(VoxTokens.Fonts.appSmall)
+        .voxPadding(.horizontal, Space.s12)
+        .voxPadding(.vertical, Space.s8)
+    }
+}
+
 /// The room on screen: its timeline and a field to post, with its members beside it.
 private struct RoomTimelineView: View {
     /// The conversation's text size, for its spacing (L-1a): this view sets it on the timeline and
@@ -1086,6 +1149,7 @@ private struct RoomTimelineView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     /// The inspector's width: the one last dragged to, kept across launches (Columns).
     @State private var inspectorWidth = Columns.width(.inspector)
+    @State private var roomActivityShown = false
 
     var body: some View {
         // The timeline and the inspector, with a divider the person drags; the inspector's width is
@@ -1100,9 +1164,13 @@ private struct RoomTimelineView: View {
                     .navigationTitle(model.roomName(room))
                     .navigationSubtitle("")
                 Divider()
+                if !model.showingSession, let summary = model.rooms.first(where: { $0.id == room }) {
+                    RoomUnreadBar(model: model, room: summary)
+                    Hairline()
+                }
                 if !model.roomServices.isEmpty || model.roomServicesNext != nil {
                     ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: Space.s8 * scale) {
+                        HStack(spacing: Space.s8) {
                             ForEach(model.roomServices, id: \.address) { service in
                                 let selected = model.selectedService?.address == service.address
                                 // A button, so a click anywhere on the card selects it, as AppKit
@@ -1123,47 +1191,56 @@ private struct RoomTimelineView: View {
                     }
                     Hairline()
                 }
-                HStack {
-                    Button("First Services") { Task { await model.readGovernancePages(first: true) } }
-                    if model.roomServicesNext != nil {
-                        Button("Next Services") { Task { await model.readGovernancePages(nextServices: true) } }
-                    }
-                }.voxPadding(.horizontal, Space.s12)
-                DisclosureGroup("Room Activity") {
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: Space.s4) {
-                            ForEach(model.notices, id: \.id) { notice in
-                                Text("\(notice.authorName.isEmpty ? String(notice.author.prefix(12)) : notice.authorName) \(notice.what)")
-                                    .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                        }
-                    }.frame(maxHeight: Theme.scaled(180))
+                if !model.roomServices.isEmpty || model.roomServicesNext != nil {
                     HStack {
-                        Button("Latest Activity") { Task { await model.readGovernancePages(first: true) } }
-                        if model.noticesBefore != nil {
-                            Button("Older Activity") { Task { await model.readGovernancePages(olderNotices: true) } }
+                        Button("First Services") { Task { await model.readGovernancePages(first: true) } }
+                        if model.roomServicesNext != nil {
+                            Button("Next Services") { Task { await model.readGovernancePages(nextServices: true) } }
                         }
-                    }
-                }.voxPadding(.horizontal, Space.s12)
-                if let failure = model.governancePageError {
-                    StateMark(kind: .danger, words: failure)
-                    Button("Reload Services and Activity") { Task { await model.readGovernancePages(first: true) } }
+                    }.voxPadding(.horizontal, Space.s12)
                 }
-                Text(model.timelineTitle)
-                    .secondaryText()
-                    .lineLimit(1).truncationMode(.middle)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .voxPadding(.horizontal, Space.s12).voxPadding(.top, Space.s8)
-                    .accessibilityIdentifier("timeline-title")
-                if !model.showingSession {
-                    VStack(alignment: .leading, spacing: Space.s4) {
-                        HStack {
+                HStack(spacing: Space.s8) {
+                    Text(model.timelineTitle)
+                        .secondaryText()
+                        .lineLimit(1).truncationMode(.middle)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .layoutPriority(-1)
+                        .help(model.timelineTitle)
+                        .accessibilityLabel(model.timelineTitle)
+                        .accessibilityIdentifier("timeline-title")
+                    Button("Room Activity") { roomActivityShown = true }
+                        .fixedSize()
+                        .accessibilityIdentifier("room-activity-open")
+                        .popover(isPresented: $roomActivityShown) {
+                            VStack(alignment: .leading, spacing: Space.s8) {
+                                ScrollView {
+                                    VStack(alignment: .leading, spacing: Space.s4) {
+                                        ForEach(model.notices, id: \.id) { notice in
+                                            Text("\(notice.authorName.isEmpty ? String(notice.author.prefix(12)) : notice.authorName) \(notice.what)")
+                                                .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                                        }
+                                    }
+                                }.frame(maxHeight: 180)
+                                HStack {
+                                    Button("Latest Activity") { Task { await model.readGovernancePages(first: true) } }
+                                    if model.noticesBefore != nil {
+                                        Button("Older Activity") { Task { await model.readGovernancePages(olderNotices: true) } }
+                                    }
+                                }
+                            }
+                            .padding(Space.s12).frame(width: 360)
+                            .panelSurface()
+                        }
+                    if !model.showingSession {
+                        Menu("History") {
                             Button("Load older history") { Task { await model.requestOlderHistory() } }
                                 .disabled(model.roomHistoryBusy || model.roomHistoryCanResume)
                                 .accessibilityIdentifier("room-history-older")
+                                .help("Read cached older messages first; request older peer history when needed. Only messages actually shown in the foreground are automatically acknowledged.")
                             Button("Load newest history") { Task { await model.requestNewestHistory() } }
                                 .disabled(model.roomHistoryBusy || model.roomHistoryCanResume)
                                 .accessibilityIdentifier("room-history-newest")
+                                .help("Request the newest history from peers. Press End in the timeline to return to its newest cached messages.")
                             if model.roomHistoryCanResume {
                                 Button("Resume") { Task { await model.resumeRoomHistory() } }
                                     .disabled(model.roomHistorySending)
@@ -1175,6 +1252,17 @@ private struct RoomTimelineView: View {
                                     .accessibilityIdentifier("room-history-cancel")
                             }
                         }
+                        .fixedSize()
+                        .accessibilityIdentifier("room-history-menu")
+                    }
+                }
+                .voxPadding(.horizontal, Space.s12).voxPadding(.vertical, Space.s4)
+                if let failure = model.governancePageError {
+                    StateMark(kind: .danger, words: failure)
+                    Button("Reload Services and Activity") { Task { await model.readGovernancePages(first: true) } }
+                }
+                if !model.showingSession {
+                    VStack(alignment: .leading, spacing: Space.s4) {
                         if model.roomHistoryBusy { ProgressView("Loading requested history…").controlSize(.small) }
                         if let state = model.roomHistoryStatus {
                             Text(state.detail).secondaryText()
@@ -1510,6 +1598,7 @@ private struct RoomTimelineView: View {
                             }
                         }
                     }
+                    .frame(minHeight: 120)
                     .background(WindowReader(seen: window))
                     .onChange(of: following) { value in model.timelineFollowingNewest = value }
                     .onChange(of: model.timelineFollowingNewest) { value in following = value }
@@ -1582,6 +1671,7 @@ private struct RoomTimelineView: View {
                         previewKeys = nil
                     }
                 }
+                .conversationScale(Theme.scale)
                 // A Session has no room composer (CL-1): the room's composer never speaks into
                 // a Session. An open one's own composer is for a member with drive only (CL-3).
                 if !model.showingSession {
@@ -1589,21 +1679,42 @@ private struct RoomTimelineView: View {
                     // trust both ways (ADR-028 R-5), which a newcomer is not told anywhere else.
                     TrustBanner(model: model)
                     composer
+                        .conversationScale(Theme.scale)
                 } else if let s = model.shownSession, s.canDrive, s.open, let room = model.roomOnScreen {
                     Hairline()
                     // One composer per Session: a draft for one never shows in another (D12).
                     SessionComposer(model: model, room: room, session: s)
                         .id("\(room)/\(s.nodeFingerprint)/\(s.sessionId)")
+                        .conversationScale(Theme.scale)
                 }
             }
-            // The conversation, the timeline and the composer, at the text size View > Bigger and
-            // Smaller set (the decider, v0.4.1); the inspector beside it keeps a steady size.
-            .conversationScale(Theme.scale)
             // At least wide enough for the slim composer and its visible Send action.
             .frame(minWidth: Theme.scaled(400), maxWidth: .infinity)
             if model.inspectorShown {
                 ColumnDivider(width: $inspectorWidth, side: .inspector)
-                Group {
+                VStack(spacing: 0) {
+                    HStack {
+                        Text("Inspector").eyebrow().secondaryText()
+                        Spacer()
+                        Button {
+                            inspectorWidth = max(Columns.Side.inspector.min, inspectorWidth - Space.s4)
+                            Columns.remember(.inspector, inspectorWidth)
+                        } label: { Image(systemName: "arrow.right.to.line") }
+                        .disabled(inspectorWidth <= Columns.Side.inspector.min)
+                        .help("Narrow Inspector")
+                        .accessibilityLabel("Narrow Inspector")
+                        .accessibilityIdentifier("inspector-narrow")
+                        Button {
+                            inspectorWidth = min(Columns.Side.inspector.max, inspectorWidth + Space.s4)
+                            Columns.remember(.inspector, inspectorWidth)
+                        } label: { Image(systemName: "arrow.left.to.line") }
+                        .disabled(inspectorWidth >= Columns.Side.inspector.max)
+                        .help("Widen Inspector")
+                        .accessibilityLabel("Widen Inspector")
+                        .accessibilityIdentifier("inspector-widen")
+                    }
+                    .buttonStyle(.borderless)
+                    .padding(.horizontal, Space.s12).padding(.vertical, Space.s4)
                     if model.openThread != nil {
                         ThreadPanel(model: model, room: room, look: { looking = $0 })
                     } else {
@@ -1703,50 +1814,83 @@ private struct RoomTimelineView: View {
             }
             .voxPadding(.horizontal, Space.s12).voxPadding(.top, Space.s8)
         }
-        HStack(spacing: Space.s8 * scale) {
-            Button {
-                tokenizeDraft(finish: true)
-                if let url = chooseFile() { attaching = Attaching(url: url) }
-            } label: {
-                Image(systemName: "paperclip")
-            }
-            .buttonStyle(.borderless)
-            .help("Attach a file or folder")
-            .accessibilityLabel("Attach a file or folder")
-            .accessibilityIdentifier("attach")
+        ViewThatFits(in: .horizontal) {
             HStack(spacing: Space.s8 * scale) {
-                Text("\(model.node) ▸").font(Theme.text).secondaryText()
-                    .lineLimit(1).truncationMode(.middle)
-                    .frame(minWidth: 48 * scale, idealWidth: 80 * scale, maxWidth: 80 * scale, alignment: .leading)
-                    .help("Posting as \(model.node)")
-                    .accessibilityIdentifier("compose-as")
-                ComposerTokens(model: model, to: $to, urgent: urgency)
-                // One line until the person types more; Return sends, ⇧↩ (or ⌥↩) adds a line.
-                TextField("Message \(model.roomName(room))…", text: input, axis: .vertical)
-                    .lineLimit(1...12)
-                    .focused($composing)
-                    .shiftReturnAddsLine(composing)
-                    .help("Return sends; ⇧Return starts a new line; @name addresses; ! marks urgent")
-                    .accessibilityLabel("Message \(model.roomName(room)), as \(model.node)")
-                    .textFieldStyle(.plain)
-                    .frame(minWidth: 80 * scale, maxWidth: .infinity, minHeight: Space.s24 * scale)
-                    .onSubmit { send(urgent: urgent) }
-                    .accessibilityIdentifier("compose")
-                ComposerAddress(model: model, to: $to, urgent: urgency)
+                composeAttachment
+                HStack(spacing: Space.s8 * scale) {
+                    composeIdentity
+                    ComposerTokens(model: model, to: $to, urgent: urgency)
+                    composeInput
+                    ComposerAddress(model: model, to: $to, urgent: urgency)
+                }
+                .voxPadding(Space.s8)
+                .background(RoundedRectangle(cornerRadius: Radius.control * scale).fill(VoxTokens.Colors.bgOverlay))
+                .cardOutline()
+                .accessibilityElement(children: .contain)
+                .accessibilityIdentifier("compose-field")
+                composeSend
             }
-            .voxPadding(.horizontal, Space.s8)
-            .voxPadding(.vertical, Space.s8)
-            // Always present, including empty, unfocused, and with the pointer elsewhere.
+            VStack(spacing: Space.s4 * scale) {
+                HStack(spacing: Space.s4 * scale) {
+                    composeIdentity
+                    ComposerTokens(model: model, to: $to, urgent: urgency)
+                    Spacer(minLength: 0)
+                    ComposerAddress(model: model, to: $to, urgent: urgency)
+                }
+                HStack(spacing: Space.s4 * scale) {
+                    composeAttachment
+                    composeInput
+                    composeSend
+                }
+            }
+            .voxPadding(Space.s8)
             .background(RoundedRectangle(cornerRadius: Radius.control * scale).fill(VoxTokens.Colors.bgOverlay))
             .cardOutline()
             .accessibilityElement(children: .contain)
             .accessibilityIdentifier("compose-field")
-            Button("Send") { send(urgent: urgent) }
-                .buttonStyle(.voxPrimary)
-                .disabled(sending || model.ended != nil || draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                .accessibilityIdentifier("compose-send")
         }
         .voxPadding(Space.s12)
+    }
+
+    private var composeIdentity: some View {
+        Text("\(model.node) ▸").font(Theme.text).secondaryText()
+            .lineLimit(1).truncationMode(.middle)
+            .frame(minWidth: 48 * scale, idealWidth: 80 * scale, maxWidth: 80 * scale, alignment: .leading)
+            .help("Posting as \(model.node)")
+            .accessibilityIdentifier("compose-as")
+    }
+
+    private var composeInput: some View {
+        TextField("Message \(model.roomName(room))…", text: input, axis: .vertical)
+            .lineLimit(1...4)
+            .focused($composing)
+            .shiftReturnAddsLine(composing)
+            .help("Return sends; ⇧Return starts a new line; @name addresses; ! marks urgent")
+            .accessibilityLabel("Message \(model.roomName(room)), as \(model.node)")
+            .textFieldStyle(.plain)
+            .frame(minWidth: 80 * scale, maxWidth: .infinity, minHeight: Space.s24 * scale)
+            .onSubmit { send(urgent: urgent) }
+            .accessibilityIdentifier("compose")
+    }
+
+    private var composeAttachment: some View {
+        Button {
+            tokenizeDraft(finish: true)
+            if let url = chooseFile() { attaching = Attaching(url: url) }
+        } label: {
+            Image(systemName: "paperclip")
+        }
+        .buttonStyle(.borderless)
+        .help("Attach a file or folder")
+        .accessibilityLabel("Attach a file or folder")
+        .accessibilityIdentifier("attach")
+    }
+
+    private var composeSend: some View {
+        Button("Send") { send(urgent: urgent) }
+            .buttonStyle(.voxPrimary)
+            .disabled(sending || model.ended != nil || draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            .accessibilityIdentifier("compose-send")
     }
 
     /// Post the draft, To: and replying as set; urgent when asked (⌘↩ or the switch).

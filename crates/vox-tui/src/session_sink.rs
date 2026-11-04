@@ -90,6 +90,7 @@ pub type Poster = Arc<
             Vec<String>,
             Option<SourceEffects>,
             Option<Arc<crate::wake::Session>>,
+            Option<tokio::sync::OwnedMutexGuard<()>>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Posted> + Send>>
         + Send
         + Sync,
@@ -97,6 +98,9 @@ pub type Poster = Arc<
 
 /// Capture one activity's destination before its bounded parts are admitted.
 pub type RoomOf = Arc<dyn Fn(&NodeName, &str) -> Option<vox_core::hash::Digest32> + Send + Sync>;
+
+/// The host's exact per-Session lifecycle fence, shared with registration and removal.
+pub type LifecycleOf = Arc<dyn Fn(&NodeName, &str) -> Arc<tokio::sync::Mutex<()>> + Send + Sync>;
 
 /// Where a session's new name goes (ADR-029 MD-1): its registration, and its Session's record.
 pub type Renamer = Arc<dyn Fn(&NodeName, &str, &str) + Send + Sync>;
@@ -119,6 +123,7 @@ pub struct Sink {
     state: Mutex<BTreeMap<(NodeName, String), Session>>,
     post: Poster,
     room_of: RoomOf,
+    lifecycle_of: LifecycleOf,
     rename: Renamer,
     attention: AttentionObserver,
 }
@@ -291,6 +296,7 @@ impl Sink {
     pub fn new(
         post: Poster,
         room_of: RoomOf,
+        lifecycle_of: LifecycleOf,
         rename: Renamer,
         attention: AttentionObserver,
     ) -> Arc<Self> {
@@ -298,6 +304,7 @@ impl Sink {
             state: Mutex::new(BTreeMap::new()),
             post,
             room_of,
+            lifecycle_of,
             rename,
             attention,
         })
@@ -347,19 +354,10 @@ impl Sink {
         session: &str,
         bodies: Vec<String>,
     ) -> SessionAdmission {
-        self.post_numbered_result(node, session, bodies)
+        let lifecycle = (self.lifecycle_of)(node, session).lock_owned().await;
+        self.post_with_effects(node, session, bodies, None, None, Some(lifecycle))
             .await
             .admission
-    }
-
-    async fn post_numbered_result(
-        &self,
-        node: &NodeName,
-        session: &str,
-        bodies: Vec<String>,
-    ) -> Posted {
-        self.post_with_effects(node, session, bodies, None, None)
-            .await
     }
 
     async fn post_with_effects(
@@ -369,6 +367,7 @@ impl Sink {
         bodies: Vec<String>,
         mut effects: Option<SourceEffects>,
         expected: Option<Arc<crate::wake::Session>>,
+        mut lifecycle: Option<tokio::sync::OwnedMutexGuard<()>>,
     ) -> Posted {
         use vox_core::node::session_ingress::{MAX_BATCH_BYTES, MAX_BATCH_ITEMS};
         let invalid = bodies.iter().find_map(|body| {
@@ -401,6 +400,7 @@ impl Sink {
                     std::mem::take(&mut batch),
                     effects.take(),
                     expected.clone(),
+                    lifecycle.take(),
                 )
                 .await;
                 fresh |= next.fresh;
@@ -424,6 +424,7 @@ impl Sink {
                 batch,
                 effects,
                 expected,
+                lifecycle,
             )
             .await;
             fresh |= next.fresh;
@@ -444,7 +445,8 @@ impl Sink {
         bodies: Vec<String>,
         echo: Option<&str>,
     ) -> Posted {
-        self.source_activity_expected(node, session, bodies, echo, None)
+        let guard = (self.lifecycle_of)(node, session).lock_owned().await;
+        self.source_activity_expected(node, session, bodies, echo, None, Some(guard))
             .await
     }
 
@@ -455,6 +457,7 @@ impl Sink {
         mut bodies: Vec<String>,
         echo: Option<&str>,
         expected: Option<Arc<crate::wake::Session>>,
+        lifecycle: Option<tokio::sync::OwnedMutexGuard<()>>,
     ) -> Posted {
         let Some(first) = bodies
             .first()
@@ -545,6 +548,7 @@ impl Sink {
                     echo,
                 }),
                 expected,
+                lifecycle,
             )
             .await;
         if suppressed {
@@ -610,7 +614,8 @@ impl Sink {
         bodies: Vec<String>,
         call: Option<ToolCall>,
     ) -> SessionAdmission {
-        self.activity_expected(node, session, bodies, call, None)
+        let guard = (self.lifecycle_of)(node, session).lock_owned().await;
+        self.activity_expected(node, session, bodies, call, None, Some(guard))
             .await
     }
 
@@ -620,6 +625,7 @@ impl Sink {
         node: &NodeName,
         expected: Arc<crate::wake::Session>,
         bodies: Vec<String>,
+        lifecycle: tokio::sync::OwnedMutexGuard<()>,
     ) -> SessionAdmission {
         self.activity_expected(
             node,
@@ -627,6 +633,7 @@ impl Sink {
             bodies,
             None,
             Some(Arc::clone(&expected)),
+            Some(lifecycle),
         )
         .await
     }
@@ -638,6 +645,7 @@ impl Sink {
         bodies: Vec<String>,
         call: Option<ToolCall>,
         expected: Option<Arc<crate::wake::Session>>,
+        lifecycle: Option<tokio::sync::OwnedMutexGuard<()>>,
     ) -> SessionAdmission {
         // The public daemon request can name any session. Do not create correlation state for
         // an unregistered/unbound session before the later durable-admission check rejects it.
@@ -668,7 +676,14 @@ impl Sink {
                 })
                 .and_then(|value| value.get("text").and_then(Value::as_str).map(str::to_owned));
             return self
-                .source_activity_expected(node, session, bodies, echo.as_deref(), expected)
+                .source_activity_expected(
+                    node,
+                    session,
+                    bodies,
+                    echo.as_deref(),
+                    expected,
+                    lifecycle,
+                )
                 .await
                 .admission;
         }
@@ -756,7 +771,7 @@ impl Sink {
         if turn_end {
             bodies.extend(self.expired_entries(node, session));
         }
-        self.post_with_effects(node, session, bodies, None, expected)
+        self.post_with_effects(node, session, bodies, None, expected, lifecycle)
             .await
             .admission
     }
@@ -856,6 +871,7 @@ impl Sink {
         call: ToolCall,
         transcript: String,
     ) -> Option<String> {
+        let lifecycle = (self.lifecycle_of)(node, session).lock_owned().await;
         (self.room_of)(node, session)?;
         let Ok(Value::Object(mut entry)) = serde_json::from_str::<Value>(&body) else {
             return None;
@@ -920,15 +936,30 @@ impl Sink {
                 // Shown, so the person knows it is there, but answered only at the terminal.
                 entry.insert("answerable".into(), json!(false));
                 entry.insert("why".into(), json!(why));
-                self.post_numbered(node, session, crate::session_mirror::split(entry, "input"))
-                    .await;
+                self.post_with_effects(
+                    node,
+                    session,
+                    crate::session_mirror::split(entry, "input"),
+                    None,
+                    None,
+                    Some(lifecycle),
+                )
+                .await;
                 None
             }
             Ok(id) => {
                 entry.insert("ref".into(), json!(id));
                 let admission = self
-                    .post_numbered(node, session, crate::session_mirror::split(entry, "input"))
-                    .await;
+                    .post_with_effects(
+                        node,
+                        session,
+                        crate::session_mirror::split(entry, "input"),
+                        None,
+                        None,
+                        Some(lifecycle),
+                    )
+                    .await
+                    .admission;
                 if !matches!(
                     admission,
                     SessionAdmission::Committed { .. } | SessionAdmission::Held(_)
@@ -1169,6 +1200,7 @@ impl Sink {
         session: &str,
         entry: String,
     ) -> Option<(oneshot::Receiver<Given>, RequestTicket)> {
+        let lifecycle = (self.lifecycle_of)(node, session).lock_owned().await;
         (self.room_of)(node, session)?;
         let Ok(Value::Object(mut m)) = serde_json::from_str::<Value>(&entry) else {
             return None;
@@ -1205,8 +1237,16 @@ impl Sink {
             return None;
         }
         let admission = self
-            .post_numbered(node, session, vec![Value::Object(m).to_string()])
-            .await;
+            .post_with_effects(
+                node,
+                session,
+                vec![Value::Object(m).to_string()],
+                None,
+                None,
+                Some(lifecycle),
+            )
+            .await
+            .admission;
         if !matches!(
             admission,
             SessionAdmission::Committed { .. } | SessionAdmission::Held(_)
@@ -1304,7 +1344,9 @@ impl Sink {
 
     async fn expire_all(&self, node: &NodeName, session: &str) {
         let entries = self.expired_entries(node, session);
-        self.post_numbered(node, session, entries).await;
+        // The host calls session_end while holding this Session's lifecycle fence.
+        self.post_with_effects(node, session, entries, None, None, None)
+            .await;
     }
 
     /// A member with drive answered `id` in the Session (the drive router calls this once it has
