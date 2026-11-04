@@ -1220,13 +1220,14 @@ pub(crate) fn apply_request(path: &Path) -> Result<(), AppError> {
                 return Ok(());
             }
             publish(&install_dir, &engine)?;
-            restart::restart_daemon(&active, &release.version_text)?;
+            let detached = restart::restart_daemon(&active, &release.version_text)?;
             run_shell_setup(&active)?;
             println!("updated: {} -> {}", active.display(), release.version_text);
             println!(
                 "         previous kept at {}",
                 install_dir.join(PREVIOUS_NAME).display()
             );
+            restart::say_detached(&detached);
             Ok(())
         }
         _ => Err(usage("update request does not name an owned installation")),
@@ -1296,7 +1297,7 @@ fn do_rollback(install_dir: &Path) -> Result<(), AppError> {
             fs::rename(&scratch, &previous).map_err(AppError::Io)?;
             sync_dir(install_dir)?;
             // As any rollback does: restart the daemon and refresh integrations first.
-            restart_onto(&active)?;
+            let detached = restart_onto(&active)?;
             run_shell_setup(&active)?;
             println!(
                 "finished a rollback that was interrupted: {} is {}, and {} is kept for --rollback",
@@ -1304,6 +1305,7 @@ fn do_rollback(install_dir: &Path) -> Result<(), AppError> {
                 binary_version(&active).unwrap_or_else(|| "unknown".to_owned()),
                 previous.display()
             );
+            restart::say_detached(&detached);
             return Ok(());
         }
         fs::remove_file(&scratch).map_err(AppError::Io)?;
@@ -1323,13 +1325,14 @@ fn do_rollback(install_dir: &Path) -> Result<(), AppError> {
     sync_dir(install_dir)?;
     fs::rename(&scratch, &previous).map_err(AppError::Io)?;
     sync_dir(install_dir)?;
-    restart_onto(&active)?;
+    let detached = restart_onto(&active)?;
     run_shell_setup(&active)?;
     println!(
         "rolled back: {} -> {}",
         active.display(),
         binary_version(&active).unwrap_or_else(|| "unknown".to_owned())
     );
+    restart::say_detached(&detached);
     Ok(())
 }
 
