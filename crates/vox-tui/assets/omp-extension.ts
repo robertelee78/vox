@@ -373,12 +373,9 @@ export default function vox(pi) {
         if (handled) return sock.destroy()
         if (msg?.type === "route") {
           handled = true
-          if (current() && !operation && !queueBusy() && notices.size >= MAX_NOTICES) {
-            activate(ctx)
-            reply({ outcome: "unavailable" })
-            sock.end(); return
-          }
-          reply(current() && msg.session === session && !poisoned && !operation && !queueBusy() && notices.size < MAX_NOTICES
+          // A probe observes this exact route; it must not retire it or perform queue admission.
+          // Temporary native work is not an ended conversation. Notice admission stays separate.
+          reply(current() && msg.session === session && !poisoned
             ? { outcome: "available", session, route, client: route } : { outcome: "unavailable" })
           sock.end(); return
         }
