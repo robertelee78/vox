@@ -436,10 +436,10 @@ async fn restart_checked(
             attached,
         }) = intent
         {
-            start_selected(account, helper, *listen, anchors, started).await?;
+            start_selected(account, helper, *listen, anchors, started, now).await?;
             attached.as_slice()
         } else {
-            crate::daemon_client::start_daemon(helper, account, default_listen, &[]).await?;
+            crate::daemon_client::start_daemon(helper, account, default_listen, &[], now).await?;
             &[]
         };
         let after = wait_for_replacement(account, now, None, &kept).await?;
@@ -523,7 +523,7 @@ async fn restart_checked(
             )));
         }
     }
-    start_selected(account, helper, listen, &anchors, &started).await?;
+    start_selected(account, helper, listen, &anchors, &started, now).await?;
     let after = wait_for_replacement(account, now, Some(before.pid), &kept).await?;
     let ended = match (held.is_empty(), attached.is_empty()) {
         (false, _) => format!(
@@ -566,6 +566,7 @@ async fn start_selected(
     listen: std::net::SocketAddr,
     anchors: &[String],
     started: &Started,
+    expected_version: &str,
 ) -> Result<(), crate::app::AppError> {
     use crate::app::AppError;
     match started {
@@ -594,7 +595,8 @@ async fn start_selected(
             }
         }
         Started::ByClient | Started::ByHand => {
-            crate::daemon_client::start_daemon(helper, account, listen, anchors).await?;
+            crate::daemon_client::start_daemon(helper, account, listen, anchors, expected_version)
+                .await?;
         }
     }
     Ok(())
@@ -614,8 +616,9 @@ async fn wait_for_replacement(
     let mut _held_after = None;
     loop {
         if let Ok(daemon) = DaemonClient::observe_held(&socket).await {
-            if daemon.protocol == vox_core::node::ipc::PROTOCOL_VERSION
-                && daemon.version == now
+            if daemon.version == now
+                && (now != env!("CARGO_PKG_VERSION")
+                    || daemon.protocol == vox_core::node::ipc::PROTOCOL_VERSION)
                 && Some(daemon.pid) != previous_pid
             {
                 let pending =
