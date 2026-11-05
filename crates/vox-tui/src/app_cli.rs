@@ -219,7 +219,9 @@ async fn pipe(stream: tokio::net::UnixStream, datagrams: bool) -> Result<(), App
                     cut = true;
                     break;
                 }
-                let chunk = pending.as_ref().expect("the pending-write arm is enabled");
+                let Some(chunk) = pending.as_ref() else {
+                    continue;
+                };
                 match w.try_write(&chunk[written..]) {
                     Ok(0) => {
                         cut = true;
