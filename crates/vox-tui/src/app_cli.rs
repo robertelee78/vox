@@ -240,9 +240,14 @@ async fn pipe(stream: tokio::net::UnixStream, datagrams: bool) -> Result<(), App
                 }
             }
             _ = probe.tick(), if net_done => {
-                if w.try_write(&[]).is_err() {
-                    cut = true;
-                    break;
+                match w.try_write(&[]) {
+                    Ok(_) => {}
+                    Err(error) if matches!(error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) => {}
+                    Err(_) => {
+                        cut = true;
+                        break;
+                    }
                 }
             }
         }
