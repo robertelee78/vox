@@ -46,6 +46,7 @@ command, give the exact arguments of the `vox` you run. `vox man` prints the sam
 | Share a service | `vox serve`, `vox service add`, `list`, `remove` | a running local service |
 | Join a room for its services | `vox connect` | the room link and passphrase |
 | Reach a service | `vox up`, `vox forward` | the sharer's trust |
+| Pipe a program to a member | `vox app listen`, `vox app open` | a shared room and mutual trust |
 | Close tunnels | `vox tunnel close` | `vox status` lists them |
 | Share and pull files | `vox share`, `vox share list`, `vox share stop`, `vox room get` | a Ready node |
 | A room's local network | `vox lan up` | the LAN helper |
@@ -56,6 +57,10 @@ command, give the exact arguments of the `vox` you run. `vox man` prints the sam
 | Private room-message attention | `vox room session --attention`, `--attention-after` | exact open Session and Drive |
 | Hold/resume automatic room news | `vox room pause`, `vox room resume` | receiver Drive; whole room or named nodes |
 | Install, update, remove | `vox update`, `vox uninstall`, `vox shell-setup` | |
+
+App streams carry stdin and stdout simultaneously; neither program needs to finish sending
+before receiving. The peer finishing its output does not cancel your remaining stdin upload.
+A withdrawn or failed stream exits nonzero instead of silently reporting a complete transfer.
 
 ## Commands you can paste
 
