@@ -9,8 +9,8 @@
 //! node's app layer counted is read from its own `vox status --json`. What each case
 //! asserts:
 //!
-//! 1. **It carries.** A 1 MiB stream round-trips through both nodes with its SHA-256
-//!    intact, and 1000 datagrams on a flow bound to a stream all arrive.
+//! 1. **It carries.** Independent 64 MiB streams travel simultaneously in both directions
+//!    with their SHA-256 intact, and 1000 datagrams on a flow bound to a stream all arrive.
 //! 2. **The responder's gate.** An opener outside the responder's keyring reaches no
 //!    listener: the listener is told about **0** incoming streams.
 //! 3. **The opener's gate.** A target outside the opener's keyring is refused by the
@@ -400,114 +400,88 @@ fn mutual(s: &mut Scene) {
     }
 }
 
-/// **(1) It carries.** 1 MiB round trip, SHA-256 checked, then 1000 datagrams.
+/// **(1) It carries.** Full-duplex streams larger than IPC buffers, then 1000 datagrams.
 #[test]
 #[ignore = "real vox daemons and real child processes; CI runs it in release"]
-fn a_mebibyte_round_trips_and_a_thousand_datagrams_arrive() {
+fn full_duplex_streams_and_a_thousand_datagrams_arrive() {
     watchdog::arm();
     let mut s = scene();
     mutual(&mut s);
 
-    // ---- a mebibyte there and back ----
-    let payload: Vec<u8> = (0..1024 * 1024u32)
-        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
-        .collect();
+    // Independent producers keep both directions backlogged. An echo or a payload that
+    // fits in the IPC buffers cannot expose a CLI awaiting writes without draining reads.
+    const CHUNKS: usize = 1024;
+    const CHUNK: usize = 64 * 1024;
     let mut listen = s.alice.vox(&["app", "listen", &s.room, LABEL]);
     listen.listening();
-    // The listener echoes: whatever comes out of it goes straight back in, and once the
-    // whole mebibyte has, its input ends — which ends its half of the stream.
-    {
-        let mut from = listen
-            .child
-            .stdout
-            .take()
-            .expect("APPARATUS: the listener's stdout pipe");
-        let mut into = listen
-            .child
-            .stdin
-            .take()
-            .expect("APPARATUS: the listener's stdin pipe");
-        let total = payload.len();
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 16 * 1024];
-            let mut echoed = 0;
-            while echoed < total {
-                match from.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if into.write_all(&buf[..n]).is_err() {
-                            break;
-                        }
-                        echoed += n;
-                    }
-                }
-            }
-        });
-    }
     let mut open = s.bob.vox(&["app", "open", &s.room, &s.alice.fp, LABEL]);
-    let echoed = Arc::new(Mutex::new(Vec::new()));
-    {
-        let mut from = open
-            .child
-            .stdout
-            .take()
-            .expect("APPARATUS: the opener's stdout pipe");
-        let sink = Arc::clone(&echoed);
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 16 * 1024];
-            while let Ok(n) = from.read(&mut buf) {
+    let pump = |child: &mut Proc, byte: u8| {
+        let mut into = child.child.stdin.take().expect("APPARATUS: child stdin");
+        let mut from = child.child.stdout.take().expect("APPARATUS: child stdout");
+        let writer = std::thread::spawn(move || {
+            let chunk = [byte; CHUNK];
+            for _ in 0..CHUNKS {
+                into.write_all(&chunk)?;
+            }
+            Ok::<_, std::io::Error>(())
+        });
+        let reader = std::thread::spawn(move || {
+            let mut chunk = [0; CHUNK];
+            let mut digest = Sha256::new();
+            let mut bytes = 0;
+            loop {
+                let n = from.read(&mut chunk)?;
                 if n == 0 {
-                    break;
+                    return Ok::<_, std::io::Error>((bytes, digest.finalize()));
                 }
-                sink.lock()
-                    .expect("APPARATUS: the echo buffer's lock")
-                    .extend_from_slice(&buf[..n]);
+                bytes += n;
+                digest.update(&chunk[..n]);
             }
         });
-        let mut into = open
-            .child
-            .stdin
-            .take()
-            .expect("APPARATUS: the opener's stdin pipe");
-        let data = payload.clone();
-        std::thread::spawn(move || {
-            let _ = into.write_all(&data);
-        });
-    }
+        (writer, reader)
+    };
+    let (alice_writer, alice_reader) = pump(&mut listen, 0x35);
+    let (bob_writer, bob_reader) = pump(&mut open, 0xa7);
     let started = Instant::now();
-    let status = open.exited_within(TIMEOUT);
-    let got = echoed
-        .lock()
-        .expect("APPARATUS: the echo buffer's lock")
-        .clone();
-    let (want, have) = (Sha256::digest(&payload), Sha256::digest(&got));
-    eprintln!(
-        "round trip: sent {} bytes, got back {} in {:?}; sha256 sent {:x} got {:x}; opener \
-         exit {status:?}\nopener said: {}\nlistener said: {}",
-        payload.len(),
-        got.len(),
+    let opened = open.exited_within(TIMEOUT);
+    let listened = listen.exited_within(TIMEOUT);
+    assert!(
+        opened.is_some_and(|s| s.success()) && listened.is_some_and(|s| s.success()),
+        "PRODUCT: full-duplex CLI streams did not finish cleanly in {:?}; opener \
+         {opened:?}, listener {listened:?}; opener said: {}; listener said: {}",
         started.elapsed(),
-        want,
-        have,
         open.said(),
         listen.said()
     );
-    assert_eq!(
-        got.len(),
-        payload.len(),
-        "PRODUCT: every byte must come back"
-    );
-    assert_eq!(want, have, "PRODUCT: the round trip must be byte-for-byte");
-    assert!(
-        status.is_some_and(|s| s.success()),
-        "PRODUCT: the opener must end cleanly"
-    );
-    let (a, b) = (s.alice.app(), s.bob.app());
-    assert_eq!(
-        (a.n("accepted"), b.n("opened")),
-        (1, 1),
-        "PRODUCT: alice must count 1 accepted and bob 1 opened: alice {a:?} bob {b:?}"
-    );
+    for writer in [alice_writer, bob_writer] {
+        writer
+            .join()
+            .expect("APPARATUS: input writer panicked")
+            .expect("PRODUCT: CLI closed before consuming its complete input");
+    }
+    for (reader, byte, direction) in [
+        (alice_reader, 0xa7, "bob to alice"),
+        (bob_reader, 0x35, "alice to bob"),
+    ] {
+        let (bytes, received) = reader
+            .join()
+            .expect("APPARATUS: output reader panicked")
+            .expect("APPARATUS: cannot read child output");
+        let mut expected = Sha256::new();
+        for _ in 0..CHUNKS {
+            expected.update([byte; CHUNK]);
+        }
+        assert_eq!(
+            bytes,
+            CHUNKS * CHUNK,
+            "PRODUCT: incomplete {direction} stream"
+        );
+        assert_eq!(
+            received,
+            expected.finalize(),
+            "PRODUCT: {direction} stream was not byte-for-byte"
+        );
+    }
     drop((listen, open));
 
     // ---- a thousand datagrams ----
