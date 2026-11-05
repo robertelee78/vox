@@ -185,6 +185,8 @@ async fn pipe(stream: tokio::net::UnixStream, datagrams: bool) -> Result<(), App
     }
     let mut buf = vec![0u8; 64 * 1024];
     let (mut net_done, mut stdin_done, mut cut) = (false, false, false);
+    let mut pending: Option<Vec<u8>> = None;
+    let mut written = 0;
     let mut probe = tokio::time::interval(std::time::Duration::from_millis(100));
     while !(net_done && stdin_done) {
         tokio::select! {
@@ -200,18 +202,43 @@ async fn pipe(stream: tokio::net::UnixStream, datagrams: bool) -> Result<(), App
                     out.flush()?;
                 }
             }
-            chunk = rx.recv(), if !stdin_done => match chunk {
+            // Never await a blocked write inside this arm: the opposite direction must
+            // keep draining when both ends have more than a socket buffer to send.
+            chunk = rx.recv(), if !stdin_done && pending.is_none() => match chunk {
                 Some(c) => {
-                    if w.write_all(&c).await.is_err() {
-                        cut = true;
-                        break;
-                    }
+                    pending = Some(c);
+                    written = 0;
                 }
                 None => {
                     stdin_done = true;
                     let _ = w.shutdown().await;
                 }
             },
+            ready = w.writable(), if pending.is_some() => {
+                if ready.is_err() {
+                    cut = true;
+                    break;
+                }
+                let chunk = pending.as_ref().expect("the pending-write arm is enabled");
+                match w.try_write(&chunk[written..]) {
+                    Ok(0) => {
+                        cut = true;
+                        break;
+                    }
+                    Ok(n) => {
+                        written += n;
+                        if written == chunk.len() {
+                            pending = None;
+                        }
+                    }
+                    Err(error) if matches!(error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) => {}
+                    Err(_) => {
+                        cut = true;
+                        break;
+                    }
+                }
+            }
             _ = probe.tick(), if net_done => {
                 if w.try_write(&[]).is_err() {
                     cut = true;
