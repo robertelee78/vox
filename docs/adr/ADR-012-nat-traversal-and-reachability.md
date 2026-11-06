@@ -223,6 +223,27 @@ relay circuit.
     (ADR-004/ADR-005).
   - Swarm presence is not consent-gated. A party removed from a member's keyring stays present at the
     ciphertext level; there is no per-member rendezvous revocation (ADR-007).
+  - **N-27a. Proposed v0.4.20, not accepted or built — room-member removal.** Boards MUST
+    retain and honor validated ADR-007 G-28–G-30 room-bound removal and readmission evidence,
+    including its causal dependencies and remove-wins ordering, when admitting or serving the
+    affected member's records. A bare Member withdrawal is not governance-log authority; a stale
+    bundle, pre-join record, passphrase or vouch MUST NOT undo valid removal. Missing evidence
+    MUST remain pending/fail closed, not become an invented readmission. Signed negative evidence
+    MUST survive local cache retraction and board recovery; unrelated members and rooms MUST NOT
+    be suppressed by a per-member removal.
+  - **N-27b. Proposed v0.4.20, not accepted or built — terminal inverse.** A local failed join,
+    rollback or rejected live projection MUST NOT manufacture a terminal whole-room tombstone.
+    A genuine authorized signed room end/Room withdrawal remains terminal, including across
+    retry and recovery; local retraction MUST NOT erase that evidence or signed member negatives.
+    ADR-023/037/038 own the lifecycle and cleanup mechanism.
+  - **N-27c. Proposed v0.4.20 consumer acceptance.** In existing isolated real-product journeys,
+    prove an independent board/peer applies room-member removal and creator readmission, rejects
+    stale member records and preserves other members; an offline peer catches up without losing
+    signed negatives. A failed join followed by an authorized retry must exchange distinct new
+    posts while a genuinely signed room end remains terminal. The apparatus is controlled board
+    availability and record ordering; the PRODUCT verdict is actual peer access and messages.
+    A mutant that treats local rollback as terminal or lets a stale record defeat valid removal
+    MUST fail the corresponding consumer proof. No proof is claimed here.
 - **N-28. Refresh floor.** A record whose claim matches the one held, inside `MIN_REFRESH_SECS`
   (60 s), MUST be answered as a no-op success and leave the held record untouched. A record whose claim
   changed MUST be accepted as soon as it strictly advances `(seq, timestamp)`. A non-advancing record

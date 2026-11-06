@@ -225,6 +225,10 @@ below remain unchanged.
   delete the room from the node — every stored row and its key, the store rewritten so none of the
   deleted bytes stay — once a sync session has carried the statement to another member (V210-164).
   A room held alone MUST go at once.
+  **2026-11-06 product amendment, selected for v0.4.20; not built:** the operator explicitly
+  chose to retain the minimal non-secret continuity marker specified by RL-8.4 below. That is
+  the sole exception to “every stored row”; room content and keys are still erased. The
+  marker's technical design requires independent Opus review before implementation.
 - **RL-8.1a.** If no member can be told within 30 s the leave MUST say so (`LeaveNotHeard`), and the
   node MUST keep the room and go on leaving, across a restart, until one is told. Anything the node
   writes in the room meanwhile undoes the leave (`LeaveUndone`).
@@ -243,6 +247,67 @@ below remain unchanged.
   ruling) are reserved and MUST be refused.
 - **RL-8.3.** There MUST NOT be a `vox room forget`: leaving and ending are the only ways a room
   leaves a node.
+
+### v0.4.20 corrective design — proposed, not implemented
+
+- **RL-8.4. Durable author continuity.** Before any own signed room entry can become externally
+  visible, the append transaction MUST durably retain a room/author-bound continuity marker:
+  the last committed signed head, sufficient cryptographic append/recovery frontier and highest
+  authored sender generation. Include implicit Presence, support/key, consent, Session and leave
+  entries, not only user messages. Do not retain message bodies, room names, passphrases,
+  sender/Drive secrets or a second room log in the marker. Store it privately in the existing
+  node store, atomically with author state; Leave's purge/rewrite MUST preserve only this
+  exception. Failure to persist continuity MUST prevent publication and successful Leave.
+  A count alone or a peer's unverified statement is not a continuity marker.
+- **RL-8.5. Return before settlement.** A rejoin with prior local continuity MUST install its
+  recovery fence before initializing a replacement empty head or signing any new entry. Keep
+  the room published for discovery and permitted reads while authenticated own-history recovery
+  verifies/reconstructs the retained prefix and frontier, reconciles higher authenticated heads,
+  and obtains applicable current key material. Only afterward may the existing sender-generation
+  rotation and return Presence run. Missing, stale or withholding peers mean recovery pending,
+  never an empty-feed proof. A fresh author without prior continuity retains ordinary local
+  settlement. This explicitly qualifies ADR-037 R5 for a returning author; it does not add an
+  all-peer acknowledgment gate to new joins. Already-conflicting history and genuinely restored
+  older backups remain fail-closed; do not delete peer evidence, bump a counter, reset identity
+  automatically or promise a signed fork can be undone.
+- **RL-8.6. Reversible local cleanup.** Failed join, interrupted unpublished construction and
+  policy-rejected reopening MUST remove only their owned transient local projection and
+  advertisements, without authoring or recording an authoritative whole-room end. Preserve real
+  member-withdrawal and signed room-end evidence. A node that is not a member MUST still refuse
+  unauthorized genesis/records. Classify Abort, AbortCompleted, RejectCreated, PurgeUnpublished,
+  PublicationReject and rejected-existing-open separately; a creator-signed rejection end remains
+  terminal. Do not globally weaken the terminal board operation. On retry, publication must
+  advance beyond any retained own member-withdrawal timestamp, including after restart.
+  A bare local withdrawn-room marker without authenticated end evidence MUST NOT become
+  authoritative end evidence; remove that erroneous local fence only when current validated
+  room admission/policy permits reconstruction. Never clear a valid signed end or another
+  member's history. An unavailable policy or evidence is pending/refused, not permission.
+- **RL-8.7. Admission name transaction.** Bind the current room name to the authenticated
+  admission proposal after passphrase proofs, and check/reserve it locally before sending
+  AdmissionPrepared or permitting remote admission. Reservation ownership MUST include pending
+  create, join and rename operations, survive the relevant retained journal, and release exactly
+  on commit/abort. No room name is disclosed before authentication. A preflight collision fails
+  without admitting the joiner, preserves the original same-name room, and uses RL-8.6 cleanup.
+  If the authoritative name changes after successful preflight/admission, complete the admitted
+  join and show colliding rooms by their full IDs, as for a rename clash; explain that outcome.
+  This is a proposed explicit exception to ADR-028 R-3's same-name join refusal, not a new
+  responder power to erase a joiner's signed history. Do not claim full rollback or “nothing
+  made” after irreversible remote admission. Other failures after admission MUST preserve a
+  durable, recoverable local admitted obligation and report actual partial outcome; retry the
+  same owned admission rather than creating a second author/admission or falsely reporting
+  success. Obsolete wire formats receive a truthful update refusal; acceptance uses matching
+  versions on both machines and release notes explain that requirement.
+- **RL-8.8. Consumer proof.** Extend existing actual-binary leave/join journeys: a donor first
+  reads ten distinct returner posts; normal leave, restart and rejoin preserve the history and
+  allow distinct new traffic both ways without replacement-prefix corruption. A returning
+  author awaiting recovery still reads permitted fresh traffic and reports pending, not healthy.
+  Exercise missing-peer and genuine conflicting/older-history inverses without destructive
+  cleanup. Wrong-passphrase then correct retry, duplicate-name failure then corrected retry,
+  rejected-existing-open recovery, concurrent name reservations and post-admission rename must
+  preserve original rooms and finish bidirectional post/read on the same daemon. A true signed
+  end stays terminal. Each committed proof needs a scoped mutant PRODUCT red on its consumer
+  assertion; trace counts, source assertions and apparatus failure do not count as that verdict.
+
 
 ## Proofs
 

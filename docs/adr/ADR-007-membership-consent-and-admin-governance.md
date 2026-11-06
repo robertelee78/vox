@@ -7,6 +7,9 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 - Admission once every online member agrees (G-22) is not built: V030-30 (#366). The cap itself is built.
 - G-10's golden-vector suite does not exist on this tree, and the known gaps listed at the end are open.
 
+**Proposed for v0.4.20, not accepted or built:** G-6, G-17 and G-21 are amended only as
+specified in G-28–G-32 below. Existing accepted requirements remain in force pending decision.
+
 **Date:** 2026-06-19
 **Deciders:** Robert E. Lee <robert@agidreams.us>
 
@@ -53,7 +56,9 @@ only room governance is who sets the room's retention. This builds on identity (
   ending the room (G-5), and only the creator or an admin it delegated MAY do either. The capabilities are `admin` and `policy`; every
   other capability token (`delegate`, `invite`, `passphrase-rotate`, `#role`, `bind:`, `dial:`) MUST be
   refused as unknown. Policy updates beyond retention, passphrase rotation, invite modes and the
-  capability lattice are removed, as are `bind:` and `dial:` (PRD-001 R44).
+  capability lattice are removed, as are `bind:` and `dial:` (PRD-001 R44). **Proposed v0.4.20
+  amendment:** additionally permit the room-member removal and readmission acts in G-28–G-32;
+  do not introduce a new capability vocabulary.
 - **G-7.** A member that is not an admin MAY set a lower retention for its own node only, for one room;
   it MUST NOT set a retention higher than the room's. A node's retention value above the room's MUST be
   ignored (the effective retention is the shorter of the two, ADR-010 AR-30), with a warning (#380).
@@ -119,7 +124,8 @@ only room governance is who sets the room's retention. This builds on identity (
   as a log author, which lets its entries pass the ADR-008 predicate and nothing more; its content stays
   ciphertext until its sender key arrives. Keys come from the verified genesis, admin certificates or the
   board's records (ADR-016), never from a server-supplied list. There is no admin-issued membership
-  certificate and no roster.
+  certificate and no roster. **Proposed v0.4.20 amendment:** author admission alone does not override
+  a room-member removal; G-28–G-32 add authoritative room-bound negative and readmission facts.
 - **G-18.** A member reaches a room-bound service when it is in the host's keyring and in the room the
   service is bound to, both checked at dial time (ADR-017 decision 3). A member the host has not trusted
   MUST reach nothing; a trusted identity that later joins gains reach on joining. The trust surface MUST
@@ -140,7 +146,9 @@ only room governance is who sets the room's retention. This builds on identity (
 - **G-20.** `epoch` MUST be a single room-global counter; per-author rotation is always `chain_id`.
 - **G-21.** There MUST be no per-room visibility opt-out and no admin removal of a member: a node stops
   reading a member, and stops being read by it, by removing it from its keyring (G-19). Passphrase
-  rotation is removed (G-6).
+  rotation is removed (G-6). **Proposed v0.4.20 amendment:** replace the prohibition on admin
+  member removal with G-28–G-32. Room removal is distinct from both a per-node visibility opt-out
+  and global keyring removal; passphrase rotation remains removed.
 
 ### Member cap
 
@@ -187,6 +195,60 @@ only room governance is who sets the room's retention. This builds on identity (
 - **G-27.** Only forward guarantees are cryptographic: rotating to keys a party never receives is
   enforced; keys a party already holds MUST NOT be described as recalled. A removed node keeps what it
   already read. Retention and erasure are honoured by clients (ADR-010).
+
+### Proposed v0.4.20 — room-scoped member removal (not accepted or built)
+
+- **G-28. Authority and scope.** The creator or a currently authorized delegated admin MAY remove
+  one particular non-creator node member from one room; an ordinary member MUST NOT do so. The
+  creator's root identity MUST NOT be removable. This is neither `room admin remove` (which revokes
+  a delegation) nor `trust remove`: it MUST NOT mutate any global trust, computer approval or
+  membership, keys or access in another room. A replacement fingerprint is a different node and
+  inherits no authority from the removed identity. An admin whose own membership is removed MUST
+  NOT exercise its delegation while removed; removal alone MUST NOT silently revoke that delegation.
+- **G-29. Signed authority and ordering.** A removal MUST be an authenticated governance-log
+  fact, using G-9's canonical encoding, composite signature, channel/epoch and author/causal
+  bindings, with a distinct versioned type/domain and the exact target composite fingerprint.
+  Validate the issuer's authority in its causal past and retain the necessary signed ancestry and
+  delegation evidence. A board Member withdrawal alone is discovery evidence, not this fact or
+  authority to alter the log. Replays MUST be idempotent; wrong-room, invalid, unauthorized or
+  missing-ancestry facts MUST NOT grant access or effect removal. A missing dependency remains
+  pending, not an invented verdict.
+- **G-30. Readmission and conflicts.** Only the creator MAY explicitly readmit the exact removed
+  fingerprint, by a distinct signed room-bound governance fact referencing all removal facts it
+  supersedes. It MUST causally descend from every removal it supersedes; an ordinary passphrase
+  join, board record, prior admission, retained trust or replacement identity MUST NOT undo removal.
+  Evaluate the complete validated causal set: any valid removal not causally superseded by a valid
+  creator readmission keeps the target removed, including a concurrent removal and readmission.
+  A later removal wins again. Replays and delivery order MUST converge on the same result; use
+  G-26's canonical order for otherwise concurrent presentation, not to turn concurrent readmission
+  into authority. Readmission is subject to ordinary admission/cap and trust checks and grants no
+  sender, Drive or service authority by itself.
+- **G-31. Forward enforcement.** Before irreversible room egress, each member MUST check current
+  validated room authorization and fence stale in-flight work against the current room authorization
+  generation; known removal or unresolved required governance dependencies MUST win over queued
+  sends, key delivery, Session read/Drive and service access. Once applied, exclude the target
+  from active membership, claims, reach and new access; rotate future sender keys and applicable
+  room-bound Drive and service keys/credentials and distribute them only to still-authorized,
+  independently trusted nodes. Close or reauthorize existing affected sessions. Catching up peers
+  MUST apply the barrier before resuming egress, including after restart. A partitioned peer cannot
+  know an unseen removal: do not claim instantaneous global revocation; show local applied versus
+  pending/unknown propagation honestly. Retain old signed messages, signatures, fork evidence and
+  claim history. Previously disclosed plaintext and keys cannot be recalled or made retroactively
+  secret (G-27).
+- **G-32. Consumer acceptance.** Extend existing real product journeys with isolated nodes and
+  native UI/CLI: identify the target by verified exact fingerprint, show before and after effects
+  and room scope, and remove it as creator and delegated admin; non-admin and creator-target
+  attempts fail. An independent online peer and an offline peer catching up must apply the signed
+  removal, retain readable signed history, and exchange distinct new posts without the removed
+  node reading them or using future room-bound Session read/Drive or services. The retained
+  passphrase, old records and concurrent/replayed readmission cannot bypass removal; an explicit
+  creator readmission followed by ordinary authorization restores only appropriate access.
+  Demonstrate unrelated rooms and global trust remain unchanged, including a same-name replacement
+  fingerprint. Exercise stale queued egress and removal/readmission permutations through actual
+  consumers. The apparatus is isolated profiles, controlled partition and timing; the PRODUCT
+  verdict is observed membership and access, not a log assertion or successful command alone.
+  A separately exercised mutant that omits the egress barrier or lets passphrase rejoin override
+  removal MUST make the corresponding consumer proof fail. These are future proofs, not results.
 
 ### Known gaps
 

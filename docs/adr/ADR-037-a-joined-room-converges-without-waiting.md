@@ -167,6 +167,17 @@ The daemon MUST say so once as a NodeNote.
 The drive generation is still never chosen off an unknown own feed: it MUST be chosen off the
 local own feed, which is authoritative.
 
+**Proposed v0.4.20 correction; not built:** ADR-023 RL-8.4–RL-8.5 explicitly qualifies R5 for
+an author with retained prior-room continuity. Leave retains only the operator-approved
+non-secret continuity marker, not room content or keys. Rejoin installs its recovery fence
+before any fresh signed head, Presence, PrivateSupport, key, Session or text append. It MUST
+verify/reconstruct the retained prefix/frontier and reconcile higher authenticated heads
+before sender-generation advancement and return Presence. The returning author's permitted
+reads and discovery remain live while it reports recovery pending. Fresh authors still settle
+locally without peer acknowledgments. This is not a global convergence gate or a scalar
+counter workaround; genuine conflicting history and older-backup refusal remain intact.
+
+
 ### R6. Proofs
 
 Every claim above MUST have a proof that drives the shipped `vox` binary as a person would
