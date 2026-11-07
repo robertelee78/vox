@@ -362,10 +362,14 @@ pub fn suggested_name(dir: &Path) -> String {
 
 /// A decision retained only in daemon memory. Credentials are never exposed by this type.
 pub struct Snapshot {
+    /// Canonical directory that a replacement would affect.
     pub target: PathBuf,
+    /// Effective source block, when the map resolves one.
     pub source: Option<PathBuf>,
+    /// Effective room id or `none`, without a link or credential.
     pub room: Option<String>,
     start: PathBuf,
+    explicit: bool,
     canonical_start: PathBuf,
     effective: Option<Identity>,
     override_at_target: Option<Identity>,
@@ -405,7 +409,7 @@ fn validate_unique(entries: &[Entry]) -> Result<(), AppError> {
     Ok(())
 }
 
-fn decision(entries: &[Entry], start: &Path) -> Result<Snapshot, AppError> {
+fn decision(entries: &[Entry], start: &Path, explicit: bool) -> Result<Snapshot, AppError> {
     validate_unique(entries)?;
     let original_start = start.to_path_buf();
     let start = std::fs::canonicalize(start).map_err(|_| AppError::Usage(
@@ -414,44 +418,54 @@ fn decision(entries: &[Entry], start: &Path) -> Result<Snapshot, AppError> {
     if !start.is_dir() {
         return Err(AppError::Usage("the repository boundary is not a directory".into()));
     }
-    let top = start.ancestors().find(|d| d.join(".git").exists()).ok_or_else(|| AppError::Usage(
-        "cannot establish a repository boundary; choose a valid git repository".into()
-    ))?;
+    let mut top = None;
+    for dir in start.ancestors() {
+        match std::fs::symlink_metadata(dir.join(".git")) {
+            Ok(_) => { top = Some(dir); break; }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(AppError::Usage(format!("cannot inspect repository metadata: {e}"))),
+        }
+    }
     let effective = resolve(entries, &start).map(identity);
-    let git = top.join(".git");
-    let target = if git.is_dir() {
-        top.to_path_buf()
-    } else if git.is_file() {
-        if let Some((worktree, main)) = worktree_of(&start) {
-            if !main.join(".git").is_dir() {
-                return Err(AppError::Usage("the linked worktree's main repository is invalid".into()));
-            }
-            if effective.as_ref().is_some_and(|e| e.repo.starts_with(&worktree)) {
-                worktree
+    let boundary = if let Some(top) = top {
+        let git = top.join(".git");
+        if git.is_dir() {
+            top.to_path_buf()
+        } else if git.is_file() {
+            if let Some((worktree, main)) = worktree_of(&start) {
+                if !main.join(".git").is_dir() {
+                    return Err(AppError::Usage("the linked worktree's main repository is invalid".into()));
+                }
+                if effective.as_ref().is_some_and(|e| e.repo.starts_with(&worktree)) {
+                    worktree
+                } else {
+                    main
+                }
             } else {
-                main
+                let text = std::fs::read_to_string(&git).map_err(|_| AppError::Usage(
+                    "cannot read repository metadata".into()
+                ))?;
+                let name = text.trim().strip_prefix("gitdir:").map(str::trim)
+                    .filter(|s| !s.is_empty()).ok_or_else(|| AppError::Usage(
+                        "the repository metadata is invalid".into()
+                    ))?;
+                let dir = Path::new(name);
+                let dir = if dir.is_absolute() { dir.to_path_buf() } else { top.join(dir) };
+                if !dir.is_dir() || dir.join("commondir").exists() {
+                    return Err(AppError::Usage("cannot establish an unambiguous repository boundary".into()));
+                }
+                top.to_path_buf()
             }
         } else {
-            let text = std::fs::read_to_string(&git).map_err(|_| AppError::Usage(
-                "cannot read repository metadata".into()
-            ))?;
-            let name = text.trim().strip_prefix("gitdir:").map(str::trim)
-                .filter(|s| !s.is_empty()).ok_or_else(|| AppError::Usage(
-                    "the repository metadata is invalid".into()
-                ))?;
-            let dir = Path::new(name);
-            let dir = if dir.is_absolute() { dir.to_path_buf() } else { top.join(dir) };
-            if !dir.is_dir() || dir.join("commondir").exists() {
-                return Err(AppError::Usage("cannot establish an unambiguous repository boundary".into()));
-            }
-            top.to_path_buf()
+            return Err(AppError::Usage("the repository metadata is invalid".into()));
         }
     } else {
-        return Err(AppError::Usage("the repository metadata is invalid".into()));
+        start.clone()
     };
+    let target = if explicit { start.clone() } else { boundary };
     // A nested block within the repository controls only part of it, not the whole boundary.
     if let Some(e) = &effective {
-        if e.repo.starts_with(&target) && e.repo != target {
+        if !explicit && e.repo.starts_with(&target) && e.repo != target {
             return Err(AppError::Usage("a more-specific room override makes this repository scope ambiguous".into()));
         }
     }
@@ -469,6 +483,7 @@ fn decision(entries: &[Entry], start: &Path) -> Result<Snapshot, AppError> {
         }),
         target,
         start: original_start,
+        explicit,
         canonical_start: start,
         effective,
         override_at_target,
@@ -478,7 +493,13 @@ fn decision(entries: &[Entry], start: &Path) -> Result<Snapshot, AppError> {
 /// Capture the effective decision and its private full identity for a later compare-and-swap.
 pub fn snapshot(data_root: &Path, repo: &Path) -> Result<Snapshot, AppError> {
     let entries = read(data_root)?;
-    decision(&entries, repo)
+    decision(&entries, repo, false)
+}
+
+/// Capture a decision for exactly the selected directory, including inherited bindings.
+pub fn snapshot_explicit(data_root: &Path, directory: &Path) -> Result<Snapshot, AppError> {
+    let entries = read(data_root)?;
+    decision(&entries, directory, true)
 }
 
 struct MapLock { _file: std::fs::File }
@@ -563,7 +584,7 @@ fn stamp(data_root: &Path) -> Result<Option<(u64, u64, u64, i64, i64, i64, i64)>
     }
 }
 
-fn commit(data_root: &Path, original: &str, initial: Option<(u64, u64, u64, i64, i64, i64, i64)>, replacement: &str) -> Result<(), AppError> {
+fn commit(data_root: &Path, original: &str, initial: Option<(u64, u64, u64, i64, i64, i64, i64)>, replacement: &str) -> Result<Option<String>, AppError> {
     use std::io::Write;
     let file = path(data_root);
     let mut temp = tempfile::NamedTempFile::new_in(data_root)
@@ -580,9 +601,9 @@ fn commit(data_root: &Path, original: &str, initial: Option<(u64, u64, u64, i64,
             Ok(_) => "the map has since changed",
             Err(_) => "the map could not be reread",
         };
-        return Err(AppError::Usage(format!("room map replacement durability is uncertain ({state}): {e}")));
+        return Ok(Some(format!("room map replacement durability is uncertain ({state}): {e}")));
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Add a new block only where no effective binding would be shadowed.
@@ -597,7 +618,10 @@ pub fn add(data_root: &Path, repo: &Path, link: &str, passphrase: &str) -> Resul
     }
     let target = canonical_or_original(repo);
     let next = rewritten(&text, &target, link, passphrase)?;
-    commit(data_root, &text, initial, &next)
+    if let Some(warning) = commit(data_root, &text, initial, &next)? {
+        return Err(AppError::Usage(warning));
+    }
+    Ok(())
 }
 
 /// Record an agent's no only when no effective binding can be shadowed.
@@ -612,24 +636,34 @@ pub fn decline(data_root: &Path, repo: &Path) -> Result<bool, AppError> {
     }
     let target = canonical_or_original(repo);
     let next = rewritten(&text, &target, DECLINED, "")?;
-    commit(data_root, &text, initial, &next)?;
+    if let Some(warning) = commit(data_root, &text, initial, &next)? {
+        return Err(AppError::Usage(warning));
+    }
     Ok(true)
 }
 
 
+/// A completed rename, with any uncertainty about persistence across a crash.
+pub struct ReplaceOutcome {
+    /// Non-secret description of the exact target block that was replaced.
+    pub previous: Option<String>,
+    /// The rename succeeded but its durability could not be confirmed.
+    pub durability_warning: Option<String>,
+}
+
 /// Replace the displayed target only if its scope and complete binding are unchanged.
-pub fn replace(data_root: &Path, snapshot: &Snapshot, link: &str, passphrase: &str) -> Result<Option<String>, AppError> {
+pub fn replace(data_root: &Path, snapshot: &Snapshot, link: &str, passphrase: &str) -> Result<ReplaceOutcome, AppError> {
     let _lock = MapLock::acquire(data_root)?;
     let initial = stamp(data_root)?;
     let text = read_text(data_root)?;
     let entries = parse_map(data_root, &text)?;
-    let current = decision(&entries, &snapshot.start).map_err(|_| conflict())?;
+    let current = decision(&entries, &snapshot.start, snapshot.explicit).map_err(|_| conflict())?;
     if current.target != snapshot.target || current.canonical_start != snapshot.canonical_start || current.effective != snapshot.effective
         || current.override_at_target != snapshot.override_at_target {
         return Err(conflict());
     }
     let before = lookup(&entries, &snapshot.target).map(description);
     let next = rewritten(&text, &snapshot.target, link, passphrase)?;
-    commit(data_root, &text, initial, &next)?;
-    Ok(before)
+    let durability_warning = commit(data_root, &text, initial, &next)?;
+    Ok(ReplaceOutcome { previous: before, durability_warning })
 }

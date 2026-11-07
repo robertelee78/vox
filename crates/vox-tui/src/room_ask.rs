@@ -110,11 +110,15 @@ pub fn answers(ask: &RoomAsk, data_root: &std::path::Path) -> Vec<(&'static str,
     };
     let node = first.node.as_str();
     if !ask.room.is_empty() {
-        return vec![(
-            "to join it",
-            format!("run vox room join with the room's link and --node {node}"),
-            false,
-        )];
+        if let Some(link) = crate::room_map::read(data_root).ok().and_then(|entries| {
+            crate::room_map::resolve(&entries, std::path::Path::new(&ask.dir))
+                .filter(|entry| vox_core::node::link::InviteLink::parse(&entry.room)
+                    .is_ok_and(|link| vox_core::node::link::b32_encode(&link.channel_id) == ask.room))
+                .map(|entry| entry.room.clone())
+        }) {
+            return vec![("to join it", vox_text::shell::node_command(&["vox", "room", "join", &link], node), true)];
+        }
+        return vec![("to join it", format!("run vox room join with the room's link and --node {node}"), false)];
     }
     vec![
         (

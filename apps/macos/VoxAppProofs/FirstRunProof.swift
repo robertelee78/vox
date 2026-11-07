@@ -3530,7 +3530,26 @@ final class FirstRunProof: XCTestCase {
         _ = try repoTurn("57000000-4c0e-4f00-9a1b-0c0ffee54007", noRepo, "decline main")
         _ = try repoTurn("58000000-4c0e-4f00-9a1b-0c0ffee54008", noTree, "decline worktree")
         oneDialog(noRepo)
+        // A failed join must not prevent the person from declining instead.
+        let beforeDeclineFailure = try readMap()
+        tap(ui, Key.id("room-ask-choose"), "Choose a Room before declining")
+        guard ui.radioButtons["other"].waitForExistence(timeout: 10) else {
+            XCTFail("PRODUCT: the held room must be available to choose before declining")
+            return
+        }
+        ui.radioButtons["other"].click()
+        type(ui, Key.id("room-ask-passphrase"), "wrong room passphrase", "the room's passphrase field")
+        tap(ui, Key.id("room-ask-bind"), "Refuse the wrong room passphrase")
+        words(ui, Key.id("room-ask-failed"), timeout: 60, "the failed join must be visible before declining",
+              until: { $0.contains("passphrase") && $0.contains("not bound") })
+        XCTAssertEqual(try readMap(), beforeDeclineFailure,
+                       "PRODUCT: the failed join must not change the repository decision")
+        tap(ui, Key.id("room-ask-back"), "Back from the failed join")
         tap(ui, Key.id("room-ask-decline"), "Not This Repo")
+        tap(ui, Key.showing("Confirm Not This Repo"), "Confirm the repository decision")
+        words(ui, Key.id("repo-decision-result"), timeout: 30, "the saved decision must be visibly confirmed",
+              until: { $0.contains(noRepo) })
+        tap(ui, Key.id("repo-decision-done"), "Acknowledge the saved decision")
         leftDialog()
         let declined = try repoTurn("59000000-4c0e-4f00-9a1b-0c0ffee54009", noTree, "later session")
         XCTAssertFalse(declined.contains("isn't tied to a Vox room"), "PRODUCT: a declined repository asked a later worktree session again: \(declined)")
@@ -3538,6 +3557,182 @@ final class FirstRunProof: XCTestCase {
         XCTAssertTrue(noMap.contains("repo " + noRepo + "\n    room       none"),
                       "PRODUCT: Not This Repo must save the canonical repository's no: \(noMap)")
         leftDialog()
+
+        // Join It really fails with the saved wrong passphrase, then the person declines.
+        // The inherited case retains its parent, whose room a sibling's node already holds.
+        var declinedPaths: [(String, String)] = []
+        for inherited in [false, true] {
+            let name = inherited ? "inherited-failed-join" : "exact-failed-join"
+            try staged(vox, ["room", "create", "--node", "alice", "--passphrase-file", pass("room"),
+                             "--name", name], env: voxEnv)
+            let failedRoom = try line(staged(vox, ["room", "list", "--node", "alice"], env: voxEnv)) {
+                $0.contains(" " + name)
+            }.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
+            let failedLink = try line(staged(vox, ["room", "link", "--node", "alice", failedRoom], env: voxEnv)) {
+                $0.hasPrefix("vox://")
+            }
+            let (failedRepo, failedTree) = try repository(inherited ? "bound-parent/child" : "bound-exact")
+            let source = inherited ? URL(fileURLWithPath: failedRepo).deletingLastPathComponent().path : failedRepo
+            let sourceBlock = "repo " + source + "\n    room       " + failedLink + "\n    passphrase wrong room passphrase\n"
+            if inherited {
+                try stager.write(Data("agent b identity\n".utf8), to: pass("claude-b"))
+                try staged(vox, ["node", "create", "claude-b", "--passphrase-file", pass("claude-b")], env: voxEnv)
+                try staged(vox, ["node", "attach", "claude-b", "--passphrase-file", pass("claude-b")], env: voxEnv)
+                try staged(vox, ["room", "join", "--node", "claude-a", "--passphrase-file", pass("room"), failedLink], env: voxEnv)
+                try stager.write(Data("keep\n".utf8), to: source + "/sibling/.keep")
+            }
+            try stager.write(Data((try readMap() + "\n" + sourceBlock).utf8), to: map)
+            if inherited {
+                let overridePath = source + "/override"
+                try stager.write(Data("keep\n".utf8), to: overridePath + "/.keep")
+                let workLink = try line(staged(vox, ["room", "link", "--node", "alice", room], env: voxEnv)) {
+                    $0.hasPrefix("vox://")
+                }
+                let overrideBlock = "\nrepo " + overridePath + "\n    room       " + workLink + "\n    passphrase work room\n"
+                try stager.write(Data((try readMap() + overrideBlock).utf8), to: map)
+            }
+            if inherited {
+                try follows("5b000000-4c0e-4f00-9a1b-0c0ffee54011", source + "/sibling", failedRoom)
+            }
+            let failedSession = inherited ? "5c000000-4c0e-4f00-9a1b-0c0ffee54012" : "5d000000-4c0e-4f00-9a1b-0c0ffee54013"
+            if inherited {
+                try stager.write(Data(), to: work + "/\(failedSession).jsonl")
+                let bEnv = hookEnv.merging(["VOX_NODE": "claude-b", "VOX_IDENTITY_PASSPHRASE": "agent b identity"]) { $1 }
+                let turn = stager.run(["/bin/sh", "-c", "cd \"$1\" && exec \"$2\" agent hook --node claude-b",
+                                       "hook", failedRepo, vox], env: bEnv,
+                                      input: event(failedSession, "UserPromptSubmit", ["prompt": "join the bound room", "cwd": failedRepo]))
+                guard turn.status == 0 else { throw Apparatus("claude-b's real room hook failed: \(turn.out)") }
+            } else {
+                _ = try repoTurn(failedSession, failedRepo, "join the bound room")
+            }
+            guard present(ui, Key.id("room-ask-join"), timeout: 540,
+                          "a bound room the agent could not join must offer Join It") else { return }
+            let beforeJoin = try readMap()
+            tap(ui, Key.id("room-ask-join"), "Join It with the saved wrong passphrase")
+            present(ui, Key.id("room-ask-failed"), timeout: 540, "the real failed Join It must be visible")
+            XCTAssertEqual(try readMap(), beforeJoin, "PRODUCT: a failed Join It must leave the map unchanged")
+            let affectedNode = inherited ? "claude-b" : "claude-a"
+            let trustBefore = try staged(vox, ["trust", "list", "--node", affectedNode], env: voxEnv)
+            let roomsBefore = try staged(vox, ["room", "list", "--node", affectedNode], env: voxEnv)
+            tap(ui, Key.id("room-ask-decline"), "Decline the failed binding")
+            tap(ui, Key.showing("Confirm Not This Repo"), "Confirm the bound repository's scope")
+            words(ui, Key.id("repo-decision-result"), timeout: 30, "the declined binding must be visibly confirmed",
+                  until: { $0.contains(failedRepo) && $0.contains("none") })
+            tap(ui, Key.id("repo-decision-done"), "Acknowledge the saved no")
+            leftDialog()
+            XCTAssertEqual(try staged(vox, ["trust", "list", "--node", affectedNode], env: voxEnv), trustBefore,
+                           "PRODUCT: declining must not change the agent node's trust")
+            XCTAssertEqual(try staged(vox, ["room", "list", "--node", affectedNode], env: voxEnv), roomsBefore,
+                           "PRODUCT: declining must not change the agent node's room membership")
+            let afterDecline = try readMap()
+            XCTAssertTrue(afterDecline.contains("repo " + failedRepo + "\n    room       none"),
+                          "PRODUCT: declining a bound repository must save its own no")
+            if inherited {
+                XCTAssertTrue(afterDecline.contains(sourceBlock),
+                              "PRODUCT: declining an inherited binding must preserve the complete parent block")
+                try follows("5e000000-4c0e-4f00-9a1b-0c0ffee54014", source + "/sibling", failedRoom)
+                try follows("63000000-4c0e-4f00-9a1b-0c0ffee54019", source + "/override", room)
+            }
+            let later = try repoTurn(inherited ? "5f000000-4c0e-4f00-9a1b-0c0ffee54015" : "60000000-4c0e-4f00-9a1b-0c0ffee54016",
+                                     failedTree, "later worktree")
+            XCTAssertFalse(later.contains("isn't tied to a Vox room"),
+                           "PRODUCT: a worktree of the declined repository must not ask again: \(later)")
+            declinedPaths.append((failedRepo, failedTree))
+            leftDialog()
+        }
+
+        // A competing map edit after the scope is shown must not be overwritten by confirmation.
+        let (staleRepo, _) = try repository("stale-decision-repo")
+        _ = try repoTurn("5a000000-4c0e-4f00-9a1b-0c0ffee54010", staleRepo, "stale decision")
+        oneDialog(staleRepo)
+        tap(ui, Key.id("room-ask-decline"), "Review a decision that will become stale")
+        present(ui, Key.showing("Confirm Not This Repo"), timeout: 30,
+                "the inspected scope must be shown before confirmation")
+        let competingMap = try readMap() + "\nrepo " + staleRepo + "\n    room       none\n"
+        try stager.write(Data(competingMap.utf8), to: map)
+        tap(ui, Key.showing("Confirm Not This Repo"), "Confirm the stale decision")
+        present(ui, Key.showing("changed"), timeout: 30,
+                "a stale decision must visibly report the conflict")
+        XCTAssertEqual(try readMap(), competingMap,
+                       "PRODUCT: a stale confirmation must not overwrite the competing decision")
+        tap(ui, Key.showing("Inspect Again"), "Inspect the competing decision")
+        tap(ui, Key.showing("Confirm Not This Repo"), "Confirm the refreshed decision")
+        tap(ui, Key.id("repo-decision-done"), "Acknowledge the refreshed decision")
+        leftDialog()
+
+        // The selected room-ask run also crosses a normal owned-daemon restart before rebind.
+        // The full Sessions run keeps its already-open Sessions for the privacy journey below.
+        if !selectedStep.isEmpty {
+            ui.terminate()
+            daemon?.terminate()
+            daemon = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
+                               until: "vox daemon: control socket")
+            for node in ["alice", "claude-a"] {
+                try staged(vox, ["node", "attach", node, "--passphrase-file", pass(node)], env: voxEnv)
+            }
+            try launchVox(ui, appPath, env: ui.launchEnvironment, scratch: scratchPath)
+            present(ui, Key.id("attached"), timeout: 60, "the app must reconnect after restart")
+            let postRestart = try repoTurn("61000000-4c0e-4f00-9a1b-0c0ffee54017", noTree, "after restart")
+            XCTAssertFalse(postRestart.contains("isn't tied to a Vox room"),
+                           "PRODUCT: the declined worktree must not ask after restart: \(postRestart)")
+            for (repo, tree) in declinedPaths {
+                for directory in [repo, tree] {
+                    let turn = try repoTurn(UUID().uuidString.lowercased(), directory, "declined after restart")
+                    XCTAssertFalse(turn.contains("isn't tied to a Vox room"),
+                                   "PRODUCT: a declined bound repository and its worktree must not ask after restart: \(turn)")
+                }
+            }
+            leftDialog()
+        }
+
+        // Rebind without a pending ask, through the person's Settings and real directory panel.
+        try follows(s5, createRepo, createdRoom)
+        func sessionOpen(_ room: String, _ session: String) -> Bool {
+            let listed = run(vox, ["room", "sessions", "--node", "claude-a", "--json", room], env: voxEnv)
+            return listed.status == 0 && listed.out.split(separator: "\n").contains { line in
+                guard let value = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any] else { return false }
+                return value["id"] as? String == session && value["open"] as? Bool == true
+            }
+        }
+        XCTAssertTrue(sessionOpen(createdRoom, s5), "APPARATUS: the existing Session must be open before rebind")
+        let otherLink = try line(staged(vox, ["room", "link", "--node", "alice", rooms["other"] ?? ""], env: voxEnv)) {
+            $0.hasPrefix("vox://")
+        }
+        ui.typeKey(",", modifierFlags: .command)
+        tap(ui, Key.id("settings-rebind-repository"), "Settings > Rebind Repository")
+        ui.typeKey("g", modifierFlags: [.command, .shift])
+        let goDeadline = Date().addingTimeInterval(10)
+        while Date() < goDeadline && ui.sheets.count == 0 { Thread.sleep(forTimeInterval: 0.25) }
+        guard ui.sheets.count > 0 else {
+            throw Apparatus("the repository panel's Go To sheet did not open")
+        }
+        ui.typeText(noRepo + "\r")
+        let choose = ui.buttons["Open"].firstMatch
+        guard choose.waitForExistence(timeout: 10) else {
+            throw Apparatus("the repository panel did not offer Open")
+        }
+        choose.click()
+        present(ui, Key.id("repo-decision-dialog"), timeout: 30, "Settings must inspect the selected repository")
+        let noBeforeRebind = try readMap()
+        type(ui, Key.id("repo-decision-link"), otherLink, "the held room's link")
+        type(ui, Key.id("repo-decision-passphrase"), "wrong room passphrase", "the wrong room passphrase")
+        tap(ui, Key.id("repo-decision-submit"), "Refuse rebind with the wrong passphrase")
+        present(ui, Key.id("repo-decision-inspect-again"), timeout: 60, "a refused rebind must offer a fresh inspection")
+        XCTAssertEqual(try readMap(), noBeforeRebind,
+                       "PRODUCT: a wrong passphrase for a held room must leave the no unchanged")
+        tap(ui, Key.id("repo-decision-inspect-again"), "Inspect the no again")
+        present(ui, Key.id("repo-decision-passphrase"), timeout: 30, "the refreshed decision must allow rebind")
+        tap(ui, Key.id("repo-decision-passphrase"), "Replace the refused passphrase")
+        ui.typeKey("a", modifierFlags: .command)
+        el(ui, Key.id("repo-decision-passphrase")).typeText("work room")
+        tap(ui, Key.id("repo-decision-submit"), "Rebind with the correct room passphrase")
+        words(ui, Key.id("repo-decision-result"), timeout: 60, "the rebind must be visibly confirmed",
+              until: { $0.contains(noRepo) })
+        tap(ui, Key.id("repo-decision-done"), "Acknowledge the rebind")
+        ui.typeKey("w", modifierFlags: .command)
+        XCTAssertTrue(sessionOpen(createdRoom, s5) && !sessionOpen(rooms["other"] ?? "", s5),
+                      "PRODUCT: rebind must not move an already-running Session")
+        try follows("62000000-4c0e-4f00-9a1b-0c0ffee54018", noTree, rooms["other"] ?? "")
         print("[proof] RM-1/2/3/5: one repo/worktree dialog; wrong passphrase left map unchanged; Choose and Create moved both next turns; alice created with keyring closed; Not This Repo suppressed later worktree asks")
 
         if !selectedStep.isEmpty {

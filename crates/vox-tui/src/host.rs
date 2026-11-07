@@ -121,7 +121,7 @@ struct Inner {
     starting: Mutex<BTreeSet<NodeName>>,
     /// Each node's joins of its sessions' rooms under way (ADR-029 RB-3).
     joins: Mutex<BTreeMap<NodeName, Arc<vox_core::node::room_join::Joins>>>,
-    room_decisions: Mutex<BTreeMap<String, crate::room_map::Snapshot>>,
+    room_decisions: Mutex<BTreeMap<String, (std::time::Instant, bool, crate::room_map::Snapshot)>>,
     /// Where harness sessions' activity is numbered and posted, and approvals wait (ADR-029).
     sink: Arc<crate::session_sink::Sink>,
     /// Ordered admission and the bounded, explicitly volatile storage-failure tail.
@@ -2098,15 +2098,22 @@ impl Router {
         .await
         .unwrap_or_default()
     }
-    async fn room_decision(&self, dir: &str) -> DaemonFrame {
-        // Keep the registered start for inherited and linked-worktree resolution.
-        let start = self.room_asks().await.into_iter().find(|a| a.dir == dir)
-            .and_then(|a| a.sessions.into_iter().next())
-            .and_then(|s| self.inner.account.node_paths(&s.node).ok()
-                .and_then(|p| crate::wake::registration(&p, &s.session)))
-            .and_then(|r| r.start)
-            .unwrap_or_else(|| dir.to_owned());
-        let snapshot = match crate::room_map::snapshot(&self.inner.account.data_root, std::path::Path::new(&start)) {
+    async fn room_decision(&self, dir: &str, explicit: bool) -> DaemonFrame {
+        let snapshot = if explicit {
+            crate::room_map::snapshot_explicit(&self.inner.account.data_root, std::path::Path::new(dir))
+        } else {
+            let Some(ask) = self.room_asks().await.into_iter().find(|a| a.dir == dir) else {
+                return DaemonFrame::RoomAnswer { done: false, said: vec!["No session is waiting for this repository decision.".into()] };
+            };
+            let Some(start) = ask.sessions.into_iter().next()
+                .and_then(|s| self.inner.account.node_paths(&s.node).ok()
+                    .and_then(|p| crate::wake::registration(&p, &s.session)))
+                .and_then(|r| r.start) else {
+                return DaemonFrame::RoomAnswer { done: false, said: vec!["The waiting session no longer has a registered start directory.".into()] };
+            };
+            crate::room_map::snapshot(&self.inner.account.data_root, std::path::Path::new(&start))
+        };
+        let snapshot = match snapshot {
             Ok(snapshot) => snapshot,
             Err(e) => return DaemonFrame::RoomAnswer { done: false, said: vec![e.to_string()] },
         };
@@ -2118,14 +2125,32 @@ impl Router {
         let target = snapshot.target.display().to_string();
         let source = snapshot.source.as_ref().map_or_else(String::new, |s| s.display().to_string());
         let room = snapshot.room.clone().unwrap_or_default();
-        lock(&self.inner.room_decisions).insert(token.clone(), snapshot);
+        {
+            let mut decisions = lock(&self.inner.room_decisions);
+            decisions.retain(|_, (expires, _, _)| *expires > std::time::Instant::now());
+            if decisions.len() >= 256 {
+                return DaemonFrame::RoomAnswer { done: false, said: vec!["Too many room decisions are pending; cancel one or try again later.".into()] };
+            }
+            decisions.insert(token.clone(), (std::time::Instant::now() + Duration::from_secs(300), explicit, snapshot));
+        }
+        let inner = Arc::downgrade(&self.inner);
+        let expiry_token = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(300)).await;
+            if let Some(inner) = inner.upgrade() {
+                lock(&inner.room_decisions).remove(&expiry_token);
+            }
+        });
         DaemonFrame::RoomDecision { token, target, source, room }
     }
 
     async fn room_replace(&self, token: &str, link: &str, passphrase: Zeroizing<String>, node: &str) -> DaemonFrame {
-        let Some(snapshot) = lock(&self.inner.room_decisions).remove(token) else {
+        let Some((expires, _, snapshot)) = lock(&self.inner.room_decisions).remove(token) else {
             return DaemonFrame::RoomAnswer { done: false, said: vec!["This decision is stale; inspect the repository again.".into()] };
         };
+        if expires <= std::time::Instant::now() {
+            return DaemonFrame::RoomAnswer { done: false, said: vec!["This decision expired; inspect the repository again.".into()] };
+        }
         let mut said = Vec::new();
         if !link.is_empty() {
             let parsed = match vox_core::node::link::InviteLink::parse(link) {
@@ -2160,9 +2185,21 @@ impl Router {
         }
         let value = if link.is_empty() { crate::room_map::DECLINED } else { link };
         match crate::room_map::replace(&self.inner.account.data_root, &snapshot, value, &passphrase) {
-            Ok(_) => {
-                said.push(format!("Updated the decision for {}. Existing sessions do not move.", snapshot.target.display()));
-                DaemonFrame::RoomAnswer { done: true, said }
+            Ok(outcome) => {
+                if let Some(previous) = outcome.previous {
+                    said.push(format!("replacing what the room map held for it: {previous}"));
+                }
+                if let Some(warning) = outcome.durability_warning {
+                    said.push(format!("The decision for {} was written, but its durability could not be confirmed: {warning}. Inspect the room map before retrying. Existing sessions do not move.", snapshot.target.display()));
+                    DaemonFrame::RoomAnswer { done: false, said }
+                } else {
+                    if link.is_empty() {
+                        said.push(format!("{} is set to room none for future sessions. Existing sessions do not move; no room was left and trust was not changed.", snapshot.target.display()));
+                    } else {
+                        said.push(format!("bound {}. Existing sessions do not move; every node of this data root can read the map, including the passphrase.", snapshot.target.display()));
+                    }
+                    DaemonFrame::RoomAnswer { done: true, said }
+                }
             }
             Err(e) => {
                 said.push(format!("Could not update the repository decision: {e}"));
@@ -2201,7 +2238,7 @@ impl Router {
             None
         } else if let Some(token) = token {
             match lock(&self.inner.room_decisions).remove(token) {
-                Some(snapshot) if snapshot.target == std::path::Path::new(dir) => Some(snapshot),
+                Some((expires, false, snapshot)) if expires > std::time::Instant::now() && snapshot.target == std::path::Path::new(dir) => Some(snapshot),
                 _ => return no("This repository decision is stale; inspect it again.".into()),
             }
         } else {
@@ -2295,7 +2332,13 @@ impl Router {
                 map.display()
             ));
             match crate::room_map::replace(&data_root, snapshot.as_ref().expect("captured before joining"), &link, &passphrase) {
-                Ok(_) => said.push(format!("bound {dir}")),
+                Ok(outcome) => {
+                    if let Some(warning) = outcome.durability_warning {
+                        said.push(format!("{dir} was written, but its durability could not be confirmed: {warning}. Inspect the room map before retrying."));
+                        return DaemonFrame::RoomAnswer { done: false, said };
+                    }
+                    said.push(format!("bound {dir}"));
+                }
                 Err(e) => {
                     said.push(format!("{dir} was not bound: {e}"));
                     return DaemonFrame::RoomAnswer { done: false, said };
@@ -5172,7 +5215,12 @@ impl Dispatch for Router {
                 passphrase,
             } => self.room_bind(&dir, &link, passphrase, None).await,
             DaemonRequest::RoomDecline { dir } => self.room_decline(&dir),
-            DaemonRequest::RoomDecision { dir } => self.room_decision(&dir).await,
+            DaemonRequest::RoomDecision { dir } => self.room_decision(&dir, false).await,
+            DaemonRequest::RoomDecisionExplicit { dir } => self.room_decision(&dir, true).await,
+            DaemonRequest::RoomDecisionCancel { token } => {
+                lock(&self.inner.room_decisions).remove(&token);
+                DaemonFrame::Ok
+            }
             DaemonRequest::RoomReplace { token, link, passphrase, node } => self.room_replace(&token, &link, passphrase, &node).await,
             DaemonRequest::RoomAnswerBind { dir, token, link, passphrase } => self.room_bind(&dir, &link, passphrase, Some(&token)).await,
             DaemonRequest::Status => match self.public_nodes().await {
