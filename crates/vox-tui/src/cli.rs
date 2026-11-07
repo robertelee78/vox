@@ -1414,23 +1414,22 @@ pub struct SessionDriveArgs {
     /// Type TEXT into the session as its operator, and submit it.
     #[arg(long, value_name = "TEXT")]
     pub say: Option<String>,
-    /// Interrupt the turn it is running (Esc).
+    /// Request interruption of the current turn (OMP does not confirm completion).
     #[arg(long)]
     pub interrupt: bool,
-    /// Stop it (Ctrl-C).
+    /// Claude: send Ctrl-C; Codex/OpenCode: interrupt the current turn; OMP: refused.
     #[arg(long)]
     pub stop: bool,
-    /// Send it a slash command, as typed: "/compact", "/clear", "/rename NAME".
+    /// Send a slash command, e.g. "/compact", "/clear", "/rename NAME"; OMP refuses it.
     #[arg(long, value_name = "COMMAND")]
     pub slash: Option<String>,
-    /// Approve the tool call the Session shows as waiting, by its ref.
+    /// Approve the tool call waiting by its ref; OMP refuses this control.
     #[arg(long, value_name = "REF")]
     pub approve: Option<String>,
-    /// Reject the tool call waiting under REF, optionally saying why: `--reject REF "reason"`.
+    /// Reject the tool call waiting under REF, optionally saying why; OMP refuses this control.
     #[arg(long, value_name = "REF", num_args = 1..=2)]
     pub reject: Option<Vec<String>>,
-    /// Answer the question waiting under REF: `--answer REF "QUESTION=ANSWER" …`, one pair per
-    /// question (a question by its id or its text; several choices joined with ", ").
+    /// Answer the question waiting under REF with "QUESTION=ANSWER" pairs; OMP refuses this control.
     #[arg(long, value_name = "REF", num_args = 2..)]
     pub answer: Option<Vec<String>>,
     /// Send the session a file: it lands on its node, and the session is told

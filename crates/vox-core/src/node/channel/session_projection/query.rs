@@ -166,6 +166,11 @@ pub(crate) enum Query {
         node: Digest32,
         id: String,
     },
+    /// One exact opening, including its end, for bounded receipt retention.
+    Opening {
+        node: Digest32,
+        opening: Digest32,
+    },
     Text {
         opening: Digest32,
         field: FieldKind,
@@ -633,7 +638,8 @@ impl ChannelState {
                 Query::HasOpen { node } if node == me => Ok(Reply::HasOpen(false)),
                 Query::HasOpen { node }
                 | Query::Exact { node, .. }
-                | Query::Lookup { node, .. } => {
+                | Query::Lookup { node, .. }
+                | Query::Opening { node, .. } => {
                     readable(&node)?;
                     Err(Failure::Request(REFRESHING))
                 }
@@ -1000,6 +1006,25 @@ impl ChannelState {
                     .transpose()?
                     .flatten()
                     .map(|row| Row::new(row, true));
+                proven(row.is_some())?;
+                Ok(Reply::Page {
+                    rows: row.into_iter().collect(),
+                    more: false,
+                    revision,
+                })
+            }
+            Query::Opening { node, opening } => {
+                readable(&node)?;
+                let row = read
+                    .find(Tree::OpeningHash, &hash_key(&opening))?
+                    .map(|id| descriptor(&read, id))
+                    .transpose()?;
+                let row = match row {
+                    Some(row) if row.node == node && read.retained(row.opening)? => {
+                        Some(Row::new(row, true))
+                    }
+                    _ => None,
+                };
                 proven(row.is_some())?;
                 Ok(Reply::Page {
                     rows: row.into_iter().collect(),

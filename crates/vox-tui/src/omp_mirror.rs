@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{json, Map, Value};
-use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
+use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, BufReader};
 use tokio::sync::{mpsc, oneshot, Notify, Semaphore};
 use vox_agentcomms::activity::{one_line, VERSION};
 use vox_core::node::content::MAX_TEXT_LEN;
@@ -56,18 +56,48 @@ pub struct OmpMirror {
     session_end: SessionEnd,
     activity: Activity,
     conns: Mutex<BTreeMap<String, Connection>>,
+    receipts: Arc<Mutex<BTreeMap<String, (String, crate::host::OmpDriveGuard)>>>,
     live: Arc<Semaphore>,
+}
+
+/// Evidence about a control which was not confirmed by the native bridge.
+#[derive(Debug)]
+pub(crate) enum OmpControlError {
+    /// No native control was sent or the bridge explicitly refused it.
+    NotSent(String),
+    /// A write may have reached the bridge; delivery must not be inferred or replayed.
+    Unconfirmed(String),
+}
+
+impl OmpControlError {
+    pub(crate) fn message(self) -> String {
+        match self {
+            Self::NotSent(message) | Self::Unconfirmed(message) => message,
+        }
+    }
+}
+
+impl From<String> for OmpControlError {
+    fn from(message: String) -> Self {
+        Self::NotSent(message)
+    }
+}
+
+impl From<&str> for OmpControlError {
+    fn from(message: &str) -> Self {
+        Self::NotSent(message.to_owned())
+    }
 }
 
 struct Cmd {
     steer: Steer,
     guard: Option<crate::host::room_pause::InterruptGuard>,
     drive: Option<crate::host::OmpDriveGuard>,
-    reply: oneshot::Sender<Result<String, String>>,
+    reply: oneshot::Sender<Result<String, OmpControlError>>,
 }
 
 struct PendingCall {
-    reply: oneshot::Sender<Result<String, String>>,
+    reply: oneshot::Sender<Result<String, OmpControlError>>,
     expires: tokio::time::Instant,
     deferred: Option<String>,
 }
@@ -91,7 +121,8 @@ impl Deferred {
     fn frame(&self, id: &str) -> String {
         format!(
             "{}\n",
-            json!({"type":"materialized","id":id,"ok":true,"text":self.text})
+            json!({"type":"materialized","id":id,"ok":true,"text":self.text,
+                "operator":self.guard.operator,"room":self.guard.room})
         )
     }
 }
@@ -105,6 +136,7 @@ impl OmpMirror {
             session_end,
             activity,
             conns: Mutex::new(BTreeMap::new()),
+            receipts: Arc::new(Mutex::new(BTreeMap::new())),
             live: Arc::new(Semaphore::new(MAX_FOLLOWS)),
         })
     }
@@ -166,6 +198,7 @@ impl OmpMirror {
             activity: Arc::clone(&self.activity),
             calls: BTreeMap::new(),
             deferred: BTreeMap::new(),
+            receipts: Arc::clone(&self.receipts),
             next_id: 1,
             failed: false,
             ended: false,
@@ -204,15 +237,28 @@ impl OmpMirror {
         guard: Option<crate::host::room_pause::InterruptGuard>,
         drive: Option<crate::host::OmpDriveGuard>,
     ) -> Result<String, String> {
+        self.steer_guarded_typed(node, registration, steer, guard, drive)
+            .await
+            .map_err(OmpControlError::message)
+    }
+
+    pub(crate) async fn steer_guarded_typed(
+        &self,
+        node: &NodeName,
+        registration: &crate::wake::Session,
+        steer: Steer,
+        guard: Option<crate::host::room_pause::InterruptGuard>,
+        drive: Option<crate::host::OmpDriveGuard>,
+    ) -> Result<String, OmpControlError> {
         if matches!(&steer, Steer::Slash { .. }) {
             return Err(
                 "OMP slash commands are unavailable through Vox; use the OMP terminal".into(),
             );
         }
         if matches!(&steer, Steer::Text(text) if text.len() > MAX_COMMAND_BYTES) {
-            return Err(format!(
-                "OMP control exceeds {MAX_COMMAND_BYTES} bytes; nothing was sent"
-            ));
+            return Err(
+                format!("OMP control exceeds {MAX_COMMAND_BYTES} bytes; nothing was sent").into(),
+            );
         }
         let conn = self
             .conns()
@@ -240,7 +286,8 @@ impl OmpMirror {
                     "Vox's connection to this OMP session has closed; nothing was sent".to_owned()
                 }
             })?;
-        rx.await.unwrap_or_else(|_| Err("OMP's connection closed; the control outcome is unknown, do not assume it is safe to repeat".into()))
+        rx.await.unwrap_or_else(|_| Err(OmpControlError::Unconfirmed(
+            "OMP's connection closed; the control outcome is unknown, do not assume it is safe to repeat".into())))
     }
 }
 
@@ -254,6 +301,7 @@ struct Follow {
     activity: Activity,
     calls: BTreeMap<u64, PendingCall>,
     deferred: BTreeMap<String, Deferred>,
+    receipts: Arc<Mutex<BTreeMap<String, (String, crate::host::OmpDriveGuard)>>>,
     next_id: u64,
     failed: bool,
     ended: bool,
@@ -274,13 +322,14 @@ impl Follow {
                 _ => { self.fail("the native bridge connection could not be opened").await; return; }
             }
         };
-        let (read, mut write) = stream.into_split();
+        let (read, write) = stream.into_split();
+        let mut write = Arc::new(write);
         let hello = format!(
             "{}\n{}\n",
             json!({"type":"auth", "token":token}),
             json!({"type":"subscribe", "session":self.session})
         );
-        if !Self::write(&mut write, &hello).await {
+        if !Self::write(&write, &hello).await {
             self.fail("the native bridge handshake failed").await;
             return;
         }
@@ -307,9 +356,9 @@ impl Follow {
                                 tokio::select! {
                                     biased;
                                     () = guard.cancelled() => false,
-                                    written = Self::write(&mut write, &call) => written,
+                                    written = Self::write(&write, &call) => written,
                                 }
-                            } else { Self::write(&mut write, &call).await };
+                            } else { Self::write(&write, &call).await };
                             if !written {
                                 self.fail("a control write failed or was cancelled; its outcome is unknown, do not assume it is safe to repeat").await;
                                 break;
@@ -357,22 +406,33 @@ impl Follow {
             }
         }
         for (_, call) in std::mem::take(&mut self.calls) {
-            let _ = call.reply.send(Err("the OMP connection closed; the control outcome is unknown, do not assume it is safe to repeat".into()));
+            let _ = call.reply.send(Err(OmpControlError::Unconfirmed(
+                "the OMP connection closed; the control outcome is unknown, do not assume it is safe to repeat".into())));
         }
     }
 
-    async fn write(write: &mut tokio::net::unix::OwnedWriteHalf, line: &str) -> bool {
-        matches!(
-            tokio::time::timeout(CALL_WITHIN, write.write_all(line.as_bytes())).await,
-            Ok(Ok(()))
-        )
+    async fn write(write: &Arc<tokio::net::unix::OwnedWriteHalf>, line: &str) -> bool {
+        let send = async {
+            let mut remaining = line.as_bytes();
+            while !remaining.is_empty() {
+                write.writable().await?;
+                match write.try_write(remaining) {
+                    Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::WriteZero)),
+                    Ok(n) => remaining = &remaining[n..],
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok::<(), std::io::Error>(())
+        };
+        matches!(tokio::time::timeout(CALL_WITHIN, send).await, Ok(Ok(())))
     }
 
     fn call(
         &mut self,
         steer: Steer,
         drive: Option<crate::host::OmpDriveGuard>,
-        reply: oneshot::Sender<Result<String, String>>,
+        reply: oneshot::Sender<Result<String, OmpControlError>>,
     ) -> Option<String> {
         if self.calls.len() >= MAX_COMMANDS {
             let _ = reply.send(Err(
@@ -403,14 +463,34 @@ impl Follow {
                     return None;
                 }
                 self.deferred.retain(|_, item| item.guard.allowed());
-                if self.deferred.len() >= MAX_COMMANDS {
+                let receipt_count = {
+                    let mut receipts = self
+                        .receipts
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    receipts.retain(|_, (_, guard)| guard.allowed());
+                    receipts
+                        .values()
+                        .filter(|(session, _)| session == &self.session)
+                        .count()
+                };
+                if self.deferred.len() + receipt_count >= MAX_COMMANDS {
                     let _ = reply.send(Err(
                         "OMP has 32 queued Drive messages; nothing was sent".into()
                     ));
                     return None;
                 }
                 let key = match opaque_id() {
-                    Ok(key) if !self.deferred.contains_key(&key) => key,
+                    Ok(key)
+                        if !self.deferred.contains_key(&key)
+                            && !self
+                                .receipts
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .contains_key(&key) =>
+                    {
+                        key
+                    }
                     _ => {
                         let _ = reply.send(Err(
                             "a unique OMP Drive capability could not be created; nothing was sent"
@@ -430,7 +510,14 @@ impl Follow {
                 deferred = Some(key.clone());
                 json!({"type":"prompt", "id":key})
             }
-            Steer::Interrupt | Steer::Stop => json!({"type":"abort"}),
+            Steer::Interrupt => json!({"type":"abort"}),
+            Steer::Stop => {
+                let _ = reply.send(Err(
+                    "OMP cannot end the Session through Vox; use Interrupt for the current operation"
+                        .into(),
+                ));
+                return None;
+            }
             Steer::Slash { .. } => {
                 let _ = reply.send(Err("OMP slash commands are unavailable through Vox".into()));
                 return None;
@@ -458,7 +545,7 @@ impl Follow {
     async fn materialize(
         &mut self,
         value: &Value,
-        write: &mut tokio::net::unix::OwnedWriteHalf,
+        write: &mut Arc<tokio::net::unix::OwnedWriteHalf>,
     ) -> bool {
         let Some(id) = value.get("id").and_then(Value::as_str).filter(|id| {
             id.len() == 32
@@ -471,15 +558,111 @@ impl Follow {
         let Some(item) = self.deferred.remove(id) else {
             return Self::write(write, &format!("{}\n", json!({"type":"materialized","id":id,"ok":false,"error":"Drive message is unavailable or already consumed"}))).await;
         };
-        if !item.guard.allowed() {
-            return Self::write(write, &format!("{}\n", json!({"type":"materialized","id":id,"ok":false,"error":"the driver, room or Session changed"}))).await;
+        let message = item.frame(id);
+        let written = if let Some((handle, room, session, admission)) = item.guard.delivery.clone()
+        {
+            use vox_core::node::session_ingress::{DriveDelivery, DriveDeliveryResult, DriveFrame};
+            struct Cancel {
+                frame: Arc<DriveFrame>,
+                armed: bool,
+            }
+            impl Drop for Cancel {
+                fn drop(&mut self) {
+                    if self.armed {
+                        self.frame.abort();
+                    }
+                }
+            }
+            let Some(frame) = DriveFrame::new(write.clone(), message.into_bytes()).map(Arc::new)
+            else {
+                return false;
+            };
+            let mut cancel = Cancel {
+                frame: frame.clone(),
+                armed: true,
+            };
+            let lifecycle = item.guard.lifecycle.clone();
+            let guard = item.guard.clone();
+            let current: Arc<dyn Fn() -> Option<Box<dyn Send>> + Send + Sync> =
+                Arc::new(move || {
+                    if !guard.allowed() {
+                        return None;
+                    }
+                    let native = (guard.native)()?;
+                    if !guard.allowed() {
+                        return None;
+                    }
+                    Some(native)
+                });
+            let send = async {
+                loop {
+                    if write.writable().await.is_err() {
+                        return None;
+                    }
+                    let slot = handle.reserve_session_batch_slot().await?;
+                    let _lifecycle = lifecycle.lock().await;
+                    let receipt = slot.deliver_drive(
+                        room,
+                        session.clone(),
+                        DriveDelivery {
+                            admission: admission.clone(),
+                            current: current.clone(),
+                            frame: frame.clone(),
+                        },
+                    );
+                    match receipt.await.ok()? {
+                        DriveDeliveryResult::Pending => continue,
+                        result => return Some(result),
+                    }
+                }
+            };
+            let result = tokio::select! {
+                biased;
+                () = item.guard.cancelled() => None,
+                result = tokio::time::timeout(CALL_WITHIN, send) => result.ok().flatten(),
+            };
+            match result {
+                Some(DriveDeliveryResult::Written) => {
+                    cancel.armed = false;
+                    true
+                }
+                _ if frame.cancel() => return false,
+                _ => {
+                    // No prefix was written; the refused frame is retired without closing
+                    // the follower that carries the explicit native refusal.
+                    cancel.armed = false;
+                    return Self::write(
+                        write,
+                        &format!(
+                            "{}\n",
+                            json!({
+                                "type":"materialized", "id":id, "ok":false,
+                                "error":"the driver, room or Session changed before delivery"
+                            })
+                        ),
+                    )
+                    .await;
+                }
+            }
+        } else {
+            let lifecycle = item.guard.lifecycle.clone();
+            let _lifecycle = lifecycle.lock().await;
+            if !item.guard.allowed() {
+                return Self::write(write, &format!("{}\n", json!({"type":"materialized","id":id,"ok":false,"error":"the driver, room or Session changed"}))).await;
+            }
+            tokio::select! {
+                biased;
+                () = item.guard.cancelled() => false,
+                written = Self::write(write, &message) => written,
+            }
+        };
+        if written && item.guard.operator.is_some() && item.guard.operation.is_some() {
+            self.receipts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(id.to_owned(), (self.session.clone(), item.guard));
         }
-        let frame = item.frame(id);
-        tokio::select! {
-            biased;
-            () = item.guard.cancelled() => false,
-            written = Self::write(write, &frame) => written,
-        }
+        written
     }
 
     async fn line(&mut self, value: &Value) {
@@ -503,24 +686,40 @@ impl Follow {
                 else {
                     return;
                 };
-                let result = if value.get("ok").and_then(Value::as_bool) == Some(true) {
-                    value
+                let result = match value.get("ok").and_then(Value::as_bool) {
+                    Some(true) => value
                         .get("value")
                         .and_then(Value::as_str)
                         .map(str::to_owned)
                         .ok_or_else(|| {
-                            "OMP returned no control acknowledgement; outcome is unknown".to_owned()
-                        })
-                } else {
-                    Err(format!(
-                        "OMP did not accept the control: {}",
+                            OmpControlError::Unconfirmed(
+                                "OMP returned no control acknowledgement; outcome is unknown"
+                                    .into(),
+                            )
+                        }),
+                    Some(false)
+                        if value.get("code").and_then(Value::as_str) == Some("not-queued") =>
+                    {
+                        Err(OmpControlError::NotSent(format!(
+                            "OMP did not queue the control: {}",
+                            value
+                                .get("error")
+                                .and_then(Value::as_str)
+                                .unwrap_or("no reason given")
+                        )))
+                    }
+                    Some(false) => Err(OmpControlError::Unconfirmed(format!(
+                        "OMP reported an error; delivery is unknown: {}",
                         value
                             .get("error")
                             .and_then(Value::as_str)
                             .unwrap_or("no reason given")
-                    ))
+                    ))),
+                    None => Err(OmpControlError::Unconfirmed(
+                        "OMP returned a malformed acknowledgement; outcome is unknown".into(),
+                    )),
                 };
-                if result.is_err() {
+                if matches!(&result, Err(OmpControlError::NotSent(_))) {
                     if let Some(id) = call.deferred {
                         self.deferred.remove(&id);
                     }
@@ -579,6 +778,47 @@ impl Follow {
             .and_then(Value::as_str)
             .unwrap_or_default();
         match kind {
+            "drive-accepted" => {
+                let Some(id) = event.get("id").and_then(Value::as_str) else {
+                    return;
+                };
+                let guard = {
+                    let mut receipts = self
+                        .receipts
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if receipts
+                        .get(id)
+                        .is_none_or(|(session, _)| session != &self.session)
+                    {
+                        return;
+                    }
+                    receipts.remove(id).map(|(_, guard)| guard)
+                };
+                let Some(guard) = guard else { return };
+                if !guard.allowed() {
+                    return;
+                }
+                let (Some(operation), Some(author)) =
+                    (guard.operation.as_deref(), guard.operator.as_deref())
+                else {
+                    return;
+                };
+                let Some(response) = event.get("response").and_then(Value::as_str) else {
+                    return;
+                };
+                let mut entry = self.envelope("drive-result", None);
+                entry.insert("of".into(), json!(operation));
+                entry.insert("ref".into(), json!(operation));
+                entry.insert("occurrence".into(), json!(author));
+                entry.insert("drive_scope".into(), json!(1));
+                entry.insert("by".into(), json!(author));
+                entry.insert("action".into(), json!("text"));
+                entry.insert("phase".into(), json!("accepted"));
+                entry.insert("ok".into(), json!(true));
+                entry.insert("text".into(), json!(response));
+                self.post(entry, "text").await;
+            }
             "user" | "reply" => {
                 let Some(text) = event.get("text").and_then(Value::as_str) else {
                     self.fail("an OMP text event has no text").await;

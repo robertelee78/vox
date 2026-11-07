@@ -126,6 +126,35 @@ pub(crate) async fn lookup(
     }
 }
 
+/// Read an exact open Session only when its published projection is current.
+///
+/// # Errors
+/// The room is unavailable or its Session projection has not caught up.
+pub async fn current_opening(
+    handle: &NodeHandle,
+    room: Digest32,
+    node: Digest32,
+    id: &str,
+) -> Result<Option<Digest32>, String> {
+    use crate::node::channel::session_projection::{Query, Reply};
+    match handle
+        .session_projection(
+            room,
+            Query::Exact {
+                node,
+                id: id.to_owned(),
+            },
+        )
+        .await?
+    {
+        Reply::Page { rows, revision, .. } if !revision.provisional() => {
+            Ok(rows.into_iter().find(|row| row.open).map(|row| row.opening))
+        }
+        Reply::Page { .. } => Err("the room is refreshing saved Sessions; retry".into()),
+        _ => Err("unexpected Session lookup answer".into()),
+    }
+}
+
 // Exact pending replies from governance, legacy classification, private controls and floors,
 // and the Session projection. Every other refusal, including unreadable facts, is permanent
 // for this attempt and must reach the caller. These are Error::Display strings where the

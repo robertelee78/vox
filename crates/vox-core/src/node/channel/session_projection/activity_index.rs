@@ -102,13 +102,29 @@ impl Fact {
                 "drive-result" => text("of"),
                 _ => "",
             });
+        let scoped_drive = matches!(kind, "drive" | "drive-result")
+            && object
+                .and_then(|b| b.get("drive_scope"))
+                .and_then(serde_json::Value::as_u64)
+                == Some(1);
         let reference = (!reference_text.is_empty()).then(|| {
-            sha256_concat(&[
-                b"vox/session-activity/ref/v1",
-                &(row.session_id.len() as u64).to_be_bytes(),
-                row.session_id.as_bytes(),
-                reference_text.as_bytes(),
-            ])
+            if scoped_drive {
+                sha256_concat(&[
+                    b"vox/session-activity/drive-ref/v1",
+                    &(row.session_id.len() as u64).to_be_bytes(),
+                    row.session_id.as_bytes(),
+                    &(text("by").len() as u64).to_be_bytes(),
+                    text("by").as_bytes(),
+                    reference_text.as_bytes(),
+                ])
+            } else {
+                sha256_concat(&[
+                    b"vox/session-activity/ref/v1",
+                    &(row.session_id.len() as u64).to_be_bytes(),
+                    row.session_id.as_bytes(),
+                    reference_text.as_bytes(),
+                ])
+            }
         });
         let request_kind = match kind {
             "approval" | "question" => kind,
@@ -140,6 +156,11 @@ impl Fact {
                 &(kind.len() as u64).to_be_bytes(),
                 kind.as_bytes(),
                 reference_text.as_bytes(),
+                if scoped_drive {
+                    text("by").as_bytes()
+                } else {
+                    b""
+                },
             ])
         });
         let part = object

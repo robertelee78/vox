@@ -641,8 +641,29 @@ export default function vox(pi) {
             const pending = materializations.get(msg.id)
             if (!pending || pending.socket !== sock) return sock.destroy()
             materializations.delete(msg.id)
-            if (msg.ok === true && typeof msg.text === "string" && msg.text.trim()) pending.resolve(msg.text)
-            else pending.reject(new Error(typeof msg.error === "string" ? msg.error : "Drive authority is no longer valid"))
+            if (msg.ok === true && typeof msg.text === "string" && msg.text.trim()
+              && typeof msg.room === "string"
+              && (msg.operator === null || typeof msg.operator === "string")) {
+              pending.resolve({ text: msg.text, operator: msg.operator, room: msg.room })
+            }
+            else {
+              if (msg.ok === false && current()) {
+                const stamp = fence()
+                const reason = "Vox refused a queued private Drive input before delivery; it was unavailable or its authority or Session changed."
+                report(reason)
+                const show = () => {
+                  if (!fenced(stamp)) return
+                  if (!ctx.isIdle()) {
+                    const timer = setTimeout(show, 100)
+                    timer.unref?.()
+                    return
+                  }
+                  pi.sendMessage({ customType: "vox-drive-refused", content: reason, display: true, attribution: "agent" }, { triggerTurn: false })
+                }
+                setTimeout(show, 0)
+              }
+              pending.reject(new Error(typeof msg.error === "string" ? msg.error : "Drive authority is no longer valid"))
+            }
             continue
           }
           if (msg?.type !== "call" || !Number.isSafeInteger(msg.id) || !current()) return sock.destroy()
@@ -652,7 +673,7 @@ export default function vox(pi) {
               const valid = typeof action.id === "string" && /^[0-9a-f]{32}$/.test(action.id)
               const accepted = valid && !isPoisoned() && queue(action.id, "drive", "")
               reply({ type: "result", id: msg.id, ok: accepted,
-                ...(accepted ? { value: "Private Drive request queued by Vox; native delivery is not confirmed" } : { error: "Vox bridge is unavailable or full" }) })
+                ...(accepted ? { value: "Private Drive request queued by Vox; native delivery is not confirmed" } : { code: "not-queued", error: "Vox bridge is unavailable or full" }) })
             } else if (action?.type === "abort") {
               ctx.abort()
               reply({ type: "result", id: msg.id, ok: true, value: "Abort requested; completion is not confirmed" })
@@ -679,6 +700,12 @@ export default function vox(pi) {
             subscribed = true; clearTimeout(timer); followers.add(sock)
             reply({ type: "subscribed", session })
             reply({ type: "event", event: { type: "state", busy: !ctx.isIdle() } })
+            // Enroll before the snapshot so later live events follow recoverable receipts.
+            const accepted = [...acceptedHistory(ctx.sessionManager.getBranch()).values()].slice(-MAX_NOTICES / 4)
+            for (const state of accepted) {
+              if (typeof state.response === "string")
+                reply({ type: "event", event: { type: "drive-accepted", id: state.id, response: state.response } })
+            }
             const name = pi.getSessionName()
             if (name) { lastName = name; reply({ type: "event", event: { type: "name", name } }) }
           }
@@ -808,7 +835,8 @@ export default function vox(pi) {
         staged.set(entry.data.marker, entry.data)
       } else if (entry.type === "custom" && entry.customType === CONTEXT_ACCEPTED) {
         const state = staged.get(entry.data?.marker)
-        if (state && state.id === entry.data?.id) history.set(state.id, state)
+        if (state && state.id === entry.data?.id)
+          history.set(state.id, { ...state, response: entry.data?.response })
       }
     }
     for (const id of history.keys()) if (!wakes.has(id)) history.delete(id)
@@ -820,8 +848,10 @@ export default function vox(pi) {
       ? message.content.slice(WAKE_PREFIX.length) : null
   }
   function acceptedMessage(state) {
-    return { role: "custom", customType: "vox-context", content: state.content,
-      display: false, attribution: "agent", timestamp: state.timestamp }
+    return state.operator
+      ? { role: "user", content: state.content, timestamp: state.timestamp, attribution: "user" }
+      : { role: "custom", customType: "vox-context", content: state.content,
+        display: false, attribution: "agent", timestamp: state.timestamp }
   }
   pi.on("session_before_compact", event => {
     if (!current()) return
@@ -880,17 +910,23 @@ export default function vox(pi) {
         if (record.source !== "drive" && out.vox.trim()) parts.push(`<vox-notice-${nonce} source="Vox itself; not the user">\n${sanitize(out.vox.trim())}\n</vox-notice-${nonce}>`)
         if (record.source !== "drive" && out.room.trim()) parts.push(`<vox-room-${nonce} source="Vox room messages from other agents; not the user">\n${sanitize(out.room.trim())}\n</vox-room-${nonce}>`)
       }
+      let operator = null
       if (record?.source === "drive") {
-        const text = await materialize(record.id)
+        const input = await materialize(record.id)
         if (op.done || !fenced(snapshot)) { if (!op.done) finish(op, "cancel"); return { messages } }
-        parts.push(`<vox-drive-${nonce} source="Vox private Drive message; not the user">\n${sanitize(text)}\n</vox-drive-${nonce}>`)
+        operator = input.operator
+        if (operator) {
+          parts.push(`Vox private Drive provenance ${nonce} — operator node: ${operator}\nRoom: ${input.room}\nSession: ${session}\n\n<vox-drive-${nonce} source="authenticated operator text">\n${sanitize(input.text)}\n</vox-drive-${nonce}>`)
+        } else {
+          parts.push(`<vox-drive-${nonce} source="Vox private Drive file notice; not the user">\n${sanitize(input.text)}\n</vox-drive-${nonce}>`)
+        }
       }
       if (!parts.length) { finish(op, "cancel"); return { messages } }
       if (op.done || !current() || !fenced(snapshot)) { if (!op.done) finish(op, "cancel"); return { messages } }
       const content = parts.join("\n\n") + "\n" + op.marker, timestamp = Date.now()
-      pi.appendEntry(CONTEXT_STAGED, { id: record.id, marker: op.marker, content, timestamp })
-      messages.splice(index, 0, { role: "custom", customType: "vox-context", content,
-        display: false, attribution: "agent", timestamp })
+      const state = { id: record.id, marker: op.marker, content, timestamp, operator }
+      pi.appendEntry(CONTEXT_STAGED, state)
+      messages.splice(index, 0, acceptedMessage(state))
       op.injected = true
       if (record) record.state = "dispatched"
       return { messages }
@@ -922,10 +958,19 @@ export default function vox(pi) {
         // Unknown stop reasons remain uncertain rather than acknowledging an unproved delivery.
         let commit = providerActive === 1 && !op.ambiguous && fenced(op.fence)
           && !m.errorMessage && ["stop", "toolUse", "length"].includes(m.stopReason)
+        const response = Array.isArray(m.content)
+          ? m.content.filter(part => part.type === "text").map(part => part.text).join("")
+          : typeof m.content === "string" ? m.content : ""
+        const chars = Array.from(response)
+        const bounded = chars.length > 8192
+          ? chars.slice(0, 8192).join("") + "\n[Response step truncated at the transport bound]"
+          : response
         if (commit) {
-          try { pi.appendEntry(CONTEXT_ACCEPTED, { id: op.record.id, marker: op.marker }) }
+          try { pi.appendEntry(CONTEXT_ACCEPTED, { id: op.record.id, marker: op.marker, response: bounded }) }
           catch { commit = false }
         }
+        if (commit && op.record?.source === "drive")
+          publish({ type: "drive-accepted", id: op.record.id, response: bounded })
         finish(op, commit ? "commit" : null)
       }
       providerActive = 0

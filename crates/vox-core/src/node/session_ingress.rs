@@ -22,7 +22,202 @@ pub const MAX_BATCH_ITEMS: usize = 512;
 const MAX_PENDING_BYTES: u64 = 64 * 1024 * 1024;
 /// Only sessions with pending work occupy the bounded scheduling directory.
 const MAX_PENDING_SESSIONS: usize = 256;
+/// Receipt capacity belongs to one actual Session opening, never the whole node.
+const MAX_DRIVE_OPERATIONS: usize = 1024;
+
+#[derive(Serialize, Deserialize)]
+struct DriveIndex {
+    room: Digest32,
+    opening: Digest32,
+    instance: [u8; 16],
+    catalog_id: u64,
+    next: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct DriveCatalog {
+    next: u64,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct DriveCatalogEntry {
+    pub room: Digest32,
+    pub instance: [u8; 16],
+    pub session: String,
+    pub opening: Digest32,
+}
+
+fn drive_catalog_scope(node: &Digest32) -> Digest32 {
+    crate::hash::sha256_concat(&[b"vox/session-ingress-drive-catalog/v1", node])
+}
+
+fn drive_index_scope(session: &Digest32, room: &Digest32, opening: &Digest32) -> Digest32 {
+    let mut bytes = b"vox/session-ingress-drive-index/v1".to_vec();
+    bytes.extend_from_slice(session);
+    bytes.extend_from_slice(room);
+    bytes.extend_from_slice(opening);
+    sha256(&bytes)
+}
 const HEADER: u64 = 0;
+/// The exact authority and durable opening on which one Drive admission depends.
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct DriveAdmission {
+    /// Authenticated room member requesting the operation.
+    pub author: Digest32,
+    /// Expected room history incarnation.
+    pub instance: [u8; 16],
+    /// Expected durable Session opening.
+    pub opening: Digest32,
+    /// Caller-generated operation identity, stable across retries.
+    pub operation: String,
+}
+
+/// Exact native-frame commit, serialized with room and Computer authority.
+#[doc(hidden)]
+pub struct DriveDelivery {
+    /// Authenticated requester, room incarnation and actual opening.
+    pub admission: DriveAdmission,
+    /// Acquire the exact native registration fence, retained through one socket write.
+    pub current: std::sync::Arc<dyn Fn() -> Option<Box<dyn Send>> + Send + Sync>,
+    /// One owned, cancellable frame and its monotonic byte offset.
+    pub frame: std::sync::Arc<DriveFrame>,
+}
+
+impl std::fmt::Debug for DriveDelivery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DriveDelivery").finish_non_exhaustive()
+    }
+}
+
+/// Result of one nonblocking frame commitment.
+#[doc(hidden)]
+#[derive(Debug)]
+pub enum DriveDeliveryResult {
+    /// Every byte entered the native socket.
+    Written,
+    /// The frame needs another readiness wait and a fresh actor authorization turn.
+    Pending,
+    /// No byte entered the socket.
+    NotWritten,
+    /// Only a prefix entered; close the socket and never replay.
+    Partial,
+}
+
+struct DriveFrameState {
+    bytes: Vec<u8>,
+    offset: usize,
+    active: bool,
+}
+
+/// Single-owner native socket frame. Cancellation and a physical write serialize under
+/// this short mutex; readiness and actor replies never hold it.
+#[doc(hidden)]
+pub struct DriveFrame {
+    socket: std::sync::Arc<tokio::net::unix::OwnedWriteHalf>,
+    state: std::sync::Mutex<DriveFrameState>,
+}
+
+impl DriveFrame {
+    /// Construct a bounded newline-delimited frame.
+    #[must_use]
+    pub fn new(
+        socket: std::sync::Arc<tokio::net::unix::OwnedWriteHalf>,
+        bytes: Vec<u8>,
+    ) -> Option<Self> {
+        if bytes.is_empty() || bytes.len() > 64 * 1024 || !bytes.ends_with(b"\n") {
+            return None;
+        }
+        Some(Self {
+            socket,
+            state: std::sync::Mutex::new(DriveFrameState {
+                bytes,
+                offset: 0,
+                active: true,
+            }),
+        })
+    }
+
+    /// Stop later writes and report whether any prefix was already sent.
+    pub fn cancel(&self) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.active = false;
+        state.offset != 0
+    }
+
+    /// Retire the owner and close the socket, including when a queued actor turn is delayed.
+    pub fn abort(&self) {
+        self.cancel();
+        let stream: &tokio::net::UnixStream = self.socket.as_ref().as_ref();
+        let _ = socket2::SockRef::from(stream).shutdown(std::net::Shutdown::Both);
+    }
+
+    pub(crate) fn refuse(&self) -> DriveDeliveryResult {
+        if self.cancel() {
+            DriveDeliveryResult::Partial
+        } else {
+            DriveDeliveryResult::NotWritten
+        }
+    }
+
+    pub(crate) fn try_write(
+        &self,
+        current: &dyn Fn() -> Option<Box<dyn Send>>,
+    ) -> DriveDeliveryResult {
+        use DriveDeliveryResult::{NotWritten, Partial, Pending, Written};
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.active {
+            return if state.offset == 0 {
+                NotWritten
+            } else {
+                Partial
+            };
+        }
+        let Some(_native_fence) = current() else {
+            state.active = false;
+            return if state.offset == 0 {
+                NotWritten
+            } else {
+                Partial
+            };
+        };
+        let end = (state.offset + 16 * 1024).min(state.bytes.len());
+        match self.socket.try_write(&state.bytes[state.offset..end]) {
+            Ok(0) => {
+                state.active = false;
+                if state.offset == 0 {
+                    NotWritten
+                } else {
+                    Partial
+                }
+            }
+            Ok(n) => {
+                state.offset += n;
+                if state.offset == state.bytes.len() {
+                    state.active = false;
+                    Written
+                } else {
+                    Pending
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Pending,
+            Err(_) => {
+                state.active = false;
+                if state.offset == 0 {
+                    NotWritten
+                } else {
+                    Partial
+                }
+            }
+        }
+    }
+}
 
 /// Inclusive bounds of the durable sequences covered by one atomic admission.
 /// A repeated source event names its original sequence rather than allocating another.
@@ -256,6 +451,75 @@ fn session_in(batch: &Batch<'_>, key: &Sek, scope: &Digest32, name: &str) -> Res
 /// Validate, number and commit an entire batch. Preparation errors accept no new sequence
 /// or body; source receipts committed by earlier calls remain authoritative.
 pub fn admit(profile: &Profile, room: Digest32, name: &str, bodies: &[String]) -> AdmissionResult {
+    admit_inner(profile, room, name, bodies, None)
+}
+
+/// Admit an authenticated Drive operation and its exact opening in one transaction.
+/// Only the node actor may supply these coordinates after its authority checks.
+pub(crate) fn admit_drive(
+    profile: &Profile,
+    room: Digest32,
+    name: &str,
+    drive: &DriveAdmission,
+    bodies: &[String],
+) -> AdmissionResult {
+    if drive.operation.len() != 32
+        || !drive
+            .operation
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(Error::Profile("invalid Drive operation identity").into());
+    }
+    let mut identity = b"vox/session-drive-operation/v1".to_vec();
+    identity.extend_from_slice(&drive.opening);
+    identity.extend_from_slice(&drive.author);
+    identity.extend_from_slice(drive.operation.as_bytes());
+    let id = sha256(&identity);
+    use sha2::{Digest, Sha256};
+    let mut revision = Sha256::new();
+    for body in bodies {
+        revision.update((body.len() as u64).to_be_bytes());
+        revision.update(body.as_bytes());
+    }
+    let revision: Digest32 = revision.finalize().into();
+    let parts = bodies.len() as u64;
+    let mut keyed = Vec::with_capacity(bodies.len());
+    for (index, body) in bodies.iter().enumerate() {
+        let serde_json::Value::Object(mut object) =
+            serde_json::from_str(body).map_err(|_| bad())?
+        else {
+            return Err(bad().into());
+        };
+        if object.get("kind").and_then(serde_json::Value::as_str) != Some("drive")
+            || object.contains_key("_vox_source")
+        {
+            return Err(source_error().into());
+        }
+        object.insert(
+            "_vox_source".into(),
+            serde_json::json!({
+                "id": id, "revision": revision, "part": index as u64 + 1, "parts": parts,
+            }),
+        );
+        keyed.push(serde_json::Value::Object(object).to_string());
+    }
+    admit_inner(
+        profile,
+        room,
+        name,
+        &keyed,
+        Some((drive.opening, drive.instance)),
+    )
+}
+
+fn admit_inner(
+    profile: &Profile,
+    room: Digest32,
+    name: &str,
+    bodies: &[String],
+    drive_opening: Option<(Digest32, [u8; 16])>,
+) -> AdmissionResult {
     if name.is_empty()
         || name.len() > crate::node::content::MAX_SESSION_ID_LEN
         || bodies.is_empty()
@@ -299,7 +563,10 @@ pub fn admit(profile: &Profile, room: Digest32, name: &str, bodies: &[String]) -
             let kind = object
                 .get("kind")
                 .and_then(serde_json::Value::as_str)
-                .filter(|kind| matches!(*kind, "user" | "tool" | "tool-done"))
+                .filter(|kind| {
+                    matches!(*kind, "user" | "tool" | "tool-done")
+                        || (*kind == "drive" && drive_opening.is_some())
+                })
                 .ok_or_else(source_error)?;
             if (source.suppressed && kind != "user")
                 || source.part == 0
@@ -370,6 +637,75 @@ pub fn admit(profile: &Profile, room: Digest32, name: &str, bodies: &[String]) -
                 None => {
                     if source.part != 1 {
                         return Err(source_error().into());
+                    }
+                    if let Some((opening, instance)) = drive_opening {
+                        let index_scope = drive_index_scope(&scope, &room, &opening);
+                        let mut index = match batch.get_segment(
+                            &index_scope,
+                            SegmentKind::SessionIngress,
+                            HEADER,
+                        )? {
+                            Some(segment) => {
+                                decode::<DriveIndex>(&key, &index_scope, HEADER, &segment)?
+                            }
+                            None => {
+                                let catalog_scope = drive_catalog_scope(&node);
+                                let mut catalog = match batch.get_segment(
+                                    &catalog_scope,
+                                    SegmentKind::SessionIngress,
+                                    HEADER,
+                                )? {
+                                    Some(segment) => decode::<DriveCatalog>(
+                                        &key,
+                                        &catalog_scope,
+                                        HEADER,
+                                        &segment,
+                                    )?,
+                                    None => DriveCatalog { next: 1 },
+                                };
+                                let catalog_id = catalog.next;
+                                if catalog_id == 0 {
+                                    return Err(bad().into());
+                                }
+                                catalog.next = catalog_id
+                                    .checked_add(1)
+                                    .ok_or(Error::SizeLimitExceeded("Drive opening catalog"))?;
+                                put(
+                                    &mut batch,
+                                    &key,
+                                    &catalog_scope,
+                                    catalog_id,
+                                    &DriveCatalogEntry {
+                                        room,
+                                        instance,
+                                        session: name.to_owned(),
+                                        opening,
+                                    },
+                                )?;
+                                put(&mut batch, &key, &catalog_scope, HEADER, &catalog)?;
+                                DriveIndex {
+                                    room,
+                                    opening,
+                                    instance,
+                                    catalog_id,
+                                    next: 1,
+                                }
+                            }
+                        };
+                        if index.room != room
+                            || index.opening != opening
+                            || index.instance != instance
+                            || index.next == 0
+                            || index.next > MAX_DRIVE_OPERATIONS as u64 + 1
+                        {
+                            return Err(bad().into());
+                        }
+                        if index.next > MAX_DRIVE_OPERATIONS as u64 {
+                            return Err(Error::SizeLimitExceeded("Drive operations for this Session opening; end the Session before starting a new one").into());
+                        }
+                        put(&mut batch, &key, &index_scope, index.next, &source_scope)?;
+                        index.next += 1;
+                        put(&mut batch, &key, &index_scope, HEADER, &index)?;
                     }
                     SourceReceipt {
                         session: scope,
@@ -492,6 +828,110 @@ pub fn admit(profile: &Profile, room: Digest32, name: &str, bodies: &[String]) -
     }
     batch.commit().map_err(AdmissionError::Unconfirmed)?;
     Ok(Committed { first, last, fresh })
+}
+
+/// Visit one indexed opening without scanning the profile or retaining other openings.
+pub(crate) fn next_drive_opening(
+    profile: &Profile,
+    after: u64,
+) -> Result<Option<(u64, DriveCatalogEntry)>> {
+    let key = key(profile)?;
+    let scope = drive_catalog_scope(&profile.fingerprint());
+    let snapshot = profile.store().snapshot()?;
+    let Some(header) = snapshot.get_segment(&scope, SegmentKind::SessionIngress, HEADER)? else {
+        return Ok(None);
+    };
+    let catalog: DriveCatalog = decode(&key, &scope, HEADER, &header)?;
+    if catalog.next == 0 {
+        return Err(bad());
+    }
+    let next = snapshot.segment_after(&scope, SegmentKind::SessionIngress, Some(after))?;
+    let Some((id, segment)) = next else {
+        return Ok(None);
+    };
+    if id == 0 || id >= catalog.next {
+        return Err(bad());
+    }
+    let entry: DriveCatalogEntry = decode(&key, &scope, id, &segment)?;
+    if entry.session.is_empty() || entry.session.len() > crate::node::content::MAX_SESSION_ID_LEN {
+        return Err(bad());
+    }
+    Ok(Some((id, entry)))
+}
+
+/// Reclaim at most one operation after the actor has proved this exact opening ended or expired.
+pub(crate) fn reclaim_drive_opening(
+    profile: &Profile,
+    id: u64,
+    entry: &DriveCatalogEntry,
+) -> Result<()> {
+    let key = key(profile)?;
+    let catalog_scope = drive_catalog_scope(&profile.fingerprint());
+    let index_scope =
+        drive_index_scope(&scope(profile, &entry.session), &entry.room, &entry.opening);
+    let mut batch = profile.store().batch()?;
+    let Some(segment) = batch.get_segment(&catalog_scope, SegmentKind::SessionIngress, id)? else {
+        return Ok(());
+    };
+    if decode::<DriveCatalogEntry>(&key, &catalog_scope, id, &segment)? != *entry {
+        return Err(bad());
+    }
+    let segment = batch
+        .get_segment(&index_scope, SegmentKind::SessionIngress, HEADER)?
+        .ok_or_else(bad)?;
+    let mut index: DriveIndex = decode(&key, &index_scope, HEADER, &segment)?;
+    if index.room != entry.room
+        || index.opening != entry.opening
+        || index.instance != entry.instance
+        || index.catalog_id != id
+        || index.next < 2
+        || index.next > MAX_DRIVE_OPERATIONS as u64 + 1
+    {
+        return Err(bad());
+    }
+    {
+        index.next -= 1;
+        let pointer = batch
+            .get_segment(&index_scope, SegmentKind::SessionIngress, index.next)?
+            .ok_or_else(bad)?;
+        let source: Digest32 = decode(&key, &index_scope, index.next, &pointer)?;
+        let segment = batch
+            .get_segment(&source, SegmentKind::SessionIngress, HEADER)?
+            .ok_or_else(bad)?;
+        let receipt: SourceReceipt = decode(&key, &source, HEADER, &segment)?;
+        if receipt.session != scope(profile, &entry.session)
+            || receipt.room != entry.room
+            || receipt.kind != "drive"
+            || receipt.parts == 0
+            || receipt.parts > MAX_BATCH_ITEMS as u64
+            || receipt.next != receipt.parts + 1
+            || receipt.suppressed
+            || source != source_scope(&receipt.session, &receipt.room, &receipt.source, "drive")
+        {
+            return Err(bad());
+        }
+        for part in 1..=receipt.parts {
+            if !batch.delete_segment(&source, SegmentKind::SessionIngress, part)? {
+                return Err(bad());
+            }
+        }
+        if !batch.delete_segment(&source, SegmentKind::SessionIngress, HEADER)? {
+            return Err(bad());
+        }
+        if !batch.delete_segment(&index_scope, SegmentKind::SessionIngress, index.next)? {
+            return Err(bad());
+        }
+    }
+    if index.next == 1 {
+        if !batch.delete_segment(&index_scope, SegmentKind::SessionIngress, HEADER)?
+            || !batch.delete_segment(&catalog_scope, SegmentKind::SessionIngress, id)?
+        {
+            return Err(bad());
+        }
+    } else {
+        put(&mut batch, &key, &index_scope, HEADER, &index)?;
+    }
+    batch.commit()
 }
 
 /// One owned item, bounded by the admission limit. Its completion is never committed alone.
