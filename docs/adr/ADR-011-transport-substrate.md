@@ -95,8 +95,9 @@ Requirements 5–8 are **superseded** by requirements 27–40 and are not in the
     implementation.
 
     **Proposed v0.4.20 incompatible cutover (not accepted or built).** This release's
-    supported matrix replaces the previous-release room-interoperability requirement: the new
-    cohort MUST interoperate with itself, and MUST refuse `vox/2` peers at transport rather than
+    supported matrix, authorized by the decider's ADR-026 F-3 compatibility scope ruling,
+    replaces the previous-release room-interoperability requirement: the new cohort MUST
+    interoperate with itself, and MUST refuse `vox/2` peers at transport rather than
     pretending that a mixed-version room is safe. The refusal MUST be surfaced as protocol
     incompatibility when known, not as a bad passphrase or an unreachable anchor; a generic
     network failure alone MUST NOT be asserted to prove an old version.

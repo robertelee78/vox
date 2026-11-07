@@ -343,15 +343,17 @@ below remain unchanged.
   own_history]`. IDs are 32-byte strings, integer fields are unsigned, and the signing input
   is ASCII `vox/join-admission-proposal/v2` followed by one NUL byte and the canonical body.
   `room_name` is a valid canonical ADR-028 DNS-label text; null represents unavailable name
-  and MUST refuse before Prepared, as must invalid text. Never replace it with an arbitrary
-  empty/default name. The responder checks its current authorized name before proposing;
-  a later governance rename follows the by-ID rule above.
+  and MUST refuse before Prepared, as must invalid text. For a legacy unnamed room,
+  explain that an admin must name the room before joining; never invent an empty/default
+  name. The responder checks its current authorized name before proposing; a later
+  governance rename follows the by-ID rule above.
   `own_history` is `[kind, head_or_null]`: 0 means no held prior authored-log evidence and
   requires null; 1 requires a bounded existing own signed Public history head; 2 means known
   authored history exists but cannot currently be supplied and requires null. The joiner
   independently verifies a supplied head's author signature and exact public room/author
-  binding. Kind 2, local continuity or contradictory evidence fences writes for recovery;
-  kind 0 with no local prior authored history permits the operator-selected automatic empty
+  binding. Kind 1 fences writes until recovery reaches the verified supplied head; kind 2,
+  local continuity or contradictory evidence also fences writes for recovery.
+  Kind 0 with no local prior authored history permits the operator-selected automatic empty
   initialization. Prior admission/board-withdraw records are discovery hints, not by themselves
   authored-log sequence evidence; inspect them when trying recovery, never forge a head from
   them. This authenticated absence declaration is not a proof of global absence.

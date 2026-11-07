@@ -223,10 +223,16 @@ only room governance is who sets the room's retention. This builds on identity (
   The creator is root admin; a delegated remover MUST have an unexpired, in-effect,
   creator-issued delegation granting `policy` in the action's strict causal past, and MUST
   itself be a member at that action. Evaluate this authority in the strict causal past,
-  not by a circular final-membership predicate: concurrent or later removal/revocation of
-  the issuer does not retroactively cancel a valid action. Two concurrently authorized
-  admins removing one another therefore produce two valid removals, not an oscillating
-  validity cycle. Later actions must honor the authority state in their own causal past.
+  not by a circular final-membership predicate, with one root-authority cutoff: a delegated
+  admin's governance act is valid only if it lies in the strict causal past of every valid
+  creator-signed removal of that admin and every creator revocation of that delegation.
+  Acts concurrent with or after those creator facts are invalid, retained only as opaque
+  evidence. The creator is non-removable, so the cutoff introduces no mutual-validity cycle.
+  Concurrent removals by two delegated admins can both stand; absent a creator cutoff,
+  a malicious removed delegated admin can still issue concurrent governance using old
+  parents. That disclosed limit is resolved by creator removal or delegation revocation,
+  not by pretending delegated removal is root revocation. Later actions must honor their
+  own causal-past authority as well as any validated creator cutoff.
   Readmission requires the creator's root signature, not delegated `policy`. Retain necessary signed
   ancestry and delegation evidence. A board Member withdrawal alone is discovery evidence, not
   this fact or authority to alter the log. Replays MUST be idempotent; wrong-room, invalid,
@@ -275,11 +281,13 @@ only room governance is who sets the room's retention. This builds on identity (
   readmission, not by wall clock or arrival order. Deny the removed target's sender keys during
   removal, including replayed keys; after readmission apply ordinary consent and fresh-key checks.
 
-  Governance facts are evaluated separately under G-29 using only their strict causal past: a
-  concurrent or later removal of their author MUST NOT invalidate an otherwise authorized
-  governance act. In particular both concurrent mutual admin removals remain valid. Members MUST
-  retain and forward the ineligible entry's signed skeleton and ciphertext as opaque causal-parent
-  and fork evidence, without treating that forwarding as content or conferring authority.
+  Governance validity uses G-29's strict-causal-past authority plus its creator-precedence
+  cutoff, not the recursive final-membership predicate. Concurrent mutual delegated-admin
+  removals remain valid unless the applicable creator cutoff invalidates an act. Creator
+  removal or delegation revocation invalidates the target admin's concurrent/later governance,
+  including room end, rename, retention, anchors and further member removals; choosing old
+  parents cannot evade it. Members MUST retain and forward ineligible signed skeletons
+  and ciphertext as opaque causal-parent/fork evidence, without applying content or authority.
 
   Retain historical signed entries, their signatures, author-chain skeletons, fork evidence and
   claim history; filtering is not deletion of the target's prefix or a rewrite of signed history.
@@ -296,7 +304,11 @@ only room governance is who sets the room's retention. This builds on identity (
   creator readmission followed by ordinary authorization restores only appropriate access.
   Demonstrate unrelated rooms and global trust remain unchanged, including a same-name replacement
   fingerprint. Exercise stale queued egress and removal/readmission permutations through actual
-  consumers. The apparatus is isolated profiles, controlled partition and timing; the PRODUCT
+  consumers. After a creator removes or revokes a delegated admin, submit attacker-crafted
+  governance with pre-cutoff parents: concurrent/later end, rename and member-removal acts
+  stay inert regardless of delivery order, including through an unaware peer. Prior valid
+  acts remain historical; mutual delegated removals converge without recursive validity
+  oscillation. The apparatus is isolated profiles, controlled partition and timing; the PRODUCT
   verdict is observed membership and access, not a log assertion or successful command alone.
   Separately have the removed node post, including a partition-concurrent post replayed after
   catch-up; independent peers' native views MUST NOT show those posts, while the causally prior

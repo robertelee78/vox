@@ -186,10 +186,11 @@ consent grants (ADR-007), rendezvous records (ADR-012), the transport identity e
   no timestamp field. Reserve their distinct tags without changing old tag meanings. Matching
   enforcement-capable participation is required through ADR-011's proposed `vox/3` cohort,
   not an undefined per-room negotiation. Older unknown-tag rejection is not proof of
-  removal enforcement. ADR-007 G-29's strict-causal-past rule alone validates governance;
-  G-31's content eligibility cannot recursively invalidate mutually concurrent valid removal
-  acts. Retain/forward ineligible signed skeletons and ciphertext as log structure for causal
-  parents/fork evidence, without decrypting, displaying or applying their content/authority.
+  removal enforcement. ADR-007 G-29's strict-causal-past authority and non-removable creator
+  cutoff validate governance; G-31's content eligibility cannot recursively invalidate mutually
+  concurrent valid delegated removals. Creator removal/revocation invalidates concurrent or
+  later delegated governance even with old parents. Retain/forward ineligible signed skeletons
+  and ciphertext for causal parents/fork evidence without applying content or authority.
   Nonmember anchors are discovery boards, not governance-authority validators.
   
 - **LS-21c. Proposed v0.4.20 admission proposal v2, not built.** ADR-023 RL-8.7 pins the join

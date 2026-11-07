@@ -374,12 +374,17 @@ replacement narrows agent `--none` permission; ST-4's supported-API/no-OMP-chang
   It does not register, autostart, attach/unlock, read rooms or call a model. It holds a
   persistent Subscribe connection only while the exact selected node is Attached and Ready.
   When absent, detached, attaching, detaching or locked it closes persistent connections and
-  uses bounded short-lived connect/Nodes probes with capped 1/2/4/8/16/30-second backoff, so
-  the daemon's one-second autostart linger can expire. On apparent Ready, Subscribe and
-  receive its acknowledgment before the final separate Nodes snapshot; reconcile intervening
-  events and resnapshot. While subscribed, resnapshot on relevant events and at most once per
-  30 seconds for lag recovery. Limit connections, handshakes, frames, stderr and in-flight
-  work; stdin EOF ends the watcher. No room/model polling or generic retry framework.
+  uses bounded short-lived authenticated hello probes with capped 1/2/4/8/16/30-second
+  backoff, so the daemon's one-second autostart linger can expire. Never issue Nodes or
+  Status: those operations can attach nodes. Attached implies Ready in the current host.
+  On apparent Ready, Subscribe and receive its acknowledgment before opening a separate
+  fresh hello connection for the final exact-fingerprint attached snapshot. The subscription
+  connection's earlier hello is not final proof. Reconcile intervening events and resnapshot;
+  while subscribed, resnapshot on relevant events and at most once per 30 seconds for lag
+  recovery. Limit connections, handshakes, frames, stderr and in-flight work; stdin EOF ends
+  the watcher. No room/model polling or generic retry framework. A detached passphrase-free
+  node stays detached, including after manual detach, and unrelated node failures do not
+  block the selected node's observation.
   A Ready observation triggers a coalesced register only for an unconfirmed current generation.
   A typed transient registration failure permits retry after a fresh successful Ready snapshot
   at capped pace even in steady Ready. Confirmation stops retry; permanent refusal remains
@@ -393,6 +398,13 @@ replacement narrows agent `--none` permission; ST-4's supported-API/no-OMP-chang
   This control IPC change requires protocol 10 → 11 (`node/ipc.rs:78`); retain the existing
   version-independent updater bootstrap, without bypassing version checks. The registration
   CLI maps typed results to OR-1 exit categories.
+  A watcher handshake version/protocol mismatch invalidates that daemon observation and
+  exits with a distinct fixed category. The extension drains and retires it, then at capped
+  pace resolves the current configured Vox binary and starts at most one successor for that
+  mismatch episode. If the successor also mismatches, stop and show update/reload guidance;
+  never bypass the handshake or loop replacements. A new daemon instance permits a fresh
+  observation; mismatch is not permanent evidence against all future daemon instances.
+  Ordinary helper spawn/pipe failures remain visible and fail closed.
 
   Every new registration write, including prompt registration and cold staging, requires live
   ownership. If the helper fails, Vox is unavailable for that extension while ordinary OMP
@@ -412,11 +424,15 @@ replacement narrows agent `--none` permission; ST-4's supported-API/no-OMP-chang
   `registration_lock` cannot cover NoNode, Attaching, cold staging and retirement across
   processes. All three `store_checked` paths and deferred writes acquire that lock, recheck
   exact active binding and live lifetime ownership, and hold it through the write. Retirement
-  first rejects old bridge work in memory, then revokes and ACKs; a successor installs a fresh
-  reference only after ACK or confirmed watcher death/EOF and draining the same mutation
-  lock. A write already past its live check may finish after death, but the successor waits
-  for it; an old reference is never reused. Never unlink/recreate lock inodes while held or
-  awaited. Unknown retirement fails closed. Reconcile the live OMP Manager after a cancelled
+  first rejects old bridge work in memory, then revokes and ACKs. After confirmed watcher
+  death/EOF a successor takes the same mutation lock, drains prior writers, acquires lifetime
+  ownership and revokes the old record before releasing mutation ownership; only then may
+  it install a fresh reference. A write already past its live check may finish after death,
+  but the successor waits for it; an old reference is never reused. Mutation-lock contention
+  is a typed temporary refusal. Never unlink/recreate lock inodes while held or awaited.
+  The extension owns cleanup after confirmed helper exit and all mutation owners/waiters
+  drain; if that cannot be established, retain the private directory rather than race unlink.
+  Unknown retirement fails closed. Reconcile the live OMP Manager after a cancelled
   or rolled-back transition, including one with no compensating event. The fence is local
   OS-account ownership, not person attestation or a room trust capability.
 
