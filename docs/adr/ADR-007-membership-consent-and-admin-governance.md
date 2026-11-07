@@ -271,18 +271,39 @@ only room governance is who sets the room's retention. This builds on identity (
   Close or reauthorize existing affected sessions. Catching up peers MUST apply the barrier before
   resuming egress, including after restart.
 
-  For each validated removal, a target-authored entry is historical if it is in that
+  For each validated removal, a target-authored public log entry is historical if it is in that
   removal's strict causal past. For any removal not in the entry's causal future, the entry is
   eligible only if it causally descends from a valid creator readmission that supersedes that
   removal. Thus concurrent entries and entries after removal but before readmission are not
   authorized by earlier membership; a removal concurrent with or later than a readmission wins.
   This eligibility filter applies to application messages, keys, consents and claims,
-  Presence/Session and services, not to governance validity. Once a removal is known, members
-  MUST NOT decrypt, accept or forward as content, display, or give authority to ineligible
+  public Presence/Session metadata and services, not governance validity or off-log Session
+  records. Once a removal is known, members MUST NOT decrypt, accept or forward as content,
+  display, or give authority to ineligible
   content, including replays and entries received before the removal became known. Recompute
   visibility when new validated causal evidence arrives. These rules apply per removal and
   readmission, not by wall clock or arrival order. Deny the removed target's sender keys during
   removal, including replayed keys; after readmission apply ordinary consent and fresh-key checks.
+
+  **Private Session records (proposed clarification, pending review).** Off-log records have
+  no public Entry ancestry. Enforce ADR-031 SA-14 through the existing signed public Session
+  floors; do not invent chronology from first-seen time, add per-activity public entries, or
+  introduce a second record/envelope authority. Keep existing private record versions and
+  key-message bytes. For a once-removed author, new acceptance requires an eligible floor
+  descending from covering creator readmission, and a drive generation strictly greater than
+  every generation that author floored outside that restoration's causal descendants.
+  An author MUST rotate after applying its own readmission and issue new eligible floors.
+  A recipient's historical floor is not current access: release/serve requires its current
+  restored membership and ordinary trust/Drive, with a floor either historically prior to
+  its removal or descending from covering readmission as SA-14 specifies.
+  Deny removed-author keys, `current_drive` and locally-held legacy bypasses; fence queued
+  key/Drive/service work at the current room authorization generation. Preserve exact signed
+  floor provenance and necessary ancestry for re-evaluation, not just folded maxima.
+  Already locally accepted private rows remain readable under the reader's current ordinary
+  permission, but confer no live authority and may be re-served only under SA-14. This local
+  history boundary depends on arrival order, not a global causal fact; new peers may not
+  acquire private rows excluded by the current floor rules. Disclose that limitation and
+  the unaware-partition window in release notes.
 
   Governance validity uses G-29's strict-causal-past authority plus its creator-precedence
   cutoff, not the recursive final-membership predicate. Concurrent mutual delegated-admin
