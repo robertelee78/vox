@@ -5429,7 +5429,7 @@ final class FirstRunProof: XCTestCase {
         let erinOffer = trustGap([("erin", erinFp, true)])
         words(ui, banner, timeout: 60,
               "remote erin trusts alice now: the room must name erin's incoming trust and explain that alice must trust her too",
-              until: { $0.contains(erinShort) && $0.contains("trusts you") && $0.contains("too") },
+              until: { $0.contains(erinShort) && $0.contains("Room consent") && $0.contains("too") },
               premise: erinOffer)
         let offerPremise = Premise("erin's untrusted offer is available to alice") {
             let (gap, said) = erinOffer.read()
@@ -5451,7 +5451,7 @@ final class FirstRunProof: XCTestCase {
         let fayShort = String(fayFp.prefix(12))
         words(ui, banner, timeout: 60,
               "remote erin and fay cannot read alice: the room must name both members and explain that reading needs both sides' trust",
-              until: { $0.contains(erinShort) && $0.contains(fayShort) && $0.contains("reading needs both sides") },
+              until: { $0.contains(erinShort) && $0.contains(fayShort) && $0.contains("room consent") },
               premise: trustGap([("erin", erinFp, true), ("fay", fayFp, false)]))
 
         // The Dock badge (P17) is not checked here: macOS exposes no Dock badge to lsappinfo or to
@@ -6405,6 +6405,20 @@ final class FirstRunProof: XCTestCase {
         let daveFp = try line(staged(vox, ["id", "--node", "dave"], env: daveEnv)) { $0.count == 52 }
         try staged(vox, ["trust", "add", "--node", "bob", daveFp, "--name", "dave",
                          "--identity-passphrase-file", bobPass], env: voxEnv)
+        // Reopen an already populated room before admitting Dave. These are existing
+        // fingerprints in the authoritative fixture, not admissions during this visit.
+        tap(ui, Key.id("room-aaa"), "leave mission before reopening it")
+        tap(ui, Key.id("room-mission"), "reopen populated mission", premise: inRoom(vox, voxEnv, "mission"))
+        guard words(ui, Key.id("room-tab-members"), timeout: 30,
+                    "the reopened room must display its existing roster", until: { $0.contains("members") }) != nil else { return }
+        let rosterBeforeDave = try staged(vox, ["room", "roster", "--node", "alice", room], env: voxEnv)
+        guard rosterBeforeDave.contains(bobFp), rosterBeforeDave.contains(erinFp), rosterBeforeDave.contains(fayFp) else {
+            throw Apparatus("the preexisting room roster must contain Bob, Erin and Fay: \(rosterBeforeDave)")
+        }
+        for fingerprint in [bobFp, erinFp, fayFp] {
+            XCTAssertNil(locate(ui, Key.id("join-\(fingerprint)")),
+                         "PRODUCT: reopening a populated room must not announce a preexisting member as newly joined: \(fingerprint)")
+        }
         tap(ui, Key.id("room-mission"), "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
         try staged(vox, ["room", "join", "--node", "dave", "--passphrase-file", roomPass, missionLink],
                    env: daveEnv)

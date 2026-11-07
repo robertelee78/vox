@@ -2429,11 +2429,11 @@ private struct TrustBanner: View {
     @State private var showingComputers = false
 
     var body: some View {
-        let cut = model.members.filter { $0.trust != .mutual }
-        if !cut.isEmpty {
+        let cut = model.members.filter { $0.trust != .mutual || $0.keyWaits != nil }
+        if !cut.isEmpty || model.memberObservationError != nil {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 8) {
-                    StateMark(kind: .attention, words: words(cut))
+                    StateMark(kind: .attention, words: model.memberObservationError ?? words(cut))
                         .accessibilityIdentifier("trust-banner")
                     Spacer()
                     if cut.count == 1, let member = cut.first, !member.trust.inKeyring,
@@ -2443,6 +2443,19 @@ private struct TrustBanner: View {
                     } else if cut.contains(where: { !$0.trust.inKeyring }) {
                         Button("Show Keyring") { Task { await model.show(.keyring) } }
                             .accessibilityIdentifier("trust-banner-keyring")
+                    }
+                }
+                if model.memberObservationError == nil {
+                    ForEach(cut) { member in
+                        if model.computerApplicationConfirmed.contains(member.id) {
+                            Text("Computer policy application is confirmed for \(member.name) (\(member.id)); room access is separate.")
+                                .secondaryText()
+                                .accessibilityIdentifier("trust-banner-application-" + member.id)
+                        }
+                        if let wait = member.keyWaits {
+                            Text("\(member.name) \(wait)").secondaryText()
+                                .accessibilityIdentifier("trust-banner-key-wait-" + member.id)
+                        }
                     }
                 }
                 if model.daemonReachable, model.ended == nil, let attention = model.computerPairingAttention {
@@ -2468,17 +2481,18 @@ private struct TrustBanner: View {
             // Every one named (D4), as the room names them: the alias, else the fingerprint's start.
             let names = cut.map(\.name)
             let listed = names.dropLast().joined(separator: ", ") + " and " + (names.last ?? "")
-            return "\(listed) aren't reading each other with you yet: reading needs both sides to "
-                + "trust each other."
+            return "\(listed) can't read each other with you yet: room consent, key exchange and node trust are separate."
         }
         switch (m.trust, m.trustsYou) {
         case (.oneWay, _):
-            return "You trust \(m.name). Waiting for \(m.name) to trust you back before you can read each other."
+            return "You trust \(m.name). Reciprocal room consent from \(m.name) has not been observed; room access is unresolved."
         // Not in the keyring and trusting this node: D4's theyOnly, or none with its trust seen.
         case (.theyOnly, _), (.none, true):
-            return "\(m.name) trusts you. Trust \(m.name) too, and you can read each other."
+            return "Room consent from \(m.name) has been observed. Trust \(m.name) too to grant local node trust."
+        case (.mutual, _):
+            return "Local node trust and reciprocal room consent are observed for \(m.name); its room key status needs attention."
         default:
-            return "You and \(m.name) can't read each other yet: each of you has to trust the other."
+            return "You and \(m.name) can't read each other yet: local node trust and reciprocal room consent have not both been observed."
         }
     }
 }
@@ -2792,13 +2806,17 @@ private struct Inspector: View {
                         Text("Platform information is still being read.").caption().secondaryText()
                             .accessibilityIdentifier("member-platform-pending")
                     }
+                    if let problem = model.memberObservationError {
+                        Text(problem).secondaryText().fixedSize(horizontal: false, vertical: true)
+                            .accessibilityIdentifier("member-observation-unavailable")
+                    }
                     ForEach(model.members) { member in
                         TrustMark(name: member.name, trust: member.trust)
                             .nodeCard(model, member.id, name: member.name)
                             .accessibilityIdentifier("member-\(member.name)")
                         role(member.id)
                         work(member.id)
-                        Text(member.trust.sentence(member.name)).caption().secondaryText()
+                        Text(memberTrustWords(member)).caption().secondaryText()
                             .fixedSize(horizontal: false, vertical: true)
                             .accessibilityIdentifier("member-trust-directions-" + member.id)
                         MemberTrustActions(model: model, fingerprint: member.id, name: member.name, room: room)
@@ -2853,6 +2871,13 @@ private struct Inspector: View {
                 catch { return }
             }
         }
+    }
+
+    private func memberTrustWords(_ member: NodeModel.MemberRow) -> String {
+        let local = member.trust.inKeyring ? "Local node trust is granted." : "This node has not granted local node trust."
+        let consent = member.trustsYou ? "Reciprocal room consent is observed." : "Reciprocal room consent has not been observed."
+        let freshness = model.memberObservationError == nil ? "" : " Last observed; may be stale."
+        return "\(local) \(consent)\(freshness)"
     }
 
     @ViewBuilder private func work(_ fingerprint: String) -> some View {
