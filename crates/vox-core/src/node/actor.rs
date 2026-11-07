@@ -3773,9 +3773,10 @@ impl Joiner {
                 *id,
                 endpoints.clone(),
             );
+            let board = !self.parsed.names_member(&id);
             let helpers = helpers.clone();
             asked.spawn(async move {
-                let said = match Self::dial_with(&net, &tx, id, &endpoints, true, &helpers).await {
+                let said = match Self::dial_with(&net, &tx, id, &endpoints, board, &helpers).await {
                     Err(e) => Err(format!("board {} was not reached: {e}", short_id(id))),
                     Ok(conn) => match net.fetch_channel(&conn, &room, 0).await {
                         Err(e) => Err(match went_offline(&conn) {
@@ -3903,11 +3904,12 @@ impl Joiner {
                     *id,
                     endpoints.clone(),
                 );
+                let board = !self.parsed.names_member(&id);
                 let helpers = helpers.clone();
                 dials.spawn(async move {
                     (
                         at,
-                        Self::dial_with(&net, &tx, id, &endpoints, true, &helpers)
+                        Self::dial_with(&net, &tx, id, &endpoints, board, &helpers)
                             .await
                             .ok(),
                     )

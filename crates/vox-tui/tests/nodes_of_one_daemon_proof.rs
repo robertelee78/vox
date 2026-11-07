@@ -5444,32 +5444,36 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
     change_shows_on_both((&b, &db, &nodes_b), (&a, &da, &nodes_a), "delta", None);
 
     if let Ok(step) = std::env::var("VOX_PROOF_STEP") {
-        assert_eq!(
-            step, "constructor-re-admission",
+        assert!(
+            step == "constructor-re-admission" || step == "direct-publication",
             "APPARATUS: unsupported FX-28 journey step"
         );
-        constructor_re_admission(
-            &a,
-            &b,
-            &db,
-            &stale_create_arm,
-            &stale_create_engaged,
-            &stale_create_release,
-            (&hold_arm, &hold_engaged, &hold_release),
-            &beta,
-            &delta,
-        );
-        return;
+        if step == "constructor-re-admission" {
+            constructor_re_admission(
+                &a,
+                &b,
+                &db,
+                &stale_create_arm,
+                &stale_create_engaged,
+                &stale_create_release,
+                (&hold_arm, &hold_engaged, &hold_release),
+                &beta,
+                &delta,
+            );
+            return;
+        }
     }
 
     // ---- a durable Computer write cannot wedge status or fabricate storage failure -------
-    computer_write_expiry_keeps_status_live(
-        (&a, &da, &nodes_a),
-        (&b, &db, &nodes_b),
-        &state_commit_arm,
-        &state_commit_engaged,
-        &state_commit_release,
-    );
+    if std::env::var("VOX_PROOF_STEP").as_deref() != Ok("direct-publication") {
+        computer_write_expiry_keeps_status_live(
+            (&a, &da, &nodes_a),
+            (&b, &db, &nodes_b),
+            &state_commit_arm,
+            &state_commit_engaged,
+            &state_commit_release,
+        );
+    }
 
     // ---- rejected join records leave the answering member's board across restart ---------
     let db = rejected_join_records_leave_remote_board(
@@ -5494,6 +5498,9 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
         &stale_join_engaged,
         &stale_join_release,
     );
+    if std::env::var("VOX_PROOF_STEP").as_deref() == Ok("direct-publication") {
+        return;
+    }
 
     // ---- a stale actor cannot publish a remote drive mutation -----------------------------
     let epsilon = stale_remote_pause_is_refused(
@@ -6504,6 +6511,237 @@ fn remote_board_serves_member(
         )
     })
 }
+/// FX-64: a direct responder no longer has anchor authority after the sole shared room is left.
+/// The former host's real identity is used by a test-side peer to introduce an unrelated origin.
+#[test]
+#[ignore = "real daemons and production Argon2id; run in release with test-knobs"]
+fn a_former_direct_responder_cannot_introduce_a_stranger() {
+    use vox_core::node::circuitstream::CircuitFrame;
+    use vox_core::transport::framing::{read_frame_within, write_frame};
+    use vox_core::transport::streams::{open_typed, StreamKind};
+
+    watchdog::arm();
+    test_knobs::require(&["VOX_TEST_ADVERTISE"]);
+    let host = Account::new();
+    let guest = Account::new();
+    host.make_node("host");
+    let guest_id = guest.make_node("guest");
+    let host_listen = format!("[::1]:{}", free_v6_udp_port());
+    let guest_listen = format!("[::1]:{}", free_v6_udp_port());
+    let mut host_daemon = Daemon::start(
+        &host,
+        &["--node", "host"],
+        &[
+            ("VOX_LISTEN", &host_listen),
+            ("VOX_TEST_ADVERTISE", &host_listen),
+        ],
+    );
+    host_daemon.expect_apparatus_event("host Ready", |line| line.contains("host is Ready"));
+    let mut guest_daemon = Daemon::start(
+        &guest,
+        &["--node", "guest"],
+        &[("VOX_LISTEN", &guest_listen)],
+    );
+    guest_daemon.expect_apparatus_event("guest Ready", |line| line.contains("guest is Ready"));
+    let room = make_room(&host, "host");
+    let (ok, link, err) = host.run(&["room", "link", &room, "--node", "host"], "");
+    assert!(ok, "PRODUCT (staging): direct room link: {link}{err}");
+    let (ok, out, err) = guest.run(
+        &[
+            "room",
+            "join",
+            "--node",
+            "guest",
+            "--passphrase-file",
+            "-",
+            link.trim(),
+        ],
+        ROOM_PASS,
+    );
+    assert!(ok, "PRODUCT (staging): direct join: {out}{err}");
+    let (ok, out, err) = guest.run(&["room", "leave", "--node", "guest", &room], "");
+    assert!(
+        ok,
+        "PRODUCT (staging): leave the sole shared room: {out}{err}"
+    );
+    let (ok, list, err) = guest.run(&["room", "list", "--node", "guest"], "");
+    assert!(
+        ok && !list.contains(&room),
+        "PRODUCT (staging): guest still holds the room: {list}{err}"
+    );
+    host_daemon.stop();
+    let signer = hostile::member_signer(&host.data);
+    let guest_id = vox_core::node::link::b32_decode(&guest_id, "guest fingerprint")
+        .expect("APPARATUS: guest fingerprint");
+    let rt = hostile::Rt::new();
+    let answer = rt.block_on(async {
+        let (_endpoint, conn) = hostile::connect(
+            &signer,
+            guest_listen
+                .parse()
+                .expect("APPARATUS: guest listen address"),
+            guest_id,
+        )
+        .await;
+        let (mut send, mut recv) = open_typed(&conn, StreamKind::Circuit)
+            .await
+            .expect("APPARATUS: open circuit stream");
+        write_frame(
+            &mut send,
+            &CircuitFrame::Incoming {
+                peer: [0x71; 32],
+                origin: [[0; 16]; 3],
+            }
+            .to_bytes(),
+        )
+        .await
+        .expect("APPARATUS: send circuit introduction");
+        read_frame_within(&mut recv, 256, Duration::from_secs(10)).await
+    });
+    let refused = match &answer {
+        Ok(Some(frame)) => matches!(
+            CircuitFrame::from_bytes(frame),
+            Ok(CircuitFrame::Refused {
+                reason: vox_core::node::circuitstream::CircuitRefusal::NotAuthorized
+            })
+        ),
+        Err(vox_core::error::Error::PeerRefused(
+            vox_core::wire::WireError::AuthenticatorInvalid,
+        )) => true,
+        _ => false,
+    };
+    assert!(refused, "PRODUCT: the former direct responder did not receive a coded refusal when introducing a stranger: {answer:?}");
+    println!("[proof] the former direct responder's stranger introduction was refused");
+}
+
+/// FX-64: the responder is a scoped anchor for a different room already held by the joiner.
+#[test]
+#[ignore = "real daemons and production Argon2id; run in release with test-knobs"]
+fn a_direct_responder_that_is_another_rooms_anchor_receives_publication() {
+    watchdog::arm();
+    test_knobs::require(&["VOX_TEST_ADVERTISE", "VOX_TEST_HOLD_ROOM_JOIN_AFTER_BOARD"]);
+    let host = Account::new();
+    let guest = Account::new();
+    let host_id = host.make_node("host");
+    let guest_id = guest.make_node("guest");
+    let host_port = free_v6_udp_port();
+    let host_listen = format!("[::1]:{host_port}");
+    let guest_listen = format!("[::1]:{}", free_v6_udp_port());
+    let arm = guest.data.join("overlap-arm");
+    let engaged = guest.data.join("overlap-engaged");
+    let release = guest.data.join("overlap-release.sock");
+    let hold = format!(
+        "guest\t{}\t{}\t{}",
+        arm.display(),
+        engaged.display(),
+        release.display()
+    );
+    let mut hd = Daemon::start(
+        &host,
+        &["--node", "host"],
+        &[
+            ("VOX_LISTEN", &host_listen),
+            ("VOX_TEST_ADVERTISE", &host_listen),
+        ],
+    );
+    hd.expect_apparatus_event("host Ready", |line| line.contains("host is Ready"));
+    let mut gd = Daemon::start(
+        &guest,
+        &["--node", "guest"],
+        &[
+            ("VOX_LISTEN", &guest_listen),
+            ("VOX_TEST_HOLD_ROOM_JOIN_AFTER_BOARD", &hold),
+        ],
+    );
+    gd.expect_apparatus_event("guest Ready", |line| line.contains("guest is Ready"));
+    let scope = make_room(&guest, "guest");
+    let spec = format!("{host_id}@/ip6/::1/udp/{host_port}");
+    let (ok, out, err) = guest.run(
+        &["room", "anchors", "--node", "guest", &scope, "add", &spec],
+        "",
+    );
+    assert!(
+        ok,
+        "PRODUCT (staging): install the other room's signed anchor: {out}{err}"
+    );
+    let (ok, anchors, err) = guest.run(&["anchor", "list", "--json"], "");
+    assert!(
+        ok && anchors.contains(&host_id) && anchors.contains(&scope),
+        "PRODUCT (staging): the other room did not expose its signed anchor: {anchors}{err}"
+    );
+    let room = make_room(&host, "host");
+    let (ok, link, err) = host.run(&["room", "link", &room, "--node", "host"], "");
+    assert!(ok, "PRODUCT (staging): direct room link: {link}{err}");
+    assert!(
+        link.contains(&format!("m={host_id}")),
+        "PRODUCT (staging): the joining link does not name the responder as a direct member: {link}"
+    );
+    let room_id = vox_core::node::link::b32_decode(
+        link.trim()
+            .strip_prefix("vox://")
+            .and_then(|s| s.get(..52))
+            .expect("APPARATUS: full room in link"),
+        "room",
+    )
+    .expect("APPARATUS: valid room id");
+    let host_id = vox_core::node::link::b32_decode(&host_id, "host").expect("APPARATUS: host id");
+    let guest_id =
+        vox_core::node::link::b32_decode(&guest_id, "guest").expect("APPARATUS: guest id");
+    std::fs::write(&arm, b"hold after direct publication\n").expect("APPARATUS: arm join hold");
+    let mut join = guest
+        .cmd(&[
+            "room",
+            "join",
+            "--node",
+            "guest",
+            "--passphrase-file",
+            "-",
+            link.trim(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("APPARATUS: start direct join");
+    join.stdin
+        .take()
+        .expect("APPARATUS: join stdin")
+        .write_all(ROOM_PASS.as_bytes())
+        .expect("APPARATUS: send room passphrase");
+    wait_for_command_marker(
+        &engaged,
+        &mut join,
+        gd.child.id(),
+        Instant::now() + RETURN_WITHIN,
+        "direct join's publication hold",
+    );
+    let rt = hostile::Rt::new();
+    let deadline = Instant::now() + RETURN_WITHIN;
+    loop {
+        let exposed = remote_board_serves_member(
+            &rt,
+            host_listen.parse().expect("APPARATUS: host address"),
+            host_id,
+            room_id,
+            guest_id,
+        );
+        if exposed == (true, true) {
+            break;
+        }
+        assert!(Instant::now() < deadline,
+            "PRODUCT: the direct responder which is another room's anchor did not serve the joiner's member and bundle records: {exposed:?}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::os::unix::net::UnixStream::connect(&release).expect("APPARATUS: release held join");
+    let joined = join
+        .wait_with_output()
+        .expect("APPARATUS: collect joined command");
+    assert!(
+        joined.status.success(),
+        "PRODUCT (staging): held join failed: {joined:?}"
+    );
+    println!("[proof] the direct responder that is another room's anchor serves the join records");
+}
 
 /// A join can publish to the member that answered it before the final Computer-policy fence.
 /// Hold that exact join, observe both accepted records on the responder's real board, move policy,
@@ -6611,6 +6849,7 @@ fn rejected_join_records_leave_remote_board(
     );
     let rt = hostile::Rt::new();
     let accepted_by = Instant::now() + RETURN_WITHIN;
+    let direct_publication = std::env::var("VOX_PROOF_STEP").as_deref() == Ok("direct-publication");
     loop {
         let exposed = remote_board_serves_member(&rt, board_address, board_id, room_id, member_id);
         if exposed == (true, true) {
@@ -6618,11 +6857,29 @@ fn rejected_join_records_leave_remote_board(
         }
         assert!(
             Instant::now() < accepted_by,
-            "APPARATUS: the responder's real board never accepted both delta join records before the policy-change claim was measured; member {}, bundle {}",
+            "{}: the responder's real board never accepted both delta join records; member {}, bundle {}",
+            if direct_publication { "PRODUCT" } else { "PRODUCT (staging)" },
             exposed.0,
             exposed.1
         );
         std::thread::sleep(Duration::from_millis(100));
+    }
+    if direct_publication {
+        println!(
+            "[proof] the directly reached member's board serves delta's member and bundle records"
+        );
+        std::os::unix::net::UnixStream::connect(join_release)
+            .expect("APPARATUS: release delta's held join");
+        let joined = join
+            .wait_with_output()
+            .expect("APPARATUS: collect delta's released join");
+        assert!(
+            joined.status.success(),
+            "PRODUCT: delta's direct join failed after publication: stdout {}; stderr {}",
+            String::from_utf8_lossy(&joined.stdout),
+            String::from_utf8_lossy(&joined.stderr)
+        );
+        return db;
     }
 
     let before = computer(b, &["status"])["revision"].as_u64().unwrap_or(0);

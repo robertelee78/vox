@@ -270,6 +270,11 @@ For the constructor boundary independently of the full journey, set
 for the complete FX-28 journey; it stages the paired Computers and exercises the original create,
 room ID, join and bidirectional posts.
 
+For FX-64's direct-publication boundary, set `VOX_PROOF_STEP=direct-publication` on the same
+command. This focused step stages the paired Computers and asserts that the directly reached
+member's board serves the joiner's member and bundle records; it does not replace the full FX-28
+journey.
+
 FX-28's executable mutants are run one at a time with
 `scripts/run-fx28-mutant.sh <mode>`, where `<mode>` is
 `preview-approval-not-durable`, `stopped-reader-fresh-write`, `lock-through-computer-write`,

@@ -40,10 +40,11 @@
   amended 2026-11-02 (FX-47: local Session projection demand independent of peer-support waits);
   amended 2026-11-02 (FX-52: direction-independent authenticated computer enrollment);
   amended 2026-11-07 (FX-61a: retain unadmitted construction across policy supersession,
-  separately from FX-61b's blocked governance/key-package investigation)
+  separately from FX-61b's blocked governance/key-package investigation); amended 2026-11-07
+  (FX-64: a direct member route is not an anchor, and join publication targets it)
 - **Deciders**: Robert E. Lee
 - **Tags**: trust, daemon identity, sessions, presence, agent comms, sync, health, releases
-- **Related**: ADR-018, ADR-020, ADR-026, ADR-029, ADR-031, ADR-033, ADR-034, ADR-035, ADR-036,
+- **Related**: ADR-012, ADR-018, ADR-020, ADR-026, ADR-029, ADR-031, ADR-033, ADR-034, ADR-035, ADR-036,
   ADR-037
 
 ## Context
@@ -1525,7 +1526,37 @@ lessons. It changes neither this record's decision status nor any requirement or
   A retained passphrase cannot undo removal. Explicit creator readmission, concurrency,
   stale-egress, non-admin, offline catch-up and replacement-identity inverses require actual
   product proof; no retroactive secrecy or instantaneous partition-wide enforcement is claimed.
-- **FX-63. Review and release boundary.** Record each FX-53–FX-62 outcome individually in
+- **FX-64. Direct publication target.** Every link route the link marks as a member that a joiner
+  dials while finding a board (all routes raced by `reach_a_board`, whether selected or not, and
+  `another_board_with_the_room`) is reported as a board dial and inserted into the global anchor
+  classification, which is never pruned and which network policy admits as anchors for the
+  daemon's lifetime. Metadata publication then skips that peer unless it is a configured or room
+  anchor of that room. While that peer is not a current member of any held room — during the join
+  before admission, and after the joiner leaves the only shared room — the anchor class lets it
+  open sync and circuit streams, introduce any origin into coord and circuit sessions, have its
+  circuit tags trusted, and be relayed to any peer. It also counts as a known anchor, which can
+  suppress a later join's immediate no-route failure. This contradicts ADR-012 N-18, N-19 and N-34
+  and AGENTS.md's anchor rules. A member route MUST NOT enter the anchor classification or
+  network-policy anchors. Non-member link routes keep their current board and anchor treatment.
+  Join publication MUST deduplicate the responder against the peers the room's anchor loop already
+  offered for admission, not against the anchor classification, so that a directly reached member
+  receives its member, bundle and address records even when it is independently classified as an
+  anchor. Real anchors MUST continue to serve their configured room scopes unchanged, per ADR-012.
+  Proof (ADR-018 §9, §10.10, §12.2) through shipped binaries:
+  (a) In `nodes_of_one_daemon_proof`'s `two_paired_computers_that_are_idle_exchange_nothing`,
+  the direct-link staging's red when the responder's real board never serves the joiner's member and
+  bundle records MUST be labelled `PRODUCT (staging):`, not `APPARATUS:`. A direct-link journey,
+  that proof's or an extended one, MUST assert as `PRODUCT:` that the responder's real board serves
+  those records, and that assertion MUST be red under a mutant restoring both the member-route
+  classification and the old selector.
+  (b) `nodes_of_one_daemon_proof`'s `a_former_direct_responder_cannot_introduce_a_stranger`
+  MUST refuse a stranger introduction after the former host's only shared room is left, and MUST
+  be red under a classification-only mutant. (c) Its
+  `a_direct_responder_that_is_another_rooms_anchor_receives_publication` MUST show publication
+  to a direct member also scoped as an anchor of another held room, and MUST be red under an
+  old-selector-only mutant.
+  (d) `a_rooms_own_anchor_is_redialled_proof` covers real-anchor room scopes and MUST stay green.
+- **FX-63. Review and release boundary.** Record each FX-53–FX-64 outcome individually in
   v0.4.20, including Designing/Blocked records while decisions or prerequisites remain open.
   Proposed source is not design approval or execution readiness. Before permanent implementation,
   obtain independent Opus review of the complete RCA/ADR/task design and resolve every finding;
