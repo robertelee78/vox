@@ -5038,6 +5038,249 @@ fn enrolled_computers_follow_node_changes_and_retire_removed_authority() {
     eprintln!("[proof] #801/#802 changed roster, personal drive, removal, transfer, recovery and deliberate re-enrollment outcomes passed");
 }
 
+/// FX-61b: an expired grant must become visible after its selected governance turn loses policy.
+#[cfg(feature = "optional-proofs")]
+fn superseded_governance_resumes() {
+    test_knobs::require(&[
+        "VOX_TEST_EXPIRING_ADMIN",
+        "VOX_TEST_HOLD_FX61_GOVERNANCE",
+        "VOX_TEST_HOLD_PERIODIC_SETTLEMENT_FILE",
+    ]);
+    let source = Account::new();
+    let member = Account::new();
+    let control = Account::new();
+    source.make_node("alpha");
+    let beta = member.make_node("beta");
+    member.make_node("delta");
+    control.make_node("control");
+    let source_listen = format!("127.0.0.1:{}", port_forward::free_v4_udp_port());
+    let member_listen = format!("127.0.0.1:{}", port_forward::free_v4_udp_port());
+    let control_listen = format!("127.0.0.1:{}", port_forward::free_v4_udp_port());
+    let arm = member.data.join("fx61-arm");
+    let engaged = member.data.join("fx61-engaged");
+    let release = member.data.join("fx61-release");
+    let spec = format!(
+        "beta\t{}\t{}\t{}",
+        arm.display(),
+        engaged.display(),
+        release.display()
+    );
+    let mut da = Daemon::start(
+        &source,
+        &["--node", "alpha"],
+        &[
+            ("VOX_TEST_EXPIRING_ADMIN", "1"),
+            ("VOX_LISTEN", &source_listen),
+        ],
+    );
+    // Otherwise the unrelated one-second settlement can create its own native owner and
+    // wake governance, masking the lost policy-owner wake. The marker names only this room;
+    // the timer and settlement of every other room remain live.
+    let periodic_hold = engaged.to_string_lossy().into_owned();
+    let mut db = Daemon::start(
+        &member,
+        &["--node", "beta"],
+        &[
+            ("VOX_TEST_HOLD_FX61_GOVERNANCE", &spec),
+            ("VOX_TEST_HOLD_PERIODIC_SETTLEMENT_FILE", &periodic_hold),
+            ("VOX_LISTEN", &member_listen),
+        ],
+    );
+    let mut dc = Daemon::start(
+        &control,
+        &["--node", "control"],
+        &[("VOX_LISTEN", &control_listen)],
+    );
+    da.expect_apparatus_event("alpha Ready", |line| line.contains("alpha is Ready"));
+    db.expect_apparatus_event("beta Ready", |line| line.contains("beta is Ready"));
+    dc.expect_apparatus_event("control Ready", |line| line.contains("control is Ready"));
+    let (ok, out, err) = member.run(&["node", "unlock", "delta", "--passphrase-file", "-"], PASS);
+    assert!(
+        ok,
+        "APPARATUS: ready delta for Computer policy application: {out}{err}"
+    );
+    computer(&member, &["personal", "beta"]);
+    computer(&control, &["personal", "control"]);
+    let invite = computer(&member, &["invite"]);
+    let preview = computer(
+        &control,
+        &[
+            "pair",
+            invite["invite_link"]
+                .as_str()
+                .expect("APPARATUS: invite link"),
+            "--preview",
+        ],
+    );
+    let op = preview["pairing"]["operation_id"]
+        .as_str()
+        .expect("APPARATUS: pairing operation");
+    computer(&control, &["approve", op]);
+    computer(&member, &["approve", op]);
+    let mut member_status = serde_json::Value::Null;
+    let mut control_status = serde_json::Value::Null;
+    assert!(
+        wait_until(RETURN_WITHIN, || {
+            member_status = computer(&member, &["status"]);
+            control_status = computer(&control, &["status"]);
+            member_status["state"] == "confirmed" && control_status["state"] == "confirmed"
+        }),
+        "APPARATUS: Computer pairing did not settle: member {member_status}; control {control_status}; beta {}; control {}",
+        db.said(), dc.said()
+    );
+    let room = make_room(&source, "alpha");
+    let (ok, link, err) = source.run(&["room", "link", &room, "--node", "alpha"], "");
+    assert!(ok, "APPARATUS: obtain room link: {err}");
+    let (ok, out, err) = member.run(
+        &[
+            "room",
+            "join",
+            link.trim(),
+            "--node",
+            "beta",
+            "--passphrase-file",
+            "-",
+        ],
+        ROOM_PASS,
+    );
+    assert!(ok, "APPARATUS: join room: {out}{err}");
+    let admins = || member.run(&["room", "admin", "list", &room, "--node", "beta"], "");
+    assert!(
+        wait_until(RETURN_WITHIN, || admins().0),
+        "APPARATUS: initial admin list unavailable"
+    );
+    let (ok, baseline, err) = admins();
+    assert!(
+        ok && !baseline.contains(&beta),
+        "APPARATUS: beta was already an admin before the staged grant: {baseline}{err}"
+    );
+    let grant_at = Instant::now();
+    let (ok, out, err) = source.run(
+        &["room", "admin", "add", &room, &beta, "--node", "alpha"],
+        "",
+    );
+    assert!(
+        ok,
+        "APPARATUS: issue expiring signed admin grant: {out}{err}"
+    );
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            let (ok, out, _) = admins();
+            ok && out.contains(&beta)
+        }),
+        "APPARATUS: beta never saw its actual unexpired admin grant"
+    );
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &da.child.id().to_string()])
+            .status()
+            .is_ok_and(|status| status.success()),
+        "APPARATUS: stop the source before the grant expires"
+    );
+    assert!(
+        wait_until(Duration::from_secs(10), || da
+            .child
+            .try_wait()
+            .ok()
+            .flatten()
+            .is_some()),
+        "APPARATUS: source did not stop cleanly"
+    );
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            let (ok, out, _) = member.run(&["status", "--json", "--node", "beta"], "");
+            if !ok {
+                return false;
+            }
+            let Ok(status) = serde_json::from_str::<serde_json::Value>(&out) else {
+                return false;
+            };
+            status["governance_pending"] == false
+                && status["rooms"].as_array().is_some_and(|rooms| {
+                    rooms.iter().all(|room| {
+                        room["received_key_generations"] == 0
+                            && room["key_packages_pending"] == false
+                            && room["members"].as_array().is_some_and(|members| {
+                                members
+                                    .iter()
+                                    .all(|m| m["me"] == true || m["connected"] == false)
+                            })
+                    })
+                })
+                && status["lanes"]["budget"]["flow_state"]["running"]
+                    .as_array()
+                    .is_some_and(|running| running.is_empty())
+                && status["lanes"]["bounded"]["running"]
+                    .as_array()
+                    .is_some_and(|running| running.iter().all(serde_json::Value::is_null))
+        }),
+        "APPARATUS: source/effect/native work did not drain"
+    );
+    assert!(
+        grant_at.elapsed() < Duration::from_secs(17),
+        "APPARATUS: setup consumed the expiring grant"
+    );
+    std::fs::write(&arm, b"arm").expect("APPARATUS: arm deadline-selected governance");
+    wait_for_daemon_marker(
+        &engaged,
+        &mut db,
+        Instant::now() + Duration::from_secs(30),
+        "the sole deadline-triggered ordinary governance selection",
+    );
+    assert_eq!(
+        std::fs::read_to_string(arm.with_extension("selected"))
+            .expect("APPARATUS: selected authority"),
+        "current",
+        "APPARATUS: selected governance did not initially hold current authority"
+    );
+    let (ok, held, err) = admins();
+    assert!(
+        (ok && held.contains(&beta)) || err.contains("room governance is refreshing"),
+        "APPARATUS: expired grant was already folded before the held turn: {held}{err}"
+    );
+    let old = computer(&member, &["status"])["revision"]
+        .as_u64()
+        .expect("APPARATUS: policy revision");
+    computer(&member, &["personal", "delta"]);
+    assert!(
+        wait_until(RETURN_WITHIN, || computer(&member, &["status"])["revision"]
+            .as_u64()
+            .is_some_and(|revision| revision > old)),
+        "APPARATUS: durable policy did not supersede the selected authority"
+    );
+    std::os::unix::net::UnixStream::connect(&release)
+        .expect("APPARATUS: release selected governance");
+    let released = arm.with_extension("released");
+    wait_for_daemon_marker(
+        &released,
+        &mut db,
+        Instant::now() + RETURN_WITHIN,
+        "the stale selection's release",
+    );
+    assert_eq!(
+        std::fs::read_to_string(&released).expect("APPARATUS: release result"),
+        "superseded",
+        "APPARATUS: selection was not actually superseded"
+    );
+    assert!(
+        wait_until(RETURN_WITHIN, || {
+            let status = computer(&member, &["status"]);
+            status["state"] == "confirmed"
+                && status["revision"]
+                    .as_u64()
+                    .is_some_and(|revision| revision > old)
+        }),
+        "APPARATUS: replacement policy was not accepted"
+    );
+    let mut shown = String::new();
+    let observed = wait_until(Duration::from_secs(15), || {
+        let (ok, out, err) = admins();
+        shown = format!("{out}{err}");
+        ok && !out.contains(&beta)
+    });
+    assert!(observed, "PRODUCT: after the accepted policy superseded the only selected governance turn, `vox room admin list` did not show the expired admin role removed: {shown}");
+}
+
 /// **Two paired computers follow each other's changes and are idle otherwise** (ADR-038 FX-15,
 /// FX-28; #989, #1020): alpha and beta, two data roots with a daemon each, pair as computers
 /// (`vox computer invite`, `pair --preview`, `approve` on both) and both report `confirmed`.
@@ -5106,6 +5349,17 @@ fn enrolled_computers_follow_node_changes_and_retire_removed_authority() {
 #[ignore = "optional five minutes of two real vox daemons paired as computers; run in release with optional-proofs"]
 fn two_paired_computers_that_are_idle_exchange_nothing() {
     watchdog::arm();
+    let step = std::env::var("VOX_PROOF_STEP").ok();
+    if std::env::var_os("VOX_MUTANT_FX28").is_none()
+        && step
+            .as_deref()
+            .is_none_or(|step| step == "superseded-governance")
+    {
+        superseded_governance_resumes();
+    }
+    if step.as_deref() == Some("superseded-governance") {
+        return;
+    }
     test_knobs::require(&[
         "VOX_TEST_ADVERTISE",
         "VOX_TEST_CLOCK_STEP_MS",

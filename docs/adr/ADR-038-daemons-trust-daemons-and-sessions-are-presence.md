@@ -10,8 +10,8 @@
   For v0.4.20, independent Opus reviews approved FX-55–FX-57, FX-59–FX-60 and FX-63 at
   `37b0ffbf4`, FX-53–FX-54 at `e8ad3b894`, and FX-58/FX-62 at `0f5988648`.
   These nine corrective designs are accepted, not implemented or release-approved.
-  FX-61a's constructor design is approved; FX-61b remains Designing/Blocked until its
-  consumer-sensitive causal boundary is established. Neither slice is accepted or delivered.
+  FX-61a's constructor design is approved. FX-61b's ordinary governance defect is proven at
+  the consumer boundary and corrected here; independent acceptance remains separate.
   The operator selected minimal non-secret leave continuity retention and automatic empty
   initialization when prior history cannot be derived; known signed history/conflicts remain
   protected. Technical approval, actual acceptance and publication are separate.
@@ -39,8 +39,8 @@
   amended 2026-11-02 (FX-48: precommit provider-cursor preparation and reservation readiness);
   amended 2026-11-02 (FX-47: local Session projection demand independent of peer-support waits);
   amended 2026-11-02 (FX-52: direction-independent authenticated computer enrollment);
-  amended 2026-11-07 (FX-61a: retain unadmitted construction across policy supersession,
-  separately from FX-61b's blocked governance/key-package investigation); amended 2026-11-07
+  amended 2026-11-07 (FX-61a: retain unadmitted construction across policy supersession;
+  FX-61b: observed ordinary-governance loss and retained-policy handoff); amended 2026-11-07
   (FX-64: a direct member route is not an anchor, and join publication targets it)
 - **Deciders**: Robert E. Lee
 - **Tags**: trust, daemon identity, sessions, presence, agent comms, sync, health, releases
@@ -1422,7 +1422,7 @@ lessons. It changes neither this record's decision status nor any requirement or
   their product assertions; a client without successful invitation PoP MUST receive no group
   history. Failure to stage that client is an apparatus failure, not a confidentiality proof.
 
-### v0.4.20 incident corrections — scoped design approval, not built
+### v0.4.20 incident corrections — scoped designs and implementation record
 
 - **FX-53. Failed join recovery.** A failed join or policy-rejected reopen MUST NOT install a
   terminal whole-room board withdrawal. Corrected retry on the same daemon MUST exchange
@@ -1515,11 +1515,20 @@ lessons. It changes neither this record's decision status nor any requirement or
   as the sole cause of the historical screenshot. “Only on this machine” means no acknowledged
   peer holding is known; it is not proof no bytes ever arrived. Health must identify actionable
   room recovery/integrity failure rather than falsely claiming nothing needs attention.
-  The current green overlap does not supply a consumer-sensitive regression. Before Ready,
-  stage selected-then-superseded key delivery as the only pending obligation for a newly
-  admitted member, with no later unrelated command, and observe its actual fresh read. A
-  source queue assertion or unstaged mutant is invalid. Until that causal consumer boundary
-  is proved, this correction remains Designing/Blocked, not an invented accepted defect.
+  A consumer-sensitive diagnostic established the governance defect: after a real expiring admin
+  grant's ordinary governance turn was selected and superseded by a Computer policy, `vox room
+  admin list` repeatedly said governance was refreshing even after policy acceptance. It answered
+  only after an incidental one-second settlement tick woke governance; the recovery depended on
+  unrelated pending work, not the policy owner. The correction retains the exact room instance and
+  ordinary-work obligation without stale authority, coalesces it, and wakes its governance owner
+  when the replacement policy completes. A late stale-worker rejection also wakes it if that policy
+  has already completed; detached or replaced instances are retired. The saved key-package path
+  already resumed its retained catalog on managed policy completion, independently of this fix.
+  The real-binary journey isolates this owner handoff with a test-only hold of periodic
+  settlement for the selected room; the timer and other rooms continue, so the incidental tick
+  cannot repair the dropped-work mutant during the consumer verdict.
+  The historical screenshot is not attributed to this defect. Other FX-61b claims, including
+  permanent and malformed refusals, still require their own evidence.
 - **FX-62. Remove a room member.** Deliver ADR-007 G-28–G-32, ADR-012 N-27a–N-27c and ADR-028
   K-26: creator/admin removal targets one exact room-member identity, preserves signed history,
   unrelated rooms and global trust, and excludes future access under current room authority.

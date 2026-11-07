@@ -60,6 +60,9 @@ pub(super) struct Maintenance {
     /// to report that the durable admin change failed.
     pub(super) admin_rosters: BTreeSet<Digest32>,
     pub(super) removal: Option<Removal>,
+    /// Ordinary turns rejected by a superseding policy, fenced to their original attachment.
+    pub(super) policy_interrupted:
+        BTreeMap<Digest32, (std::sync::Weak<tokio::sync::Mutex<ChannelState>>, u64)>,
 }
 
 impl Maintenance {
@@ -154,6 +157,22 @@ pub(super) struct Removal {
 }
 
 impl Node {
+    pub(super) fn resume_interrupted_governance(&mut self) {
+        for (room, (instance, attachment)) in
+            std::mem::take(&mut self.governance_work.policy_interrupted)
+        {
+            if attachment == self.delivery_epoch
+                && self.channels.get(&room).is_some_and(|current| {
+                    instance
+                        .upgrade()
+                        .is_some_and(|old| Arc::ptr_eq(current, &old))
+                })
+            {
+                self.governance_work.wake_room(room);
+            }
+        }
+    }
+
     pub(super) fn begin_admin_removal(
         &mut self,
         room: Digest32,
@@ -276,6 +295,7 @@ impl Node {
             self.governance_work.settled.clear();
             self.governance_work.deadlines.clear();
             self.governance_work.deadline_order.clear();
+            self.governance_work.policy_interrupted.clear();
             return;
         }
         use std::ops::Bound::{Excluded, Unbounded};

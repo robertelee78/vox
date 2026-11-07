@@ -230,6 +230,20 @@ impl Node {
                     self.finish_legacy_cleanup_turn(room, owner, turn);
                 }
                 After::Turn(_) => {
+                    if matches!(error, Error::ComputerPolicySuperseded) {
+                        if self.pending_policy.is_none() && self.computer_authority_current() {
+                            // The replacement policy can finish before this stale worker returns.
+                            self.governance_work.wake_room(room);
+                        } else {
+                            self.governance_work.policy_interrupted.insert(
+                                room,
+                                (
+                                    Arc::downgrade(&continuation.instance),
+                                    continuation.attachment,
+                                ),
+                            );
+                        }
+                    }
                     if ChannelState::governance_refreshing(&error)
                         || ChannelState::legacy_classification_refreshing(&error)
                         || matches!(
@@ -293,6 +307,12 @@ impl Node {
         let saved = match result {
             Ok(saved) => saved,
             Err(error) => {
+                if matches!(error, Error::ComputerPolicySuperseded)
+                    && matches!(&continuation.after, After::Turn(_))
+                {
+                    self.reject_owned_governance(room, error, continuation, reply);
+                    return;
+                }
                 if matches!(
                     &continuation.after,
                     After::Turn(Turn {
