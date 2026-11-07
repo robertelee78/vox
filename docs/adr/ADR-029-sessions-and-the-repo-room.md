@@ -252,7 +252,9 @@ me specify one if not".)
   setup, installation, diagnostics, room binding, real session identity and lifecycle, activity
   publication, discovery and authorized Session interaction MUST cover it, not merely rename
   another harness's messages. Integration MUST use Oh My Pi's actual supported session and
-  extension contracts and MUST NOT require changes to Oh My Pi itself. In particular, eligible
+  extension contracts. Robert's 2026-11-06 source-backed correction explicitly permits the
+  narrowly scoped public transition-settlement API in P420-OR-6; other integration MUST NOT
+  depend on private OMP APIs or require unrelated OMP changes. In particular, eligible
   urgent room messages MUST reach the intended
   already-running Oh My Pi session through native message delivery, without tmux or simulated
   terminal input. Normal room attention MUST retain its existing read/addressing authorization;
@@ -283,9 +285,10 @@ me specify one if not".)
 
 The operator selected these product outcomes. Independent Opus review of `37b0ffbf4` approved
 P420-RB-1–5, P420-OD-1–4 and P420-OP-1–4 at design level; implementation, consumer acceptance
-and publication are not approved. P420-OR remains proposed and blocked on its review findings.
+and publication are not approved. P420-OR's scoped design approvals and the additional
+source-discovered transition prerequisite are recorded in the review documents.
 Existing node identity, membership, read and Drive safeguards remain required. Repository
-replacement narrows agent `--none` permission; ST-4's supported-API/no-OMP-change rule remains.
+replacement narrows agent `--none` permission; ST-4 now permits only P420-OR-6's explicit OMP change.
 
 ### Repository decision and deliberate rebind
 
@@ -448,6 +451,36 @@ replacement narrows agent `--none` permission; ST-4's supported-API/no-OMP-chang
   delayed-write inverses on every write path, daemon linger, old extension reload guidance,
   and an actual v0.4.19 CLI/daemon upgrade cohort through post-update Ready and Locked
   guidance. No version-check bypass or real-profile proof is permitted.
+
+- **P420-OR-6. Authoritative native transition settlement.** The OMP source at
+  `dc295ad286692e9668914cfb44127097039b2f3e`, provided at `/opt/oh-my-pi`, already owns an
+  outermost transition scope, but does not expose its settlement to extensions. Later
+  before-handlers can cancel after Vox, post-event work can roll back without a compensating
+  Session event, and reset can transition silently. `isIdle`, a timer, Session ID or branch
+  ancestry alone MUST NOT be substituted for that boundary.
+
+  Add a read-only public `ctx.sessionTransition` with monotonic `epoch`, synchronous `active`,
+  and `waitForSettled(epoch)` returning the actual `{epoch, sessionId, leafId}`. Increment
+  the epoch at the outermost depth 0→1 before any await; nested transitions share it.
+  Resolve only at depth zero after every cancellation, exception, rollback or success,
+  reading the final identity and leaf synchronously. The API MUST NOT delay, cancel or
+  reorder transitions and MUST introduce no new event stream.
+
+  Vox's before-handlers retire old authority and schedule a continuation, never await
+  settlement inside a transition handler. Switch/branch/tree handlers also only schedule.
+  After settlement, re-read the live manager and synchronously recheck inactive state,
+  epoch, Session ID and leaf before installing fresh authority. Recheck after each await,
+  including register completion; obsolete continuations drop, changed epochs retire and
+  reconcile. Materialization and provider-request boundaries check the captured epoch,
+  not just identity/ancestry, including silent reset and same-ID/branch ABA.
+
+  Missing API means Vox registration is unavailable with explicit guidance that a new
+  OMP runtime build containing this API is required; ordinary OMP continues. Refreshing
+  `vox.ts` alone cannot add it to installed Tern OMP 18.18.0. Implement and prove the
+  upstream change in a private checkout, without changing the operator's running install.
+  Prove delayed successful transitions, later-handler cancellation, exceptions and rollback,
+  silent reset, nesting and ABA against the built native OMP/Vox candidates; no internal
+  value assertion substitutes for correct room routing, delivery and stale-write refusal.
 
 ### OMP private Drive
 

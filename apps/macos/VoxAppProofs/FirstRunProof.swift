@@ -4693,6 +4693,8 @@ final class FirstRunProof: XCTestCase {
             throw Product("the app's New Room made no room alice's `vox room list` lists: \(rooms)")
         }
         room = made
+        guard present(ui, Key.id("attached"), timeout: 60,
+                      "the native node must recover observation after room creation before room commands are exercised") else { return }
         NSPasteboard.general.clearContents()
         ui.typeKey("l", modifierFlags: .command)
         var link = ""
