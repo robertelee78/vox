@@ -123,6 +123,27 @@ impl ComputerAuthority {
         Some(ComputerPublication { _managed: managed })
     }
 
+    /// Only a changed durable target is a supersession. A blocked or failed Computer authority,
+    /// or an unsettled application of the same target, is a terminal refusal instead.
+    pub(super) fn superseded(&self) -> crate::error::Result<bool> {
+        match self {
+            Self::Unmanaged => Ok(false),
+            Self::Managed {
+                computer,
+                applied,
+                expired,
+                ..
+            } => {
+                computer.storage_ready()?;
+                if computer.own_key_authority_blocked() {
+                    return Err(Error::Profile("current computer trust is unavailable"));
+                }
+                let target = computer.policy_target();
+                Ok(target.revision() != *applied || target.expired() != *expired)
+            }
+        }
+    }
+
     pub(super) fn publish<T>(&self, publish: impl FnOnce() -> T) -> Option<T> {
         #[cfg(feature = "test-knobs")]
         if crate::node::computer::fx28_mutant("stale-join-authority") {
@@ -137,14 +158,6 @@ impl ComputerAuthority {
                 node,
             } => computer.publish_with_current_authority(*applied, *expired, *node, publish),
         }
-    }
-
-    pub(super) fn publish_room_creation<T>(&self, publish: impl FnOnce() -> T) -> Option<T> {
-        #[cfg(feature = "test-knobs")]
-        if crate::node::computer::fx28_mutant("stale-room-create-authority") {
-            return Some(publish());
-        }
-        self.publish(publish)
     }
 
     /// The pause mutant changes only this publication, so earlier join assertions cannot mask it.
@@ -379,12 +392,47 @@ impl Node {
         let Ok(listener) = tokio::net::UnixListener::bind(release) else {
             return;
         };
-        if std::fs::write(engaged, format!("{action} held\n")).is_err() {
+        let marker = if variable == TEST_HOLD_ROOM_CREATE_PUBLICATION_ENV {
+            format!("{action}\n")
+        } else {
+            format!("{action} held\n")
+        };
+        if std::fs::write(engaged, marker).is_err() {
             return;
         }
         let _ = listener.accept().await;
         let _ = std::fs::remove_file(engaged);
         let _ = std::fs::remove_file(release);
+    }
+
+    /// Hold only the constructor proof's policy application, leaving the actor free.
+    #[cfg(feature = "test-knobs")]
+    pub(super) fn hold_constructor_policy_for_proof(
+        &self,
+    ) -> Option<(
+        tokio::net::UnixListener,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    )> {
+        let spec = std::env::var(TEST_HOLD_COMPUTER_POLICY_ENV).ok()?;
+        let mut fields = spec.splitn(4, '\t');
+        let (node, arm, engaged, release) = (
+            fields.next()?,
+            fields.next()?,
+            fields.next()?,
+            fields.next()?,
+        );
+        let mine = self.paths.profile_dir.file_name()?.to_str()?;
+        if mine != node
+            || std::fs::read(arm).ok()?.as_slice() != b"hold delta's next policy application\n"
+        {
+            return None;
+        }
+        std::fs::remove_file(arm).ok()?;
+        let _ = std::fs::remove_file(release);
+        let listener = tokio::net::UnixListener::bind(release).ok()?;
+        std::fs::write(engaged, b"computer policy application held off actor\n").ok()?;
+        Some((listener, engaged.into(), release.into()))
     }
 
     pub(super) async fn hold_computer_policy_for_proof(&self, guard: &ComputerPolicyGuard) {
@@ -485,10 +533,10 @@ impl Node {
 
     /// Test apparatus: hold one completed room seal after all off-actor work and immediately
     /// before the durable room commit. The marker stages only; shipped create/list output judges.
-    pub(super) async fn hold_room_create_publication_for_proof(&self) {
+    pub(super) async fn hold_room_create_publication_for_proof(&self, room: Digest32) {
         self.hold_authority_use_for_proof(
             TEST_HOLD_ROOM_CREATE_PUBLICATION_ENV,
-            "room create publication",
+            &crate::node::link::b32_encode(&room),
         )
         .await;
     }

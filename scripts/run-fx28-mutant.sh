@@ -88,11 +88,19 @@ case "${1-}" in
     verdict='PRODUCT [FX28 stale-post-authority]:'
     staging='[proof] FX-28 stale-post-authority apparatus staged:'
     ;;
-  stale-room-create-authority)
+  constructor-terminal-refusal)
     mutant=$1
     journey=two_paired_computers_that_are_idle_exchange_nothing
-    verdict='PRODUCT [FX28 stale-room-create-authority]:'
-    staging='[proof] FX-28 stale-room-create-authority apparatus staged:'
+    verdict='PRODUCT [FX28 constructor-re-admission]:'
+    staging="[proof] FX-28 constructor-re-admission apparatus staged: delta's moved Computer policy is held after releasing the sealed create"
+    export VOX_PROOF_STEP=constructor-re-admission
+    ;;
+  constructor-stale-commit)
+    mutant=$1
+    journey=two_paired_computers_that_are_idle_exchange_nothing
+    verdict='PRODUCT [FX28 constructor-stale-publication]:'
+    staging="[proof] FX-28 constructor-re-admission apparatus staged: delta's moved Computer policy is held after releasing the sealed create"
+    export VOX_PROOF_STEP=constructor-re-admission
     ;;
   stale-trust-projection)
     mutant=$1
@@ -113,7 +121,7 @@ case "${1-}" in
     staging='[proof] FX-28 legacy rekey route apparatus staged:'
     ;;
   *)
-    printf '%s\n' "usage: $0 preview-approval-not-durable|stopped-reader-fresh-write|lock-through-computer-write|deadline-as-storage-failure|withdrawal-not-durable|stale-tick-authority|redeem-rejects-pending-registration|owner-refusal-decoded-as-payload|due-backoff-drops-causal-cause|fresh-preview-inherits-old-deadline|detach-keeps-reconciliation|late-application-abandons-work|stale-join-authority|stale-post-authority|stale-room-create-authority|stale-trust-projection|stale-rekey-authority|legacy-ended-unanswered-not-selected" >&2
+    printf '%s\n' "usage: $0 preview-approval-not-durable|stopped-reader-fresh-write|lock-through-computer-write|deadline-as-storage-failure|withdrawal-not-durable|stale-tick-authority|redeem-rejects-pending-registration|owner-refusal-decoded-as-payload|due-backoff-drops-causal-cause|fresh-preview-inherits-old-deadline|detach-keeps-reconciliation|late-application-abandons-work|stale-join-authority|stale-post-authority|constructor-terminal-refusal|constructor-stale-commit|stale-trust-projection|stale-rekey-authority|legacy-ended-unanswered-not-selected" >&2
     exit 2
     ;;
 esac

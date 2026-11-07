@@ -5443,6 +5443,25 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
     let nodes_b = [("beta", beta.as_str()), ("delta", delta.as_str())];
     change_shows_on_both((&b, &db, &nodes_b), (&a, &da, &nodes_a), "delta", None);
 
+    if let Ok(step) = std::env::var("VOX_PROOF_STEP") {
+        assert_eq!(
+            step, "constructor-re-admission",
+            "APPARATUS: unsupported FX-28 journey step"
+        );
+        constructor_re_admission(
+            &a,
+            &b,
+            &db,
+            &stale_create_arm,
+            &stale_create_engaged,
+            &stale_create_release,
+            (&hold_arm, &hold_engaged, &hold_release),
+            &beta,
+            &delta,
+        );
+        return;
+    }
+
     // ---- a durable Computer write cannot wedge status or fabricate storage failure -------
     computer_write_expiry_keeps_status_live(
         (&a, &da, &nodes_a),
@@ -5489,6 +5508,7 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
         &stale_create_arm,
         &stale_create_engaged,
         &stale_create_release,
+        (&hold_arm, &hold_engaged, &hold_release),
         (&beta, &delta),
     );
     let nodes_a = [
@@ -6320,14 +6340,19 @@ fn change_shows_on_both(
         attached.elapsed(),
         names_here[0]
     );
-    // On the other daemon the status must both name an exchange which carried this revision and
-    // show the applied result. The same clock began before the triggering attach; observing an
-    // exchange later cannot reset it and turn a late product result green.
+    // Either a started exchange or a reply to the peer's exchange can carry this daemon's
+    // revision. An inbound reply can supersede the outbound flight, so requiring only a started
+    // exchange would reject an applied change. The other daemon must still show the result within
+    // the same clock begun before attach; observing an exchange cannot reset that clock.
     loop {
         let toward = application_toward(changer, &other_id);
-        let carried = toward["last_started_exchange"]["sent_revision"]
-            .as_u64()
-            .is_some_and(|revision| revision >= revision_here);
+        let carried = ["last_started_exchange", "last_answered_exchange"]
+            .iter()
+            .any(|kind| {
+                toward[*kind]["sent_revision"]
+                    .as_u64()
+                    .is_some_and(|revision| revision >= revision_here)
+            });
         let status = computer(other, &["status"]);
         let names_it = status["nodes"]
             .as_array()
@@ -7211,6 +7236,7 @@ fn stale_remote_pause_is_refused(
     create_arm: &Path,
     create_engaged: &Path,
     create_release: &Path,
+    policy_hold: (&Path, &Path, &Path),
     (beta, delta): (&str, &str),
 ) -> String {
     let room = make_room(b, "delta");
@@ -7540,9 +7566,43 @@ fn stale_remote_pause_is_refused(
         "APPARATUS: nodes did not settle after the stale text-append refusal"
     );
 
-    // Room sealing is off actor and can finish after durable policy moved. Hold the exact sealed
-    // create at its first store commit, move policy through a shipped personal-node command, and
-    // require both the create answer and room list to remain fail closed.
+    constructor_re_admission(
+        a,
+        b,
+        db,
+        create_arm,
+        create_engaged,
+        create_release,
+        policy_hold,
+        beta,
+        delta,
+    );
+    computer(a, &["personal", "alpha"]);
+    assert!(
+        wait_until(RETURN_WITHIN, || {
+            roster_current(&computer(a, &["status"]), &["alpha", "gamma", "epsilon"])
+                && roster_current(&computer(b, &["status"]), &["beta", "delta"])
+        }),
+        "APPARATUS: nodes did not settle after the re-admitted room create"
+    );
+
+    epsilon
+}
+
+#[allow(clippy::too_many_arguments)]
+fn constructor_re_admission(
+    a: &Account,
+    b: &Account,
+    db: &Daemon,
+    create_arm: &Path,
+    create_engaged: &Path,
+    create_release: &Path,
+    (policy_arm, policy_engaged, policy_release): (&Path, &Path, &Path),
+    beta: &str,
+    delta: &str,
+) {
+    // Hold the exact sealed create at its first store commit, then move durable policy. The
+    // original command must resume under current authority without making a different room.
     std::fs::write(create_arm, b"hold delta's sealed room create\n")
         .expect("APPARATUS: arm the stale room-create publication hold");
     let mut create = b
@@ -7574,6 +7634,16 @@ fn stale_remote_pause_is_refused(
         Instant::now() + RETURN_WITHIN,
         "delta's sealed room create at its first durable commit",
     );
+    let held_room = std::fs::read_to_string(create_engaged)
+        .expect("APPARATUS: read the held sealed room ID")
+        .trim()
+        .to_owned();
+    assert!(
+        held_room.len() == 52,
+        "APPARATUS: held room marker did not contain a full room ID: {held_room:?}"
+    );
+    std::fs::write(policy_arm, b"hold delta's next policy application\n")
+        .expect("APPARATUS: arm delta's Computer policy hold");
     let before = computer(b, &["status"])["revision"].as_u64().unwrap_or(0);
     computer(a, &["personal", "gamma"]);
     assert!(
@@ -7586,39 +7656,200 @@ fn stale_remote_pause_is_refused(
         create_engaged.is_file(),
         "APPARATUS: delta's exact sealed room create was not held through policy movement"
     );
-    println!(
-        "[proof] FX-28 stale-room-create-authority apparatus staged: durable Computer policy moved while delta's exact sealed room create remained held at its first durable commit"
-    );
+    let moved_revision = computer(b, &["status"])["revision"].as_u64().unwrap();
     std::os::unix::net::UnixStream::connect(create_release).unwrap_or_else(|error| {
         panic!(
             "APPARATUS: release delta's held room create at {}: {error}",
             create_release.display()
         )
     });
-    let created = create
-        .wait_with_output()
-        .expect("APPARATUS: collect the causally released room-create command");
+    let policy_deadline = Instant::now() + RETURN_WITHIN;
+    while !policy_engaged.is_file() {
+        assert!(
+            daemon_alive(db.child.id()) && Instant::now() < policy_deadline,
+            "APPARATUS: delta's moved Computer policy application did not reach its hold"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    println!(
+        "[proof] FX-28 constructor-re-admission apparatus staged: delta's moved Computer policy is held after releasing the sealed create"
+    );
+    let mut create = Some(create);
+    let mut early = None;
+    let observation_end = Instant::now() + Duration::from_secs(2);
+    loop {
+        let (listed, rooms, list_error) = b.run(&["room", "list", "--node", "delta"], "");
+        assert!(
+            policy_engaged.is_file() && daemon_alive(db.child.id()),
+            "APPARATUS: delta's Computer policy hold disappeared during the room-list observation"
+        );
+        assert!(
+            listed,
+            "APPARATUS: list delta's rooms while Computer policy is held: {rooms}{list_error}"
+        );
+        assert!(
+            !rooms.lines().any(|line| {
+                let mut fields = line.split_whitespace();
+                let id = fields.next().unwrap_or("");
+                let name = fields.next().unwrap_or("");
+                name == "stale-create" || (id.len() == 12 && held_room.starts_with(id))
+            }),
+            "PRODUCT [FX28 constructor-stale-publication]: held room appeared while moved Computer policy was held: held {held_room}; stdout {rooms}; stderr {list_error}"
+        );
+        if create
+            .as_mut()
+            .unwrap()
+            .try_wait()
+            .expect("APPARATUS: inspect held-policy create")
+            .is_some()
+        {
+            let output = create
+                .take()
+                .unwrap()
+                .wait_with_output()
+                .expect("APPARATUS: collect held-policy create");
+            assert!(
+                !output.status.success(),
+                "PRODUCT [FX28 constructor-stale-publication]: original create succeeded while moved Computer policy was held: stdout {}; stderr {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            early = Some(output);
+            break;
+        }
+        if Instant::now() >= observation_end {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::os::unix::net::UnixStream::connect(policy_release).unwrap_or_else(|error| {
+        panic!(
+            "APPARATUS: release delta's held Computer policy at {}: {error}",
+            policy_release.display()
+        )
+    });
+    let cleanup_deadline = Instant::now() + RETURN_WITHIN;
+    while policy_engaged.is_file() {
+        assert!(
+            Instant::now() < cleanup_deadline && daemon_alive(db.child.id()),
+            "APPARATUS: delta's Computer policy hold did not clear after release"
+        );
+        std::thread::yield_now();
+    }
+    let created = if let Some(output) = early {
+        output
+    } else {
+        let mut create = create.take().unwrap();
+        let release_deadline = Instant::now() + RETURN_WITHIN;
+        while create
+            .try_wait()
+            .expect("APPARATUS: inspect released create")
+            .is_none()
+        {
+            if Instant::now() >= release_deadline {
+                let status = b.run(&["status", "--json", "--node", "delta"], "");
+                let _ = create.kill();
+                let output = create
+                    .wait_with_output()
+                    .expect("APPARATUS: collect stalled create");
+                panic!("PRODUCT [FX28 constructor-re-admission]: original create still running after release; delta status {status:?}; stdout {}; stderr {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        create
+            .wait_with_output()
+            .expect("APPARATUS: collect the causally released room-create command")
+    };
     assert!(
-        !created.status.success(),
-        "PRODUCT [FX28 stale-room-create-authority]: after durable Computer policy moved while its exact sealed room was held, shipped `vox room create` still committed and acknowledged it: stdout {}; stderr {}",
+        created.status.success(),
+        "PRODUCT [FX28 constructor-re-admission]: the original sealed room create did not succeed after Computer policy moved: stdout {}; stderr {}",
         String::from_utf8_lossy(&created.stdout),
         String::from_utf8_lossy(&created.stderr)
     );
-    let (listed, rooms, list_error) = b.run(&["room", "list", "--node", "delta"], "");
-    assert!(
-        listed && !rooms.contains("stale-create"),
-        "PRODUCT [FX28 stale-room-create-authority]: delta's shipped room list exposed the stale-authority room after its create was refused: {rooms}{list_error}"
-    );
-    computer(a, &["personal", "alpha"]);
+    let mut current_status = serde_json::Value::Null;
     assert!(
         wait_until(RETURN_WITHIN, || {
-            roster_current(&computer(a, &["status"]), &["alpha", "gamma", "epsilon"])
-                && roster_current(&computer(b, &["status"]), &["beta", "delta"])
+            current_status = computer(b, &["status"]);
+            current_status["revision"].as_u64().is_some_and(|revision| revision >= moved_revision)
+                && roster_current(&current_status, &["beta", "delta"])
         }),
-        "APPARATUS: nodes did not settle after the stale room-create refusal"
+        "PRODUCT [FX28 constructor-re-admission]: beta and delta did not reach the moved Computer policy after the create: {current_status}"
     );
-
-    epsilon
+    let (listed, rooms, list_error) = b.run(&["room", "list", "--node", "delta"], "");
+    let matching: Vec<_> = rooms
+        .lines()
+        .filter(|line| line.split_whitespace().nth(1) == Some("stale-create"))
+        .collect();
+    let held_count = rooms
+        .lines()
+        .filter(|line| {
+            line.split_whitespace()
+                .next()
+                .is_some_and(|id| id.len() == 12 && held_room.starts_with(id))
+        })
+        .count();
+    assert!(
+        listed && matching.len() == 1 && held_count == 1
+            && matching[0].split_whitespace().next().is_some_and(|id| id.len() == 12 && held_room.starts_with(id)),
+        "PRODUCT [FX28 constructor-re-admission]: the held room was not listed exactly once with its original ID: held {held_room}; stdout {rooms}; stderr {list_error}"
+    );
+    let room = matching[0].split_whitespace().next().unwrap();
+    let (linked, link, link_error) = b.run(&["room", "link", room, "--node", "delta"], "");
+    let invite = link.lines().find(|line| line.starts_with("vox://"));
+    assert!(
+        linked && invite.is_some_and(|url| url.strip_prefix("vox://").and_then(|rest| rest.split('?').next()) == Some(held_room.as_str())),
+        "PRODUCT [FX28 constructor-re-admission]: the created room did not provide a link to the held ID: stdout {link}; stderr {link_error}"
+    );
+    let (joined, out, err) = b.run(
+        &[
+            "room",
+            "join",
+            "--node",
+            "beta",
+            "--passphrase-file",
+            "-",
+            invite.unwrap(),
+        ],
+        ROOM_PASS,
+    );
+    assert!(
+        joined,
+        "PRODUCT [FX28 constructor-re-admission]: beta could not join the created room through its link: {out}{err}"
+    );
+    assert!(
+        wait_until(RETURN_WITHIN, || {
+            ["beta", "delta"].iter().all(|node| {
+                let (ok, roster, _) = b.run(&["room", "roster", room, "--node", node], "");
+                ok && roster.contains(beta) && roster.contains(delta)
+            })
+        }),
+        "PRODUCT [FX28 constructor-re-admission]: the created room did not expose both members after beta joined"
+    );
+    for (node, text) in [
+        ("delta", "re-admitted-create-from-delta"),
+        ("beta", "re-admitted-create-from-beta"),
+    ] {
+        let (ok, out, err) = b.run(&["room", "post", room, text, "--node", node], "");
+        assert!(
+            ok,
+            "PRODUCT [FX28 constructor-re-admission]: {node} could not post in the created room: {out}{err}"
+        );
+    }
+    for (node, text) in [
+        ("beta", "re-admitted-create-from-delta"),
+        ("delta", "re-admitted-create-from-beta"),
+    ] {
+        let mut last = (false, String::new(), String::new());
+        assert!(
+            wait_until(RETURN_WITHIN, || {
+                last = b.run(&["room", "read", room, "--node", node], "");
+                last.0 && last.1.contains(text)
+            }),
+            "PRODUCT [FX28 constructor-re-admission]: {node} could not read the other member's post: stdout {}; stderr {}",
+            last.1,
+            last.2
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

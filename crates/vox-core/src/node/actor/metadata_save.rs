@@ -558,21 +558,13 @@ impl Node {
         let room = channel.channel_id();
         let retention = self.node_retention_for(&room);
         let step_retention = self.node_step_retention.for_room(&room);
-        let mut install = || {
+        let install = || {
             channel.set_node_retention(retention);
             channel.set_node_step_retention(step_retention);
         };
-        #[cfg(feature = "test-knobs")]
-        let stale_creation = crate::node::computer::fx28_mutant("stale-room-create-authority");
-        #[cfg(not(feature = "test-knobs"))]
-        let stale_creation = false;
         let accepted = match &lifetime {
-            Some(_) if stale_creation => {
-                install();
-                true
-            }
             Some(held) => held.publish(install).is_some(),
-            None => authority.publish_room_creation(install).is_some(),
+            None => authority.publish(install).is_some(),
         };
         self.begin_metadata_room(
             RoomAfter::Create {

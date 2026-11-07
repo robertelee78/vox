@@ -855,6 +855,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::SessionFiles { .. } => "reading bounded Session file offers",
         NetEvent::MemberDialer(_) => "lending the proxy its dialer",
         NetEvent::ComputerPolicy { .. } => "applying computer trust",
+        NetEvent::ConstructorPolicyFailed { .. } => "retiring a failed constructor policy",
         NetEvent::LocalTrustBlacklist(_) => "reading local trust removal decisions",
         NetEvent::TrustLocalNode { .. } => "applying the daemon's local trust policy",
     }
@@ -1359,6 +1360,9 @@ enum NetEvent {
         guard: computer::ComputerPolicyGuard,
         reply: oneshot::Sender<crate::error::Result<()>>,
         permit: tokio::sync::OwnedSemaphorePermit,
+    },
+    ConstructorPolicyFailed {
+        guard: computer::ComputerPolicyGuard,
     },
     TrustLocalNode {
         fingerprint: Digest32,
@@ -2074,6 +2078,7 @@ impl NetEvent {
                 // Original physical owners must retire without waiting behind their own save.
                 | Self::OwnKeyWriterInterrupted(..)
                 | Self::OwnKeyComputerCancelled { .. }
+                | Self::ConstructorPolicyFailed { .. }
                 | Self::OwnKeyOpenReady(..)
                 | Self::OwnKeyRequestReady(..)
                 | Self::OwnKeyRequestFailed { .. }
@@ -5832,15 +5837,6 @@ struct RoomPublication {
 
 impl RoomPublication {
     fn authority_current(&self) -> bool {
-        #[cfg(feature = "test-knobs")]
-        if self
-            .authority
-            .as_ref()
-            .is_some_and(|(_, ownership, _)| *ownership == RoomPublicationOwnership::Created)
-            && crate::node::computer::fx28_mutant("stale-room-create-authority")
-        {
-            return true;
-        }
         self.authority
             .as_ref()
             .is_none_or(|(_, _, lifetime)| lifetime.publish(|| ()).is_some())
@@ -6271,7 +6267,7 @@ pub struct Node {
     /// initial anchor round ends. Neither room keys nor a snapshot survive a wait.
     publish_waiters: BTreeMap<Digest32, RoomPublication>,
     /// Carried from the first durable room write to the publication waiter. Ownership selects
-    /// both the room-create mutant boundary and whether failed publication may purge new rows.
+    /// whether failed publication may purge new rows.
     room_publication_authority: BTreeMap<Digest32, RoomPublicationAuthority>,
     publication_after: Option<Digest32>,
     publication_pending: bool,
@@ -6473,6 +6469,8 @@ pub struct Node {
     pending_posts: BTreeMap<Digest32, post_save::Pending>,
     parked_private_drives: BTreeMap<Digest32, private_save::ParkedPrivateDrive>,
     pending_policy: Option<policy_save::Pending>,
+    parked_construction: Option<construction_save::Parked>,
+    failed_construction_policy: Option<computer::ComputerPolicyGuard>,
     pending_metadata: Option<metadata_save::Pending>,
     post_save_wake: Arc<tokio::sync::Notify>,
     deferred_commands: std::collections::VecDeque<post_save::DeferredCommand>,
@@ -6956,6 +6954,8 @@ impl Node {
             pending_posts: BTreeMap::new(),
             parked_private_drives: BTreeMap::new(),
             pending_policy: None,
+            parked_construction: None,
+            failed_construction_policy: None,
             pending_metadata: None,
             post_save_wake: Arc::new(tokio::sync::Notify::new()),
             deferred_commands: std::collections::VecDeque::new(),
@@ -7134,6 +7134,7 @@ impl Node {
         // Retain the actual task sets through result/receiver cleanup, blocking joins and
         // exact old Flow retirement. The secret-work barrier alone cannot drop a handed result.
         self.stop_network().await;
+        self.retire_parked_construction(Fault::ShuttingDown);
         if self.lock_all().await.await.is_err() {
             termination.send_modify(|state| {
                 state.failure = Some("node secret cleanup ended without completion".to_owned());
@@ -7287,6 +7288,14 @@ impl Node {
             tokio::pin!(governance_deadline);
             let deferred_commands = &mut self.deferred_commands;
             tokio::select! {
+                () = async {
+                    match self.parked_construction.as_mut() {
+                        Some(parked) => parked.reply.closed().await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    self.parked_construction = None;
+                }
                 () = journal_ready, if journal_busy => {}
                 Some(returned) = self.join_tasks.join_next(), if !self.join_tasks.is_empty() => {
                     self.complete_join_task(returned).await;
@@ -7299,6 +7308,7 @@ impl Node {
                     self.complete_pending_policies().await;
                     self.complete_pending_metadata().await;
                     self.start_own_key_computer_drain();
+                    self.resume_parked_construction();
                     self.resume_peer_book_save();
                 }
                 () = self.availability_wake.notified() => { self.accept_availability(); self.schedule().await; }
@@ -7331,6 +7341,7 @@ impl Node {
                     self.publication_again |= !self.publish_waiters.is_empty();
                     let started = std::time::Instant::now();
                     self.complete_own_key_transitions().await;
+                    self.resume_parked_construction();
                     self.note_if_stalled("resuming publication transitions", started);
                     self.publish().await;
                     self.schedule().await;
@@ -10695,7 +10706,7 @@ impl Node {
                     }
                     Ok(sealed) => {
                         #[cfg(feature = "test-knobs")]
-                        self.hold_room_create_publication_for_proof().await;
+                        self.hold_room_create_publication_for_proof(room).await;
                         self.begin_construct_created(
                             construction_save::Created {
                                 name: room_name,
@@ -10826,6 +10837,12 @@ impl Node {
                     }
                 }
                 self.start_own_key_computer_drain();
+            }
+            NetEvent::ConstructorPolicyFailed { guard } => {
+                if guard.active(self.computer.as_ref()).is_ok() {
+                    self.failed_construction_policy = Some(guard);
+                    self.retire_parked_construction(Fault::ComputerPolicy);
+                }
             }
             NetEvent::OwnKeyPolicyReady { room, owner } => {
                 if self
@@ -12860,9 +12877,28 @@ impl Node {
                 permit,
             } => {
                 #[cfg(feature = "test-knobs")]
+                if let Some((listener, engaged, release)) = self.hold_constructor_policy_for_proof()
+                {
+                    let tx = self.net_tx.clone();
+                    tokio::spawn(async move {
+                        let _ = listener.accept().await;
+                        let _ = std::fs::remove_file(engaged);
+                        let _ = std::fs::remove_file(release);
+                        let _ = tx
+                            .send(NetEvent::ComputerPolicy {
+                                guard,
+                                reply,
+                                permit,
+                            })
+                            .await;
+                    });
+                    return;
+                }
+                #[cfg(feature = "test-knobs")]
                 self.hold_computer_policy_for_proof(&guard).await;
                 #[cfg(feature = "test-knobs")]
                 let reply_delay = self.hold_computer_policy_reply_for_proof();
+                self.failed_construction_policy = None;
                 self.retire_stale_private_drives();
                 self.retire_stale_private_pulls();
                 if reply.is_closed() {
@@ -12876,7 +12912,8 @@ impl Node {
                 let owner = Arc::new(());
                 let cancel_owner = Arc::clone(&owner);
                 let tx = self.net_tx.clone();
-                let (completion, finished) = oneshot::channel();
+                let (completion, finished) = oneshot::channel::<crate::error::Result<()>>();
+                let failure_guard = guard.clone();
                 tokio::spawn(async move {
                     tokio::select! {
                         biased;
@@ -12885,6 +12922,9 @@ impl Node {
                         }
                         result = finished => {
                             if let Ok(result) = result {
+                                if result.as_ref().is_err_and(|error| !matches!(error, Error::ComputerPolicySuperseded)) {
+                                    let _ = tx.send(NetEvent::ConstructorPolicyFailed { guard: failure_guard }).await;
+                                }
                                 #[cfg(feature = "test-knobs")]
                                 if let Some(delay) = reply_delay { tokio::time::sleep(delay).await; }
                                 let _ = reply.send(result);
@@ -18370,6 +18410,7 @@ impl Node {
     async fn lock_all(&mut self) -> oneshot::Receiver<()> {
         self.session_ingress_waits.clear();
         self.session_ingress_scan = 0;
+        self.retire_parked_construction(Fault::Locked);
         self.retire_parked_private_drives(Fault::Locked);
         self.retire_identity_startup();
         self.retire_pending_posts();
@@ -18668,6 +18709,10 @@ impl Node {
         service: Option<(String, SocketAddr)>,
         reply: oneshot::Sender<Outcome>,
     ) {
+        if self.parked_construction.is_some() {
+            let _ = reply.send(Outcome::Failed(Fault::RoomChangePending));
+            return;
+        }
         // A node holds one room of a name (ADR-028 R-3): it is the room part of every address.
         if self.room_named(&room_name).is_some() {
             let _ = reply.send(Outcome::Failed(Fault::RoomNameTaken));
@@ -19726,6 +19771,7 @@ impl Node {
             });
             break;
         }
+        self.resume_parked_construction();
     }
 
     /// Retire sends from all current rooms off actor before committing a keyring removal.
@@ -24412,6 +24458,7 @@ pub fn fault_of(e: &Error) -> Fault {
         Error::Profile("identity already exists on this node") => Fault::IdentityExists,
         Error::Profile("locked") => Fault::Locked,
         Error::Profile("no such room on this node") => Fault::UnknownChannel,
+        Error::ComputerPolicySuperseded => Fault::ComputerPolicy,
         Error::Profile("computer policy changed before the room mutation") => Fault::ComputerPolicy,
         Error::Profile(crate::node::channel::UNSUPPORTED_ROOM_FORMAT) => {
             Fault::UnsupportedRoomFormat

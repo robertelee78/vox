@@ -19,6 +19,13 @@ pub(super) struct Lifetime {
 impl Lifetime {
     /// Revalidate under the boundary already retained by this exact decision.
     pub(super) fn publish<T>(&self, publish: impl FnOnce() -> T) -> Option<T> {
+        #[cfg(feature = "test-knobs")]
+        if self.publication.is_none()
+            && self.exclusive.is_none()
+            && crate::node::computer::fx28_mutant("constructor-stale-commit")
+        {
+            return Some(publish());
+        }
         ((self.publication.is_some() || self.exclusive.is_some()) && self.authority.current())
             .then(publish)
     }
