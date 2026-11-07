@@ -408,6 +408,9 @@ replacement narrows agent `--none` permission; ST-4's supported-API/no-OMP-chang
   the strict compatibility check; the first fully successful handshake resumes normal
   availability observation and ends the mismatch episode. Later updates get a new bounded
   successor opportunity. Matching daemon recovery works without an OMP prompt or restart.
+  A registration refusal caused solely by that daemon mismatch is scoped to the episode;
+  the first subsequent matching Ready snapshot clears that refusal and coalesces one
+  register-only attempt for the unconfirmed generation. It is not a permanent session latch.
   Ordinary helper spawn/pipe failures remain visible and fail closed.
 
   Every new registration write, including prompt registration and cold staging, requires live

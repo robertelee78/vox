@@ -7,9 +7,10 @@
   source-bound issues, separately from decision status. Each product requirement MUST land
   with its proof (ADR-018) in a small release (FX-19).
   FX-52's 2026-11-02 pairing design is approved; implementation and acceptance are separate.
-  For v0.4.20, independent Opus reviews of `37b0ffbf4` approved the designs of FX-55–FX-57,
-  FX-59 and FX-60, plus FX-63's process boundary; no implementation or release is approved.
-  FX-53, FX-54, FX-58 and FX-62 remain proposed; FX-61 remains Designing/Blocked.
+  For v0.4.20, independent Opus reviews approved FX-55–FX-57, FX-59–FX-60 and FX-63 at
+  `37b0ffbf4`, FX-53–FX-54 at `e8ad3b894`, and FX-58/FX-62 at `0f5988648`.
+  These nine corrective designs are accepted, not implemented or release-approved.
+  FX-61 remains Designing/Blocked until its consumer-sensitive causal boundary is established.
   The operator selected minimal non-secret leave continuity retention and automatic empty
   initialization when prior history cannot be derived; known signed history/conflicts remain
   protected. Technical approval, actual acceptance and publication are separate.
