@@ -3752,7 +3752,7 @@ final class FirstRunProof: XCTestCase {
               until: { $0.contains(nongit) })
         tap(ui, Key.id("repo-decision-done"), "Acknowledge the non-git binding")
         ui.typeKey("w", modifierFlags: .command)
-        try follows("63000000-4c0e-4f00-9a1b-0c0ffee54019", nongit, rooms["other"] ?? "")
+        try follows("64000000-4c0e-4f00-9a1b-0c0ffee54020", nongit, rooms["other"] ?? "")
         print("[proof] RM-1/2/3/5: one repo/worktree dialog; wrong passphrase left map unchanged; Choose and Create moved both next turns; alice created with keyring closed; Not This Repo suppressed later worktree asks")
 
         if !selectedStep.isEmpty {

@@ -2100,38 +2100,82 @@ impl Router {
     }
     async fn room_decision(&self, dir: &str, explicit: bool) -> DaemonFrame {
         let snapshot = if explicit {
-            crate::room_map::snapshot_explicit(&self.inner.account.data_root, std::path::Path::new(dir))
+            crate::room_map::snapshot_explicit(
+                &self.inner.account.data_root,
+                std::path::Path::new(dir),
+            )
         } else {
             let Some(ask) = self.room_asks().await.into_iter().find(|a| a.dir == dir) else {
-                return DaemonFrame::RoomAnswer { done: false, said: vec!["No session is waiting for this repository decision.".into()] };
+                return DaemonFrame::RoomAnswer {
+                    done: false,
+                    said: vec!["No session is waiting for this repository decision.".into()],
+                };
             };
-            let Some(start) = ask.sessions.into_iter().next()
-                .and_then(|s| self.inner.account.node_paths(&s.node).ok()
-                    .and_then(|p| crate::wake::registration(&p, &s.session)))
-                .and_then(|r| r.start) else {
-                return DaemonFrame::RoomAnswer { done: false, said: vec!["The waiting session no longer has a registered start directory.".into()] };
+            let Some(start) = ask
+                .sessions
+                .into_iter()
+                .next()
+                .and_then(|s| {
+                    self.inner
+                        .account
+                        .node_paths(&s.node)
+                        .ok()
+                        .and_then(|p| crate::wake::registration(&p, &s.session))
+                })
+                .and_then(|r| r.start)
+            else {
+                return DaemonFrame::RoomAnswer {
+                    done: false,
+                    said: vec![
+                        "The waiting session no longer has a registered start directory.".into(),
+                    ],
+                };
             };
             crate::room_map::snapshot(&self.inner.account.data_root, std::path::Path::new(&start))
         };
         let snapshot = match snapshot {
             Ok(snapshot) => snapshot,
-            Err(e) => return DaemonFrame::RoomAnswer { done: false, said: vec![e.to_string()] },
+            Err(e) => {
+                return DaemonFrame::RoomAnswer {
+                    done: false,
+                    said: vec![e.to_string()],
+                }
+            }
         };
         let mut random = [0u8; 32];
         if getrandom::fill(&mut random).is_err() {
-            return DaemonFrame::RoomAnswer { done: false, said: vec!["cannot create a secure room decision token".into()] };
+            return DaemonFrame::RoomAnswer {
+                done: false,
+                said: vec!["cannot create a secure room decision token".into()],
+            };
         }
         let token = vox_core::node::link::b32_encode(&random);
         let target = snapshot.target.display().to_string();
-        let source = snapshot.source.as_ref().map_or_else(String::new, |s| s.display().to_string());
+        let source = snapshot
+            .source
+            .as_ref()
+            .map_or_else(String::new, |s| s.display().to_string());
         let room = snapshot.room.clone().unwrap_or_default();
         {
             let mut decisions = lock(&self.inner.room_decisions);
             decisions.retain(|_, (expires, _, _)| *expires > std::time::Instant::now());
             if decisions.len() >= 256 {
-                return DaemonFrame::RoomAnswer { done: false, said: vec!["Too many room decisions are pending; cancel one or try again later.".into()] };
+                return DaemonFrame::RoomAnswer {
+                    done: false,
+                    said: vec![
+                        "Too many room decisions are pending; cancel one or try again later."
+                            .into(),
+                    ],
+                };
             }
-            decisions.insert(token.clone(), (std::time::Instant::now() + Duration::from_secs(300), explicit, snapshot));
+            decisions.insert(
+                token.clone(),
+                (
+                    std::time::Instant::now() + Duration::from_secs(300),
+                    explicit,
+                    snapshot,
+                ),
+            );
         }
         let inner = Arc::downgrade(&self.inner);
         let expiry_token = token.clone();
@@ -2141,40 +2185,80 @@ impl Router {
                 lock(&inner.room_decisions).remove(&expiry_token);
             }
         });
-        DaemonFrame::RoomDecision { token, target, source, room }
+        DaemonFrame::RoomDecision {
+            token,
+            target,
+            source,
+            room,
+        }
     }
 
-    async fn room_replace(&self, token: &str, link: &str, passphrase: Zeroizing<String>, node: &str) -> DaemonFrame {
+    async fn room_replace(
+        &self,
+        token: &str,
+        link: &str,
+        passphrase: Zeroizing<String>,
+        node: &str,
+    ) -> DaemonFrame {
         let Some((expires, _, snapshot)) = lock(&self.inner.room_decisions).remove(token) else {
-            return DaemonFrame::RoomAnswer { done: false, said: vec!["This decision is stale; inspect the repository again.".into()] };
+            return DaemonFrame::RoomAnswer {
+                done: false,
+                said: vec!["This decision is stale; inspect the repository again.".into()],
+            };
         };
         if expires <= std::time::Instant::now() {
-            return DaemonFrame::RoomAnswer { done: false, said: vec!["This decision expired; inspect the repository again.".into()] };
+            return DaemonFrame::RoomAnswer {
+                done: false,
+                said: vec!["This decision expired; inspect the repository again.".into()],
+            };
         }
         let mut said = Vec::new();
         if !link.is_empty() {
             let parsed = match vox_core::node::link::InviteLink::parse(link) {
                 Ok(parsed) => parsed,
-                Err(_) => return DaemonFrame::RoomAnswer { done: false, said: vec!["That is not a valid room link.".into()] },
+                Err(_) => {
+                    return DaemonFrame::RoomAnswer {
+                        done: false,
+                        said: vec!["That is not a valid room link.".into()],
+                    }
+                }
             };
             let node = match NodeName::parse(node) {
                 Ok(node) => node,
-                Err(_) => return DaemonFrame::RoomAnswer { done: false, said: vec!["Choose an attached node to authenticate the room.".into()] },
+                Err(_) => {
+                    return DaemonFrame::RoomAnswer {
+                        done: false,
+                        said: vec!["Choose an attached node to authenticate the room.".into()],
+                    }
+                }
             };
             let Some(handle) = self.handle_of(&node) else {
-                return DaemonFrame::RoomAnswer { done: false, said: vec![format!("Node {node} is not attached; the decision was not changed.")] };
+                return DaemonFrame::RoomAnswer {
+                    done: false,
+                    said: vec![format!(
+                        "Node {node} is not attached; the decision was not changed."
+                    )],
+                };
             };
-            let held = handle.view().channels.iter().any(|c| c.channel_id == parsed.channel_id);
+            let held = handle
+                .view()
+                .channels
+                .iter()
+                .any(|c| c.channel_id == parsed.channel_id);
             let outcome = if held {
-                handle.apply(NodeCommand::CheckRoomPassphrase {
-                    channel_id: parsed.channel_id,
-                    passphrase: Secret::new(passphrase.as_bytes().to_vec()),
-                }).await
+                handle
+                    .apply(NodeCommand::CheckRoomPassphrase {
+                        channel_id: parsed.channel_id,
+                        passphrase: Secret::new(passphrase.as_bytes().to_vec()),
+                    })
+                    .await
             } else {
-                handle.apply(NodeCommand::JoinChannel {
-                    link: link.to_owned(),
-                    passphrase: Secret::new(passphrase.as_bytes().to_vec()),
-                }).await
+                handle
+                    .apply(NodeCommand::JoinChannel {
+                        link: link.to_owned(),
+                        passphrase: Secret::new(passphrase.as_bytes().to_vec()),
+                    })
+                    .await
             };
             if outcome != Outcome::Done {
                 return DaemonFrame::RoomAnswer { done: false, said: vec![format!("Node {node} could not authenticate or join the room; the decision was not changed: {outcome}")] };
@@ -2183,11 +2267,18 @@ impl Router {
                 said.push(format!("Node {node} joined the room."));
             }
         }
-        let value = if link.is_empty() { crate::room_map::DECLINED } else { link };
-        match crate::room_map::replace(&self.inner.account.data_root, &snapshot, value, &passphrase) {
+        let value = if link.is_empty() {
+            crate::room_map::DECLINED
+        } else {
+            link
+        };
+        match crate::room_map::replace(&self.inner.account.data_root, &snapshot, value, &passphrase)
+        {
             Ok(outcome) => {
                 if let Some(previous) = outcome.previous {
-                    said.push(format!("replacing what the room map held for it: {previous}"));
+                    said.push(format!(
+                        "replacing what the room map held for it: {previous}"
+                    ));
                 }
                 if let Some(warning) = outcome.durability_warning {
                     said.push(format!("The decision for {} was written, but its durability could not be confirmed: {warning}. Inspect the room map before retrying. Existing sessions do not move.", snapshot.target.display()));
@@ -2208,7 +2299,6 @@ impl Router {
         }
     }
 
-
     /// The person's answer to the ask about `dir` (ADR-029 RB-5a, RB-6).
     ///
     /// With a `link`: bind `dir` to the room it names, what `vox room join <link> --node <node>
@@ -2218,7 +2308,13 @@ impl Router {
     /// another room. With `link` empty: the room map binds `dir` already, to a room the sessions'
     /// nodes are not in, and they join it with the map's own link and passphrase. Either way every
     /// session that asked is then put in the room.
-    async fn room_bind(&self, dir: &str, link: &str, passphrase: Zeroizing<String>, token: Option<&str>) -> DaemonFrame {
+    async fn room_bind(
+        &self,
+        dir: &str,
+        link: &str,
+        passphrase: Zeroizing<String>,
+        token: Option<&str>,
+    ) -> DaemonFrame {
         let no = |why: String| DaemonFrame::RoomAnswer {
             done: false,
             said: vec![why],
@@ -2229,16 +2325,28 @@ impl Router {
             ));
         };
         let data_root = self.inner.account.data_root.clone();
-        let registered_start = ask.sessions.first()
-            .and_then(|s| self.inner.account.node_paths(&s.node).ok()
-                .and_then(|p| crate::wake::registration(&p, &s.session)))
+        let registered_start = ask
+            .sessions
+            .first()
+            .and_then(|s| {
+                self.inner
+                    .account
+                    .node_paths(&s.node)
+                    .ok()
+                    .and_then(|p| crate::wake::registration(&p, &s.session))
+            })
             .and_then(|r| r.start)
             .unwrap_or_else(|| dir.to_owned());
         let snapshot = if link.is_empty() {
             None
         } else if let Some(token) = token {
             match lock(&self.inner.room_decisions).remove(token) {
-                Some((expires, false, snapshot)) if expires > std::time::Instant::now() && snapshot.target == std::path::Path::new(dir) => Some(snapshot),
+                Some((expires, false, snapshot))
+                    if expires > std::time::Instant::now()
+                        && snapshot.target == std::path::Path::new(dir) =>
+                {
+                    Some(snapshot)
+                }
                 _ => return no("This repository decision is stale; inspect it again.".into()),
             }
         } else {
@@ -2248,7 +2356,7 @@ impl Router {
                 Err(e) => return no(format!("cannot inspect the repository decision: {e}")),
             }
         };
-        let (link, passphrase, bind) = if link.is_empty() {
+        let (link, passphrase) = if link.is_empty() {
             let mapped = crate::room_map::read(&data_root).ok().and_then(|entries| {
                 crate::room_map::resolve(&entries, std::path::Path::new(&registered_start))
                     .filter(|e| e.room != crate::room_map::DECLINED)
@@ -2260,9 +2368,9 @@ impl Router {
                      was changed"
                 ));
             };
-            (link, passphrase, false)
+            (link, passphrase)
         } else {
-            (link.to_owned(), passphrase, true)
+            (link.to_owned(), passphrase)
         };
         let parsed = match vox_core::node::link::InviteLink::parse(&link) {
             Ok(p) => p,
@@ -2322,7 +2430,7 @@ impl Router {
                 }
             }
         }
-        if bind {
+        if let Some(snapshot) = snapshot {
             // Said before it is written (ADR-028 E-5): who can read what is saved.
             let map = crate::room_map::path(&data_root);
             said.push(format!(
@@ -2331,7 +2439,7 @@ impl Router {
                  included",
                 map.display()
             ));
-            match crate::room_map::replace(&data_root, snapshot.as_ref().expect("captured before joining"), &link, &passphrase) {
+            match crate::room_map::replace(&data_root, &snapshot, &link, &passphrase) {
                 Ok(outcome) => {
                     if let Some(warning) = outcome.durability_warning {
                         said.push(format!("{dir} was written, but its durability could not be confirmed: {warning}. Inspect the room map before retrying."));
@@ -5221,8 +5329,18 @@ impl Dispatch for Router {
                 lock(&self.inner.room_decisions).remove(&token);
                 DaemonFrame::Ok
             }
-            DaemonRequest::RoomReplace { token, link, passphrase, node } => self.room_replace(&token, &link, passphrase, &node).await,
-            DaemonRequest::RoomAnswerBind { dir, token, link, passphrase } => self.room_bind(&dir, &link, passphrase, Some(&token)).await,
+            DaemonRequest::RoomReplace {
+                token,
+                link,
+                passphrase,
+                node,
+            } => self.room_replace(&token, &link, passphrase, &node).await,
+            DaemonRequest::RoomAnswerBind {
+                dir,
+                token,
+                link,
+                passphrase,
+            } => self.room_bind(&dir, &link, passphrase, Some(&token)).await,
             DaemonRequest::Status => match self.public_nodes().await {
                 Ok(nodes) => DaemonFrame::Status(DaemonStatus {
                     version: env!("CARGO_PKG_VERSION").to_owned(),

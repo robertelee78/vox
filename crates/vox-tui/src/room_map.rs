@@ -62,7 +62,10 @@ pub fn read(data_root: &Path) -> Result<Vec<Entry>, AppError> {
 
 fn parse_map(data_root: &Path, text: &str) -> Result<Vec<Entry>, AppError> {
     parse(text).map_err(|(n, why)| {
-        AppError::Usage(format!("the room map {}, line {n}: {why}", path(data_root).display()))
+        AppError::Usage(format!(
+            "the room map {}, line {n}: {why}",
+            path(data_root).display()
+        ))
     })
 }
 
@@ -72,8 +75,15 @@ fn read_text(data_root: &Path) -> Result<Zeroizing<String>, AppError> {
     let file = path(data_root);
     let mut f = match std::fs::File::open(&file) {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Zeroizing::new(String::new())),
-        Err(e) => return Err(AppError::Usage(format!("cannot read the room map {}: {e}", file.display()))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Zeroizing::new(String::new()))
+        }
+        Err(e) => {
+            return Err(AppError::Usage(format!(
+                "cannot read the room map {}: {e}",
+                file.display()
+            )))
+        }
     };
     let mode = f.metadata().map_err(AppError::Io)?.permissions().mode() & 0o777;
     if mode & 0o077 != 0 {
@@ -85,7 +95,9 @@ fn read_text(data_root: &Path) -> Result<Zeroizing<String>, AppError> {
         )));
     }
     let mut text = Zeroizing::new(String::new());
-    f.read_to_string(&mut text).map_err(|e| AppError::Usage(format!("cannot read the room map {}: {e}", file.display())))?;
+    f.read_to_string(&mut text).map_err(|e| {
+        AppError::Usage(format!("cannot read the room map {}: {e}", file.display()))
+    })?;
     Ok(text)
 }
 
@@ -395,7 +407,9 @@ fn canonical_or_original(p: &Path) -> PathBuf {
 }
 
 fn conflict() -> AppError {
-    AppError::Usage("the room map or repository scope changed; refresh the decision and try again".into())
+    AppError::Usage(
+        "the room map or repository scope changed; refresh the decision and try again".into(),
+    )
 }
 
 // Refuse duplicate aliases: first-match resolution cannot safely identify an editable block.
@@ -403,7 +417,9 @@ fn validate_unique(entries: &[Entry]) -> Result<(), AppError> {
     let mut seen = std::collections::HashSet::new();
     for entry in entries {
         if !seen.insert(canonical_or_original(&entry.repo)) {
-            return Err(AppError::Usage("the room map has ambiguous duplicate repository blocks".into()));
+            return Err(AppError::Usage(
+                "the room map has ambiguous duplicate repository blocks".into(),
+            ));
         }
     }
     Ok(())
@@ -412,18 +428,29 @@ fn validate_unique(entries: &[Entry]) -> Result<(), AppError> {
 fn decision(entries: &[Entry], start: &Path, explicit: bool) -> Result<Snapshot, AppError> {
     validate_unique(entries)?;
     let original_start = start.to_path_buf();
-    let start = std::fs::canonicalize(start).map_err(|_| AppError::Usage(
-        "the repository directory is missing or inaccessible; choose a valid repository".into()
-    ))?;
+    let start = std::fs::canonicalize(start).map_err(|_| {
+        AppError::Usage(
+            "the repository directory is missing or inaccessible; choose a valid repository".into(),
+        )
+    })?;
     if !start.is_dir() {
-        return Err(AppError::Usage("the repository boundary is not a directory".into()));
+        return Err(AppError::Usage(
+            "the repository boundary is not a directory".into(),
+        ));
     }
     let mut top = None;
     for dir in start.ancestors() {
         match std::fs::symlink_metadata(dir.join(".git")) {
-            Ok(_) => { top = Some(dir); break; }
+            Ok(_) => {
+                top = Some(dir);
+                break;
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(AppError::Usage(format!("cannot inspect repository metadata: {e}"))),
+            Err(e) => {
+                return Err(AppError::Usage(format!(
+                    "cannot inspect repository metadata: {e}"
+                )))
+            }
         }
     }
     let effective = resolve(entries, &start).map(identity);
@@ -434,25 +461,37 @@ fn decision(entries: &[Entry], start: &Path, explicit: bool) -> Result<Snapshot,
         } else if git.is_file() {
             if let Some((worktree, main)) = worktree_of(&start) {
                 if !main.join(".git").is_dir() {
-                    return Err(AppError::Usage("the linked worktree's main repository is invalid".into()));
+                    return Err(AppError::Usage(
+                        "the linked worktree's main repository is invalid".into(),
+                    ));
                 }
-                if effective.as_ref().is_some_and(|e| e.repo.starts_with(&worktree)) {
+                if effective
+                    .as_ref()
+                    .is_some_and(|e| e.repo.starts_with(&worktree))
+                {
                     worktree
                 } else {
                     main
                 }
             } else {
-                let text = std::fs::read_to_string(&git).map_err(|_| AppError::Usage(
-                    "cannot read repository metadata".into()
-                ))?;
-                let name = text.trim().strip_prefix("gitdir:").map(str::trim)
-                    .filter(|s| !s.is_empty()).ok_or_else(|| AppError::Usage(
-                        "the repository metadata is invalid".into()
-                    ))?;
+                let text = std::fs::read_to_string(&git)
+                    .map_err(|_| AppError::Usage("cannot read repository metadata".into()))?;
+                let name = text
+                    .trim()
+                    .strip_prefix("gitdir:")
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| AppError::Usage("the repository metadata is invalid".into()))?;
                 let dir = Path::new(name);
-                let dir = if dir.is_absolute() { dir.to_path_buf() } else { top.join(dir) };
+                let dir = if dir.is_absolute() {
+                    dir.to_path_buf()
+                } else {
+                    top.join(dir)
+                };
                 if !dir.is_dir() || dir.join("commondir").exists() {
-                    return Err(AppError::Usage("cannot establish an unambiguous repository boundary".into()));
+                    return Err(AppError::Usage(
+                        "cannot establish an unambiguous repository boundary".into(),
+                    ));
                 }
                 top.to_path_buf()
             }
@@ -466,7 +505,9 @@ fn decision(entries: &[Entry], start: &Path, explicit: bool) -> Result<Snapshot,
     // A nested block within the repository controls only part of it, not the whole boundary.
     if let Some(e) = &effective {
         if !explicit && e.repo.starts_with(&target) && e.repo != target {
-            return Err(AppError::Usage("a more-specific room override makes this repository scope ambiguous".into()));
+            return Err(AppError::Usage(
+                "a more-specific room override makes this repository scope ambiguous".into(),
+            ));
         }
     }
     let override_at_target = lookup(entries, &target).map(identity);
@@ -502,20 +543,26 @@ pub fn snapshot_explicit(data_root: &Path, directory: &Path) -> Result<Snapshot,
     decision(&entries, directory, true)
 }
 
-struct MapLock { _file: std::fs::File }
+struct MapLock {
+    _file: std::fs::File,
+}
 
 impl MapLock {
     fn acquire(data_root: &Path) -> Result<Self, AppError> {
         use std::os::unix::fs::OpenOptionsExt;
-        let f = std::fs::OpenOptions::new().read(true).write(true).create(true)
-            .truncate(false).mode(0o600).open(data_root.join("rooms.lock"))
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(data_root.join("rooms.lock"))
             .map_err(|e| AppError::Usage(format!("cannot open room map lock: {e}")))?;
         rustix::fs::flock(&f, rustix::fs::FlockOperation::LockExclusive)
             .map_err(|e| AppError::Usage(format!("cannot lock room map: {e}")))?;
         Ok(Self { _file: f })
     }
 }
-
 
 fn description(entry: &Entry) -> String {
     if entry.room == DECLINED {
@@ -529,12 +576,28 @@ fn description(entry: &Entry) -> String {
 }
 
 // Keep comments (including those inside the replaced block) and every unrelated line verbatim.
-fn rewritten(text: &str, target: &Path, link: &str, passphrase: &str) -> Result<Zeroizing<String>, AppError> {
-    let repo = target.to_str().ok_or_else(|| AppError::Usage("repository path is not valid UTF-8".into()))?;
-    if repo.contains('\n') || repo.contains('\r') || link.contains('\n') || link.contains('\r')
-        || passphrase.contains('\n') || passphrase.contains('\r')
-        || repo.trim() != repo || link.trim() != link || passphrase.trim() != passphrase {
-        return Err(AppError::Usage("repository, room or passphrase cannot be represented in the room map".into()));
+fn rewritten(
+    text: &str,
+    target: &Path,
+    link: &str,
+    passphrase: &str,
+) -> Result<Zeroizing<String>, AppError> {
+    let repo = target
+        .to_str()
+        .ok_or_else(|| AppError::Usage("repository path is not valid UTF-8".into()))?;
+    if repo.contains('\n')
+        || repo.contains('\r')
+        || link.contains('\n')
+        || link.contains('\r')
+        || passphrase.contains('\n')
+        || passphrase.contains('\r')
+        || repo.trim() != repo
+        || link.trim() != link
+        || passphrase.trim() != passphrase
+    {
+        return Err(AppError::Usage(
+            "repository, room or passphrase cannot be represented in the room map".into(),
+        ));
     }
     if link != DECLINED {
         vox_core::node::link::InviteLink::parse(link)
@@ -575,33 +638,58 @@ fn rewritten(text: &str, target: &Path, link: &str, passphrase: &str) -> Result<
     Ok(result)
 }
 
-fn stamp(data_root: &Path) -> Result<Option<(u64, u64, u64, i64, i64, i64, i64)>, AppError> {
+type FileStamp = (u64, u64, u64, i64, i64, i64, i64);
+
+fn stamp(data_root: &Path) -> Result<Option<FileStamp>, AppError> {
     use std::os::unix::fs::MetadataExt;
     match std::fs::metadata(path(data_root)) {
-        Ok(m) => Ok(Some((m.dev(), m.ino(), m.len(), m.mtime(), m.mtime_nsec(), m.ctime(), m.ctime_nsec()))),
+        Ok(m) => Ok(Some((
+            m.dev(),
+            m.ino(),
+            m.len(),
+            m.mtime(),
+            m.mtime_nsec(),
+            m.ctime(),
+            m.ctime_nsec(),
+        ))),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(AppError::Usage(format!("cannot inspect room map: {e}"))),
     }
 }
 
-fn commit(data_root: &Path, original: &str, initial: Option<(u64, u64, u64, i64, i64, i64, i64)>, replacement: &str) -> Result<Option<String>, AppError> {
+fn commit(
+    data_root: &Path,
+    original: &str,
+    initial: Option<FileStamp>,
+    replacement: &str,
+) -> Result<Option<String>, AppError> {
     use std::io::Write;
     let file = path(data_root);
-    let mut temp = tempfile::NamedTempFile::new_in(data_root)
-        .map_err(|e| AppError::Usage(format!("cannot create private room map temporary file: {e}")))?;
-    temp.write_all(replacement.as_bytes()).and_then(|()| temp.as_file().sync_all())
+    let mut temp = tempfile::NamedTempFile::new_in(data_root).map_err(|e| {
+        AppError::Usage(format!(
+            "cannot create private room map temporary file: {e}"
+        ))
+    })?;
+    temp.write_all(replacement.as_bytes())
+        .and_then(|()| temp.as_file().sync_all())
         .map_err(|e| AppError::Usage(format!("cannot write room map: {e}")))?;
-    if stamp(data_root)? != initial || read_text(data_root)?.as_str() != original || stamp(data_root)? != initial {
+    if stamp(data_root)? != initial
+        || read_text(data_root)?.as_str() != original
+        || stamp(data_root)? != initial
+    {
         return Err(conflict());
     }
-    temp.persist(&file).map_err(|e| AppError::Usage(format!("cannot replace room map: {}", e.error)))?;
+    temp.persist(&file)
+        .map_err(|e| AppError::Usage(format!("cannot replace room map: {}", e.error)))?;
     if let Err(e) = std::fs::File::open(data_root).and_then(|f| f.sync_all()) {
         let state = match read_text(data_root) {
             Ok(text) if text.as_str() == replacement => "the new map is visible",
             Ok(_) => "the map has since changed",
             Err(_) => "the map could not be reread",
         };
-        return Ok(Some(format!("room map replacement durability is uncertain ({state}): {e}")));
+        return Ok(Some(format!(
+            "room map replacement durability is uncertain ({state}): {e}"
+        )));
     }
     Ok(None)
 }
@@ -614,7 +702,10 @@ pub fn add(data_root: &Path, repo: &Path, link: &str, passphrase: &str) -> Resul
     let entries = parse_map(data_root, &text)?;
     validate_unique(&entries)?;
     if resolve(&entries, repo).is_some() {
-        return Err(AppError::Usage(format!("the room map names {} already; change it there", repo.display())));
+        return Err(AppError::Usage(format!(
+            "the room map names {} already; change it there",
+            repo.display()
+        )));
     }
     let target = canonical_or_original(repo);
     let next = rewritten(&text, &target, link, passphrase)?;
@@ -642,7 +733,6 @@ pub fn decline(data_root: &Path, repo: &Path) -> Result<bool, AppError> {
     Ok(true)
 }
 
-
 /// A completed rename, with any uncertainty about persistence across a crash.
 pub struct ReplaceOutcome {
     /// Non-secret description of the exact target block that was replaced.
@@ -652,18 +742,29 @@ pub struct ReplaceOutcome {
 }
 
 /// Replace the displayed target only if its scope and complete binding are unchanged.
-pub fn replace(data_root: &Path, snapshot: &Snapshot, link: &str, passphrase: &str) -> Result<ReplaceOutcome, AppError> {
+pub fn replace(
+    data_root: &Path,
+    snapshot: &Snapshot,
+    link: &str,
+    passphrase: &str,
+) -> Result<ReplaceOutcome, AppError> {
     let _lock = MapLock::acquire(data_root)?;
     let initial = stamp(data_root)?;
     let text = read_text(data_root)?;
     let entries = parse_map(data_root, &text)?;
     let current = decision(&entries, &snapshot.start, snapshot.explicit).map_err(|_| conflict())?;
-    if current.target != snapshot.target || current.canonical_start != snapshot.canonical_start || current.effective != snapshot.effective
-        || current.override_at_target != snapshot.override_at_target {
+    if current.target != snapshot.target
+        || current.canonical_start != snapshot.canonical_start
+        || current.effective != snapshot.effective
+        || current.override_at_target != snapshot.override_at_target
+    {
         return Err(conflict());
     }
     let before = lookup(&entries, &snapshot.target).map(description);
     let next = rewritten(&text, &snapshot.target, link, passphrase)?;
     let durability_warning = commit(data_root, &text, initial, &next)?;
-    Ok(ReplaceOutcome { previous: before, durability_warning })
+    Ok(ReplaceOutcome {
+        previous: before,
+        durability_warning,
+    })
 }

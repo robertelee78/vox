@@ -911,7 +911,6 @@ pub struct RoomDecisionInfo {
     pub room: String,
 }
 
-
 /// The reported outcome of a repository decision or ask, including any durability uncertainty.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct RoomAnswerInfo {
@@ -5233,44 +5232,86 @@ impl VoxClient {
     /// Inspect the current repository decision before an operator replacement.
     pub async fn room_decision(&self, dir: String) -> Result<RoomDecisionInfo, VoxError> {
         match self.daemon(DaemonRequest::RoomDecision { dir }).await? {
-            DaemonFrame::RoomDecision { token, target, source, room } =>
-                Ok(RoomDecisionInfo { token, target, source, room }),
-            DaemonFrame::RoomAnswer { said, .. } => Err(failed(&said.join("\n"))),
+            DaemonFrame::RoomDecision {
+                token,
+                target,
+                source,
+                room,
+            } => Ok(RoomDecisionInfo {
+                token,
+                target,
+                source,
+                room,
+            }),
+            DaemonFrame::RoomAnswer { said, .. } => Err(failed(said.join("\n"))),
             _ => Err(failed("the daemon did not inspect the repository decision")),
         }
     }
     /// Inspect an explicitly selected directory rather than a waiting session's scope.
     pub async fn room_decision_explicit(&self, dir: String) -> Result<RoomDecisionInfo, VoxError> {
-        match self.daemon(DaemonRequest::RoomDecisionExplicit { dir }).await? {
-            DaemonFrame::RoomDecision { token, target, source, room } =>
-                Ok(RoomDecisionInfo { token, target, source, room }),
-            DaemonFrame::RoomAnswer { said, .. } => Err(failed(&said.join("\n"))),
+        match self
+            .daemon(DaemonRequest::RoomDecisionExplicit { dir })
+            .await?
+        {
+            DaemonFrame::RoomDecision {
+                token,
+                target,
+                source,
+                room,
+            } => Ok(RoomDecisionInfo {
+                token,
+                target,
+                source,
+                room,
+            }),
+            DaemonFrame::RoomAnswer { said, .. } => Err(failed(said.join("\n"))),
             _ => Err(failed("the daemon did not inspect the repository decision")),
         }
     }
 
     /// Discard an unused inspection token.
     pub async fn cancel_room_decision(&self, token: String) -> Result<(), VoxError> {
-        match self.daemon(DaemonRequest::RoomDecisionCancel { token }).await? {
+        match self
+            .daemon(DaemonRequest::RoomDecisionCancel { token })
+            .await?
+        {
             DaemonFrame::Ok => Ok(()),
             _ => Err(failed("the daemon did not cancel the repository decision")),
         }
     }
 
     /// Replace a captured decision; an empty link opts out.
-    pub async fn replace_room(&self, token: String, link: String, passphrase: Arc<Passphrase>, node: String) -> Result<RoomAnswerInfo, VoxError> {
+    pub async fn replace_room(
+        &self,
+        token: String,
+        link: String,
+        passphrase: Arc<Passphrase>,
+        node: String,
+    ) -> Result<RoomAnswerInfo, VoxError> {
         self.room_answer(DaemonRequest::RoomReplace {
-            token, link: link.trim().to_owned(), passphrase: passphrase.copy(), node,
-        }).await
+            token,
+            link: link.trim().to_owned(),
+            passphrase: passphrase.copy(),
+            node,
+        })
+        .await
     }
     /// Answer a waiting ask against the decision displayed to the operator.
-    pub async fn bind_room_decision(&self, dir: String, token: String, link: String, passphrase: Arc<Passphrase>) -> Result<RoomAnswerInfo, VoxError> {
+    pub async fn bind_room_decision(
+        &self,
+        dir: String,
+        token: String,
+        link: String,
+        passphrase: Arc<Passphrase>,
+    ) -> Result<RoomAnswerInfo, VoxError> {
         self.room_answer(DaemonRequest::RoomAnswerBind {
-            dir, token, link: link.trim().to_owned(), passphrase: passphrase.copy(),
-        }).await
+            dir,
+            token,
+            link: link.trim().to_owned(),
+            passphrase: passphrase.copy(),
+        })
+        .await
     }
-
-
 
     /// Bind the directory `dir` to the room `link` names (ADR-029 RB-6), the person's answer to
     /// its ask: what `vox room join <link> --node <node> --bind <dir>` does. The room's

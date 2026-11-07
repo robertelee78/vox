@@ -1329,13 +1329,27 @@ impl Opening {
                 DaemonRequest::RoomDecisionCancel { token } => {
                     e.array(2).uint(T_REQ_ROOM_DECISION_CANCEL).text(token);
                 }
-                DaemonRequest::RoomReplace { token, link, passphrase, node } => {
+                DaemonRequest::RoomReplace {
+                    token,
+                    link,
+                    passphrase,
+                    node,
+                } => {
                     e.array(5).uint(T_REQ_ROOM_REPLACE).text(token).text(link);
                     put_secret(&mut e, Some(passphrase));
                     e.text(node);
                 }
-                DaemonRequest::RoomAnswerBind { dir, token, link, passphrase } => {
-                    e.array(5).uint(T_REQ_ROOM_ANSWER_BIND).text(dir).text(token).text(link);
+                DaemonRequest::RoomAnswerBind {
+                    dir,
+                    token,
+                    link,
+                    passphrase,
+                } => {
+                    e.array(5)
+                        .uint(T_REQ_ROOM_ANSWER_BIND)
+                        .text(dir)
+                        .text(token)
+                        .text(link);
                     put_secret(&mut e, Some(passphrase));
                 }
                 DaemonRequest::Status => {
@@ -1557,9 +1571,11 @@ impl Opening {
             (T_REQ_ROOM_DECISION, 2) => Opening::Daemon(DaemonRequest::RoomDecision {
                 dir: text(&mut d, "ipc room decision dir")?,
             }),
-            (T_REQ_ROOM_DECISION_EXPLICIT, 2) => Opening::Daemon(DaemonRequest::RoomDecisionExplicit {
-                dir: text(&mut d, "ipc explicit room decision dir")?,
-            }),
+            (T_REQ_ROOM_DECISION_EXPLICIT, 2) => {
+                Opening::Daemon(DaemonRequest::RoomDecisionExplicit {
+                    dir: text(&mut d, "ipc explicit room decision dir")?,
+                })
+            }
             (T_REQ_ROOM_DECISION_CANCEL, 2) => Opening::Daemon(DaemonRequest::RoomDecisionCancel {
                 token: text(&mut d, "ipc room decision token")?,
             }),
@@ -1784,8 +1800,18 @@ impl DaemonFrame {
                 e.array(3).uint(T_ROOM_ANSWER).uint(u64::from(*done));
                 put_texts(&mut e, said);
             }
-            DaemonFrame::RoomDecision { token, target, source, room } => {
-                e.array(5).uint(T_ROOM_DECISION).text(token).text(target).text(source).text(room);
+            DaemonFrame::RoomDecision {
+                token,
+                target,
+                source,
+                room,
+            } => {
+                e.array(5)
+                    .uint(T_ROOM_DECISION)
+                    .text(token)
+                    .text(target)
+                    .text(source)
+                    .text(room);
             }
             DaemonFrame::Status(s) => {
                 e.array(6)

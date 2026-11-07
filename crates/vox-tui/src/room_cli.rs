@@ -5562,7 +5562,6 @@ fn room_passphrase(
     Ok(crate::tunnel_cli::encouraged(p, "room").to_owned())
 }
 
-
 fn require_operator_binding() -> Result<(), AppError> {
     let harness_marked = [
         "CLAUDE_CODE_ENTRYPOINT",
@@ -5583,17 +5582,27 @@ fn require_operator_binding() -> Result<(), AppError> {
 async fn repo_decision(paths: &Paths, dir: &std::path::Path) -> Result<String, AppError> {
     use vox_core::node::daemonipc::{DaemonClient, DaemonFrame, DaemonRequest};
     let mut daemon = DaemonClient::open(&paths.account().socket()).await?;
-    match daemon.request(DaemonRequest::RoomDecisionExplicit {
-        dir: dir.to_string_lossy().into_owned(),
-    }).await? {
-        DaemonFrame::RoomDecision { token, target, source, room } => {
+    match daemon
+        .request(DaemonRequest::RoomDecisionExplicit {
+            dir: dir.to_string_lossy().into_owned(),
+        })
+        .await?
+    {
+        DaemonFrame::RoomDecision {
+            token,
+            target,
+            source,
+            room,
+        } => {
             let resolved = if room.is_empty() { "unbound" } else { &room };
             let source = if source.is_empty() { "none" } else { &source };
             println!("vox: binding selected directory {target}; current decision {resolved}, source {source}. Future sessions use the new binding; existing sessions do not move. Every node of this data root can read the room map, including the saved passphrase.");
             Ok(token)
         }
         DaemonFrame::RoomAnswer { said, .. } => Err(AppError::Usage(said.join("\n"))),
-        _ => Err(AppError::Usage("the daemon did not provide a repository decision; nothing was bound".into())),
+        _ => Err(AppError::Usage(
+            "the daemon did not provide a repository decision; nothing was bound".into(),
+        )),
     }
 }
 
@@ -5601,7 +5610,11 @@ async fn cancel_repo_decision(paths: &Paths, token: Option<&str>) {
     use vox_core::node::daemonipc::{DaemonClient, DaemonRequest};
     let Some(token) = token else { return };
     if let Ok(mut daemon) = DaemonClient::open(&paths.account().socket()).await {
-        let _ = daemon.request(DaemonRequest::RoomDecisionCancel { token: token.to_owned() }).await;
+        let _ = daemon
+            .request(DaemonRequest::RoomDecisionCancel {
+                token: token.to_owned(),
+            })
+            .await;
     }
 }
 
@@ -5612,20 +5625,38 @@ async fn save_repo_binding(
     passphrase: &str,
 ) -> Result<(), AppError> {
     use vox_core::node::daemonipc::{DaemonClient, DaemonFrame, DaemonRequest};
-    let node = paths.profile_dir.file_name().and_then(|n| n.to_str())
-        .ok_or_else(|| AppError::Usage("cannot identify the node; repository was not bound".into()))?;
+    let node = paths
+        .profile_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| {
+            AppError::Usage("cannot identify the node; repository was not bound".into())
+        })?;
     let mut daemon = DaemonClient::open(&paths.account().socket()).await?;
-    match daemon.request(DaemonRequest::RoomReplace {
-        token: token.to_owned(),
-        link: link.to_owned(),
-        passphrase: zeroize::Zeroizing::new(passphrase.to_owned()),
-        node: node.to_owned(),
-    }).await? {
+    match daemon
+        .request(DaemonRequest::RoomReplace {
+            token: token.to_owned(),
+            link: link.to_owned(),
+            passphrase: zeroize::Zeroizing::new(passphrase.to_owned()),
+            node: node.to_owned(),
+        })
+        .await?
+    {
         DaemonFrame::RoomAnswer { done, said } => {
-            for line in &said { println!("vox: {line}"); }
-            if done { Ok(()) } else { Err(AppError::Usage("repository update was not confirmed; see the result above".into())) }
+            for line in &said {
+                println!("vox: {line}");
+            }
+            if done {
+                Ok(())
+            } else {
+                Err(AppError::Usage(
+                    "repository update was not confirmed; see the result above".into(),
+                ))
+            }
         }
-        _ => Err(AppError::Usage("the daemon did not confirm the repository decision; its outcome is unknown".into())),
+        _ => Err(AppError::Usage(
+            "the daemon did not confirm the repository decision; its outcome is unknown".into(),
+        )),
     }
 }
 
