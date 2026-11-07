@@ -41,7 +41,8 @@
   amended 2026-11-02 (FX-52: direction-independent authenticated computer enrollment);
   amended 2026-11-07 (FX-61a: retain unadmitted construction across policy supersession;
   FX-61b: observed ordinary-governance loss and retained-policy handoff); amended 2026-11-07
-  (FX-64: a direct member route is not an anchor, and join publication targets it)
+  (FX-64: a direct member route is not an anchor, and join publication targets it);
+  amended 2026-11-07 (FX-66: explicit individual-mode Drive withdrawal survives local reconciliation)
 - **Deciders**: Robert E. Lee
 - **Tags**: trust, daemon identity, sessions, presence, agent comms, sync, health, releases
 - **Related**: ADR-012, ADR-018, ADR-020, ADR-026, ADR-029, ADR-031, ADR-033, ADR-034, ADR-035, ADR-036,
@@ -1578,7 +1579,15 @@ lessons. It changes neither this record's decision status nor any requirement or
   treating local settlement as share readiness, and removing the preparation deadline MUST each turn
   its own consumer assertion red. The refusal of a canonical room ID the profile does not hold, and
   the readable-room-name wait, rest on review; the journey does not stage them.
-- **FX-63. Review and release boundary.** Record each FX-53–FX-65 outcome individually in
+- **FX-66. Local Drive withdrawal.** In individual mode, a successful `vox trust read` MUST
+  retain read trust while preventing automatic local trust from restoring Drive to that pair,
+  including after restart, until the person explicitly grants Drive again. This applies the
+  explicit-choice persistence rule of ADR-031 LT-6 to capability withdrawal. Enrolled computer
+  mode MUST retain ADR-035 CT-3–CT-4: contradictory per-node changes are refused, not exceptions
+  to computer policy. The existing local-trust shipped-binary journey MUST show the pair remains
+  read-only beyond 15 seconds, actual Drive is refused, and the choice survives restart.
+  A mutant restoring the automatic Drive grant MUST turn that same visible read-only assertion red.
+- **FX-63. Review and release boundary.** Record each FX-53–FX-66 outcome individually in
   v0.4.20, including Designing/Blocked records while decisions or prerequisites remain open.
   Proposed source is not design approval or execution readiness. Before permanent implementation,
   obtain independent Opus review of the complete RCA/ADR/task design and resolve every finding;

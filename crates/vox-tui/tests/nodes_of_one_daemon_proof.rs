@@ -549,6 +549,8 @@ fn full_room_id(link: &str, shown: &str) -> String {
 /// LT-1–6 (#724): the app's saved personal-node choice is apparatus; every grant, join,
 /// displayed alias, decision and restart is exercised through the shipped binary. No app runs.
 /// Mutant: grant the personal node only Read; the personal-drive assertion must turn PRODUCT red.
+/// Revocation mutant: omit the read-only blacklist insertion; the 15-second keyring and Session
+/// target assertions must report PRODUCT after the automatic local rule restores drive.
 #[test]
 #[ignore = "real binaries with production Argon2id; run in release"]
 fn local_nodes_trust_each_other_without_a_prompt_and_remember_removals() {
@@ -794,6 +796,130 @@ fn local_nodes_trust_each_other_without_a_prompt_and_remember_removals() {
         a.run(&["status", "--json", "--node", names[3]], ""),
         a.log()
     );
+    // The worker's real Session is visible and addressable to the personal node before narrowing.
+    const REVOKE_SESSION: &str = "79979979-aaaa-4bbb-8ccc-000000001113";
+    let transcript = a._tmp.path().join("revocation-transcript.jsonl");
+    std::fs::write(&transcript, "").expect("APPARATUS: synthetic Session transcript");
+    let payload = serde_json::json!({
+        "session_id": REVOKE_SESSION,
+        "hook_event_name": "UserPromptSubmit",
+        "cwd": a._tmp.path(),
+        "transcript_path": transcript,
+        "prompt": "local revocation Session",
+    });
+    let mut hook = a
+        .cmd(&[
+            "agent", "hook", "--node", names[1], "--room", &room, "--format", "text",
+        ])
+        .env("CLAUDE_CODE_ENTRYPOINT", "cli")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("APPARATUS: start Session hook");
+    hook.stdin
+        .take()
+        .expect("APPARATUS: hook stdin")
+        .write_all(payload.to_string().as_bytes())
+        .expect("APPARATUS: write Session hook");
+    let hook_output = hook
+        .wait_with_output()
+        .expect("APPARATUS: collect Session hook");
+    assert!(
+        hook_output.status.success(),
+        "APPARATUS: Session hook failed: {}",
+        String::from_utf8_lossy(&hook_output.stderr)
+    );
+    let target = format!("{}/{REVOKE_SESSION}", fps[1]);
+    let mut attempt = (false, String::new(), String::new());
+    assert!(
+        wait_until(Duration::from_secs(45), || {
+            attempt = a.run(
+                &[
+                    "room",
+                    "post",
+                    &room,
+                    "--to",
+                    &target,
+                    "before-revocation",
+                    "--node",
+                    person,
+                ],
+                "",
+            );
+            attempt.0
+        }),
+        "APPARATUS: personal node could not address the staged Session: {attempt:?}"
+    );
+    let started = Instant::now();
+    manual(&["trust", "read", &fps[0], "--node", names[1]]);
+    // Changing the existing history grant is not an explicit grant of Drive.
+    manual(&[
+        "trust",
+        "add",
+        &fps[0],
+        "--name",
+        person,
+        "--history",
+        "full",
+        "--node",
+        names[1],
+    ]);
+    for _ in 0..15 {
+        let shown = ring(names[1]);
+        eprintln!(
+            "[proof] revocation +{:?}: {}",
+            started.elapsed(),
+            shown.trim()
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    let shown = ring(names[1]);
+    eprintln!(
+        "[proof] revocation +{:?}: {}",
+        started.elapsed(),
+        shown.trim()
+    );
+    assert!(
+        shown
+            .lines()
+            .any(|line| line.contains(&fps[0]) && line.ends_with("read")),
+        "PRODUCT: explicit read-only choice was reversed after 15s: {shown}"
+    );
+    let (ok, out, err) = a.run(
+        &[
+            "room",
+            "post",
+            &room,
+            "--to",
+            &target,
+            "after-revocation",
+            "--node",
+            person,
+        ],
+        "",
+    );
+    assert!(
+        !ok && format!("{out}{err}").contains("this node cannot read that Session"),
+        "PRODUCT: after 15 seconds Session addressing did not refuse for lack of read access: {out}{err}"
+    );
+    let (ok, out, err) = a.run(
+        &[
+            "room",
+            "session",
+            &room,
+            REVOKE_SESSION,
+            "--say",
+            "must not arrive",
+            "--node",
+            person,
+        ],
+        "",
+    );
+    assert!(
+        !ok && format!("{out}{err}").contains("this node cannot read that Session"),
+        "PRODUCT: after 15 seconds Drive did not refuse for lack of Session read access: {out}{err}"
+    );
 
     manual(&["trust", "remove", &fps[3], "--node", names[1]]);
     absent(names[1], &fps[3]);
@@ -846,6 +972,11 @@ fn local_nodes_trust_each_other_without_a_prompt_and_remember_removals() {
         )),
         "PRODUCT: personal drive was lost after restart: {}",
         ring(names[3])
+    );
+    assert!(
+        has(names[1], &fps[0], person, false),
+        "PRODUCT: the explicit read-only choice did not survive restart: {}",
+        ring(names[1])
     );
     absent(names[1], &fps[3]);
     absent(names[2], &fps[3]);

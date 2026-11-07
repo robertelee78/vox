@@ -198,7 +198,7 @@ pub struct Keyring {
     full_history: BTreeSet<Digest32>,
     /// The identities trusted with drive (ADR-028 K-14); everyone else has [`Capability::Read`].
     drive: BTreeSet<Digest32>,
-    /// A person's removals forbid automatic local trust until they add that identity back.
+    /// A person's removals and explicit read-only choices forbid automatic local widening.
     /// Kept in the same sealed write as the keyring, independently of decision-log retention.
     local_removals: BTreeSet<Digest32>,
     /// Older roots import the still-retained removal decisions before automatic trust runs.
@@ -274,8 +274,14 @@ impl Keyring {
             return false;
         }
         match capability {
-            Capability::ReadDrive => self.drive.insert(*fingerprint),
-            Capability::Read => self.drive.remove(fingerprint),
+            Capability::ReadDrive => {
+                self.local_removals.remove(fingerprint);
+                self.drive.insert(*fingerprint)
+            }
+            Capability::Read => {
+                self.local_removals.insert(*fingerprint);
+                self.drive.remove(fingerprint)
+            }
         };
         true
     }
@@ -331,7 +337,7 @@ impl Keyring {
         removed
     }
 
-    /// Identities a manual removal has blacklisted from automatic local trust.
+    /// Identities a manual removal or read-only choice has blacklisted from automatic local trust.
     #[must_use]
     pub fn local_removals(&self) -> &BTreeSet<Digest32> {
         &self.local_removals
@@ -495,7 +501,7 @@ impl Keyring {
                         .map_err(|_| Error::MalformedAtRest("local trust removal"))?,
                 )
                 .map_err(|_| Error::MalformedAtRest("local trust removal fingerprint"))?;
-                if entries.contains_key(&fp) || !local_removals.insert(fp) {
+                if drive.contains(&fp) || !local_removals.insert(fp) {
                     return Err(Error::MalformedAtRest(
                         "local trust removal conflicts with keyring",
                     ));
