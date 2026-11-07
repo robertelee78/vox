@@ -206,13 +206,39 @@ only room governance is who sets the room's retention. This builds on identity (
   inherits no authority from the removed identity. An admin whose own membership is removed MUST
   NOT exercise its delegation while removed; removal alone MUST NOT silently revoke that delegation.
 - **G-29. Signed authority and ordering.** A removal MUST be an authenticated governance-log
-  fact, using G-9's canonical encoding, composite signature, channel/epoch and author/causal
-  bindings, with a distinct versioned type/domain and the exact target composite fingerprint.
-  Validate the issuer's authority in its causal past and retain the necessary signed ancestry and
-  delegation evidence. A board Member withdrawal alone is discovery evidence, not this fact or
-  authority to alter the log. Replays MUST be idempotent; wrong-room, invalid, unauthorized or
-  missing-ancestry facts MUST NOT grant access or effect removal. A missing dependency remains
-  pending, not an invented verdict.
+  fact using G-9's canonical encoding, composite signature, channel/epoch and author/causal
+  bindings. The proposed appended tags, unallocated in the source registry through `0x0023`,
+  are removal `0x0024` with signing domain `vox/member-removal/v1`, and readmission `0x0025`
+  with signing domain `vox/member-readmission/v1`; both use frame version `1`. The canonical
+  unsigned CBOR arrays are respectively `[channel_id, epoch, issuer_id, target_id]` and
+  `[channel_id, epoch, issuer_id, target_id, removal_entry_hashes]`: IDs and hashes are 32-byte
+  byte strings, epoch is an unsigned integer, and the nonempty removal hash array is unique and
+  sorted by bytewise hash. Each framed wire array appends the composite signature bytes to its
+  unsigned fields; the signature covers the domain concatenated with the unsigned canonical body.
+  The issuer MUST equal the enclosing log author; channel and epoch MUST match that entry and
+  the epoch in its strict causal past. References identify enclosing governance log entry hashes.
+  ADR-008's registry MUST be updated when this proposal is implemented; reserved old tags MUST
+  NOT be reused.
+
+  The creator is root admin; a delegated remover MUST have an unexpired, in-effect,
+  creator-issued delegation granting `policy` in the action's strict causal past, and MUST
+  itself be a member at that action. Evaluate this authority in the strict causal past,
+  not by a circular final-membership predicate: concurrent or later removal/revocation of
+  the issuer does not retroactively cancel a valid action. Two concurrently authorized
+  admins removing one another therefore produce two valid removals, not an oscillating
+  validity cycle. Later actions must honor the authority state in their own causal past.
+  Readmission requires the creator's root signature, not delegated `policy`. Retain necessary signed
+  ancestry and delegation evidence. A board Member withdrawal alone is discovery evidence, not
+  this fact or authority to alter the log. Replays MUST be idempotent; wrong-room, invalid,
+  unauthorized or missing-ancestry facts MUST NOT grant access or effect removal. Missing or
+  unvalidated dependencies remain inert, not a room-wide egress barrier; re-evaluate the fact
+  when ancestry arrives.
+
+  All participating members and boards MUST support these exact fact versions and enforcement
+  before room removal is offered or relied upon. An obsolete or incompatible participant MUST
+  update or be refused participation in that removal-enabled room; do not assume an old node
+  will enforce an unknown tag. Existing builds reject unknown struct tags; their subsequent feed
+  behaviour is not established. The compatibility gate MUST be enforced, not merely displayed.
 - **G-30. Readmission and conflicts.** Only the creator MAY explicitly readmit the exact removed
   fingerprint, by a distinct signed room-bound governance fact referencing all removal facts it
   supersedes. It MUST causally descend from every removal it supersedes; an ordinary passphrase
@@ -225,16 +251,30 @@ only room governance is who sets the room's retention. This builds on identity (
   sender, Drive or service authority by itself.
 - **G-31. Forward enforcement.** Before irreversible room egress, each member MUST check current
   validated room authorization and fence stale in-flight work against the current room authorization
-  generation; known removal or unresolved required governance dependencies MUST win over queued
-  sends, key delivery, Session read/Drive and service access. Once applied, exclude the target
-  from active membership, claims, reach and new access; rotate future sender keys and applicable
-  room-bound Drive and service keys/credentials and distribute them only to still-authorized,
-  independently trusted nodes. Close or reauthorize existing affected sessions. Catching up peers
-  MUST apply the barrier before resuming egress, including after restart. A partitioned peer cannot
-  know an unseen removal: do not claim instantaneous global revocation; show local applied versus
-  pending/unknown propagation honestly. Retain old signed messages, signatures, fork evidence and
-  claim history. Previously disclosed plaintext and keys cannot be recalled or made retroactively
-  secret (G-27).
+  generation; an applied, validated removal MUST win over queued sends, key delivery, Session
+  read/Drive and service access. Once applied, exclude the target from active membership, claims,
+  reach and new access; rotate future sender keys and applicable room-bound Drive and service
+  keys/credentials and distribute them only to still-authorized, independently trusted nodes.
+  Close or reauthorize existing affected sessions. Catching up peers MUST apply the barrier before
+  resuming egress, including after restart.
+
+  For each validated removal, a target-authored entry is historical if it is in that
+  removal's strict causal past. For any removal not in the entry's causal future, the entry is
+  eligible only if it causally descends from a valid creator readmission that supersedes that
+  removal. Thus concurrent entries and entries after removal but before readmission are not
+  authorized by earlier membership; a removal concurrent with or later than a readmission wins.
+  Once a removal is known,
+  members MUST NOT accept as room content, forward as content, or display ineligible entries,
+  including replays and entries received before the removal became known. Recompute visibility
+  when new validated causal evidence arrives. These rules apply per removal and readmission, not
+  by wall clock or arrival order. Deny the removed target's sender keys during removal, including
+  replayed keys; after readmission apply ordinary consent and fresh-key checks.
+
+  Retain historical signed entries, their signatures, author-chain skeletons, fork evidence and
+  claim history; filtering is not deletion of the target's prefix or a rewrite of signed history.
+  A partitioned peer cannot know an unseen removal: do not claim instantaneous global revocation;
+  show local applied versus pending/unknown propagation honestly. Previously disclosed plaintext
+  and keys cannot be recalled or made retroactively secret (G-27).
 - **G-32. Consumer acceptance.** Extend existing real product journeys with isolated nodes and
   native UI/CLI: identify the target by verified exact fingerprint, show before and after effects
   and room scope, and remove it as creator and delegated admin; non-admin and creator-target
@@ -247,8 +287,12 @@ only room governance is who sets the room's retention. This builds on identity (
   fingerprint. Exercise stale queued egress and removal/readmission permutations through actual
   consumers. The apparatus is isolated profiles, controlled partition and timing; the PRODUCT
   verdict is observed membership and access, not a log assertion or successful command alone.
-  A separately exercised mutant that omits the egress barrier or lets passphrase rejoin override
-  removal MUST make the corresponding consumer proof fail. These are future proofs, not results.
+  Separately have the removed node post, including a partition-concurrent post replayed after
+  catch-up; independent peers' native views MUST NOT show those posts, while the causally prior
+  signed history remains readable. Exercise eligible post-readmission content separately.
+  Independently exercised mutants that omit the egress barrier, accept and display a removed
+  author's post, or let passphrase rejoin override removal MUST each make the corresponding
+  consumer proof fail. These are future proofs, not results.
 
 ### Known gaps
 

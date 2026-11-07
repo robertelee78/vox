@@ -282,11 +282,10 @@ me specify one if not".)
 ## Proposed v0.4.20 amendments — not accepted or built
 
 These amendments are proposed for independent design review, not a decision or implementation
-claim. If accepted, they amend RB-5a–RB-7 and ST-4 only as stated below; existing Session,
-node identity, room membership, read and Drive safeguards remain required. In particular, the
-operator-only replacement below narrows RB-7's agent `--none` permission; the presentation
-prerequisite explicitly qualifies ST-4's prohibition on requiring OMP changes. The proposed
-requirements and acceptance matrix have stable IDs for subsequent source-bound work.
+claim. If accepted, they amend RB-5a–RB-7 only as stated below; existing Session,
+node identity, room membership, read and Drive safeguards remain required. The operator-only
+replacement narrows RB-7's agent `--none` permission. ST-4's supported-API and no-OMP-change
+requirements remain unchanged. The requirements below have stable IDs for source-bound work.
 
 ### Repository decision and deliberate rebind
 
@@ -303,18 +302,18 @@ requirements and acceptance matrix have stable IDs for subsequent source-bound w
   including linked-worktree mapping, and place a more-specific `none` there; do not replace the
   parent. Split asks grouped under a parent by actual decision boundary. Sibling repositories,
   parent credentials and explicit more-specific repository or worktree overrides remain effective.
-  If the boundary or effective scope is ambiguous, stale or invalid, require a clearly described
-  valid operator choice or cancel; if none can be established, refuse and explain rather than
-  choosing a parent or arbitrary subdirectory.
+  If the boundary or effective scope is ambiguous, stale or invalid, refuse and explain; do not
+  choose a parent or arbitrary subdirectory. The operator may then choose an unambiguous valid
+  repository through the deliberate rebind surface.
 - **P420-RB-3.** Replacement is a distinct operator action, not a broadening of agent decline.
   An agent's `vox agent room --none` MAY record a no for an unbound scope but MUST NOT replace an
   operator binding or shadow any resolved inherited binding. Check this against the effective map
   atomically. Replacement CLI entry points MUST reject agent-marked callers, including malformed
-  nonempty harness marks; ordinary agent-facing commands and FFI MUST NOT provide replacement
-  authority. The native action needs an enforceable local operator authorization boundary:
-  a new daemon verb, an environment mark or a caller-supplied operator flag alone does not
-  authenticate a person or defeat arbitrary same-user socket access. Review that boundary and,
-  if necessary, provide an appropriate authorization mechanism before exposing replacement.
+  nonempty harness marks. The native action and operator CLI use a distinct replacement daemon
+  verb behind the existing mode-0600, uid-checked local control socket. The OS account remains
+  the authorization boundary (ADR-026 C-1/C-6), not person attestation or a new grant ceremony.
+  Ordinary agent-facing decline does not gain replacement authority. This does not claim to
+  isolate an arbitrary malicious process already running as the same OS user.
 - **P420-RB-4.** The displayed decision MUST carry an opaque non-secret snapshot of the
   registered target boundary, effective source block and target override, detecting even a
   credential change for the same room. A lost snapshot or restart is stale. Under one data-root
@@ -339,24 +338,26 @@ requirements and acceptance matrix have stable IDs for subsequent source-bound w
 ### OMP registration and recovery
 
 - **P420-OR-1.** Registration belongs to the exact live OMP TUI main-session generation and
-  authenticated bridge route, not to a process-wide success flag. The adapter MUST track
-  unregistered, pending, registered and actionable failure for that generation. A bounded,
-  structured, non-secret registration-only receipt MUST identify the node, native session,
-  route/generation correlation and actual daemon admission; it MUST be checked against the
-  still-current manager and route before use. Staging, attaching, missing node, timeout, EOF,
-  malformed reply, a listening bridge or a zero exit without that receipt is not registration.
-  Ordinary hook success is not an acknowledgment. Errors are bounded and actionable without
-  leaking credentials, route tokens or private content.
-- **P420-OR-2.** On startup and switch/branch/tree, and before actual prompt preparation or
-  another use depending on registration, reconcile the live manager and coalesce a bounded
-  attempt for the current generation. An unavailable or failed startup MUST be recoverable when
-  the node becomes Ready without restarting OMP; use an existing native lifecycle/recovery
-  signal when sufficient. If needed, use the existing daemon Subscribe channel with a bounded
-  connection and race-free subscribe/snapshot resynchronization, not a new subscription
-  framework; if unavailable, report it and retry on the next real prompt/use. No continuous
-  polling, blind respawn loop, automatic attach/unlock, credential retention, second runtime or
-  generic retry framework. Recheck identity after asynchronous waits, invalidate receipts after
-  daemon restart/reattach, and leave ordinary OMP usable when Vox is unavailable.
+  authenticated bridge route, not to a process-wide success flag. Track unregistered, pending,
+  registered and actionable failure for that generation. The existing registration-only child
+  exit 0, still in the captured generation and `current()` at close, is its receipt: that mode
+  succeeds only after actual non-Attaching SessionRegistered. No new receipt format or daemon
+  IPC is required. Ordinary hook success, staging, attaching, missing node, timeout, EOF or a
+  listening bridge is not registration. Capture bounded sanitized child stderr and show the
+  actual failure without credentials, route tokens or private content.
+  Registration-only failures MUST distinguish existing typed transient unavailability
+  (missing/attaching node, unanswered/unavailable daemon and timeout) from permanent identity,
+  route, permission or protocol refusal through a documented nonzero exit category, without
+  parsing translated prose. Success remains the same exit-0 criterion, not a new ACK format.
+- **P420-OR-2.** On activation and before each real prompt's prepare or other registration-dependent
+  use, reconcile the live manager; if its generation is not registered, invoke the existing
+  register-only child once, coalescing concurrent callers, then recheck the fence. A confirmed
+  pre-envelope missing-registration failure returns that generation to unregistered. Capture
+  errors and keep ordinary OMP usable. No blind five-attempt loop, automatic attach/unlock,
+  credential retention or unnecessary receipt/subscription framework is required.
+  Idle urgent-attention recovery after initial daemon/node failure is required by ST-4:
+  use P420-OR-5's bounded native availability bridge and mutation-time route ownership,
+  not an assumed external Subscribe stream or another model prompt.
 - **P420-OR-3.** Preserve transition fences and route authentication. A stale completion cannot
   revive an old route, register a newer generation or overwrite its state. A cancelled or
   rolled-back switch MUST reconcile the live manager and retire a provisional target, even if
@@ -368,6 +369,46 @@ requirements and acceptance matrix have stable IDs for subsequent source-bound w
   poison later legitimate use: recover only after a matching current registration receipt.
   Ambiguous delivery remains fail-closed; never clear it blindly or replay potentially delivered
   context. Repeated failures remain bounded and visible rather than silently disabling Vox.
+- **P420-OR-5. Idle availability and native ownership.** Add one narrowly scoped Vox CLI
+  availability-watch child owned by this extension, not a second runtime. It does not register,
+  autostart a daemon, attach/unlock a node, read rooms or call a model. With bounded handshakes,
+  subscribe to existing daemon events before a separate exact-node Ready snapshot, reconcile
+  intervening events, and resnapshot after relevant events or connection loss. Because the
+  current server silently skips lag, take at most one serialized health snapshot per 30 seconds;
+  absent/unanswered transport reconnects with capped 1/2/4/8/16/30-second delay. Emit bounded
+  non-secret ready/unavailable/error categories. Parent lifetime stdin EOF ends the child.
+  Keep one subscription, one snapshot, one timer and one coalesced register child, never
+  one per room; cap frames/stderr and retire all work on native shutdown.
+  A Ready observation triggers registration only while the current generation is unconfirmed.
+  After a typed transient registration failure, a fresh successful Ready snapshot may retry
+  at the same capped pace even if readiness never transitioned: a register request may fail
+  while Nodes still answers. This must eventually recover when the daemon can register again,
+  without a new operator prompt. Permanent refusals remain visible and do not trigger a steady
+  respawn loop. Confirmation stops retry; a new availability epoch or legitimate use can
+  reacquire. Ambiguous same-generation SessionRegister retry must be idempotent for its exact
+  node/session/route, never replay room messages or use another identity.
+
+  JS completion fencing does not cancel an already accepted daemon write. The watcher owns
+  a private native-extension-instance directory with stable mutation and lifetime lock files,
+  active random generation reference and exact node/session binding. Hold lifetime ownership
+  while live. Both daemon registration writes, including deferred completions, and cold-start
+  direct staging take the same mutation lock, verify exact active generation plus live
+  lifetime ownership, and hold mutation ownership through the record write. Retirement first
+  rejects old bridge work in memory, then revokes under that mutation lock; its ACK follows
+  revocation. A successor cannot activate/register until retirement ACK, or confirmed owner
+  death plus acquisition/drain of the same mutation lock. It then takes lifetime ownership and
+  installs its distinct active generation under mutation ownership. Never unlink/recreate a
+  lock inode while held or awaited. Disk state without live ownership never grants authority;
+  watcher death closes eligibility and rotates the native route. Unknown retirement fails
+  closed and is surfaced, not treated as success. Cancelled/rolled-back transitions reconcile
+  the actual still-current native manager and acquire a fresh valid generation. This is a
+  local OS-account ownership fence, not person attestation or a new room trust capability.
+
+  The [source-bound bridge design](../research/v0.4.20-omp-idle-registration-design.md)
+  supplies the source anchors and acceptance apparatus; the requirements here supersede its
+  earlier steady-Ready retry limitation. Real proof must deliver an authorized room ask to
+  the same idle native Session after missing-node and busy-daemon recovery with no operator
+  prompt, plus a delayed-old-write inverse on both daemon and cold-stage paths.
 
 ### OMP private Drive
 
@@ -376,25 +417,30 @@ requirements and acceptance matrix have stable IDs for subsequent source-bound w
   person or an agent; nodes, not human/agent types, are the identities. No new human-origin flag
   or grant ceremony is required. Preserve the authenticated peer node, room/history instance,
   session/branch and explicit action kind. Ordinary room attention and messages remain foreign
-  participant content, not operator instructions; file bytes and notes remain data. Deliver
-  explicit Drive text using OMP user-prompt semantics with defined idle/streaming behavior,
-  while retaining node provenance instead of falsely asserting local-human authorship.
+  participant content, not operator instructions; file bytes and notes remain data. Retain the
+  existing aside wake → `context`-time capability materialization → provider-marker observation
+  path. At the guarded context event inject explicit Drive text as a supported `role: user`
+  AgentMessage with authenticated node provenance, not the “not the user” wrapper. An idle
+  Session starts a turn; a streaming Session consumes it at the next eligible step boundary.
+  Do not substitute eager `sendUserMessage`, which would bypass deferred materialization.
 - **P420-OD-2.** Preserve the single-use deferred capability and revalidate membership, Drive,
   node/room/history, exact registration and branch immediately before materialization and native
-  delivery. Revocation or transition before that boundary prevents delivery; after an irreversible
+  delivery. Revocation or transition before that boundary prevents delivery; after irreversible
   delivery report uncertainty, not retraction. Do not replay unaccepted staged content on
-  reconnect or reset. If OMP's void `sendUserMessage` cannot couple this guard to identifiable
-  consumption, a narrow supported native API/event contract is a prerequisite; do not invent an
-  acknowledgment or bypass the guard.
+  reconnect or reset. Existing ContextEventResult.messages supports this AgentMessage path;
+  no upstream API change is required. Exactly one provider marker establishes the candidate
+  consumption step under the existing native observation criterion.
 - **P420-OD-3.** Generate an unpredictable operation ID before send and carry it with authenticated
   author and scope through request, `drive.id`, private capability mapping, native receipt,
   `drive-result.of`, projection, pagination/reconnect, FFI and UI. The private capability is
   secret and distinct from this correlation ID. Deduplicate within author/operation scope; never
-  associate by text or timing. Show separately refused/not sent, bridge queued, native/provider
-  accepted under a defined observed criterion, an identified native turn/step, and an answer
-  only with a defensible native causal association. Missing or ambiguous evidence stays
-  unconfirmed, never auto-resends or downgrades established evidence. A late receipt cannot
-  update a different sender, room, Session, branch or UI item. Queue acceptance MAY clear the
+  associate by text or timing. Show refused/not sent, bridge queued, and native/provider accepted
+  under the defined marker criterion separately. The assistant `message_end` belonging to the
+  single provider request containing that operation's marker is its linked response step;
+  publish an ID-bearing event over the authenticated follower and `drive-result.of`. Do not
+  call that step a semantic answer, or attach any later/unmarked reply. Missing or ambiguous
+  evidence stays unconfirmed, never auto-resends or downgrades established evidence.
+  A late receipt cannot update a different sender, room, Session, branch or UI item. Queue acceptance MAY clear the
   draft only with recoverable submitted text and status for refusal or unknown delivery.
 - **P420-OD-4.** Advertise only native controls actually supported. OMP `abort()` is a request
   to abort the current operation, not evidence of completion or termination of the Session;
@@ -414,22 +460,24 @@ requirements and acceptance matrix have stable IDs for subsequent source-bound w
   JSON tool output may still be shown as content. Both app and TUI consume the same structured
   projection; the TUI may use a readable bounded fallback. Other harnesses and existing
   authorized approval/question behavior remain intact.
-- **P420-OP-2.** Full native parity is blocked pending an OMP-owned supported, versioned export
-  of resolved, serializable semantic snapshot and updates from the running host, or an
-  equivalent supported in-process extension API which resolves descriptions while OMP owns
-  tool hooks and component context. The observed public lifecycle events expose intent and
-  partial results, not such a renderer export; internal `NativeToolView`/`NativeChild` objects
-  are not an established external API. This proposal therefore qualifies ST-4's no-OMP-changes
-  constraint for that narrowly scoped upstream dependency. Do not import private renderers,
-  execute extension JS in Vox, scrape a Tern screen, or build another terminal engine. A
-  formatting-only improvement MUST NOT be claimed as parity.
-- **P420-OP-3.** The negotiated export MUST supply an atomic active post-reset branch snapshot,
-  cursor and stable session, branch/reset generation, message, call and semantic-node IDs,
-  followed without a snapshot/event race by ordered updates and explicit replacement/reset.
-  Preserve author/occurrence ownership and native history separately. On gap, reconnect, branch
-  change or incompatible version, mark observation incomplete and resnapshot; reject late old
-  generation updates. Preserve latest coalesced progress and every terminal outcome, including
-  async completion, and explicitly indicate unsupported or omitted content.
+- **P420-OP-2.** Use existing supported OMP lifecycle and read-only Session APIs, without an
+  OMP change: separate `intent` at tool start; coalesced `partialResult` updates; final typed
+  result content/details and `isError`; streaming assistant text; `getAsyncJobSnapshot()` jobs
+  (id, type, status, label, intent, command, caption, start/end); and async-result messages.
+  Present intent or tool name as the heading, status/progress and readable text/image parts.
+  Tool args and intentionally structured JSON remain available in disclosure, never a protocol
+  envelope as the normal card. Do not copy arbitrary tool-specific renderers into Vox.
+  Full arbitrary/custom `describeCall`/`describeResult` visual parity would need a supported
+  future OMP API; it is not required for this outcome and is not a release prerequisite.
+- **P420-OP-3.** Build the active-branch snapshot from the supported `sessionManager.getBranch()`,
+  persisted native tool-call intent, async snapshot and the extension's current running-call
+  map. Capture it synchronously with follower enrollment on the native event loop and assign
+  a cursor before subsequent deltas; do not assume asynchronous renderer objects are
+  serializable. Carry stable session, branch/reset generation, message/call/job identifiers
+  and ordered typed updates with explicit replacement/reset. A gap, reconnect or branch change
+  marks observation incomplete until a fresh current snapshot; reject late old-generation
+  updates. Preserve latest coalesced progress and every terminal outcome, native history
+  separately, and explicit unsupported/omitted-content indicators.
 - **P420-OP-4.** Carry typed semantics through sealed Session activity, validation, bounded
   storage and paging, projection, FFI and client views without exposing hidden/private reasoning.
   Bound frames, tree depth and nodes, retained snapshot, text/blobs, in-flight bytes and update
@@ -453,21 +501,17 @@ No acceptance, mutant or implementation is claimed here.
 
 | Requirement | Real consumer acceptance and inverse |
 |---|---|
-| P420-RB-1, P420-RB-2 | In Vox.app, fail a real Join It on a bound repository, then confirm Not This Repo; see truthful failure and durable opt-out, no subsequent ask for future repo/worktree sessions after normal lifecycle. A sibling under the inherited parent still joins and communicates, explicit overrides work, and running sessions, trust and membership remain unchanged. Ambiguous boundary refuses or requests a valid explicit choice. |
+| P420-RB-1, P420-RB-2 | In Vox.app, fail a real Join It on a bound repository, then confirm Not This Repo; see truthful failure and durable opt-out, no subsequent ask for future repo/worktree sessions after normal lifecycle. A sibling under the inherited parent still joins and communicates, explicit overrides work, and running sessions, trust and membership remain unchanged. An ambiguous boundary refuses with an explanation and changes nothing. |
 | P420-RB-3, P420-RB-4 | From real agent-marked entry points attempt exact replacement and inherited shadowing: both refuse, while unbound agent no works. Change room, same-room credential or override after displaying confirmation and observe conflict without lost data; exercise competing cooperating writers and write/durability failure, with no credential disclosure or false success. |
 | P420-RB-5 | After opt-out use native rebind without an ask; wrong credentials retain the no, correct credentials permit a new session/worktree to use the room without a prompt loop. Verify held-room credential checking and the operator CLI route; existing sessions do not silently move. |
-| P420-OR-1–P420-OR-3 | In a real resumed OMP TUI with real room/node, match the native identity to an admitted receipt and post/read a distinct message. Repeat with startup node absent then Ready, daemon reattach, actual prompt recovery, startup resume and in-process switch/branch/tree without restarting OMP. Delayed old completion, cancelled/rolled-back switch, mismatched markers, wrong harness or borrowed ID must not route or post. Staging, timeout or exit zero without receipt is not success. |
+| P420-OR-1–P420-OR-3 | In a real resumed OMP TUI with real room/node, observe actual register-only success under the unchanged native generation and post/read a distinct message. Exercise startup node absent then Ready and actual prompt recovery, startup resume and in-process switch/branch/tree without restarting OMP. Delayed old completion, cancelled/rolled-back switch, mismatched markers, wrong harness or borrowed ID must not route or post. Staging, timeout and ordinary-hook success are not registration. |
 | P420-OR-4 | In a fresh native session arrange a real startup daemon timeout and first prepare's pre-envelope close; show failure while OMP remains usable, restore the authorized node and recover context and a new post/read under the same current identity without restart or replay. Repeat unavailable/repeated failure and genuinely ambiguous delivery: no false receipt, unbounded respawn, silent permanent disablement or duplicate injection. |
-| P420-OD-1–P420-OD-4 | In actual OMP and Vox, send harmless uniquely identified private Drive inputs while idle and streaming; see authenticated node provenance, queue then the matching observed native acceptance, and an answer only when causally associated. Concurrent input and unrelated turns cannot take its receipt. Exercise disconnect, branch/reset, revocation and late receipts, plus foreign room text and file content; no unauthorized elevation, replay or cross-session association. Controls report only evidenced native capability and outcome. |
-| P420-OP-1–P420-OP-4 | With a supported semantic exporter, observe actual app and TUI Sessions with real tool intent, partial progress, success/error/cancellation and background completion, rich blocks and long Unicode details across pages. Disconnect, gap and branch reset must recover without old updates; media works across hosts without shared paths and denied/revoked access, forged hashes or unsupported/oversized media never leak or render as verified. No hidden reasoning or executable content is introduced. |
+| P420-OD-1–P420-OD-4 | In actual OMP and Vox, send harmless uniquely identified private Drive inputs while idle and streaming; see authenticated node provenance, queue then matching observed native acceptance and the marker-associated response step, not an invented answer state. Concurrent input and unrelated turns cannot take its receipt. Exercise disconnect, branch/reset, revocation and late receipts, plus foreign room text and file content; no unauthorized elevation, replay or cross-session association. Controls report only evidenced native capability and outcome. |
+| P420-OP-1–P420-OP-4 | Using current supported OMP APIs, observe actual app and TUI Sessions with real intent, coalesced partial progress, success/error/cancellation, async jobs and background completion, text/image parts and long Unicode details across pages. Disconnect, gap and branch reset recover without stale updates. Media works across hosts without shared paths; denied/revoked access, forged hashes or unsupported/oversized media never leak or render as verified. No hidden reasoning, executable content, private renderer import or new terminal/runtime is introduced. |
 
-The 2026-11-06 investigation artifacts are [bound prompt](file:///Users/robert.lee/.omp/agent/artifacts/vox-computer-trust-rca-20261106/bound-prompt-full-rca.md),
-[OMP resume](file:///Users/robert.lee/.omp/agent/artifacts/vox-computer-trust-rca-20261106/omp-resume-full-rca.md),
-[OMP Drive](file:///Users/robert.lee/.omp/agent/artifacts/vox-computer-trust-rca-20261106/omp-drive-full-rca.md), and
-[OMP presentation](file:///Users/robert.lee/.omp/agent/artifacts/vox-computer-trust-rca-20261106/omp-presentation-full-rca.md).
-These local artifact links are not portable: durable publication of the evidence and replacement
-with accessible links are prerequisites to source-bound issue creation. The artifacts record
-incident observations and their limits, not candidate acceptance. Repository-side source
+The complete [incident RCA and proposed corrective boundaries](../research/v0.4.20-incident-rcas.md)
+retain observations, source mechanisms, original alternatives and uncertainty separately.
+Local diagnostic logs are not published and are not candidate acceptance. Repository-side source
 anchors include [OMP extension](../../crates/vox-tui/assets/omp-extension.ts),
 [OMP mirror](../../crates/vox-tui/src/omp_mirror.rs),
 [Drive host](../../crates/vox-tui/src/host.rs) and
@@ -478,9 +522,10 @@ incident's exact trigger. OMP lifecycle source inspected for this proposal is at
 binary. Tern.app 0.9.12 is a presentation reference, not an authority channel:
 [transport](https://docs.stencil.so/tern/protocol/transport.md),
 [operations](https://docs.stencil.so/tern/protocol/operations.md) and
-[design](https://docs.stencil.so/tern/guides/design.md). Its protocol does not establish an OMP
-external renderer API. The exact operator-authorization boundary, ambiguous-scope UI and
-supported OMP semantic export remain review prerequisites, not accepted decisions.
+[design](https://docs.stencil.so/tern/guides/design.md). Its protocol is a presentation reference,
+not evidence of an external OMP renderer API. Current supported OMP events and snapshots are
+sufficient for P420-OP's required outcome; idle registration-recovery ownership remains an
+explicit technical design-review item rather than an invented native API.
 
 ## Superseded and amended lines
 

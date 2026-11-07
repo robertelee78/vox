@@ -170,12 +170,17 @@ local own feed, which is authoritative.
 **Proposed v0.4.20 correction; not built:** ADR-023 RL-8.4–RL-8.5 explicitly qualifies R5 for
 an author with retained prior-room continuity. Leave retains only the operator-approved
 non-secret continuity marker, not room content or keys. Rejoin installs its recovery fence
-before any fresh signed head, Presence, PrivateSupport, key, Session or text append. It MUST
-verify/reconstruct the retained prefix/frontier and reconcile higher authenticated heads
-before sender-generation advancement and return Presence. The returning author's permitted
-reads and discovery remain live while it reports recovery pending. Fresh authors still settle
-locally without peer acknowledgments. This is not a global convergence gate or a scalar
-counter workaround; genuine conflicting history and older-backup refusal remain intact.
+before any fresh signed head, Presence, PrivateSupport, key, Session or text append. Verify
+the retained own signed head, derive its append frontier during authenticated recovery and
+reconcile higher authenticated heads before generation advancement and return Presence.
+RL-8.5's durable verified admission notice newer than departure supplies pre-Presence recovery
+standing, not independent trust or removal override. Missing marker alone never proves a fresh
+author; prior-release erased/unknown history remains pending/read-only as RL-8.5 specifies.
+Permitted reads remain live where independent membership, trust and key checks allow them;
+report exact recovery/integrity failure when sync is blocked. Fresh authors still settle
+locally without peer acknowledgments. No global convergence gate or scalar-counter workaround
+is introduced; genuine conflicting/older-backup refusal remains intact, and End erases the
+Leave-only marker.
 
 
 ### R6. Proofs

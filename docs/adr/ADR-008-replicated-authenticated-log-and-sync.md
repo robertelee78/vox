@@ -169,11 +169,24 @@ consent grants (ADR-007), rendezvous records (ADR-012), the transport identity e
   | `0x001C` | identity ask | — (never signed) | ADR-011 req 28 (ADR-026; decided, not built on this tree) |
   | `0x001D` | identity prove | `vox-id/v2/resp` | ADR-011 req 28 (ADR-026; decided, not built on this tree) |
   | `0x001E` | identity claim | `vox-id/v2/init` | ADR-011 req 28 (ADR-026; decided, not built on this tree) |
+  | `0x001F` | room-name | `vox/room-name/v1` | ADR-028 R-1 |
+  | `0x0020` | admission-notice | `vox/admission-notice/v1` | ADR-016; existing source registry |
+  | `0x0021` | room-anchors | `vox/room-anchors/v1` | ADR-032 |
+  | `0x0022` | log-head | `vox/log-head/v1` | ADR-036 |
+  | `0x0023` | control-context | `vox/log-context/v1` | ADR-036 |
+  | `0x0024` | member-removal (proposed, not built) | `vox/member-removal/v1` | ADR-007 G-29, v0.4.20 |
+  | `0x0025` | member-readmission (proposed, not built) | `vox/member-readmission/v1` | ADR-007 G-29, v0.4.20 |
 
 - **LS-21a.** A struct that carries a time MUST carry it in milliseconds, at format version 2 (the
   frame's version byte) under its `/v2` label (#562). A board record, pre-join, join witness or board
   withdraw at format 1 MUST be refused with the reason that it is from a Vox whose times were seconds; a
   logged struct at format 1 is read as ADR-007 G-1a says.
+- **LS-21b. Proposed v0.4.20, not accepted or built.** The two new member lifecycle types
+  use frame version 1 with the canonical arrays/signature domains in ADR-007 G-29; they have
+  no timestamp field. Reserve their distinct tags without changing old tag meanings. Matching
+  enforcement-capable participant versions are required before relying on room removal.
+  An older parser's unknown-tag rejection is not proof that it enforces removal; incompatible
+  participation must be refused under the negotiated room contract, not silently tolerated.
 - **LS-22.** New struct types MUST be appended, versioned, and a tag MUST NOT be reused. `0x000B`
   and `0x0010` belong to removed deniable mode: they stay registered and MUST NOT be produced.
   `0x0006` carries only a room's retention; policy updates beyond retention and passphrase rotation
