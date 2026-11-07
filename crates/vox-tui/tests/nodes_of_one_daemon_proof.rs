@@ -5455,6 +5455,7 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
             &stale_create_arm,
             &stale_create_engaged,
             &stale_create_release,
+            (&hold_arm, &hold_engaged, &hold_release),
             &beta,
             &delta,
         );
@@ -5470,8 +5471,8 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
         &state_commit_release,
     );
 
-    // ---- an admitted join serializes a later Computer policy move ------------------------
-    let db = admitted_join_serializes_computer_policy(
+    // ---- rejected join records leave the answering member's board across restart ---------
+    let db = rejected_join_records_leave_remote_board(
         (&a, &da),
         RestartComputerSide {
             account: &b,
@@ -5507,6 +5508,7 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
         &stale_create_arm,
         &stale_create_engaged,
         &stale_create_release,
+        (&hold_arm, &hold_engaged, &hold_release),
         (&beta, &delta),
     );
     let nodes_a = [
@@ -6498,10 +6500,15 @@ fn remote_board_serves_member(
     })
 }
 
-/// An admitted join keeps its publication lease until it completes; a later Computer policy
-/// move waits, and the joined room remains usable after that move.
-fn admitted_join_serializes_computer_policy(
-    (a, _da): (&Account, &Daemon),
+/// A join can publish to the member that answered it before the final Computer-policy fence.
+/// Hold that exact join, observe both accepted records on the responder's real board, move policy,
+/// take the responder's path offline, and release the join. The refused join must survive neither
+/// local room listing nor the responder's board after the joining daemon restarts. Reopening the
+/// responder's exact userspace path while the joiner is stopped proves its in-memory stale records
+/// persisted; only the joining daemon's durable cleanup can remove them.
+#[allow(clippy::too_many_arguments)]
+fn rejected_join_records_leave_remote_board(
+    (a, da): (&Account, &Daemon),
     side: RestartComputerSide<'_>,
     join_arm: &Path,
     join_engaged: &Path,
@@ -6511,7 +6518,17 @@ fn admitted_join_serializes_computer_policy(
         account: b,
         daemon: db,
         nodes: nodes_b,
-        ..
+        listen: listen_b,
+        hold_spec,
+        reply_spec,
+        state_commit_spec,
+        stale_pause_spec,
+        stale_post_spec,
+        stale_create_spec,
+        stale_join_spec,
+        stale_rekey_spec,
+        older_selected_spec,
+        stopped_reader_answered,
     } = side;
     let c = Account::new();
     let host = c.make_node("host");
@@ -6603,80 +6620,124 @@ fn admitted_join_serializes_computer_policy(
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    // computer.rs:2635-2638 takes the exclusive publication transition; 2650-2658
-    // retains a shared publication lease for an admitted join until its outcome settles.
-    // A policy writer must therefore wait, not supersede this already-admitted work.
     let before = computer(b, &["status"])["revision"].as_u64().unwrap_or(0);
     computer(a, &["personal", "gamma"]);
-    println!("[proof] FX-28 join-publication-serialization apparatus staged: the responder serves both join records and delta's admitted join remains held while a Computer policy move is requested");
-    let deadline = Instant::now() + CHANGE_SHOWN_WITHIN;
-    while Instant::now() < deadline {
-        let revision = computer(b, &["status"])["revision"].as_u64().unwrap_or(0);
-        assert!(
-            revision == before && join_engaged.is_file(),
-            "PRODUCT [FX28 join-publication-serialization]: Computer policy moved from revision {before} to {revision} while the admitted join still held its publication lease"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    assert!(
+        wait_until(RETURN_WITHIN, || computer(b, &["status"])["revision"]
+            .as_u64()
+            .is_some_and(|revision| revision > before)),
+        "APPARATUS: durable Computer policy did not move on beta while delta's join was held\n{}\n{}",
+        da.said(),
+        db.said()
+    );
+    assert!(
+        join_engaged.is_file(),
+        "APPARATUS: delta's join was not still held after durable policy moved"
+    );
+    println!("[proof] FX-28 stale-join-authority apparatus staged: the responder serves both exact join records while delta's completed join remains held across durable Computer policy movement");
+    board_forward.close();
     std::os::unix::net::UnixStream::connect(join_release).unwrap_or_else(|error| {
         panic!(
             "APPARATUS: release delta's held join at {}: {error}",
             join_release.display()
         )
     });
-    let release_deadline = Instant::now() + RETURN_WITHIN;
-    while join
-        .try_wait()
-        .expect("APPARATUS: inspect released join")
-        .is_none()
-    {
-        if Instant::now() >= release_deadline {
-            let status = b.run(&["status", "--json", "--node", "delta"], "");
-            let _ = join.kill();
-            let output = join
-                .wait_with_output()
-                .expect("APPARATUS: collect stalled join");
-            panic!("PRODUCT [FX28 join-publication-serialization]: join child still running after release; Computer policy command already returned; delta status {status:?}; stdout {}; stderr {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
     let joined = join
         .wait_with_output()
-        .expect("APPARATUS: collect the released room join");
+        .expect("APPARATUS: collect the causally released room join");
     assert!(
-        joined.status.success(),
-        "PRODUCT [FX28 join-publication-serialization]: admitted join failed after release: stdout {}; stderr {}",
+        !joined.status.success(),
+        "PRODUCT [FX28 stale-join-authority]: after durable Computer policy moved while its accepted board records were visible, shipped `vox room join` still acknowledged the stale join: stdout {}; stderr {}",
         String::from_utf8_lossy(&joined.stdout),
         String::from_utf8_lossy(&joined.stderr)
     );
     assert!(
-        wait_until(RETURN_WITHIN, || computer(b, &["status"])["revision"]
-            .as_u64().is_some_and(|revision| revision > before)),
-        "PRODUCT [FX28 join-publication-serialization]: the waiting Computer policy did not apply after the admitted join completed"
+        board_forward.dropped() > 0,
+        "APPARATUS: the closed responder path dropped no datagram, so board unreachability was not staged"
     );
-    for (account, node, text) in [
-        (&c, "host", "serialized-join-from-host"),
-        (b, "delta", "serialized-join-from-delta"),
-    ] {
-        let (ok, out, err) = account.run(&["room", "post", &room, text, "--node", node], "");
-        assert!(ok, "PRODUCT [FX28 join-publication-serialization]: {node} could not post after the policy move: {out}{err}");
+    let _beta_before_restart = db.stop();
+    let _verified = board_forward.open_and_verify();
+    let still_exposed =
+        remote_board_serves_member(&rt, board_address, board_id, room_id, member_id);
+    assert!(
+        still_exposed == (true, true),
+        "APPARATUS: after the answering board's exact path reopened while beta was stopped, it did not still expose both accepted stale join records, so durable withdrawal recovery cannot be measured; member {}, bundle {}",
+        still_exposed.0,
+        still_exposed.1
+    );
+    println!(
+        "[proof] FX-28 withdrawal-not-durable apparatus staged: after the refused join and with beta stopped, the reopened responder board still exposes both exact accepted records"
+    );
+
+    let rotate_after_post_spec = b
+        .data
+        .join(FX28_ROTATE_AFTER_POST_ARM)
+        .to_string_lossy()
+        .into_owned();
+    let restarted = Instant::now();
+    let mut db = Daemon::start(
+        b,
+        &["--node", "beta"],
+        &[
+            ("VOX_LISTEN", listen_b),
+            ("VOX_TEST_CLOCK_STEP_MS", REMOTE_CLOCK_SKEW_MS),
+            ("VOX_TEST_HOLD_COMPUTER_POLICY", hold_spec),
+            ("VOX_TEST_HOLD_COMPUTER_POLICY_REPLY", reply_spec),
+            ("VOX_TEST_HOLD_COMPUTER_STATE_COMMIT", state_commit_spec),
+            ("VOX_TEST_HOLD_ROOM_PAUSE_PUBLICATION", stale_pause_spec),
+            ("VOX_TEST_HOLD_TEXT_APPEND_PUBLICATION", stale_post_spec),
+            ("VOX_TEST_HOLD_ROOM_CREATE_PUBLICATION", stale_create_spec),
+            ("VOX_TEST_HOLD_ROOM_JOIN_AFTER_BOARD", stale_join_spec),
+            ("VOX_TEST_HOLD_REKEY_ENQUEUE", stale_rekey_spec),
+            (
+                "VOX_TEST_FX28_MARK_ENDED_UNANSWERED_FILE",
+                older_selected_spec,
+            ),
+            ("VOX_TEST_FX28_ROTATE_AFTER_POST", &rotate_after_post_spec),
+            (
+                "VOX_TEST_FX28_STOPPED_READER_ANSWERED_FILE",
+                stopped_reader_answered,
+            ),
+        ],
+    );
+    for (name, _) in nodes_b {
+        let ready = format!("{name} is Ready");
+        db.expect_event_until(
+            restarted + RETURN_WITHIN,
+            &format!("node {name} is Ready after durable-withdrawal restart"),
+            |line| line.contains(&ready),
+        );
     }
-    for (account, node, text) in [
-        (b, "delta", "serialized-join-from-host"),
-        (&c, "host", "serialized-join-from-delta"),
-    ] {
-        assert!(wait_until(RETURN_WITHIN, || {
-            let (ok, out, _) = account.run(&["room", "read", &room, "--node", node], "");
-            ok && out.contains(text)
-        }), "PRODUCT [FX28 join-publication-serialization]: {node} did not read the other member's fresh post under the new policy");
+    let (listed, rooms, list_error) = b.run(&["room", "list", "--node", "delta"], "");
+    assert!(
+        listed && !rooms.contains(&room),
+        "PRODUCT [FX28 stale-join-authority]: after the joining daemon restarted and delta was Ready, its shipped room list exposed the refused stale-authority join: {rooms}{list_error}"
+    );
+    loop {
+        let exposed = remote_board_serves_member(&rt, board_address, board_id, room_id, member_id);
+        if exposed == (false, false) {
+            break;
+        }
+        assert!(
+            restarted.elapsed() < RETURN_WITHIN,
+            "PRODUCT [FX28 withdrawal-not-durable]: after delta's refused join and daemon restart, the answering member's real board still exposed its stale records: member {}, bundle {}; beta daemon {}; host daemon {}",
+            exposed.0,
+            exposed.1,
+            db.said(),
+            dc.said()
+        );
+        std::thread::sleep(Duration::from_millis(100));
     }
+    println!(
+        "[proof] after a refused join, offline responder and joining-daemon restart, the responder's real board exposes neither stale member nor stale bundle record"
+    );
     computer(a, &["personal", "alpha"]);
     assert!(
         wait_until(RETURN_WITHIN, || {
             roster_current(&computer(a, &["status"]), &["alpha", "gamma"])
                 && roster_current(&computer(b, &["status"]), &["beta", "delta"])
         }),
-        "APPARATUS: both Computers did not settle after the serialized join phase"
+        "APPARATUS: both Computers did not settle after the durable board-withdrawal phase"
     );
     db
 }
@@ -7170,6 +7231,7 @@ fn stale_remote_pause_is_refused(
     create_arm: &Path,
     create_engaged: &Path,
     create_release: &Path,
+    policy_hold: (&Path, &Path, &Path),
     (beta, delta): (&str, &str),
 ) -> String {
     let room = make_room(b, "delta");
@@ -7506,6 +7568,7 @@ fn stale_remote_pause_is_refused(
         create_arm,
         create_engaged,
         create_release,
+        policy_hold,
         beta,
         delta,
     );
@@ -7529,6 +7592,7 @@ fn constructor_re_admission(
     create_arm: &Path,
     create_engaged: &Path,
     create_release: &Path,
+    (policy_arm, policy_engaged, policy_release): (&Path, &Path, &Path),
     beta: &str,
     delta: &str,
 ) {
@@ -7573,6 +7637,8 @@ fn constructor_re_admission(
         held_room.len() == 52,
         "APPARATUS: held room marker did not contain a full room ID: {held_room:?}"
     );
+    std::fs::write(policy_arm, b"hold delta's next policy application\n")
+        .expect("APPARATUS: arm delta's Computer policy hold");
     let before = computer(b, &["status"])["revision"].as_u64().unwrap_or(0);
     computer(a, &["personal", "gamma"]);
     assert!(
@@ -7586,34 +7652,109 @@ fn constructor_re_admission(
         "APPARATUS: delta's exact sealed room create was not held through policy movement"
     );
     let moved_revision = computer(b, &["status"])["revision"].as_u64().unwrap();
-    println!(
-        "[proof] FX-28 constructor-re-admission apparatus staged: durable Computer policy moved while delta's exact sealed room create remained held at its first durable commit"
-    );
     std::os::unix::net::UnixStream::connect(create_release).unwrap_or_else(|error| {
         panic!(
             "APPARATUS: release delta's held room create at {}: {error}",
             create_release.display()
         )
     });
-    let release_deadline = Instant::now() + RETURN_WITHIN;
-    while create
-        .try_wait()
-        .expect("APPARATUS: inspect released create")
-        .is_none()
-    {
-        if Instant::now() >= release_deadline {
-            let status = b.run(&["status", "--json", "--node", "delta"], "");
-            let _ = create.kill();
+    let policy_deadline = Instant::now() + RETURN_WITHIN;
+    while !policy_engaged.is_file() {
+        assert!(
+            daemon_alive(db.child.id()) && Instant::now() < policy_deadline,
+            "APPARATUS: delta's moved Computer policy application did not reach its hold"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    println!(
+        "[proof] FX-28 constructor-re-admission apparatus staged: delta's moved Computer policy is held after releasing the sealed create"
+    );
+    let mut create = Some(create);
+    let mut early = None;
+    let observation_end = Instant::now() + Duration::from_secs(2);
+    loop {
+        let (listed, rooms, list_error) = b.run(&["room", "list", "--node", "delta"], "");
+        assert!(
+            policy_engaged.is_file() && daemon_alive(db.child.id()),
+            "APPARATUS: delta's Computer policy hold disappeared during the room-list observation"
+        );
+        assert!(
+            listed,
+            "APPARATUS: list delta's rooms while Computer policy is held: {rooms}{list_error}"
+        );
+        assert!(
+            !rooms.lines().any(|line| {
+                let mut fields = line.split_whitespace();
+                let id = fields.next().unwrap_or("");
+                let name = fields.next().unwrap_or("");
+                name == "stale-create" || (id.len() == 12 && held_room.starts_with(id))
+            }),
+            "PRODUCT [FX28 constructor-stale-publication]: held room appeared while moved Computer policy was held: held {held_room}; stdout {rooms}; stderr {list_error}"
+        );
+        if create
+            .as_mut()
+            .unwrap()
+            .try_wait()
+            .expect("APPARATUS: inspect held-policy create")
+            .is_some()
+        {
             let output = create
+                .take()
+                .unwrap()
                 .wait_with_output()
-                .expect("APPARATUS: collect stalled create");
-            panic!("PRODUCT [FX28 constructor-re-admission]: original create still running after release; delta status {status:?}; stdout {}; stderr {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+                .expect("APPARATUS: collect held-policy create");
+            assert!(
+                !output.status.success(),
+                "PRODUCT [FX28 constructor-stale-publication]: original create succeeded while moved Computer policy was held: stdout {}; stderr {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            early = Some(output);
+            break;
+        }
+        if Instant::now() >= observation_end {
+            break;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    let created = create
-        .wait_with_output()
-        .expect("APPARATUS: collect the causally released room-create command");
+    std::os::unix::net::UnixStream::connect(policy_release).unwrap_or_else(|error| {
+        panic!(
+            "APPARATUS: release delta's held Computer policy at {}: {error}",
+            policy_release.display()
+        )
+    });
+    let cleanup_deadline = Instant::now() + RETURN_WITHIN;
+    while policy_engaged.is_file() {
+        assert!(
+            Instant::now() < cleanup_deadline && daemon_alive(db.child.id()),
+            "APPARATUS: delta's Computer policy hold did not clear after release"
+        );
+        std::thread::yield_now();
+    }
+    let created = if let Some(output) = early {
+        output
+    } else {
+        let mut create = create.take().unwrap();
+        let release_deadline = Instant::now() + RETURN_WITHIN;
+        while create
+            .try_wait()
+            .expect("APPARATUS: inspect released create")
+            .is_none()
+        {
+            if Instant::now() >= release_deadline {
+                let status = b.run(&["status", "--json", "--node", "delta"], "");
+                let _ = create.kill();
+                let output = create
+                    .wait_with_output()
+                    .expect("APPARATUS: collect stalled create");
+                panic!("PRODUCT [FX28 constructor-re-admission]: original create still running after release; delta status {status:?}; stdout {}; stderr {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        create
+            .wait_with_output()
+            .expect("APPARATUS: collect the causally released room-create command")
+    };
     assert!(
         created.status.success(),
         "PRODUCT [FX28 constructor-re-admission]: the original sealed room create did not succeed after Computer policy moved: stdout {}; stderr {}",

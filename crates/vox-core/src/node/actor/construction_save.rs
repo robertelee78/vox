@@ -69,7 +69,7 @@ pub(super) struct Parked {
     epoch: u64,
     store: std::sync::Weak<Store>,
     work: Work,
-    reply: oneshot::Sender<Outcome>,
+    pub(super) reply: oneshot::Sender<Outcome>,
     ready: bool,
 }
 
@@ -213,9 +213,9 @@ impl Node {
         }
     }
 
-    pub(super) fn retire_parked_construction(&mut self) {
+    pub(super) fn retire_parked_construction(&mut self, fault: Fault) {
         if let Some(parked) = self.parked_construction.take() {
-            let _ = parked.reply.send(Outcome::Failed(Fault::Locked));
+            let _ = parked.reply.send(Outcome::Failed(fault));
         }
     }
 
@@ -235,7 +235,7 @@ impl Node {
                     .is_some_and(|store| Arc::ptr_eq(&store, &profile.store_handle()))
             });
         if !current {
-            self.retire_parked_construction();
+            self.retire_parked_construction(Fault::Locked);
             return;
         }
         if !parked.ready
@@ -421,7 +421,27 @@ impl Node {
                         .unwrap_or_else(|_| Err(Error::Profile("room constructor worker stopped")));
                     Returned::Started { result, lifetime }
                 }
-                None => Returned::Unadmitted { work, lifetime },
+                None => {
+                    #[cfg(feature = "test-knobs")]
+                    if crate::node::computer::fx28_mutant("constructor-stale-commit")
+                        && matches!(work, Work::Create { .. })
+                    {
+                        let lifetime = Arc::new(lifetime);
+                        let held = Arc::clone(&lifetime);
+                        let result = tokio::task::spawn_blocking(move || work.run(&held))
+                            .await
+                            .unwrap_or_else(|_| {
+                                Err(Error::Profile("room constructor worker stopped"))
+                            });
+                        *returned
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some(Returned::Started { result, lifetime });
+                        wake.notify_one();
+                        return;
+                    }
+                    Returned::Unadmitted { work, lifetime }
+                }
             };
             *returned
                 .lock()
@@ -456,8 +476,18 @@ impl Node {
         let _ = pending.task.await;
         let returned = match returned {
             Returned::Unadmitted { work, lifetime } => {
+                let superseded = lifetime.authority.superseded();
                 drop(lifetime);
                 if matches!(work, Work::Create { .. }) {
+                    if !matches!(superseded, Ok(true))
+                        || self
+                            .failed_construction_policy
+                            .as_ref()
+                            .is_some_and(|guard| guard.active(self.computer.as_ref()).is_ok())
+                    {
+                        let _ = pending.reply.send(Outcome::Failed(Fault::ComputerPolicy));
+                        return;
+                    }
                     #[cfg(feature = "test-knobs")]
                     if crate::node::computer::fx28_mutant("constructor-terminal-refusal") {
                         let _ = pending.reply.send(Outcome::Failed(Fault::ComputerPolicy));

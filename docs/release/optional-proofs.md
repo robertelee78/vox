@@ -273,11 +273,11 @@ room ID, join and bidirectional posts.
 FX-28's executable mutants are run one at a time with
 `scripts/run-fx28-mutant.sh <mode>`, where `<mode>` is
 `preview-approval-not-durable`, `stopped-reader-fresh-write`, `lock-through-computer-write`,
-`deadline-as-storage-failure`, `stale-tick-authority`, `join-drops-publication-lease`,
+`deadline-as-storage-failure`, `withdrawal-not-durable`, `stale-tick-authority`, `stale-join-authority`,
 `fresh-preview-inherits-old-deadline`, `late-application-abandons-work`, `detach-keeps-reconciliation`,
 `redeem-rejects-pending-registration`, `owner-refusal-decoded-as-payload`,
 `due-backoff-drops-causal-cause`,
-`stale-post-authority`, `constructor-terminal-refusal`,
+`stale-post-authority`, `constructor-terminal-refusal`, `constructor-stale-commit`,
 `stale-trust-projection`, `stale-rekey-authority`, or
 `legacy-ended-unanswered-not-selected`. Each mode selects the journey which stages that fault and accepts
 only its exact named `PRODUCT [FX28 ...]:` verdict; another product red is an apparatus failure,
@@ -286,16 +286,18 @@ authenticated peer which fills the other daemon's bounded management slots and l
 response unread. `lock-through-computer-write` restores the former state lock across an exact held
 durable Computer write; shipped status must still answer with the last committed revision inside
 its existing actor-liveness contract. `deadline-as-storage-failure` turns an exact pre-rename
-causal refusal into permanent storage quarantine again. `join-drops-publication-lease` releases
-the admitted Join's lease at its held handoff; the shipped Computer status must not show the
-waiting policy applied before that Join settles. The previous stale-Join withdrawal phase assumed
-an impossible policy-move interleaving and no longer supplies withdrawal-recovery evidence.
+causal refusal into permanent storage quarantine again. `withdrawal-not-durable` omits the refused
+join's prepared and pending board-withdrawal journals; after the responder path reopens with the
+joining daemon stopped, restart must still remove both exact accepted records from that real board.
 `stale-post-authority` bypasses the durable-policy fence around an
 ordinary text append; `stale-trust-projection` makes the shipped trust list copy unreconciled
 trusted rows; `constructor-terminal-refusal` makes the pre-admission supersession terminal instead
 of retaining the exact sealed Create: the shipped journey requires its original room ID to
 complete under the accepted current policy and appear in the room list. Its intended verdict is
 `PRODUCT [FX28 constructor-re-admission]:`; stale authority must never commit that room.
+`constructor-stale-commit` bypasses the refused constructor lease and its lease-less continuation
+checks: while delta's moved Computer policy remains held, the original create must not succeed or
+appear in the room list. Its intended verdict is `PRODUCT [FX28 constructor-stale-publication]:`.
 `stale-rekey-authority` bypasses the final fence around exact sender-key queue
 admission after every preceding await. `legacy-ended-unanswered-not-selected` suppresses only
 the real `ENDED_UNANSWERED` compatibility-route selection; the shipped roster then fails to say

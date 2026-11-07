@@ -536,16 +536,6 @@ lessons. It changes neither this record's decision status nor any requirement or
   it until withdrawal is complete. Sender-key authority proofs stage the exact protected entry
   at the recipient before releasing a held key batch: lack of ciphertext or receiver-side policy
   revocation cannot substitute for proving the sender's final admission fence.
-  An admitted Join retains its shared publication lease through its outcome; the Computer policy
-  transition takes the exclusive lease (`computer.rs` 2635–2638, 2650–2658). Therefore a policy
-  move cannot commit across that held Join. The FX-28 journey observes the old revision while
-  held, then both successful Join and policy move and fresh posts in both directions. Its former
-  stale-Join withdrawal phase assumed an impossible post-admission policy-move interleaving.
-  Withdrawal after admission remains reachable but unproven: an independent application-miss
-  save failure calls `storage_failure` (`computer.rs` 3256–3290, 2841–2847), blocking authority
-  so the Join publication fence can refuse (`maintenance_save.rs` 19–23;
-  `metadata_save.rs` 939–972). No existing proof knob stages that storage fault at this boundary;
-  the removed journey supplies no withdrawal-after-admission or restart-recovery evidence.
   A sealed Create held before publication admission whose Computer policy is superseded MUST
   retain its original construction and complete under the accepted current policy, with the
   original room ID and reply, rather than fail solely because the policy moved. Stale authority
@@ -1497,9 +1487,11 @@ lessons. It changes neither this record's decision status nor any requirement or
   authority and lifetime. On accepted policy completion, managed and headless paths MUST re-admit
   that same work under current authority, without another command or restart. Re-admission MUST
   check the reply is still open, attachment epoch, newer supersession and ADR-028 R-3. A new
-  Create or Serve while this slot is occupied MUST receive `RoomChangePending`; lock or shutdown
-  MUST retire it with `Locked`. The slot MAY retain only the original in-memory sealed room key
-  and passphrase, no secret lease, and MUST drop them synchronously on lock. Join retains its abort
+  Create or Serve while this slot is occupied MUST receive `RoomChangePending`; lock MUST retire
+  it with `Locked`, and shutdown with `ShuttingDown`. Blocked authority, storage failure, or a
+  failed or unsettled application without supersession MUST fail instead of parking. The slot MAY
+  retain only the original in-memory sealed room key and passphrase, no secret lease, and MUST drop
+  them synchronously on lock. Join retains its abort
   path but MUST report `ComputerPolicy`, not `Internal`. Started or ambiguous construction MUST
   NOT be replayed; the unadmitted distinction MUST be enforced by type.
 

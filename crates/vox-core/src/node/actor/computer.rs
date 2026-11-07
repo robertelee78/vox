@@ -123,7 +123,32 @@ impl ComputerAuthority {
         Some(ComputerPublication { _managed: managed })
     }
 
+    /// Only a changed durable target is a supersession. A blocked or failed Computer authority,
+    /// or an unsettled application of the same target, is a terminal refusal instead.
+    pub(super) fn superseded(&self) -> crate::error::Result<bool> {
+        match self {
+            Self::Unmanaged => Ok(false),
+            Self::Managed {
+                computer,
+                applied,
+                expired,
+                ..
+            } => {
+                computer.storage_ready()?;
+                if computer.own_key_authority_blocked() {
+                    return Err(Error::Profile("current computer trust is unavailable"));
+                }
+                let target = computer.policy_target();
+                Ok(target.revision() != *applied || target.expired() != *expired)
+            }
+        }
+    }
+
     pub(super) fn publish<T>(&self, publish: impl FnOnce() -> T) -> Option<T> {
+        #[cfg(feature = "test-knobs")]
+        if crate::node::computer::fx28_mutant("stale-join-authority") {
+            return Some(publish());
+        }
         match self {
             Self::Unmanaged => Some(publish()),
             Self::Managed {
@@ -148,6 +173,10 @@ impl ComputerAuthority {
     /// asynchronous hand-offs whose irreversible operation belongs to another component; the
     /// operation is not even constructed unless the same authority still exists.
     pub(super) fn current(&self) -> bool {
+        #[cfg(feature = "test-knobs")]
+        if crate::node::computer::fx28_mutant("stale-join-authority") {
+            return true;
+        }
         match self {
             Self::Unmanaged => true,
             Self::Managed {
@@ -376,6 +405,36 @@ impl Node {
         let _ = std::fs::remove_file(release);
     }
 
+    /// Hold only the constructor proof's policy application, leaving the actor free.
+    #[cfg(feature = "test-knobs")]
+    pub(super) fn hold_constructor_policy_for_proof(
+        &self,
+    ) -> Option<(
+        tokio::net::UnixListener,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    )> {
+        let spec = std::env::var(TEST_HOLD_COMPUTER_POLICY_ENV).ok()?;
+        let mut fields = spec.splitn(4, '\t');
+        let (node, arm, engaged, release) = (
+            fields.next()?,
+            fields.next()?,
+            fields.next()?,
+            fields.next()?,
+        );
+        let mine = self.paths.profile_dir.file_name()?.to_str()?;
+        if mine != node
+            || std::fs::read(arm).ok()?.as_slice() != b"hold delta's next policy application\n"
+        {
+            return None;
+        }
+        std::fs::remove_file(arm).ok()?;
+        let _ = std::fs::remove_file(release);
+        let listener = tokio::net::UnixListener::bind(release).ok()?;
+        std::fs::write(engaged, b"computer policy application held off actor\n").ok()?;
+        Some((listener, engaged.into(), release.into()))
+    }
+
     pub(super) async fn hold_computer_policy_for_proof(&self, guard: &ComputerPolicyGuard) {
         let Ok(spec) = std::env::var(TEST_HOLD_COMPUTER_POLICY_ENV) else {
             return;
@@ -485,34 +544,12 @@ impl Node {
     /// Test apparatus: hold a completed join after its records were queued to the answering
     /// member's real board and immediately before the final durable-policy fence. The marker
     /// stages only; shipped join/list output and the remote board judge the result.
-    pub(super) fn hold_room_join_after_board_for_proof(&self) -> Option<oneshot::Receiver<()>> {
-        let spec = std::env::var(TEST_HOLD_ROOM_JOIN_AFTER_BOARD_ENV).ok()?;
-        let mut fields = spec.splitn(4, '\t');
-        let (node, arm, engaged, release) = (
-            fields.next()?,
-            fields.next()?,
-            fields.next()?,
-            fields.next()?,
-        );
-        let mine = self.paths.profile_dir.file_name()?.to_str()?;
-        if mine != node || std::fs::remove_file(arm).is_err() {
-            return None;
-        }
-        let _ = std::fs::remove_file(release);
-        let listener = tokio::net::UnixListener::bind(release).ok()?;
-        std::fs::write(engaged, b"room join after board publication held\n").ok()?;
-        let engaged = std::path::PathBuf::from(engaged);
-        let release = std::path::PathBuf::from(release);
-        let wake = Arc::clone(&self.post_save_wake);
-        let (send, recv) = oneshot::channel();
-        tokio::spawn(async move {
-            let _ = listener.accept().await;
-            let _ = std::fs::remove_file(engaged);
-            let _ = std::fs::remove_file(release);
-            let _ = send.send(());
-            wake.notify_one();
-        });
-        Some(recv)
+    pub(super) async fn hold_room_join_after_board_for_proof(&self) {
+        self.hold_authority_use_for_proof(
+            TEST_HOLD_ROOM_JOIN_AFTER_BOARD_ENV,
+            "room join after board publication",
+        )
+        .await;
     }
 
     /// Test apparatus: hold a prepared sender/history-key batch after every await and immediately
