@@ -4378,6 +4378,14 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
     lands_in(&third, "88888888-aaaa-4bbb-8ccc-000000000008");
 
     // An explicit subdirectory binding must not replace the inherited parent block.
+    let parent_session = "8c888888-aaaa-4bbb-8ccc-000000000008";
+    let parent_first = turn(parent_session, &repo);
+    let parent_by = Instant::now() + Duration::from_secs(30);
+    while !open_in(&home, parent_session) {
+        assert!(Instant::now() < parent_by,
+            "APPARATUS: the parent's existing Session was not staged before override: {parent_first}");
+        std::thread::sleep(Duration::from_millis(250));
+    }
     let override_dir = repo.join("explicit-override");
     std::fs::create_dir_all(&override_dir).expect("APPARATUS: create override directory");
     let override_dir = std::fs::canonicalize(&override_dir).expect("APPARATUS: canonical override");
@@ -4402,7 +4410,7 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
     while !open_in(&other, override_session) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(250));
     }
-    assert!(open_in(&other, override_session) && open_in(&home, mapped),
+    assert!(open_in(&other, override_session) && open_in(&home, parent_session),
         "PRODUCT: the override must use the new room without moving an existing parent session: {first}");
     let sibling_session = "8b888888-aaaa-4bbb-8ccc-000000000008";
     let sibling_first = turn(sibling_session, &repo.join("sub"));
