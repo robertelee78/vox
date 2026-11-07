@@ -1392,13 +1392,20 @@ impl Node {
                         .collect()
                 })
                 .unwrap_or_default();
+            // Admission reserves the peer or queues a retry, even when it returns no target.
+            let responder_offered = match &after {
+                Some(PublicationAfter::Joined { conn, .. }) => conns
+                    .iter()
+                    .any(|anchor| anchor.peer_id() == conn.peer_id()),
+                _ => false,
+            };
             for conn in conns {
                 if let Some(target) = self.admit_metadata_anchor(room, conn, cause).await {
                     targets.push(target);
                 }
             }
             if let Some(PublicationAfter::Joined { conn, .. }) = &after {
-                if !self.anchor_ids.contains(&conn.peer_id()) {
+                if !responder_offered {
                     if let Some(target) = self
                         .admit_metadata_anchor(room, Arc::clone(conn), cause)
                         .await
