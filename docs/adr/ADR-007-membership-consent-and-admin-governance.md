@@ -252,9 +252,10 @@ only room governance is who sets the room's retention. This builds on identity (
   unauthorized or missing-ancestry facts MUST NOT grant access or effect removal. Missing or
   unvalidated dependencies remain inert, not a room-wide egress barrier; re-evaluate the fact
   when ancestry arrives.
-  A verified issuer fork MUST NOT restore access. An otherwise-valid removal on either
-  branch remains exclusionary, subject to the creator cutoff and reversible only by
-  creator readmission. Other governance acts at or after the verified divergence carry
+  A verified issuer fork MUST NOT restore access. Otherwise-valid member removals and
+  creator delegation revocations on either branch remain exclusionary, subject to the
+  creator cutoff and reversible only by the corresponding creator restoration.
+  Other governance acts at or after the verified divergence carry
   no authority; only acts proved in the shared authenticated prefix strictly before
   divergence may retain it. Retain proof pairs and provenance and re-evaluate when a
   proof commits; an unproved common-prefix position is unavailable authority, not permission

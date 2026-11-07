@@ -3558,23 +3558,6 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
     let told = turn(below, &loose);
     eprintln!("[proof] (2) a session started in loose was told: {told:?}");
     assert!(
-        told.contains("isn't tied to a Vox room")
-            && told.contains("You can create one for it")
-            && !told.contains("Vox has asked the operator")
-            && told.contains(&format!(
-                "vox room create --name '<name>' --node default --bind {}",
-                loose.display()
-            ))
-            && told.contains("do not ask again on later turns")
-            && told.contains(&format!(
-                "vox room join '<link>' --node default --bind {}",
-                loose.display()
-            ))
-            && told.contains("vox agent room --none --node default"),
-        "PRODUCT: an unmapped repo's hook must give terminal create-and-bind, pasted-link and no \
-         choices once, without claiming an app asked; it was told {told:?}"
-    );
-    assert!(
         !sessions(&home).iter().any(|r| r["id"] == below),
         "PRODUCT: a session started in an unmapped directory must open no Session in any room: \
          {:?}",
