@@ -175,7 +175,11 @@ by any of them (ADR-001: there is no typed agent or human).
 - **K-20. No trust file.** There MUST be no provision-time import, bulk trust file or other trust
   path beyond ADR-020 3.7's two entry points.
 
-### Proposed v0.4.20 — room access and truthful observation (not accepted or built)
+### v0.4.20 — scoped design approval, not built
+
+The operator selected these outcomes; independent Opus review of `37b0ffbf4` approved K-21–K-25
+at design level, with K-22's independent staging clarification below. K-26 member removal
+remains proposed. No implementation, consumer acceptance or publication is approved here.
 
 - **K-26. Room removal action.** The native member UI and CLI MUST allow the creator or authorized
   admin to select the exact verified member fingerprint for removal from this room under ADR-007
@@ -196,7 +200,8 @@ by any of them (ADR-001: there is no typed agent or human).
   reads MUST NOT convert unknown into false or present last-good data as current; retained rows
   MUST identify staleness and the actual failure. No approval, trust or access check is weakened.
 - **K-22. Warning consumer acceptance.** In the existing isolated native paired-computer journey,
-  complete actual approvals and stage the failed room join/consent condition. The visible warning
+  complete actual approvals and stage genuine unresolved inbound consent or key wait; a failed
+  join may supply it but is not required, so acceptance does not depend on FX-53's repair. The visible warning
   MUST not accuse the remote node of withholding trust; it MUST show the actual unresolved room or
   delivery condition. After real repair, exchange distinct new messages both ways before presenting
   room access as ready. Separately exercise genuine missing approval/refusal, stale and unavailable

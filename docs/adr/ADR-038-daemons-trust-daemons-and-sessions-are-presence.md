@@ -7,9 +7,12 @@
   source-bound issues, separately from decision status. Each product requirement MUST land
   with its proof (ADR-018) in a small release (FX-19).
   FX-52's 2026-11-02 pairing design is approved; implementation and acceptance are separate.
-  FX-53–FX-63 are proposed v0.4.20 corrective designs, not accepted or built. On 2026-11-06 the
-  operator selected minimal non-secret leave-continuity retention (ADR-023 RL-8.4); technical
-  approval, implementation, independent acceptance and publication remain separate.
+  For v0.4.20, independent Opus reviews of `37b0ffbf4` approved the designs of FX-55–FX-57,
+  FX-59 and FX-60, plus FX-63's process boundary; no implementation or release is approved.
+  FX-53, FX-54, FX-58 and FX-62 remain proposed; FX-61 remains Designing/Blocked.
+  The operator selected minimal non-secret leave continuity retention and automatic empty
+  initialization when prior history cannot be derived; known signed history/conflicts remain
+  protected. Technical approval, actual acceptance and publication are separate.
 - **Date**: 2026-10-19; amended 2026-10-20 (FX-22–FX-27, the daemon's CPU); amended
   2026-10-20 (FX-28–FX-34: the idle daemon's disk and CPU, measured on v0.4.9, the own-feed
   recovery ruling of 2026-10-19, a retention change that poisoned a room, and a node on Linux
@@ -1404,7 +1407,7 @@ lessons. It changes neither this record's decision status nor any requirement or
   their product assertions; a client without successful invitation PoP MUST receive no group
   history. Failure to stage that client is an apparatus failure, not a confidentiality proof.
 
-### v0.4.20 incident corrections — proposed, not built
+### v0.4.20 incident corrections — scoped design approval, not built
 
 - **FX-53. Failed join recovery.** A failed join or policy-rejected reopen MUST NOT install a
   terminal whole-room board withdrawal. Corrected retry on the same daemon MUST exchange
@@ -1420,8 +1423,11 @@ lessons. It changes neither this record's decision status nor any requirement or
   only after verified history and sender-generation recovery. Preserve genuine fork/backup
   refusal and signed peer history. The diagnostic run committed different Presence and
   PrivateSupport hashes at reused sequence 1 and 2 before learning the peer's retained head.
-  For previously erased history with no marker, apply RL-8.5's authenticated head-recovery or
-  unknown/read-only outcome; missing marker alone cannot authorize fresh sequence 1.
+  For previously erased history with no marker, apply RL-8.5/RL-8.7's authenticated
+  recovery attempt and operator-selected automatic empty fallback when no prior authored
+  history can be derived. Never discard a known signed head, marker or conflict; explain
+  the residual erased/withheld-history risk, without a confirmation prompt or blanket
+  read-only treatment of upgraded identities in newly joined rooms.
 - **FX-55. Repository decision escape.** A bound-repository Join It ask MUST support persistent
   explicit operator opt-out and deliberate native rebind under ADR-029 P420-RB-1–P420-RB-5.
   Canonical `room none`, stale-safe atomic scope replacement, inherited-scope isolation and the

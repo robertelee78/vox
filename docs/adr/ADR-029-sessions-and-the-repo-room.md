@@ -279,13 +279,13 @@ me specify one if not".)
   members whose key it held made a Session vanish from the list the moment its node took drive
   back, instead of saying `can_drive: false` (measured 2026-10-19, on v0.4.5 as well).
 
-## Proposed v0.4.20 amendments — not accepted or built
+## v0.4.20 amendments — design status by scope, not built
 
-These amendments are proposed for independent design review, not a decision or implementation
-claim. If accepted, they amend RB-5a–RB-7 only as stated below; existing Session,
-node identity, room membership, read and Drive safeguards remain required. The operator-only
-replacement narrows RB-7's agent `--none` permission. ST-4's supported-API and no-OMP-change
-requirements remain unchanged. The requirements below have stable IDs for source-bound work.
+The operator selected these product outcomes. Independent Opus review of `37b0ffbf4` approved
+P420-RB-1–5, P420-OD-1–4 and P420-OP-1–4 at design level; implementation, consumer acceptance
+and publication are not approved. P420-OR remains proposed and blocked on its review findings.
+Existing node identity, membership, read and Drive safeguards remain required. Repository
+replacement narrows agent `--none` permission; ST-4's supported-API/no-OMP-change rule remains.
 
 ### Repository decision and deliberate rebind
 
@@ -341,14 +341,14 @@ requirements remain unchanged. The requirements below have stable IDs for source
   authenticated bridge route, not to a process-wide success flag. Track unregistered, pending,
   registered and actionable failure for that generation. The existing registration-only child
   exit 0, still in the captured generation and `current()` at close, is its receipt: that mode
-  succeeds only after actual non-Attaching SessionRegistered. No new receipt format or daemon
-  IPC is required. Ordinary hook success, staging, attaching, missing node, timeout, EOF or a
-  listening bridge is not registration. Capture bounded sanitized child stderr and show the
-  actual failure without credentials, route tokens or private content.
-  Registration-only failures MUST distinguish existing typed transient unavailability
-  (missing/attaching node, unanswered/unavailable daemon and timeout) from permanent identity,
-  route, permission or protocol refusal through a documented nonzero exit category, without
-  parsing translated prose. Success remains the same exit-0 criterion, not a new ACK format.
+  succeeds only after actual non-Attaching SessionRegistered. No new success ACK format is
+  required, but the typed retryable daemon refusal in OR-5 is required. Ordinary hook success,
+  staging, attaching, missing node, timeout, EOF or a listening bridge is not registration.
+  Capture bounded sanitized child stderr without credentials, route tokens or private content.
+  Registration-only exits MUST distinguish transient unavailability from permanent identity,
+  route, permission, incompatible protocol or obsolete extension refusal without parsing prose.
+  Exit 0 retains its existing receipt meaning; use a distinct documented nonzero temporary
+  category (75) versus permanent failure (1), preserving other existing exit categories.
 - **P420-OR-2.** On activation and before each real prompt's prepare or other registration-dependent
   use, reconcile the live manager; if its generation is not registered, invoke the existing
   register-only child once, coalescing concurrent callers, then recheck the fence. A confirmed
@@ -369,46 +369,62 @@ requirements remain unchanged. The requirements below have stable IDs for source
   poison later legitimate use: recover only after a matching current registration receipt.
   Ambiguous delivery remains fail-closed; never clear it blindly or replay potentially delivered
   context. Repeated failures remain bounded and visible rather than silently disabling Vox.
-- **P420-OR-5. Idle availability and native ownership.** Add one narrowly scoped Vox CLI
-  availability-watch child owned by this extension, not a second runtime. It does not register,
-  autostart a daemon, attach/unlock a node, read rooms or call a model. With bounded handshakes,
-  subscribe to existing daemon events before a separate exact-node Ready snapshot, reconcile
-  intervening events, and resnapshot after relevant events or connection loss. Because the
-  current server silently skips lag, take at most one serialized health snapshot per 30 seconds;
-  absent/unanswered transport reconnects with capped 1/2/4/8/16/30-second delay. Emit bounded
-  non-secret ready/unavailable/error categories. Parent lifetime stdin EOF ends the child.
-  Keep one subscription, one snapshot, one timer and one coalesced register child, never
-  one per room; cap frames/stderr and retire all work on native shutdown.
-  A Ready observation triggers registration only while the current generation is unconfirmed.
-  After a typed transient registration failure, a fresh successful Ready snapshot may retry
-  at the same capped pace even if readiness never transitioned: a register request may fail
-  while Nodes still answers. This must eventually recover when the daemon can register again,
-  without a new operator prompt. Permanent refusals remain visible and do not trigger a steady
-  respawn loop. Confirmation stops retry; a new availability epoch or legitimate use can
-  reacquire. Ambiguous same-generation SessionRegister retry must be idempotent for its exact
-  node/session/route, never replay room messages or use another identity.
+- **P420-OR-5. Idle availability and native ownership.** One narrowly scoped Vox CLI watcher
+  belongs to each native extension instance for its process lifetime, not to each generation.
+  It does not register, autostart, attach/unlock, read rooms or call a model. It holds a
+  persistent Subscribe connection only while the exact selected node is Attached and Ready.
+  When absent, detached, attaching, detaching or locked it closes persistent connections and
+  uses bounded short-lived connect/Nodes probes with capped 1/2/4/8/16/30-second backoff, so
+  the daemon's one-second autostart linger can expire. On apparent Ready, Subscribe and
+  receive its acknowledgment before the final separate Nodes snapshot; reconcile intervening
+  events and resnapshot. While subscribed, resnapshot on relevant events and at most once per
+  30 seconds for lag recovery. Limit connections, handshakes, frames, stderr and in-flight
+  work; stdin EOF ends the watcher. No room/model polling or generic retry framework.
+  A Ready observation triggers a coalesced register only for an unconfirmed current generation.
+  A typed transient registration failure permits retry after a fresh successful Ready snapshot
+  at capped pace even in steady Ready. Confirmation stops retry; permanent refusal remains
+  visible without a respawn loop. No operator prompt is needed for transient recovery.
+  Same-generation retry is idempotent for the exact node/session/route, not message replay.
 
-  JS completion fencing does not cancel an already accepted daemon write. The watcher owns
-  a private native-extension-instance directory with stable mutation and lifetime lock files,
-  active random generation reference and exact node/session binding. Hold lifetime ownership
-  while live. Both daemon registration writes, including deferred completions, and cold-start
-  direct staging take the same mutation lock, verify exact active generation plus live
-  lifetime ownership, and hold mutation ownership through the record write. Retirement first
-  rejects old bridge work in memory, then revokes under that mutation lock; its ACK follows
-  revocation. A successor cannot activate/register until retirement ACK, or confirmed owner
-  death plus acquisition/drain of the same mutation lock. It then takes lifetime ownership and
-  installs its distinct active generation under mutation ownership. Never unlink/recreate a
-  lock inode while held or awaited. Disk state without live ownership never grants authority;
-  watcher death closes eligibility and rotates the native route. Unknown retirement fails
-  closed and is surfaced, not treated as success. Cancelled/rolled-back transitions reconcile
-  the actual still-current native manager and acquire a fresh valid generation. This is a
-  local OS-account ownership fence, not person attestation or a new room trust capability.
+  Add a small typed daemon retryable registration refusal carrying a fixed reason enum, for
+  initial and deferred writes. Classify NoNode, Attaching, Unanswered, NoDaemon, timeout,
+  StillDetaching, registration-lock busy and Session ending as temporary; wrong identity,
+  route, permission or incompatible protocol are permanent. Never parse prose-only `Failed`.
+  This control IPC change requires protocol 10 → 11 (`node/ipc.rs:78`); retain the existing
+  version-independent updater bootstrap, without bypassing version checks. The registration
+  CLI maps typed results to OR-1 exit categories.
+
+  Every new registration write, including prompt registration and cold staging, requires live
+  ownership. If the helper fails, Vox is unavailable for that extension while ordinary OMP
+  remains usable; never fall back to an unfenced write. A reference-less old in-memory
+  extension receives a typed permanent update/reload-extension refusal. Disk setup refresh
+  alone does not prove the loaded extension changed: status/doctor MUST explain that the
+  operator must restart OMP and resume the same conversation to load the refreshed extension.
+  Confine ownership under account-data `.daemon/omp-instances/<opaque-random-id>`: current-uid
+  private 0700 directories and 0600 files; reject symlinks, hardlinks and path traversal.
+  Wire data carries only opaque instance ID and generation, never a caller-selected path.
+  Validate current node fingerprint, session and generation; a replacement fingerprint is
+  not the old identity.
+
+  The watcher holds its instance lifetime lock once; it accepts correlated revoke/install
+  generation commands and acknowledges only after mutation under the same stable instance
+  mutation lock. A private instance lock is required because the existing node
+  `registration_lock` cannot cover NoNode, Attaching, cold staging and retirement across
+  processes. All three `store_checked` paths and deferred writes acquire that lock, recheck
+  exact active binding and live lifetime ownership, and hold it through the write. Retirement
+  first rejects old bridge work in memory, then revokes and ACKs; a successor installs a fresh
+  reference only after ACK or confirmed watcher death/EOF and draining the same mutation
+  lock. A write already past its live check may finish after death, but the successor waits
+  for it; an old reference is never reused. Never unlink/recreate lock inodes while held or
+  awaited. Unknown retirement fails closed. Reconcile the live OMP Manager after a cancelled
+  or rolled-back transition, including one with no compensating event. The fence is local
+  OS-account ownership, not person attestation or a room trust capability.
 
   The [source-bound bridge design](../research/v0.4.20-omp-idle-registration-design.md)
-  supplies the source anchors and acceptance apparatus; the requirements here supersede its
-  earlier steady-Ready retry limitation. Real proof must deliver an authorized room ask to
-  the same idle native Session after missing-node and busy-daemon recovery with no operator
-  prompt, plus a delayed-old-write inverse on both daemon and cold-stage paths.
+  defines acceptance: actual idle room delivery after missing-node and busy-daemon recovery,
+  delayed-write inverses on every write path, daemon linger, old extension reload guidance,
+  and an actual v0.4.19 CLI/daemon upgrade cohort through post-update Ready and Locked
+  guidance. No version-check bypass or real-profile proof is permitted.
 
 ### OMP private Drive
 
@@ -452,8 +468,9 @@ requirements remain unchanged. The requirements below have stable IDs for source
 
 ### OMP semantic Session presentation
 
-- **P420-OP-1.** OMP Sessions MUST show native user-visible semantic tool intent, target,
-  typed head and rich body, live partial progress, async running/waiting and final outcomes,
+- **P420-OP-1.** OMP Sessions MUST show meaningful semantic tool intent and a typed heading
+  derived from intent, tool name and status, readable rich body, live partial progress,
+  async running/waiting and final outcomes,
   including truthful error and cancellation states, rather than raw JSON envelopes or flattened
   160-character strings as normal presentation. Readable prose, Markdown, code, diffs and
   supported image/rich parts retain their meaning and long details remain accessible. Intentional

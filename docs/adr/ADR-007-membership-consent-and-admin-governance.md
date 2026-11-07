@@ -234,11 +234,15 @@ only room governance is who sets the room's retention. This builds on identity (
   unvalidated dependencies remain inert, not a room-wide egress barrier; re-evaluate the fact
   when ancestry arrives.
 
-  All participating members and boards MUST support these exact fact versions and enforcement
-  before room removal is offered or relied upon. An obsolete or incompatible participant MUST
-  update or be refused participation in that removal-enabled room; do not assume an old node
-  will enforce an unknown tag. Existing builds reject unknown struct tags; their subsequent feed
-  behaviour is not established. The compatibility gate MUST be enforced, not merely displayed.
+  The global v0.4.20 protocol cutover in ADR-011 is a prerequisite, not a per-room
+  capability negotiation: every currently participating or reachable peer, including a board,
+  MUST negotiate the applicable `vox/3` ALPN and prove its node identity before any room
+  mutation or data exchange. Refuse old-protocol connections at transport, without calling the
+  refusal a bad passphrase or an unreachable anchor. No acknowledgement from an offline legacy
+  or retired member is required to remove it. An offline old peer cannot receive future keys or
+  sync from the new cohort until updated and its current governance fold is applied. An unaware
+  partition may continue under old rules; this cutover does not promise instant global revocation.
+  Direct and no-anchor rooms remain supported; no mixed-version compatibility is assumed.
 - **G-30. Readmission and conflicts.** Only the creator MAY explicitly readmit the exact removed
   fingerprint, by a distinct signed room-bound governance fact referencing all removal facts it
   supersedes. It MUST causally descend from every removal it supersedes; an ordinary passphrase
@@ -263,12 +267,19 @@ only room governance is who sets the room's retention. This builds on identity (
   eligible only if it causally descends from a valid creator readmission that supersedes that
   removal. Thus concurrent entries and entries after removal but before readmission are not
   authorized by earlier membership; a removal concurrent with or later than a readmission wins.
-  Once a removal is known,
-  members MUST NOT accept as room content, forward as content, or display ineligible entries,
-  including replays and entries received before the removal became known. Recompute visibility
-  when new validated causal evidence arrives. These rules apply per removal and readmission, not
-  by wall clock or arrival order. Deny the removed target's sender keys during removal, including
-  replayed keys; after readmission apply ordinary consent and fresh-key checks.
+  This eligibility filter applies to application messages, keys, consents and claims,
+  Presence/Session and services, not to governance validity. Once a removal is known, members
+  MUST NOT decrypt, accept or forward as content, display, or give authority to ineligible
+  content, including replays and entries received before the removal became known. Recompute
+  visibility when new validated causal evidence arrives. These rules apply per removal and
+  readmission, not by wall clock or arrival order. Deny the removed target's sender keys during
+  removal, including replayed keys; after readmission apply ordinary consent and fresh-key checks.
+
+  Governance facts are evaluated separately under G-29 using only their strict causal past: a
+  concurrent or later removal of their author MUST NOT invalidate an otherwise authorized
+  governance act. In particular both concurrent mutual admin removals remain valid. Members MUST
+  retain and forward the ineligible entry's signed skeleton and ciphertext as opaque causal-parent
+  and fork evidence, without treating that forwarding as content or conferring authority.
 
   Retain historical signed entries, their signatures, author-chain skeletons, fork evidence and
   claim history; filtering is not deletion of the target's prefix or a rewrite of signed history.

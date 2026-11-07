@@ -184,9 +184,22 @@ consent grants (ADR-007), rendezvous records (ADR-012), the transport identity e
 - **LS-21b. Proposed v0.4.20, not accepted or built.** The two new member lifecycle types
   use frame version 1 with the canonical arrays/signature domains in ADR-007 G-29; they have
   no timestamp field. Reserve their distinct tags without changing old tag meanings. Matching
-  enforcement-capable participant versions are required before relying on room removal.
-  An older parser's unknown-tag rejection is not proof that it enforces removal; incompatible
-  participation must be refused under the negotiated room contract, not silently tolerated.
+  enforcement-capable participation is required through ADR-011's proposed `vox/3` cohort,
+  not an undefined per-room negotiation. Older unknown-tag rejection is not proof of
+  removal enforcement. ADR-007 G-29's strict-causal-past rule alone validates governance;
+  G-31's content eligibility cannot recursively invalidate mutually concurrent valid removal
+  acts. Retain/forward ineligible signed skeletons and ciphertext as log structure for causal
+  parents/fork evidence, without decrypting, displaying or applying their content/authority.
+  Nonmember anchors are discovery boards, not governance-authority validators.
+  
+- **LS-21c. Proposed v0.4.20 admission proposal v2, not built.** ADR-023 RL-8.7 pins the join
+  subprotocol (not a new StructTag): opcode 12 carries `[unsigned_body_bytes, signature_bytes]`;
+  unsigned fields are `[2, channel_id, epoch, joiner_id, responder_id, timestamp_ms, room_name,
+  own_history]`, signed under `vox/join-admission-proposal/v2` plus NUL. Null name is an
+  explicit pre-Prepared refusal, never a default. Own-history classifications/verification and
+  field bounds are exactly RL-8.7's. Prepared binds the full proposal hash. Accepted carries
+  only the verified witness; its old unsigned name field is removed. Refuse obsolete v1
+  proposal/Accepted formats truthfully as software incompatibility, without downgrade.
 - **LS-22.** New struct types MUST be appended, versioned, and a tag MUST NOT be reused. `0x000B`
   and `0x0010` belong to removed deniable mode: they stay registered and MUST NOT be produced.
   `0x0006` carries only a room's retention; policy updates beyond retention and passphrase rotation

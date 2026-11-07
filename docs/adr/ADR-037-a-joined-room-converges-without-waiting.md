@@ -174,8 +174,12 @@ before any fresh signed head, Presence, PrivateSupport, key, Session or text app
 the retained own signed head, derive its append frontier during authenticated recovery and
 reconcile higher authenticated heads before generation advancement and return Presence.
 RL-8.5's durable verified admission notice newer than departure supplies pre-Presence recovery
-standing, not independent trust or removal override. Missing marker alone never proves a fresh
-author; prior-release erased/unknown history remains pending/read-only as RL-8.5 specifies.
+standing, not independent trust or removal override. For unmarked bindings, use RL-8.7's
+authenticated own-history classification: recover known authored history; if none can be
+derived and none is held locally, initialize empty automatically under the operator's
+2026-11-06 ruling. No confirmation prompt or blanket legacy read-only gate is permitted.
+Peer absence is not global proof; preserve known marker/head/conflict fences and disclose
+the residual erased/withheld-history risk rather than claim perfect legacy recovery.
 Permitted reads remain live where independent membership, trust and key checks allow them;
 report exact recovery/integrity failure when sync is blocked. Fresh authors still settle
 locally without peer acknowledgments. No global convergence gate or scalar-counter workaround

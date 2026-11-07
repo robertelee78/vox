@@ -280,14 +280,19 @@ below remain unchanged.
   validated room removal still apply. A peer without enough verified evidence remains pending.
   Distinguish recovery standing from a new authored Presence rather than bypassing history safety.
   This explicitly qualifies RL-8.1b and ADR-037 R5; new authors still settle locally.
-  Missing marker is NOT proof of a fresh author. Seed markers for currently held valid room
-  histories before further appends. A prior-release erased binding must request its own
-  self-signed head during authenticated admission and recover it before writing. If its prior
-  history cannot be established, report unknown/read-only recovery rather than create a fresh
-  prefix; only provenance that establishes a genuinely new author permits fresh initialization.
-  This includes an explicit marker-tracking-from-identity-creation fact for new identities;
-  do not fabricate that provenance for an upgraded identity. Release notes MUST explain that
-  already-erased history is not restored by retaining a marker now.
+  Seed markers for currently held valid room histories before further appends. For an
+  unmarked binding, first try to derive the author's prior signed history through the
+  authenticated admitting member. The operator ruled on 2026-11-06: “it should be automatic
+  and just start with no history if it can't derrive”. When no prior authored history can
+  be derived, initialize empty automatically; no attestation prompt or blanket read-only
+  treatment of existing identities joining new rooms. The admitting member must check its
+  held feed, own-head, notice and withdrawal evidence and return the authenticated history
+  classification specified by RL-8.7. Known signed history, retained continuity markers or
+  detected conflicts are never discarded to force this fallback. Malformed, unauthorized
+  or contradictory evidence is an error, not an absent-history result. Absence at a peer
+  is not proof of global absence: disclose the residual fork risk of previously erased/
+  withheld history in release notes. The marker prevents future normal Leave from creating
+  this uncertainty; it cannot retroactively restore history already erased by old releases.
   An already-conflicting prefix remains write-frozen; report room integrity failure, keep
   permitted cached/independently decryptable reads and explain that blocked sync may limit them.
   The operator may retire that identity and create a genuinely new node under ADR-028 K-8,
@@ -331,6 +336,38 @@ below remain unchanged.
   Never promote the rollback withdrawal for case (3) while resuming. Recheck current room/
   computer authority and removal evidence before publication; show pending, locked, failed or
   completed outcome truthfully. Matching wire versions are required and release notes say so.
+
+  **Proposal v2.** Keep join opcode 12's `[12, proposal_bytes]` envelope. The proposal's
+  outer canonical CBOR is `[unsigned_body_bytes, composite_signature_bytes]`; its unsigned
+  body is exactly `[2, channel_id, epoch, joiner_id, responder_id, timestamp_ms, room_name,
+  own_history]`. IDs are 32-byte strings, integer fields are unsigned, and the signing input
+  is ASCII `vox/join-admission-proposal/v2` followed by one NUL byte and the canonical body.
+  `room_name` is a valid canonical ADR-028 DNS-label text; null represents unavailable name
+  and MUST refuse before Prepared, as must invalid text. Never replace it with an arbitrary
+  empty/default name. The responder checks its current authorized name before proposing;
+  a later governance rename follows the by-ID rule above.
+  `own_history` is `[kind, head_or_null]`: 0 means no held prior authored-log evidence and
+  requires null; 1 requires a bounded existing own signed Public history head; 2 means known
+  authored history exists but cannot currently be supplied and requires null. The joiner
+  independently verifies a supplied head's author signature and exact public room/author
+  binding. Kind 2, local continuity or contradictory evidence fences writes for recovery;
+  kind 0 with no local prior authored history permits the operator-selected automatic empty
+  initialization. Prior admission/board-withdraw records are discovery hints, not by themselves
+  authored-log sequence evidence; inspect them when trying recovery, never forge a head from
+  them. This authenticated absence declaration is not a proof of global absence.
+  The proposal hash acknowledged by `[13, hash]` covers the entire version-2 proposal.
+  Accepted becomes `[6, witness_bytes]`; the old unsigned Accepted.name is neither sent nor
+  used. Verify the final witness against the prepared proposal and use the later authenticated
+  governance name for any post-admission rename. A version-1 five-field proposal receives a
+  truthful software-update refusal before Prepared. An obsolete Accepted shape is rejected
+  before local publication and remains commit-uncertain under case (2); do not pretend it was
+  detectable before Prepared or that remote admission did not occur. No v1 downgrade;
+  keep existing frame/field-size bounds.
+  An explicit authorized cancellation of a verified accepted obligation promotes its exact
+  own Member withdrawal, durably completes cancellation, then releases its reservation and
+  owned wrap/construction state; preserve prior continuity and never sign a blind log Presence.
+  Crash, child disconnect and uncertain commit are not that explicit cancellation.
+
 - **RL-8.8. Consumer proof.** Extend existing actual-binary leave/join journeys: a donor first
   reads ten distinct returner posts; normal leave, restart and rejoin preserve the history and
   allow distinct new traffic both ways without replacement-prefix corruption. A returning

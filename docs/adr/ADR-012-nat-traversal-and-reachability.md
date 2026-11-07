@@ -223,15 +223,22 @@ relay circuit.
     (ADR-004/ADR-005).
   - Swarm presence is not consent-gated. A party removed from a member's keyring stays present at the
     ciphertext level; there is no per-member rendezvous revocation (ADR-007).
-  - **N-27a. Proposed v0.4.20, not accepted or built — room-member removal.** Boards MUST
-    retain and honor validated ADR-007 G-28–G-30 room-bound removal and readmission evidence,
-    including its causal dependencies and remove-wins ordering, when admitting or serving the
-    affected member's records. A bare Member withdrawal is not governance-log authority; a stale
-    bundle, pre-join record, passphrase or vouch MUST NOT undo valid removal. Missing dependencies
-    leave an unvalidated fact pending and inert; re-evaluate it when ancestry arrives. They MUST
-    NOT create a room-wide barrier or an invented readmission, and MUST NOT override a validated
-    removal. Signed negative evidence MUST survive local cache retraction and board recovery;
-    unrelated members and rooms MUST NOT be suppressed by a per-member removal.
+  - **N-27a. Proposed v0.4.20, not accepted or built — room-member removal.** A member
+    board MUST retain and honor validated ADR-007 G-28–G-30 room-bound removal and readmission
+    evidence from its held log, including causal dependencies and remove-wins ordering, when
+    admitting or serving the affected member's records. Missing dependencies leave an unvalidated
+    fact pending and inert; re-evaluate it when ancestry arrives. Signed negative evidence MUST
+    survive local cache retraction and board recovery when available. Unrelated members and rooms
+    MUST NOT be suppressed by a per-member removal.
+
+    A nonmember anchor board retains N-27's existing signature, genesis and vouch discovery
+    validation; it is not room-authorization authority and is not required to hold the room log.
+    All board connections are subject to the global ALPN cutover in ADR-011. A bare Member
+    withdrawal is not governance-log authority; a stale bundle, pre-join record, passphrase or
+    vouch MUST NOT undo valid removal. Before a new member accepts room content or keys it MUST
+    obtain and verify actual room governance and removal evidence, not infer authorization from
+    an anchor advertisement. Missing evidence MUST NOT invent readmission or override a validated
+    removal; an old advertisement cannot readmit a removed identity.
   - **N-27b. Proposed v0.4.20, not accepted or built — terminal inverse.** A local failed join,
     rollback or rejected live projection MUST NOT manufacture a terminal whole-room tombstone.
     Classify producers instead: genuinely `ended_here` rooms and received valid signed Room
