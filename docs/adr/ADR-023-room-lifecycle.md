@@ -225,6 +225,10 @@ below remain unchanged.
   delete the room from the node — every stored row and its key, the store rewritten so none of the
   deleted bytes stay — once a sync session has carried the statement to another member (V210-164).
   A room held alone MUST go at once.
+  **2026-11-06 product amendment, selected for v0.4.20; not built:** the operator explicitly
+  chose to retain the minimal non-secret continuity marker specified by RL-8.4 below. That is
+  the sole exception to “every stored row”; room content and keys are still erased. The
+  marker's technical design requires independent Opus review before implementation.
 - **RL-8.1a.** If no member can be told within 30 s the leave MUST say so (`LeaveNotHeard`), and the
   node MUST keep the room and go on leaving, across a restart, until one is told. Anything the node
   writes in the room meanwhile undoes the leave (`LeaveUndone`).
@@ -232,6 +236,10 @@ below remain unchanged.
   member's roster, sync and key delivery. Joining again is an ordinary join: once synced, the node
   moves to a sender generation above any its feed shows and says it is back (`here` = true), which
   starts its consents over.
+  **Proposed v0.4.20 qualification:** a verified, durable admission notice newer than the
+  member's departure supplies the recovery standing in RL-8.5 before return Presence. It
+  does not supply read/Drive trust or supersede an admin removal. Peers retain and propagate
+  that standing through the existing notice machinery, including after restart.
 - **RL-8.2. End.** The room's creator, or an admin it delegated (ADR-007 G-5), MAY end the room (a
   room-lifecycle fact `0x0019`, kind end); the creator MAY choose an idle end at creation (kind idle
   end), and the room then ends once nothing is said in it for that long. A node holding an ended
@@ -241,8 +249,156 @@ below remain unchanged.
   only from the creator or an admin on the creator's signed roster (`0x001B`), and MUST answer a
   later join of the room as ended. Lifecycle kind codes 1 and 4 (a leave and a return, before this
   ruling) are reserved and MUST be refused.
+  An End applied in the room erases its continuity marker. For a node that already left,
+  erase the marker only after verifying a creator-signed room-scope board withdrawal against
+  the retained public genesis (RL-8.4), with matching room/epoch and the existing skew bound.
+  On applying a valid delegated-admin End, the creator's node MUST also publish its own
+  room-scope withdrawal through the existing withdrawal journal. This is cleanup evidence,
+  not a new restriction on an admin's End permission. RAM-only board tombstones retain the
+  bounded creator public key from the removed genesis, accept a later creator endorsement,
+  and prefer that authenticated endorsement over a delegated withdrawal.
+  Missing or unverifiable evidence keeps the checkpoint: this includes a creator that was
+  offline or had left, and boards that restarted and forgot the End. There is no unsigned
+  erase, permanent end-evidence ledger or promise of tombstone survival across restart.
 - **RL-8.3.** There MUST NOT be a `vox room forget`: leaving and ending are the only ways a room
   leaves a node.
+
+### v0.4.20 corrective design — proposed, not implemented
+
+- **RL-8.4. Durable author continuity.** Before any own signed room entry can become externally
+  visible, the append transaction MUST durably retain a room/author-bound continuity marker:
+  the last own signed history head (the existing recovery-head type, including room/author
+  binding and signature), highest authored sender chain/generation, and immutable verified
+  public genesis bound to that same room. The genesis adds no room name, passphrase, room key,
+  messages, private Session data, member list or append frontier. Bound its encoded size by
+  the existing genesis format's composite public-key/signature limits plus fixed framing;
+  validate it and its room binding on load. Derive the append frontier during verified
+  recovery, not from a retained second record.
+  Include implicit Presence, support/key, consent, Session and leave entries, not only user messages.
+  Do not retain message bodies, room names, passphrases, sender/Drive secrets or a second room
+  log. Store privately in the existing node store atomically with author state and before any
+  signature is externally visible. Leave's purge/rewrite preserves only this exception;
+  authenticated End cleanup follows RL-8.2. Failure to persist continuity prevents publication
+  and successful Leave. The operator approved this retained public checkpoint and retaining
+  it until End can be verified on 2026-11-07.
+  A scalar count or a peer's unverified statement is not continuity evidence.
+- **RL-8.5. Return before settlement.** A rejoin with prior local continuity MUST install its
+  recovery fence before initializing a replacement empty head or signing any new entry. Keep
+  the room published for discovery and permitted reads while authenticated own-history recovery
+  verifies/reconstructs the retained prefix and frontier, reconciles higher authenticated heads,
+  and obtains applicable current key material. Only afterward may the existing sender-generation
+  rotation and return Presence run. Missing, stale or withholding peers mean recovery pending,
+  never an empty-feed proof. Before return Presence, peers MUST honor the verified admission
+  notice newer than the last departure for own-head/pages, own-generation recovery and permitted
+  key redelivery; persist/propagate the existing notice and restore that recovery standing after
+  restart. It grants no independent Read/Drive/service authority; current trust, consent and
+  validated room removal still apply. A peer without enough verified evidence remains pending.
+  Distinguish recovery standing from a new authored Presence rather than bypassing history safety.
+  This explicitly qualifies RL-8.1b and ADR-037 R5; new authors still settle locally.
+  Seed markers for currently held valid room histories before further appends. For an
+  unmarked binding, first try to derive the author's prior signed history through the
+  authenticated admitting member. The operator ruled on 2026-11-06: “it should be automatic
+  and just start with no history if it can't derrive”. When no prior authored history can
+  be derived, initialize empty automatically; no attestation prompt or blanket read-only
+  treatment of existing identities joining new rooms. The admitting member must check its
+  held feed, own-head, notice and withdrawal evidence and return the authenticated history
+  classification specified by RL-8.7. Known signed history, retained continuity markers or
+  detected conflicts are never discarded to force this fallback. Malformed, unauthorized
+  or contradictory evidence is an error, not an absent-history result. Absence at a peer
+  is not proof of global absence: disclose the residual fork risk of previously erased/
+  withheld history in release notes. The marker prevents future normal Leave from creating
+  this uncertainty; it cannot retroactively restore history already erased by old releases.
+  An already-conflicting prefix remains write-frozen; report room integrity failure, keep
+  permitted cached/independently decryptable reads and explain that blocked sync may limit them.
+  The operator may retire that identity and create a genuinely new node under ADR-028 K-8,
+  optionally removing the retired room member under ADR-007 G-28. Never silently reset it,
+  discard signed peer evidence, bump counters or promise a signed fork can be undone.
+- **RL-8.6. Reversible local cleanup.** Failed join, interrupted unpublished construction and
+  policy-rejected reopening MUST remove only their owned transient local projection and
+  advertisements, without authoring or recording an authoritative whole-room end. Preserve real
+  member-withdrawal and signed room-end evidence. A node that is not a member MUST still refuse
+  unauthorized genesis/records. Classify Abort, AbortCompleted, RejectCreated, PurgeUnpublished,
+  PublicationReject and rejected-existing-open separately; a creator-signed rejection end remains
+  terminal. Do not globally weaken the terminal board operation. On retry, publication must
+  advance beyond any retained own member-withdrawal timestamp, including after restart.
+  Classify every producer, not the optional signed-payload value: a genuine ended_here path
+  can also record a bare local tombstone, including idle end. Never clear it by treating
+  `None` as non-authoritative. The board is RAM-only and starts empty after daemon restart;
+  preserve existing retained log/withdrawal-ledger evidence and its actual lifetime without
+  claiming permanent tombstone persistence. Unavailable policy/evidence is not permission.
+  An unverified delegated withdrawal is discovery evidence only: it MUST NOT erase the
+  continuity marker or block joining through another verified live genesis. Check supplied
+  withdrawals independently; one forged entry MUST NOT hide a genuine creator-signed one.
+- **RL-8.7. Admission name transaction.** Bind the current room name to the authenticated
+  admission proposal after passphrase proofs, and check/reserve it locally before sending
+  AdmissionPrepared or permitting remote admission. Reservation ownership MUST include pending
+  create, join and rename operations, survive the relevant retained journal, and release exactly
+  on commit/abort. No room name is disclosed before authentication. A preflight collision fails
+  without admitting the joiner, preserves the original same-name room, and uses RL-8.6 cleanup.
+  If the authoritative name changes after successful preflight/admission, complete the admitted
+  join and show colliding rooms by their full IDs, as for a rename clash; explain that outcome.
+  This is a proposed explicit exception to ADR-028 R-3's same-name join refusal, not a new
+  responder power to erase a joiner's signed history. Classify the commit boundary precisely:
+  (1) before AdmissionPrepared, abort reversible local work; (2) after Prepared but without a
+  verified Accepted, commit is uncertain—promote the already journalled own Member withdrawal,
+  report that remote admission may have occurred and require a strictly newer fresh PAKE retry;
+  do not claim no admission; (3) after verified Accepted, persist proposal, final witness,
+  verified genesis and exact name reservation in the existing join journal before name/
+  construction/publication checks. Retain the already generated double-lock SEK wrap there,
+  not the passphrase; generate/seal that wrap before Prepared if necessary to make this boundary
+  crash-safe. After restart the operator re-enters the room passphrase (or existing authorized
+  held-room unlock supplies it), verifies the wrap and resumes that exact accepted witness
+  without a second remote admission. Keep the reservation until commit or an explicitly
+  authorized cancellation; crash alone does not release an accepted obligation. Lost Accepted
+  or failed durable acceptance save remains case (2), not an invented resumable witness.
+  Never promote the rollback withdrawal for case (3) while resuming. Recheck current room/
+  computer authority and removal evidence before publication; show pending, locked, failed or
+  completed outcome truthfully. Matching wire versions are required and release notes say so.
+
+  **Proposal v2.** Keep join opcode 12's `[12, proposal_bytes]` envelope. The proposal's
+  outer canonical CBOR is `[unsigned_body_bytes, composite_signature_bytes]`; its unsigned
+  body is exactly `[2, channel_id, epoch, joiner_id, responder_id, timestamp_ms, room_name,
+  own_history]`. IDs are 32-byte strings, integer fields are unsigned, and the signing input
+  is ASCII `vox/join-admission-proposal/v2` followed by one NUL byte and the canonical body.
+  `room_name` is a valid canonical ADR-028 DNS-label text; null represents unavailable name
+  and MUST refuse before Prepared, as must invalid text. For a legacy unnamed room,
+  explain that an admin must name the room before joining; never invent an empty/default
+  name. The responder checks its current authorized name before proposing; a later
+  governance rename follows the by-ID rule above.
+  `own_history` is `[kind, head_or_null]`: 0 means no held prior authored-log evidence and
+  requires null; 1 requires a bounded existing own signed Public history head; 2 means known
+  authored history exists but cannot currently be supplied and requires null. The joiner
+  independently verifies a supplied head's author signature and exact public room/author
+  binding. Kind 1 fences writes until recovery reaches the verified supplied head; kind 2,
+  local continuity or contradictory evidence also fences writes for recovery.
+  Kind 0 with no local prior authored history permits the operator-selected automatic empty
+  initialization. Prior admission/board-withdraw records are discovery hints, not by themselves
+  authored-log sequence evidence; inspect them when trying recovery, never forge a head from
+  them. This authenticated absence declaration is not a proof of global absence.
+  The proposal hash acknowledged by `[13, hash]` covers the entire version-2 proposal.
+  Accepted becomes `[6, witness_bytes]`; the old unsigned Accepted.name is neither sent nor
+  used. Verify the final witness against the prepared proposal and use the later authenticated
+  governance name for any post-admission rename. A version-1 five-field proposal receives a
+  truthful software-update refusal before Prepared. An obsolete Accepted shape is rejected
+  before local publication and remains commit-uncertain under case (2); do not pretend it was
+  detectable before Prepared or that remote admission did not occur. No v1 downgrade;
+  keep existing frame/field-size bounds.
+  An explicit authorized cancellation of a verified accepted obligation promotes its exact
+  own Member withdrawal, durably completes cancellation, then releases its reservation and
+  owned wrap/construction state; preserve prior continuity and never sign a blind log Presence.
+  Crash, child disconnect and uncertain commit are not that explicit cancellation.
+
+- **RL-8.8. Consumer proof.** Extend existing actual-binary leave/join journeys: a donor first
+  reads ten distinct returner posts; normal leave, restart and rejoin preserve the history and
+  allow distinct new traffic both ways without replacement-prefix corruption. A returning
+  author awaiting recovery still reads permitted fresh traffic and reports pending, not healthy.
+  Exercise missing-peer and genuine conflicting/older-history inverses without destructive
+  cleanup. Wrong-passphrase then correct retry, duplicate-name failure then corrected retry,
+  rejected-existing-open recovery, concurrent name reservations and post-admission rename must
+  preserve original rooms and finish bidirectional post/read on the same daemon. A true signed
+  end stays terminal. Each committed proof needs a scoped mutant PRODUCT red on its consumer
+  assertion; trace counts, source assertions and apparatus failure do not count as that verdict.
+
 
 ## Proofs
 
