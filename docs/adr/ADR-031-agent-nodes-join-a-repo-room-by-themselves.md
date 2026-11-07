@@ -10,7 +10,9 @@ story-plan answers that night (LT-8, a Mac over ssh, one format step), and his S
 decisions and answers that night (SA-7–SA-13). The decider's 2026-10-12 scope amendment
 removes prior-release data and wire compatibility and migration proofs from v0.4.5 (ADR-026 F-3).
 The remaining feature requirements retain their stated release targets.
-**Date**: 2026-10-10
+SA-14's v0.4.20 removal clarification is proposed pending targeted independent review;
+it does not change SA-7's privacy boundary or grant earlier history.
+**Date**: 2026-10-10; amended 2026-11-06 (proposed SA-14 removal/readmission enforcement)
 **Deciders**: Robert E. Lee
 **Tags**: agents, onboarding, hooks, keyring, trust, drive, sessions, macos
 **Related**: ADR-001, ADR-005, ADR-007, ADR-010, ADR-014, ADR-020, ADR-026, ADR-028, ADR-029, ADR-033, ADR-034
@@ -305,6 +307,75 @@ on a point the decider left open).
   in plain words, as one thing an agent did in its Session: a message, a command it ran, a file it
   edited. They MUST NOT use "step" without that meaning, and MUST NOT name it otherwise. The
   decider asked what a step is: it is to be explained plainly where the person meets it.
+- **SA-14. Proposed v0.4.20 — member removal and private floors, not built.** ADR-007
+  G-28–G-32 MUST also fence private Session ingress, egress, read/Drive, receiver-key
+  installation and service use. Private records remain off the public DAG: preserve current
+  v1/private and v2/embedded-legacy-Entry wire bytes and existing key-message domains. No
+  v3 restoration field or new key envelope is needed. Embedded legacy Entry records retain
+  their independent G-31 public-causal eligibility check.
+
+  **Author restoration.** A not-yet-locally-accepted private record from an author with any
+  validated removal MUST have an existing signed Session floor for
+  `(author, recipient, epoch, generation)` that is itself G-31-eligible and descends from
+  a valid creator readmission covering every removal of that author not in the floor's
+  causal future. Its generation MUST be strictly greater than every generation that author
+  put in a floor outside that readmission's causal descendants. Ordinary recipient
+  membership identity, iteration-at-or-after-floor, current membership, trust and Drive
+  checks still apply. After applying its own readmission, an author MUST mint a fresh drive
+  generation and MUST NOT publish a floor for any generation it minted before that point.
+  Receivers enforce the strictly-greater check against previously floored generations;
+  this does not prove when a never-before-floored generation was minted.
+
+  **Recipient restoration.** For every validated removal of a floor's named recipient, that
+  floor supplies history authority only if it is strictly prior to that removal or descends
+  from a valid creator readmission superseding it. Historical authority MUST NOT become
+  current access: immediately before serving a page or releasing a key, independently
+  require the recipient's current restored room membership and ordinary trust/Drive.
+  Remaining authors MUST NOT publish floors or release drive keys to a currently removed
+  recipient. Validate exact room/epoch/author/recipient/generation/iteration/membership
+  bindings through the signed enclosing public floor entry and its actual causal ancestry;
+  a hashable ControlContext or unproven folded maximum is not a signed recipient grant.
+  Retain/recover floor provenance and sufficient signed ancestry; missing or ambiguous
+  evidence is unavailable authority, never a fabricated positive or destructive reset.
+  Readmission is a new forward-access boundary even when global Drive trust and the older
+  Presence.back membership scalar are unchanged. Issue a new eligible floor at the current
+  release iteration. SC-2a's whole-generation floor zero applies only if that recipient was
+  an eligible room member with Drive when the generation was minted; retained trust alone
+  MUST NOT backfill the period of removal.
+
+  **Bypasses and queued work.** `current_drive` and the locally-held legacy receive path
+  MUST refuse a currently removed author or one failing the author-restoration rule.
+  Refuse removed-author drive-key messages, including replays. Recheck the current room
+  authorization generation for queued/in-flight key delivery, Drive and service use at
+  every irreversible release/install/commit boundary. A local own-record exception may
+  preserve already accepted history, never authorize new egress while removed.
+  The validated removal cut MUST rotate affected sender/Drive secrets independently of the
+  acknowledged-delivery ledger and global trust-holder set; an unacknowledged published
+  package may already have disclosed a key. Use fresh random key material, not merely a
+  larger counter. Capture immutable room authorization identity before queuing raw input,
+  including the exact author/driver and recipient/Session-owner restoration identities.
+  Carry it through deferred capability materialization and the actual native/provider
+  delivery boundary. Removal then readmission MUST NOT make an old queued request valid
+  again merely because current membership/trust sets match. A post-provider check cannot
+  undo disclosure; retire old raw work and require a separately authorized new request.
+
+  **Retained history.** Rows already accepted locally remain stored/readable under the
+  reader's current ordinary permissions and give no live authority. Re-serving them requires
+  the same author/recipient floor rules above. This local acceptance boundary depends on
+  arrival order, not a global causal assertion about an off-log record; peers may retain
+  different pre-removal private rows, and a new device/member cannot fetch rows excluded
+  by current floor eligibility. Release notes MUST state this and the unaware-partition
+  window. Existing retention and no-backfill requirements remain unchanged.
+
+  **Consumer proof.** In the actual binary/native Session view, an unaware author's generation
+  floored during removal and delivered after readmission stays inert; a post-readmission
+  floor on a reused generation does not expose earlier iterations; a floor naming a removed
+  recipient grants nothing until valid readmission and ordinary authorization; and a
+  locally-held legacy record cannot bypass removed-author refusal. Already accepted local
+  historical rows remain readable, distinct new activity succeeds after proper restoration
+  and fresh generation, queued old Drive is not replayed, and unauthorized/other-room peers
+  receive no private data. Each negative control must fail its consumer assertion, not merely
+  observe a queue, parser branch or projection field.
 
 ### 9. Renaming a node
 

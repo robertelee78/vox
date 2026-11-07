@@ -167,6 +167,28 @@ The daemon MUST say so once as a NodeNote.
 The drive generation is still never chosen off an unknown own feed: it MUST be chosen off the
 local own feed, which is authoritative.
 
+**Proposed v0.4.20 correction; not built:** ADR-023 RL-8.4–RL-8.5 explicitly qualifies R5 for
+an author with retained prior-room continuity. Leave retains only the operator-approved
+non-secret continuity marker, not room content or keys. Rejoin installs its recovery fence
+before any fresh signed head, Presence, PrivateSupport, key, Session or text append. Verify
+the retained own signed head, derive its append frontier during authenticated recovery and
+reconcile higher authenticated heads before generation advancement and return Presence.
+RL-8.5's durable verified admission notice newer than departure supplies pre-Presence recovery
+standing, not independent trust or removal override. For unmarked bindings, use RL-8.7's
+authenticated own-history classification: recover known authored history; if none can be
+derived and none is held locally, initialize empty automatically under the operator's
+2026-11-06 ruling. No confirmation prompt or blanket legacy read-only gate is permitted.
+Peer absence is not global proof; preserve known marker/head/conflict fences and disclose
+the residual erased/withheld-history risk rather than claim perfect legacy recovery.
+Permitted reads remain live where independent membership, trust and key checks allow them;
+report exact recovery/integrity failure when sync is blocked. Fresh authors still settle
+locally without peer acknowledgments. No global convergence gate or scalar-counter workaround
+is introduced; genuine conflicting/older-backup refusal remains intact. An End applied in
+the room erases the marker. A former member clears it only on authenticated creator End
+evidence under ADR-023 RL-8.2, verified using the retained public genesis. Missing evidence
+keeps the sealed checkpoint; it does not restrict an admin's permission to end the room.
+
+
 ### R6. Proofs
 
 Every claim above MUST have a proof that drives the shipped `vox` binary as a person would
