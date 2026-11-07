@@ -4080,14 +4080,23 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
         "PRODUCT: a stale cached room still accepted a post after a deliberate move: {out}{err}"
     );
     posted(mapped, &["room", "post", &other, "DELIBERATELY-MOVED-TO-B"]);
-    assert!(
-        open_in(&other, mapped)
-            && !open_in(&home, mapped)
-            && read_room(&other).iter().any(|r| r["text"]
-                .as_str()
-                .is_some_and(|t| t.contains("DELIBERATELY-MOVED-TO-B"))),
-        "PRODUCT: deliberate room move did not move the Session and its conversation"
-    );
+    let moved_by = Instant::now() + Duration::from_secs(30);
+    loop {
+        let old_sessions = sessions(&home);
+        let new_sessions = sessions(&other);
+        let old_open = old_sessions.iter().any(|r| r["id"] == mapped && r["open"] == true);
+        let new_open = new_sessions.iter().any(|r| r["id"] == mapped && r["open"] == true);
+        let new_history = read_room(&other);
+        let moved_post = new_history.iter().any(|r| r["text"].as_str()
+            .is_some_and(|t| t.contains("DELIBERATELY-MOVED-TO-B")));
+        if new_open && !old_open && moved_post { break; }
+        assert!(
+            Instant::now() < moved_by,
+            "PRODUCT: deliberate room move did not settle the Session and its conversation; \
+             old Sessions {old_sessions:?}; new Sessions {new_sessions:?}; new history {new_history:?}"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
     eprintln!("[proof] (3b) restart preserves each saved room; a deliberate move works and rejects its old cached target");
 
     // (4) `vox agent room`, run as the session in no room, sets its room.
