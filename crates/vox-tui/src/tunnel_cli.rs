@@ -1838,7 +1838,77 @@ pub async fn forward_named(
             .await
             .map_err(|e| AppError::Usage(format!("{name}: {e}")))
     };
-    let mut room = resolve().await?;
+    let mut reopen_deadline = None;
+    let mut room = loop {
+        match resolve().await {
+            Ok(room) => break room,
+            Err(error) => {
+                // A Ready node can still be reopening its remembered rooms. A canonical room
+                // ID needs only its own preparation; a readable room name cannot be known
+                // until the remembered rooms have opened.
+                let labels: Vec<_> = name.trim().trim_end_matches('.').split('.').collect();
+                let room_id = match labels.as_slice() {
+                    [service, node, room, suffix]
+                        if !service.is_empty()
+                            && !node.is_empty()
+                            && suffix.eq_ignore_ascii_case("vox") =>
+                    {
+                        vox_core::node::link::b32_decode(&room.to_ascii_lowercase(), "vox room")
+                            .ok()
+                    }
+                    _ => return Err(error),
+                };
+                let rooms = match held.client.rooms().await {
+                    Ok(Frame::Rooms { rooms }) => rooms,
+                    Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
+                    Ok(other) => return Err(crate::client::unexpected(&other)),
+                    Err(e) => return Err(AppError::Usage(e.to_string())),
+                };
+                let Some(pending) = rooms
+                    .iter()
+                    .find(|r| r.4 && room_id.is_none_or(|id| r.0 == id))
+                else {
+                    return Err(error);
+                };
+                let why = pending
+                    .5
+                    .as_ref()
+                    .map_or("its saved state to prepare", |(what, _)| what.as_str());
+                let deadline = *reopen_deadline.get_or_insert_with(|| {
+                    waiting.on("the room to reopen");
+                    if room_id.is_none() {
+                        eprintln!(
+                            "vox: {name}: waiting up to {}s for a preparing room that could \
+                             have this name; its name is unavailable until it opens; it waits for {why}",
+                            share_patience().as_secs()
+                        );
+                    } else {
+                        eprintln!(
+                            "vox: {name}: waiting up to {}s for this room to reopen; it waits for {why}",
+                            share_patience().as_secs()
+                        );
+                    }
+                    Instant::now() + share_patience()
+                });
+                if Instant::now() >= deadline {
+                    let scope = if room_id.is_none() {
+                        "a room that could have this name: "
+                    } else {
+                        ""
+                    };
+                    return Err(AppError::Usage(format!(
+                        "{name}: {scope}{}; it waits for {why}",
+                        vox_core::node::api::Fault::RoomPreparing.explain()
+                    )));
+                }
+                tokio::time::sleep(
+                    Duration::from_millis(100)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                )
+                .await;
+            }
+        }
+    };
     // **Which share the name names is the room's log's to say** (V030-25): its transport — a UDP
     // share is asked for as `udp/<name>` (ADR-022 decision 6) — and whether there is one at all.
     // A room this node joined and has not yet synced may not hold the statement yet; it arrives
