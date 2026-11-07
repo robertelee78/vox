@@ -22,6 +22,9 @@ pub struct Request {
     pub v: u64,
     /// The harness's session id, whole.
     pub session: String,
+    /// Unpredictable sender-generated identity of this operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<String>,
     /// The input.
     #[serde(flatten)]
     pub action: Action,

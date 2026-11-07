@@ -69,6 +69,7 @@ pub async fn send(
     let at = crate::client::one_shot(paths).map_err(|e| NotDelivered::NotSent(e.to_string()))?;
     match vox_core::node::drive_input::send(&at, room, peer, request).await {
         Ok(a) if a.ok => Ok(a.said),
+        Ok(a) if a.code.as_deref() == Some("drive-unknown") => Err(NotDelivered::NoAnswer(a.said)),
         // The session's node is named as this node knows it.
         Ok(a) => Err(NotDelivered::Refused(
             a.said_to(&crate::ident::name_of(&peer)),
@@ -168,6 +169,7 @@ pub async fn send_file(
     let request = Request {
         v: 1,
         session: session_id,
+        operation: None,
         action: Action::File {
             name: row.name,
             size: row.size,
@@ -266,6 +268,7 @@ async fn deliver(
     let request = Request {
         v: 1,
         session: id,
+        operation: None,
         action,
     };
     match send(paths, channel_id, node, &request).await {

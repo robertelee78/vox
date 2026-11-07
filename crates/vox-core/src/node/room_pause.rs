@@ -159,6 +159,7 @@ async fn request(
     let request = vox_agentcomms::drive::Request {
         v: 1,
         session: String::new(),
+        operation: None,
         action: Action::RoomPause {
             paused,
             expected_instance: selected

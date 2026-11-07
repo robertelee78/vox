@@ -4475,6 +4475,8 @@ extension NodeModel {
         case let .taken(words): report(operation: operation, done: asSentence(words))
         case let .refused(words): report(VoxError.Failed(reason: asSentence(words)), operation: operation)
         case let .unknown(words): report(VoxError.Unknown(reason: asSentence(words)), operation: operation)
+        case let .queued(words, _), let .unconfirmed(words, _):
+            report(VoxError.Unknown(reason: asSentence(words)), operation: operation)
         }
         await readSession()
     }

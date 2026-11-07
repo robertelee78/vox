@@ -166,6 +166,17 @@ impl Drop for OmpEnding {
 pub(crate) struct OmpDriveGuard {
     current: Arc<dyn Fn() -> bool + Send + Sync>,
     views: tokio::sync::watch::Receiver<vox_core::node::api::NodeView>,
+    pub(crate) lifecycle: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) native: Arc<dyn Fn() -> Option<Box<dyn Send>> + Send + Sync>,
+    pub(crate) delivery: Option<(
+        NodeHandle,
+        [u8; 32],
+        String,
+        vox_core::node::session_ingress::DriveAdmission,
+    )>,
+    pub(crate) operator: Option<String>,
+    pub(crate) room: String,
+    pub(crate) operation: Option<String>,
 }
 
 impl OmpDriveGuard {
@@ -2815,6 +2826,53 @@ impl Router {
         if reg.room.as_deref() != Some(room.as_str()) {
             return refuse("that session does not work in this room; nothing was sent".into());
         }
+        if reg.harness == "omp"
+            && matches!(&req.action, Action::Text { .. })
+            && !req.operation.as_deref().is_some_and(|id| {
+                id.len() == 32
+                    && id
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })
+        {
+            return refuse(
+                "OMP Drive requires a valid operation identity; nothing was sent".into(),
+            );
+        }
+        let drive_opening = if reg.harness == "omp" && matches!(&req.action, Action::Text { .. }) {
+            let Some(owner) = me else {
+                return refuse("the Session node is unavailable; nothing was sent".into());
+            };
+            let Some(instance) = view
+                .open_channels
+                .iter()
+                .find(|channel| {
+                    channel.channel_id == info.channel_id && channel.members.contains(&info.peer)
+                })
+                .map(|channel| channel.history_instance)
+            else {
+                return refuse("the driver or room is no longer present; nothing was sent".into());
+            };
+            let opening = match vox_core::node::sessions::current_opening(
+                handle,
+                info.channel_id,
+                owner,
+                &req.session,
+            )
+            .await
+            {
+                Ok(Some(opening)) => opening,
+                Ok(None) => return refuse("that Session is not open; nothing was sent".into()),
+                Err(reason) => {
+                    return refuse(format!(
+                        "the Session opening cannot be verified; nothing was sent: {reason}"
+                    ))
+                }
+            };
+            Some((opening, instance))
+        } else {
+            None
+        };
         let by = vox_core::node::link::b32_encode(&info.peer);
         let alias = view
             .trusted
@@ -2837,6 +2895,12 @@ impl Router {
         match &req.action {
             Action::Text { text } => {
                 copy.insert("text".into(), serde_json::json!(text));
+                if reg.harness == "omp" {
+                    copy.insert("id".into(), serde_json::json!(req.operation));
+                    copy.insert("ref".into(), serde_json::json!(req.operation));
+                    copy.insert("occurrence".into(), serde_json::json!(by));
+                    copy.insert("drive_scope".into(), serde_json::json!(1));
+                }
             }
             Action::Slash { text } => {
                 copy.insert("cmd".into(), serde_json::json!(crate::drive::slash(text).0));
@@ -2864,17 +2928,59 @@ impl Router {
                 }
             }
         }
-        sink.activity(
-            node,
-            &req.session,
-            vox_agentcomms::activity::split(
-                copy,
-                "text",
-                vox_core::node::content::MAX_TEXT_LEN - 512,
-            ),
-            None,
-        )
-        .await;
+        let bodies = vox_agentcomms::activity::split(
+            copy,
+            "text",
+            vox_core::node::content::MAX_TEXT_LEN - 512,
+        );
+        if let Some((opening, instance)) = drive_opening {
+            use vox_core::node::session_ingress::{DriveAdmission, OwnedAdmission};
+            let drive = DriveAdmission {
+                author: info.peer,
+                instance,
+                opening,
+                operation: req.operation.clone().unwrap_or_default(),
+            };
+            let receipt = match handle.try_enqueue_session_drive(
+                info.channel_id,
+                req.session.clone(),
+                bodies,
+                drive,
+            ) {
+                Ok(receipt) => receipt,
+                Err(_) => {
+                    return refuse(
+                        "the Session node is busy; the Drive operation was not sent".into(),
+                    )
+                }
+            };
+            match receipt.await {
+                Ok(OwnedAdmission::Committed(saved)) if saved.fresh => {}
+                Ok(OwnedAdmission::Committed(_)) => {
+                    return refuse(
+                        "this Drive operation was already reserved; it will not be sent again"
+                            .into(),
+                    )
+                }
+                Ok(OwnedAdmission::NotCommitted { error, .. }) => {
+                    return refuse(format!(
+                        "the Drive operation was not saved or sent: {error}"
+                    ))
+                }
+                Ok(OwnedAdmission::Unconfirmed(_)) | Err(_) => {
+                    return Answer {
+                        ok: false,
+                        said:
+                            "the Drive reservation outcome is unknown; do not repeat this operation"
+                                .into(),
+                        code: Some("drive-unknown".into()),
+                        pause: None,
+                    }
+                }
+            }
+        } else {
+            sink.activity(node, &req.session, bodies, None).await;
+        }
         let same_attachment = {
             let slots = lock(&self.inner.slots);
             matches!(slots.get(node), Some(Slot::Attached(attached))
@@ -2907,6 +3013,10 @@ impl Router {
         };
         if current_reg.room.as_deref() != Some(room.as_str())
             || current_reg.first_seen_ms != reg.first_seen_ms
+            || (reg.harness == "omp"
+                && (!current_reg.same(&reg)
+                    || current_reg.omp_fence != reg.omp_fence
+                    || current_reg.mirror != reg.mirror))
         {
             return refuse(
                 "that Session changed rooms or ended while saving; nothing was sent".into(),
@@ -2926,6 +3036,32 @@ impl Router {
             else {
                 return refuse("the driver or room is no longer present; nothing was sent".into());
             };
+            let Some(native_fence) = reg.omp_fence.clone() else {
+                return refuse(
+                    "the OMP native instance is not registered; nothing was sent".into(),
+                );
+            };
+            let Some(native_route) = reg.attention.clone() else {
+                return refuse("the OMP native route is unavailable; nothing was sent".into());
+            };
+            let Some(owner) = me else {
+                return refuse("the Session node is unavailable; nothing was sent".into());
+            };
+            let native_account = self.inner.account.clone();
+            let native_node = vox_core::node::link::b32_encode(&owner);
+            let native_session = reg.session.clone();
+            let native = Arc::new(move || {
+                crate::omp_fence::validate(
+                    &native_account,
+                    &native_fence,
+                    &native_node,
+                    &native_session,
+                    &native_route,
+                )
+                .ok()
+                .map(|guard| Box::new(guard) as Box<dyn Send>)
+            });
+            let lifecycle = self.session_lifecycle(node, &reg.session);
             let (router, node, handle, paths, reg) = (
                 self.clone(),
                 node.clone(),
@@ -2936,6 +3072,24 @@ impl Router {
             let peer = info.peer;
             let channel = info.channel_id;
             Some(OmpDriveGuard {
+                operator: matches!(&req.action, Action::Text { .. }).then(|| by.clone()),
+                room: room.clone(),
+                operation: req.operation.clone(),
+                lifecycle,
+                native,
+                delivery: drive_opening.map(|(opening, instance)| {
+                    (
+                        handle.clone(),
+                        channel,
+                        reg.session.clone(),
+                        vox_core::node::session_ingress::DriveAdmission {
+                            author: peer,
+                            instance,
+                            opening,
+                            operation: req.operation.clone().unwrap_or_default(),
+                        },
+                    )
+                }),
                 views: handle.watch(),
                 current: Arc::new(move || {
                     let same = {
@@ -2962,6 +3116,7 @@ impl Router {
                             .is_some_and(|now| {
                                 now.same(&reg)
                                     && now.first_seen_ms == reg.first_seen_ms
+                                    && now.omp_fence == reg.omp_fence
                                     && now.mirror == reg.mirror
                                     && now.interactive
                             })
@@ -2970,6 +3125,7 @@ impl Router {
         } else {
             None
         };
+        let mut omp_uncertain = false;
         let outcome: Result<String, String> = match &req.action {
             Action::Approve { r#ref } => handed(sink.answer(
                 node,
@@ -3024,9 +3180,10 @@ impl Router {
                 }
             }
             Action::Text { text } if reg.harness == "omp" => {
-                self.inner
+                match self
+                    .inner
                     .omp
-                    .steer_guarded(
+                    .steer_guarded_typed(
                         node,
                         &reg,
                         crate::codex_mirror::Steer::Text(text.clone()),
@@ -3034,6 +3191,14 @@ impl Router {
                         omp_guard.clone(),
                     )
                     .await
+                {
+                    Ok(said) => Ok(said),
+                    Err(crate::omp_mirror::OmpControlError::NotSent(why)) => Err(why),
+                    Err(crate::omp_mirror::OmpControlError::Unconfirmed(why)) => {
+                        omp_uncertain = true;
+                        Err(why)
+                    }
+                }
             }
             input => self.steer(node, &reg, input).await,
         };
@@ -3049,6 +3214,21 @@ impl Router {
         }
         if let Action::File { tag, .. } = &req.action {
             result["of"] = serde_json::json!(tag);
+        }
+        let omp_text = reg.harness == "omp" && matches!(&req.action, Action::Text { .. });
+        let uncertain = omp_text && omp_uncertain;
+        if omp_text {
+            result["of"] = serde_json::json!(req.operation);
+            result["ref"] = serde_json::json!(req.operation);
+            result["occurrence"] = serde_json::json!(by);
+            result["drive_scope"] = serde_json::json!(1);
+            result["phase"] = serde_json::json!(if outcome.is_ok() {
+                "queued"
+            } else if uncertain {
+                "unconfirmed"
+            } else {
+                "refused"
+            });
         }
         sink.activity(node, &req.session, vec![result.to_string()], None)
             .await;
@@ -3083,13 +3263,13 @@ impl Router {
             Ok(said) => Answer {
                 ok: true,
                 said,
-                code: None,
+                code: omp_text.then(|| "drive-queued".to_owned()),
                 pause: None,
             },
             Err(said) => Answer {
                 ok: false,
                 said,
-                code: None,
+                code: uncertain.then(|| "drive-unknown".to_owned()),
                 pause: None,
             },
         }

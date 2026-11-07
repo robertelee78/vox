@@ -510,6 +510,8 @@ replacement narrows agent `--none` permission. ST-4's no-OMP-change rule is unch
   reconnect or reset. Existing ContextEventResult.messages supports this AgentMessage path;
   no upstream API change is required. Exactly one provider marker establishes the candidate
   consumption step under the existing native observation criterion.
+  If Drive is revoked before consumption, read access remains but the operation has no accepted
+  receipt; OMP shows the refusal and an already-started wake turn runs without the Drive content.
 - **P420-OD-3.** Generate an unpredictable operation ID before send and carry it with authenticated
   author and scope through request, `drive.id`, private capability mapping, native receipt,
   `drive-result.of`, projection, pagination/reconnect, FFI and UI. The private capability is

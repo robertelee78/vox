@@ -1362,8 +1362,23 @@ pub enum NodeCommand {
         session_id: String,
         /// Unnumbered shared-format activity, within the ingress batch bound.
         bodies: Vec<String>,
+        /// Optional exact Drive authority and opening for an atomic operation reservation.
+        #[doc(hidden)]
+        drive: Option<crate::node::session_ingress::DriveAdmission>,
         /// Exact committed range, or the saving/refusal error. Never a network receipt.
         reply: tokio::sync::oneshot::Sender<crate::node::session_ingress::OwnedAdmission>,
+    },
+    /// Commit one authorized native Drive frame without waiting for socket readiness.
+    #[doc(hidden)]
+    DeliverSessionDrive {
+        /// Room containing this exact Session.
+        channel_id: Digest32,
+        /// Native Session identity.
+        session_id: String,
+        /// Captured authority, registration fence and bounded frame.
+        delivery: crate::node::session_ingress::DriveDelivery,
+        /// Physical write outcome.
+        reply: tokio::sync::oneshot::Sender<crate::node::session_ingress::DriveDeliveryResult>,
     },
     /// Finish a hosted daemon's ordered cleanup after it retired this room's volatile tails
     /// and session bindings. Does not delete room history or reset persistent counters.
