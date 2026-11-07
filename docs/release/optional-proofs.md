@@ -275,6 +275,12 @@ command. This focused step stages the paired Computers and asserts that the dire
 member's board serves the joiner's member and bundle records; it does not replace the full FX-28
 journey.
 
+For the FX-61b governance handoff independently, set `VOX_PROOF_STEP=superseded-governance`
+on the same command. It stages an expiring admin grant, holds the selected ordinary governance
+turn across a real Computer policy change, and asks the member's `vox room admin list` after
+policy acceptance. Test-only apparatus holds periodic settlement only for the selected room,
+so an incidental tick cannot mask the lost governance-owner wake.
+
 FX-28's executable mutants are run one at a time with
 `scripts/run-fx28-mutant.sh <mode>`, where `<mode>` is
 `preview-approval-not-durable`, `stopped-reader-fresh-write`, `lock-through-computer-write`,

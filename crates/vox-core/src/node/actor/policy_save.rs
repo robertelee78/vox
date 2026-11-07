@@ -1548,6 +1548,7 @@ impl Node {
             self.publish_computer_trust_projection();
             self.publish().await;
             self.governance_work.resume_after_computer_policy();
+            self.resume_interrupted_governance();
             self.resume_own_key_interruptions();
             self.resume_own_key_donor_busy();
             self.resume_own_key_policy_waiting();

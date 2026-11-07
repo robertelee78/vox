@@ -7904,6 +7904,15 @@ impl Node {
                     // is its own feed's acknowledgement gets no further sync event until
                     // the fetch that acknowledgement needs is itself driven — by this call.
                     for room in self.channels.keys().copied().collect::<Vec<_>>() {
+                        // The FX-61b apparatus isolates the selected room from this unrelated
+                        // periodic owner; the timer and all other rooms continue normally.
+                        #[cfg(feature = "test-knobs")]
+                        if std::env::var_os("VOX_TEST_HOLD_PERIODIC_SETTLEMENT_FILE")
+                            .and_then(|path| std::fs::read_to_string(path).ok())
+                            .is_some_and(|held| held == crate::node::link::b32_encode(&room))
+                        {
+                            continue;
+                        }
                         self.settle_room(&room).await;
                     }
                     // Audit durable bounded result slots as maintenance. Completion now sends a

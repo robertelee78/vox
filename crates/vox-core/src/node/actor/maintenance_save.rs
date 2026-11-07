@@ -5,6 +5,33 @@ use crate::node::channel::pending_text::{CompletedText, Saved as AppendSaved};
 use crate::node::channel::{pending_retention, pending_session, session_projection};
 use crate::node::store::Store;
 
+/// Park the deadline-selected ordinary governance turn before publication admission.
+#[cfg(feature = "test-knobs")]
+fn fx61_governance_hold(node: &Node) -> Option<(String, String, String)> {
+    let spec = std::env::var("VOX_TEST_HOLD_FX61_GOVERNANCE").ok()?;
+    let fields: Vec<_> = spec.split('\t').collect();
+    let [name, arm, engaged, release] = fields.as_slice() else {
+        return None;
+    };
+    if node.paths.profile_dir.file_name()?.to_str()? != *name
+        || !std::path::Path::new(arm).exists()
+        || !node.pending_posts.is_empty()
+        || !node.key_package_rooms.is_empty()
+        || node.governance_work.again
+        || !node.governance_work.admin_rosters.is_empty()
+        || node.governance_work.removal.is_some()
+        || node.pending_policy.is_some()
+        || !node.preparing_rooms.is_empty()
+        || node.metadata_save_pending()
+        || !node.key_delivery_settling.is_empty()
+        || !node.keys_in_flight.is_empty()
+        || !node.history_in_flight.is_empty()
+    {
+        return None;
+    }
+    Some((arm.to_string(), engaged.to_string(), release.to_string()))
+}
+
 /// The original physical publication boundary follows every native child and continuation.
 /// Managed policy children retain the same exclusive transition rather than acquiring a reader.
 pub(super) struct Lifetime {
@@ -707,7 +734,47 @@ impl Node {
         let holders = self.drive_holders();
         let epoch = self.delivery_epoch;
         let attachment = self.pairwise_epoch.subscribe();
+        #[cfg(feature = "test-knobs")]
+        let proof_hold = if std::env::var_os("VOX_TEST_HOLD_FX61_GOVERNANCE").is_some()
+            && matches!(&work, Work::Consent(consent_save::Work::ReceiverCleanup))
+            && matches!(&continuation, Continuation::Governance(_))
+            && instance
+                .lock()
+                .await
+                .governance_revision(crate::time::Ms(clock()))
+                .is_err_and(|error| ChannelState::governance_refreshing(&error))
+        {
+            fx61_governance_hold(self)
+        } else {
+            None
+        };
         let worker = tokio::spawn(async move {
+            #[cfg(feature = "test-knobs")]
+            if let Some((arm, engaged, release)) = proof_hold {
+                if let Ok(listener) = tokio::net::UnixListener::bind(&release) {
+                    if std::fs::remove_file(&arm).is_ok() {
+                        let _ = std::fs::write(
+                            format!("{arm}.selected"),
+                            if authority.current() {
+                                "current"
+                            } else {
+                                "superseded"
+                            },
+                        );
+                        let _ = std::fs::write(engaged, crate::node::link::b32_encode(&room));
+                        let _ = listener.accept().await;
+                        let _ = std::fs::write(
+                            format!("{arm}.released"),
+                            if authority.current() {
+                                "current"
+                            } else {
+                                "superseded"
+                            },
+                        );
+                        let _ = std::fs::remove_file(release);
+                    }
+                }
+            }
             let lifetime = match retained {
                 Some(held) => held,
                 None => {
