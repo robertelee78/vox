@@ -72,6 +72,8 @@ mod world;
 
 #[path = "support/relay.rs"]
 mod relay;
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
 
 use std::time::{Duration, Instant};
 
@@ -99,6 +101,10 @@ const APPARATUS_BUDGET: Duration = Duration::from_secs(2);
 #[ignore = "real binaries, production Argon2id and a PoW; CI runs it in release"]
 fn a_rooms_own_anchor_is_redialled_after_it_restarts() {
     watchdog::arm();
+    test_knobs::require(&[
+        "VOX_TEST_HOLD_REOPEN_PREPARATION",
+        "VOX_TEST_SHARE_PATIENCE_MS",
+    ]);
     let mut w = RelayWorld::new(Split::Families);
     // The creator explicitly chooses the room's initial anchor. A machine anchor or URL
     // hint cannot make that choice for the room (ADR-032 AN-5/AN-9).
@@ -301,6 +307,66 @@ fn a_rooms_own_anchor_is_redialled_after_it_restarts() {
          debug build this is #287 (V210-93), a stopping anchor's closes lost as it exits\n{said}"
     );
     signed_replacements(&mut w);
+    preparing_forward_is_bounded(&mut w);
+}
+
+fn preparing_forward_is_bounded(w: &mut RelayWorld) {
+    assert!(
+        world::kill_daemon(&w.guest_dir).is_some(),
+        "APPARATUS: guest daemon to restart is absent"
+    );
+    drop(w.fwd.take());
+    let marker = w.tmp.path().join("reopen-preparation-held");
+    let marker_name = marker.to_str().expect("APPARATUS: UTF-8 marker path");
+    let mut fwd = VoxProc::spawn_env(
+        "preparing-forward",
+        &w.guest_dir,
+        &args(&[
+            "forward",
+            &w.hostname(),
+            "127.0.0.1:0",
+            "--listen",
+            "[::]:0",
+        ]),
+        &[
+            ("VOX_TEST_HOLD_REOPEN_PREPARATION", marker_name),
+            ("VOX_TEST_SHARE_PATIENCE_MS", "5000"),
+        ],
+    );
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(30);
+    while !marker.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        marker.exists(),
+        "APPARATUS: the reopening preparation was not held:\n{}",
+        fwd.transcript()
+    );
+    let status = loop {
+        match fwd.child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) => break None,
+            Err(e) => panic!("APPARATUS: waiting for the preparing forward: {e}"),
+        }
+    };
+    let said = fwd.transcript();
+    println!(
+        "[proof] held preparation: {status:?} after {:?}\n{said}",
+        started.elapsed()
+    );
+    assert!(
+        status.is_some_and(|s| !s.success())
+            && said.contains("waiting up to")
+            && said.contains("the proof-held room preparation")
+            && said.contains("that room is preparing its saved history"),
+        "PRODUCT: forwarding to a room held preparing must say why and refuse within 30s; \
+         status {status:?} after {:?}:\n{said}",
+        started.elapsed()
+    );
 }
 
 /// Extend the same running product journey; the original single-anchor recovery above is
@@ -415,7 +481,24 @@ fn command(data: &std::path::Path, argv: &[&str]) -> String {
 fn change(w: &RelayWorld, action: &str, values: &[&str]) {
     let mut argv = vec!["room", "anchors", &w.room, action];
     argv.extend_from_slice(values);
-    command(&w.host_dir, &argv);
+    if action != "remove" {
+        command(&w.host_dir, &argv);
+        return;
+    }
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let (ok, out, err) = world::vox_once(&w.host_dir, &args(&argv));
+        println!("[781] {argv:?} -> {ok}\n{out}\n{err}");
+        if ok {
+            return;
+        }
+        assert!(
+            err.contains("a previous change to this room is still being applied; this request made no change")
+                && Instant::now() < deadline,
+            "PRODUCT: {argv:?} failed\n{out}\n{err}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 /// Public projections and authenticated peer identities, never local store contents. A

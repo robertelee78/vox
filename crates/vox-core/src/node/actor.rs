@@ -12941,11 +12941,25 @@ impl Node {
                         .get(&target.channel_id)
                         .ok_or("room not open")?;
                     let profile = self.profile.as_ref().ok_or("the node is locked")?;
-                    let share = shared
-                        .lock()
-                        .await
+                    let channel = shared.lock().await;
+                    let share = channel
                         .shared_service(profile.store(), &target.host, &target.service)
                         .map_err(|e| e.to_string())?;
+                    // Sparse settlement only establishes that our own feed is safe to write;
+                    // it does not mean the sharing member's feed has ever arrived. A completed
+                    // role head is durable evidence that this member's source has been read.
+                    if share.is_none()
+                        && target.host != channel.me()
+                        && channel
+                            .uses_sparse_history(profile.store())
+                            .map_err(|e| e.to_string())?
+                        && channel
+                            .history_role_head(profile.store(), &target.host)
+                            .map_err(|e| e.to_string())?
+                            .is_none()
+                    {
+                        names.set_synced(target.channel_id, false);
+                    }
                     if let Some(share) = share {
                         names.add_share(target.channel_id, share.host, &share.name, share.udp);
                     }
@@ -19213,6 +19227,21 @@ impl Node {
         let Some(mut prepared) = self.preparing_rooms.remove(&id) else {
             return;
         };
+        // A proof can keep an automatically reopening room in its real preparing state.
+        #[cfg(feature = "test-knobs")]
+        if let Some(marker) = std::env::var_os("VOX_TEST_HOLD_REOPEN_PREPARATION")
+            .filter(|v| prepared.reopening && !v.is_empty())
+        {
+            let marker = std::path::Path::new(&marker);
+            if !marker.exists() {
+                let _ = std::fs::write(marker, b"preparing");
+            }
+            prepared.wait_on("the proof-held room preparation", self.now_ms().get());
+            prepared.legacy_cleanup_due = Some(now + TICK);
+            self.preparing_rooms.insert(id, prepared);
+            self.publish().await;
+            return;
+        }
         let outcome = if !self.profile.as_ref().is_some_and(Profile::is_unlocked)
             || self.locking != 0
         {

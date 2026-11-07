@@ -172,6 +172,11 @@ It prints `vox: forwarding 127.0.0.1:2222 to ssh on ssh.robertgpt.family.vox (ek
 runs until Ctrl-C. Point the tool at the local port: `ssh -p 2222 robert@127.0.0.1`. Keep the
 forward on loopback unless you mean others on your network to use it.
 
+If this starts the node after `vox connect`, the forward says when it must wait for the saved
+room to reopen. It waits at most five minutes, then says why the room is still preparing.
+A room ID the profile does not hold is refused at once. A readable room name cannot be checked
+against a preparing room until it opens, so it may wait for that room before being refused.
+
 `vox status --node ann` lists live tunnels with their actual numbers and peers. To close one,
 use `vox tunnel close` with its number in `--id` and `--node ann`. To close all tunnels to one
 member, use that member's actual fingerprint after `close`; add the actual service name to

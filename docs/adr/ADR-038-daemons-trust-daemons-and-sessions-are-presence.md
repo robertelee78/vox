@@ -1556,7 +1556,20 @@ lessons. It changes neither this record's decision status nor any requirement or
   to a direct member also scoped as an anchor of another held room, and MUST be red under an
   old-selector-only mutant.
   (d) `a_rooms_own_anchor_is_redialled_proof` covers real-anchor room scopes and MUST stay green.
-- **FX-63. Review and release boundary.** Record each FX-53–FX-64 outcome individually in
+- **FX-65. Forward after connect.** A forward that starts a node after `connect` can resolve
+  before a remembered room reopens; sparse local settlement can also be mistaken for a remote
+  sharer's first sync. Under ADR-017 §12.11–12.12, a forward MUST wait for the relevant held
+  room and a not-yet-known share as needed, announce each bounded wait, serve an authorized share,
+  and refuse a known absent share at once. A canonical room ID not held by the profile MUST be refused
+  without waiting for unrelated rooms. A readable room name that cannot yet be matched MAY wait
+  for preparing rooms, but MUST say why; on expiry it MUST refuse with the preparation reason.
+  The shipped-binary `a_rooms_own_anchor_is_redialled_proof` MUST exercise `connect` followed
+  by `forward` to a readable service name at a canonical node and room ID, and a forward to a room
+  held preparing that is refused with its reason within the deadline. Restoring immediate resolution,
+  treating local settlement as share readiness, and removing the preparation deadline MUST each turn
+  its own consumer assertion red. The refusal of a canonical room ID the profile does not hold, and
+  the readable-room-name wait, rest on review; the journey does not stage them.
+- **FX-63. Review and release boundary.** Record each FX-53–FX-65 outcome individually in
   v0.4.20, including Designing/Blocked records while decisions or prerequisites remain open.
   Proposed source is not design approval or execution readiness. Before permanent implementation,
   obtain independent Opus review of the complete RCA/ADR/task design and resolve every finding;
