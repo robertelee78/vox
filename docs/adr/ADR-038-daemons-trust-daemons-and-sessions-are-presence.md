@@ -1587,7 +1587,18 @@ lessons. It changes neither this record's decision status nor any requirement or
   to computer policy. The existing local-trust shipped-binary journey MUST show the pair remains
   read-only beyond 15 seconds, actual Drive is refused, and the choice survives restart.
   A mutant restoring the automatic Drive grant MUST turn that same visible read-only assertion red.
-- **FX-63. Review and release boundary.** Record each FX-53–FX-66 outcome individually in
+- **FX-67. Retained Session opening.** A durable Session registration whose idempotent
+  opening receives the exact `RoomChangePending` refusal before admission MUST retain its
+  opening owner and resume without another hook, prompt or daemon restart. The daemon owner
+  MUST recheck the exact registration, room, attachment and native lifecycle on each attempt,
+  using its existing bounded readiness cadence. Permanent and ambiguous refusals MUST still
+  reach the caller; this does not authorize replay of an uncertain write. The pending-room
+  refusal MUST remain separate from shared view-refresh classification, whose callers can
+  yield without sleeping. A shipped-binary consumer MUST hold an unrelated pending room post
+  off the actor, observe the exact no-change refusal, release that post, and then see both the
+  Session and its already-saved fresh activity without a second hook. Restoring the old
+  terminal classification MUST turn that same Session-registration assertion PRODUCT red.
+- **FX-63. Review and release boundary.** Record each FX-53–FX-67 outcome individually in
   v0.4.20, including Designing/Blocked records while decisions or prerequisites remain open.
   Proposed source is not design approval or execution readiness. Before permanent implementation,
   obtain independent Opus review of the complete RCA/ADR/task design and resolve every finding;

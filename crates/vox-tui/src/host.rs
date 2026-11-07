@@ -1991,7 +1991,8 @@ impl Router {
                     drop(guard);
                     match attempt {
                         Err(why)
-                            if vox_core::node::sessions::opening_refreshing(&why)
+                            if (vox_core::node::sessions::opening_refreshing(&why)
+                                || vox_core::node::sessions::opening_room_change_pending(&why))
                                 && !*detached.borrow()
                                 && still_registered() =>
                         {

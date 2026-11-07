@@ -160,8 +160,8 @@ pub async fn current_opening(
 // for this attempt and must reach the caller. These are Error::Display strings where the
 // actor returns a storage-layer readiness error before reaching the Session query.
 /// Whether an idempotent Session opening stopped only because its bounded view is still being
-/// rebuilt. A durable daemon registration may retry these exact refusals; every other error is a
-/// permanent result for that registration and must be surfaced.
+/// rebuilt. This shared view predicate excludes a pending room write; a durable daemon
+/// opening owner classifies that refusal separately.
 #[must_use]
 pub fn opening_refreshing(reason: &str) -> bool {
     matches!(
@@ -173,6 +173,13 @@ pub fn opening_refreshing(reason: &str) -> bool {
             | "stream refused: Session control facts are refreshing"
             | OPENING_VIEW_CHANGED
     )
+}
+
+/// Whether an idempotent opening was refused before admission by an existing room write.
+/// Only the durable daemon opening owner retries this refusal, not view-refresh loops.
+#[must_use]
+pub fn opening_room_change_pending(reason: &str) -> bool {
+    reason == crate::node::api::Fault::RoomChangePending.explain()
 }
 
 /// What a session tells its node about itself, for its Session's records.
