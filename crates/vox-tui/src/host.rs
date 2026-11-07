@@ -166,6 +166,8 @@ impl Drop for OmpEnding {
 pub(crate) struct OmpDriveGuard {
     current: Arc<dyn Fn() -> bool + Send + Sync>,
     views: tokio::sync::watch::Receiver<vox_core::node::api::NodeView>,
+    pub(crate) operator: Option<String>,
+    pub(crate) room: String,
 }
 
 impl OmpDriveGuard {
@@ -2773,6 +2775,8 @@ impl Router {
             let peer = info.peer;
             let channel = info.channel_id;
             Some(OmpDriveGuard {
+                operator: matches!(&req.action, Action::Text { .. }).then(|| by.clone()),
+                room: room.clone(),
                 views: handle.watch(),
                 current: Arc::new(move || {
                     let same = {

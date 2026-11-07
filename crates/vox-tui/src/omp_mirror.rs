@@ -91,7 +91,8 @@ impl Deferred {
     fn frame(&self, id: &str) -> String {
         format!(
             "{}\n",
-            json!({"type":"materialized","id":id,"ok":true,"text":self.text})
+            json!({"type":"materialized","id":id,"ok":true,"text":self.text,
+                "operator":self.guard.operator,"room":self.guard.room})
         )
     }
 }

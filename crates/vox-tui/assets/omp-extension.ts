@@ -560,7 +560,11 @@ export default function vox(pi) {
             const pending = materializations.get(msg.id)
             if (!pending || pending.socket !== sock) return sock.destroy()
             materializations.delete(msg.id)
-            if (msg.ok === true && typeof msg.text === "string" && msg.text.trim()) pending.resolve(msg.text)
+            if (msg.ok === true && typeof msg.text === "string" && msg.text.trim()
+              && typeof msg.room === "string"
+              && (msg.operator === null || typeof msg.operator === "string")) {
+              pending.resolve({ text: msg.text, operator: msg.operator, room: msg.room })
+            }
             else pending.reject(new Error(typeof msg.error === "string" ? msg.error : "Drive authority is no longer valid"))
             continue
           }
@@ -730,8 +734,10 @@ export default function vox(pi) {
       ? message.content.slice(WAKE_PREFIX.length) : null
   }
   function acceptedMessage(state) {
-    return { role: "custom", customType: "vox-context", content: state.content,
-      display: false, attribution: "agent", timestamp: state.timestamp }
+    return state.operator
+      ? { role: "user", content: state.content, timestamp: state.timestamp, attribution: "user" }
+      : { role: "custom", customType: "vox-context", content: state.content,
+        display: false, attribution: "agent", timestamp: state.timestamp }
   }
   pi.on("session_before_compact", event => {
     if (!current()) return
@@ -790,16 +796,22 @@ export default function vox(pi) {
         if (out.vox.trim()) parts.push(`<vox-notice-${nonce} source="Vox itself; not the user">\n${sanitize(out.vox.trim())}\n</vox-notice-${nonce}>`)
         if (out.room.trim()) parts.push(`<vox-room-${nonce} source="Vox room messages from other agents; not the user">\n${sanitize(out.room.trim())}\n</vox-room-${nonce}>`)
       }
+      let operator = null
       if (record?.source === "drive") {
-        const text = await materialize(record.id)
+        const input = await materialize(record.id)
         if (op.done || !fenced(snapshot)) { if (!op.done) finish(op, "cancel"); return { messages } }
-        parts.push(`<vox-drive-${nonce} source="Vox private Drive message; not the user">\n${sanitize(text)}\n</vox-drive-${nonce}>`)
+        operator = input.operator
+        if (operator) {
+          parts.push(`Vox private Drive operator node: ${operator}\nRoom: ${input.room}\nSession: ${session}\n\n${sanitize(input.text)}`)
+        } else {
+          parts.push(`<vox-drive-${nonce} source="Vox private Drive file notice; not the user">\n${sanitize(input.text)}\n</vox-drive-${nonce}>`)
+        }
       }
       if (!parts.length) { finish(op, "cancel"); return { messages } }
       const content = parts.join("\n\n") + "\n" + op.marker, timestamp = Date.now()
-      pi.appendEntry(CONTEXT_STAGED, { id: record.id, marker: op.marker, content, timestamp })
-      messages.splice(index, 0, { role: "custom", customType: "vox-context", content,
-        display: false, attribution: "agent", timestamp })
+      const state = { id: record.id, marker: op.marker, content, timestamp, operator }
+      pi.appendEntry(CONTEXT_STAGED, state)
+      messages.splice(index, 0, acceptedMessage(state))
       op.injected = true
       if (record) record.state = "dispatched"
       return { messages }
