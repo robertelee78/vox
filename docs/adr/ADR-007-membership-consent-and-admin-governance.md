@@ -252,12 +252,16 @@ only room governance is who sets the room's retention. This builds on identity (
   unauthorized or missing-ancestry facts MUST NOT grant access or effect removal. Missing or
   unvalidated dependencies remain inert, not a room-wide egress barrier; re-evaluate the fact
   when ancestry arrives.
-  A governance act on a verified forked branch of its issuer's author chain carries no
-  authority. Retain verified proof pairs and their provenance, and re-evaluate affected
-  decisions when a new proof commits. Only acts proved to lie in the shared authenticated
-  prefix strictly before divergence may retain authority; an unproved common-prefix position
-  is unavailable authority, not permission to choose a favored branch. Preserve historical
-  signed evidence rather than deleting it.
+  A verified issuer fork MUST NOT restore access. An otherwise-valid removal on either
+  branch remains exclusionary, subject to the creator cutoff and reversible only by
+  creator readmission. Other governance acts at or after the verified divergence carry
+  no authority; only acts proved in the shared authenticated prefix strictly before
+  divergence may retain it. Retain proof pairs and provenance and re-evaluate when a
+  proof commits; an unproved common-prefix position is unavailable authority, not permission
+  to choose a favored branch. Preserve historical signed evidence. A room end already
+  applied locally remains applied because deletion cannot be undone; a fork-branch end
+  supplies no authority to a node that has not applied it. This is a disclosed divergence
+  limit, not permission to restore deleted data or propagate an unauthorized end.
 
   The global v0.4.20 protocol cutover in ADR-011 is a prerequisite, not a per-room
   capability negotiation: every currently participating or reachable peer, including a board,
@@ -357,9 +361,12 @@ only room governance is who sets the room's retention. This builds on identity (
   successful command alone.
   Include a read-only target with no own public log, and deliver its signed removal to an
   independent peer before its join history; subsequent ordinary join MUST remain refused.
-  Supply a verified issuer-fork proof after a governance act: branch acts MUST lose authority,
-  while acts proved strictly before divergence retain it. Missing common-prefix evidence
-  MUST NOT become authority or delete the signed history.
+  Supply a verified issuer-fork proof after a governance act: non-removal branch acts MUST
+  lose authority, while acts proved strictly before divergence retain it. The issuer's
+  earlier otherwise-valid removal MUST remain exclusionary and ordinary rejoin refused
+  until creator readmission. Missing common-prefix evidence MUST NOT grant authority or
+  delete signed history. Exercise already-applied versus unapplied fork-branch room ends
+  and report the disclosed divergence without pretending deleted data was restored.
   Separately have the removed node post, including a partition-concurrent post replayed after
   catch-up; independent peers' native views MUST NOT show those posts, while the causally prior
   signed history remains readable. Exercise eligible post-readmission content separately.
