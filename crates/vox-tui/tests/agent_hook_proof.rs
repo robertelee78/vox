@@ -3826,8 +3826,16 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
         assert!(ok, "PRODUCT: reading room {room} failed: {out}{err}");
         out.lines()
             .map(|line| {
-                serde_json::from_str(line).unwrap_or_else(|e| {
+                let row: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|e| {
                     panic!("PRODUCT: room {room} printed invalid row JSON: {e}: {line}")
+                });
+                // Peer receipts may advance while refused commands run. Compare the
+                // actual message history, not asynchronous delivery acknowledgements.
+                serde_json::json!({
+                    "entry_hash": row["entry_hash"],
+                    "author": row["author"],
+                    "text": row["text"],
+                    "envelope": row["envelope"],
                 })
             })
             .collect()

@@ -289,6 +289,7 @@ struct RepoDecisionView: View {
         }
         .padding(Space.s24)
         .frame(width: Theme.scaled(500))
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier("repo-decision-dialog")
         .task { inspect() }
         .onDisappear {
