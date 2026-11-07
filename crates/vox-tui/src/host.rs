@@ -168,6 +168,7 @@ pub(crate) struct OmpDriveGuard {
     views: tokio::sync::watch::Receiver<vox_core::node::api::NodeView>,
     pub(crate) operator: Option<String>,
     pub(crate) room: String,
+    pub(crate) operation: Option<String>,
 }
 
 impl OmpDriveGuard {
@@ -2654,6 +2655,20 @@ impl Router {
         if reg.room.as_deref() != Some(room.as_str()) {
             return refuse("that session does not work in this room; nothing was sent".into());
         }
+        if reg.harness == "omp" && matches!(&req.action, Action::Text { .. })
+            && !req.operation.as_deref().is_some_and(|id| id.len() == 32
+                && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+        {
+            return refuse("OMP Drive requires a valid operation identity; nothing was sent".into());
+        }
+        if reg.harness == "omp" && matches!(&req.action, Action::Text { .. }) {
+            if let Err(why) = self.inner.omp.reserve_operation(
+                &paths, &info.channel_id, &info.peer, &req.session,
+                req.operation.as_deref().unwrap_or_default(),
+            ) {
+                return refuse(why);
+            }
+        }
         let by = vox_core::node::link::b32_encode(&info.peer);
         let alias = view
             .trusted
@@ -2676,6 +2691,12 @@ impl Router {
         match &req.action {
             Action::Text { text } => {
                 copy.insert("text".into(), serde_json::json!(text));
+                if reg.harness == "omp" {
+                    copy.insert("id".into(), serde_json::json!(req.operation));
+                    copy.insert("ref".into(), serde_json::json!(req.operation));
+                    copy.insert("occurrence".into(), serde_json::json!(by));
+                    copy.insert("drive_scope".into(), serde_json::json!(1));
+                }
             }
             Action::Slash { text } => {
                 copy.insert("cmd".into(), serde_json::json!(crate::drive::slash(text).0));
@@ -2777,6 +2798,7 @@ impl Router {
             Some(OmpDriveGuard {
                 operator: matches!(&req.action, Action::Text { .. }).then(|| by.clone()),
                 room: room.clone(),
+                operation: req.operation.clone(),
                 views: handle.watch(),
                 current: Arc::new(move || {
                     let same = {
@@ -2891,6 +2913,17 @@ impl Router {
         if let Action::File { tag, .. } = &req.action {
             result["of"] = serde_json::json!(tag);
         }
+        let omp_text = reg.harness == "omp" && matches!(&req.action, Action::Text { .. });
+        let uncertain = omp_text
+            && outcome.as_ref().err().is_some_and(|why|
+                !why.contains("nothing was sent") && !why.contains("did not accept"));
+        if omp_text {
+            result["of"] = serde_json::json!(req.operation);
+            result["ref"] = serde_json::json!(req.operation);
+            result["occurrence"] = serde_json::json!(by);
+            result["drive_scope"] = serde_json::json!(1);
+            result["phase"] = serde_json::json!(if outcome.is_ok() { "queued" } else if uncertain { "unconfirmed" } else { "refused" });
+        }
         sink.activity(node, &req.session, vec![result.to_string()], None)
             .await;
         if let Action::File {
@@ -2924,13 +2957,13 @@ impl Router {
             Ok(said) => Answer {
                 ok: true,
                 said,
-                code: None,
+                code: omp_text.then(|| "drive-queued".to_owned()),
                 pause: None,
             },
             Err(said) => Answer {
                 ok: false,
                 said,
-                code: None,
+                code: uncertain.then(|| "drive-unknown".to_owned()),
                 pause: None,
             },
         }

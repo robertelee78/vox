@@ -251,6 +251,7 @@ async fn act(paths: &Paths, t: &Target, action: Action) -> Result<String, String
     let request = Request {
         v: 1,
         session: t.session.clone(),
+        operation: None,
         action,
     };
     match crate::drive::send(paths, t.room, t.node, &request).await {

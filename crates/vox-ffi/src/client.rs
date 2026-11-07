@@ -1246,6 +1246,32 @@ pub struct FfiSessionEntry {
     pub file: Option<FfiSessionFile>,
     /// An approval or a question the session asked.
     pub request: Option<FfiRequest>,
+    /// Scoped OMP Drive evidence, if this is a Drive operation.
+    pub drive: Option<FfiDriveEvidence>,
+}
+
+/// Evidence for one attributed OMP Drive operation.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiDriveEvidence {
+    /// Sender-generated operation identity.
+    pub operation: String,
+    /// Authenticated driver fingerprint.
+    pub by: String,
+    /// The most authoritative observed delivery phase.
+    pub phase: FfiDrivePhase,
+}
+
+/// Evidence of delivery to an OMP Session.
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum FfiDrivePhase {
+    /// No native conclusion is known.
+    Unconfirmed,
+    /// The request was refused.
+    Refused,
+    /// The bridge queued it, but native delivery is not confirmed.
+    Queued,
+    /// The marker-associated native response step was observed.
+    Accepted,
 }
 
 fn session_entry(
@@ -1259,6 +1285,16 @@ fn session_entry(
         kind: l.kind.clone(),
         line: l.text.clone(),
         details: details_text(l),
+        drive: l.drive.as_ref().map(|d| FfiDriveEvidence {
+            operation: d.operation.clone(),
+            by: d.by.clone(),
+            phase: match d.phase.as_str() {
+                "accepted" => FfiDrivePhase::Accepted,
+                "queued" => FfiDrivePhase::Queued,
+                "refused" => FfiDrivePhase::Refused,
+                _ => FfiDrivePhase::Unconfirmed,
+            },
+        }),
         file: l.file.as_ref().map(|f| FfiSessionFile {
             name: shown_name(&f.name),
             size: f.size,
@@ -1606,6 +1642,10 @@ pub struct DriveAnswer {
     pub said: String,
     /// Whether the session's node answered at all.
     pub delivery: DriveDelivery,
+    /// Sender-generated operation identity, including when the outcome is unknown.
+    pub operation: String,
+    /// Immediate OMP Drive evidence, separate from later activity receipts.
+    pub phase: Option<FfiDrivePhase>,
 }
 
 /// Something done to a room, said among its messages (ADR-028 R-1, R-7): its retention set, its
@@ -6509,6 +6549,7 @@ impl VoxClient {
         use vox_agentcomms::drive::{Action, Request as Drive};
         let channel_id = digest(&room, "room id")?;
         let node = input_fingerprint(&node)?;
+        let operation = vox_core::node::drive_input::operation_id().map_err(failed)?;
         // A file is served before it is said: its share is started once the Session's node is
         // known, below.
         let mut file = None;
@@ -6533,7 +6574,7 @@ impl VoxClient {
         };
         let held = Arc::clone(&self.held);
         self.on_rt(async move {
-            let (at, attachment, node, trusted, action, shown) = {
+            let (at, attachment, node, trusted, action, shown, omp_text) = {
                 let mut slot = held.lock().await;
                 let h = slot.as_mut().ok_or_else(not_attached)?;
                 h.mend().await?;
@@ -6562,12 +6603,15 @@ impl VoxClient {
                                     ok: false,
                                     said: format!("not sent: {said}"),
                                     delivery: DriveDelivery::Unreachable,
+                                    operation: operation.clone(),
+                                    phase: None,
                                 })
                             }
                         }
                     }
                     _ => action,
                 };
+                let omp_text = row.harness == "omp" && matches!(&action, Action::Text { .. });
                 (
                     h.at.clone(),
                     Arc::clone(&h.attachment),
@@ -6575,6 +6619,7 @@ impl VoxClient {
                     trusted,
                     action,
                     shown,
+                    omp_text,
                 )
             };
             // The app gate opens a stream only between nodes that trust each other; a member
@@ -6587,11 +6632,14 @@ impl VoxClient {
                         "you do not trust {shown}, so you cannot drive or read its Sessions"
                     ),
                     delivery: DriveDelivery::Unreachable,
+                    operation: operation.clone(),
+                    phase: omp_text.then_some(FfiDrivePhase::Refused),
                 });
             }
             let request = Drive {
                 v: 1,
                 session,
+                operation: Some(operation.clone()),
                 action,
             };
             let file_tag = match &request.action {
@@ -6603,17 +6651,33 @@ impl VoxClient {
                     Ok(a) => DriveAnswer {
                         ok: a.ok,
                         said: a.said_to(&shown),
-                        delivery: DriveDelivery::Answered,
+                        delivery: if a.code.as_deref() == Some("drive-unknown") {
+                            DriveDelivery::NoAnswer
+                        } else {
+                            DriveDelivery::Answered
+                        },
+                        operation: operation.clone(),
+                        phase: if omp_text {
+                            Some(match a.code.as_deref() {
+                                Some("drive-queued") => FfiDrivePhase::Queued,
+                                Some("drive-unknown") => FfiDrivePhase::Unconfirmed,
+                                _ => FfiDrivePhase::Refused,
+                            })
+                        } else { None },
                     },
                     Err(vox_core::node::drive_input::Unsent::Unreachable(said)) => DriveAnswer {
                         ok: false,
                         said,
                         delivery: DriveDelivery::Unreachable,
+                        operation: operation.clone(),
+                        phase: omp_text.then_some(FfiDrivePhase::Refused),
                     },
                     Err(vox_core::node::drive_input::Unsent::NoAnswer(said)) => DriveAnswer {
                         ok: false,
                         said,
                         delivery: DriveDelivery::NoAnswer,
+                        operation: operation.clone(),
+                        phase: omp_text.then_some(FfiDrivePhase::Unconfirmed),
                     },
                 };
             // A file not taken is served to no one, so not served at all.

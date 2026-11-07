@@ -892,6 +892,7 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
         &vox_agentcomms::drive::Request {
             v: 1,
             session: SESSION.to_owned(),
+            operation: None,
             action: vox_agentcomms::drive::Action::File {
                 name: "huge.bin".into(),
                 size: 1_000_000_000_000_000,

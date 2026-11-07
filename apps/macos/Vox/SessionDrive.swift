@@ -10,10 +10,12 @@ enum DriveResult {
     case taken(String)
     case refused(String)
     case unknown(String)
+    case queued(String, String)
+    case unconfirmed(String, String)
 
     var said: String {
         switch self {
-        case let .taken(s), let .refused(s), let .unknown(s): return s
+        case let .taken(s), let .refused(s), let .unknown(s), let .queued(s, _), let .unconfirmed(s, _): return s
         }
     }
 }
@@ -34,6 +36,9 @@ extension NodeModel {
             let answer = try await drive(room: room, node: s.nodeFingerprint, session: s.sessionId, action: action)
             switch answer.delivery {
             case .answered:
+                if case .some(.queued) = answer.phase {
+                    return .queued("\(s.label): \(answer.said)", answer.operation)
+                }
                 return answer.ok ? .taken("\(s.label): \(answer.said)")
                     : .refused("not delivered to \(s.label): \(answer.said)")
             case .unreachable:
@@ -41,6 +46,9 @@ extension NodeModel {
                 let why = answer.said.hasPrefix("not sent: ") ? String(answer.said.dropFirst(10)) : answer.said
                 return .refused("not sent to \(s.label): \(why)")
             case .noAnswer:
+                if case .some(.unconfirmed) = answer.phase {
+                    return .unconfirmed("no answer from \(s.label): delivery is unconfirmed", answer.operation)
+                }
                 return .unknown("no answer from \(s.label): it may or may not have been delivered")
             }
         } catch {
@@ -188,6 +196,10 @@ struct SessionComposer: View {
             case .taken:
                 if draft.trimmingCharacters(in: .whitespacesAndNewlines) == text { draft = "" }
                 said = result.said
+            case let .queued(words, operation):
+                said = "\(words) (operation \(operation); text kept — do not resend automatically)"
+            case let .unconfirmed(words, operation):
+                said = "\(words) (operation \(operation); text kept — do not resend automatically)"
             case .refused:
                 said = result.said
             case .unknown:

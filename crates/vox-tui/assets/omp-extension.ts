@@ -597,6 +597,13 @@ export default function vox(pi) {
           subscribed = true; clearTimeout(timer); followers.add(sock)
           reply({ type: "subscribed", session })
           reply({ type: "event", event: { type: "state", busy: !ctx.isIdle() } })
+          // The follower is enrolled before the branch snapshot, so later live events
+          // follow these recoverable receipts in socket order.
+          const accepted = [...acceptedHistory(ctx.sessionManager.getBranch()).values()].slice(-MAX_NOTICES / 4)
+          for (const state of accepted) {
+            if (typeof state.response === "string")
+              reply({ type: "event", event: { type: "drive-accepted", id: state.id, response: state.response } })
+          }
           const name = pi.getSessionName()
           if (name) { lastName = name; reply({ type: "event", event: { type: "name", name } }) }
           continue
@@ -722,7 +729,8 @@ export default function vox(pi) {
         staged.set(entry.data.marker, entry.data)
       } else if (entry.type === "custom" && entry.customType === CONTEXT_ACCEPTED) {
         const state = staged.get(entry.data?.marker)
-        if (state && state.id === entry.data?.id) history.set(state.id, state)
+        if (state && state.id === entry.data?.id)
+          history.set(state.id, { ...state, response: entry.data?.response })
       }
     }
     for (const id of history.keys()) if (!wakes.has(id)) history.delete(id)
@@ -845,10 +853,19 @@ export default function vox(pi) {
         // Unknown stop reasons remain uncertain rather than acknowledging an unproved delivery.
         let commit = providerActive === 1 && !op.ambiguous && fenced(op.fence)
           && !m.errorMessage && ["stop", "toolUse", "length"].includes(m.stopReason)
+        const response = Array.isArray(m.content)
+          ? m.content.filter(part => part.type === "text").map(part => part.text).join("")
+          : typeof m.content === "string" ? m.content : ""
+        const chars = Array.from(response)
+        const bounded = chars.length > 8192
+          ? chars.slice(0, 8192).join("") + "\n[Response step truncated at the transport bound]"
+          : response
         if (commit) {
-          try { pi.appendEntry(CONTEXT_ACCEPTED, { id: op.record.id, marker: op.marker }) }
+          try { pi.appendEntry(CONTEXT_ACCEPTED, { id: op.record.id, marker: op.marker, response: bounded }) }
           catch { commit = false }
         }
+        if (commit && op.record?.source === "drive")
+          publish({ type: "drive-accepted", id: op.record.id, response: bounded })
         finish(op, commit ? "commit" : null)
       }
       providerActive = 0

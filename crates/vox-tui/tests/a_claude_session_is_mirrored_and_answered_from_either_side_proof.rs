@@ -1755,6 +1755,7 @@ fn an_approval_is_answered_from_either_side_and_the_first_answer_wins() {
         request: vox_agentcomms::drive::Request {
             v: 1,
             session: SESSION.to_owned(),
+            operation: None,
             action: vox_agentcomms::drive::Action::Approve {
                 r#ref: "toolu_7".to_owned(),
             },
