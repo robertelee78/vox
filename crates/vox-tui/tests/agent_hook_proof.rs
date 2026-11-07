@@ -2630,11 +2630,15 @@ fn restart(d: &mut Daemon, root: &Path) {
         .spawn()
         .expect("APPARATUS: cannot start vox daemon again");
     let deadline = Instant::now() + Duration::from_secs(60);
-    while !hook(&d.data, &d.cfg, &["room", "list"], "").0 {
+    loop {
+        let (ok, status, err) = hook(&d.data, &d.cfg, &["status", "--json"], "");
+        let ready = ok && serde_json::from_str::<serde_json::Value>(&status).ok()
+            .and_then(|v| v["preparing"].as_array().map(Vec::is_empty)) == Some(true);
+        if ready { break; }
         assert!(
             Instant::now() < deadline,
-            "PRODUCT (staging): the restarted daemon never answered `vox room list` in 60 s; it \
-             said:\n{}",
+            "APPARATUS: restarted room preparation did not finish before the binding journey; \
+             status={status:?}, error={err:?}, daemon log:\n{}",
             std::fs::read_to_string(&err_file).unwrap_or_default()
         );
         std::thread::sleep(Duration::from_millis(250));
