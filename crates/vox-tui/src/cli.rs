@@ -996,6 +996,9 @@ pub struct RoomTailArgs {
 /// `vox agent` — wiring an agent session into a room.
 #[derive(Subcommand, Debug, Clone)]
 enum AgentCmd {
+    /// Internal OMP lifetime and read-only availability bridge.
+    #[command(hide = true)]
+    OmpWatch(OmpWatchArgs),
     /// Read this session's unread messages and print them for the harness to
     /// inject. Meant to be run BY a harness hook, not by hand.
     ///
@@ -1109,6 +1112,20 @@ enum AgentCmd {
     ///
     /// For example: vox agent send ./report.pdf --note "the numbers you asked for"
     Send(AgentSendArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+struct OmpWatchArgs {
+    #[command(flatten)]
+    profile: AccountArgs,
+    #[arg(long)]
+    node: String,
+    #[arg(long)]
+    successor: bool,
+    #[arg(long, conflicts_with = "successor")]
+    cleanup: bool,
+    #[arg(long)]
+    instance: Option<String>,
 }
 
 /// `vox agent status`
@@ -1313,6 +1330,9 @@ pub struct AgentHookArgs {
     /// Prepare OMP context without acknowledging it until the extension commits.
     #[arg(long, hide = true, requires = "session", conflicts_with_all = ["light", "attention_register", "native_attention"])]
     pub omp_prepare: bool,
+    /// Check durable OMP delivery uncertainty without reading room content.
+    #[arg(long, hide = true, requires = "session", conflicts_with_all = ["light", "attention_register", "native_attention", "omp_prepare"])]
+    pub omp_check_uncertainty: bool,
     /// The harness session this drain is for, overriding the one on stdin.
     ///
     /// The session id is the cursor key: it is what stops two agent sessions on
@@ -3282,6 +3302,48 @@ pub fn run() -> ExitCode {
                 }
             }
         }
+        Cmd::Agent(AgentCmd::OmpWatch(args)) => {
+            let account = match vox_core::node::paths::Account::of(
+                args.profile.data_dir.as_deref(),
+                args.profile.config_dir.as_deref(),
+            ) {
+                Ok(account) => account,
+                Err(_) => return ExitCode::FAILURE,
+            };
+            if vox_core::node::layout::refuse_old_layout(&account).is_err() {
+                return ExitCode::FAILURE;
+            }
+            if args.cleanup {
+                return if args
+                    .instance
+                    .as_deref()
+                    .is_some_and(|id| crate::omp_fence::cleanup(&account, id).is_ok())
+                {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                };
+            }
+            if args.successor != args.instance.is_some() {
+                return ExitCode::FAILURE;
+            }
+            let node = match vox_core::node::paths::NodeName::parse(&args.node) {
+                Ok(node) => node,
+                Err(_) => return ExitCode::FAILURE,
+            };
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return ExitCode::FAILURE;
+            };
+            ExitCode::from(rt.block_on(crate::omp_watch::run(
+                account,
+                node,
+                args.successor,
+                args.instance,
+            )))
+        }
         Cmd::Agent(AgentCmd::Hook(args)) => {
             // HK-2/3: only account configuration and a one-line notice; no node or daemon.
             if let Some(harness) = args.light.as_deref() {
@@ -3315,6 +3377,25 @@ pub fn run() -> ExitCode {
             // **A hook makes no node directory** (#666): it may name a node that is not here,
             // and says so; its paths are resolved as they are.
             let paths = account.node_paths_as_they_are(&node);
+            if args.omp_check_uncertainty {
+                let session = args
+                    .session
+                    .as_deref()
+                    .filter(|id| !id.trim().is_empty() && *id == id.trim());
+                if std::env::var("VOX_HARNESS").as_deref() != Ok("omp") || session.is_none() {
+                    return ExitCode::FAILURE;
+                }
+                return match crate::agent_hook::omp_uncertainty_lock(
+                    &paths,
+                    session.unwrap_or_default(),
+                ) {
+                    Ok(_guard) => ExitCode::SUCCESS,
+                    Err(error) => {
+                        eprintln!("vox: {error}");
+                        error.exit_code()
+                    }
+                };
+            }
             let daemon = crate::agent_hook::Daemon {
                 account,
                 node,
@@ -3360,7 +3441,11 @@ pub fn run() -> ExitCode {
                     Ok(()) => ExitCode::SUCCESS,
                     Err(error) => {
                         eprintln!("vox: {error}");
-                        ExitCode::FAILURE
+                        if args.attention_register || args.omp_prepare {
+                            error.exit_code()
+                        } else {
+                            ExitCode::FAILURE
+                        }
                     }
                 };
             }

@@ -251,6 +251,107 @@ async fn check_omp_opening(paths: &Paths, input: &HookInput) -> Result<(), AppEr
     Ok(())
 }
 
+const OMP_UNCERTAIN: &str = "Vox delivery in this conversation is uncertain; start a new native OMP conversation to use Vox. Restarting or resuming this conversation cannot confirm the earlier delivery.";
+
+fn omp_uncertainty_file(paths: &Paths, session: &str) -> std::path::PathBuf {
+    under_cursors(paths, "omp", session, "omp-uncertain")
+}
+
+/// Serialize preparation for one exact node and native Session. A published, undecided
+/// envelope survives process death as a private durable marker, not a retryable timeout.
+pub(crate) fn omp_uncertainty_lock(
+    paths: &Paths,
+    session: &str,
+) -> Result<std::fs::File, AppError> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    let path = omp_uncertainty_file(paths, session);
+    let dir = path
+        .parent()
+        .ok_or_else(|| AppError::Usage("invalid OMP uncertainty path".into()))?;
+    vox_core::node::paths::create_private_dir(dir).map_err(|e| AppError::Usage(e.to_string()))?;
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+        .open(path.with_extension("lock"))
+        .map_err(|e| AppError::Usage(e.to_string()))?;
+    let meta = lock
+        .metadata()
+        .map_err(|e| AppError::Usage(e.to_string()))?;
+    if !meta.is_file()
+        || meta.nlink() != 1
+        || meta.uid() != rustix::process::geteuid().as_raw()
+        || meta.mode() & 0o7777 != 0o600
+    {
+        return Err(AppError::Usage("unsafe OMP uncertainty lock".into()));
+    }
+    lock.try_lock().map_err(|error| match error {
+        std::fs::TryLockError::WouldBlock => AppError::Refused {
+            code: 75,
+            message: "Vox OMP preparation is busy".into(),
+        },
+        std::fs::TryLockError::Error(error) => AppError::Usage(error.to_string()),
+    })?;
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => Err(AppError::Refused {
+            code: 78,
+            message: OMP_UNCERTAIN.into(),
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(lock),
+        Err(error) => Err(AppError::Usage(error.to_string())),
+    }
+}
+
+fn omp_uncertainty_begin(
+    paths: &Paths,
+    input: &HookInput,
+    owner: Option<Digest32>,
+    room: Option<Digest32>,
+    receipts: &[(
+        vox_core::node::attention::Recipient,
+        Vec<Digest32>,
+        [u8; 16],
+    )],
+) -> Result<(), AppError> {
+    let entries: Vec<_> = receipts
+        .iter()
+        .map(|(recipient, sources, ticket)| {
+            serde_json::json!({
+                "room": b32_encode(&recipient.room), "instance": recipient.instance,
+                "session": recipient.session, "ticket": ticket,
+                "sources": sources.iter().map(b32_encode).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    let body = serde_json::json!({
+        "session": input.session_id,
+        "node": owner.map(|id| b32_encode(&id)),
+        "room": room.map(|id| b32_encode(&id)),
+        "notice": input.native_notice.as_ref().map(|n| n.notice_id),
+        "receipts": entries,
+    });
+    vox_core::node::paths::write_private_file_unique(
+        &omp_uncertainty_file(paths, &input.session_id),
+        body.to_string().as_bytes(),
+    )
+    .map_err(|e| AppError::Usage(format!("cannot record OMP delivery uncertainty: {e}")))
+}
+
+fn omp_uncertainty_resolved(paths: &Paths, session: &str) -> Result<(), AppError> {
+    let path = omp_uncertainty_file(paths, session);
+    std::fs::remove_file(&path)
+        .map_err(|e| AppError::Usage(format!("cannot resolve OMP delivery uncertainty: {e}")))?;
+    std::fs::File::open(
+        path.parent()
+            .ok_or_else(|| AppError::Usage("invalid OMP uncertainty path".into()))?,
+    )
+    .and_then(|dir| dir.sync_all())
+    .map_err(|e| AppError::Usage(format!("cannot sync OMP delivery resolution: {e}")))
+}
+
 async fn omp_prepare(
     paths: &Paths,
     daemon: &Daemon,
@@ -266,12 +367,27 @@ async fn omp_prepare(
             "OMP preparation requires its native route and opencode format".into(),
         ));
     }
+    let _uncertainty_lock = omp_uncertainty_lock(paths, session)?;
     let saved = crate::wake::pause_registration(paths, session)
         .map_err(AppError::Usage)?
-        .ok_or_else(|| AppError::Usage("Vox OMP conversation is no longer registered".into()))?;
+        .ok_or_else(|| AppError::Refused {
+            code: 75,
+            message: "Vox OMP conversation is no longer registered".into(),
+        })?;
     check_omp_registration(paths, &saved).await?;
     let mut input = parse_input("");
     input.session_id = session.to_owned();
+    if std::env::var("VOX_OMP_DRIVE").as_deref() == Ok("1") {
+        input.omp_registration = Some(saved.clone());
+        omp_uncertainty_begin(paths, &input, None, None, &[])?;
+        emit_receipts(format, "", &input.event, "", "", &[]);
+        std::io::Write::flush(&mut std::io::stdout())
+            .map_err(|e| AppError::Usage(format!("OMP output is unconfirmed: {e}")))?;
+        if omp_decision()? {
+            check_omp_registration(paths, &saved).await?;
+        }
+        return omp_uncertainty_resolved(paths, session);
+    }
     let notice = match std::env::var("VOX_OMP_NOTICE") {
         Ok(value) => Some(
             crate::wake::NativeNotice::parse(&value)
@@ -2050,10 +2166,14 @@ pub async fn run(
         input.event = "VoxAttentionRegister".into();
         input.codex = false;
         input.claude = false;
-        let registered = daemon
-            .register(&input, room_arg)
-            .await
-            .map_err(|error| AppError::Usage(error.said(&input, &daemon.account)))?;
+        let registered =
+            daemon
+                .register(&input, room_arg)
+                .await
+                .map_err(|error| AppError::Refused {
+                    code: if error.temporary() { 75 } else { 1 },
+                    message: error.said(&input, &daemon.account),
+                })?;
         if route.harness == "omp" {
             if let Some(joining) = registered.joining {
                 let marker = under_cursors(paths, "omp", &input.session_id, "omp-room-note");
@@ -2215,6 +2335,7 @@ pub async fn run(
             u @ (Unregistered::NoDaemon(_)
             | Unregistered::Attaching(_)
             | Unregistered::DaemonUnanswered
+            | Unregistered::Temporary(_)
             | Unregistered::Version(_)),
         ) => {
             let words = u.said(&input, &daemon.account);
@@ -2257,6 +2378,8 @@ pub(crate) enum Unregistered {
     DaemonUnanswered,
     /// A local daemon of another release is refused before any request.
     Version(String),
+    /// A typed temporary registration refusal.
+    Temporary(String),
     /// Anything else, in words.
     Failed(AppError),
 }
@@ -2317,6 +2440,18 @@ impl From<AppError> for Unregistered {
 }
 
 impl Unregistered {
+    fn temporary(&self) -> bool {
+        matches!(
+            self,
+            Self::NotAttached(_)
+                | Self::NoNode(_)
+                | Self::NoDaemon(_)
+                | Self::Attaching(_)
+                | Self::DaemonUnanswered
+                | Self::Temporary(_)
+        )
+    }
+
     /// In one sentence, with the exact command the operator runs (#666).
     fn said(&self, input: &HookInput, account: &Account) -> String {
         match self {
@@ -2351,6 +2486,7 @@ impl Unregistered {
                 crate::client::START_DAEMON
             ),
             Self::Version(why) => why.clone(),
+            Self::Temporary(why) => why.clone(),
             Self::Failed(e) => e.to_string(),
         }
     }
@@ -2385,10 +2521,16 @@ impl Daemon {
         room_arg: Option<&str>,
     ) -> Result<Registered, Unregistered> {
         use vox_core::node::daemonipc::{DaemonClient, DaemonFrame, DaemonRequest};
+        let mut record = crate::wake::Session::from_env(&input.session_id, input.codex);
+        if record.harness == "omp" && (record.omp_fence.is_none() || record.attention.is_none()) {
+            return Err(Unregistered::Failed(AppError::Usage(
+                "Vox OMP extension needs an update: restart OMP and resume the same conversation"
+                    .into(),
+            )));
+        }
         if !self.account.nodes_on_disk().contains(&self.node) {
             return Err(Unregistered::NoNode(self.node.clone()));
         }
-        let mut record = crate::wake::Session::from_env(&input.session_id, input.codex);
         // A native Claude hook identifies its actual child harness even inside another
         // agent's shell. Inherited OpenCode endpoints never become that child's route.
         if input.claude && !input.codex {
@@ -2419,13 +2561,15 @@ impl Daemon {
         let daemon =
             crate::daemon_client::ensure_daemon_for_hook(&self.account, self.listen, &self.anchors)
                 .await
-                .map_err(|e| {
-                    let why = one_line_reason(&e);
-                    if why.contains("Vox's daemon is ") {
-                        Unregistered::Version(why)
-                    } else {
-                        Unregistered::NoDaemon(why)
-                    }
+                .map_err(|e| match &e {
+                    AppError::Core(vox_core::error::Error::Ipc(
+                        vox_core::error::IpcHandshake::Version { .. }
+                        | vox_core::error::IpcHandshake::Protocol { .. },
+                    )) => Unregistered::Version(one_line_reason(&e)),
+                    AppError::Core(vox_core::error::Error::Ipc(
+                        vox_core::error::IpcHandshake::Root,
+                    )) => Unregistered::Failed(e),
+                    _ => Unregistered::NoDaemon(one_line_reason(&e)),
                 })?;
         if matches!(daemon, crate::daemon_client::HookDaemon::Unanswered) {
             return Err(Unregistered::DaemonUnanswered);
@@ -2440,8 +2584,39 @@ impl Daemon {
                 .node_paths(&self.node)
                 .map_err(|e| AppError::Usage(e.to_string()))?;
             record.tmux_claim = None;
-            crate::wake::store_checked(&paths, &record)
-                .map_err(|why| AppError::Usage(format!("the session was not registered: {why}")))?;
+            let _fence = if record.harness == "omp" {
+                let fingerprint = paths
+                    .shown_fingerprint()
+                    .map(|id| vox_core::node::link::b32_encode(&id))
+                    .ok_or_else(|| {
+                        Unregistered::Failed(AppError::Usage(
+                            "Vox node identity unavailable".into(),
+                        ))
+                    })?;
+                let reference = record.omp_fence.as_ref().ok_or_else(|| {
+                    Unregistered::Failed(AppError::Usage(
+                        "restart OMP and resume the same conversation".into(),
+                    ))
+                })?;
+                let route = record.attention.as_ref().ok_or_else(|| {
+                    Unregistered::Failed(AppError::Usage("Vox OMP route unavailable".into()))
+                })?;
+                Some(crate::omp_fence::validate(&self.account, reference, &fingerprint, &record.session, route)
+                    .map_err(|error| match error {
+                        crate::omp_fence::FenceError::Busy => Unregistered::Temporary("Vox registration is busy".into()),
+                        _ => Unregistered::Failed(AppError::Usage("Vox OMP ownership is invalid; restart OMP and resume the same conversation".into())),
+                    })?)
+            } else {
+                None
+            };
+            crate::wake::store_checked(&paths, &record).map_err(|why| match why {
+                crate::wake::RegistrationStoreError::Busy => {
+                    Unregistered::Temporary("Vox registration is busy".into())
+                }
+                crate::wake::RegistrationStoreError::Failed(why) => Unregistered::Failed(
+                    AppError::Usage(format!("the session was not registered: {why}")),
+                ),
+            })?;
             return Err(Unregistered::Attaching(self.node.clone()));
         }
         let record = serde_json::to_string(&record)
@@ -2452,7 +2627,11 @@ impl Daemon {
                 let words = e.to_string().lines().next().unwrap_or_default().to_owned();
                 if matches!(
                     &e,
-                    vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Version { .. })
+                    vox_core::error::Error::Ipc(
+                        vox_core::error::IpcHandshake::Version { .. }
+                            | vox_core::error::IpcHandshake::Protocol { .. }
+                            | vox_core::error::IpcHandshake::Root
+                    )
                 ) {
                     Unregistered::Version(words)
                 } else {
@@ -2472,13 +2651,8 @@ impl Daemon {
             }),
         )
         .await
-        .map_err(|_| {
-            AppError::Usage(format!(
-                "the daemon did not register this session within {} s; this turn reads nothing",
-                REGISTER_WITHIN.as_secs()
-            ))
-        })?
-        .map_err(|e| AppError::Usage(e.to_string()))?;
+        .map_err(|_| Unregistered::Temporary("Vox daemon registration timed out".into()))?
+        .map_err(|e| Unregistered::Temporary(e.to_string()))?;
         match asked {
             // Its node still attaching: the daemon holds the registration until it is, and
             // this turn says so (#666).
@@ -2491,10 +2665,18 @@ impl Daemon {
                 room, new, joining, ..
             } => Ok(Registered { room, new, joining }),
             DaemonFrame::Refused(vox_core::node::daemonipc::Refusal::StillDetaching { node }) => {
-                Err(AppError::Usage(format!(
-                    "node {node}'s work is still stopping; this turn reads nothing"
-                ))
-                .into())
+                Err(Unregistered::Temporary(format!(
+                    "node {node}'s work is still stopping"
+                )))
+            }
+            DaemonFrame::Refused(vox_core::node::daemonipc::Refusal::RegistrationRetryable {
+                reason,
+                ..
+            }) => Err(Unregistered::Temporary(format!(
+                "Vox registration temporarily unavailable: {reason:?}"
+            ))),
+            DaemonFrame::Refused(vox_core::node::daemonipc::Refusal::NoSuchNode { node }) => {
+                Err(Unregistered::NoNode(node))
             }
             DaemonFrame::Refused(vox_core::node::daemonipc::Refusal::NotAttached { node }) => {
                 Err(Unregistered::NotAttached(node))
@@ -3074,11 +3256,13 @@ async fn drain(
         };
         if input.omp_registration.is_some() {
             check_omp_opening(paths, input).await?;
+            omp_uncertainty_begin(paths, input, me, selected_room, &[])?;
             emit_receipts(format, raw_input, &input.event, "", "", &[]);
             std::io::Write::flush(&mut std::io::stdout())
                 .map_err(|e| AppError::Usage(format!("OMP output is unconfirmed: {e}")))?;
             drop(publication);
             if !omp_decision()? {
+                omp_uncertainty_resolved(paths, &input.session_id)?;
                 return Ok(());
             }
             let NewsPublication::Ready(_publication) =
@@ -3090,6 +3274,7 @@ async fn drain(
             for d in &drains {
                 d.commit(paths, &input.session_id, 0, true)?;
             }
+            omp_uncertainty_resolved(paths, &input.session_id)?;
             return Ok(());
         }
         // Nothing new: emit nothing at all rather than "no new messages". An
@@ -3362,6 +3547,17 @@ async fn drain(
         }
         return Err(error);
     }
+    if input.omp_registration.is_some() {
+        if let Err(error) =
+            omp_uncertainty_begin(paths, input, me, selected_room, &attention_receipts)
+        {
+            drop(publication);
+            if let Some(owner) = me {
+                cancel_attention_receipts(paths, owner, &attention_receipts).await;
+            }
+            return Err(error);
+        }
+    }
     emit_receipts(
         format,
         raw_input,
@@ -3391,6 +3587,7 @@ async fn drain(
                     ));
                 }
             }
+            omp_uncertainty_resolved(paths, &input.session_id)?;
             return Ok(());
         }
         let NewsPublication::Ready(publication) =
@@ -3469,6 +3666,9 @@ async fn drain(
     }
     for (d, shown) in drains.iter().zip(shown_in) {
         mark_read(&mut client, d, shown).await;
+    }
+    if input.omp_registration.is_some() {
+        omp_uncertainty_resolved(paths, &input.session_id)?;
     }
     Ok(())
 }
