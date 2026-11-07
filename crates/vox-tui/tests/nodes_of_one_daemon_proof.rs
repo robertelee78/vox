@@ -6340,14 +6340,19 @@ fn change_shows_on_both(
         attached.elapsed(),
         names_here[0]
     );
-    // On the other daemon the status must both name an exchange which carried this revision and
-    // show the applied result. The same clock began before the triggering attach; observing an
-    // exchange later cannot reset it and turn a late product result green.
+    // Either a started exchange or a reply to the peer's exchange can carry this daemon's
+    // revision. An inbound reply can supersede the outbound flight, so requiring only a started
+    // exchange would reject an applied change. The other daemon must still show the result within
+    // the same clock begun before attach; observing an exchange cannot reset that clock.
     loop {
         let toward = application_toward(changer, &other_id);
-        let carried = toward["last_started_exchange"]["sent_revision"]
-            .as_u64()
-            .is_some_and(|revision| revision >= revision_here);
+        let carried = ["last_started_exchange", "last_answered_exchange"]
+            .iter()
+            .any(|kind| {
+                toward[*kind]["sent_revision"]
+                    .as_u64()
+                    .is_some_and(|revision| revision >= revision_here)
+            });
         let status = computer(other, &["status"]);
         let names_it = status["nodes"]
             .as_array()
