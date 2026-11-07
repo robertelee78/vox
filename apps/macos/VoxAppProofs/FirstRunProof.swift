@@ -3696,21 +3696,25 @@ final class FirstRunProof: XCTestCase {
         let otherLink = try line(staged(vox, ["room", "link", "--node", "alice", rooms["other"] ?? ""], env: voxEnv)) {
             $0.hasPrefix("vox://")
         }
-        ui.typeKey(",", modifierFlags: .command)
-        tap(ui, Key.id("settings-rebind-repository"), "Settings > Rebind Repository")
-        ui.typeKey("g", modifierFlags: [.command, .shift])
-        let goDeadline = Date().addingTimeInterval(10)
-        while Date() < goDeadline && ui.sheets.count == 0 { Thread.sleep(forTimeInterval: 0.25) }
-        guard ui.sheets.count > 0 else {
-            throw Apparatus("the repository panel's Go To sheet did not open")
+        func inspectRebind(_ directory: String) throws {
+            ui.typeKey(",", modifierFlags: .command)
+            tap(ui, Key.id("settings-rebind-repository"), "Settings > Rebind Repository")
+            ui.typeKey("g", modifierFlags: [.command, .shift])
+            let goDeadline = Date().addingTimeInterval(10)
+            while Date() < goDeadline && ui.sheets.count == 0 { Thread.sleep(forTimeInterval: 0.25) }
+            guard ui.sheets.count > 0 else {
+                throw Apparatus("the repository panel's Go To sheet did not open")
+            }
+            ui.typeText(directory + "\r")
+            let choose = ui.buttons["Open"].firstMatch
+            guard choose.waitForExistence(timeout: 10) else {
+                throw Apparatus("the repository panel did not offer Open")
+            }
+            choose.click()
+            present(ui, Key.id("repo-decision-dialog"), timeout: 30,
+                    "Settings must inspect the selected directory")
         }
-        ui.typeText(noRepo + "\r")
-        let choose = ui.buttons["Open"].firstMatch
-        guard choose.waitForExistence(timeout: 10) else {
-            throw Apparatus("the repository panel did not offer Open")
-        }
-        choose.click()
-        present(ui, Key.id("repo-decision-dialog"), timeout: 30, "Settings must inspect the selected repository")
+        try inspectRebind(noRepo)
         let noBeforeRebind = try readMap()
         type(ui, Key.id("repo-decision-link"), otherLink, "the held room's link")
         type(ui, Key.id("repo-decision-passphrase"), "wrong room passphrase", "the wrong room passphrase")
@@ -3731,6 +3735,19 @@ final class FirstRunProof: XCTestCase {
         XCTAssertTrue(sessionOpen(createdRoom, s5) && !sessionOpen(rooms["other"] ?? "", s5),
                       "PRODUCT: rebind must not move an already-running Session")
         try follows("62000000-4c0e-4f00-9a1b-0c0ffee54018", noTree, rooms["other"] ?? "")
+        // Explicit directory selection also works without .git or a pending room ask.
+        let nongit = root.appendingPathComponent("nongit-binding").path
+        try stager.write(Data("ordinary directory\n".utf8), to: nongit + "/.keep")
+        try inspectRebind(nongit)
+        type(ui, Key.id("repo-decision-link"), otherLink, "the room link for a non-git directory")
+        type(ui, Key.id("repo-decision-passphrase"), "work room", "the room's passphrase")
+        tap(ui, Key.id("repo-decision-submit"), "Bind the non-git directory")
+        words(ui, Key.id("repo-decision-result"), timeout: 60,
+              "the non-git directory's decision must be visibly confirmed",
+              until: { $0.contains(nongit) })
+        tap(ui, Key.id("repo-decision-done"), "Acknowledge the non-git binding")
+        ui.typeKey("w", modifierFlags: .command)
+        try follows("63000000-4c0e-4f00-9a1b-0c0ffee54019", nongit, rooms["other"] ?? "")
         print("[proof] RM-1/2/3/5: one repo/worktree dialog; wrong passphrase left map unchanged; Choose and Create moved both next turns; alice created with keyring closed; Not This Repo suppressed later worktree asks")
 
         if !selectedStep.isEmpty {
