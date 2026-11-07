@@ -3546,7 +3546,7 @@ final class FirstRunProof: XCTestCase {
                        "PRODUCT: the failed join must not change the repository decision")
         tap(ui, Key.id("room-ask-back"), "Back from the failed join")
         tap(ui, Key.id("room-ask-decline"), "Not This Repo")
-        tap(ui, Key.showing("Confirm Not This Repo"), "Confirm the repository decision")
+        tap(ui, Key.id("repo-decision-submit"), "Confirm the repository decision")
         words(ui, Key.id("repo-decision-result"), timeout: 30, "the saved decision must be visibly confirmed",
               until: { $0.contains(noRepo) })
         tap(ui, Key.id("repo-decision-done"), "Acknowledge the saved decision")

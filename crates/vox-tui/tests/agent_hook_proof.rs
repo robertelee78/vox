@@ -2631,7 +2631,7 @@ fn restart(d: &mut Daemon, root: &Path) {
         .expect("APPARATUS: cannot start vox daemon again");
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        let (ok, status, err) = hook(&d.data, &d.cfg, &["status", "--json"], "");
+        let (ok, status, err) = hook(&d.data, &d.cfg, &["status", "--node", "default", "--json"], "");
         let ready = ok && serde_json::from_str::<serde_json::Value>(&status).ok()
             .and_then(|v| v["preparing"].as_array().map(Vec::is_empty)) == Some(true);
         if ready { break; }
