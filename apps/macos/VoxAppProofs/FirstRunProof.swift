@@ -3655,9 +3655,7 @@ final class FirstRunProof: XCTestCase {
                 "a stale decision must visibly report the conflict")
         XCTAssertEqual(try readMap(), competingMap,
                        "PRODUCT: a stale confirmation must not overwrite the competing decision")
-        tap(ui, Key.showing("Inspect Again"), "Inspect the competing decision")
-        tap(ui, Key.showing("Confirm Not This Repo"), "Confirm the refreshed decision")
-        tap(ui, Key.id("repo-decision-done"), "Acknowledge the refreshed decision")
+        tap(ui, Key.showing("Cancel"), "Close the conflicted decision without changing it")
         leftDialog()
 
         // The selected room-ask run also crosses a normal owned-daemon restart before rebind.
