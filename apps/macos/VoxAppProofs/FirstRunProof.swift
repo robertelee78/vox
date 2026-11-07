@@ -3615,7 +3615,7 @@ final class FirstRunProof: XCTestCase {
             let trustBefore = try staged(vox, ["trust", "list", "--node", affectedNode], env: voxEnv)
             let roomsBefore = try staged(vox, ["room", "list", "--node", affectedNode], env: voxEnv)
             tap(ui, Key.id("room-ask-decline"), "Decline the failed binding")
-            tap(ui, Key.showing("Confirm Not This Repo"), "Confirm the bound repository's scope")
+            tap(ui, Key.id("repo-decision-submit"), "Confirm the bound repository's scope")
             words(ui, Key.id("repo-decision-result"), timeout: 30, "the declined binding must be visibly confirmed",
                   until: { $0.contains(failedRepo) && $0.contains("none") })
             tap(ui, Key.id("repo-decision-done"), "Acknowledge the saved no")
@@ -3646,11 +3646,11 @@ final class FirstRunProof: XCTestCase {
         _ = try repoTurn("5a000000-4c0e-4f00-9a1b-0c0ffee54010", staleRepo, "stale decision")
         oneDialog(staleRepo)
         tap(ui, Key.id("room-ask-decline"), "Review a decision that will become stale")
-        present(ui, Key.showing("Confirm Not This Repo"), timeout: 30,
+        present(ui, Key.id("repo-decision-submit"), timeout: 30,
                 "the inspected scope must be shown before confirmation")
         let competingMap = try readMap() + "\nrepo " + staleRepo + "\n    room       none\n"
         try stager.write(Data(competingMap.utf8), to: map)
-        tap(ui, Key.showing("Confirm Not This Repo"), "Confirm the stale decision")
+        tap(ui, Key.id("repo-decision-submit"), "Confirm the stale decision")
         present(ui, Key.showing("changed"), timeout: 30,
                 "a stale decision must visibly report the conflict")
         XCTAssertEqual(try readMap(), competingMap,

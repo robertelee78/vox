@@ -3793,24 +3793,31 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
             .parent()
             .expect("APPARATUS: a root")
             .join("identity.pass");
-        let (ok, out, err) = hook(
-            &who.data,
-            &who.cfg,
-            &[
-                "trust",
-                "add",
-                &peer.fingerprint,
-                "--name",
-                name,
-                "--identity-passphrase-file",
-                pass.to_str().expect("APPARATUS: a UTF-8 path"),
-            ],
-            "",
-        );
-        assert!(
-            ok,
-            "PRODUCT: trust for the two-room conversation failed: {out}{err}"
-        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let (ok, out, err) = hook(
+                &who.data,
+                &who.cfg,
+                &[
+                    "trust",
+                    "add",
+                    &peer.fingerprint,
+                    "--name",
+                    name,
+                    "--identity-passphrase-file",
+                    pass.to_str().expect("APPARATUS: a UTF-8 path"),
+                ],
+                "",
+            );
+            if ok { break; }
+            assert!(
+                err.contains("this request made no change") && Instant::now() < deadline,
+                "APPARATUS: mutual trust was not staged for the two-room binding journey: {out}{err}"
+            );
+            // Room publication may still own its writer after the session becomes visible.
+            // Retry only the product's explicit refusal that made no change.
+            std::thread::sleep(Duration::from_millis(250));
+        }
     }
     let as_session = |session: &str, args: &[&str]| {
         hook_env(
