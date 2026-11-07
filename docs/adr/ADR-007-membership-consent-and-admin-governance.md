@@ -205,6 +205,12 @@ only room governance is who sets the room's retention. This builds on identity (
   membership, keys or access in another room. A replacement fingerprint is a different node and
   inherits no authority from the removed identity. An admin whose own membership is removed MUST
   NOT exercise its delegation while removed; removal alone MUST NOT silently revoke that delegation.
+  The issuing node MUST observe the exact target as a member when the operator removes it.
+  Other peers MUST validate and apply that signed exact-identity removal without requiring
+  the target's admission in its strict causal past; the removal can arrive before its join
+  history and still bars ordinary rejoin until creator readmission. Robert explicitly chose
+  this existing-room/read-only-member boundary on 2026-11-06, rather than new public admission
+  certificates (issue #1171, decision comment 6701696825). Removal never grants membership.
 - **G-29. Signed authority and ordering.** A removal MUST be an authenticated governance-log
   fact using G-9's canonical encoding, composite signature, channel/epoch and author/causal
   bindings. The proposed appended tags, unallocated in the source registry through `0x0023`,
@@ -220,16 +226,20 @@ only room governance is who sets the room's retention. This builds on identity (
   ADR-008's registry MUST be updated when this proposal is implemented; reserved old tags MUST
   NOT be reused.
 
-  The creator is root admin; a delegated remover MUST have an unexpired, in-effect,
-  creator-issued delegation granting `policy` in the action's strict causal past, and MUST
-  itself be a member at that action. Evaluate this authority in the strict causal past,
-  not by a circular final-membership predicate, with one root-authority cutoff: a delegated
+  The creator is root admin; delegated authority is proved by an unexpired, in-effect,
+  creator-issued `policy` certificate, the issuer's own signed leave/return Presence, and
+  removal/restoration state in the action's strict causal past. A known own leave without
+  a subsequent eligible return denies authority. Do not substitute the receiver's current
+  admitted-author set, a board timestamp or an invented admission certificate for that proof.
+  The issuer's existing root delegation supplies governance authority; ordinary joining and
+  read/Drive remain separate. Evaluate signed authority in the strict causal past rather
+  than a circular final-membership predicate, with one root-authority cutoff: a delegated
   admin's governance act must, for every valid creator removal of that admin or revocation
   of its delegation, either lie in that creator fact's strict causal past or descend from a
   valid root-only re-enabling fact which itself descends from that cutoff: creator readmission
   for removal, or a fresh creator delegation for revocation. Otherwise it is invalid and kept
-  only as opaque evidence. Restored authority also requires ordinary current membership,
-  scope and delegation checks. Acts citing only pre-cutoff parents remain invalid after
+  only as opaque evidence. Restored authority also requires the signed leave/return,
+  scope and delegation checks above. Acts citing only pre-cutoff parents remain invalid after
   restoration. Root-only cutoffs and restoration introduce no mutual-validity cycle.
   Concurrent removals by two delegated admins can both stand; absent a creator cutoff,
   a malicious removed delegated admin can still issue concurrent governance using old
@@ -242,6 +252,12 @@ only room governance is who sets the room's retention. This builds on identity (
   unauthorized or missing-ancestry facts MUST NOT grant access or effect removal. Missing or
   unvalidated dependencies remain inert, not a room-wide egress barrier; re-evaluate the fact
   when ancestry arrives.
+  A governance act on a verified forked branch of its issuer's author chain carries no
+  authority. Retain verified proof pairs and their provenance, and re-evaluate affected
+  decisions when a new proof commits. Only acts proved to lie in the shared authenticated
+  prefix strictly before divergence may retain authority; an unproved common-prefix position
+  is unavailable authority, not permission to choose a favored branch. Preserve historical
+  signed evidence rather than deleting it.
 
   The global v0.4.20 protocol cutover in ADR-011 is a prerequisite, not a per-room
   capability negotiation: every currently participating or reachable peer, including a board,
@@ -339,6 +355,11 @@ only room governance is who sets the room's retention. This builds on identity (
   remain inert after restoration. The apparatus is isolated profiles, controlled partition
   and timing; the PRODUCT verdict is observed membership and access, not a log assertion or
   successful command alone.
+  Include a read-only target with no own public log, and deliver its signed removal to an
+  independent peer before its join history; subsequent ordinary join MUST remain refused.
+  Supply a verified issuer-fork proof after a governance act: branch acts MUST lose authority,
+  while acts proved strictly before divergence retain it. Missing common-prefix evidence
+  MUST NOT become authority or delete the signed history.
   Separately have the removed node post, including a partition-concurrent post replayed after
   catch-up; independent peers' native views MUST NOT show those posts, while the causally prior
   signed history remains readable. Exercise eligible post-readmission content separately.

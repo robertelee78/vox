@@ -322,8 +322,9 @@ on a point the decider left open).
   put in a floor outside that readmission's causal descendants. Ordinary recipient
   membership identity, iteration-at-or-after-floor, current membership, trust and Drive
   checks still apply. After applying its own readmission, an author MUST mint a fresh drive
-  generation and publish its floors under that restored authority. A post-readmission floor
-  on a reused pre-restoration generation MUST NOT authorize old iterations.
+  generation and MUST NOT publish a floor for any generation it minted before that point.
+  Receivers enforce the strictly-greater check against previously floored generations;
+  this does not prove when a never-before-floored generation was minted.
 
   **Recipient restoration.** For every validated removal of a floor's named recipient, that
   floor supplies history authority only if it is strictly prior to that removal or descends
