@@ -49,7 +49,8 @@ impl Lifetime {
         #[cfg(feature = "test-knobs")]
         if self.publication.is_none()
             && self.exclusive.is_none()
-            && crate::node::computer::fx28_mutant("constructor-stale-commit")
+            && (crate::node::computer::fx28_mutant("constructor-stale-commit")
+                || crate::node::computer::fx28_mutant("stale-join-authority"))
         {
             return Some(publish());
         }

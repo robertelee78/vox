@@ -485,6 +485,11 @@ impl Node {
             queue,
             credit,
         } = delivery;
+        #[cfg(feature = "test-knobs")]
+        if self.fx28_rekey_pause == Some((room, continuation.target)) {
+            self.wait_owned_consent(room, continuation, reply).await;
+            return;
+        }
         let before = self.snapshot_legacy_session((room, continuation.target), true);
         let Some((frames, hello, session)) =
             self.frame_owned_legacy_key(room, continuation.target, &skdm, true)

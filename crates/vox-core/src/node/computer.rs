@@ -2599,6 +2599,70 @@ pub struct DerivedBinding {
     pub at_ms: u64,
 }
 impl Computer {
+    #[cfg(feature = "test-knobs")]
+    fn mark_held_join_writer_for_proof(&self, replacing: bool) -> bool {
+        if !replacing {
+            return false;
+        }
+        let Ok(spec) = std::env::var("VOX_TEST_HOLD_ROOM_JOIN_AFTER_BOARD") else {
+            return false;
+        };
+        let Some(engaged) = spec.split('\t').nth(2) else {
+            return false;
+        };
+        let engaged = std::path::Path::new(engaged);
+        if !engaged.is_file() {
+            return false;
+        }
+        let _ = std::fs::write(
+            engaged.with_extension("writer"),
+            b"policy replacement reached publication fence\n",
+        );
+        fx28_mutant("join-writer-fence")
+    }
+
+    #[cfg(feature = "test-knobs")]
+    fn mark_held_rekey_writer_for_proof(
+        &self,
+        replacing: bool,
+        held: &State,
+        next: &State,
+    ) -> bool {
+        if !replacing {
+            return false;
+        }
+        let Ok(spec) = std::env::var("VOX_TEST_HOLD_REKEY_ENQUEUE") else {
+            return false;
+        };
+        let Some(engaged) = spec.split('\t').nth(2) else {
+            return false;
+        };
+        let engaged = std::path::Path::new(engaged);
+        if !engaged.is_file() {
+            return false;
+        }
+        let target = std::fs::read_to_string(engaged.with_extension("target"))
+            .ok()
+            .and_then(|text| crate::node::link::b32_decode(text.trim(), "proof Computer").ok());
+        let Some(target) = target else {
+            return false;
+        };
+        let contains = |state: &State| {
+            state
+                .members
+                .values()
+                .any(|grant| grant.computer.fingerprint().ok() == Some(target))
+        };
+        if !contains(held) || contains(next) {
+            return false;
+        }
+        let _ = std::fs::write(
+            engaged.with_extension("writer"),
+            b"policy replacement reached publication fence\n",
+        );
+        fx28_mutant("rekey-writer-fence")
+    }
+
     pub(crate) fn writer_pending(&self) -> bool {
         self.changes.writer_pending()
     }
@@ -4106,8 +4170,30 @@ impl Computer {
             let authorization_changed = held.policy_revision != next.policy_revision
                 || Self::revision_expired(&held) != Self::revision_expired(&next);
             let publication_changed = self.publication_authority_changed(&held, &next);
-            let _publication = (publication_changed && transition.is_none())
+            #[cfg(feature = "test-knobs")]
+            let skip_publication = self
+                .mark_held_join_writer_for_proof(publication_changed && transition.is_none())
+                || self.mark_held_rekey_writer_for_proof(
+                    publication_changed && transition.is_none(),
+                    &held,
+                    &next,
+                );
+            #[cfg(not(feature = "test-knobs"))]
+            let skip_publication = false;
+            let _publication = (publication_changed && transition.is_none() && !skip_publication)
                 .then(|| self.publications.blocking_write());
+            #[cfg(feature = "test-knobs")]
+            if publication_changed && fx28_mutant("join-policy-not-applied") {
+                if let Ok(spec) = std::env::var("VOX_TEST_HOLD_ROOM_JOIN_AFTER_BOARD") {
+                    if spec.split('\t').nth(2).is_some_and(|path| {
+                        std::path::Path::new(path)
+                            .with_extension("writer")
+                            .is_file()
+                    }) {
+                        return Ok(Some(value));
+                    }
+                }
+            }
             if publication_changed {
                 self.block_own_key_authority();
             }
@@ -4362,7 +4448,17 @@ impl Computer {
             let authorization_changed = held.policy_revision != next.policy_revision
                 || Self::revision_expired(&held) != Self::revision_expired(&next);
             let publication_changed = self.publication_authority_changed(&held, &next);
-            let _publication = (publication_changed && !publication_owned)
+            #[cfg(feature = "test-knobs")]
+            let skip_publication = self
+                .mark_held_join_writer_for_proof(publication_changed && !publication_owned)
+                || self.mark_held_rekey_writer_for_proof(
+                    publication_changed && !publication_owned,
+                    &held,
+                    &next,
+                );
+            #[cfg(not(feature = "test-knobs"))]
+            let skip_publication = false;
+            let _publication = (publication_changed && !publication_owned && !skip_publication)
                 .then(|| self.publications.blocking_write());
             if publication_changed {
                 self.block_own_key_authority();

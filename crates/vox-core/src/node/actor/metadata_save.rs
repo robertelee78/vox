@@ -1714,6 +1714,16 @@ impl Node {
             } => {
                 #[cfg(feature = "test-knobs")]
                 self.hold_room_join_after_board_for_proof().await;
+                #[cfg(feature = "test-knobs")]
+                if crate::node::computer::fx28_mutant("join-outcome-refusal") {
+                    self.begin_metadata_abort_join(
+                        room,
+                        Fault::ComputerPolicy,
+                        Some(reply),
+                        Some(lifetime),
+                    );
+                    return;
+                }
                 let Some(instance) = self.channels.get(&room).cloned() else {
                     self.begin_metadata_abort_join(
                         room,
@@ -1871,16 +1881,6 @@ fn load_journal(
         .transpose()
         .map(Option::unwrap_or_default)
 }
-fn durable_withdrawals() -> bool {
-    #[cfg(feature = "test-knobs")]
-    {
-        !crate::node::computer::fx28_mutant("withdrawal-not-durable")
-    }
-    #[cfg(not(feature = "test-knobs"))]
-    {
-        true
-    }
-}
 fn add_rollback_route(pending: &mut PendingWithdrawal, board: Digest32, route: SocketAddr) {
     let routes = pending.routes.entry(board).or_default();
     if !routes.contains(&route) {
@@ -1946,12 +1946,10 @@ impl JournalWork {
                     let mut withdrawn = load_journal(store, PENDING_WITHDRAWALS_META_KEY)?;
                     withdrawn.insert(room, PendingWithdrawal { wire, routes });
                     delta.withdrawal = Some(withdrawn.get(&room).cloned());
-                    if durable_withdrawals() {
-                        batch.put_meta(
-                            PENDING_WITHDRAWALS_META_KEY,
-                            &pending_withdrawals_bytes(&withdrawn)?,
-                        )?;
-                    }
+                    batch.put_meta(
+                        PENDING_WITHDRAWALS_META_KEY,
+                        &pending_withdrawals_bytes(&withdrawn)?,
+                    )?;
                 }
                 MapChange::Forget(room).queue(store, signer, &mut batch)?;
                 crate::node::history_demand::purge_own_recovery_in(&mut batch, node, room)?;
@@ -1963,13 +1961,11 @@ impl JournalWork {
             Self::RemoveWithdrawal { room } => {
                 let mut pending = load_journal(store, PENDING_WITHDRAWALS_META_KEY)?;
                 pending.remove(&room);
-                if durable_withdrawals() {
-                    batch.put_meta(
-                        PENDING_WITHDRAWALS_META_KEY,
-                        &pending_withdrawals_bytes(&pending)?,
-                    )?;
-                    batch.commit()?;
-                }
+                batch.put_meta(
+                    PENDING_WITHDRAWALS_META_KEY,
+                    &pending_withdrawals_bytes(&pending)?,
+                )?;
+                batch.commit()?;
                 delta.withdrawal = Some(None);
                 return Ok(delta);
             }
@@ -2017,13 +2013,11 @@ impl JournalWork {
                     .remove(&room)
                     .ok_or(Error::Profile("accepted join has no rollback journal"))?;
                 verify_join_rollback(&cleanup, signer, room, completed.epoch)?;
-                if durable_withdrawals() {
-                    batch.put_meta(
-                        PENDING_JOIN_CLEANUP_META_KEY,
-                        &pending_withdrawals_bytes(&pending)?,
-                    )?;
-                    batch.commit()?;
-                }
+                batch.put_meta(
+                    PENDING_JOIN_CLEANUP_META_KEY,
+                    &pending_withdrawals_bytes(&pending)?,
+                )?;
+                batch.commit()?;
                 delta.join = Some(None);
                 return Ok(delta);
             }
@@ -2084,13 +2078,11 @@ impl JournalWork {
                 let mut withdrawn = load_journal(store, PENDING_WITHDRAWALS_META_KEY)?;
                 withdrawn.insert(room, PendingWithdrawal { wire, routes });
                 delta.withdrawal = Some(withdrawn.get(&room).cloned());
-                if durable_withdrawals() {
-                    batch.put_meta(
-                        PENDING_WITHDRAWALS_META_KEY,
-                        &pending_withdrawals_bytes(&withdrawn)?,
-                    )?;
-                    batch.commit()?;
-                }
+                batch.put_meta(
+                    PENDING_WITHDRAWALS_META_KEY,
+                    &pending_withdrawals_bytes(&withdrawn)?,
+                )?;
+                batch.commit()?;
                 return Ok(delta);
             }
             work => {
@@ -2180,13 +2172,11 @@ impl JournalWork {
                     }
                 };
                 delta.join = Some(pending.get(&room).cloned());
-                if durable_withdrawals() {
-                    batch.put_meta(
-                        PENDING_JOIN_CLEANUP_META_KEY,
-                        &pending_withdrawals_bytes(&pending)?,
-                    )?;
-                    batch.commit()?;
-                }
+                batch.put_meta(
+                    PENDING_JOIN_CLEANUP_META_KEY,
+                    &pending_withdrawals_bytes(&pending)?,
+                )?;
+                batch.commit()?;
             }
         }
         Ok(delta)
@@ -3997,7 +3987,11 @@ fn queue_join_rollback(
     delta.withdrawal = Some(withdrawn.get(&room).cloned());
     delta.join = Some(None);
     delta.purged = true;
-    if durable_withdrawals() {
+    #[cfg(feature = "test-knobs")]
+    let durable = !crate::node::computer::fx28_mutant("withdrawal-not-durable");
+    #[cfg(not(feature = "test-knobs"))]
+    let durable = true;
+    if durable {
         batch.put_meta(
             PENDING_WITHDRAWALS_META_KEY,
             &pending_withdrawals_bytes(&withdrawn)?,

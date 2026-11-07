@@ -263,7 +263,7 @@ The Linux form runs unprivileged in a network namespace and is an ordinary proof
 |---|---|---|---|---|
 | `nodes_of_one_daemon_proof::computer_pairing_uses_an_anchor_without_room_membership_and_reconnects` | Paired computers do not converge after path loss, lose historical misses across restart, or fail to apply the current managed grants after a newer policy. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test nodes_of_one_daemon_proof -- --ignored --exact computer_pairing_uses_an_anchor_without_room_membership_and_reconnects --nocapture` | a real machine with IPv4 and IPv6 loopback; run alone | several minutes; not timed in CI |
 | `nodes_of_one_daemon_proof::computer_preview_and_approval_survive_a_crash` | An authenticated Add Computer preview or the local operator's approval disappears when the daemon crashes before the other operator approves. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test nodes_of_one_daemon_proof -- --ignored --exact computer_preview_and_approval_survive_a_crash --nocapture` | a real machine; run alone | not timed in CI |
-| `nodes_of_one_daemon_proof::two_paired_computers_that_are_idle_exchange_nothing` | Idle paired computers keep exchanging unchanged histories, re-derive bindings, or fail to reconcile siblings while one actor is held. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test nodes_of_one_daemon_proof -- --ignored --exact two_paired_computers_that_are_idle_exchange_nothing --nocapture` | a real machine; run alone | about five minutes; not timed in CI |
+| `nodes_of_one_daemon_proof::two_paired_computers_that_are_idle_exchange_nothing` | Idle paired computers keep exchanging unchanged histories, re-derive bindings, fail to reconcile siblings while one actor is held, replace policy during a held admitted join, or leave a refused pre-lease join on a real board after restart. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test nodes_of_one_daemon_proof -- --ignored --exact two_paired_computers_that_are_idle_exchange_nothing --nocapture` | a real machine; run alone | several minutes; not timed in CI |
 
 For the constructor boundary independently of the full journey, set
 `VOX_PROOF_STEP=constructor-re-admission` on that command. This selector is not a substitute
@@ -281,15 +281,19 @@ turn across a real Computer policy change, and asks the member's `vox room admin
 policy acceptance. Test-only apparatus holds periodic settlement only for the selected room,
 so an incidental tick cannot mask the lost governance-owner wake.
 
+`VOX_PROOF_STEP=join-ordering` stages the paired Computers and exercises the held publication
+and pre-lease join boundaries; it is not a substitute for the complete journey.
+
 FX-28's executable mutants are run one at a time with
 `scripts/run-fx28-mutant.sh <mode>`, where `<mode>` is
 `preview-approval-not-durable`, `stopped-reader-fresh-write`, `lock-through-computer-write`,
-`deadline-as-storage-failure`, `withdrawal-not-durable`, `stale-tick-authority`, `stale-join-authority`,
+`deadline-as-storage-failure`, `join-writer-fence`, `join-outcome-refusal`, `join-policy-not-applied`,
+`withdrawal-not-durable`, `stale-tick-authority`, `stale-join-authority`,
 `fresh-preview-inherits-old-deadline`, `late-application-abandons-work`, `detach-keeps-reconciliation`,
 `redeem-rejects-pending-registration`, `owner-refusal-decoded-as-payload`,
 `due-backoff-drops-causal-cause`,
 `stale-post-authority`, `constructor-terminal-refusal`, `constructor-stale-commit`,
-`stale-trust-projection`, `stale-rekey-authority`, or
+`stale-trust-projection`, `rekey-writer-fence`, `stale-rekey-authority`, or
 `legacy-ended-unanswered-not-selected`. Each mode selects the journey which stages that fault and accepts
 only its exact named `PRODUCT [FX28 ...]:` verdict; another product red is an apparatus failure,
 not evidence for the mutant. `stopped-reader-fresh-write` uses one real shipped daemon as an
@@ -297,9 +301,12 @@ authenticated peer which fills the other daemon's bounded management slots and l
 response unread. `lock-through-computer-write` restores the former state lock across an exact held
 durable Computer write; shipped status must still answer with the last committed revision inside
 its existing actor-liveness contract. `deadline-as-storage-failure` turns an exact pre-rename
-causal refusal into permanent storage quarantine again. `withdrawal-not-durable` omits the refused
-join's prepared and pending board-withdrawal journals; after the responder path reopens with the
-joining daemon stopped, restart must still remove both exact accepted records from that real board.
+causal refusal into permanent storage quarantine again. `join-writer-fence` skips the policy
+replacement's physical writer; `join-outcome-refusal` refuses the already-published held join;
+`join-policy-not-applied` discards the policy replacement after the publication reader drains.
+`stale-join-authority` admits a superseded join before its publication lease;
+`withdrawal-not-durable` drops the refused join's persisted board-withdrawal obligation before
+the joining daemon restarts.
 `stale-post-authority` bypasses the durable-policy fence around an
 ordinary text append; `stale-trust-projection` makes the shipped trust list copy unreconciled
 trusted rows; `constructor-terminal-refusal` makes the pre-admission supersession terminal instead
@@ -309,8 +316,10 @@ complete under the accepted current policy and appear in the room list. Its inte
 `constructor-stale-commit` bypasses the refused constructor lease and its lease-less continuation
 checks: while delta's moved Computer policy remains held, the original create must not succeed or
 appear in the room list. Its intended verdict is `PRODUCT [FX28 constructor-stale-publication]:`.
-`stale-rekey-authority` bypasses the final fence around exact sender-key queue
-admission after every preceding await. `legacy-ended-unanswered-not-selected` suppresses only
+`rekey-writer-fence` skips the policy writer while an admitted legacy rekey holds its reader;
+the journey removes a third Computer and checks that its removal waits for the rekey.
+`stale-rekey-authority` bypasses the final fence around a separately prepared lease-free automatic
+sender-key batch after every preceding await. `legacy-ended-unanswered-not-selected` suppresses only
 the real `ENDED_UNANSWERED` compatibility-route selection; the shipped roster then fails to say
 that the exact peer runs an older Vox, before the authority race is staged. Full transcripts are
 written under `target/fx28-mutants/`. That same causal route makes the authority rejection seal

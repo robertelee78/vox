@@ -5286,19 +5286,35 @@ fn superseded_governance_resumes() {
         "APPARATUS: beta was already an admin before the staged grant: {baseline}{err}"
     );
     let grant_at = Instant::now();
-    let (ok, out, err) = source.run(
-        &["room", "admin", "add", &room, &beta, "--node", "alpha"],
-        "",
-    );
+    let grant_deadline = grant_at + Duration::from_secs(10);
+    let (ok, out, err) = loop {
+        let result = source.run(
+            &["room", "admin", "add", &room, &beta, "--node", "alpha"],
+            "",
+        );
+        if !result.0
+            && result.2.starts_with(
+                "vox: cannot add the admin: a previous change to this room is still being applied; this request made no change",
+            )
+            && Instant::now() < grant_deadline
+        {
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+        break result;
+    };
     assert!(
         ok,
         "APPARATUS: issue expiring signed admin grant: {out}{err}"
     );
     assert!(
-        wait_until(Duration::from_secs(10), || {
-            let (ok, out, _) = admins();
-            ok && out.contains(&beta)
-        }),
+        wait_until(
+            grant_deadline.saturating_duration_since(Instant::now()),
+            || {
+                let (ok, out, _) = admins();
+                ok && out.contains(&beta)
+            }
+        ),
         "APPARATUS: beta never saw its actual unexpired admin grant"
     );
     assert!(
@@ -5830,7 +5846,9 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
 
     if let Ok(step) = std::env::var("VOX_PROOF_STEP") {
         assert!(
-            step == "constructor-re-admission" || step == "direct-publication",
+            step == "constructor-re-admission"
+                || step == "direct-publication"
+                || step == "join-ordering",
             "APPARATUS: unsupported FX-28 journey step"
         );
         if step == "constructor-re-admission" {
@@ -5850,7 +5868,10 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
     }
 
     // ---- a durable Computer write cannot wedge status or fabricate storage failure -------
-    if std::env::var("VOX_PROOF_STEP").as_deref() != Ok("direct-publication") {
+    if !matches!(
+        std::env::var("VOX_PROOF_STEP").as_deref(),
+        Ok("direct-publication" | "join-ordering")
+    ) {
         computer_write_expiry_keeps_status_live(
             (&a, &da, &nodes_a),
             (&b, &db, &nodes_b),
@@ -5860,8 +5881,8 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
         );
     }
 
-    // ---- rejected join records leave the answering member's board across restart ---------
-    let db = rejected_join_records_leave_remote_board(
+    // ---- an admitted join serializes with policy replacement ----------------------------
+    let db = held_join_serializes_with_policy(
         (&a, &da),
         RestartComputerSide {
             account: &b,
@@ -5883,7 +5904,10 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
         &stale_join_engaged,
         &stale_join_release,
     );
-    if std::env::var("VOX_PROOF_STEP").as_deref() == Ok("direct-publication") {
+    if matches!(
+        std::env::var("VOX_PROOF_STEP").as_deref(),
+        Ok("direct-publication" | "join-ordering")
+    ) {
         return;
     }
 
@@ -6219,14 +6243,17 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
         confirmed_a && confirmed_b && (last_a.is_some() || last_b.is_some()),
         "PRODUCT: `vox computer status` does not say the peer is confirmed and date the pair's completed fallback: alpha {confirmed_a} {last_a:?}, beta {confirmed_b} {last_b:?}"
     );
-    // The plain `vox computer status` exposes the same fields to a person. Do not compare its
+    // The documented detailed status exposes the same fields to a person. Do not compare its
     // numbers with an earlier JSON command: the two sides' named fallbacks can be phase-shifted,
     // so one side can legitimately reach its next cadence while the proof waits for the other's
     // first boundary. The exact per-boundary numbers were asserted above from each coherent JSON
-    // snapshot; this independent command proves the plain surface renders those records.
+    // snapshot; this independent command proves the detailed surface renders those records.
     for (who, acct, (revision, nodes)) in [("alpha", &a, &derived1.0), ("beta", &b, &derived1.1)] {
-        let (ok, text, err) = acct.run(&["computer", "status"], "");
-        assert!(ok, "PRODUCT: `vox computer status` failed for {who}: {err}");
+        let (ok, text, err) = acct.run(&["computer", "status", "--details"], "");
+        assert!(
+            ok,
+            "PRODUCT: `vox computer status --details` failed for {who}: {err}"
+        );
         let exchange_line = text.lines().find(|line| {
             line.contains("exchanged ")
                 && line.contains(" time(s) in ")
@@ -6240,13 +6267,13 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
                     && line.matches("sent revision ").count() == 2
                     && line.matches("merged to revision ").count() == 2
             }),
-            "PRODUCT: {who}'s `vox computer status` does not say how many exchanges and attempts \
+            "PRODUCT: {who}'s `vox computer status --details` does not say how many exchanges and attempts \
              it currently records, when, and what the last exchange it started and the last it \
              answered carried (#989, ADR-038 FX-28); it said: {text}"
         );
         assert!(
             !text.contains("failed in a row"),
-            "PRODUCT: {who}'s `vox computer status` reports failures on the reachable quiet pair: {text}"
+            "PRODUCT: {who}'s `vox computer status --details` reports failures on the reachable quiet pair: {text}"
         );
         // And, per node of this computer, the revision its binding was derived at and that it
         // is the current one (ADR-038 FX-28).
@@ -6254,7 +6281,7 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
         assert!(
             text.contains(&format!("policy revision {revision}"))
                 && text.matches(&current).count() == nodes.len(),
-            "PRODUCT: {who}'s `vox computer status` does not say, for each of its {} nodes, that \
+            "PRODUCT: {who}'s `vox computer status --details` does not say, for each of its {} nodes, that \
              its binding was derived at the current policy revision {revision} (ADR-038 FX-28); \
              it said: {text}",
             nodes.len()
@@ -7128,14 +7155,36 @@ fn a_direct_responder_that_is_another_rooms_anchor_receives_publication() {
     println!("[proof] the direct responder that is another room's anchor serves the join records");
 }
 
-/// A join can publish to the member that answered it before the final Computer-policy fence.
-/// Hold that exact join, observe both accepted records on the responder's real board, move policy,
-/// take the responder's path offline, and release the join. The refused join must survive neither
-/// local room listing nor the responder's board after the joining daemon restarts. Reopening the
-/// responder's exact userspace path while the joiner is stopped proves its in-memory stale records
-/// persisted; only the joining daemon's durable cleanup can remove them.
+fn remote_board_serves_prejoin(
+    rt: &hostile::Rt,
+    address: std::net::SocketAddr,
+    board: vox_core::hash::Digest32,
+    room: vox_core::hash::Digest32,
+    member: vox_core::hash::Digest32,
+) -> bool {
+    use vox_core::nat::service::{RecordKinds, RendezvousClient};
+    let reader = hostile::stranger(0xC7);
+    rt.block_on(async {
+        let (_endpoint, connection) = hostile::connect(&reader, address, board).await;
+        let mut client = RendezvousClient::open(&connection)
+            .await
+            .expect("APPARATUS: open the responder's board");
+        let records = client
+            .get(&room, 0, RecordKinds::ALL)
+            .await
+            .expect("APPARATUS: read the responder's board");
+        client.finish();
+        records
+            .prejoins
+            .iter()
+            .any(|record| record.asserted_id() == member)
+    })
+}
+
+/// A held, already-published join owns the physical reader until its outcome is durable.
+/// A policy replacement on the other computer must wait for that reader, then converge.
 #[allow(clippy::too_many_arguments)]
-fn rejected_join_records_leave_remote_board(
+fn held_join_serializes_with_policy(
     (a, da): (&Account, &Daemon),
     side: RestartComputerSide<'_>,
     join_arm: &Path,
@@ -7269,53 +7318,258 @@ fn rejected_join_records_leave_remote_board(
 
     let before = computer(b, &["status"])["revision"].as_u64().unwrap_or(0);
     computer(a, &["personal", "gamma"]);
+    let changed_revision = computer(a, &["status"])["revision"]
+        .as_u64()
+        .expect("PRODUCT: alpha status names no policy revision");
+    let beta_id = computer_id(b);
+    let writer_marker = join_engaged.with_extension("writer");
     assert!(
-        wait_until(RETURN_WITHIN, || computer(b, &["status"])["revision"]
-            .as_u64()
-            .is_some_and(|revision| revision > before)),
-        "APPARATUS: durable Computer policy did not move on beta while delta's join was held\n{}\n{}",
+        wait_until(RETURN_WITHIN, || writer_marker.is_file()),
+        "APPARATUS: beta did not reach the publication writer fence for the policy change\n{}\n{}",
         da.said(),
         db.said()
     );
-    assert!(
-        join_engaged.is_file(),
-        "APPARATUS: delta's join was not still held after durable policy moved"
-    );
-    println!("[proof] FX-28 stale-join-authority apparatus staged: the responder serves both exact join records while delta's completed join remains held across durable Computer policy movement");
-    board_forward.close();
-    std::os::unix::net::UnixStream::connect(join_release).unwrap_or_else(|error| {
-        panic!(
-            "APPARATUS: release delta's held join at {}: {error}",
-            join_release.display()
-        )
-    });
+    println!("[proof] FX-28 join-writer-fence apparatus staged: the held join's policy replacement reached the publication writer");
+    let observation_end = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < observation_end {
+        let status = computer(b, &["status"]);
+        assert!(
+            status["revision"].as_u64() == Some(before),
+            "PRODUCT [FX28 join-writer-fence]: beta replaced policy while delta's published join was held: before {before}, status {status}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::os::unix::net::UnixStream::connect(join_release)
+        .expect("APPARATUS: release delta's held join");
     let joined = join
         .wait_with_output()
-        .expect("APPARATUS: collect the causally released room join");
+        .expect("APPARATUS: collect delta's released join");
     assert!(
-        !joined.status.success(),
-        "PRODUCT [FX28 stale-join-authority]: after durable Computer policy moved while its accepted board records were visible, shipped `vox room join` still acknowledged the stale join: stdout {}; stderr {}",
+        joined.status.success(),
+        "PRODUCT [FX28 join-writer-fence]: delta's published join failed after release: stdout {}; stderr {}",
         String::from_utf8_lossy(&joined.stdout),
         String::from_utf8_lossy(&joined.stderr)
     );
     assert!(
-        board_forward.dropped() > 0,
-        "APPARATUS: the closed responder path dropped no datagram, so board unreachability was not staged"
+        wait_until(RETURN_WITHIN, || {
+            let status = computer(b, &["status"]);
+            let gamma_personal = status["nodes"].as_array().into_iter().flatten()
+                .any(|node| node["name"] == "gamma" && node["personal"] == true);
+            let exchange = application_toward(a, &beta_id);
+            let carried = ["last_started_exchange", "last_answered_exchange"].iter().any(|kind|
+                exchange[*kind]["sent_revision"].as_u64().is_some_and(|revision| revision >= changed_revision));
+            status["revision"].as_u64().is_some_and(|revision| revision > before)
+                && gamma_personal && carried && roster_current(&status, &["beta", "delta"])
+        }),
+        "PRODUCT [FX28 join-writer-fence]: beta did not converge after the published join completed: {}",
+        computer(b, &["status"])
     );
-    let _beta_before_restart = db.stop();
-    let _verified = board_forward.open_and_verify();
-    let still_exposed =
-        remote_board_serves_member(&rt, board_address, board_id, room_id, member_id);
+    computer(a, &["personal", "alpha"]);
     assert!(
-        still_exposed == (true, true),
-        "APPARATUS: after the answering board's exact path reopened while beta was stopped, it did not still expose both accepted stale join records, so durable withdrawal recovery cannot be measured; member {}, bundle {}",
-        still_exposed.0,
-        still_exposed.1
+        wait_until(RETURN_WITHIN, || {
+            let a_status = computer(a, &["status"]);
+            let b_status = computer(b, &["status"]);
+            let alpha_personal = b_status["nodes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|node| node["name"] == "alpha" && node["personal"] == true);
+            alpha_personal
+                && roster_current(&a_status, &["alpha", "gamma"])
+                && roster_current(&b_status, &["beta", "delta"])
+        }),
+        "APPARATUS: both Computers did not settle after the held join phase"
     );
-    println!(
-        "[proof] FX-28 withdrawal-not-durable apparatus staged: after the refused join and with beta stopped, the reopened responder board still exposes both exact accepted records"
+    // The answering member removes its prejoin on admission. Use a separate real board so
+    // the original prejoin remains observable through the later pre-lease refusal.
+    let anchor = Account::new();
+    let anchor_out = anchor.data.with_extension("anchor.out");
+    let anchor_file = std::fs::File::create(&anchor_out).expect("APPARATUS: anchor transcript");
+    let started = Instant::now();
+    let anchor_child = anchor
+        .cmd(&["node", "--listen", "127.0.0.1:0", "--serve", "anyone"])
+        .env("VOX_TEST_CLOCK_STEP_MS", REMOTE_CLOCK_SKEW_MS)
+        .stdin(Stdio::null())
+        .stdout(
+            anchor_file
+                .try_clone()
+                .expect("APPARATUS: clone anchor transcript"),
+        )
+        .stderr(anchor_file)
+        .spawn()
+        .expect("APPARATUS: start rollback board");
+    let mut anchor_daemon = Daemon {
+        child: anchor_child,
+        out: anchor_out,
+        started,
+    };
+    anchor_daemon.expect_apparatus_event("rollback board address", |line| {
+        line.contains('@') && line.contains("/udp/")
+    });
+    let transcript = anchor_daemon.said();
+    let anchor_spec = transcript
+        .lines()
+        .map(str::trim)
+        .find(|line| line.contains('@') && line.contains("/udp/"))
+        .expect("APPARATUS: rollback board printed no address");
+    let (anchor_fp, address) = anchor_spec
+        .split_once('@')
+        .expect("APPARATUS: rollback board identity");
+    let anchor_port = address
+        .rsplit('/')
+        .next()
+        .expect("APPARATUS: rollback board port");
+    let anchor_inside: std::net::SocketAddr = format!("127.0.0.1:{anchor_port}")
+        .parse()
+        .expect("APPARATUS: rollback board socket address");
+    let rollback_forward = port_forward::PortForward::start(anchor_inside, true);
+    let anchor_address = rollback_forward.public;
+    let anchor_id = vox_core::node::link::b32_decode(anchor_fp, "anchor fingerprint")
+        .expect("APPARATUS: rollback board fingerprint");
+    let rollback_host = Account::new();
+    rollback_host.make_node("rollback-host");
+    let rollback_listen = format!("127.0.0.1:{}", port_forward::free_v4_udp_port());
+    let responder_forward = port_forward::PortForward::start(
+        rollback_listen
+            .parse()
+            .expect("APPARATUS: rollback responder address"),
+        true,
     );
-
+    let responder_advertised = responder_forward.public.to_string();
+    let mut rollback_daemon = Daemon::start(
+        &rollback_host,
+        &["--node", "rollback-host", "--anchor", anchor_spec],
+        &[
+            ("VOX_LISTEN", &rollback_listen),
+            ("VOX_TEST_ADVERTISE", &responder_advertised),
+            ("VOX_TEST_CLOCK_STEP_MS", REMOTE_CLOCK_SKEW_MS),
+        ],
+    );
+    rollback_daemon.expect_apparatus_event("rollback host Ready", |line| {
+        line.contains("rollback-host is Ready")
+    });
+    let rollback_name = make_room(&rollback_host, "rollback-host");
+    let (added, output, error) = rollback_host.run(
+        &[
+            "room",
+            "anchors",
+            &rollback_name,
+            "--node",
+            "rollback-host",
+            "add",
+            anchor_spec,
+        ],
+        "",
+    );
+    assert!(
+        added,
+        "APPARATUS: add the real rollback board to the room: {output}{error}"
+    );
+    let (linked, link, err) = rollback_host.run(
+        &["room", "link", &rollback_name, "--node", "rollback-host"],
+        "",
+    );
+    assert!(linked, "APPARATUS: link rollback room: {link}{err}");
+    // A valid invite may name only the anchor and its pinned responder. Removing the direct
+    // member route exercises the real anchor path instead of racing the preferred direct route.
+    let mut anchor_link = vox_core::node::link::InviteLink::parse(link.trim())
+        .expect("APPARATUS: parse the shipped rollback invite");
+    anchor_link.anchors.retain(|route| route.id == anchor_id);
+    anchor_link.members.clear();
+    assert!(
+        !anchor_link.anchors.is_empty(),
+        "APPARATUS: shipped invite did not name the rollback board"
+    );
+    anchor_link.anchors = vec![vox_core::node::link::parse_anchor_spec(&format!(
+        "{anchor_fp}@/ip6/::1/udp/{}",
+        anchor_address.port()
+    ))
+    .expect("APPARATUS: route the real rollback board through its forward")];
+    let link = anchor_link.to_url();
+    let full_room = link
+        .strip_prefix("vox://")
+        .and_then(|rest| rest.get(..52))
+        .expect("APPARATUS: rollback link has no full room fingerprint");
+    let rollback_room = vox_core::node::link::b32_decode(full_room, "room fingerprint")
+        .expect("APPARATUS: rollback link has an invalid room fingerprint");
+    std::fs::write(join_arm, b"hold join before publication lease\n")
+        .expect("APPARATUS: arm the pre-lease join hold");
+    let mut joining = b
+        .cmd(&[
+            "room",
+            "join",
+            "--node",
+            "delta",
+            "--passphrase-file",
+            "-",
+            &link,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("APPARATUS: start the pre-lease join");
+    joining
+        .stdin
+        .take()
+        .expect("APPARATUS: pre-lease join stdin")
+        .write_all(ROOM_PASS.as_bytes())
+        .expect("APPARATUS: supply the pre-lease join passphrase");
+    wait_for_command_marker(
+        join_engaged,
+        &mut joining,
+        db.child.id(),
+        Instant::now() + RETURN_WITHIN,
+        "the exact join before publication lease acquisition",
+    );
+    assert_eq!(
+        std::fs::read_to_string(join_engaged).expect("APPARATUS: read pre-lease join marker"),
+        full_room,
+        "APPARATUS: pre-lease marker named a different join"
+    );
+    assert!(
+        remote_board_serves_prejoin(&rt, anchor_address, anchor_id, rollback_room, member_id),
+        "APPARATUS: the separate real board did not retain delta's prejoin at the pre-lease boundary"
+    );
+    let before = computer(b, &["status"])["revision"].as_u64().unwrap_or(0);
+    computer(a, &["personal", "gamma"]);
+    assert!(
+        wait_until(RETURN_WITHIN, || {
+            let status = computer(b, &["status"]);
+            status["revision"]
+                .as_u64()
+                .is_some_and(|revision| revision > before)
+                && status["nodes"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|node| node["name"] == "gamma" && node["personal"] == true)
+        }),
+        "APPARATUS: beta policy did not move while the exact pre-lease join was held"
+    );
+    println!("[proof] FX-28 stale-join-authority apparatus staged: the exact pre-lease join has a real board prejoin and beta's policy moved");
+    rollback_forward.close();
+    std::os::unix::net::UnixStream::connect(join_release)
+        .expect("APPARATUS: release the pre-lease join");
+    let refused = joining
+        .wait_with_output()
+        .expect("APPARATUS: collect the pre-lease join");
+    assert!(
+        !refused.status.success() && String::from_utf8_lossy(&refused.stderr).contains("computer trust changed while this command was being applied"),
+        "PRODUCT [FX28 stale-join-authority]: superseded join did not report a Computer-policy refusal: stdout {}; stderr {}",
+        String::from_utf8_lossy(&refused.stdout), String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(
+        wait_until(RETURN_WITHIN, || rollback_forward.dropped() > 0),
+        "APPARATUS: the closed rollback-board path dropped no datagram"
+    );
+    let _before_restart = db.stop();
+    rollback_forward.open_and_verify();
+    assert!(
+        remote_board_serves_prejoin(&rt, anchor_address, anchor_id, rollback_room, member_id),
+        "APPARATUS: the reopened real board no longer served the prejoin while beta was stopped"
+    );
+    println!("[proof] FX-28 withdrawal-not-durable apparatus staged: the real board still serves the refused join's prejoin while beta is stopped");
     let rotate_after_post_spec = b
         .data
         .join(FX28_ROTATE_AFTER_POST_ARM)
@@ -7351,40 +7605,44 @@ fn rejected_join_records_leave_remote_board(
         let ready = format!("{name} is Ready");
         db.expect_event_until(
             restarted + RETURN_WITHIN,
-            &format!("node {name} is Ready after durable-withdrawal restart"),
+            &format!("node {name} is Ready after rollback restart"),
             |line| line.contains(&ready),
         );
     }
     let (listed, rooms, list_error) = b.run(&["room", "list", "--node", "delta"], "");
     assert!(
-        listed && !rooms.contains(&room),
-        "PRODUCT [FX28 stale-join-authority]: after the joining daemon restarted and delta was Ready, its shipped room list exposed the refused stale-authority join: {rooms}{list_error}"
+        listed && !rooms.contains(&full_room[..12]),
+        "PRODUCT [FX28 stale-join-authority]: delta listed the refused join after restart: {rooms}{list_error}"
     );
-    loop {
-        let exposed = remote_board_serves_member(&rt, board_address, board_id, room_id, member_id);
-        if exposed == (false, false) {
-            break;
-        }
-        assert!(
-            restarted.elapsed() < RETURN_WITHIN,
-            "PRODUCT [FX28 withdrawal-not-durable]: after delta's refused join and daemon restart, the answering member's real board still exposed its stale records: member {}, bundle {}; beta daemon {}; host daemon {}",
-            exposed.0,
-            exposed.1,
-            db.said(),
-            dc.said()
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    println!(
-        "[proof] after a refused join, offline responder and joining-daemon restart, the responder's real board exposes neither stale member nor stale bundle record"
+    assert!(
+        wait_until(RETURN_WITHIN, || !remote_board_serves_prejoin(&rt, anchor_address, anchor_id, rollback_room, member_id)),
+        "PRODUCT [FX28 withdrawal-not-durable]: after beta restarted, the real board still serves the refused join's prejoin"
     );
     computer(a, &["personal", "alpha"]);
     assert!(
         wait_until(RETURN_WITHIN, || {
-            roster_current(&computer(a, &["status"]), &["alpha", "gamma"])
-                && roster_current(&computer(b, &["status"]), &["beta", "delta"])
+            let a_status = computer(a, &["status"]);
+            let status = computer(b, &["status"]);
+            status["nodes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|node| node["name"] == "alpha" && node["personal"] == true)
+                && roster_current(&a_status, &["alpha", "gamma"])
+                && roster_current(&status, &["beta", "delta"])
+                && [&a_status, &status].iter().all(|snapshot| {
+                    snapshot["state"] == "confirmed"
+                        && snapshot["applications"]
+                            .as_array()
+                            .is_some_and(|applications| {
+                                applications.iter().all(|application| {
+                                    application["confirmed"] == true
+                                        && application["exchange_in_flight"] == false
+                                })
+                            })
+                })
         }),
-        "APPARATUS: both Computers did not settle after the durable board-withdrawal phase"
+        "APPARATUS: Computers did not settle after the pre-lease join"
     );
     db
 }
@@ -7716,6 +7974,7 @@ fn change_reaches_a_live_computer(
     let changed = Instant::now();
     computer(a, &["personal", "gamma"]);
     let shown = loop {
+        let observation_started = changed.elapsed();
         let status = computer(a, &["status"]);
         let personal = status["nodes"]
             .as_array()
@@ -7734,12 +7993,17 @@ fn change_reaches_a_live_computer(
             break status;
         }
         assert!(
-            !shown && elapsed < CHANGE_SHOWN_WITHIN,
-            "PRODUCT: {CHANGE_SHOWN_WITHIN:?} after `vox computer personal gamma`, alpha's computer \
-             did not show it applied in time (ADR-038 FX-28, #1020; shown {shown} when looked at \
-             after {elapsed:?}): gamma personal {personal}, bindings \
-             current {}, alpha grants gamma {:?} (read + drive expected), gamma grants alpha {:?} \
-             (read expected); status: revision {} nodes {}\nits daemon said: {}",
+            !shown || elapsed <= CHANGE_SHOWN_WITHIN,
+            "APPARATUS: alpha's policy was shown at {elapsed:?}, but the first complete \
+             observation straddled the {CHANGE_SHOWN_WITHIN:?} boundary; the shipped views \
+             do not establish whether it became current before or after that boundary"
+        );
+        assert!(
+            observation_started < CHANGE_SHOWN_WITHIN,
+            "PRODUCT: after {CHANGE_SHOWN_WITHIN:?}, alpha's shipped status and keyrings still \
+             did not show gamma's applied personal policy: gamma personal {personal}, bindings \
+             current {}, alpha grants gamma {:?}, gamma grants alpha {:?}; status revision {} \
+             nodes {}\nits daemon said: {}",
             roster_current(&status, &["alpha", "gamma"]),
             grant_words(a, "alpha", &gamma),
             grant_words(a, "gamma", &alpha),
@@ -7926,13 +8190,14 @@ fn stale_remote_pause_is_refused(
         ok,
         "APPARATUS: delta's shipped Session hook for stale-pause observation failed: {out}{err}"
     );
+    let mut session_listing = (false, String::new(), String::new());
     assert!(
         wait_until(RETURN_WITHIN, || {
-            let (ok, listed, _) = b.run(
+            session_listing = b.run(
                 &["room", "sessions", &room, "--node", "delta", "--json"],
                 "",
             );
-            ok && listed
+            session_listing.0 && session_listing.1
                 .lines()
                 .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
                 .any(|session| {
@@ -7941,7 +8206,8 @@ fn stale_remote_pause_is_refused(
                         && session["open"] == true
                 })
         }),
-        "APPARATUS: delta's exact shipped Session was not registered in the stale-pause room"
+        "APPARATUS: delta's exact shipped Session was not registered in the stale-pause room; hook stdout {out}; stderr {err}; listing {:?}; beta daemon:\n{}",
+        session_listing, db.said()
     );
 
     std::fs::write(hold_arm, b"hold delta's admitted remote pause\n")
@@ -7980,7 +8246,10 @@ fn stale_remote_pause_is_refused(
             status["revision"].as_u64().is_some_and(|r| r > before)
                 && grant_words(b, "beta", &epsilon).is_some()
         }),
-        "APPARATUS: durable policy did not move and apply on beta while delta's exact publication was held\n{}\n{}",
+        "APPARATUS: durable policy did not move and apply on beta while delta's exact publication was held; before {before}, alpha status {}, beta status {}, beta grant to epsilon {:?}\n{}\n{}",
+        computer(a, &["status"]),
+        computer(b, &["status"]),
+        grant_words(b, "beta", &epsilon),
         da.said(),
         db.said()
     );
@@ -8202,8 +8471,14 @@ fn stale_remote_pause_is_refused(
     computer(a, &["personal", "alpha"]);
     assert!(
         wait_until(RETURN_WITHIN, || {
-            roster_current(&computer(a, &["status"]), &["alpha", "gamma", "epsilon"])
-                && roster_current(&computer(b, &["status"]), &["beta", "delta"])
+            let status = computer(b, &["status"]);
+            status["nodes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|node| node["name"] == "alpha" && node["personal"] == true)
+                && roster_current(&computer(a, &["status"]), &["alpha", "gamma", "epsilon"])
+                && roster_current(&status, &["beta", "delta"])
         }),
         "APPARATUS: nodes did not settle after the stale text-append refusal"
     );
@@ -8622,6 +8897,32 @@ fn stale_rekey_is_not_delivered(
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+    // A third Computer lets this first phase move policy without revoking the intended recipient.
+    let c = Account::new();
+    c.make_node("zeta");
+    let listen_c = format!("[::1]:{}", free_v6_udp_port());
+    let mut dc = Daemon::start(&c, &["--node", "zeta"], &[("VOX_LISTEN", &listen_c)]);
+    dc.expect_apparatus_event("node zeta is Ready", |line| line.contains("zeta is Ready"));
+    computer(&c, &["personal", "zeta"]);
+    let invited = computer(b, &["invite"]);
+    let link_c = invited["invite_link"]
+        .as_str()
+        .expect("APPARATUS: third Computer invitation has no link");
+    let preview = computer(&c, &["pair", link_c, "--preview"]);
+    let operation = preview["pairing"]["operation_id"]
+        .as_str()
+        .expect("APPARATUS: third Computer preview has no operation");
+    computer(&c, &["approve", operation]);
+    computer(b, &["approve", operation]);
+    let c_id = computer_id(&c);
+    assert!(
+        wait_until(RETURN_WITHIN, || computer(b, &["status"])["state"]
+            == "confirmed"
+            && computer(&c, &["status"])["state"] == "confirmed"),
+        "APPARATUS: third Computer did not finish pairing: beta {}; zeta {}",
+        computer(b, &["status"]),
+        computer(&c, &["status"])
+    );
     let _ = std::fs::remove_file(&baseline_drained_marker);
     std::fs::write(&baseline_drained_arm, format!("{epsilon}\t{full_room}\n"))
         .expect("APPARATUS: arm delta's exact baseline-delivery drain boundary");
@@ -8743,7 +9044,7 @@ fn stale_rekey_is_not_delivered(
             "room",
             "post",
             room,
-            "STALE-AUTHORITY-REKEY",
+            "ADMITTED-LEASE-REKEY",
             "--node",
             "delta",
             "--json",
@@ -8770,7 +9071,7 @@ fn stale_rekey_is_not_delivered(
         "APPARATUS: epsilon never held the exact protected ciphertext before sender revocation"
     );
     let (ok, unreadable, err) = a.run(&["room", "read", room, "--node", "epsilon"], "");
-    assert!(ok && !unreadable.contains("STALE-AUTHORITY-REKEY"),
+    assert!(ok && !unreadable.contains("ADMITTED-LEASE-REKEY"),
         "APPARATUS: the exact ciphertext was not staged unreadable while its key remained paused: {unreadable}{err}");
     println!("[proof] epsilon holds the exact protected post through shipped read --hashes, while its ordinary room read cannot display it without the paused sender key");
     let rekey_fault = rekey_decision.with_extension("fault");
@@ -8779,15 +9080,13 @@ fn stale_rekey_is_not_delivered(
     }
     std::fs::write(rekey_arm, format!("{epsilon}\t{full_room}\n"))
         .expect("APPARATUS: arm epsilon's exact stale rekey enqueue");
-    std::fs::write(hold_arm, b"hold delta's revocation policy message\n")
-        .expect("APPARATUS: arm delta's reconciliation behind the rekey decision");
     let _ = std::fs::remove_file(&rotate_after_post_result);
     std::fs::write(
         &rotate_after_post_arm,
         format!("delta\t{full_room}\trelease-paused\t{epsilon}\n"),
     )
     .expect("APPARATUS: arm the target post to release the exact paused sender-key delivery");
-    let mut rotating_post = b
+    let rotating_post = b
         .cmd(&[
             "room",
             "post",
@@ -8801,17 +9100,155 @@ fn stale_rekey_is_not_delivered(
         .stderr(Stdio::piped())
         .spawn()
         .expect("APPARATUS: start the shipped post whose key remains paused for epsilon");
-    wait_for_command_marker(
+    // The post may return before its owed sync reaches the actor's later turn. The exact
+    // daemon marker, not the lifetime of the post command, establishes this boundary.
+    read_daemon_marker(
         rekey_engaged,
-        &mut rotating_post,
         db.child.id(),
-        Instant::now() + RETURN_WITHIN,
         "epsilon's prepared sender-key batch at final queue admission",
     );
     let (read_ok, held_read, held_error) = a.run(&["room", "read", room, "--node", "epsilon"], "");
     assert!(
-        read_ok && !held_read.contains("STALE-AUTHORITY-REKEY"),
+        read_ok && !held_read.contains("ADMITTED-LEASE-REKEY"),
         "APPARATUS: before revocation epsilon already exposed the protected text while its exact sender-key batch was held, or its room could not be read: {held_read}{held_error}"
+    );
+    let before_serialization = computer(b, &["status"]);
+    let frontier = before_serialization["frontier"]
+        .as_str()
+        .expect("APPARATUS: beta status has no removal frontier");
+    std::fs::write(rekey_engaged.with_extension("target"), &c_id)
+        .expect("APPARATUS: arm the exact third-Computer removal writer");
+    let mut removal = b
+        .cmd(&["computer", "remove", &c_id, "--confirm", frontier])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("APPARATUS: start third Computer removal");
+    let writer = rekey_engaged.with_extension("writer");
+    wait_for_command_marker(
+        &writer,
+        &mut removal,
+        db.child.id(),
+        Instant::now() + RETURN_WITHIN,
+        "third Computer removal reached the held rekey's publication writer",
+    );
+    println!("[proof] FX-28 rekey-writer-fence apparatus staged: the third Computer removal reached the held rekey's publication writer");
+    let observation_end = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < observation_end {
+        let status = computer(b, &["status"]);
+        assert!(
+            status["revision"] == before_serialization["revision"]
+                && removal.try_wait().expect("APPARATUS: inspect removal").is_none(),
+            "PRODUCT [FX28 rekey-writer-fence]: removal completed or beta replaced policy while the admitted rekey held its publication lease: before {before_serialization}; status {status}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::os::unix::net::UnixStream::connect(rekey_release)
+        .expect("APPARATUS: release admitted rekey");
+    let removed = removal
+        .wait_with_output()
+        .expect("APPARATUS: collect third Computer removal");
+    assert!(
+        removed.status.success(),
+        "PRODUCT [FX28 rekey-writer-fence]: removal failed after the admitted rekey released: {}{}",
+        String::from_utf8_lossy(&removed.stdout),
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    assert!(
+        wait_until(RETURN_WITHIN, || computer(b, &["status"])["revision"]
+            .as_u64()
+            > before_serialization["revision"].as_u64()),
+        "PRODUCT [FX28 rekey-writer-fence]: beta did not expose the removal after release"
+    );
+    let post_result = rotating_post
+        .wait_with_output()
+        .expect("APPARATUS: collect admitted rekey post");
+    assert!(
+        post_result.status.success(),
+        "PRODUCT [FX28 rekey-writer-fence]: the admitted post failed after release: {}{}",
+        String::from_utf8_lossy(&post_result.stdout),
+        String::from_utf8_lossy(&post_result.stderr)
+    );
+    assert!(
+        wait_until(RETURN_WITHIN, || a
+            .run(&["room", "read", room, "--node", "epsilon"], "")
+            .1
+            .contains("ADMITTED-LEASE-REKEY")),
+        "APPARATUS: the admitted legacy rekey did not establish the receiver's session"
+    );
+    assert!(
+        wait_until(RETURN_WITHIN, || computer(b, &["status"])["state"]
+            == "confirmed"
+            && grant_words(b, "delta", epsilon).is_some()),
+        "APPARATUS: the remaining Computers did not converge after third-Computer removal"
+    );
+    let _ = std::fs::remove_file(&rotate_after_post_result);
+    std::fs::write(
+        &rotate_after_post_arm,
+        format!("delta\t{full_room}\tpause-older\t{epsilon}\n"),
+    )
+    .expect("APPARATUS: re-pause the established legacy pair while rotating");
+    let (ok, out, err) = b.run(
+        &["room", "post", room, "SECOND-ROTATION", "--node", "delta"],
+        "",
+    );
+    assert!(ok, "APPARATUS: rotate the second sender key: {out}{err}");
+    let rotation = read_daemon_marker(
+        &rotate_after_post_result,
+        db.child.id(),
+        "second paused rotation",
+    );
+    assert!(rotation.trim().starts_with(&format!("delta\t{full_room}\trotated=true\trelease_requested=false\treleased_paused=false\tcomplete_target_batches=")),
+        "APPARATUS: second sender key did not rotate under the paused legacy pair: {rotation}");
+    let (ok, posted, err) = b.run(
+        &[
+            "room",
+            "post",
+            room,
+            "STALE-AUTHORITY-REKEY",
+            "--node",
+            "delta",
+            "--json",
+        ],
+        "",
+    );
+    assert!(
+        ok,
+        "APPARATUS: append the independent protected ciphertext: {posted}{err}"
+    );
+    let posted: serde_json::Value =
+        serde_json::from_str(posted.trim()).expect("APPARATUS: protected post has no JSON receipt");
+    let protected_hash = posted["entry_hash"]
+        .as_str()
+        .expect("APPARATUS: protected post has no hash");
+    assert!(
+        wait_until(RETURN_WITHIN, || {
+            let (ok, hashes, _) =
+                a.run(&["room", "read", room, "--node", "epsilon", "--hashes"], "");
+            ok && hashes
+                .lines()
+                .any(|line| line.split_whitespace().next() == Some(protected_hash))
+        }),
+        "APPARATUS: epsilon did not receive the independent protected ciphertext"
+    );
+    let (ok, unreadable, err) = a.run(&["room", "read", room, "--node", "epsilon"], "");
+    assert!(
+        ok && !unreadable.contains("STALE-AUTHORITY-REKEY"),
+        "APPARATUS: independent ciphertext was already readable: {unreadable}{err}\nsender:\n{}\nrecipient:\n{}",
+        db.said(), _da.said()
+    );
+    for stale in [rekey_engaged, rekey_decision, &rekey_fault] {
+        let _ = std::fs::remove_file(stale);
+    }
+    std::fs::write(rekey_arm, format!("{epsilon}\t{full_room}\tautomatic\n"))
+        .expect("APPARATUS: arm the exact lease-free automatic rekey");
+    std::fs::write(hold_arm, b"hold delta's revocation policy message\n")
+        .expect("APPARATUS: arm delta's reconciliation behind the rekey decision");
+    read_daemon_marker(
+        rekey_engaged,
+        db.child.id(),
+        "the exact lease-free automatic rekey enqueue",
     );
     let before = computer(b, &["status"])["revision"].as_u64().unwrap_or(0);
     let a_id = computer_id(a);
@@ -8871,37 +9308,10 @@ fn stale_rekey_is_not_delivered(
             rekey_release.display()
         )
     });
-    let post_result = rotating_post
-        .wait_with_output()
-        .expect("APPARATUS: collect the shipped sender-rotation post");
-    assert!(
-        post_result.status.success(),
-        "APPARATUS: the pre-revocation append did not complete after its rekey decision: {}{}",
-        String::from_utf8_lossy(&post_result.stdout),
-        String::from_utf8_lossy(&post_result.stderr)
-    );
-    let released = read_daemon_marker(
-        &rotate_after_post_result,
-        db.child.id(),
-        "the target post's exact paused sender-key release",
-    );
-    assert!(
-        released.trim().starts_with(&format!(
-            "delta\t{full_room}\trotated=false\trelease_requested=true\treleased_paused=true\tcomplete_target_batches="
-        )),
-        "APPARATUS: the target post did not release the exact paused sender-key obligation: {released}"
-    );
     let decision = read_daemon_marker(
         rekey_decision,
         db.child.id(),
         "the exact rekey authority decision",
-    );
-    let expected_batches = if decision.trim() == "enqueued" { 1 } else { 0 };
-    assert!(
-        released
-            .trim()
-            .ends_with(&format!("complete_target_batches={expected_batches}")),
-        "APPARATUS: the exact legacy re-key boundary reported {decision:?} but its post-side result did not name the corresponding complete-batch count: {released}"
     );
     if decision.trim() == "enqueued" {
         assert!(
