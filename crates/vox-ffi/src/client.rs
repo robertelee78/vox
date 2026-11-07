@@ -898,13 +898,25 @@ pub struct RoomAskInfo {
     /// How many sessions wait on the answer.
     pub sessions: u32,
 }
+/// An opaque operator decision and its non-secret scope.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct RoomDecisionInfo {
+    /// Opaque, single-use token invalid after expiry or daemon restart.
+    pub token: String,
+    /// Canonical directory affected by a replacement.
+    pub target: String,
+    /// Effective source block, or empty when unbound.
+    pub source: String,
+    /// Effective room id, `none`, or empty when unbound.
+    pub room: String,
+}
 
-/// What binding or declining an ask did: whether it was done, and its lines, said for a person.
+/// The reported outcome of a repository decision or ask, including any durability uncertainty.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct RoomAnswerInfo {
-    /// It was done.
+    /// The requested outcome was confirmed, including map durability when changed.
     pub done: bool,
-    /// What was done, or why not.
+    /// What happened; an unconfirmed operation may already be visible.
     pub said: Vec<String>,
 }
 
@@ -5216,6 +5228,89 @@ impl VoxClient {
                  vox's version",
             )),
         }
+    }
+    /// Inspect the current repository decision before an operator replacement.
+    pub async fn room_decision(&self, dir: String) -> Result<RoomDecisionInfo, VoxError> {
+        match self.daemon(DaemonRequest::RoomDecision { dir }).await? {
+            DaemonFrame::RoomDecision {
+                token,
+                target,
+                source,
+                room,
+            } => Ok(RoomDecisionInfo {
+                token,
+                target,
+                source,
+                room,
+            }),
+            DaemonFrame::RoomAnswer { said, .. } => Err(failed(said.join("\n"))),
+            _ => Err(failed("the daemon did not inspect the repository decision")),
+        }
+    }
+    /// Inspect an explicitly selected directory rather than a waiting session's scope.
+    pub async fn room_decision_explicit(&self, dir: String) -> Result<RoomDecisionInfo, VoxError> {
+        match self
+            .daemon(DaemonRequest::RoomDecisionExplicit { dir })
+            .await?
+        {
+            DaemonFrame::RoomDecision {
+                token,
+                target,
+                source,
+                room,
+            } => Ok(RoomDecisionInfo {
+                token,
+                target,
+                source,
+                room,
+            }),
+            DaemonFrame::RoomAnswer { said, .. } => Err(failed(said.join("\n"))),
+            _ => Err(failed("the daemon did not inspect the repository decision")),
+        }
+    }
+
+    /// Discard an unused inspection token.
+    pub async fn cancel_room_decision(&self, token: String) -> Result<(), VoxError> {
+        match self
+            .daemon(DaemonRequest::RoomDecisionCancel { token })
+            .await?
+        {
+            DaemonFrame::Ok => Ok(()),
+            _ => Err(failed("the daemon did not cancel the repository decision")),
+        }
+    }
+
+    /// Replace a captured decision; an empty link opts out.
+    pub async fn replace_room(
+        &self,
+        token: String,
+        link: String,
+        passphrase: Arc<Passphrase>,
+        node: String,
+    ) -> Result<RoomAnswerInfo, VoxError> {
+        self.room_answer(DaemonRequest::RoomReplace {
+            token,
+            link: link.trim().to_owned(),
+            passphrase: passphrase.copy(),
+            node,
+        })
+        .await
+    }
+    /// Answer a waiting ask against the decision displayed to the operator.
+    pub async fn bind_room_decision(
+        &self,
+        dir: String,
+        token: String,
+        link: String,
+        passphrase: Arc<Passphrase>,
+    ) -> Result<RoomAnswerInfo, VoxError> {
+        self.room_answer(DaemonRequest::RoomAnswerBind {
+            dir,
+            token,
+            link: link.trim().to_owned(),
+            passphrase: passphrase.copy(),
+        })
+        .await
     }
 
     /// Bind the directory `dir` to the room `link` names (ADR-029 RB-6), the person's answer to

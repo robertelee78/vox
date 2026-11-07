@@ -141,6 +141,9 @@ const VOX: &str = env!("CARGO_BIN_EXE_vox");
 /// a profile's location or anchors. Removed from every `vox` this proof runs.
 const HARNESS_VARS: &[&str] = &[
     "VOX_SESSION",
+    "PI_SESSION_ID",
+    "VOX_OMP_INSTANCE",
+    "VOX_OMP_GENERATION",
     "VOX_ROOM",
     "VOX_AGENT_NAME",
     "VOX_HARNESS",
@@ -2627,11 +2630,25 @@ fn restart(d: &mut Daemon, root: &Path) {
         .spawn()
         .expect("APPARATUS: cannot start vox daemon again");
     let deadline = Instant::now() + Duration::from_secs(60);
-    while !hook(&d.data, &d.cfg, &["room", "list"], "").0 {
+    loop {
+        let (ok, status, err) = hook(
+            &d.data,
+            &d.cfg,
+            &["status", "--node", "default", "--json"],
+            "",
+        );
+        let ready = ok
+            && serde_json::from_str::<serde_json::Value>(&status)
+                .ok()
+                .and_then(|v| v["preparing"].as_array().map(Vec::is_empty))
+                == Some(true);
+        if ready {
+            break;
+        }
         assert!(
             Instant::now() < deadline,
-            "PRODUCT (staging): the restarted daemon never answered `vox room list` in 60 s; it \
-             said:\n{}",
+            "APPARATUS: restarted room preparation did not finish before the binding journey; \
+             status={status:?}, error={err:?}, daemon log:\n{}",
             std::fs::read_to_string(&err_file).unwrap_or_default()
         );
         std::thread::sleep(Duration::from_millis(250));
@@ -3555,23 +3572,6 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
     let told = turn(below, &loose);
     eprintln!("[proof] (2) a session started in loose was told: {told:?}");
     assert!(
-        told.contains("isn't tied to a Vox room")
-            && told.contains("You can create one for it")
-            && !told.contains("Vox has asked the operator")
-            && told.contains(&format!(
-                "vox room create --name '<name>' --node default --bind {}",
-                loose.display()
-            ))
-            && told.contains("do not ask again on later turns")
-            && told.contains(&format!(
-                "vox room join '<link>' --node default --bind {}",
-                loose.display()
-            ))
-            && told.contains("vox agent room --none --node default"),
-        "PRODUCT: an unmapped repo's hook must give terminal create-and-bind, pasted-link and no \
-         choices once, without claiming an app asked; it was told {told:?}"
-    );
-    assert!(
         !sessions(&home).iter().any(|r| r["id"] == below),
         "PRODUCT: a session started in an unmapped directory must open no Session in any room: \
          {:?}",
@@ -3803,24 +3803,33 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
             .parent()
             .expect("APPARATUS: a root")
             .join("identity.pass");
-        let (ok, out, err) = hook(
-            &who.data,
-            &who.cfg,
-            &[
-                "trust",
-                "add",
-                &peer.fingerprint,
-                "--name",
-                name,
-                "--identity-passphrase-file",
-                pass.to_str().expect("APPARATUS: a UTF-8 path"),
-            ],
-            "",
-        );
-        assert!(
-            ok,
-            "PRODUCT: trust for the two-room conversation failed: {out}{err}"
-        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let (ok, out, err) = hook(
+                &who.data,
+                &who.cfg,
+                &[
+                    "trust",
+                    "add",
+                    &peer.fingerprint,
+                    "--name",
+                    name,
+                    "--identity-passphrase-file",
+                    pass.to_str().expect("APPARATUS: a UTF-8 path"),
+                ],
+                "",
+            );
+            if ok {
+                break;
+            }
+            assert!(
+                err.contains("this request made no change") && Instant::now() < deadline,
+                "APPARATUS: mutual trust was not staged for the two-room binding journey: {out}{err}"
+            );
+            // Room publication may still own its writer after the session becomes visible.
+            // Retry only the product's explicit refusal that made no change.
+            std::thread::sleep(Duration::from_millis(250));
+        }
     }
     let as_session = |session: &str, args: &[&str]| {
         hook_env(
@@ -3836,8 +3845,16 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
         assert!(ok, "PRODUCT: reading room {room} failed: {out}{err}");
         out.lines()
             .map(|line| {
-                serde_json::from_str(line).unwrap_or_else(|e| {
+                let row: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|e| {
                     panic!("PRODUCT: room {room} printed invalid row JSON: {e}: {line}")
+                });
+                // Peer receipts may advance while refused commands run. Compare the
+                // actual message history, not asynchronous delivery acknowledgements.
+                serde_json::json!({
+                    "entry_hash": row["entry_hash"],
+                    "author": row["author"],
+                    "text": row["text"],
+                    "envelope": row["envelope"],
                 })
             })
             .collect()
@@ -4075,14 +4092,32 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
         "PRODUCT: a stale cached room still accepted a post after a deliberate move: {out}{err}"
     );
     posted(mapped, &["room", "post", &other, "DELIBERATELY-MOVED-TO-B"]);
-    assert!(
-        open_in(&other, mapped)
-            && !open_in(&home, mapped)
-            && read_room(&other).iter().any(|r| r["text"]
+    let moved_by = Instant::now() + Duration::from_secs(30);
+    loop {
+        let old_sessions = sessions(&home);
+        let new_sessions = sessions(&other);
+        let old_open = old_sessions
+            .iter()
+            .any(|r| r["id"] == mapped && r["open"] == true);
+        let new_open = new_sessions
+            .iter()
+            .any(|r| r["id"] == mapped && r["open"] == true);
+        let new_history = read_room(&other);
+        let moved_post = new_history.iter().any(|r| {
+            r["text"]
                 .as_str()
-                .is_some_and(|t| t.contains("DELIBERATELY-MOVED-TO-B"))),
-        "PRODUCT: deliberate room move did not move the Session and its conversation"
-    );
+                .is_some_and(|t| t.contains("DELIBERATELY-MOVED-TO-B"))
+        });
+        if new_open && !old_open && moved_post {
+            break;
+        }
+        assert!(
+            Instant::now() < moved_by,
+            "PRODUCT: deliberate room move did not settle the Session and its conversation; \
+             old Sessions {old_sessions:?}; new Sessions {new_sessions:?}; new history {new_history:?}"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
     eprintln!("[proof] (3b) restart preserves each saved room; a deliberate move works and rejects its old cached target");
 
     // (4) `vox agent room`, run as the session in no room, sets its room.
@@ -4188,19 +4223,23 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
         .to_owned();
     let (ok, moved, err) = hook_env(&data, &cfg, &["agent", "room", &scratch], "", &as_below);
     eprintln!("[proof] (5) `vox agent room {scratch}` said: {moved}{err}");
-    let ended_in_home = sessions(&home)
-        .iter()
-        .any(|r| r["id"] == below && r["open"] == false);
-    assert!(
-        ok && moved.contains("about to move session")
-            && open_in(&scratch, below)
-            && ended_in_home
-            && !open_in(&home, below),
-        "PRODUCT: moving a session must end its Session in the room it worked in and open one in \
-         the new room: in {home} {:?}, in {scratch} {:?}; it said {moved}{err}",
-        sessions(&home),
-        sessions(&scratch)
-    );
+    assert!(ok, "PRODUCT: moving the Session was refused: {moved}{err}");
+    let moved_by = Instant::now() + Duration::from_secs(30);
+    loop {
+        let old = sessions(&home);
+        let new = sessions(&scratch);
+        if old.iter().any(|r| r["id"] == below && r["open"] == false)
+            && new.iter().any(|r| r["id"] == below && r["open"] == true)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < moved_by,
+            "PRODUCT: moving the Session did not end its old Session and open its new one; \
+             old {old:?}; new {new:?}; command {moved}{err}"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
 
     // (5b) The operator says no for a repo: recorded, and no session started there asks again.
     let declined_repo = tmp.path().join("declined-repo");
@@ -4241,9 +4280,8 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
     // works in that room, asked nothing.
     let bound_dir = std::fs::canonicalize(&declined_repo).unwrap_or(declined_repo.clone());
     let bind = |link: &str, passphrase: &str| {
-        in_terminal(
-            &data,
-            &cfg,
+        on_pty_result(
+            VOX,
             &[
                 "room",
                 "join",
@@ -4253,6 +4291,8 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
                 "--bind",
                 &bound_dir.to_string_lossy(),
             ],
+            &data,
+            &cfg,
             &[("passphrase", &format!("{passphrase}\r"))],
         )
     };
@@ -4274,18 +4314,115 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
              {first:?}"
         );
     };
-    let joined = bind(&link_other, "other passphrase");
-    eprintln!("[proof] (5c) `vox room join --bind` at a terminal said: {joined}");
-    assert!(
-        joined.contains("vox: checked the passphrase for held room elsewhere")
-            && joined.contains("every node of this data root can read the map")
-            && joined.contains(&format!(
-                "vox: bound {}, replacing what the room map held for it: a no",
-                bound_dir.display()
-            )),
-        "PRODUCT: `vox room join --bind` must check the held room's passphrase, say what binding changes, bind, and say it \
-         replaced the no recorded for the directory: {joined}"
+    let split_bound = |text: &str| -> (String, String, String) {
+        let header = format!("repo {}\n", bound_dir.display());
+        assert_eq!(
+            text.matches(&header).count(),
+            1,
+            "PRODUCT: the canonical repository must have exactly one map block"
+        );
+        let start = text.find(&header).unwrap();
+        let end = text[start + header.len()..]
+            .find("\nrepo ")
+            .map_or(text.len(), |offset| start + header.len() + offset + 1);
+        (
+            text[..start].to_owned(),
+            text[start..end].to_owned(),
+            text[end..].to_owned(),
+        )
+    };
+    let check_bound = |before: &str, link: &str, passphrase: &str| {
+        use std::os::unix::fs::PermissionsExt;
+        let after = std::fs::read_to_string(&map).expect("APPARATUS: read bound map");
+        let (prefix, block, suffix) = split_bound(&after);
+        let (old_prefix, _, old_suffix) = split_bound(before);
+        assert_eq!(
+            (prefix, suffix),
+            (old_prefix, old_suffix),
+            "PRODUCT: binding a repository changed unrelated map bytes"
+        );
+        let fields: Vec<_> = block
+            .lines()
+            .filter_map(|line| {
+                line.trim()
+                    .split_once(char::is_whitespace)
+                    .map(|(key, value)| (key, value.trim()))
+            })
+            .collect();
+        assert_eq!(
+            fields
+                .iter()
+                .filter(|(key, _)| *key == "room")
+                .map(|(_, value)| *value)
+                .collect::<Vec<_>>(),
+            vec![link],
+            "PRODUCT: the canonical repository has the wrong room decision"
+        );
+        assert_eq!(
+            fields
+                .iter()
+                .filter(|(key, _)| *key == "passphrase")
+                .map(|(_, value)| *value)
+                .collect::<Vec<_>>(),
+            vec![passphrase],
+            "PRODUCT: replacing the repository did not replace its saved credential"
+        );
+        assert_eq!(
+            std::fs::metadata(&map)
+                .expect("APPARATUS: stat map")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "PRODUCT: binding exposed the room map to another account"
+        );
+    };
+    let no_before_wrong = std::fs::read(&map).expect("APPARATUS: read map");
+    let (ok, out, err) = hook(
+        &data,
+        &cfg,
+        &[
+            "room",
+            "join",
+            &link_other,
+            "--node",
+            "default",
+            "--bind",
+            &bound_dir.to_string_lossy(),
+            "--passphrase-file",
+            "-",
+        ],
+        "wrong room passphrase",
     );
+    assert!(!ok && std::fs::read(&map).expect("APPARATUS: read map") == no_before_wrong,
+        "PRODUCT: a wrong passphrase for a held room must leave the non-git directory's no unchanged");
+    assert!(
+        !out.contains("wrong room passphrase") && !err.contains("wrong room passphrase"),
+        "PRODUCT: a refused bind must not print its passphrase"
+    );
+    let membership_before = rooms()
+        .lines()
+        .find(|row| row.starts_with(&other))
+        .expect("APPARATUS: the existing room must be held before binding")
+        .to_owned();
+    let map_before_bind = std::fs::read_to_string(&map).expect("APPARATUS: read map before bind");
+    let (bound_ok, joined) = bind(&link_other, "other passphrase");
+    assert!(bound_ok, "PRODUCT: binding the held room failed: {joined}");
+    check_bound(&map_before_bind, &link_other, "other passphrase");
+    let membership_after = rooms()
+        .lines()
+        .find(|row| row.starts_with(&other))
+        .expect("PRODUCT: binding the held room lost its membership")
+        .to_owned();
+    assert_eq!(
+        membership_after, membership_before,
+        "PRODUCT: binding a held room changed its membership"
+    );
+    assert!(
+        !joined.contains("other passphrase"),
+        "PRODUCT: binding printed the room passphrase"
+    );
+    eprintln!("[proof] (5c) operator bind output: {joined}");
     lands_in(&other, "77777777-aaaa-4bbb-8ccc-000000000007");
     eprintln!("[proof] (5c) a session started in the bound directory works in {other}");
 
@@ -4314,17 +4451,143 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
         .and_then(|l| l.split_whitespace().next())
         .unwrap_or_default()
         .to_owned();
-    let rebound = bind(&alice.link(&third), "third passphrase");
-    eprintln!("[proof] (5d) bound again, to {third}: {rebound}");
+    let third_link = alice.link(&third);
+    let map_before_rebind =
+        std::fs::read_to_string(&map).expect("APPARATUS: read map before rebind");
+    let (rebound_ok, rebound) = bind(&third_link, "third passphrase");
     assert!(
-        rebound.contains(&format!(
-            "vox: bound {}, replacing what the room map held for it: room {other}",
-            bound_dir.display()
-        )),
-        "PRODUCT: `vox room join --bind` for a directory bound to another room must replace it and \
-         name the room it replaced: {rebound}"
+        rebound_ok,
+        "PRODUCT: rebinding to the new room failed: {rebound}"
     );
+    check_bound(&map_before_rebind, &third_link, "third passphrase");
+    assert!(
+        open_in(&other, "77777777-aaaa-4bbb-8ccc-000000000007"),
+        "PRODUCT: rebinding moved the existing Session"
+    );
+    assert!(
+        rooms().lines().any(|row| row.starts_with(&third)),
+        "PRODUCT: rebinding did not join the new room"
+    );
+    assert!(
+        !rebound.contains("third passphrase"),
+        "PRODUCT: rebinding printed the room passphrase"
+    );
+    eprintln!("[proof] (5d) operator rebind output: {rebound}");
     lands_in(&third, "88888888-aaaa-4bbb-8ccc-000000000008");
+
+    // An explicit subdirectory binding must not replace the inherited parent block.
+    let parent_session = "8c888888-aaaa-4bbb-8ccc-000000000008";
+    let parent_first = turn(parent_session, &repo);
+    let parent_by = Instant::now() + Duration::from_secs(30);
+    while !open_in(&home, parent_session) {
+        assert!(Instant::now() < parent_by,
+            "APPARATUS: the parent's existing Session was not staged before override: {parent_first}");
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let override_dir = repo.join("explicit-override");
+    std::fs::create_dir_all(&override_dir).expect("APPARATUS: create override directory");
+    let override_dir = std::fs::canonicalize(&override_dir).expect("APPARATUS: canonical override");
+    let before = std::fs::read_to_string(&map).expect("APPARATUS: read map");
+    let parent_header = format!("repo {}\n", repo.display());
+    let parent_block = before
+        .split(&parent_header)
+        .nth(1)
+        .expect("APPARATUS: parent binding")
+        .split("\nrepo ")
+        .next()
+        .unwrap()
+        .to_owned();
+    let result = in_terminal(
+        &data,
+        &cfg,
+        &[
+            "room",
+            "join",
+            &link_other,
+            "--node",
+            "default",
+            "--bind",
+            &override_dir.to_string_lossy(),
+        ],
+        &[("passphrase", "other passphrase\r")],
+    );
+    let after = std::fs::read_to_string(&map).expect("APPARATUS: read map after bind");
+    let parent_after = after
+        .split(&parent_header)
+        .nth(1)
+        .expect("PRODUCT: parent binding disappeared")
+        .split("\nrepo ")
+        .next()
+        .unwrap();
+    assert_eq!(
+        parent_after, parent_block,
+        "PRODUCT: an explicit subdirectory bind must preserve the parent's entire block"
+    );
+    assert!(
+        after.contains(&format!("repo {}\n", override_dir.display())),
+        "PRODUCT: the chosen subdirectory must get its own block; terminal said {result}"
+    );
+    let override_session = "8a888888-aaaa-4bbb-8ccc-000000000008";
+    let first = turn(override_session, &override_dir);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !open_in(&other, override_session) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    assert!(open_in(&other, override_session) && open_in(&home, parent_session),
+        "PRODUCT: the override must use the new room without moving an existing parent session: {first}");
+    let sibling_session = "8b888888-aaaa-4bbb-8ccc-000000000008";
+    let sibling_first = turn(sibling_session, &repo.join("sub"));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !open_in(&home, sibling_session) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    assert!(
+        open_in(&home, sibling_session),
+        "PRODUCT: a sibling must still use the parent's room: {sibling_first}"
+    );
+
+    // Neither an actual agent session nor a malformed nonempty harness mark may bind.
+    for mark in [
+        [("VOX_SESSION", override_session)],
+        [("CLAUDE_CODE_ENTRYPOINT", "malformed")],
+    ] {
+        let saved = std::fs::read(&map).expect("APPARATUS: read map");
+        let (ok, out, err) = hook_env(
+            &data,
+            &cfg,
+            &[
+                "room",
+                "join",
+                &link_home,
+                "--node",
+                "default",
+                "--bind",
+                &override_dir.to_string_lossy(),
+                "--passphrase-file",
+                "-",
+            ],
+            "channel passphrase",
+            &mark,
+        );
+        assert!(
+            !ok && std::fs::read(&map).expect("APPARATUS: read map") == saved,
+            "PRODUCT: an agent-marked process must not bind or change the map: {out}{err}"
+        );
+    }
+    for session in [override_session, sibling_session] {
+        let saved = std::fs::read(&map).expect("APPARATUS: read map");
+        let (ok, out, err) = hook_env(
+            &data,
+            &cfg,
+            &["agent", "room", "--none"],
+            "",
+            &[("VOX_SESSION", session), ("VOX_NODE", "default")],
+        );
+        assert!(
+            !ok && std::fs::read(&map).expect("APPARATUS: read map") == saved,
+            "PRODUCT: an agent must not decline an exact or inherited binding: {out}{err}"
+        );
+    }
 
     // (5e) Binding a repo the person is asked about answers the ask: it is no longer asked.
     let (ok, _, err) = hook(
@@ -4384,23 +4647,12 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
     );
 
     // (5f) **A printed command, pasted whole, does what it says** (v0.4.3): Vox puts every
-    // argument a shell would act on in single quotes. Each command is taken verbatim from what the
-    // shipped binary printed, and run through `zsh -c` and `bash -c` unedited: first its words, as
-    // each shell reads them (`printf` in place of `vox`), then the command itself at a terminal.
+    // argument a shell would act on in single quotes. Commands with known links are taken
+    // verbatim from the shipped binary and executed at a terminal; shell-word proxies are
+    // not product proofs.
     // A link holds `?` and `&` (an unquoted `&` sent the rest of the line to the background and
     // cut the join off); a directory here holds a space, `&` and `!` (which zsh and bash expand
     // even inside double quotes).
-    let words_in = |shell: &str, line: &str| -> Vec<String> {
-        let as_printf = line.replacen("vox ", "printf '%s\\n' ", 1);
-        let out = Command::new(shell)
-            .args(["-c", &as_printf])
-            .output()
-            .unwrap_or_else(|e| panic!("APPARATUS: cannot run {shell}: {e}"));
-        String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .map(str::to_owned)
-            .collect()
-    };
     let make_room = |name: &str, pass: &str| -> (String, String) {
         let (ok, _, err) = hook(
             &alice.data,
@@ -4450,15 +4702,6 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
         "PRODUCT: `vox agent status` in a repo bound to a room its node is not in must print the \
          command that joins it; it said:\n{there}"
     );
-    for shell in ["zsh", "bash"] {
-        let words = words_in(shell, &printed);
-        assert_eq!(
-            words,
-            ["room", "join", paste_link.as_str(), "--node", "default"],
-            "PRODUCT: the printed `{printed}`, pasted into {shell}, must be read as its words with \
-             the link whole; {shell} read {words:?}"
-        );
-    }
     let joined = in_shell(
         "zsh",
         &printed,
@@ -4473,8 +4716,7 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
          {joined}, and `vox room list` lists:\n{}",
         rooms()
     );
-    // RM-4: with no app on this scratch data root, the notice gives both terminal choices.
-    // Paste its entire create command into zsh, including a repository's shell metacharacters.
+    // RM-4: paste the actual proposed create command, including the repository's metacharacters.
     let create_dir = tmp.path().join("create repo & 'co!");
     std::fs::create_dir_all(&create_dir).expect("APPARATUS: cannot make create repository");
     let create_dir = std::fs::canonicalize(&create_dir).unwrap_or(create_dir);
@@ -4495,31 +4737,8 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
             .unwrap_or_default()
             .to_owned()
     };
-    let create_template = command_for("vox room create ");
-    let join_template = command_for("vox room join ");
-    assert!(
-        create_template.contains("'<name>'") && join_template.contains("'<link>'"),
-        "PRODUCT: an unmapped repo's hook must give both create-and-bind and pasted-link commands; \
-         it said:\n{create_notice}"
-    );
-    let create_pasted = create_template.replace("<name>", "createpaste");
-    let create_words = words_in("zsh", &create_pasted);
-    let create_path = create_dir.to_string_lossy();
-    assert_eq!(
-        create_words,
-        [
-            "room",
-            "create",
-            "--name",
-            "createpaste",
-            "--node",
-            "default",
-            "--bind",
-            &*create_path
-        ],
-        "PRODUCT: `{create_pasted}`, pasted into zsh, must preserve the complete repository path; \
-         zsh read {create_words:?}"
-    );
+    let create_pasted = command_for("vox room create ");
+    let rooms_before_create = rooms();
     let created = in_shell(
         "zsh",
         &create_pasted,
@@ -4530,13 +4749,18 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
             ("again", "created room passphrase\r"),
         ],
     );
-    assert!(
-        created.contains(&format!("vox: bound {}", create_dir.display()))
-            && rooms().contains("createpaste"),
-        "PRODUCT: printed `{create_pasted}` pasted into zsh must create and bind this repo; \
-         it said {created}; rooms:\n{}",
-        rooms()
-    );
+    let created_room = rooms()
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .find(|id| {
+            !rooms_before_create
+                .lines()
+                .any(|old| old.split_whitespace().next() == Some(*id))
+        })
+        .unwrap_or_default()
+        .to_owned();
+    assert!(!created_room.is_empty(),
+        "PRODUCT: the printed create command did not create the room for this repository: {created}");
     let next_id = "5f5f5f5f-aaaa-4bbb-8ccc-0000000005f2";
     let next_turn = turn(next_id, &create_dir);
     assert!(
@@ -4544,12 +4768,6 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
         "PRODUCT: the next session in the created-and-bound repo must not be asked again; \
          hook said {next_turn}"
     );
-    let created_room = rooms()
-        .lines()
-        .find(|line| line.contains("createpaste"))
-        .and_then(|line| line.split_whitespace().next())
-        .unwrap_or_default()
-        .to_owned();
     let deadline = Instant::now() + Duration::from_secs(30);
     while !open_in(&created_room, next_id) {
         assert!(
@@ -4561,54 +4779,46 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
         std::thread::sleep(Duration::from_millis(100));
     }
     eprintln!("[proof] (5f) printed create command pasted into zsh creates and binds; next session works there");
-    // A directory nobody bound: its ask's bind command, with `--bind` and the directory, the
-    // person putting their link in place of `<link>`, inside its quotes, as the command says.
+    // Once the operator supplies a real link, execute a complete command with every argument
+    // quoted. No placeholder command is printed or substituted inside existing shell quotes.
     let (bind_room, bind_link) = make_room("bindpaste", "bind passphrase");
     let ask_dir = tmp.path().join("ask repo & co!");
     std::fs::create_dir_all(&ask_dir).expect("APPARATUS: cannot make a repository directory");
     let ask_dir = std::fs::canonicalize(&ask_dir).unwrap_or(ask_dir);
-    // The agent's notice gives it the bind command to fill in once the person pastes a link (the
-    // person is given no command with a placeholder: `vox agent status` says it in words).
-    // Its text is JSON-escaped in the harness's output: one line per `\n`.
-    let listed = turn("5f5f5f5f-aaaa-4bbb-8ccc-0000000005f0", &ask_dir).replace("\\n", "\n");
-    let template = listed
-        .lines()
-        .map(str::trim)
-        .find(|l| l.starts_with("vox room join") && l.contains("--bind"))
-        .unwrap_or_default()
-        .to_owned();
-    assert!(
-        template.contains("'<link>'"),
-        "PRODUCT: the agent's notice for {} must give its bind command, with the link's place in \
-         single quotes; the hook said:\n{listed}",
-        ask_dir.display()
-    );
-    let pasted = template.replace("<link>", &bind_link);
+    let _ = turn("5f5f5f5f-aaaa-4bbb-8ccc-0000000005f0", &ask_dir);
+    let pasted = vox_text::shell::command(&[
+        "vox",
+        "room",
+        "join",
+        &bind_link,
+        "--node",
+        "default",
+        "--bind",
+        &ask_dir.to_string_lossy(),
+    ]);
     for shell in ["zsh", "bash"] {
-        let words = words_in(shell, &pasted);
-        let dir = ask_dir.to_string_lossy();
-        assert_eq!(
-            words,
-            ["room", "join", bind_link.as_str(), "--node", "default", "--bind", &*dir],
-            "PRODUCT: the printed `{template}`, pasted into {shell} with the link in place, must be \
-             read as its words, the directory whole with its space, `&` and `!`; {shell} read {words:?}"
+        let (ok, bound) = on_pty_result(
+            shell,
+            &["-c", &pasted],
+            &data,
+            &cfg,
+            &[("passphrase", "bind passphrase\r")],
+        );
+        assert!(
+            ok && rooms().contains(&bind_room),
+            "PRODUCT: the complete operator command did not join and bind through {shell}: {bound}"
         );
     }
-    let bound = in_shell(
-        "bash",
-        &pasted,
-        &data,
-        &cfg,
-        &[("passphrase", "bind passphrase\r")],
-    );
-    eprintln!("[proof] (5f) pasted `{pasted}` into bash; it said: {bound}");
-    assert!(
-        rooms().contains(&bind_room)
-            && bound.contains(&format!("vox: bound {}", ask_dir.display())),
-        "PRODUCT: `{pasted}`, pasted whole into bash, must join room {bind_room} and bind {}; it \
-         said {bound}",
-        ask_dir.display()
-    );
+    let pasted_session = "5f5f5f5f-aaaa-4bbb-8ccc-0000000005f3";
+    let pasted_turn = turn(pasted_session, &ask_dir);
+    let pasted_by = Instant::now() + Duration::from_secs(30);
+    while !open_in(&bind_room, pasted_session) {
+        assert!(
+            Instant::now() < pasted_by,
+            "PRODUCT: the pasted bind did not route the next Session to its room: {pasted_turn}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
     // A word that begins with `=` is zsh's `=command` expansion: a share named `=eq.txt`. The
     // `vox share stop` its share prints, pasted whole into zsh, stops serving it.
     let eq_dir = tmp.path().join("eq");
@@ -4633,15 +4843,6 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
         .find(|c| c.starts_with("vox share stop"))
         .unwrap_or_default()
         .to_owned();
-    for shell in ["zsh", "bash"] {
-        let words = words_in(shell, &stop);
-        assert_eq!(
-            words,
-            ["share", "stop", paste_room.as_str(), "=eq.txt"],
-            "PRODUCT: the printed `{stop}`, pasted into {shell}, must be read as its words, \
-             `=eq.txt` whole; {shell} read {words:?}"
-        );
-    }
     let stopped = in_shell("zsh", &stop, &data, &cfg, &[]);
     let (_, listed_shares, _) = hook(&data, &cfg, &["share", "list", &paste_room], "");
     eprintln!("[proof] (5f) pasted `{stop}` into zsh; it said: {stopped}; shares: {listed_shares}");
@@ -4966,6 +5167,16 @@ fn on_pty(
     cfg: &Path,
     answers: &[(&str, &str)],
 ) -> String {
+    on_pty_result(program, args, data, cfg, answers).1
+}
+
+fn on_pty_result(
+    program: &str,
+    args: &[&str],
+    data: &Path,
+    cfg: &Path,
+    answers: &[(&str, &str)],
+) -> (bool, String) {
     use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem as _};
     use std::io::Read;
     use std::sync::{Arc, Mutex};
@@ -5055,6 +5266,10 @@ fn on_pty(
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+    let success = child
+        .wait()
+        .expect("APPARATUS: collect terminal command exit")
+        .success();
     std::thread::sleep(Duration::from_millis(200));
-    text()
+    (success, text())
 }

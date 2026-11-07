@@ -56,11 +56,28 @@ pub fn path(data_root: &Path) -> PathBuf {
 /// refused, as ssh refuses a key others can read), or a line is not one the map takes, named by
 /// its number.
 pub fn read(data_root: &Path) -> Result<Vec<Entry>, AppError> {
+    let text = read_text(data_root)?;
+    parse_map(data_root, &text)
+}
+
+fn parse_map(data_root: &Path, text: &str) -> Result<Vec<Entry>, AppError> {
+    parse(text).map_err(|(n, why)| {
+        AppError::Usage(format!(
+            "the room map {}, line {n}: {why}",
+            path(data_root).display()
+        ))
+    })
+}
+
+fn read_text(data_root: &Path) -> Result<Zeroizing<String>, AppError> {
+    use std::io::Read;
     use std::os::unix::fs::PermissionsExt;
     let file = path(data_root);
-    let text = match std::fs::read_to_string(&file) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+    let mut f = match std::fs::File::open(&file) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Zeroizing::new(String::new()))
+        }
         Err(e) => {
             return Err(AppError::Usage(format!(
                 "cannot read the room map {}: {e}",
@@ -68,10 +85,7 @@ pub fn read(data_root: &Path) -> Result<Vec<Entry>, AppError> {
             )))
         }
     };
-    let text = Zeroizing::new(text);
-    let mode = std::fs::metadata(&file)
-        .map(|m| m.permissions().mode() & 0o777)
-        .unwrap_or(0);
+    let mode = f.metadata().map_err(AppError::Io)?.permissions().mode() & 0o777;
     if mode & 0o077 != 0 {
         return Err(AppError::Usage(format!(
             "the room map {} holds room passphrases and others may read it (mode {mode:o}); \
@@ -80,9 +94,11 @@ pub fn read(data_root: &Path) -> Result<Vec<Entry>, AppError> {
             vox_text::shell::command(&["chmod", "600", &file.display().to_string()])
         )));
     }
-    parse(&text).map_err(|(n, why)| {
-        AppError::Usage(format!("the room map {}, line {n}: {why}", file.display()))
-    })
+    let mut text = Zeroizing::new(String::new());
+    f.read_to_string(&mut text).map_err(|e| {
+        AppError::Usage(format!("cannot read the room map {}: {e}", file.display()))
+    })?;
+    Ok(text)
 }
 
 /// The blocks of a room map's text, or the 1-based number of the first line it does not take and
@@ -356,126 +372,399 @@ pub fn suggested_name(dir: &Path) -> String {
     }
 }
 
-/// Add a `repo` block to `data_root`'s room map: `repo` works in the room `link` names, joined with
-/// `passphrase` (none when empty). The map is made, mode 0600, if there is none; what it held is
-/// kept.
-///
-/// # Errors
-/// The map cannot be read (what [`read`] refuses) or written, or it names `repo` already.
-pub fn add(data_root: &Path, repo: &Path, link: &str, passphrase: &str) -> Result<(), AppError> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
+/// A decision retained only in daemon memory. Credentials are never exposed by this type.
+pub struct Snapshot {
+    /// Canonical directory that a replacement would affect.
+    pub target: PathBuf,
+    /// Effective source block, when the map resolves one.
+    pub source: Option<PathBuf>,
+    /// Effective room id or `none`, without a link or credential.
+    pub room: Option<String>,
+    start: PathBuf,
+    explicit: bool,
+    canonical_start: PathBuf,
+    effective: Option<Identity>,
+    override_at_target: Option<Identity>,
+}
+
+#[derive(PartialEq, Eq)]
+struct Identity {
+    repo: PathBuf,
+    room: String,
+    passphrase: Zeroizing<String>,
+}
+
+fn identity(entry: &Entry) -> Identity {
+    Identity {
+        repo: canonical_or_original(&entry.repo),
+        room: entry.room.clone(),
+        passphrase: entry.passphrase.clone(),
+    }
+}
+
+fn canonical_or_original(p: &Path) -> PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+fn conflict() -> AppError {
+    AppError::Usage(
+        "the room map or repository scope changed; refresh the decision and try again".into(),
+    )
+}
+
+// Refuse duplicate aliases: first-match resolution cannot safely identify an editable block.
+fn validate_unique(entries: &[Entry]) -> Result<(), AppError> {
+    let mut seen = std::collections::HashSet::new();
+    for entry in entries {
+        if !seen.insert(canonical_or_original(&entry.repo)) {
+            return Err(AppError::Usage(
+                "the room map has ambiguous duplicate repository blocks".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn decision(entries: &[Entry], start: &Path, explicit: bool) -> Result<Snapshot, AppError> {
+    validate_unique(entries)?;
+    let original_start = start.to_path_buf();
+    let start = std::fs::canonicalize(start).map_err(|_| {
+        AppError::Usage(
+            "the repository directory is missing or inaccessible; choose a valid repository".into(),
+        )
+    })?;
+    if !start.is_dir() {
+        return Err(AppError::Usage(
+            "the repository boundary is not a directory".into(),
+        ));
+    }
+    let mut top = None;
+    for dir in start.ancestors() {
+        match std::fs::symlink_metadata(dir.join(".git")) {
+            Ok(_) => {
+                top = Some(dir);
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(AppError::Usage(format!(
+                    "cannot inspect repository metadata: {e}"
+                )))
+            }
+        }
+    }
+    let effective = resolve(entries, &start).map(identity);
+    let boundary = if let Some(top) = top {
+        let git = top.join(".git");
+        if git.is_dir() {
+            top.to_path_buf()
+        } else if git.is_file() {
+            if let Some((worktree, main)) = worktree_of(&start) {
+                if !main.join(".git").is_dir() {
+                    return Err(AppError::Usage(
+                        "the linked worktree's main repository is invalid".into(),
+                    ));
+                }
+                if effective
+                    .as_ref()
+                    .is_some_and(|e| e.repo.starts_with(&worktree))
+                {
+                    worktree
+                } else {
+                    main
+                }
+            } else {
+                let text = std::fs::read_to_string(&git)
+                    .map_err(|_| AppError::Usage("cannot read repository metadata".into()))?;
+                let name = text
+                    .trim()
+                    .strip_prefix("gitdir:")
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| AppError::Usage("the repository metadata is invalid".into()))?;
+                let dir = Path::new(name);
+                let dir = if dir.is_absolute() {
+                    dir.to_path_buf()
+                } else {
+                    top.join(dir)
+                };
+                if !dir.is_dir() || dir.join("commondir").exists() {
+                    return Err(AppError::Usage(
+                        "cannot establish an unambiguous repository boundary".into(),
+                    ));
+                }
+                top.to_path_buf()
+            }
+        } else {
+            return Err(AppError::Usage("the repository metadata is invalid".into()));
+        }
+    } else {
+        start.clone()
+    };
+    let target = if explicit { start.clone() } else { boundary };
+    // A nested block within the repository controls only part of it, not the whole boundary.
+    if let Some(e) = &effective {
+        if !explicit && e.repo.starts_with(&target) && e.repo != target {
+            return Err(AppError::Usage(
+                "a more-specific room override makes this repository scope ambiguous".into(),
+            ));
+        }
+    }
+    let override_at_target = lookup(entries, &target).map(identity);
+    Ok(Snapshot {
+        source: effective.as_ref().map(|e| e.repo.clone()),
+        room: effective.as_ref().map(|e| {
+            if e.room == DECLINED {
+                DECLINED.to_owned()
+            } else {
+                vox_core::node::link::InviteLink::parse(&e.room)
+                    .map(|link| vox_core::node::link::b32_encode(&link.channel_id))
+                    .unwrap_or_default()
+            }
+        }),
+        target,
+        start: original_start,
+        explicit,
+        canonical_start: start,
+        effective,
+        override_at_target,
+    })
+}
+
+/// Capture the effective decision and its private full identity for a later compare-and-swap.
+pub fn snapshot(data_root: &Path, repo: &Path) -> Result<Snapshot, AppError> {
     let entries = read(data_root)?;
-    if lookup(&entries, repo).is_some() {
+    decision(&entries, repo, false)
+}
+
+/// Capture a decision for exactly the selected directory, including inherited bindings.
+pub fn snapshot_explicit(data_root: &Path, directory: &Path) -> Result<Snapshot, AppError> {
+    let entries = read(data_root)?;
+    decision(&entries, directory, true)
+}
+
+struct MapLock {
+    _file: std::fs::File,
+}
+
+impl MapLock {
+    fn acquire(data_root: &Path) -> Result<Self, AppError> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(data_root.join("rooms.lock"))
+            .map_err(|e| AppError::Usage(format!("cannot open room map lock: {e}")))?;
+        rustix::fs::flock(&f, rustix::fs::FlockOperation::LockExclusive)
+            .map_err(|e| AppError::Usage(format!("cannot lock room map: {e}")))?;
+        Ok(Self { _file: f })
+    }
+}
+
+fn description(entry: &Entry) -> String {
+    if entry.room == DECLINED {
+        "a no (`room none`)".to_owned()
+    } else {
+        let room = vox_core::node::link::InviteLink::parse(&entry.room)
+            .map(|l| vox_core::node::link::b32_encode(&l.channel_id))
+            .unwrap_or_default();
+        format!("room {}", room.chars().take(12).collect::<String>())
+    }
+}
+
+// Keep comments (including those inside the replaced block) and every unrelated line verbatim.
+fn rewritten(
+    text: &str,
+    target: &Path,
+    link: &str,
+    passphrase: &str,
+) -> Result<Zeroizing<String>, AppError> {
+    let repo = target
+        .to_str()
+        .ok_or_else(|| AppError::Usage("repository path is not valid UTF-8".into()))?;
+    if repo.contains('\n')
+        || repo.contains('\r')
+        || link.contains('\n')
+        || link.contains('\r')
+        || passphrase.contains('\n')
+        || passphrase.contains('\r')
+        || repo.trim() != repo
+        || link.trim() != link
+        || passphrase.trim() != passphrase
+    {
+        return Err(AppError::Usage(
+            "repository, room or passphrase cannot be represented in the room map".into(),
+        ));
+    }
+    if link != DECLINED {
+        vox_core::node::link::InviteLink::parse(link)
+            .map_err(|e| AppError::Usage(format!("invalid room link: {e}")))?;
+    } else if !passphrase.is_empty() {
+        return Err(AppError::Usage("room none cannot have a passphrase".into()));
+    }
+    let mut result = Zeroizing::new(String::new());
+    let mut replacing = false;
+    let mut inserted = false;
+    for line in text.split_inclusive('\n') {
+        let t = line.trim();
+        let (key, value) = t.split_once(char::is_whitespace).unwrap_or((t, ""));
+        if key == "repo" {
+            replacing = canonical_or_original(Path::new(value.trim())) == target;
+            if replacing {
+                result.push_str(&format!("repo {repo}\n    room       {link}\n"));
+                if !passphrase.is_empty() {
+                    result.push_str(&format!("    passphrase {passphrase}\n"));
+                }
+                inserted = true;
+                continue;
+            }
+        }
+        if !replacing || t.is_empty() || t.starts_with('#') {
+            result.push_str(line);
+        }
+    }
+    if !inserted {
+        if !result.is_empty() && !result.ends_with('\n') {
+            result.push('\n');
+        }
+        result.push_str(&format!("\nrepo {repo}\n    room       {link}\n"));
+        if !passphrase.is_empty() {
+            result.push_str(&format!("    passphrase {passphrase}\n"));
+        }
+    }
+    Ok(result)
+}
+
+type FileStamp = (u64, u64, u64, i64, i64, i64, i64);
+
+fn stamp(data_root: &Path) -> Result<Option<FileStamp>, AppError> {
+    use std::os::unix::fs::MetadataExt;
+    match std::fs::metadata(path(data_root)) {
+        Ok(m) => Ok(Some((
+            m.dev(),
+            m.ino(),
+            m.len(),
+            m.mtime(),
+            m.mtime_nsec(),
+            m.ctime(),
+            m.ctime_nsec(),
+        ))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(AppError::Usage(format!("cannot inspect room map: {e}"))),
+    }
+}
+
+fn commit(
+    data_root: &Path,
+    original: &str,
+    initial: Option<FileStamp>,
+    replacement: &str,
+) -> Result<Option<String>, AppError> {
+    use std::io::Write;
+    let file = path(data_root);
+    let mut temp = tempfile::NamedTempFile::new_in(data_root).map_err(|e| {
+        AppError::Usage(format!(
+            "cannot create private room map temporary file: {e}"
+        ))
+    })?;
+    temp.write_all(replacement.as_bytes())
+        .and_then(|()| temp.as_file().sync_all())
+        .map_err(|e| AppError::Usage(format!("cannot write room map: {e}")))?;
+    if stamp(data_root)? != initial
+        || read_text(data_root)?.as_str() != original
+        || stamp(data_root)? != initial
+    {
+        return Err(conflict());
+    }
+    temp.persist(&file)
+        .map_err(|e| AppError::Usage(format!("cannot replace room map: {}", e.error)))?;
+    if let Err(e) = std::fs::File::open(data_root).and_then(|f| f.sync_all()) {
+        let state = match read_text(data_root) {
+            Ok(text) if text.as_str() == replacement => "the new map is visible",
+            Ok(_) => "the map has since changed",
+            Err(_) => "the map could not be reread",
+        };
+        return Ok(Some(format!(
+            "room map replacement durability is uncertain ({state}): {e}"
+        )));
+    }
+    Ok(None)
+}
+
+/// Add a new block only where no effective binding would be shadowed.
+pub fn add(data_root: &Path, repo: &Path, link: &str, passphrase: &str) -> Result<(), AppError> {
+    let _lock = MapLock::acquire(data_root)?;
+    let initial = stamp(data_root)?;
+    let text = read_text(data_root)?;
+    let entries = parse_map(data_root, &text)?;
+    validate_unique(&entries)?;
+    if resolve(&entries, repo).is_some() {
         return Err(AppError::Usage(format!(
             "the room map names {} already; change it there",
             repo.display()
         )));
     }
-    let mut block = format!("\nrepo {}\n    room       {link}\n", repo.display());
-    if !passphrase.is_empty() {
-        block.push_str(&format!("    passphrase {passphrase}\n"));
+    let target = canonical_or_original(repo);
+    let next = rewritten(&text, &target, link, passphrase)?;
+    if let Some(warning) = commit(data_root, &text, initial, &next)? {
+        return Err(AppError::Usage(warning));
     }
-    let block = Zeroizing::new(block);
-    let file = path(data_root);
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(&file)
-        .map_err(|e| {
-            AppError::Usage(format!("cannot write the room map {}: {e}", file.display()))
-        })?;
-    f.write_all(block.as_bytes())
-        .and_then(|()| f.sync_all())
-        .map_err(|e| AppError::Usage(format!("cannot write the room map {}: {e}", file.display())))
+    Ok(())
 }
 
-/// Record that the operator said no to binding `repo` to a room (RB-7): a block whose room is
-/// `none`, which no passphrase rides on. A directory the map names already is left as it is.
-///
-/// # Errors
-/// The map cannot be read or written.
+/// Record an agent's no only when no effective binding can be shadowed.
 pub fn decline(data_root: &Path, repo: &Path) -> Result<bool, AppError> {
-    let entries = read(data_root)?;
-    if lookup(&entries, repo).is_some() {
+    let _lock = MapLock::acquire(data_root)?;
+    let initial = stamp(data_root)?;
+    let text = read_text(data_root)?;
+    let entries = parse_map(data_root, &text)?;
+    validate_unique(&entries)?;
+    if resolve(&entries, repo).is_some() {
         return Ok(false);
     }
-    append(
-        data_root,
-        &format!("\nrepo {}\n    room       {DECLINED}\n", repo.display()),
-    )?;
+    let target = canonical_or_original(repo);
+    let next = rewritten(&text, &target, DECLINED, "")?;
+    if let Some(warning) = commit(data_root, &text, initial, &next)? {
+        return Err(AppError::Usage(warning));
+    }
     Ok(true)
 }
 
-/// Bind `repo` to the room `link` names, joined with `passphrase` (RB-6), replacing whatever the
-/// map held for it: a `no`, or another room. Returns what was replaced, as a person reads it:
-/// `None` when the map held nothing for `repo`.
-///
-/// # Errors
-/// The map cannot be read or written.
-pub fn bind(
+/// A completed rename, with any uncertainty about persistence across a crash.
+pub struct ReplaceOutcome {
+    /// Non-secret description of the exact target block that was replaced.
+    pub previous: Option<String>,
+    /// The rename succeeded but its durability could not be confirmed.
+    pub durability_warning: Option<String>,
+}
+
+/// Replace the displayed target only if its scope and complete binding are unchanged.
+pub fn replace(
     data_root: &Path,
-    repo: &Path,
+    snapshot: &Snapshot,
     link: &str,
     passphrase: &str,
-) -> Result<Option<String>, AppError> {
-    let entries = read(data_root)?;
-    let before = lookup(&entries, repo).map(|e| {
-        if e.room == DECLINED {
-            "a no (`room none`)".to_owned()
-        } else {
-            let room = vox_core::node::link::InviteLink::parse(&e.room)
-                .map(|l| vox_core::node::link::b32_encode(&l.channel_id))
-                .unwrap_or_default();
-            format!("room {}", room.chars().take(12).collect::<String>())
-        }
-    });
-    if before.is_some() {
-        drop_block(data_root, repo)?;
+) -> Result<ReplaceOutcome, AppError> {
+    let _lock = MapLock::acquire(data_root)?;
+    let initial = stamp(data_root)?;
+    let text = read_text(data_root)?;
+    let entries = parse_map(data_root, &text)?;
+    let current = decision(&entries, &snapshot.start, snapshot.explicit).map_err(|_| conflict())?;
+    if current.target != snapshot.target
+        || current.canonical_start != snapshot.canonical_start
+        || current.effective != snapshot.effective
+        || current.override_at_target != snapshot.override_at_target
+    {
+        return Err(conflict());
     }
-    add(data_root, repo, link, passphrase)?;
-    Ok(before)
-}
-
-/// Take `repo`'s block out of the map, keeping every other line as it is.
-fn drop_block(data_root: &Path, repo: &Path) -> Result<(), AppError> {
-    let file = path(data_root);
-    let text = Zeroizing::new(std::fs::read_to_string(&file).map_err(|e| {
-        AppError::Usage(format!("cannot read the room map {}: {e}", file.display()))
-    })?);
-    let same = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    let target = same(repo);
-    let mut kept = Zeroizing::new(String::new());
-    let mut skipping = false;
-    for line in text.lines() {
-        let t = line.trim();
-        if let Some(dir) = t.strip_prefix("repo").filter(|_| t.starts_with("repo ")) {
-            skipping = same(Path::new(dir.trim())) == target;
-        }
-        if !skipping {
-            kept.push_str(line);
-            kept.push('\n');
-        }
-    }
-    vox_core::node::paths::write_private_file_unique(&file, kept.as_bytes())
-        .map_err(|e| AppError::Usage(format!("cannot write the room map {}: {e}", file.display())))
-}
-
-/// Append `block` to the map, made mode 0600 when there is none.
-fn append(data_root: &Path, block: &str) -> Result<(), AppError> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let file = path(data_root);
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(&file)
-        .map_err(|e| {
-            AppError::Usage(format!("cannot write the room map {}: {e}", file.display()))
-        })?;
-    f.write_all(block.as_bytes())
-        .and_then(|()| f.sync_all())
-        .map_err(|e| AppError::Usage(format!("cannot write the room map {}: {e}", file.display())))
+    let before = lookup(&entries, &snapshot.target).map(description);
+    let next = rewritten(&text, &snapshot.target, link, passphrase)?;
+    let durability_warning = commit(data_root, &text, initial, &next)?;
+    Ok(ReplaceOutcome {
+        previous: before,
+        durability_warning,
+    })
 }

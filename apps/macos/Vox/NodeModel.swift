@@ -857,6 +857,8 @@ final class NodeModel: ObservableObject {
     @Published private(set) var roomAskDialog: RoomAskInfo?
     /// What the last answer to an ask did, or why it was not done: for the ask's view.
     @Published private(set) var roomAskSaid: RoomAnswerInfo?
+    /// Keep the ask visible while its explicit decision and result are being reviewed.
+    var roomDecisionOpen = false
     /// The directories already notified, so each ask notifies once (M-23).
     private var roomAsksNotified: Set<String> = []
     /// The trusted nodes that trust this node back, as the rooms shared with them record it (L-4).
@@ -2246,7 +2248,8 @@ final class NodeModel: ObservableObject {
             if let fresh = asks.first(where: { $0.dir == current.dir }) {
                 roomAskDialog = fresh
             } else if !activeOperations.values.contains("bind-room")
-                        && !activeOperations.values.contains("decline-room") {
+                        && !activeOperations.values.contains("decline-room")
+                        && !roomDecisionOpen {
                 finishRoomAsk()
             }
         }
@@ -2258,6 +2261,44 @@ final class NodeModel: ObservableObject {
             sheet = .repoRoom
         }
     }
+    func inspectRoomDecision(_ dir: String) async throws -> RoomDecisionInfo {
+        try await client.roomDecision(dir: dir)
+    }
+
+    func inspectExplicitRoomDecision(_ dir: String) async throws -> RoomDecisionInfo {
+        try await client.roomDecisionExplicit(dir: dir)
+    }
+
+    func cancelRoomDecision(_ decision: RoomDecisionInfo) async {
+        try? await client.cancelRoomDecision(token: decision.token)
+    }
+
+    func reportRoomDecision(_ answer: RoomAnswerInfo) {
+        report(operation: "bind-room", done: answer.said.joined(separator: "\n"))
+    }
+
+    private func reportRoomDecisionFailure(_ answer: RoomAnswerInfo) {
+        let words = answer.said.joined(separator: "\n")
+        if words.contains("durability could not be confirmed") {
+            report(VoxError.Unknown(reason: words), operation: "bind-room")
+        }
+    }
+
+    func replaceRoomDecision(_ decision: RoomDecisionInfo, room: String?, link: String,
+                             secret: Secret) async throws -> RoomAnswerInfo {
+        let attempt = begin("decline-room")
+        defer { end(attempt) }
+        var address = link
+        if let room { address = try await client.link(room: room).url }
+        let passphrase = try secret.passphrase()
+        defer { passphrase.wipe() }
+        let answer = try await client.replaceRoom(token: decision.token, link: address,
+                                                  passphrase: passphrase, node: node)
+        if answer.done { reportRoomDecision(answer) }
+        else { reportRoomDecisionFailure(answer) }
+        return answer
+    }
+
 
     /// Creation uses the app's selected (person's) node. The room secret is reused only for the
     /// verified bind; no identity passphrase or keyring change is involved (RM-2, KP-1).
@@ -2290,7 +2331,8 @@ final class NodeModel: ObservableObject {
     /// Bind `dir` to the room this node holds by `room`'s id, or to the room `link` names (one of
     /// them is given), joined with the passphrase the person typed (RB-6): what `vox room join
     /// <link> --node <node> --bind <dir>` does. Whether it was done.
-    func bindRoom(_ dir: String, room: String?, link: String?, passphrase secret: Secret) async -> Bool {
+    func bindRoom(_ dir: String, room: String?, link: String?, passphrase secret: Secret,
+                  decision: RoomDecisionInfo? = nil) async -> Bool {
         let operation = "bind-room"
         let attempt = begin(operation)
         defer { end(attempt) }
@@ -2300,8 +2342,15 @@ final class NodeModel: ObservableObject {
             if let room { address = try await client.link(room: room).url }
             let passphrase = try secret.passphrase()
             defer { passphrase.wipe() }
-            let answer = try await client.bindRoom(dir: dir, link: address, passphrase: passphrase)
+            let answer: RoomAnswerInfo
+            if let decision {
+                answer = try await client.bindRoomDecision(dir: dir, token: decision.token,
+                                                           link: address, passphrase: passphrase)
+            } else {
+                answer = try await client.bindRoom(dir: dir, link: address, passphrase: passphrase)
+            }
             roomAskSaid = answer
+            if !answer.done { reportRoomDecisionFailure(answer) }
             await readRoomAsks()
             return answer.done
         } catch {

@@ -66,7 +66,12 @@ pub fn asks(account: &Account, outside: &dyn Fn(&NodeName, &str) -> bool) -> Vec
                     room
                 }
             };
-            let dir = crate::room_map::ask_directory(&entries, start);
+            let dir = if room.is_empty() {
+                crate::room_map::ask_directory(&entries, start)
+            } else {
+                crate::room_map::snapshot(&account.data_root, start)
+                    .map_or_else(|_| start.to_path_buf(), |s| s.target)
+            };
             by_dir
                 .entry((dir.display().to_string(), room))
                 .or_default()
@@ -105,22 +110,26 @@ pub fn answers(ask: &RoomAsk, data_root: &std::path::Path) -> Vec<(&'static str,
     };
     let node = first.node.as_str();
     if !ask.room.is_empty() {
-        let link = crate::room_map::read(data_root).ok().and_then(|entries| {
+        if let Some(link) = crate::room_map::read(data_root).ok().and_then(|entries| {
             crate::room_map::resolve(&entries, std::path::Path::new(&ask.dir))
-                .map(|e| e.room.clone())
-        });
-        return vec![match link {
-            Some(link) => (
+                .filter(|entry| {
+                    vox_core::node::link::InviteLink::parse(&entry.room).is_ok_and(|link| {
+                        vox_core::node::link::b32_encode(&link.channel_id) == ask.room
+                    })
+                })
+                .map(|entry| entry.room.clone())
+        }) {
+            return vec![(
                 "to join it",
                 vox_text::shell::node_command(&["vox", "room", "join", &link], node),
                 true,
-            ),
-            None => (
-                "to join it",
-                format!("run vox room join with the room's link and --node {node}"),
-                false,
-            ),
-        }];
+            )];
+        }
+        return vec![(
+            "to join it",
+            format!("run vox room join with the room's link and --node {node}"),
+            false,
+        )];
     }
     vec![
         (

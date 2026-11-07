@@ -279,6 +279,57 @@ me specify one if not".)
   members whose key it held made a Session vanish from the list the moment its node took drive
   back, instead of saying `can_drive: false` (measured 2026-10-19, on v0.4.5 as well).
 
+### 9. v0.4.20 — repository decision and deliberate rebind
+
+Scoped design approval is recorded on issue #1164; implementation and actual consumer
+qualification must be independently accepted before release.
+
+- **P420-RB-1.** A bound repository ask MUST offer an explicit operator-confirmed “Not This
+  Repo”, including after a failed Join It. Failure alone MUST NOT alter the map, room membership,
+  trust or history. Confirmation MUST identify the actual repository, resolved binding and
+  affected scope, including inheritance and overrides; say that future sessions across the data
+  root's nodes and harnesses use `room none`, existing sessions do not move, no room is left or
+  trust changed, and an exactly replaced block's saved link and passphrase are discarded and
+  needed again to rebind. Cancel changes nothing. Never show or log the credential.
+- **P420-RB-2.** An exact repository binding is replaced by the canonical `room none` block.
+  For a binding inherited from a parent outside the actual repository, derive and validate the
+  repository boundary from the registered start independently of the displayed source block,
+  including linked-worktree mapping, and place a more-specific `none` there; do not replace the
+  parent. Split asks grouped under a parent by actual decision boundary. Sibling repositories,
+  parent credentials and explicit more-specific repository or worktree overrides remain effective.
+  If the boundary or effective scope is ambiguous, stale or invalid, refuse and explain; do not
+  choose a parent or arbitrary subdirectory. The operator may then choose an unambiguous valid
+  repository through the deliberate rebind surface.
+- **P420-RB-3.** Replacement is a distinct operator action, not a broadening of agent decline.
+  An agent's `vox agent room --none` MAY record a no for an unbound scope but MUST NOT replace an
+  operator binding or shadow any resolved inherited binding. Check this against the effective map
+  atomically. Replacement CLI entry points MUST reject agent-marked callers, including malformed
+  nonempty harness marks. The native action and operator CLI use a distinct replacement daemon
+  verb behind the existing mode-0600, uid-checked local control socket. The OS account remains
+  the authorization boundary (ADR-026 C-1/C-6), not person attestation or a new grant ceremony.
+  Ordinary agent-facing decline does not gain replacement authority. This does not claim to
+  isolate an arbitrary malicious process already running as the same OS user.
+- **P420-RB-4.** The displayed decision MUST carry an opaque non-secret snapshot of the
+  registered target boundary, effective source block and target override, detecting even a
+  credential change for the same room. A lost snapshot or restart is stale. Under one data-root
+  interprocess writer lock, every Vox map writer MUST re-read, validate and re-resolve the map,
+  compare the displayed snapshot and applicable override, and either report conflict and refresh
+  or construct one whole-map replacement preserving unrelated blocks, comments and credentials.
+  Use a unique private mode-0600 temporary file, flush and atomically replace using durable-write
+  conventions; do not expose a transient missing block. Compare again before replacement for
+  detectable outside edits; an advisory lock cannot serialize arbitrary noncooperating editors.
+  Report failure truthfully; if rename succeeded but durability is uncertain, re-read and report
+  uncertainty, not a false unchanged or durable-success claim. Never expose secret map text or a
+  guessable password-derived digest in the snapshot, IPC, UI or logs.
+- **P420-RB-5.** Vox.app MUST offer deliberate repository rebind independent of a pending ask:
+  choose a directory, show its resolved decision and precise scope, choose a room or link, enter
+  its passphrase in the app and explain who can read it. Authenticate even a held room's
+  credential and perform required joins before the same stale-safe map replacement. Bad
+  credentials, stale scope, unavailable node or failed write MUST NOT erase the no; report any
+  actual partial joins. The operator's existing terminal `--bind` remains available and uses
+  the same transaction. Rebinding changes future selection, not running sessions; existing
+  explicit session moves and documented ask-answer moves remain separate.
+
 ## Superseded and amended lines
 
 | ADR line | Was | Now |

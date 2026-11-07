@@ -60,6 +60,12 @@ const T_ROOM_ANSWER: u64 = 4013;
 const T_ANCHORS: u64 = 4014;
 const T_ANCHOR_FAILED: u64 = 4015;
 const T_ANCHOR_RESOLVED: u64 = 4016;
+const T_ROOM_DECISION: u64 = 4018;
+const T_REQ_ROOM_DECISION: u64 = 4148;
+const T_REQ_ROOM_REPLACE: u64 = 4149;
+const T_REQ_ROOM_ANSWER_BIND: u64 = 4150;
+const T_REQ_ROOM_DECISION_EXPLICIT: u64 = 4151;
+const T_REQ_ROOM_DECISION_CANCEL: u64 = 4152;
 const T_ANCHORS_FOUND: u64 = 4017;
 /// 4020–4029: the Session activity sink (ADR-029 §2, §3).
 const T_SESSION_ANSWER: u64 = 4020;
@@ -386,6 +392,43 @@ pub enum DaemonRequest {
     RoomDecline {
         /// The directory, absolute.
         dir: String,
+    },
+    /// Capture the effective repository decision for an operator replacement.
+    RoomDecision {
+        /// The directory of a pending repository ask.
+        dir: String,
+    },
+    /// Inspect the exact directory chosen by an operator, independently of pending asks.
+    RoomDecisionExplicit {
+        /// The exact directory selected by the operator.
+        dir: String,
+    },
+    /// Discard an unused inspection token.
+    RoomDecisionCancel {
+        /// The opaque, unused decision token.
+        token: String,
+    },
+    /// Replace the captured decision, authenticating a nonempty link on `node` first.
+    RoomReplace {
+        /// The opaque token returned by the inspection.
+        token: String,
+        /// The new room link, or empty to decline this scope.
+        link: String,
+        /// The new room's passphrase, never included in the decision.
+        passphrase: Zeroizing<String>,
+        /// The attached node used to authenticate and join the new room.
+        node: String,
+    },
+    /// Bind an asked repository using the decision inspected before the answer.
+    RoomAnswerBind {
+        /// The directory of the pending ask.
+        dir: String,
+        /// The opaque token for its inspected decision.
+        token: String,
+        /// The selected room's link.
+        link: String,
+        /// The selected room's passphrase.
+        passphrase: Zeroizing<String>,
     },
     /// The daemon's own status: answered [`DaemonFrame::Status`].
     Status,
@@ -872,10 +915,21 @@ pub enum DaemonFrame {
     SessionActivity(SessionAdmission),
     /// What a [`DaemonRequest::RoomAsks`] asked for: one per directory, oldest session first.
     RoomAsks(Vec<RoomAsk>),
-    /// What a [`DaemonRequest::RoomBind`] or [`DaemonRequest::RoomDecline`] did: whether it was
-    /// done, and what to tell the person (what was done, or why not).
+    /// Non-secret description and opaque daemon-local replacement token.
+    RoomDecision {
+        /// Opaque, single-use daemon-local token, invalid after expiry or restart.
+        token: String,
+        /// Canonical directory affected by this decision.
+        target: String,
+        /// Effective source block, or empty if unbound.
+        source: String,
+        /// Effective room id, `none`, or empty if unbound.
+        room: String,
+    },
+    /// The reported outcome of a repository decision or ask. When durability is uncertain,
+    /// `done` is false and `said` explains that the change may already be visible.
     RoomAnswer {
-        /// It was done.
+        /// The requested outcome was confirmed, including map durability when changed.
         done: bool,
         /// One line per thing said.
         said: Vec<String>,
@@ -1266,6 +1320,38 @@ impl Opening {
                 DaemonRequest::RoomDecline { dir } => {
                     e.array(2).uint(T_REQ_ROOM_DECLINE).text(dir);
                 }
+                DaemonRequest::RoomDecision { dir } => {
+                    e.array(2).uint(T_REQ_ROOM_DECISION).text(dir);
+                }
+                DaemonRequest::RoomDecisionExplicit { dir } => {
+                    e.array(2).uint(T_REQ_ROOM_DECISION_EXPLICIT).text(dir);
+                }
+                DaemonRequest::RoomDecisionCancel { token } => {
+                    e.array(2).uint(T_REQ_ROOM_DECISION_CANCEL).text(token);
+                }
+                DaemonRequest::RoomReplace {
+                    token,
+                    link,
+                    passphrase,
+                    node,
+                } => {
+                    e.array(5).uint(T_REQ_ROOM_REPLACE).text(token).text(link);
+                    put_secret(&mut e, Some(passphrase));
+                    e.text(node);
+                }
+                DaemonRequest::RoomAnswerBind {
+                    dir,
+                    token,
+                    link,
+                    passphrase,
+                } => {
+                    e.array(5)
+                        .uint(T_REQ_ROOM_ANSWER_BIND)
+                        .text(dir)
+                        .text(token)
+                        .text(link);
+                    put_secret(&mut e, Some(passphrase));
+                }
                 DaemonRequest::Status => {
                     e.array(1).uint(T_REQ_STATUS);
                 }
@@ -1482,6 +1568,29 @@ impl Opening {
             (T_REQ_ROOM_DECLINE, 2) => Opening::Daemon(DaemonRequest::RoomDecline {
                 dir: text(&mut d, "ipc room decline dir")?,
             }),
+            (T_REQ_ROOM_DECISION, 2) => Opening::Daemon(DaemonRequest::RoomDecision {
+                dir: text(&mut d, "ipc room decision dir")?,
+            }),
+            (T_REQ_ROOM_DECISION_EXPLICIT, 2) => {
+                Opening::Daemon(DaemonRequest::RoomDecisionExplicit {
+                    dir: text(&mut d, "ipc explicit room decision dir")?,
+                })
+            }
+            (T_REQ_ROOM_DECISION_CANCEL, 2) => Opening::Daemon(DaemonRequest::RoomDecisionCancel {
+                token: text(&mut d, "ipc room decision token")?,
+            }),
+            (T_REQ_ROOM_REPLACE, 5) => Opening::Daemon(DaemonRequest::RoomReplace {
+                token: text(&mut d, "ipc room replacement token")?,
+                link: text(&mut d, "ipc room replacement link")?,
+                passphrase: secret(&mut d, "ipc room replacement passphrase")?.unwrap_or_default(),
+                node: text(&mut d, "ipc room replacement node")?,
+            }),
+            (T_REQ_ROOM_ANSWER_BIND, 5) => Opening::Daemon(DaemonRequest::RoomAnswerBind {
+                dir: text(&mut d, "ipc room answer dir")?,
+                token: text(&mut d, "ipc room answer token")?,
+                link: text(&mut d, "ipc room answer link")?,
+                passphrase: secret(&mut d, "ipc room answer passphrase")?.unwrap_or_default(),
+            }),
             (T_REQ_STATUS, 1) => Opening::Daemon(DaemonRequest::Status),
             (T_REQ_ANCHORS, 1) => Opening::Daemon(DaemonRequest::Anchors),
             (T_REQ_ANCHOR_SEARCH, 1) => Opening::Daemon(DaemonRequest::AnchorSearch),
@@ -1690,6 +1799,19 @@ impl DaemonFrame {
             DaemonFrame::RoomAnswer { done, said } => {
                 e.array(3).uint(T_ROOM_ANSWER).uint(u64::from(*done));
                 put_texts(&mut e, said);
+            }
+            DaemonFrame::RoomDecision {
+                token,
+                target,
+                source,
+                room,
+            } => {
+                e.array(5)
+                    .uint(T_ROOM_DECISION)
+                    .text(token)
+                    .text(target)
+                    .text(source)
+                    .text(room);
             }
             DaemonFrame::Status(s) => {
                 e.array(6)
@@ -1954,6 +2076,12 @@ impl DaemonFrame {
             (T_ROOM_ANSWER, 3) => DaemonFrame::RoomAnswer {
                 done: flag(&mut d, "ipc room answer done")?,
                 said: texts(&mut d, "ipc room answer said")?,
+            },
+            (T_ROOM_DECISION, 5) => DaemonFrame::RoomDecision {
+                token: text(&mut d, "ipc room decision token")?,
+                target: text(&mut d, "ipc room decision target")?,
+                source: text(&mut d, "ipc room decision source")?,
+                room: text(&mut d, "ipc room decision room")?,
             },
             (T_METRICS, 2) => DaemonFrame::Metrics(text(&mut d, "ipc metrics")?),
             (T_DAEMON_EVENT, 2) => {
