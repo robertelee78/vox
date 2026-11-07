@@ -54,6 +54,7 @@ struct SettingsView: View {
                         showingRepoDecision = true
                     }
                 }
+                .accessibilityIdentifier("settings-rebind-repository")
                 .disabled(app.node == nil)
             } said: {
                 Text("Choose a repository and review its current room decision before changing it.")

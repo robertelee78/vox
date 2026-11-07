@@ -901,19 +901,23 @@ pub struct RoomAskInfo {
 /// An opaque operator decision and its non-secret scope.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct RoomDecisionInfo {
+    /// Opaque, single-use token invalid after expiry or daemon restart.
     pub token: String,
+    /// Canonical directory affected by a replacement.
     pub target: String,
+    /// Effective source block, or empty when unbound.
     pub source: String,
+    /// Effective room id, `none`, or empty when unbound.
     pub room: String,
 }
 
 
-/// What binding or declining an ask did: whether it was done, and its lines, said for a person.
+/// The reported outcome of a repository decision or ask, including any durability uncertainty.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct RoomAnswerInfo {
-    /// It was done.
+    /// The requested outcome was confirmed, including map durability when changed.
     pub done: bool,
-    /// What was done, or why not.
+    /// What happened; an unconfirmed operation may already be visible.
     pub said: Vec<String>,
 }
 
@@ -5276,6 +5280,23 @@ impl VoxClient {
                 Ok(RoomDecisionInfo { token, target, source, room }),
             DaemonFrame::RoomAnswer { said, .. } => Err(failed(&said.join("\n"))),
             _ => Err(failed("the daemon did not inspect the repository decision")),
+        }
+    }
+    /// Inspect an explicitly selected directory rather than a waiting session's scope.
+    pub async fn room_decision_explicit(&self, dir: String) -> Result<RoomDecisionInfo, VoxError> {
+        match self.daemon(DaemonRequest::RoomDecisionExplicit { dir }).await? {
+            DaemonFrame::RoomDecision { token, target, source, room } =>
+                Ok(RoomDecisionInfo { token, target, source, room }),
+            DaemonFrame::RoomAnswer { said, .. } => Err(failed(&said.join("\n"))),
+            _ => Err(failed("the daemon did not inspect the repository decision")),
+        }
+    }
+
+    /// Discard an unused inspection token.
+    pub async fn cancel_room_decision(&self, token: String) -> Result<(), VoxError> {
+        match self.daemon(DaemonRequest::RoomDecisionCancel { token }).await? {
+            DaemonFrame::Ok => Ok(()),
+            _ => Err(failed("the daemon did not cancel the repository decision")),
         }
     }
 

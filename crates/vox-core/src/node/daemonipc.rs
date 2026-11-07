@@ -64,6 +64,8 @@ const T_ROOM_DECISION: u64 = 4018;
 const T_REQ_ROOM_DECISION: u64 = 4148;
 const T_REQ_ROOM_REPLACE: u64 = 4149;
 const T_REQ_ROOM_ANSWER_BIND: u64 = 4150;
+const T_REQ_ROOM_DECISION_EXPLICIT: u64 = 4151;
+const T_REQ_ROOM_DECISION_CANCEL: u64 = 4152;
 const T_ANCHORS_FOUND: u64 = 4017;
 /// 4020–4029: the Session activity sink (ADR-029 §2, §3).
 const T_SESSION_ANSWER: u64 = 4020;
@@ -394,16 +396,42 @@ pub enum DaemonRequest {
         dir: String,
     },
     /// Capture the effective repository decision for an operator replacement.
-    RoomDecision { dir: String },
+    RoomDecision {
+        /// The directory of a pending repository ask.
+        dir: String,
+    },
+    /// Inspect the exact directory chosen by an operator, independently of pending asks.
+    RoomDecisionExplicit {
+        /// The exact directory selected by the operator.
+        dir: String,
+    },
+    /// Discard an unused inspection token.
+    RoomDecisionCancel {
+        /// The opaque, unused decision token.
+        token: String,
+    },
     /// Replace the captured decision, authenticating a nonempty link on `node` first.
     RoomReplace {
+        /// The opaque token returned by the inspection.
         token: String,
+        /// The new room link, or empty to decline this scope.
         link: String,
+        /// The new room's passphrase, never included in the decision.
         passphrase: Zeroizing<String>,
+        /// The attached node used to authenticate and join the new room.
         node: String,
     },
     /// Bind an asked repository using the decision inspected before the answer.
-    RoomAnswerBind { dir: String, token: String, link: String, passphrase: Zeroizing<String> },
+    RoomAnswerBind {
+        /// The directory of the pending ask.
+        dir: String,
+        /// The opaque token for its inspected decision.
+        token: String,
+        /// The selected room's link.
+        link: String,
+        /// The selected room's passphrase.
+        passphrase: Zeroizing<String>,
+    },
     /// The daemon's own status: answered [`DaemonFrame::Status`].
     Status,
     /// The metrics, as Prometheus text: answered [`DaemonFrame::Metrics`].
@@ -923,11 +951,20 @@ pub enum DaemonFrame {
     /// What a [`DaemonRequest::RoomAsks`] asked for: one per directory, oldest session first.
     RoomAsks(Vec<RoomAsk>),
     /// Non-secret description and opaque daemon-local replacement token.
-    RoomDecision { token: String, target: String, source: String, room: String },
-    /// What a [`DaemonRequest::RoomBind`] or [`DaemonRequest::RoomDecline`] did: whether it was
-    /// done, and what to tell the person (what was done, or why not).
+    RoomDecision {
+        /// Opaque, single-use daemon-local token, invalid after expiry or restart.
+        token: String,
+        /// Canonical directory affected by this decision.
+        target: String,
+        /// Effective source block, or empty if unbound.
+        source: String,
+        /// Effective room id, `none`, or empty if unbound.
+        room: String,
+    },
+    /// The reported outcome of a repository decision or ask. When durability is uncertain,
+    /// `done` is false and `said` explains that the change may already be visible.
     RoomAnswer {
-        /// It was done.
+        /// The requested outcome was confirmed, including map durability when changed.
         done: bool,
         /// One line per thing said.
         said: Vec<String>,
@@ -1340,6 +1377,12 @@ impl Opening {
                 DaemonRequest::RoomDecision { dir } => {
                     e.array(2).uint(T_REQ_ROOM_DECISION).text(dir);
                 }
+                DaemonRequest::RoomDecisionExplicit { dir } => {
+                    e.array(2).uint(T_REQ_ROOM_DECISION_EXPLICIT).text(dir);
+                }
+                DaemonRequest::RoomDecisionCancel { token } => {
+                    e.array(2).uint(T_REQ_ROOM_DECISION_CANCEL).text(token);
+                }
                 DaemonRequest::RoomReplace { token, link, passphrase, node } => {
                     e.array(5).uint(T_REQ_ROOM_REPLACE).text(token).text(link);
                     put_secret(&mut e, Some(passphrase));
@@ -1567,6 +1610,12 @@ impl Opening {
             }),
             (T_REQ_ROOM_DECISION, 2) => Opening::Daemon(DaemonRequest::RoomDecision {
                 dir: text(&mut d, "ipc room decision dir")?,
+            }),
+            (T_REQ_ROOM_DECISION_EXPLICIT, 2) => Opening::Daemon(DaemonRequest::RoomDecisionExplicit {
+                dir: text(&mut d, "ipc explicit room decision dir")?,
+            }),
+            (T_REQ_ROOM_DECISION_CANCEL, 2) => Opening::Daemon(DaemonRequest::RoomDecisionCancel {
+                token: text(&mut d, "ipc room decision token")?,
             }),
             (T_REQ_ROOM_REPLACE, 5) => Opening::Daemon(DaemonRequest::RoomReplace {
                 token: text(&mut d, "ipc room replacement token")?,

@@ -5583,15 +5583,25 @@ fn require_operator_binding() -> Result<(), AppError> {
 async fn repo_decision(paths: &Paths, dir: &std::path::Path) -> Result<String, AppError> {
     use vox_core::node::daemonipc::{DaemonClient, DaemonFrame, DaemonRequest};
     let mut daemon = DaemonClient::open(&paths.account().socket()).await?;
-    match daemon.request(DaemonRequest::RoomDecision {
+    match daemon.request(DaemonRequest::RoomDecisionExplicit {
         dir: dir.to_string_lossy().into_owned(),
     }).await? {
         DaemonFrame::RoomDecision { token, target, source, room } => {
-            println!("vox: repository {target}; resolved decision {room}; source {source}. Future sessions use the new binding; existing sessions do not move. Every node of this data root can read the saved passphrase.");
+            let resolved = if room.is_empty() { "unbound" } else { &room };
+            let source = if source.is_empty() { "none" } else { &source };
+            println!("vox: binding selected directory {target}; current decision {resolved}, source {source}. Future sessions use the new binding; existing sessions do not move. Every node of this data root can read the room map, including the saved passphrase.");
             Ok(token)
         }
         DaemonFrame::RoomAnswer { said, .. } => Err(AppError::Usage(said.join("\n"))),
         _ => Err(AppError::Usage("the daemon did not provide a repository decision; nothing was bound".into())),
+    }
+}
+
+async fn cancel_repo_decision(paths: &Paths, token: Option<&str>) {
+    use vox_core::node::daemonipc::{DaemonClient, DaemonRequest};
+    let Some(token) = token else { return };
+    if let Ok(mut daemon) = DaemonClient::open(&paths.account().socket()).await {
+        let _ = daemon.request(DaemonRequest::RoomDecisionCancel { token: token.to_owned() }).await;
     }
 }
 
@@ -5613,7 +5623,7 @@ async fn save_repo_binding(
     }).await? {
         DaemonFrame::RoomAnswer { done, said } => {
             for line in &said { println!("vox: {line}"); }
-            if done { Ok(()) } else { Err(AppError::Usage("repository was not bound; see the result above".into())) }
+            if done { Ok(()) } else { Err(AppError::Usage("repository update was not confirmed; see the result above".into())) }
         }
         _ => Err(AppError::Usage("the daemon did not confirm the repository decision; its outcome is unknown".into())),
     }
@@ -5667,6 +5677,7 @@ pub async fn join(
         Some(dir) => Some(repo_decision(paths, dir).await?),
         None => None,
     };
+    let result = async {
     let mut client = attach(paths).await?;
     // A room this node holds open, and has not left, is not joined again: its address is taken
     // as where the room's host is now, and the host is dialled there (V210-167). No passphrase is read for it: none
@@ -5814,6 +5825,11 @@ pub async fn join(
         Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
+    }.await;
+    if result.is_err() {
+        cancel_repo_decision(paths, decision.as_deref()).await;
+    }
+    result
 }
 
 /// How long a join waits for the trust of members this node trusts to reach it before saying who
@@ -5926,6 +5942,7 @@ pub async fn create(
         Some(dir) => Some(repo_decision(paths, dir).await?),
         None => None,
     };
+    let result = async {
     // Checked before anything is made: a typo must not leave a room with no idle end behind.
     let idle_secs = match idle_end {
         None => None,
@@ -6045,6 +6062,11 @@ pub async fn create(
         Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
+    }.await;
+    if result.is_err() {
+        cancel_repo_decision(paths, decision.as_deref()).await;
+    }
+    result
 }
 
 /// Show the exact capped link routes, separately from the complete signed room configuration.

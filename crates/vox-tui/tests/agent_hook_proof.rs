@@ -4274,6 +4274,17 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
              {first:?}"
         );
     };
+    let no_before_wrong = std::fs::read(&map).expect("APPARATUS: read map");
+    let (ok, out, err) = hook(
+        &data, &cfg,
+        &["room", "join", &link_other, "--node", "default", "--bind",
+          &bound_dir.to_string_lossy(), "--passphrase-file", "-"],
+        "wrong room passphrase",
+    );
+    assert!(!ok && std::fs::read(&map).expect("APPARATUS: read map") == no_before_wrong,
+        "PRODUCT: a wrong passphrase for a held room must leave the non-git directory's no unchanged");
+    assert!(!out.contains("wrong room passphrase") && !err.contains("wrong room passphrase"),
+        "PRODUCT: a refused bind must not print its passphrase");
     let joined = bind(&link_other, "other passphrase");
     eprintln!("[proof] (5c) `vox room join --bind` at a terminal said: {joined}");
     assert!(
@@ -4325,6 +4336,64 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
          name the room it replaced: {rebound}"
     );
     lands_in(&third, "88888888-aaaa-4bbb-8ccc-000000000008");
+
+    // An explicit subdirectory binding must not replace the inherited parent block.
+    let override_dir = repo.join("explicit-override");
+    std::fs::create_dir_all(&override_dir).expect("APPARATUS: create override directory");
+    let override_dir = std::fs::canonicalize(&override_dir).expect("APPARATUS: canonical override");
+    let before = std::fs::read_to_string(&map).expect("APPARATUS: read map");
+    let parent_header = format!("repo {}\n", repo.display());
+    let parent_block = before.split(&parent_header).nth(1)
+        .expect("APPARATUS: parent binding").split("\nrepo ").next().unwrap().to_owned();
+    let result = in_terminal(
+        &data, &cfg,
+        &["room", "join", &link_other, "--node", "default", "--bind", &override_dir.to_string_lossy()],
+        &[("passphrase", "other passphrase\r")],
+    );
+    let after = std::fs::read_to_string(&map).expect("APPARATUS: read map after bind");
+    let parent_after = after.split(&parent_header).nth(1)
+        .expect("PRODUCT: parent binding disappeared").split("\nrepo ").next().unwrap();
+    assert_eq!(parent_after, parent_block, "PRODUCT: an explicit subdirectory bind must preserve the parent's entire block");
+    assert!(after.contains(&format!("repo {}\n", override_dir.display())),
+        "PRODUCT: the chosen subdirectory must get its own block; terminal said {result}");
+    let override_session = "8a888888-aaaa-4bbb-8ccc-000000000008";
+    let first = turn(override_session, &override_dir);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !open_in(&other, override_session) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    assert!(open_in(&other, override_session) && open_in(&home, mapped),
+        "PRODUCT: the override must use the new room without moving an existing parent session: {first}");
+    let sibling_session = "8b888888-aaaa-4bbb-8ccc-000000000008";
+    let sibling_first = turn(sibling_session, &repo.join("sub"));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !open_in(&home, sibling_session) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    assert!(open_in(&home, sibling_session),
+        "PRODUCT: a sibling must still use the parent's room: {sibling_first}");
+
+    // Neither an actual agent session nor a malformed nonempty harness mark may bind.
+    for mark in [[("VOX_SESSION", override_session)], [("CLAUDE_CODE_ENTRYPOINT", "malformed")]] {
+        let saved = std::fs::read(&map).expect("APPARATUS: read map");
+        let (ok, out, err) = hook_env(
+            &data, &cfg,
+            &["room", "join", &link_home, "--node", "default", "--bind",
+              &override_dir.to_string_lossy(), "--passphrase-file", "-"],
+            "channel passphrase", &mark,
+        );
+        assert!(!ok && std::fs::read(&map).expect("APPARATUS: read map") == saved,
+            "PRODUCT: an agent-marked process must not bind or change the map: {out}{err}");
+    }
+    for session in [override_session, sibling_session] {
+        let saved = std::fs::read(&map).expect("APPARATUS: read map");
+        let (ok, out, err) = hook_env(
+            &data, &cfg, &["agent", "room", "--none"], "",
+            &[("VOX_SESSION", session), ("VOX_NODE", "default")],
+        );
+        assert!(!ok && std::fs::read(&map).expect("APPARATUS: read map") == saved,
+            "PRODUCT: an agent must not decline an exact or inherited binding: {out}{err}");
+    }
 
     // (5e) Binding a repo the person is asked about answers the ask: it is no longer asked.
     let (ok, _, err) = hook(
