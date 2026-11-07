@@ -1094,6 +1094,8 @@ pub struct FfiSession {
     pub name: Option<String>,
     /// How every client labels it (SE-3): `codex@device-2 · gso-cap · 3f0c25bf`.
     pub label: String,
+    /// Whether this harness can end its Session through Drive.
+    pub can_stop: bool,
     /// Open, or ended (SE-5).
     pub open: bool,
     /// When it opened, milliseconds since the Unix epoch.
@@ -1117,6 +1119,7 @@ fn ffi_session(
         node_alias: known.names.get(&s.node).cloned().unwrap_or_default(),
         short_id: s.id.chars().take(8).collect(),
         label: known.label(s),
+        can_stop: s.harness != "omp",
         session_id: s.id.clone(),
         opening: b32_encode(&s.opening),
         name: s.name.clone(),

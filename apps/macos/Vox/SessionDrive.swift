@@ -124,9 +124,9 @@ struct SessionComposer: View {
                     .accessibilityIdentifier("session-interrupt")
                 Button("Stop") { confirmStop = true }
                     .fixedSize()
-                    .help("Stop it (Ctrl-C)")
+                    .help(session.canStop ? "Stop it (Ctrl-C)" : "Ending this Session through Vox is unavailable")
                     .keyboardShortcut("c", modifiers: .control)
-                    .disabled(stopping)
+                    .disabled(stopping || !session.canStop)
                     .accessibilityIdentifier("session-stop")
             }
             .confirmationDialog("Stop \(session.label)? It ends the session.", isPresented: $confirmStop) {

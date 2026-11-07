@@ -430,7 +430,14 @@ impl Follow {
                 deferred = Some(key.clone());
                 json!({"type":"prompt", "id":key})
             }
-            Steer::Interrupt | Steer::Stop => json!({"type":"abort"}),
+            Steer::Interrupt => json!({"type":"abort"}),
+            Steer::Stop => {
+                let _ = reply.send(Err(
+                    "OMP cannot end the Session through Vox; use Interrupt for the current operation"
+                        .into(),
+                ));
+                return None;
+            }
             Steer::Slash { .. } => {
                 let _ = reply.send(Err("OMP slash commands are unavailable through Vox".into()));
                 return None;
