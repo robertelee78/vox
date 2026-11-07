@@ -2481,11 +2481,15 @@ private struct TrustBanner: View {
             // Every one named (D4), as the room names them: the alias, else the fingerprint's start.
             let names = cut.map(\.name)
             let listed = names.dropLast().joined(separator: ", ") + " and " + (names.last ?? "")
-            return "\(listed) can't read each other with you yet: room consent, key exchange and node trust are separate."
+            return "Room access needs review for \(listed): room consent, key status and node trust are separate."
         }
         switch (m.trust, m.trustsYou) {
         case (.oneWay, _):
+            #if VOX_PROOF_STUB_SERVICES && VOX_PROOF_MUTANT_REFUSAL
+            return "You trust \(m.name). \(m.name) declined to trust you."
+            #else
             return "You trust \(m.name). Reciprocal room consent from \(m.name) has not been observed; room access is unresolved."
+            #endif
         // Not in the keyring and trusting this node: D4's theyOnly, or none with its trust seen.
         case (.theyOnly, _), (.none, true):
             return "Room consent from \(m.name) has been observed. Trust \(m.name) too to grant local node trust."

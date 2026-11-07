@@ -528,6 +528,7 @@ fn detail_of(
         }
     }
     Ok(ChannelDetail {
+        projection_failure: None,
         history_read: ch.history_read_resource(),
         history_read_revision: ch
             .history_read_resource()
@@ -23022,6 +23023,7 @@ impl Node {
                     summaries.insert(*id, summary_of(&ch, rows));
                     if let Some(detail) = kept {
                         let mut detail = detail.clone();
+                        detail.projection_failure = Some(error.to_string());
                         detail.history_read = ch.history_read_resource();
                         detail.history_read_revision = detail
                             .history_read

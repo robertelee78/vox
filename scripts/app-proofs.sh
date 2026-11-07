@@ -279,12 +279,25 @@ fi
 # and stops at once, APPARATUS, if the app says notifications are off.
 echo "app-proofs: preflight: whether Vox may notify is checked first by the notification case"
 
+# Consumer-sensitivity controls: only the isolated proof app may compile one mutant.
+case "${VOX_PROOF_MUTANT:-}" in
+    "") proof_mutant="" ;;
+    ghost) proof_mutant="VOX_PROOF_MUTANT_GHOST" ;;
+    empty) proof_mutant="VOX_PROOF_MUTANT_EMPTY" ;;
+    refusal) proof_mutant="VOX_PROOF_MUTANT_REFUSAL" ;;
+    *) echo "app-proofs: APPARATUS: unknown VOX_PROOF_MUTANT" >&2; exit 2 ;;
+esac
+if [ -n "$proof_mutant" ]; then
+    echo "app-proofs: MUTANT CONTROL $proof_mutant (not a candidate proof)" >&2
+fi
+
 XCFRAMEWORK_SLICES=macos scripts/build-xcframework.sh
 cargo build --release --bin vox
 # Apparatus, never the app's: a `vox` built with test-knobs, for a peer whose clock is set behind
 # (FirstRunProof step 3d, VOX_TEST_CLOCK_SKEW_MS), in a target directory of its own so the app's
 # `vox` is never one with knobs.
 cargo build --release --bin vox --features vox-tui/test-knobs --target-dir target/proof-knobs
+cargo build --release -p vox-tui --features test-knobs --example native_key_wait --target-dir target/proof-knobs
 
 # **The app under proof registers no background item** (#571): built with
 # VOX_PROOF_STUB_SERVICES, its login item and its LAN helper are stand-ins that record what was
@@ -293,7 +306,7 @@ cargo build --release --bin vox --features vox-tui/test-knobs --target-dir targe
 # scripts/assemble-macos-app.sh refuses a bundle carrying the stand-ins.
 xcodebuild -project apps/macos/Vox.xcodeproj -scheme Vox -configuration Release \
     -derivedDataPath "$DERIVED" ARCHS=arm64 CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual \
-    SWIFT_ACTIVE_COMPILATION_CONDITIONS='$(inherited) VOX_PROOF_STUB_SERVICES' \
+    SWIFT_ACTIVE_COMPILATION_CONDITIONS="\$(inherited) VOX_PROOF_STUB_SERVICES $proof_mutant" \
     VOX_APP_ID=us.vox.app.proof VOX_APP_NAME="Vox Proof" \
     build-for-testing
 built_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
@@ -422,6 +435,7 @@ TEST_RUNNER_VOX_PROOF_APP="$APP" TEST_RUNNER_VOX_PROOF_SCRATCH="$SCRATCH" \
     TEST_RUNNER_VOX_PROOF_STAGER_TOKEN="$TOKEN" \
     TEST_RUNNER_VOX_PROOF_FROM="${VOX_PROOF_FROM:-}" \
     TEST_RUNNER_VOX_PROOF_KNOBS_VOX="$ROOT/target/proof-knobs/release/vox" \
+    TEST_RUNNER_VOX_PROOF_KEY_WAIT_HELPER="$ROOT/target/proof-knobs/release/examples/native_key_wait" \
     TEST_RUNNER_VOX_PROOF_NATIVE_NODE="$NATIVE_NODE" \
     TEST_RUNNER_VOX_PROOF_OPENCODE_HOST="$ROOT/crates/vox-tui/tests/support/opencode_plugin_host.mjs" \
     TEST_RUNNER_VOX_PROOF_CONTINUE="${VOX_PROOF_CONTINUE:-}" \
