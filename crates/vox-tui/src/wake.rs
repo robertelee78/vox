@@ -462,6 +462,9 @@ pub struct Session {
     /// Registration-only client activation; consumed before storage, never a turn receipt.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub registration_only: bool,
+    /// Live OMP instance and generation that owns this registration mutation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub omp_fence: Option<crate::omp_fence::OmpFenceRef>,
 }
 
 /// What a hook's environment says of its tmux pane: claimed, not proven. The daemon proves it
@@ -763,10 +766,11 @@ pub fn register(paths: &Paths, session: &str, codex: bool) {
 // Every registration rewrite, including a hook's idle update, shares this lock. Atomic
 // rename alone cannot stop a stale whole-record rewrite from restoring a removed room.
 // The lock file is outside the registrations directory, so it can never look like a session.
-fn registration_lock(paths: &Paths) -> Result<std::fs::File, String> {
+fn registration_lock_typed(paths: &Paths) -> Result<std::fs::File, RegistrationStoreError> {
     let path = paths.session_dir().with_extension("lock");
     if let Some(parent) = path.parent() {
-        vox_core::node::paths::create_private_dir(parent).map_err(|e| e.to_string())?;
+        vox_core::node::paths::create_private_dir(parent)
+            .map_err(|e| RegistrationStoreError::Failed(e.to_string()))?;
     }
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
@@ -775,10 +779,29 @@ fn registration_lock(paths: &Paths) -> Result<std::fs::File, String> {
         use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(0o600);
     }
-    let file = options.open(&path).map_err(|e| e.to_string())?;
-    file.try_lock()
-        .map_err(|e| format!("session registration is busy or cannot be locked: {e}"))?;
+    let file = options
+        .open(&path)
+        .map_err(|e| RegistrationStoreError::Failed(e.to_string()))?;
+    file.try_lock().map_err(|e| match e {
+        std::fs::TryLockError::WouldBlock => RegistrationStoreError::Busy,
+        std::fs::TryLockError::Error(e) => RegistrationStoreError::Failed(e.to_string()),
+    })?;
     Ok(file)
+}
+
+fn registration_lock(paths: &Paths) -> Result<std::fs::File, String> {
+    registration_lock_typed(paths).map_err(|e| e.to_string())
+}
+
+/// A registration write was either contended or failed permanently.
+#[derive(Debug, thiserror::Error)]
+pub enum RegistrationStoreError {
+    /// Another registration writer holds the node lock.
+    #[error("session registration is busy")]
+    Busy,
+    /// The lock or registration could not be written.
+    #[error("{0}")]
+    Failed(String),
 }
 
 fn registration_write(paths: &Paths) -> Option<std::fs::File> {
@@ -839,8 +862,8 @@ pub fn store(paths: &Paths, reg: &Session) {
 ///
 /// # Errors
 /// Lock contention or a failed registration write leaves the request refused.
-pub fn store_checked(paths: &Paths, reg: &Session) -> Result<(), String> {
-    let _lock = registration_lock(paths)?;
+pub fn store_checked(paths: &Paths, reg: &Session) -> Result<(), RegistrationStoreError> {
+    let _lock = registration_lock_typed(paths)?;
     let mut reg = reg.clone();
     let session = reg.session.clone();
     let session = session.as_str();
@@ -893,10 +916,12 @@ pub fn store_checked(paths: &Paths, reg: &Session) -> Result<(), String> {
     if let Some(mine) = reg.tmux.as_ref() {
         unbind_pane(paths, session, &mine.socket, &mine.pane);
     }
-    vox_core::node::paths::create_private_dir(&paths.session_dir()).map_err(|e| e.to_string())?;
-    let body = serde_json::to_vec(&reg).map_err(|e| e.to_string())?;
+    vox_core::node::paths::create_private_dir(&paths.session_dir())
+        .map_err(|e| RegistrationStoreError::Failed(e.to_string()))?;
+    let body =
+        serde_json::to_vec(&reg).map_err(|e| RegistrationStoreError::Failed(e.to_string()))?;
     vox_core::node::paths::write_private_file_unique(&paths.session_file(session), &body)
-        .map_err(|e| e.to_string())
+        .map_err(|e| RegistrationStoreError::Failed(e.to_string()))
 }
 
 /// Name `session`'s registration `name`, as its harness now calls it (ADR-029 MD-1): what an
@@ -944,6 +969,18 @@ impl Session {
             }
         }
         s.attention = AttentionRoute::from_env();
+        if s.harness == "omp" || std::env::var("VOX_HARNESS").as_deref() == Ok("omp") {
+            s.omp_fence = match (
+                std::env::var("VOX_OMP_INSTANCE"),
+                std::env::var("VOX_OMP_GENERATION"),
+            ) {
+                (Ok(instance_id), Ok(generation)) => Some(crate::omp_fence::OmpFenceRef {
+                    instance_id,
+                    generation,
+                }),
+                _ => None,
+            };
+        }
         if s.attention.is_some() && !codex {
             s.harness = if std::env::var("VOX_HARNESS").as_deref() == Ok("omp") {
                 "omp"
@@ -983,6 +1020,7 @@ impl Session {
                 mirror: String::new(),
                 attention: None,
                 registration_only: false,
+                omp_fence: None,
             }
         } else if let (Ok(endpoint), Ok(token)) = (
             std::env::var("CLAUDE_CODE_MESSAGING_SOCKET"),
@@ -1009,6 +1047,7 @@ impl Session {
                 mirror: String::new(),
                 attention: None,
                 registration_only: false,
+                omp_fence: None,
             }
         } else if let (Ok(endpoint), Ok(token)) = (
             std::env::var("VOX_OPENCODE_WAKE_SOCKET"),
@@ -1035,6 +1074,7 @@ impl Session {
                 mirror: std::env::var("VOX_OPENCODE_MIRROR_SOCKET").unwrap_or_default(),
                 attention: None,
                 registration_only: false,
+                omp_fence: None,
             }
         } else {
             Session {
@@ -1058,6 +1098,7 @@ impl Session {
                 mirror: String::new(),
                 attention: None,
                 registration_only: false,
+                omp_fence: None,
             }
         }
     }
@@ -1253,6 +1294,8 @@ struct PauseRegistration {
     mirror: String,
     #[serde(default)]
     attention: Option<AttentionRoute>,
+    #[serde(default)]
+    omp_fence: Option<crate::omp_fence::OmpFenceRef>,
 }
 fn pause_registration_file(path: &std::path::Path) -> Result<Option<Session>, String> {
     let file = match std::fs::File::open(path) {
@@ -1281,6 +1324,7 @@ fn pause_registration_file(path: &std::path::Path) -> Result<Option<Session>, St
         mirror: reg.mirror,
         attention: reg.attention,
         registration_only: false,
+        omp_fence: reg.omp_fence,
         state: String::new(),
         state_ms: 0,
         last_drained_ms: 0,

@@ -75,7 +75,8 @@ use crate::node::api::{MessageRow, NodeEvent};
 /// ([`crate::node::daemonipc`]); a request in flight when its node detaches is answered
 /// [`Frame::NodeDetached`].
 /// 10: `Using` identifies the attachment incarnation; derived connections can require it.
-/// 11: stale-safe operator repository decision and replacement requests.
+/// 11: stale-safe operator repository decision and replacement requests; typed registration
+/// refusals distinguish retryable mutations from invalid ownership.
 pub const PROTOCOL_VERSION: u64 = 11;
 
 /// Largest frame accepted in either direction.
