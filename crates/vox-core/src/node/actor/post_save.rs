@@ -69,16 +69,10 @@ impl EndPreparation {
             },
         );
         let bytes = pending_withdrawals_bytes(&next).map_err(|error| fault_of(&error))?;
-        #[cfg(feature = "test-knobs")]
-        let durable = !crate::node::computer::fx28_mutant("withdrawal-not-durable");
-        #[cfg(not(feature = "test-knobs"))]
-        let durable = true;
-        if durable {
-            batch
-                .put_meta(PENDING_WITHDRAWALS_META_KEY, &bytes)
-                .map_err(|error| fault_of(&error))?;
-            batch.commit().map_err(|error| fault_of(&error))?;
-        }
+        batch
+            .put_meta(PENDING_WITHDRAWALS_META_KEY, &bytes)
+            .map_err(|error| fault_of(&error))?;
+        batch.commit().map_err(|error| fault_of(&error))?;
         Ok(EndWithdrawal {
             pending: next.remove(&room).ok_or(Fault::Internal)?,
         })

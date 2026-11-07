@@ -124,10 +124,6 @@ impl ComputerAuthority {
     }
 
     pub(super) fn publish<T>(&self, publish: impl FnOnce() -> T) -> Option<T> {
-        #[cfg(feature = "test-knobs")]
-        if crate::node::computer::fx28_mutant("stale-join-authority") {
-            return Some(publish());
-        }
         match self {
             Self::Unmanaged => Some(publish()),
             Self::Managed {
@@ -137,14 +133,6 @@ impl ComputerAuthority {
                 node,
             } => computer.publish_with_current_authority(*applied, *expired, *node, publish),
         }
-    }
-
-    pub(super) fn publish_room_creation<T>(&self, publish: impl FnOnce() -> T) -> Option<T> {
-        #[cfg(feature = "test-knobs")]
-        if crate::node::computer::fx28_mutant("stale-room-create-authority") {
-            return Some(publish());
-        }
-        self.publish(publish)
     }
 
     /// The pause mutant changes only this publication, so earlier join assertions cannot mask it.
@@ -160,10 +148,6 @@ impl ComputerAuthority {
     /// asynchronous hand-offs whose irreversible operation belongs to another component; the
     /// operation is not even constructed unless the same authority still exists.
     pub(super) fn current(&self) -> bool {
-        #[cfg(feature = "test-knobs")]
-        if crate::node::computer::fx28_mutant("stale-join-authority") {
-            return true;
-        }
         match self {
             Self::Unmanaged => true,
             Self::Managed {
@@ -379,7 +363,12 @@ impl Node {
         let Ok(listener) = tokio::net::UnixListener::bind(release) else {
             return;
         };
-        if std::fs::write(engaged, format!("{action} held\n")).is_err() {
+        let marker = if variable == TEST_HOLD_ROOM_CREATE_PUBLICATION_ENV {
+            format!("{action}\n")
+        } else {
+            format!("{action} held\n")
+        };
+        if std::fs::write(engaged, marker).is_err() {
             return;
         }
         let _ = listener.accept().await;
@@ -485,10 +474,10 @@ impl Node {
 
     /// Test apparatus: hold one completed room seal after all off-actor work and immediately
     /// before the durable room commit. The marker stages only; shipped create/list output judges.
-    pub(super) async fn hold_room_create_publication_for_proof(&self) {
+    pub(super) async fn hold_room_create_publication_for_proof(&self, room: Digest32) {
         self.hold_authority_use_for_proof(
             TEST_HOLD_ROOM_CREATE_PUBLICATION_ENV,
-            "room create publication",
+            &crate::node::link::b32_encode(&room),
         )
         .await;
     }
@@ -496,12 +485,34 @@ impl Node {
     /// Test apparatus: hold a completed join after its records were queued to the answering
     /// member's real board and immediately before the final durable-policy fence. The marker
     /// stages only; shipped join/list output and the remote board judge the result.
-    pub(super) async fn hold_room_join_after_board_for_proof(&self) {
-        self.hold_authority_use_for_proof(
-            TEST_HOLD_ROOM_JOIN_AFTER_BOARD_ENV,
-            "room join after board publication",
-        )
-        .await;
+    pub(super) fn hold_room_join_after_board_for_proof(&self) -> Option<oneshot::Receiver<()>> {
+        let spec = std::env::var(TEST_HOLD_ROOM_JOIN_AFTER_BOARD_ENV).ok()?;
+        let mut fields = spec.splitn(4, '\t');
+        let (node, arm, engaged, release) = (
+            fields.next()?,
+            fields.next()?,
+            fields.next()?,
+            fields.next()?,
+        );
+        let mine = self.paths.profile_dir.file_name()?.to_str()?;
+        if mine != node || std::fs::remove_file(arm).is_err() {
+            return None;
+        }
+        let _ = std::fs::remove_file(release);
+        let listener = tokio::net::UnixListener::bind(release).ok()?;
+        std::fs::write(engaged, b"room join after board publication held\n").ok()?;
+        let engaged = std::path::PathBuf::from(engaged);
+        let release = std::path::PathBuf::from(release);
+        let wake = Arc::clone(&self.post_save_wake);
+        let (send, recv) = oneshot::channel();
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+            let _ = std::fs::remove_file(engaged);
+            let _ = std::fs::remove_file(release);
+            let _ = send.send(());
+            wake.notify_one();
+        });
+        Some(recv)
     }
 
     /// Test apparatus: hold a prepared sender/history-key batch after every await and immediately

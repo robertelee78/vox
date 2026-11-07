@@ -1551,6 +1551,7 @@ impl Node {
             self.resume_own_key_interruptions();
             self.resume_own_key_donor_busy();
             self.resume_own_key_policy_waiting();
+            self.ready_parked_construction();
         }
         let rooms = pending
             .ready

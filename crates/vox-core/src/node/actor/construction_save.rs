@@ -51,9 +51,26 @@ enum After {
     },
 }
 
-struct Returned {
-    result: crate::error::Result<ChannelState>,
-    lifetime: Arc<maintenance_save::Lifetime>,
+// The result is already stored in a heap-allocated shared slot; boxing adds another allocation.
+#[allow(clippy::large_enum_variant)]
+enum Returned {
+    Unadmitted {
+        work: Work,
+        lifetime: maintenance_save::Lifetime,
+    },
+    Started {
+        result: crate::error::Result<ChannelState>,
+        lifetime: Arc<maintenance_save::Lifetime>,
+    },
+}
+
+pub(super) struct Parked {
+    room: Digest32,
+    epoch: u64,
+    store: std::sync::Weak<Store>,
+    work: Work,
+    reply: oneshot::Sender<Outcome>,
+    ready: bool,
 }
 
 pub(super) struct Pending {
@@ -158,14 +175,17 @@ impl Pending {
         // Retirement still owns the actual durable result and its original secret/publication
         // lease. A successfully constructed room is private until its metadata tail installs it.
         let outcome = if let Some(returned) = returned {
-            let channel = match returned.result {
+            let Returned::Started { result, lifetime } = returned else {
+                let _ = self.reply.send(Outcome::Failed(Fault::Locked));
+                return;
+            };
+            let channel = match result {
                 Ok(channel) => channel,
                 Err(error) => {
                     let _ = self.reply.send(Outcome::Failed(fault_of(&error)));
                     return;
                 }
             };
-            let lifetime = returned.lifetime;
             let room = channel.channel_id();
             let node = channel.me();
             match tokio::task::spawn_blocking(move || {
@@ -186,11 +206,68 @@ impl Pending {
 }
 
 impl Node {
+    pub(super) fn ready_parked_construction(&mut self) {
+        if let Some(parked) = &mut self.parked_construction {
+            parked.ready = true;
+            self.post_save_wake.notify_one();
+        }
+    }
+
+    pub(super) fn retire_parked_construction(&mut self) {
+        if let Some(parked) = self.parked_construction.take() {
+            let _ = parked.reply.send(Outcome::Failed(Fault::Locked));
+        }
+    }
+
+    pub(super) fn resume_parked_construction(&mut self) {
+        let Some(parked) = self.parked_construction.as_ref() else {
+            return;
+        };
+        if parked.reply.is_closed() {
+            self.parked_construction = None;
+            return;
+        }
+        let current = parked.epoch == self.delivery_epoch
+            && self.profile.as_ref().is_some_and(|profile| {
+                parked
+                    .store
+                    .upgrade()
+                    .is_some_and(|store| Arc::ptr_eq(&store, &profile.store_handle()))
+            });
+        if !current {
+            self.retire_parked_construction();
+            return;
+        }
+        if !parked.ready
+            || self.pending_policy.is_some()
+            || self.own_key_untrust_pending.is_some()
+            || self.own_key_computer_flight.is_some()
+            || !self.own_key_computer_pending.is_empty()
+            || !self.computer_authority_current()
+        {
+            return;
+        }
+        let Some(parked) = self.parked_construction.take() else {
+            return;
+        };
+        if let Work::Create { name, .. } = &parked.work {
+            if self.room_named(name).is_some() {
+                let _ = parked.reply.send(Outcome::Failed(Fault::RoomNameTaken));
+                return;
+            }
+        }
+        self.begin_construction(parked.room, parked.work, After::Create, parked.reply);
+    }
+
     pub(super) fn begin_construct_created(
         &mut self,
         created: Created,
         reply: oneshot::Sender<Outcome>,
     ) {
+        if self.parked_construction.is_some() {
+            let _ = reply.send(Outcome::Failed(Fault::RoomChangePending));
+            return;
+        }
         let Created {
             name,
             passphrase,
@@ -334,22 +411,21 @@ impl Node {
         let wake = Arc::clone(&self.post_save_wake);
         let task = tokio::spawn(async move {
             let mut lifetime = lifetime;
-            lifetime.publication = lifetime.authority.acquire_publication().await;
-            let lifetime = Arc::new(lifetime);
-            let held = Arc::clone(&lifetime);
-            let saved = if lifetime.publication.is_some() {
-                tokio::task::spawn_blocking(move || work.run(&held))
-                    .await
-                    .unwrap_or_else(|_| Err(Error::Profile("room constructor worker stopped")))
-            } else {
-                Err(Error::ComputerPolicySuperseded)
+            let saved = match lifetime.authority.acquire_publication().await {
+                Some(publication) => {
+                    lifetime.publication = Some(publication);
+                    let lifetime = Arc::new(lifetime);
+                    let held = Arc::clone(&lifetime);
+                    let result = tokio::task::spawn_blocking(move || work.run(&held))
+                        .await
+                        .unwrap_or_else(|_| Err(Error::Profile("room constructor worker stopped")));
+                    Returned::Started { result, lifetime }
+                }
+                None => Returned::Unadmitted { work, lifetime },
             };
             *returned
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Returned {
-                result: saved,
-                lifetime,
-            });
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(saved);
             wake.notify_one();
         });
         self.pending_policy = Some(policy_save::Pending::Construction(Pending {
@@ -378,6 +454,40 @@ impl Node {
             return;
         };
         let _ = pending.task.await;
+        let returned = match returned {
+            Returned::Unadmitted { work, lifetime } => {
+                drop(lifetime);
+                if matches!(work, Work::Create { .. }) {
+                    #[cfg(feature = "test-knobs")]
+                    if crate::node::computer::fx28_mutant("constructor-terminal-refusal") {
+                        let _ = pending.reply.send(Outcome::Failed(Fault::ComputerPolicy));
+                        return;
+                    }
+                    let ready = self.computer_authority_current();
+                    self.parked_construction = Some(Parked {
+                        room: pending.room,
+                        epoch: pending.epoch,
+                        store: Arc::downgrade(&pending.store),
+                        work,
+                        reply: pending.reply,
+                        ready,
+                    });
+                    if ready {
+                        self.post_save_wake.notify_one();
+                    }
+                } else {
+                    self.begin_metadata_abort_join(
+                        pending.room,
+                        Fault::ComputerPolicy,
+                        Some(pending.reply),
+                        None,
+                    );
+                }
+                return;
+            }
+            Returned::Started { result, lifetime } => (result, lifetime),
+        };
+        let (result, lifetime) = returned;
         let current = pending.epoch == self.delivery_epoch
             && self
                 .profile
@@ -389,9 +499,13 @@ impl Node {
             let reply = pending.reply;
             tokio::spawn(async move {
                 let result = tokio::task::spawn_blocking(move || {
-                    let held = returned.lifetime;
-                    let channel = returned.result?;
-                    metadata_save::purge_unpublished(&held.store, &held.signer, channel.me(), room)
+                    let channel = result?;
+                    metadata_save::purge_unpublished(
+                        &lifetime.store,
+                        &lifetime.signer,
+                        channel.me(),
+                        room,
+                    )
                 })
                 .await;
                 let outcome = match result {
@@ -403,7 +517,7 @@ impl Node {
             });
             return;
         }
-        match returned.result {
+        match result {
             Err(error) => match pending.after {
                 After::Create => {
                     self.answer_when_published(
@@ -417,18 +531,18 @@ impl Node {
                     pending.room,
                     fault_of(&error),
                     Some(pending.reply),
-                    Some(returned.lifetime),
+                    Some(lifetime),
                 ),
             },
             Ok(channel) => {
-                let authority = returned.lifetime.authority.clone();
+                let authority = lifetime.authority.clone();
                 match pending.after {
                     After::Create => {
                         self.begin_metadata_created(
                             channel,
                             authority,
                             pending.reply,
-                            Some(returned.lifetime),
+                            Some(lifetime),
                         )
                         .await
                     }
@@ -451,7 +565,7 @@ impl Node {
                         self.begin_metadata_room(
                             metadata_save::RoomAfter::Join(Box::new(tail)),
                             pending.reply,
-                            Some(returned.lifetime),
+                            Some(lifetime),
                             true,
                         )
                         .await;

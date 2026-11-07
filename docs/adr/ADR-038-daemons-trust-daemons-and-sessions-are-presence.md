@@ -10,7 +10,8 @@
   For v0.4.20, independent Opus reviews approved FX-55–FX-57, FX-59–FX-60 and FX-63 at
   `37b0ffbf4`, FX-53–FX-54 at `e8ad3b894`, and FX-58/FX-62 at `0f5988648`.
   These nine corrective designs are accepted, not implemented or release-approved.
-  FX-61 remains Designing/Blocked until its consumer-sensitive causal boundary is established.
+  FX-61a's constructor design is approved; FX-61b remains Designing/Blocked until its
+  consumer-sensitive causal boundary is established. Neither slice is accepted or delivered.
   The operator selected minimal non-secret leave continuity retention and automatic empty
   initialization when prior history cannot be derived; known signed history/conflicts remain
   protected. Technical approval, actual acceptance and publication are separate.
@@ -37,7 +38,9 @@
   amended 2026-11-02 (FX-51: post-issued-consent rekey selection through governance readiness);
   amended 2026-11-02 (FX-48: precommit provider-cursor preparation and reservation readiness);
   amended 2026-11-02 (FX-47: local Session projection demand independent of peer-support waits);
-  amended 2026-11-02 (FX-52: direction-independent authenticated computer enrollment)
+  amended 2026-11-02 (FX-52: direction-independent authenticated computer enrollment);
+  amended 2026-11-07 (FX-61a: retain unadmitted construction across policy supersession,
+  separately from FX-61b's blocked governance/key-package investigation)
 - **Deciders**: Robert E. Lee
 - **Tags**: trust, daemon identity, sessions, presence, agent comms, sync, health, releases
 - **Related**: ADR-018, ADR-020, ADR-026, ADR-029, ADR-031, ADR-033, ADR-034, ADR-035, ADR-036,
@@ -533,6 +536,21 @@ lessons. It changes neither this record's decision status nor any requirement or
   it until withdrawal is complete. Sender-key authority proofs stage the exact protected entry
   at the recipient before releasing a held key batch: lack of ciphertext or receiver-side policy
   revocation cannot substitute for proving the sender's final admission fence.
+  An admitted Join retains its shared publication lease through its outcome; the Computer policy
+  transition takes the exclusive lease (`computer.rs` 2635–2638, 2650–2658). Therefore a policy
+  move cannot commit across that held Join. The FX-28 journey observes the old revision while
+  held, then both successful Join and policy move and fresh posts in both directions. Its former
+  stale-Join withdrawal phase assumed an impossible post-admission policy-move interleaving.
+  Withdrawal after admission remains reachable but unproven: an independent application-miss
+  save failure calls `storage_failure` (`computer.rs` 3256–3290, 2841–2847), blocking authority
+  so the Join publication fence can refuse (`maintenance_save.rs` 19–23;
+  `metadata_save.rs` 939–972). No existing proof knob stages that storage fault at this boundary;
+  the removed journey supplies no withdrawal-after-admission or restart-recovery evidence.
+  A sealed Create held before publication admission whose Computer policy is superseded MUST
+  retain its original construction and complete under the accepted current policy, with the
+  original room ID and reply, rather than fail solely because the policy moved. Stale authority
+  MUST NOT commit the room. The FX-28 shipped journey stages this exact boundary and checks the
+  resumed create and room list; FX-61a defines its ownership and lifecycle.
 - **FX-29.** A sync round that brings this node nothing (no entry, header, proof or key it did
   not already hold) MUST write nothing: over a quiet minute a member's store MUST gain no
   commit at all from its rounds. Decision: a hint this node holds (its committed head, its
@@ -936,7 +954,10 @@ lessons. It changes neither this record's decision status nor any requirement or
   MUST NOT retain the policy writer while waiting for discovery. A parked obligation MUST
   retain its stage/prerequisite, original optional reply, weak room-instance identity,
   attachment generation and settled policy target, but no store, signer, secret lease,
-  publication lease, room lock or worker. Re-entry MUST reacquire the necessary native lease
+  publication lease, room lock or worker. The narrow FX-61a exception permits an unpublished,
+  unadmitted constructor to retain only its own in-memory sealed room key and passphrase as part
+  of the original work; it holds no secret lease and drops that work synchronously on lock.
+  Re-entry MUST reacquire the necessary native lease
   and publication reader and revalidate those exact fences. Real bounded-head/support,
   connection, board/governance and publication progress wake the corresponding obligation;
   Tick and Status MUST NOT retry unchanged parked work. Lock/shutdown, room removal or
@@ -1081,7 +1102,9 @@ lessons. It changes neither this record's decision status nor any requirement or
   input MUST hand off its exact room progress after releasing physical ownership.
   The existing weak parked owner and its lifecycle/authority fences MUST be extended rather
   than duplicated. It MUST retain no store, signer, secret, publication lease, room lock or
-  native worker while parked. Source review and a diagnostic spike MUST distinguish actual
+  native worker while parked. The narrow FX-61a exception permits an unpublished, unadmitted
+  constructor to retain its own in-memory sealed room key and passphrase, without a secret lease,
+  until synchronous drop on lock. Source review and a diagnostic spike MUST distinguish actual
   dependency progress from indirect Tick-driven churn; no mechanism counter is a release gate.
 
   The first correction retained a drive stage but not the failed prerequisite. Its aggregated
@@ -1468,7 +1491,27 @@ lessons. It changes neither this record's decision status nor any requirement or
   envelopes as normal UI. Use existing supported OMP lifecycle, branch and async-snapshot APIs;
   no upstream export prerequisite, private renderer import, new runtime or arbitrary custom
   renderer visual-parity claim is needed for this meaningful presentation.
-- **FX-61. Policy-interrupted delivery.** A currently owned ordinary governance or key-package
+- **FX-61a. Policy-interrupted constructor.** A Create or Serve rejected with
+  `ComputerPolicySuperseded` before publication admission MUST retain the exact original sealed
+  work and reply in one structural unadmitted slot outside `pending_policy`, releasing obsolete
+  authority and lifetime. On accepted policy completion, managed and headless paths MUST re-admit
+  that same work under current authority, without another command or restart. Re-admission MUST
+  check the reply is still open, attachment epoch, newer supersession and ADR-028 R-3. A new
+  Create or Serve while this slot is occupied MUST receive `RoomChangePending`; lock or shutdown
+  MUST retire it with `Locked`. The slot MAY retain only the original in-memory sealed room key
+  and passphrase, no secret lease, and MUST drop them synchronously on lock. Join retains its abort
+  path but MUST report `ComputerPolicy`, not `Internal`. Started or ambiguous construction MUST
+  NOT be replayed; the unadmitted distinction MUST be enforced by type.
+
+  A disposable real-binary diagnostic held a constructor before admission, moved policy 13→15
+  with `vox computer personal gamma`, and observed create fail with an internal error and no room
+  listed. This establishes constructor ownership loss, not a key-package failure or the cause of
+  the historical delivery screenshot. Independent Opus approved this slice's design; implementation,
+  consumer acceptance and delivery remain separate. Acceptance MUST observe the original room ID
+  successfully created after the policy applies, and independently prove stale authority cannot
+  commit. A terminal-refusal inverse MUST fail the consumer assertion, not merely a queue check.
+
+- **FX-61b. Policy-interrupted delivery.** A currently owned ordinary governance or key-package
   selection interrupted by ComputerPolicySuperseded MUST retain its room-instance/work-kind
   obligation and resume on the current accepted policy, without an unrelated command or restart.
   Release stale authority/resources, coalesce requeue, preserve original replies and progress,

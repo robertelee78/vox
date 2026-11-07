@@ -5832,15 +5832,6 @@ struct RoomPublication {
 
 impl RoomPublication {
     fn authority_current(&self) -> bool {
-        #[cfg(feature = "test-knobs")]
-        if self
-            .authority
-            .as_ref()
-            .is_some_and(|(_, ownership, _)| *ownership == RoomPublicationOwnership::Created)
-            && crate::node::computer::fx28_mutant("stale-room-create-authority")
-        {
-            return true;
-        }
         self.authority
             .as_ref()
             .is_none_or(|(_, _, lifetime)| lifetime.publish(|| ()).is_some())
@@ -6271,7 +6262,7 @@ pub struct Node {
     /// initial anchor round ends. Neither room keys nor a snapshot survive a wait.
     publish_waiters: BTreeMap<Digest32, RoomPublication>,
     /// Carried from the first durable room write to the publication waiter. Ownership selects
-    /// both the room-create mutant boundary and whether failed publication may purge new rows.
+    /// whether failed publication may purge new rows.
     room_publication_authority: BTreeMap<Digest32, RoomPublicationAuthority>,
     publication_after: Option<Digest32>,
     publication_pending: bool,
@@ -6473,7 +6464,10 @@ pub struct Node {
     pending_posts: BTreeMap<Digest32, post_save::Pending>,
     parked_private_drives: BTreeMap<Digest32, private_save::ParkedPrivateDrive>,
     pending_policy: Option<policy_save::Pending>,
+    parked_construction: Option<construction_save::Parked>,
     pending_metadata: Option<metadata_save::Pending>,
+    #[cfg(feature = "test-knobs")]
+    held_join_publication: Option<metadata_save::HeldJoinPublication>,
     post_save_wake: Arc<tokio::sync::Notify>,
     deferred_commands: std::collections::VecDeque<post_save::DeferredCommand>,
     command_sender: mpsc::WeakSender<(NodeCommand, oneshot::Sender<Outcome>)>,
@@ -6956,7 +6950,10 @@ impl Node {
             pending_posts: BTreeMap::new(),
             parked_private_drives: BTreeMap::new(),
             pending_policy: None,
+            parked_construction: None,
             pending_metadata: None,
+            #[cfg(feature = "test-knobs")]
+            held_join_publication: None,
             post_save_wake: Arc::new(tokio::sync::Notify::new()),
             deferred_commands: std::collections::VecDeque::new(),
             command_sender: cmd_tx.downgrade(),
@@ -7298,7 +7295,10 @@ impl Node {
                     self.complete_pending_posts().await;
                     self.complete_pending_policies().await;
                     self.complete_pending_metadata().await;
+                    #[cfg(feature = "test-knobs")]
+                    self.resume_held_join_publication_for_proof().await;
                     self.start_own_key_computer_drain();
+                    self.resume_parked_construction();
                     self.resume_peer_book_save();
                 }
                 () = self.availability_wake.notified() => { self.accept_availability(); self.schedule().await; }
@@ -7331,6 +7331,7 @@ impl Node {
                     self.publication_again |= !self.publish_waiters.is_empty();
                     let started = std::time::Instant::now();
                     self.complete_own_key_transitions().await;
+                    self.resume_parked_construction();
                     self.note_if_stalled("resuming publication transitions", started);
                     self.publish().await;
                     self.schedule().await;
@@ -10695,7 +10696,7 @@ impl Node {
                     }
                     Ok(sealed) => {
                         #[cfg(feature = "test-knobs")]
-                        self.hold_room_create_publication_for_proof().await;
+                        self.hold_room_create_publication_for_proof(room).await;
                         self.begin_construct_created(
                             construction_save::Created {
                                 name: room_name,
@@ -18370,6 +18371,9 @@ impl Node {
     async fn lock_all(&mut self) -> oneshot::Receiver<()> {
         self.session_ingress_waits.clear();
         self.session_ingress_scan = 0;
+        self.retire_parked_construction();
+        #[cfg(feature = "test-knobs")]
+        self.retire_held_join_publication_for_proof();
         self.retire_parked_private_drives(Fault::Locked);
         self.retire_identity_startup();
         self.retire_pending_posts();
@@ -18668,6 +18672,10 @@ impl Node {
         service: Option<(String, SocketAddr)>,
         reply: oneshot::Sender<Outcome>,
     ) {
+        if self.parked_construction.is_some() {
+            let _ = reply.send(Outcome::Failed(Fault::RoomChangePending));
+            return;
+        }
         // A node holds one room of a name (ADR-028 R-3): it is the room part of every address.
         if self.room_named(&room_name).is_some() {
             let _ = reply.send(Outcome::Failed(Fault::RoomNameTaken));
@@ -19726,6 +19734,7 @@ impl Node {
             });
             break;
         }
+        self.resume_parked_construction();
     }
 
     /// Retire sends from all current rooms off actor before committing a keyring removal.
@@ -24412,6 +24421,7 @@ pub fn fault_of(e: &Error) -> Fault {
         Error::Profile("identity already exists on this node") => Fault::IdentityExists,
         Error::Profile("locked") => Fault::Locked,
         Error::Profile("no such room on this node") => Fault::UnknownChannel,
+        Error::ComputerPolicySuperseded => Fault::ComputerPolicy,
         Error::Profile("computer policy changed before the room mutation") => Fault::ComputerPolicy,
         Error::Profile(crate::node::channel::UNSUPPORTED_ROOM_FORMAT) => {
             Fault::UnsupportedRoomFormat
