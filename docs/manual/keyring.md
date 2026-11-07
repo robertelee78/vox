@@ -188,6 +188,11 @@ you trust. `vox trust read` takes drive back: the current private Session view a
 are withdrawn. This cannot erase content someone already read or copied; previously visible
 text is not evidence of continuing permission.
 
+On an individual computer, an explicit `vox trust read` also prevents its automatic local trust
+rule from giving that node Drive again; `vox trust drive` restores it. In enrolled computer mode,
+the computer policy has no per-node exceptions: change the personal selection or stop trusting
+the computer before choosing a different individual grant.
+
 ## Rename a node in your keyring
 
 Use `vox trust rename` with ann's actual fingerprint from `vox trust list --node robertgpt`,

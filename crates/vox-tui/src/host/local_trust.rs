@@ -96,8 +96,22 @@ impl Router {
                 .iter()
                 .filter(|node| node.fingerprint != eligible.fingerprint)
             {
-                if eligible.removed.contains(&other.fingerprint)
-                    || other.removed.contains(&eligible.fingerprint)
+                let from_blocked = eligible.removed.contains(&other.fingerprint);
+                let to_blocked = other.removed.contains(&eligible.fingerprint);
+                // A full removal suppresses both directions. A read-only choice suppresses
+                // only widening the keyring in which the person made that choice.
+                if (from_blocked
+                    && !eligible
+                        .view
+                        .trusted
+                        .iter()
+                        .any(|(fp, _)| *fp == other.fingerprint))
+                    || (to_blocked
+                        && !other
+                            .view
+                            .trusted
+                            .iter()
+                            .any(|(fp, _)| *fp == eligible.fingerprint))
                 {
                     continue;
                 }
@@ -106,8 +120,12 @@ impl Router {
                 } else {
                     Capability::Read
                 };
-                grant(eligible, other, capability).await?;
-                grant(other, eligible, Capability::Read).await?;
+                if !from_blocked {
+                    grant(eligible, other, capability).await?;
+                }
+                if !to_blocked {
+                    grant(other, eligible, Capability::Read).await?;
+                }
             }
         }
         Ok(())

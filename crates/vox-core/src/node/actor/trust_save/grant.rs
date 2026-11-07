@@ -75,7 +75,12 @@ pub(super) fn run(
             let capability = capability
                 .or_else(|| trust.capability(&target))
                 .unwrap_or_default();
+            let narrowed =
+                was && capability == Capability::Read && trust.local_removals().contains(&target);
             trust.trust_as(target, &petname, history, capability)?;
+            if narrowed {
+                trust.set_capability(&target, Capability::Read);
+            }
         }
         GrantChange::Capability { capability, .. } => {
             if !trust.set_capability(&target, capability) {
@@ -87,7 +92,11 @@ pub(super) fn run(
                 .capability(&target)
                 .ok_or(Error::Profile("identity is not trusted"))?;
             let history = trust.history(&target);
+            let narrowed = trust.local_removals().contains(&target);
             trust.trust_as(target, &petname, history, capability)?;
+            if narrowed {
+                trust.set_capability(&target, Capability::Read);
+            }
         }
         GrantChange::Local {
             name, capability, ..
