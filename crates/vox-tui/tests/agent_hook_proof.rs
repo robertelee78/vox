@@ -141,6 +141,9 @@ const VOX: &str = env!("CARGO_BIN_EXE_vox");
 /// a profile's location or anchors. Removed from every `vox` this proof runs.
 const HARNESS_VARS: &[&str] = &[
     "VOX_SESSION",
+    "PI_SESSION_ID",
+    "VOX_OMP_INSTANCE",
+    "VOX_OMP_GENERATION",
     "VOX_ROOM",
     "VOX_AGENT_NAME",
     "VOX_HARNESS",
