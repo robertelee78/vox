@@ -898,6 +898,15 @@ pub struct RoomAskInfo {
     /// How many sessions wait on the answer.
     pub sessions: u32,
 }
+/// An opaque operator decision and its non-secret scope.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct RoomDecisionInfo {
+    pub token: String,
+    pub target: String,
+    pub source: String,
+    pub room: String,
+}
+
 
 /// What binding or declining an ask did: whether it was done, and its lines, said for a person.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -5217,6 +5226,30 @@ impl VoxClient {
             )),
         }
     }
+    /// Inspect the current repository decision before an operator replacement.
+    pub async fn room_decision(&self, dir: String) -> Result<RoomDecisionInfo, VoxError> {
+        match self.daemon(DaemonRequest::RoomDecision { dir }).await? {
+            DaemonFrame::RoomDecision { token, target, source, room } =>
+                Ok(RoomDecisionInfo { token, target, source, room }),
+            DaemonFrame::RoomAnswer { said, .. } => Err(failed(&said.join("\n"))),
+            _ => Err(failed("the daemon did not inspect the repository decision")),
+        }
+    }
+
+    /// Replace a captured decision; an empty link opts out.
+    pub async fn replace_room(&self, token: String, link: String, passphrase: Arc<Passphrase>, node: String) -> Result<RoomAnswerInfo, VoxError> {
+        self.room_answer(DaemonRequest::RoomReplace {
+            token, link: link.trim().to_owned(), passphrase: passphrase.copy(), node,
+        }).await
+    }
+    /// Answer a waiting ask against the decision displayed to the operator.
+    pub async fn bind_room_decision(&self, dir: String, token: String, link: String, passphrase: Arc<Passphrase>) -> Result<RoomAnswerInfo, VoxError> {
+        self.room_answer(DaemonRequest::RoomAnswerBind {
+            dir, token, link: link.trim().to_owned(), passphrase: passphrase.copy(),
+        }).await
+    }
+
+
 
     /// Bind the directory `dir` to the room `link` names (ADR-029 RB-6), the person's answer to
     /// its ask: what `vox room join <link> --node <node> --bind <dir>` does. The room's

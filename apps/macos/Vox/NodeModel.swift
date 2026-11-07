@@ -2349,6 +2349,20 @@ final class NodeModel: ObservableObject {
             sheet = .repoRoom
         }
     }
+    func inspectRoomDecision(_ dir: String) async throws -> RoomDecisionInfo {
+        try await client.roomDecision(dir: dir)
+    }
+
+    func replaceRoomDecision(_ decision: RoomDecisionInfo, room: String?, link: String,
+                             secret: Secret) async throws -> RoomAnswerInfo {
+        var address = link
+        if let room { address = try await client.link(room: room).url }
+        let passphrase = try secret.passphrase()
+        defer { passphrase.wipe() }
+        return try await client.replaceRoom(token: decision.token, link: address,
+                                            passphrase: passphrase, node: node)
+    }
+
 
     /// Creation uses the app's selected (person's) node. The room secret is reused only for the
     /// verified bind; no identity passphrase or keyring change is involved (RM-2, KP-1).
@@ -2381,7 +2395,8 @@ final class NodeModel: ObservableObject {
     /// Bind `dir` to the room this node holds by `room`'s id, or to the room `link` names (one of
     /// them is given), joined with the passphrase the person typed (RB-6): what `vox room join
     /// <link> --node <node> --bind <dir>` does. Whether it was done.
-    func bindRoom(_ dir: String, room: String?, link: String?, passphrase secret: Secret) async -> Bool {
+    func bindRoom(_ dir: String, room: String?, link: String?, passphrase secret: Secret,
+                  decision: RoomDecisionInfo? = nil) async -> Bool {
         let operation = "bind-room"
         let attempt = begin(operation)
         defer { end(attempt) }
@@ -2391,7 +2406,13 @@ final class NodeModel: ObservableObject {
             if let room { address = try await client.link(room: room).url }
             let passphrase = try secret.passphrase()
             defer { passphrase.wipe() }
-            let answer = try await client.bindRoom(dir: dir, link: address, passphrase: passphrase)
+            let answer: RoomAnswerInfo
+            if let decision {
+                answer = try await client.bindRoomDecision(dir: dir, token: decision.token,
+                                                           link: address, passphrase: passphrase)
+            } else {
+                answer = try await client.bindRoom(dir: dir, link: address, passphrase: passphrase)
+            }
             roomAskSaid = answer
             await readRoomAsks()
             return answer.done
