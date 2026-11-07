@@ -4202,19 +4202,18 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
         .to_owned();
     let (ok, moved, err) = hook_env(&data, &cfg, &["agent", "room", &scratch], "", &as_below);
     eprintln!("[proof] (5) `vox agent room {scratch}` said: {moved}{err}");
-    let ended_in_home = sessions(&home)
-        .iter()
-        .any(|r| r["id"] == below && r["open"] == false);
-    assert!(
-        ok && moved.contains("about to move session")
-            && open_in(&scratch, below)
-            && ended_in_home
-            && !open_in(&home, below),
-        "PRODUCT: moving a session must end its Session in the room it worked in and open one in \
-         the new room: in {home} {:?}, in {scratch} {:?}; it said {moved}{err}",
-        sessions(&home),
-        sessions(&scratch)
-    );
+    assert!(ok, "PRODUCT: moving the Session was refused: {moved}{err}");
+    let moved_by = Instant::now() + Duration::from_secs(30);
+    loop {
+        let old = sessions(&home);
+        let new = sessions(&scratch);
+        if old.iter().any(|r| r["id"] == below && r["open"] == false)
+            && new.iter().any(|r| r["id"] == below && r["open"] == true) { break; }
+        assert!(Instant::now() < moved_by,
+            "PRODUCT: moving the Session did not end its old Session and open its new one; \
+             old {old:?}; new {new:?}; command {moved}{err}");
+        std::thread::sleep(Duration::from_millis(250));
+    }
 
     // (5b) The operator says no for a repo: recorded, and no session started there asks again.
     let declined_repo = tmp.path().join("declined-repo");
@@ -4255,9 +4254,8 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
     // works in that room, asked nothing.
     let bound_dir = std::fs::canonicalize(&declined_repo).unwrap_or(declined_repo.clone());
     let bind = |link: &str, passphrase: &str| {
-        in_terminal(
-            &data,
-            &cfg,
+        on_pty_result(
+            VOX,
             &[
                 "room",
                 "join",
@@ -4267,6 +4265,8 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
                 "--bind",
                 &bound_dir.to_string_lossy(),
             ],
+            &data,
+            &cfg,
             &[("passphrase", &format!("{passphrase}\r"))],
         )
     };
@@ -4288,6 +4288,31 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
              {first:?}"
         );
     };
+    let split_bound = |text: &str| -> (String, String, String) {
+        let header = format!("repo {}\n", bound_dir.display());
+        assert_eq!(text.matches(&header).count(), 1,
+            "PRODUCT: the canonical repository must have exactly one map block");
+        let start = text.find(&header).unwrap();
+        let end = text[start + header.len()..].find("\nrepo ")
+            .map_or(text.len(), |offset| start + header.len() + offset + 1);
+        (text[..start].to_owned(), text[start..end].to_owned(), text[end..].to_owned())
+    };
+    let check_bound = |before: &str, link: &str, passphrase: &str| {
+        use std::os::unix::fs::PermissionsExt;
+        let after = std::fs::read_to_string(&map).expect("APPARATUS: read bound map");
+        let (prefix, block, suffix) = split_bound(&after);
+        let (old_prefix, _, old_suffix) = split_bound(before);
+        assert_eq!((prefix, suffix), (old_prefix, old_suffix),
+            "PRODUCT: binding a repository changed unrelated map bytes");
+        let fields: Vec<_> = block.lines().filter_map(|line| line.trim()
+            .split_once(char::is_whitespace).map(|(key, value)| (key, value.trim()))).collect();
+        assert_eq!(fields.iter().filter(|(key, _)| *key == "room").map(|(_, value)| *value).collect::<Vec<_>>(),
+            vec![link], "PRODUCT: the canonical repository has the wrong room decision");
+        assert_eq!(fields.iter().filter(|(key, _)| *key == "passphrase").map(|(_, value)| *value).collect::<Vec<_>>(),
+            vec![passphrase], "PRODUCT: replacing the repository did not replace its saved credential");
+        assert_eq!(std::fs::metadata(&map).expect("APPARATUS: stat map").permissions().mode() & 0o777,
+            0o600, "PRODUCT: binding exposed the room map to another account");
+    };
     let no_before_wrong = std::fs::read(&map).expect("APPARATUS: read map");
     let (ok, out, err) = hook(
         &data, &cfg,
@@ -4299,8 +4324,18 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
         "PRODUCT: a wrong passphrase for a held room must leave the non-git directory's no unchanged");
     assert!(!out.contains("wrong room passphrase") && !err.contains("wrong room passphrase"),
         "PRODUCT: a refused bind must not print its passphrase");
-    let joined = bind(&link_other, "other passphrase");
-    eprintln!("[proof] (5c) `vox room join --bind` at a terminal said: {joined}");
+    let membership_before = rooms().lines().find(|row| row.starts_with(&other))
+        .expect("APPARATUS: the existing room must be held before binding").to_owned();
+    let map_before_bind = std::fs::read_to_string(&map).expect("APPARATUS: read map before bind");
+    let (bound_ok, joined) = bind(&link_other, "other passphrase");
+    assert!(bound_ok, "PRODUCT: binding the held room failed: {joined}");
+    check_bound(&map_before_bind, &link_other, "other passphrase");
+    let membership_after = rooms().lines().find(|row| row.starts_with(&other))
+        .expect("PRODUCT: binding the held room lost its membership").to_owned();
+    assert_eq!(membership_after, membership_before,
+        "PRODUCT: binding a held room changed its membership");
+    assert!(!joined.contains("other passphrase"), "PRODUCT: binding printed the room passphrase");
+    eprintln!("[proof] (5c) operator bind output: {joined}");
     lands_in(&other, "77777777-aaaa-4bbb-8ccc-000000000007");
     eprintln!("[proof] (5c) a session started in the bound directory works in {other}");
 
@@ -4329,8 +4364,17 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
         .and_then(|l| l.split_whitespace().next())
         .unwrap_or_default()
         .to_owned();
-    let rebound = bind(&alice.link(&third), "third passphrase");
-    eprintln!("[proof] (5d) bound again, to {third}: {rebound}");
+    let third_link = alice.link(&third);
+    let map_before_rebind = std::fs::read_to_string(&map).expect("APPARATUS: read map before rebind");
+    let (rebound_ok, rebound) = bind(&third_link, "third passphrase");
+    assert!(rebound_ok, "PRODUCT: rebinding to the new room failed: {rebound}");
+    check_bound(&map_before_rebind, &third_link, "third passphrase");
+    assert!(open_in(&other, "77777777-aaaa-4bbb-8ccc-000000000007"),
+        "PRODUCT: rebinding moved the existing Session");
+    assert!(rooms().lines().any(|row| row.starts_with(&third)),
+        "PRODUCT: rebinding did not join the new room");
+    assert!(!rebound.contains("third passphrase"), "PRODUCT: rebinding printed the room passphrase");
+    eprintln!("[proof] (5d) operator rebind output: {rebound}");
     lands_in(&third, "88888888-aaaa-4bbb-8ccc-000000000008");
 
     // An explicit subdirectory binding must not replace the inherited parent block.
@@ -5031,6 +5075,16 @@ fn on_pty(
     cfg: &Path,
     answers: &[(&str, &str)],
 ) -> String {
+    on_pty_result(program, args, data, cfg, answers).1
+}
+
+fn on_pty_result(
+    program: &str,
+    args: &[&str],
+    data: &Path,
+    cfg: &Path,
+    answers: &[(&str, &str)],
+) -> (bool, String) {
     use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem as _};
     use std::io::Read;
     use std::sync::{Arc, Mutex};
@@ -5120,6 +5174,7 @@ fn on_pty(
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+    let success = child.wait().expect("APPARATUS: collect terminal command exit").success();
     std::thread::sleep(Duration::from_millis(200));
-    text()
+    (success, text())
 }
