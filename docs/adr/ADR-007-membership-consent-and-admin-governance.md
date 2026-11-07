@@ -224,10 +224,13 @@ only room governance is who sets the room's retention. This builds on identity (
   creator-issued delegation granting `policy` in the action's strict causal past, and MUST
   itself be a member at that action. Evaluate this authority in the strict causal past,
   not by a circular final-membership predicate, with one root-authority cutoff: a delegated
-  admin's governance act is valid only if it lies in the strict causal past of every valid
-  creator-signed removal of that admin and every creator revocation of that delegation.
-  Acts concurrent with or after those creator facts are invalid, retained only as opaque
-  evidence. The creator is non-removable, so the cutoff introduces no mutual-validity cycle.
+  admin's governance act must, for every valid creator removal of that admin or revocation
+  of its delegation, either lie in that creator fact's strict causal past or descend from a
+  valid root-only re-enabling fact which itself descends from that cutoff: creator readmission
+  for removal, or a fresh creator delegation for revocation. Otherwise it is invalid and kept
+  only as opaque evidence. Restored authority also requires ordinary current membership,
+  scope and delegation checks. Acts citing only pre-cutoff parents remain invalid after
+  restoration. Root-only cutoffs and restoration introduce no mutual-validity cycle.
   Concurrent removals by two delegated admins can both stand; absent a creator cutoff,
   a malicious removed delegated admin can still issue concurrent governance using old
   parents. That disclosed limit is resolved by creator removal or delegation revocation,
@@ -284,10 +287,12 @@ only room governance is who sets the room's retention. This builds on identity (
   Governance validity uses G-29's strict-causal-past authority plus its creator-precedence
   cutoff, not the recursive final-membership predicate. Concurrent mutual delegated-admin
   removals remain valid unless the applicable creator cutoff invalidates an act. Creator
-  removal or delegation revocation invalidates the target admin's concurrent/later governance,
-  including room end, rename, retention, anchors and further member removals; choosing old
-  parents cannot evade it. Members MUST retain and forward ineligible signed skeletons
-  and ciphertext as opaque causal-parent/fork evidence, without applying content or authority.
+  removal or delegation revocation invalidates concurrent/later delegated governance,
+  including room end, rename, retention, anchors and further removals, unless the act
+  descends from the appropriate valid root re-enabling fact under G-29. Choosing old
+  parents cannot evade a cutoff before or after restoration. Members MUST retain and
+  forward ineligible signed skeletons and ciphertext as opaque causal-parent/fork evidence,
+  without applying content or authority.
 
   Retain historical signed entries, their signatures, author-chain skeletons, fork evidence and
   claim history; filtering is not deletion of the target's prefix or a rewrite of signed history.
@@ -308,8 +313,11 @@ only room governance is who sets the room's retention. This builds on identity (
   governance with pre-cutoff parents: concurrent/later end, rename and member-removal acts
   stay inert regardless of delivery order, including through an unaware peer. Prior valid
   acts remain historical; mutual delegated removals converge without recursive validity
-  oscillation. The apparatus is isolated profiles, controlled partition and timing; the PRODUCT
-  verdict is observed membership and access, not a log assertion or successful command alone.
+  oscillation. Revoke then re-add, and remove then readmit, restore governance for new acts
+  descending from the appropriate root restoration; forged acts citing only pre-cutoff parents
+  remain inert after restoration. The apparatus is isolated profiles, controlled partition
+  and timing; the PRODUCT verdict is observed membership and access, not a log assertion or
+  successful command alone.
   Separately have the removed node post, including a partition-concurrent post replayed after
   catch-up; independent peers' native views MUST NOT show those posts, while the causally prior
   signed history remains readable. Exercise eligible post-readmission content separately.

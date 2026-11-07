@@ -398,12 +398,16 @@ replacement narrows agent `--none` permission; ST-4's supported-API/no-OMP-chang
   This control IPC change requires protocol 10 → 11 (`node/ipc.rs:78`); retain the existing
   version-independent updater bootstrap, without bypassing version checks. The registration
   CLI maps typed results to OR-1 exit categories.
-  A watcher handshake version/protocol mismatch invalidates that daemon observation and
+  A watcher's first handshake version/protocol mismatch invalidates the observation and
   exits with a distinct fixed category. The extension drains and retires it, then at capped
   pace resolves the current configured Vox binary and starts at most one successor for that
-  mismatch episode. If the successor also mismatches, stop and show update/reload guidance;
-  never bypass the handshake or loop replacements. A new daemon instance permits a fresh
-  observation; mismatch is not permanent evidence against all future daemon instances.
+  mismatch episode. If the successor also mismatches, it stays alive as lifetime owner,
+  reports a fixed unavailable/mismatch category and visible update guidance, and continues
+  capped short authenticated-hello observations without reporting Ready or permitting writes.
+  No replacement loop or handshake bypass is allowed. Observe daemon pid/version before
+  the strict compatibility check; the first fully successful handshake resumes normal
+  availability observation and ends the mismatch episode. Later updates get a new bounded
+  successor opportunity. Matching daemon recovery works without an OMP prompt or restart.
   Ordinary helper spawn/pipe failures remain visible and fail closed.
 
   Every new registration write, including prompt registration and cold staging, requires live

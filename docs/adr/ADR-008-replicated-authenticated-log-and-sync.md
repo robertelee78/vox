@@ -189,7 +189,8 @@ consent grants (ADR-007), rendezvous records (ADR-012), the transport identity e
   removal enforcement. ADR-007 G-29's strict-causal-past authority and non-removable creator
   cutoff validate governance; G-31's content eligibility cannot recursively invalidate mutually
   concurrent valid delegated removals. Creator removal/revocation invalidates concurrent or
-  later delegated governance even with old parents. Retain/forward ineligible signed skeletons
+  later delegated governance unless it descends from a valid root restoration that itself
+  descends from that cutoff, as G-29 specifies. Retain/forward ineligible signed skeletons
   and ciphertext for causal parents/fork evidence without applying content or authority.
   Nonmember anchors are discovery boards, not governance-authority validators.
   
