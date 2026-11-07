@@ -268,7 +268,7 @@ async fn omp_prepare(
     }
     let saved = crate::wake::pause_registration(paths, session)
         .map_err(AppError::Usage)?
-        .ok_or_else(|| AppError::Usage("Vox OMP conversation is no longer registered".into()))?;
+        .ok_or_else(|| AppError::Refused { code: 75, message: "Vox OMP conversation is no longer registered".into() })?;
     check_omp_registration(paths, &saved).await?;
     let mut input = parse_input("");
     input.session_id = session.to_owned();
@@ -2053,7 +2053,10 @@ pub async fn run(
         let registered = daemon
             .register(&input, room_arg)
             .await
-            .map_err(|error| AppError::Usage(error.said(&input, &daemon.account)))?;
+            .map_err(|error| AppError::Refused {
+                code: if error.temporary() { 75 } else { 1 },
+                message: error.said(&input, &daemon.account),
+            })?;
         if route.harness == "omp" {
             if let Some(joining) = registered.joining {
                 let marker = under_cursors(paths, "omp", &input.session_id, "omp-room-note");
@@ -2215,6 +2218,7 @@ pub async fn run(
             u @ (Unregistered::NoDaemon(_)
             | Unregistered::Attaching(_)
             | Unregistered::DaemonUnanswered
+            | Unregistered::Temporary(_)
             | Unregistered::Version(_)),
         ) => {
             let words = u.said(&input, &daemon.account);
@@ -2257,6 +2261,8 @@ pub(crate) enum Unregistered {
     DaemonUnanswered,
     /// A local daemon of another release is refused before any request.
     Version(String),
+    /// A typed temporary registration refusal.
+    Temporary(String),
     /// Anything else, in words.
     Failed(AppError),
 }
@@ -2317,6 +2323,10 @@ impl From<AppError> for Unregistered {
 }
 
 impl Unregistered {
+    fn temporary(&self) -> bool {
+        matches!(self, Self::NotAttached(_) | Self::NoNode(_) | Self::NoDaemon(_) | Self::Attaching(_) | Self::DaemonUnanswered | Self::Temporary(_))
+    }
+
     /// In one sentence, with the exact command the operator runs (#666).
     fn said(&self, input: &HookInput, account: &Account) -> String {
         match self {
@@ -2351,6 +2361,7 @@ impl Unregistered {
                 crate::client::START_DAEMON
             ),
             Self::Version(why) => why.clone(),
+            Self::Temporary(why) => why.clone(),
             Self::Failed(e) => e.to_string(),
         }
     }
@@ -2385,10 +2396,15 @@ impl Daemon {
         room_arg: Option<&str>,
     ) -> Result<Registered, Unregistered> {
         use vox_core::node::daemonipc::{DaemonClient, DaemonFrame, DaemonRequest};
+        let mut record = crate::wake::Session::from_env(&input.session_id, input.codex);
+        if record.harness == "omp" && (record.omp_fence.is_none() || record.attention.is_none()) {
+            return Err(Unregistered::Failed(AppError::Usage(
+                "Vox OMP extension needs an update: restart OMP and resume the same conversation".into(),
+            )));
+        }
         if !self.account.nodes_on_disk().contains(&self.node) {
             return Err(Unregistered::NoNode(self.node.clone()));
         }
-        let mut record = crate::wake::Session::from_env(&input.session_id, input.codex);
         // A native Claude hook identifies its actual child harness even inside another
         // agent's shell. Inherited OpenCode endpoints never become that child's route.
         if input.claude && !input.codex {
@@ -2420,11 +2436,10 @@ impl Daemon {
             crate::daemon_client::ensure_daemon_for_hook(&self.account, self.listen, &self.anchors)
                 .await
                 .map_err(|e| {
-                    let why = one_line_reason(&e);
-                    if why.contains("Vox's daemon is ") {
-                        Unregistered::Version(why)
-                    } else {
-                        Unregistered::NoDaemon(why)
+                    match &e {
+                        AppError::Core(vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Version { .. } | vox_core::error::IpcHandshake::Protocol { .. })) => Unregistered::Version(one_line_reason(&e)),
+                        AppError::Core(vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Root)) => Unregistered::Failed(e),
+                        _ => Unregistered::NoDaemon(one_line_reason(&e)),
                     }
                 })?;
         if matches!(daemon, crate::daemon_client::HookDaemon::Unanswered) {
@@ -2440,8 +2455,22 @@ impl Daemon {
                 .node_paths(&self.node)
                 .map_err(|e| AppError::Usage(e.to_string()))?;
             record.tmux_claim = None;
-            crate::wake::store_checked(&paths, &record)
-                .map_err(|why| AppError::Usage(format!("the session was not registered: {why}")))?;
+            let _fence = if record.harness == "omp" {
+                let fingerprint = paths.shown_fingerprint()
+                    .map(|id| vox_core::node::link::b32_encode(&id))
+                    .ok_or_else(|| Unregistered::Failed(AppError::Usage("Vox node identity unavailable".into())))?;
+                let reference = record.omp_fence.as_ref().ok_or_else(|| Unregistered::Failed(AppError::Usage("restart OMP and resume the same conversation".into())))?;
+                let route = record.attention.as_ref().ok_or_else(|| Unregistered::Failed(AppError::Usage("Vox OMP route unavailable".into())))?;
+                Some(crate::omp_fence::validate(&self.account, reference, &fingerprint, &record.session, route)
+                    .map_err(|error| match error {
+                        crate::omp_fence::FenceError::Busy => Unregistered::Temporary("Vox registration is busy".into()),
+                        _ => Unregistered::Failed(AppError::Usage("Vox OMP ownership is invalid; restart OMP and resume the same conversation".into())),
+                    })?)
+            } else { None };
+            crate::wake::store_checked(&paths, &record).map_err(|why| match why {
+                crate::wake::RegistrationStoreError::Busy => Unregistered::Temporary("Vox registration is busy".into()),
+                crate::wake::RegistrationStoreError::Failed(why) => Unregistered::Failed(AppError::Usage(format!("the session was not registered: {why}"))),
+            })?;
             return Err(Unregistered::Attaching(self.node.clone()));
         }
         let record = serde_json::to_string(&record)
@@ -2452,7 +2481,7 @@ impl Daemon {
                 let words = e.to_string().lines().next().unwrap_or_default().to_owned();
                 if matches!(
                     &e,
-                    vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Version { .. })
+                    vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Version { .. } | vox_core::error::IpcHandshake::Protocol { .. } | vox_core::error::IpcHandshake::Root)
                 ) {
                     Unregistered::Version(words)
                 } else {
@@ -2472,13 +2501,8 @@ impl Daemon {
             }),
         )
         .await
-        .map_err(|_| {
-            AppError::Usage(format!(
-                "the daemon did not register this session within {} s; this turn reads nothing",
-                REGISTER_WITHIN.as_secs()
-            ))
-        })?
-        .map_err(|e| AppError::Usage(e.to_string()))?;
+        .map_err(|_| Unregistered::Temporary("Vox daemon registration timed out".into()))?
+        .map_err(|e| Unregistered::Temporary(e.to_string()))?;
         match asked {
             // Its node still attaching: the daemon holds the registration until it is, and
             // this turn says so (#666).
@@ -2490,12 +2514,12 @@ impl Daemon {
             DaemonFrame::SessionRegistered {
                 room, new, joining, ..
             } => Ok(Registered { room, new, joining }),
-            DaemonFrame::Refused(vox_core::node::daemonipc::Refusal::StillDetaching { node }) => {
-                Err(AppError::Usage(format!(
-                    "node {node}'s work is still stopping; this turn reads nothing"
-                ))
-                .into())
-            }
+            DaemonFrame::Refused(vox_core::node::daemonipc::Refusal::StillDetaching { node }) =>
+                Err(Unregistered::Temporary(format!("node {node}'s work is still stopping"))),
+            DaemonFrame::Refused(vox_core::node::daemonipc::Refusal::RegistrationRetryable { reason, .. }) =>
+                Err(Unregistered::Temporary(format!("Vox registration temporarily unavailable: {reason:?}"))),
+            DaemonFrame::Refused(vox_core::node::daemonipc::Refusal::NoSuchNode { node }) =>
+                Err(Unregistered::NoNode(node)),
             DaemonFrame::Refused(vox_core::node::daemonipc::Refusal::NotAttached { node }) => {
                 Err(Unregistered::NotAttached(node))
             }

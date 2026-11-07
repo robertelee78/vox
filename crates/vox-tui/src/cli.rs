@@ -996,6 +996,9 @@ pub struct RoomTailArgs {
 /// `vox agent` — wiring an agent session into a room.
 #[derive(Subcommand, Debug, Clone)]
 enum AgentCmd {
+    /// Internal OMP lifetime and read-only availability bridge.
+    #[command(hide = true)]
+    OmpWatch(OmpWatchArgs),
     /// Read this session's unread messages and print them for the harness to
     /// inject. Meant to be run BY a harness hook, not by hand.
     ///
@@ -1109,6 +1112,18 @@ enum AgentCmd {
     ///
     /// For example: vox agent send ./report.pdf --note "the numbers you asked for"
     Send(AgentSendArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+struct OmpWatchArgs {
+    #[command(flatten)]
+    profile: AccountArgs,
+    #[arg(long)]
+    node: String,
+    #[arg(long)]
+    successor: bool,
+    #[arg(long, requires = "successor")]
+    instance: Option<String>,
 }
 
 /// `vox agent status`
@@ -3282,6 +3297,25 @@ pub fn run() -> ExitCode {
                 }
             }
         }
+        Cmd::Agent(AgentCmd::OmpWatch(args)) => {
+            let account = match vox_core::node::paths::Account::of(
+                args.profile.data_dir.as_deref(), args.profile.config_dir.as_deref(),
+            ) {
+                Ok(account) => account,
+                Err(_) => return ExitCode::FAILURE,
+            };
+            if vox_core::node::layout::refuse_old_layout(&account).is_err() {
+                return ExitCode::FAILURE;
+            }
+            let node = match vox_core::node::paths::NodeName::parse(&args.node) {
+                Ok(node) => node,
+                Err(_) => return ExitCode::FAILURE,
+            };
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+                return ExitCode::FAILURE;
+            };
+            ExitCode::from(rt.block_on(crate::omp_watch::run(account, node, args.successor, args.instance)))
+        }
         Cmd::Agent(AgentCmd::Hook(args)) => {
             // HK-2/3: only account configuration and a one-line notice; no node or daemon.
             if let Some(harness) = args.light.as_deref() {
@@ -3360,7 +3394,7 @@ pub fn run() -> ExitCode {
                     Ok(()) => ExitCode::SUCCESS,
                     Err(error) => {
                         eprintln!("vox: {error}");
-                        ExitCode::FAILURE
+                        if args.attention_register || args.omp_prepare { error.exit_code() } else { ExitCode::FAILURE }
                     }
                 };
             }

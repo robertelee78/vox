@@ -23,7 +23,11 @@ const CONTEXT_ACCEPTED = "vox-context-accepted"
 export default function vox(pi) {
   let ctx = null, session = null, route = randomBytes(32).toString("hex")
   let generation = 0, listening = false, stopped = false, registration = null
-  let pending = null, lastName = null
+  let lastName = null, confirmed = false, refusal = null, readyNode = false
+  let watcher = null, instance = null, generationRef = null, watcherReady = null, watcherFailed = false
+  let ownership = Promise.resolve(), retryTimer = null, retryStep = 0, mismatchEpisode = false
+  let commandId = 0, commands = new Map(), reconciliationTimer = null, installPending = null
+  let availabilityEpoch = 0, successorPending = false
   const token = randomBytes(32).toString("hex")
   const expected = Buffer.from(token)
   const notices = new Map(), materializations = new Map()
@@ -51,7 +55,8 @@ export default function vox(pi) {
     const e = { ...process.env, VOX_NODE, VOX_HARNESS: "omp", VOX_SESSION: session,
       VOX_OPENCODE_WAKE_SOCKET: socketPath, VOX_OPENCODE_WAKE_TOKEN: token,
       VOX_OPENCODE_MIRROR_SOCKET: socketPath, VOX_OPENCODE_ATTENTION_SOCKET: socketPath,
-      VOX_OPENCODE_ATTENTION_TOKEN: token, VOX_OPENCODE_ATTENTION_ROUTE: route }
+      VOX_OPENCODE_ATTENTION_TOKEN: token, VOX_OPENCODE_ATTENTION_ROUTE: route,
+      VOX_OMP_INSTANCE: instance || "", VOX_OMP_GENERATION: generationRef || "" }
     for (const k of ["CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_ENTRYPOINT",
       "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN", "OPENCODE_SESSION_ID", "VOX_OPENCODE_HEADLESS"]) delete e[k]
     return e
@@ -128,7 +133,7 @@ export default function vox(pi) {
     return retained < MAX_NOTICES
   }
   function queue(id, source, text) {
-    if (queueBusy() || notices.has(id) || notices.size >= MAX_NOTICES || operation || !current()) return false
+    if (queueBusy() || notices.has(id) || notices.size >= MAX_NOTICES || operation || !current() || !generationRef || !readyNode) return false
     const stamp = fence()
     if (!stamp) return false
     const record = { id, source, text, fence: stamp, state: "queued" }
@@ -189,25 +194,41 @@ export default function vox(pi) {
     try {
       child = spawn(process.env.VOX_BIN || "vox",
         ["agent", "hook", "--node", VOX_NODE, "--session", op.fence.session, "--format", "opencode", "--omp-prepare"],
-        { cwd: ctx.cwd, env: e, stdio: ["pipe", "pipe", "inherit"] })
+        { cwd: ctx.cwd, env: e, stdio: ["pipe", "pipe", "pipe"] })
     } catch (error) { reject(error); return promise }
     op.child = child
     const closed = Promise.withResolvers()
     op.closed = closed.promise
     child.stdin.on("error", () => {})
+    let stderrSize = 0
+    child.stderr.on("data", chunk => { stderrSize += chunk.length; if (stderrSize > MAX_OUTPUT) child.kill() })
+    const deadline = setTimeout(() => child.kill(), REQUEST_WITHIN_MS)
+    deadline.unref?.()
     let buffer = Buffer.alloc(0), settled = false, enveloped = false
     const fail = error => { if (!settled) { settled = true; reject(error); child.kill() } }
     child.once("error", fail)
     child.once("close", code => {
+      clearTimeout(deadline)
+      if (!enveloped && fenced(op.fence)) {
+        confirmed = false
+        report(code === 75 ? "Session registration is no longer present; reacquiring it" : "context preparation unavailable; reacquiring registration")
+        scheduleRetry()
+      }
       if (!settled) fail(new Error("Vox prepare ended before its envelope"))
       if (op.decision === "commit" || op.decision === "cancel") {
         const confirmed = enveloped && code === 0
         if (op.record) op.record.state = confirmed ? (op.decision === "commit" ? "committed" : "cancelled") : "unknown"
-        if (!confirmed) {
+        if (!confirmed && enveloped) {
           poisoned = true
           publish({ type: "unavailable", error: "Vox context " + op.decision + " was not confirmed" })
         }
-      } else if (!op.done) finish(op, null)
+      } else if (!op.done) {
+        if (!enveloped) {
+          confirmed = false
+          op.done = true
+          if (op.record) op.record.state = "cancelled"
+        } else finish(op, null)
+      }
       if (operation === op) operation = null
       closed.resolve()
     })
@@ -222,6 +243,7 @@ export default function vox(pi) {
         if (!value || typeof value.vox !== "string" || typeof value.room !== "string" || !Array.isArray(value.attention_receipts)) throw new Error("invalid envelope")
         settled = true
         enveloped = true
+        clearTimeout(deadline)
         resolve(value)
       } catch { fail(new Error("Vox prepare returned an invalid envelope")) }
     })
@@ -250,15 +272,18 @@ export default function vox(pi) {
     }
     return count
   }
+  function report(reason) {
+    try { ctx?.ui?.notify?.("Vox: " + reason, "warning") } catch {}
+  }
   function hook(args, input = null) {
     const snapshot = generation
     const { promise, resolve, reject } = Promise.withResolvers()
     let child
     try { child = spawn(process.env.VOX_BIN || "vox", ["agent", "hook", "--node", VOX_NODE, ...args],
-      { cwd: ctx.cwd, env: env(), stdio: ["pipe", "pipe", "ignore"] }) }
+      { cwd: ctx.cwd, env: env(), stdio: ["pipe", "pipe", "pipe"] }) }
     catch (error) { reject(error); return promise }
     children.add(child)
-    let output = [], size = 0, failed = false
+    let output = [], size = 0, failed = false, stderrSize = 0
     const deadline = setTimeout(() => { failed = true; child.kill() }, REQUEST_WITHIN_MS)
     deadline.unref?.()
     child.stdout.on("data", chunk => {
@@ -266,45 +291,219 @@ export default function vox(pi) {
       if (size > MAX_OUTPUT) { failed = true; child.kill(); return }
       output.push(chunk)
     })
+    // Drain without displaying untrusted diagnostic prose, which may contain private data.
+    child.stderr.on("data", chunk => { stderrSize += chunk.length; if (stderrSize > MAX_OUTPUT) { failed = true; child.kill() } })
     child.stdin.on("error", () => {})
     child.stdin.end(input)
     child.once("error", error => { clearTimeout(deadline); children.delete(child); reject(error) })
     child.once("close", code => {
       clearTimeout(deadline); children.delete(child)
-      if (failed || code !== 0 || snapshot !== generation || !current()) return reject(new Error("Vox hook failed or the session changed"))
+      if (failed || snapshot !== generation || !current()) return reject(Object.assign(new Error("Vox hook unavailable or session changed"), { temporary: true }))
+      if (code !== 0) return reject(Object.assign(new Error("Vox registration failed"), { temporary: code === 75 }))
       resolve(Buffer.concat(output).toString("utf8"))
     })
     return promise
   }
-  async function register() {
-    if (!listening || !current()) return
-    if (registration) return registration
-    const id = session, stamp = generation
-    registration = hook(["--session", id, "--attention-register"]).catch(() => {}).finally(() => {
-      registration = null
-      if (pending && stamp !== generation) { pending = false; void register() }
+  function cancelRetry() {
+    clearTimeout(retryTimer)
+    retryTimer = null
+  }
+  function scheduleRetry() {
+    if (retryTimer || stopped || confirmed || refusal === "permanent" || !watcher) return
+    const delay = [1, 2, 4, 8, 16, 30][Math.min(retryStep++, 5)] * 1000
+    retryTimer = setTimeout(() => {
+      retryTimer = null
+      if (stopped || !watcher || confirmed || refusal === "permanent") return
+      if (!generationRef && installPending) { void installPending(); return }
+      void watcherCommand({ op: "snapshot" }).catch(error => {
+        if (error.reason === "unavailable") scheduleRetry()
+        else failWatcher("availability observation failed")
+      })
+    }, delay)
+    retryTimer.unref?.()
+  }
+  function failWatcher(reason) {
+    const ambiguous = poisoned || !!operation?.injected
+    retire()
+    poisoned = ambiguous
+    readyNode = false
+    report(reason)
+    if (watcher) { watcher.stdin.destroy(); watcher.kill() }
+  }
+  function watcherCommand(command) {
+    const child = watcher
+    if (!child || child.stdin.destroyed) return Promise.reject(new Error("Vox ownership unavailable"))
+    const id = String(++commandId)
+    const { promise, resolve, reject } = Promise.withResolvers()
+    const timer = setTimeout(() => {
+      commands.delete(id)
+      reject(new Error("Vox ownership command timed out"))
+    }, REQUEST_WITHIN_MS)
+    timer.unref?.()
+    commands.set(id, { resolve, reject, timer })
+    child.stdin.write(JSON.stringify({ id, ...command }) + "\n", error => {
+      if (error && commands.has(id)) {
+        commands.delete(id); clearTimeout(timer); reject(error)
+      }
     })
-    return registration
+    return promise
+  }
+  function startWatcher(successor = false, previousInstance = null) {
+    if (watcher || stopped || !ctx) return watcherReady
+    if (watcherFailed) return Promise.reject(new Error("Vox ownership unavailable"))
+    const started = Promise.withResolvers()
+    watcherReady = started.promise
+    let child
+    try {
+      child = spawn(process.env.VOX_BIN || "vox", ["agent", "omp-watch", "--node", VOX_NODE, ...(successor ? ["--successor", "--instance", previousInstance] : [])],
+        { cwd: ctx.cwd, env: process.env, stdio: ["pipe", "pipe", "pipe"] })
+    } catch {
+      watcherFailed = true
+      started.reject(new Error("Vox availability helper could not start"))
+      report("availability helper could not start; restart OMP and resume this conversation")
+      return watcherReady
+    }
+    watcher = child
+    let text = "", stderrSize = 0, owned = false
+    const ownerDeadline = setTimeout(() => failWatcher("availability helper did not acquire ownership"), REQUEST_WITHIN_MS)
+    ownerDeadline.unref?.()
+    child.stdin.on("error", () => failWatcher("availability helper pipe failed"))
+    child.stderr.on("data", chunk => { stderrSize += chunk.length; if (stderrSize > MAX_OUTPUT) failWatcher("availability helper exceeded its output limit") })
+    child.stdout.on("data", chunk => {
+      text += chunk.toString("utf8")
+      if (Buffer.byteLength(text) > MAX_FRAME) return failWatcher("availability helper returned an oversized frame")
+      let end
+      while ((end = text.indexOf("\n")) !== -1) {
+        const line = text.slice(0, end); text = text.slice(end + 1)
+        let frame
+        try { frame = JSON.parse(line) } catch { failWatcher("availability helper returned an invalid frame"); return }
+        if (frame?.type === "owner" && !owned && /^[0-9a-f]{64}$/.test(frame.instance)) {
+          clearTimeout(ownerDeadline); owned = true; instance = frame.instance; started.resolve()
+        } else if (frame?.type === "ack" && typeof frame.id === "string") {
+          const command = commands.get(frame.id)
+          if (!command) continue
+          commands.delete(frame.id); clearTimeout(command.timer)
+          if (frame.ok === true) command.resolve()
+          else command.reject(Object.assign(new Error("Vox ownership command refused"), { reason: frame.reason, temporary: frame.reason === "busy" }))
+        } else if (frame?.type === "matched") {
+          mismatchEpisode = false
+        } else if (frame?.type === "ready") {
+          readyNode = true
+          mismatchEpisode = false
+          if (refusal === "mismatch") refusal = null
+          if (!current() && ctx?.mode === "tui" && ctx?.agent.kind === "main") void reconcileManager()
+          else if (!confirmed && !retryTimer && refusal !== "permanent") void register()
+        } else if (frame?.type === "unavailable") {
+          readyNode = false; confirmed = false; availabilityEpoch++
+          if (frame.reason === "mismatch") {
+            if (refusal !== "mismatch") report("Vox update mismatch; update Vox and restart the daemon")
+            refusal = "mismatch"
+          }
+        } else { failWatcher("availability helper returned an invalid frame"); return }
+      }
+    })
+    child.once("error", () => { if (!owned) started.reject(new Error("Vox availability helper could not start")) })
+    child.once("close", code => {
+      clearTimeout(ownerDeadline)
+      if (watcher !== child) return
+      const previousInstance = instance
+      const ambiguous = poisoned || !!operation?.injected
+      retire()
+      poisoned = ambiguous
+      watcher = null; instance = null; readyNode = false
+      for (const command of commands.values()) { clearTimeout(command.timer); command.reject(new Error("Vox ownership ended")) }
+      commands.clear()
+      if (!owned) started.reject(new Error("Vox availability helper ended"))
+      if (stopped) return
+      if (code === 76 && !mismatchEpisode) {
+        mismatchEpisode = true
+        report("Vox update detected; reconnecting availability helper")
+        successorPending = true
+        const successor = Promise.withResolvers()
+        void successor.promise.catch(() => {})
+        watcherReady = successor.promise
+        const timer = setTimeout(() => {
+          if (stopped) { successor.reject(new Error("Vox stopped")); return }
+          const started = startWatcher(true, previousInstance)
+          successorPending = false
+          void started.then(() => { successor.resolve(); return reconcileManager() }).catch(error => {
+            successor.reject(error); report("Vox availability helper could not recover")
+          })
+        }, 1000)
+        timer.unref?.()
+      } else { watcherFailed = true; report("Vox availability helper stopped; restart OMP and resume this conversation") }
+    })
+    return watcherReady
+  }
+  async function register() {
+    if (!listening || !current() || !readyNode || !instance || !generationRef || refusal === "permanent" || refusal === "mismatch") return
+    if (confirmed) return
+    if (registration) return registration
+    const id = session, stamp = generation, reference = generationRef, observation = availabilityEpoch
+    const attempt = hook(["--session", id, "--attention-register"]).then(() => {
+      if (stamp === generation && reference === generationRef && observation === availabilityEpoch && current() && readyNode) {
+        confirmed = true; refusal = null; retryStep = 0; cancelRetry()
+      }
+    }).catch(error => {
+      if (stamp !== generation || reference !== generationRef || observation !== availabilityEpoch || !current() || refusal === "mismatch") return
+      confirmed = false
+      refusal = error.temporary ? "temporary" : "permanent"
+      report(error.temporary ? "registration temporarily unavailable; retrying when the node is ready" : "registration refused; check node identity, permissions and Vox version")
+      if (error.temporary) scheduleRetry()
+    }).finally(() => {
+      if (registration === attempt) registration = null
+      if ((stamp !== generation || observation !== availabilityEpoch) && readyNode && generationRef) void register()
+    })
+    registration = attempt
+    return attempt
   }
   function retire() {
     generation++
     route = randomBytes(32).toString("hex")
+    generationRef = null; installPending = null; confirmed = false; refusal = null; retryStep = 0; cancelRetry()
     if (operation) finish(operation, operation.injected ? null : "cancel")
     notices.clear()
-    poisoned = false
     lastName = null
     tools.clear()
     for (const follower of followers) follower.destroy()
     followers.clear()
     for (const child of children) child.kill()
   }
-  function activate(next) {
+  function reconcileManager() {
+    if (stopped || !ctx) return Promise.resolve()
     retire()
+    session = ctx.mode === "tui" && ctx.agent.kind === "main" ? ctx.sessionManager.getSessionId() : null
+    transitionFence = session ? { leaf: ctx.sessionManager.getLeafId(), existing: new Set(ctx.sessionManager.getEntries().map(entry => entry.id)) } : null
+    const stamp = generation, id = session, nextRoute = route
+    ownership = ownership.catch(() => {}).then(async () => {
+      if (!watcher && !successorPending) await startWatcher()
+      else await watcherReady
+      await watcherCommand({ op: "revoke" })
+      if (stamp !== generation || !id || !current()) return
+      const install = async () => {
+        if (stamp !== generation || !current() || installPending !== install) return
+        const reference = randomBytes(32).toString("hex")
+        try {
+          await watcherCommand({ op: "install", generation: reference, session: id, endpoint: socketPath, token, route: nextRoute })
+          if (stamp !== generation || !current()) return
+          installPending = null; generationRef = reference; retryStep = 0
+          if (readyNode) void register()
+        } catch (error) {
+          if (stamp !== generation) return
+          if (error.temporary) { report("Vox Session ownership temporarily unavailable"); scheduleRetry() }
+          else { installPending = null; report("Vox Session ownership refused") }
+        }
+      }
+      installPending = install
+      await install()
+    }).catch(() => { if (stamp === generation) { generationRef = null; report("Vox Session ownership unavailable") } })
+    return ownership
+  }
+  function activate(next) {
+    clearTimeout(reconciliationTimer)
+    reconciliationTimer = null
     ctx = next
-    transitionFence = null
-    session = next.mode === "tui" && next.agent.kind === "main" ? next.sessionManager.getSessionId() : null
-    if (registration) pending = true
-    else void register()
+    void reconcileManager()
   }
   function publish(event) {
     send({ type: "event", event })
@@ -385,12 +584,12 @@ export default function vox(pi) {
           handled = true
           // A probe observes this exact route; it must not retire it or perform queue admission.
           // Temporary native work is not an ended conversation. Notice admission stays separate.
-          reply(current() && msg.session === session && !poisoned
+          reply(current() && generationRef && readyNode && msg.session === session && !poisoned
             ? { outcome: "available", session, route, client: route, admission: admissionAvailable() } : { outcome: "unavailable" })
           sock.end(); return
         }
         if (msg?.type === "subscribe") {
-          if (!current() || msg.session !== session) return sock.destroy()
+          if (!current() || !generationRef || !readyNode || msg.session !== session) return sock.destroy()
           subscribed = true; clearTimeout(timer); followers.add(sock)
           reply({ type: "subscribed", session })
           reply({ type: "event", event: { type: "state", busy: !ctx.isIdle() } })
@@ -402,7 +601,7 @@ export default function vox(pi) {
         const answer = (outcome, error) => { reply({ id: valid ? msg.id : null, outcome, ...(error ? { error } : {}) }); sock.end() }
         if (msg?.type !== "attention" || !valid || typeof msg.text !== "string" || !msg.text.trim()
           || Buffer.byteLength(msg.text) > MAX_FRAME / 2) return answer("rejected", "Invalid attention frame")
-        if (!current() || msg.session !== session || msg.route !== route || poisoned) return answer("unavailable", "The exact Session route is unavailable")
+        if (!current() || !generationRef || !readyNode || msg.session !== session || msg.route !== route || poisoned) return answer("unavailable", "The exact Session route is unavailable")
         const digest = createHash("sha256").update(msg.text).digest("hex")
         const prior = notices.get(msg.id)
         if (prior) return prior.digest !== digest ? answer("rejected", "Attention ID already used")
@@ -421,21 +620,26 @@ export default function vox(pi) {
   })
   pi.on("session_start", async (_event, context) => {
     activate(context)
-    if (await ready) await register()
+    if (await ready) { await ownership; await register() }
   })
   async function beforeTransition() {
     observeOrdinary()
     if (ordinarySensitive || operation?.injected) return { cancel: true }
-    if (operation) {
-      const op = operation
-      finish(op, "cancel")
-      if (op.closed) await op.closed
-    }
-    if (current()) {
-      const manager = ctx.sessionManager
-      transitionFence = { leaf: manager.getLeafId(), existing: new Set(manager.getEntries().map(entry => entry.id)) }
-    }
-    for (const record of notices.values()) if (record.state === "queued") record.state = "cancelled"
+    const op = operation
+    retire()
+    if (op?.closed) await op.closed
+    const stamp = generation
+    ownership = ownership.catch(() => {}).then(async () => {
+      if (watcher) await watcherCommand({ op: "revoke" })
+    }).catch(() => report("Vox Session retirement could not be confirmed"))
+    await ownership
+    // Native cancellation can leave the Manager unchanged without a compensating event.
+    // Reconcile on the next turn; a real switch event supersedes this timer.
+    reconciliationTimer = setTimeout(() => {
+      reconciliationTimer = null
+      if (!stopped && stamp === generation) void reconcileManager()
+    }, 0)
+    reconciliationTimer.unref?.()
   }
   pi.on("session_before_switch", beforeTransition)
   pi.on("session_before_branch", beforeTransition)
@@ -456,12 +660,16 @@ export default function vox(pi) {
       }
       followers.clear()
     }
-    stopped = true; retire(); for (const sock of sockets) sock.destroy(); server.close()
+    stopped = true; clearTimeout(reconciliationTimer); retire()
+    if (watcher) { watcher.stdin.end(); watcher.kill() }
+    for (const sock of sockets) sock.destroy(); server.close()
     try { unlinkSync(socketPath); rmdirSync(dir) } catch {}
     await Promise.all(pendingWrites)
   })
   pi.on("before_agent_start", async event => {
-    if (event.reason !== "prompt" || !current() || poisoned) return
+    if (event.reason !== "prompt" || poisoned) return
+    if (!current() && ctx?.mode === "tui" && ctx?.agent.kind === "main") await reconcileManager()
+    if (!current()) return
     reconcileQueued()
     // A retry or a later prompt must reacquire room authority, not replay staged text.
     if (operation?.ordinary && operation.content && !operation.injected) {
@@ -473,8 +681,9 @@ export default function vox(pi) {
     if (operation || [...notices.values()].some(record => record.state === "queued")) return
     const snapshot = fence()
     if (!snapshot) return
-    if (registration) await registration
-    if (!fenced(snapshot) || operation || poisoned || queueBusy()) return
+    await ownership
+    await register()
+    if (!confirmed || !fenced(snapshot) || operation || poisoned || queueBusy()) return
     const op = { fence: snapshot, record: null, child: null, injected: false, done: false,
       marker: "vox-context-" + randomBytes(32).toString("hex"), ordinary: true }
     operation = op
@@ -562,6 +771,9 @@ export default function vox(pi) {
     const { record, index } = matched[0]
     const snapshot = record?.fence || fence()
     if (!snapshot || !fenced(snapshot)) return { messages }
+    await ownership
+    await register()
+    if (!confirmed || !fenced(snapshot) || operation || poisoned) return { messages }
     // Only requests belonging to this new native step can acknowledge its marker.
     providerActive = 0
     const op = { fence: snapshot, record, child: null, injected: false, done: false,

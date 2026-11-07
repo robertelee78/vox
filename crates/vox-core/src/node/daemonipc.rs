@@ -110,6 +110,8 @@ const T_REF_FAILED: u64 = 4305;
 const T_REF_STOPPING: u64 = 4306;
 const T_REF_NODE_IN_USE: u64 = 4307;
 const T_REF_STILL_DETACHING: u64 = 4308;
+const T_REF_REGISTRATION_RETRYABLE: u64 = 4309;
+const T_REF_REGISTRATION_INVALID: u64 = 4310;
 
 // Small enums.
 const STATE_DETACHED: u64 = 0;
@@ -533,6 +535,15 @@ impl SessionAdmission {
     }
 }
 
+/// A temporary reason a registration mutation could not be completed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistrationRetryReason {
+    /// A registration or ownership mutation lock is busy.
+    LockBusy,
+    /// The same Session is still ending.
+    SessionEnding,
+}
+
 /// Why the daemon would not do what a `Use` or a [`DaemonRequest`] asked. Each says what to do; none
 /// names another node's secrets.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -584,6 +595,18 @@ pub enum Refusal {
         /// The node.
         node: NodeName,
     },
+    /// A registration mutation may be retried after the indicated condition clears.
+    RegistrationRetryable {
+        /// The node.
+        node: NodeName,
+        /// A fixed, non-secret retry reason.
+        reason: RegistrationRetryReason,
+    },
+    /// OMP registration ownership is absent or invalid; reload the running extension.
+    RegistrationInvalid {
+        /// The node.
+        node: NodeName,
+    },
 }
 
 /// The longest a request waits for a node that is detaching before it is refused
@@ -614,6 +637,18 @@ impl std::fmt::Display for Refusal {
             Self::StillDetaching { node } => write!(
                 f,
                 "node {node}'s work is still stopping; try again once it has finished"
+            ),
+            Self::RegistrationRetryable { node, reason } => write!(
+                f,
+                "node {node}: registration temporarily unavailable ({})",
+                match reason {
+                    RegistrationRetryReason::LockBusy => "registration lock busy",
+                    RegistrationRetryReason::SessionEnding => "Session ending",
+                }
+            ),
+            Self::RegistrationInvalid { node } => write!(
+                f,
+                "node {node}: OMP registration ownership is invalid; restart OMP and resume the same conversation to load the updated extension"
             ),
         }
     }
@@ -1100,6 +1135,15 @@ fn put_refusal(e: &mut Encoder, r: &Refusal) {
         Refusal::StillDetaching { node } => {
             e.array(2).uint(T_REF_STILL_DETACHING).text(node.as_str());
         }
+        Refusal::RegistrationRetryable { node, reason } => {
+            e.array(3).uint(T_REF_REGISTRATION_RETRYABLE).text(node.as_str()).uint(match reason {
+                RegistrationRetryReason::LockBusy => 0,
+                RegistrationRetryReason::SessionEnding => 1,
+            });
+        }
+        Refusal::RegistrationInvalid { node } => {
+            e.array(2).uint(T_REF_REGISTRATION_INVALID).text(node.as_str());
+        }
     }
 }
 
@@ -1123,6 +1167,16 @@ fn refusal(d: &mut Decoder<'_>) -> Result<Refusal> {
         (T_REF_STOPPING, 1) => Refusal::Stopping,
         (T_REF_NODE_IN_USE, 2) => Refusal::NodeInUse { node: name(d, w)? },
         (T_REF_STILL_DETACHING, 2) => Refusal::StillDetaching { node: name(d, w)? },
+        (T_REF_REGISTRATION_RETRYABLE, 3) => {
+            let node = name(d, w)?;
+            let reason = match d.uint().map_err(malformed("ipc registration retry reason"))? {
+                0 => RegistrationRetryReason::LockBusy,
+                1 => RegistrationRetryReason::SessionEnding,
+                _ => return Err(Error::MalformedIpc("ipc registration retry reason")),
+            };
+            Refusal::RegistrationRetryable { node, reason }
+        }
+        (T_REF_REGISTRATION_INVALID, 2) => Refusal::RegistrationInvalid { node: name(d, w)? },
         _ => return Err(Error::MalformedIpc("ipc refusal tag")),
     })
 }

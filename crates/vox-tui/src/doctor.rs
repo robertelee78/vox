@@ -751,7 +751,7 @@ fn omp_extension(node: &vox_core::node::paths::NodeName) -> Check {
         Ok(text) if text == crate::agent_hook::omp_extension(node) => ok(
             id,
             format!(
-                "{} is this build's Oh My Pi extension for node {node}",
+                "{} is this build's Oh My Pi extension for node {node} on disk; a running OMP may still have an older extension loaded. Restart OMP and resume the same conversation to load it",
                 path.display()
             ),
         ),
@@ -761,7 +761,7 @@ fn omp_extension(node: &vox_core::node::paths::NodeName) -> Check {
                 "{} is an edited, older, light, or differently bound extension",
                 path.display()
             ),
-            "inspect the extension; preserve any edits and run `vox agent setup omp --node <node>`",
+            "inspect the extension; preserve any edits and run `vox agent setup omp --node <node>`, then restart OMP and resume the same conversation",
         ),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound && !dir.exists() => ok(
             id,

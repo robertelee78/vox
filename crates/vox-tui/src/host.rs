@@ -1575,6 +1575,50 @@ impl Router {
             notes: g.notes,
         })
     }
+    /// Serialize an OMP registration mutation against retirement of its native route.
+    fn registration_fence(
+        &self,
+        node: &NodeName,
+        session: &crate::wake::Session,
+        fingerprint: Option<Digest32>,
+    ) -> Result<Option<crate::omp_fence::MutationGuard>, Refusal> {
+        if session.harness != "omp" {
+            return Ok(None);
+        }
+        let invalid = || Refusal::RegistrationInvalid { node: node.clone() };
+        let reference = session.omp_fence.as_ref().ok_or_else(invalid)?;
+        let route = session.attention.as_ref().ok_or_else(invalid)?;
+        let fingerprint = fingerprint.or_else(|| {
+            self.inner.account.node_paths(node).ok()?.shown_fingerprint()
+        }).ok_or_else(invalid)?;
+        let fingerprint = vox_core::node::link::b32_encode(&fingerprint);
+        crate::omp_fence::validate(
+            &self.inner.account,
+            reference,
+            &fingerprint,
+            &session.session,
+            route,
+        ).map(Some).map_err(|error| match error {
+            crate::omp_fence::FenceError::Busy => Refusal::RegistrationRetryable {
+                node: node.clone(),
+                reason: vox_core::node::daemonipc::RegistrationRetryReason::LockBusy,
+            },
+            crate::omp_fence::FenceError::Invalid => invalid(),
+        })
+    }
+    fn registration_store_refusal(node: &NodeName, error: crate::wake::RegistrationStoreError) -> Refusal {
+        match error {
+            crate::wake::RegistrationStoreError::Busy => Refusal::RegistrationRetryable {
+                node: node.clone(),
+                reason: vox_core::node::daemonipc::RegistrationRetryReason::LockBusy,
+            },
+            crate::wake::RegistrationStoreError::Failed(why) => Refusal::Failed {
+                node: node.clone(),
+                why: format!("session was not registered: {why}"),
+            },
+        }
+    }
+
 
     /// Register an agent session of `node` (ADR-020 6.10): store its record and count it as a
     /// holder. **A session never attaches its node** (ADR-028 K-13): one not attached is refused
@@ -1588,6 +1632,9 @@ impl Router {
         session: crate::wake::Session,
         join: Option<(String, Zeroizing<String>)>,
     ) -> Result<DaemonFrame, Refusal> {
+        if session.harness == "omp" && (session.omp_fence.is_none() || session.attention.is_none()) {
+            return Err(Refusal::RegistrationInvalid { node: node.clone() });
+        }
         // A node that does not exist is said as that, not as one to attach.
         if !self.inner.account.nodes_on_disk().contains(node) {
             return Err(Refusal::NoSuchNode { node: node.clone() });
@@ -1646,15 +1693,14 @@ impl Router {
             }
             let ending = lock(&self.inner.omp_ending);
             if ending.contains(&(node.clone(), session.session.clone())) {
-                return Err(Refusal::Failed {
+                return Err(Refusal::RegistrationRetryable {
                     node: node.clone(),
-                    why: "the Session is ending; retry registration".into(),
+                    reason: vox_core::node::daemonipc::RegistrationRetryReason::SessionEnding,
                 });
             }
-            crate::wake::store_checked(&paths, &session).map_err(|why| Refusal::Failed {
-                node: node.clone(),
-                why: format!("session was not registered: {why}"),
-            })?;
+            let _fence = self.registration_fence(node, &session, None)?;
+            crate::wake::store_checked(&paths, &session)
+                .map_err(|error| Self::registration_store_refusal(node, error))?;
             drop(ending);
             drop(ingress);
             let router = self.clone();
@@ -1720,6 +1766,7 @@ impl Router {
             .node_paths(node)
             .ok()
             .and_then(|paths| crate::wake::registration(&paths, &id));
+        let fence_session = (session.harness == "omp").then(|| session.clone());
         let g = self
             .want(
                 node,
@@ -1752,6 +1799,9 @@ impl Router {
                     .filter(|c| c.starts_with(prefix.trim()))
                     .collect();
                 if let [one] = whole.as_slice() {
+                    let _fence = fence_session.as_ref()
+                        .map(|session| self.registration_fence(node, session, g.info.fingerprint))
+                        .transpose()?;
                     crate::wake::store_room(&paths, &id, one);
                 }
             }
@@ -4052,8 +4102,9 @@ impl Router {
                     None => {
                         // A protected node needs the person's Unlock. A passphrase-free
                         // node can start only through the same real credential check below.
-                        if matches!(want, Some(Want::IfAttached | Want::Session(_)))
-                            && !self.no_passphrase(node)?
+                        if matches!(&want, Some(Want::Session(s)) if s.harness == "omp")
+                            || (matches!(want, Some(Want::IfAttached | Want::Session(_)))
+                                && !self.no_passphrase(node)?)
                         {
                             Step::NotAttached
                         } else {
@@ -4292,15 +4343,14 @@ impl Router {
             Want::Session(s) => {
                 let ending = lock(&self.inner.omp_ending);
                 if ending.contains(&(node.clone(), s.session.clone())) {
-                    return Err(Refusal::Failed {
+                    return Err(Refusal::RegistrationRetryable {
                         node: node.clone(),
-                        why: "the Session is ending; retry registration".into(),
+                        reason: vox_core::node::daemonipc::RegistrationRetryReason::SessionEnding,
                     });
                 }
-                crate::wake::store_checked(&a.paths, &s).map_err(|why| Refusal::Failed {
-                    node: node.clone(),
-                    why: format!("session was not registered: {why}"),
-                })?;
+                let _fence = self.registration_fence(node, &s, Some(a.fingerprint))?;
+                crate::wake::store_checked(&a.paths, &s)
+                    .map_err(|error| Self::registration_store_refusal(node, error))?;
                 drop(ending);
                 self.watch_harness(node, &s);
                 a.sessions.insert(s.session.clone());
