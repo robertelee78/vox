@@ -16,6 +16,8 @@ struct SettingsView: View {
     @ObservedObject var app: AppModel
     @State private var showingComputers = false
     @State private var showingNetwork = false
+    @State private var repoDirectory: URL?
+    @State private var showingRepoDecision = false
     @FocusState private var focused: SettingsFocus?
 
     var body: some View {
@@ -29,11 +31,33 @@ struct SettingsView: View {
                 }
                 .sheet(isPresented: $showingComputers) { ComputerTrustView() }
                 .sheet(isPresented: $showingNetwork) { NetworkSettingsView() }
+                .sheet(isPresented: $showingRepoDecision) {
+                    if let node = app.node, let directory = repoDirectory {
+                        RepoDecisionView(model: node, directory: directory.path, decline: false) {
+                            showingRepoDecision = false
+                        }
+                    }
+                }
         }
     }
 
     private var settings: some View {
         VStack(alignment: .leading, spacing: Space.s20) {
+            setting {
+                Button("Rebind Repository…") {
+                    let panel = NSOpenPanel()
+                    panel.canChooseFiles = false
+                    panel.canChooseDirectories = true
+                    panel.allowsMultipleSelection = false
+                    if panel.runModal() == .OK, let url = panel.url {
+                        repoDirectory = url
+                        showingRepoDecision = true
+                    }
+                }
+                .disabled(app.node == nil)
+            } said: {
+                Text("Choose a repository and review its current room decision before changing it.")
+            }
             if !app.agentSetups.isEmpty {
                 setting {
                     ForEach(app.agentSetups) { request in

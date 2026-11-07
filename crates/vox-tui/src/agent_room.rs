@@ -132,10 +132,10 @@ pub fn decline(
             crate::room_map::path(&account.data_root).display()
         );
     } else {
-        println!(
-            "vox: the room map names {} already; nothing was changed",
+        return Err(AppError::Usage(format!(
+            "the room map already resolves {} to a decision; an agent cannot replace or shadow it. An operator can change it in Vox.app or their own terminal",
             start.display()
-        );
+        )));
     }
     Ok(())
 }
