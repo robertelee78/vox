@@ -3736,8 +3736,13 @@ final class FirstRunProof: XCTestCase {
                       "PRODUCT: rebind must not move an already-running Session")
         try follows("62000000-4c0e-4f00-9a1b-0c0ffee54018", noTree, rooms["other"] ?? "")
         // Explicit directory selection also works without .git or a pending room ask.
-        let nongit = root.appendingPathComponent("nongit-binding").path
-        try stager.write(Data("ordinary directory\n".utf8), to: nongit + "/.keep")
+        let nongitInput = root.appendingPathComponent("nongit-binding").path
+        try stager.write(Data("ordinary directory\n".utf8), to: nongitInput + "/.keep")
+        let physicalNongit = stager.run(["/bin/sh", "-c", "cd \"$1\" && pwd -P", "directory", nongitInput], env: [:])
+        let nongit = physicalNongit.out.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard physicalNongit.status == 0, nongit.hasPrefix("/") else {
+            throw Apparatus("the non-git directory's physical path could not be staged")
+        }
         try inspectRebind(nongit)
         type(ui, Key.id("repo-decision-link"), otherLink, "the room link for a non-git directory")
         type(ui, Key.id("repo-decision-passphrase"), "work room", "the room's passphrase")
