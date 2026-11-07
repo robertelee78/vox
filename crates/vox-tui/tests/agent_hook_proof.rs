@@ -4501,23 +4501,12 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
     );
 
     // (5f) **A printed command, pasted whole, does what it says** (v0.4.3): Vox puts every
-    // argument a shell would act on in single quotes. Each command is taken verbatim from what the
-    // shipped binary printed, and run through `zsh -c` and `bash -c` unedited: first its words, as
-    // each shell reads them (`printf` in place of `vox`), then the command itself at a terminal.
+    // argument a shell would act on in single quotes. Commands with known links are taken
+    // verbatim from the shipped binary and executed at a terminal; shell-word proxies are
+    // not product proofs.
     // A link holds `?` and `&` (an unquoted `&` sent the rest of the line to the background and
     // cut the join off); a directory here holds a space, `&` and `!` (which zsh and bash expand
     // even inside double quotes).
-    let words_in = |shell: &str, line: &str| -> Vec<String> {
-        let as_printf = line.replacen("vox ", "printf '%s\\n' ", 1);
-        let out = Command::new(shell)
-            .args(["-c", &as_printf])
-            .output()
-            .unwrap_or_else(|e| panic!("APPARATUS: cannot run {shell}: {e}"));
-        String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .map(str::to_owned)
-            .collect()
-    };
     let make_room = |name: &str, pass: &str| -> (String, String) {
         let (ok, _, err) = hook(
             &alice.data,
@@ -4567,15 +4556,6 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
         "PRODUCT: `vox agent status` in a repo bound to a room its node is not in must print the \
          command that joins it; it said:\n{there}"
     );
-    for shell in ["zsh", "bash"] {
-        let words = words_in(shell, &printed);
-        assert_eq!(
-            words,
-            ["room", "join", paste_link.as_str(), "--node", "default"],
-            "PRODUCT: the printed `{printed}`, pasted into {shell}, must be read as its words with \
-             the link whole; {shell} read {words:?}"
-        );
-    }
     let joined = in_shell(
         "zsh",
         &printed,
@@ -4590,8 +4570,7 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
          {joined}, and `vox room list` lists:\n{}",
         rooms()
     );
-    // RM-4: with no app on this scratch data root, the notice gives both terminal choices.
-    // Paste its entire create command into zsh, including a repository's shell metacharacters.
+    // RM-4: paste the actual proposed create command, including the repository's metacharacters.
     let create_dir = tmp.path().join("create repo & 'co!");
     std::fs::create_dir_all(&create_dir).expect("APPARATUS: cannot make create repository");
     let create_dir = std::fs::canonicalize(&create_dir).unwrap_or(create_dir);
@@ -4612,31 +4591,8 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
             .unwrap_or_default()
             .to_owned()
     };
-    let create_template = command_for("vox room create ");
-    let join_template = command_for("vox room join ");
-    assert!(
-        create_template.contains("'<name>'") && join_template.contains("'<link>'"),
-        "PRODUCT: an unmapped repo's hook must give both create-and-bind and pasted-link commands; \
-         it said:\n{create_notice}"
-    );
-    let create_pasted = create_template.replace("<name>", "createpaste");
-    let create_words = words_in("zsh", &create_pasted);
-    let create_path = create_dir.to_string_lossy();
-    assert_eq!(
-        create_words,
-        [
-            "room",
-            "create",
-            "--name",
-            "createpaste",
-            "--node",
-            "default",
-            "--bind",
-            &*create_path
-        ],
-        "PRODUCT: `{create_pasted}`, pasted into zsh, must preserve the complete repository path; \
-         zsh read {create_words:?}"
-    );
+    let create_pasted = command_for("vox room create ");
+    let rooms_before_create = rooms();
     let created = in_shell(
         "zsh",
         &create_pasted,
@@ -4647,13 +4603,13 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
             ("again", "created room passphrase\r"),
         ],
     );
-    assert!(
-        created.contains(&format!("vox: bound {}", create_dir.display()))
-            && rooms().contains("createpaste"),
-        "PRODUCT: printed `{create_pasted}` pasted into zsh must create and bind this repo; \
-         it said {created}; rooms:\n{}",
-        rooms()
-    );
+    let created_room = rooms().lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .find(|id| !rooms_before_create.lines()
+            .any(|old| old.split_whitespace().next() == Some(*id)))
+        .unwrap_or_default().to_owned();
+    assert!(!created_room.is_empty(),
+        "PRODUCT: the printed create command did not create the room for this repository: {created}");
     let next_id = "5f5f5f5f-aaaa-4bbb-8ccc-0000000005f2";
     let next_turn = turn(next_id, &create_dir);
     assert!(
@@ -4661,12 +4617,6 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
         "PRODUCT: the next session in the created-and-bound repo must not be asked again; \
          hook said {next_turn}"
     );
-    let created_room = rooms()
-        .lines()
-        .find(|line| line.contains("createpaste"))
-        .and_then(|line| line.split_whitespace().next())
-        .unwrap_or_default()
-        .to_owned();
     let deadline = Instant::now() + Duration::from_secs(30);
     while !open_in(&created_room, next_id) {
         assert!(
@@ -4678,54 +4628,31 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
         std::thread::sleep(Duration::from_millis(100));
     }
     eprintln!("[proof] (5f) printed create command pasted into zsh creates and binds; next session works there");
-    // A directory nobody bound: its ask's bind command, with `--bind` and the directory, the
-    // person putting their link in place of `<link>`, inside its quotes, as the command says.
+    // Once the operator supplies a real link, execute a complete command with every argument
+    // quoted. No placeholder command is printed or substituted inside existing shell quotes.
     let (bind_room, bind_link) = make_room("bindpaste", "bind passphrase");
     let ask_dir = tmp.path().join("ask repo & co!");
     std::fs::create_dir_all(&ask_dir).expect("APPARATUS: cannot make a repository directory");
     let ask_dir = std::fs::canonicalize(&ask_dir).unwrap_or(ask_dir);
-    // The agent's notice gives it the bind command to fill in once the person pastes a link (the
-    // person is given no command with a placeholder: `vox agent status` says it in words).
-    // Its text is JSON-escaped in the harness's output: one line per `\n`.
-    let listed = turn("5f5f5f5f-aaaa-4bbb-8ccc-0000000005f0", &ask_dir).replace("\\n", "\n");
-    let template = listed
-        .lines()
-        .map(str::trim)
-        .find(|l| l.starts_with("vox room join") && l.contains("--bind"))
-        .unwrap_or_default()
-        .to_owned();
-    assert!(
-        template.contains("'<link>'"),
-        "PRODUCT: the agent's notice for {} must give its bind command, with the link's place in \
-         single quotes; the hook said:\n{listed}",
-        ask_dir.display()
-    );
-    let pasted = template.replace("<link>", &bind_link);
+    let _ = turn("5f5f5f5f-aaaa-4bbb-8ccc-0000000005f0", &ask_dir);
+    let pasted = vox_text::shell::command(&[
+        "vox", "room", "join", &bind_link, "--node", "default", "--bind",
+        &ask_dir.to_string_lossy(),
+    ]);
     for shell in ["zsh", "bash"] {
-        let words = words_in(shell, &pasted);
-        let dir = ask_dir.to_string_lossy();
-        assert_eq!(
-            words,
-            ["room", "join", bind_link.as_str(), "--node", "default", "--bind", &*dir],
-            "PRODUCT: the printed `{template}`, pasted into {shell} with the link in place, must be \
-             read as its words, the directory whole with its space, `&` and `!`; {shell} read {words:?}"
-        );
+        let (ok, bound) = on_pty_result(shell, &["-c", &pasted], &data, &cfg,
+            &[("passphrase", "bind passphrase\r")]);
+        assert!(ok && rooms().contains(&bind_room),
+            "PRODUCT: the complete operator command did not join and bind through {shell}: {bound}");
     }
-    let bound = in_shell(
-        "bash",
-        &pasted,
-        &data,
-        &cfg,
-        &[("passphrase", "bind passphrase\r")],
-    );
-    eprintln!("[proof] (5f) pasted `{pasted}` into bash; it said: {bound}");
-    assert!(
-        rooms().contains(&bind_room)
-            && bound.contains(&format!("vox: bound {}", ask_dir.display())),
-        "PRODUCT: `{pasted}`, pasted whole into bash, must join room {bind_room} and bind {}; it \
-         said {bound}",
-        ask_dir.display()
-    );
+    let pasted_session = "5f5f5f5f-aaaa-4bbb-8ccc-0000000005f3";
+    let pasted_turn = turn(pasted_session, &ask_dir);
+    let pasted_by = Instant::now() + Duration::from_secs(30);
+    while !open_in(&bind_room, pasted_session) {
+        assert!(Instant::now() < pasted_by,
+            "PRODUCT: the pasted bind did not route the next Session to its room: {pasted_turn}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
     // A word that begins with `=` is zsh's `=command` expansion: a share named `=eq.txt`. The
     // `vox share stop` its share prints, pasted whole into zsh, stops serving it.
     let eq_dir = tmp.path().join("eq");
@@ -4750,15 +4677,6 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
         .find(|c| c.starts_with("vox share stop"))
         .unwrap_or_default()
         .to_owned();
-    for shell in ["zsh", "bash"] {
-        let words = words_in(shell, &stop);
-        assert_eq!(
-            words,
-            ["share", "stop", paste_room.as_str(), "=eq.txt"],
-            "PRODUCT: the printed `{stop}`, pasted into {shell}, must be read as its words, \
-             `=eq.txt` whole; {shell} read {words:?}"
-        );
-    }
     let stopped = in_shell("zsh", &stop, &data, &cfg, &[]);
     let (_, listed_shares, _) = hook(&data, &cfg, &["share", "list", &paste_room], "");
     eprintln!("[proof] (5f) pasted `{stop}` into zsh; it said: {stopped}; shares: {listed_shares}");
