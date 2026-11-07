@@ -121,6 +121,7 @@ struct Inner {
     starting: Mutex<BTreeSet<NodeName>>,
     /// Each node's joins of its sessions' rooms under way (ADR-029 RB-3).
     joins: Mutex<BTreeMap<NodeName, Arc<vox_core::node::room_join::Joins>>>,
+    room_decisions: Mutex<BTreeMap<String, (std::time::Instant, bool, crate::room_map::Snapshot)>>,
     /// Where harness sessions' activity is numbered and posted, and approvals wait (ADR-029).
     sink: Arc<crate::session_sink::Sink>,
     /// Ordered admission and the bounded, explicitly volatile storage-failure tail.
@@ -165,6 +166,9 @@ impl Drop for OmpEnding {
 pub(crate) struct OmpDriveGuard {
     current: Arc<dyn Fn() -> bool + Send + Sync>,
     views: tokio::sync::watch::Receiver<vox_core::node::api::NodeView>,
+    pub(crate) operator: Option<String>,
+    pub(crate) room: String,
+    pub(crate) operation: Option<String>,
 }
 
 impl OmpDriveGuard {
@@ -671,6 +675,7 @@ impl Router {
                     session_openings: Mutex::default(),
                     session_open_failures: Mutex::default(),
                     joins: Mutex::default(),
+                    room_decisions: Mutex::default(),
                 }
             }),
         };
@@ -1573,6 +1578,50 @@ impl Router {
             notes: g.notes,
         })
     }
+    /// Serialize an OMP registration mutation against retirement of its native route.
+    fn registration_fence(
+        &self,
+        node: &NodeName,
+        session: &crate::wake::Session,
+        fingerprint: Option<Digest32>,
+    ) -> Result<Option<crate::omp_fence::MutationGuard>, Refusal> {
+        if session.harness != "omp" {
+            return Ok(None);
+        }
+        let invalid = || Refusal::RegistrationInvalid { node: node.clone() };
+        let reference = session.omp_fence.as_ref().ok_or_else(invalid)?;
+        let route = session.attention.as_ref().ok_or_else(invalid)?;
+        let fingerprint = fingerprint.or_else(|| {
+            self.inner.account.node_paths(node).ok()?.shown_fingerprint()
+        }).ok_or_else(invalid)?;
+        let fingerprint = vox_core::node::link::b32_encode(&fingerprint);
+        crate::omp_fence::validate(
+            &self.inner.account,
+            reference,
+            &fingerprint,
+            &session.session,
+            route,
+        ).map(Some).map_err(|error| match error {
+            crate::omp_fence::FenceError::Busy => Refusal::RegistrationRetryable {
+                node: node.clone(),
+                reason: vox_core::node::daemonipc::RegistrationRetryReason::LockBusy,
+            },
+            crate::omp_fence::FenceError::Invalid => invalid(),
+        })
+    }
+    fn registration_store_refusal(node: &NodeName, error: crate::wake::RegistrationStoreError) -> Refusal {
+        match error {
+            crate::wake::RegistrationStoreError::Busy => Refusal::RegistrationRetryable {
+                node: node.clone(),
+                reason: vox_core::node::daemonipc::RegistrationRetryReason::LockBusy,
+            },
+            crate::wake::RegistrationStoreError::Failed(why) => Refusal::Failed {
+                node: node.clone(),
+                why: format!("session was not registered: {why}"),
+            },
+        }
+    }
+
 
     /// Register an agent session of `node` (ADR-020 6.10): store its record and count it as a
     /// holder. **A session never attaches its node** (ADR-028 K-13): one not attached is refused
@@ -1586,6 +1635,9 @@ impl Router {
         session: crate::wake::Session,
         join: Option<(String, Zeroizing<String>)>,
     ) -> Result<DaemonFrame, Refusal> {
+        if session.harness == "omp" && (session.omp_fence.is_none() || session.attention.is_none()) {
+            return Err(Refusal::RegistrationInvalid { node: node.clone() });
+        }
         // A node that does not exist is said as that, not as one to attach.
         if !self.inner.account.nodes_on_disk().contains(node) {
             return Err(Refusal::NoSuchNode { node: node.clone() });
@@ -1644,15 +1696,14 @@ impl Router {
             }
             let ending = lock(&self.inner.omp_ending);
             if ending.contains(&(node.clone(), session.session.clone())) {
-                return Err(Refusal::Failed {
+                return Err(Refusal::RegistrationRetryable {
                     node: node.clone(),
-                    why: "the Session is ending; retry registration".into(),
+                    reason: vox_core::node::daemonipc::RegistrationRetryReason::SessionEnding,
                 });
             }
-            crate::wake::store_checked(&paths, &session).map_err(|why| Refusal::Failed {
-                node: node.clone(),
-                why: format!("session was not registered: {why}"),
-            })?;
+            let _fence = self.registration_fence(node, &session, None)?;
+            crate::wake::store_checked(&paths, &session)
+                .map_err(|error| Self::registration_store_refusal(node, error))?;
             drop(ending);
             drop(ingress);
             let router = self.clone();
@@ -1718,6 +1769,7 @@ impl Router {
             .node_paths(node)
             .ok()
             .and_then(|paths| crate::wake::registration(&paths, &id));
+        let fence_session = (session.harness == "omp").then(|| session.clone());
         let g = self
             .want(
                 node,
@@ -1750,6 +1802,9 @@ impl Router {
                     .filter(|c| c.starts_with(prefix.trim()))
                     .collect();
                 if let [one] = whole.as_slice() {
+                    let _fence = fence_session.as_ref()
+                        .map(|session| self.registration_fence(node, session, g.info.fingerprint))
+                        .transpose()?;
                     crate::wake::store_room(&paths, &id, one);
                 }
             }
@@ -2096,6 +2151,116 @@ impl Router {
         .await
         .unwrap_or_default()
     }
+    async fn room_decision(&self, dir: &str, explicit: bool) -> DaemonFrame {
+        let snapshot = if explicit {
+            crate::room_map::snapshot_explicit(&self.inner.account.data_root, std::path::Path::new(dir))
+        } else {
+            let Some(ask) = self.room_asks().await.into_iter().find(|a| a.dir == dir) else {
+                return DaemonFrame::RoomAnswer { done: false, said: vec!["No session is waiting for this repository decision.".into()] };
+            };
+            let Some(start) = ask.sessions.into_iter().next()
+                .and_then(|s| self.inner.account.node_paths(&s.node).ok()
+                    .and_then(|p| crate::wake::registration(&p, &s.session)))
+                .and_then(|r| r.start) else {
+                return DaemonFrame::RoomAnswer { done: false, said: vec!["The waiting session no longer has a registered start directory.".into()] };
+            };
+            crate::room_map::snapshot(&self.inner.account.data_root, std::path::Path::new(&start))
+        };
+        let snapshot = match snapshot {
+            Ok(snapshot) => snapshot,
+            Err(e) => return DaemonFrame::RoomAnswer { done: false, said: vec![e.to_string()] },
+        };
+        let mut random = [0u8; 32];
+        if getrandom::fill(&mut random).is_err() {
+            return DaemonFrame::RoomAnswer { done: false, said: vec!["cannot create a secure room decision token".into()] };
+        }
+        let token = vox_core::node::link::b32_encode(&random);
+        let target = snapshot.target.display().to_string();
+        let source = snapshot.source.as_ref().map_or_else(String::new, |s| s.display().to_string());
+        let room = snapshot.room.clone().unwrap_or_default();
+        {
+            let mut decisions = lock(&self.inner.room_decisions);
+            decisions.retain(|_, (expires, _, _)| *expires > std::time::Instant::now());
+            if decisions.len() >= 256 {
+                return DaemonFrame::RoomAnswer { done: false, said: vec!["Too many room decisions are pending; cancel one or try again later.".into()] };
+            }
+            decisions.insert(token.clone(), (std::time::Instant::now() + Duration::from_secs(300), explicit, snapshot));
+        }
+        let inner = Arc::downgrade(&self.inner);
+        let expiry_token = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(300)).await;
+            if let Some(inner) = inner.upgrade() {
+                lock(&inner.room_decisions).remove(&expiry_token);
+            }
+        });
+        DaemonFrame::RoomDecision { token, target, source, room }
+    }
+
+    async fn room_replace(&self, token: &str, link: &str, passphrase: Zeroizing<String>, node: &str) -> DaemonFrame {
+        let Some((expires, _, snapshot)) = lock(&self.inner.room_decisions).remove(token) else {
+            return DaemonFrame::RoomAnswer { done: false, said: vec!["This decision is stale; inspect the repository again.".into()] };
+        };
+        if expires <= std::time::Instant::now() {
+            return DaemonFrame::RoomAnswer { done: false, said: vec!["This decision expired; inspect the repository again.".into()] };
+        }
+        let mut said = Vec::new();
+        if !link.is_empty() {
+            let parsed = match vox_core::node::link::InviteLink::parse(link) {
+                Ok(parsed) => parsed,
+                Err(_) => return DaemonFrame::RoomAnswer { done: false, said: vec!["That is not a valid room link.".into()] },
+            };
+            let node = match NodeName::parse(node) {
+                Ok(node) => node,
+                Err(_) => return DaemonFrame::RoomAnswer { done: false, said: vec!["Choose an attached node to authenticate the room.".into()] },
+            };
+            let Some(handle) = self.handle_of(&node) else {
+                return DaemonFrame::RoomAnswer { done: false, said: vec![format!("Node {node} is not attached; the decision was not changed.")] };
+            };
+            let held = handle.view().channels.iter().any(|c| c.channel_id == parsed.channel_id);
+            let outcome = if held {
+                handle.apply(NodeCommand::CheckRoomPassphrase {
+                    channel_id: parsed.channel_id,
+                    passphrase: Secret::new(passphrase.as_bytes().to_vec()),
+                }).await
+            } else {
+                handle.apply(NodeCommand::JoinChannel {
+                    link: link.to_owned(),
+                    passphrase: Secret::new(passphrase.as_bytes().to_vec()),
+                }).await
+            };
+            if outcome != Outcome::Done {
+                return DaemonFrame::RoomAnswer { done: false, said: vec![format!("Node {node} could not authenticate or join the room; the decision was not changed: {outcome}")] };
+            }
+            if !held {
+                said.push(format!("Node {node} joined the room."));
+            }
+        }
+        let value = if link.is_empty() { crate::room_map::DECLINED } else { link };
+        match crate::room_map::replace(&self.inner.account.data_root, &snapshot, value, &passphrase) {
+            Ok(outcome) => {
+                if let Some(previous) = outcome.previous {
+                    said.push(format!("replacing what the room map held for it: {previous}"));
+                }
+                if let Some(warning) = outcome.durability_warning {
+                    said.push(format!("The decision for {} was written, but its durability could not be confirmed: {warning}. Inspect the room map before retrying. Existing sessions do not move.", snapshot.target.display()));
+                    DaemonFrame::RoomAnswer { done: false, said }
+                } else {
+                    if link.is_empty() {
+                        said.push(format!("{} is set to room none for future sessions. Existing sessions do not move; no room was left and trust was not changed.", snapshot.target.display()));
+                    } else {
+                        said.push(format!("bound {}. Existing sessions do not move; every node of this data root can read the map, including the passphrase.", snapshot.target.display()));
+                    }
+                    DaemonFrame::RoomAnswer { done: true, said }
+                }
+            }
+            Err(e) => {
+                said.push(format!("Could not update the repository decision: {e}"));
+                DaemonFrame::RoomAnswer { done: false, said }
+            }
+        }
+    }
+
 
     /// The person's answer to the ask about `dir` (ADR-029 RB-5a, RB-6).
     ///
@@ -2106,7 +2271,7 @@ impl Router {
     /// another room. With `link` empty: the room map binds `dir` already, to a room the sessions'
     /// nodes are not in, and they join it with the map's own link and passphrase. Either way every
     /// session that asked is then put in the room.
-    async fn room_bind(&self, dir: &str, link: &str, passphrase: Zeroizing<String>) -> DaemonFrame {
+    async fn room_bind(&self, dir: &str, link: &str, passphrase: Zeroizing<String>, token: Option<&str>) -> DaemonFrame {
         let no = |why: String| DaemonFrame::RoomAnswer {
             done: false,
             said: vec![why],
@@ -2117,9 +2282,28 @@ impl Router {
             ));
         };
         let data_root = self.inner.account.data_root.clone();
+        let registered_start = ask.sessions.first()
+            .and_then(|s| self.inner.account.node_paths(&s.node).ok()
+                .and_then(|p| crate::wake::registration(&p, &s.session)))
+            .and_then(|r| r.start)
+            .unwrap_or_else(|| dir.to_owned());
+        let snapshot = if link.is_empty() {
+            None
+        } else if let Some(token) = token {
+            match lock(&self.inner.room_decisions).remove(token) {
+                Some((expires, false, snapshot)) if expires > std::time::Instant::now() && snapshot.target == std::path::Path::new(dir) => Some(snapshot),
+                _ => return no("This repository decision is stale; inspect it again.".into()),
+            }
+        } else {
+            match crate::room_map::snapshot(&data_root, std::path::Path::new(&registered_start)) {
+                Ok(snapshot) if snapshot.room.is_none() => Some(snapshot),
+                Ok(_) => return no("Inspect this repository decision before replacing it.".into()),
+                Err(e) => return no(format!("cannot inspect the repository decision: {e}")),
+            }
+        };
         let (link, passphrase, bind) = if link.is_empty() {
             let mapped = crate::room_map::read(&data_root).ok().and_then(|entries| {
-                crate::room_map::resolve(&entries, std::path::Path::new(dir))
+                crate::room_map::resolve(&entries, std::path::Path::new(&registered_start))
                     .filter(|e| e.room != crate::room_map::DECLINED)
                     .map(|e| (e.room.clone(), e.passphrase.clone()))
             });
@@ -2148,10 +2332,8 @@ impl Router {
         let mut said = Vec::new();
         for node in &nodes {
             let Some(handle) = self.handle_of(node) else {
-                return no(format!(
-                    "node {node} is Locked, so it cannot join room {short}; nothing more \
-                     was changed"
-                ));
+                said.push(format!("node {node} is Locked, so it cannot join room {short}; the map was not changed"));
+                return DaemonFrame::RoomAnswer { done: false, said };
             };
             let member = handle
                 .view()
@@ -2170,10 +2352,8 @@ impl Router {
                     })
                     .await;
                 if checked != vox_core::node::api::Outcome::Done {
-                    return no(format!(
-                        "the room passphrase was not authenticated by node {node}, so {dir} was \
-                         not bound: {checked}"
-                    ));
+                    said.push(format!("the room passphrase was not authenticated by node {node}, so {dir} was not bound: {checked}"));
+                    return DaemonFrame::RoomAnswer { done: false, said };
                 }
                 continue;
             }
@@ -2204,11 +2384,14 @@ impl Router {
                  included",
                 map.display()
             ));
-            match crate::room_map::bind(&data_root, std::path::Path::new(dir), &link, &passphrase) {
-                Ok(Some(was)) => said.push(format!(
-                    "bound {dir}, replacing what the room map held for it: {was}"
-                )),
-                Ok(None) => said.push(format!("bound {dir}")),
+            match crate::room_map::replace(&data_root, snapshot.as_ref().expect("captured before joining"), &link, &passphrase) {
+                Ok(outcome) => {
+                    if let Some(warning) = outcome.durability_warning {
+                        said.push(format!("{dir} was written, but its durability could not be confirmed: {warning}. Inspect the room map before retrying."));
+                        return DaemonFrame::RoomAnswer { done: false, said };
+                    }
+                    said.push(format!("bound {dir}"));
+                }
                 Err(e) => {
                     said.push(format!("{dir} was not bound: {e}"));
                     return DaemonFrame::RoomAnswer { done: false, said };
@@ -2515,6 +2698,20 @@ impl Router {
         if reg.room.as_deref() != Some(room.as_str()) {
             return refuse("that session does not work in this room; nothing was sent".into());
         }
+        if reg.harness == "omp" && matches!(&req.action, Action::Text { .. })
+            && !req.operation.as_deref().is_some_and(|id| id.len() == 32
+                && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+        {
+            return refuse("OMP Drive requires a valid operation identity; nothing was sent".into());
+        }
+        if reg.harness == "omp" && matches!(&req.action, Action::Text { .. }) {
+            if let Err(why) = self.inner.omp.reserve_operation(
+                &paths, &info.channel_id, &info.peer, &req.session,
+                req.operation.as_deref().unwrap_or_default(),
+            ) {
+                return refuse(why);
+            }
+        }
         let by = vox_core::node::link::b32_encode(&info.peer);
         let alias = view
             .trusted
@@ -2537,6 +2734,12 @@ impl Router {
         match &req.action {
             Action::Text { text } => {
                 copy.insert("text".into(), serde_json::json!(text));
+                if reg.harness == "omp" {
+                    copy.insert("id".into(), serde_json::json!(req.operation));
+                    copy.insert("ref".into(), serde_json::json!(req.operation));
+                    copy.insert("occurrence".into(), serde_json::json!(by));
+                    copy.insert("drive_scope".into(), serde_json::json!(1));
+                }
             }
             Action::Slash { text } => {
                 copy.insert("cmd".into(), serde_json::json!(crate::drive::slash(text).0));
@@ -2636,6 +2839,9 @@ impl Router {
             let peer = info.peer;
             let channel = info.channel_id;
             Some(OmpDriveGuard {
+                operator: matches!(&req.action, Action::Text { .. }).then(|| by.clone()),
+                room: room.clone(),
+                operation: req.operation.clone(),
                 views: handle.watch(),
                 current: Arc::new(move || {
                     let same = {
@@ -2750,6 +2956,17 @@ impl Router {
         if let Action::File { tag, .. } = &req.action {
             result["of"] = serde_json::json!(tag);
         }
+        let omp_text = reg.harness == "omp" && matches!(&req.action, Action::Text { .. });
+        let uncertain = omp_text
+            && outcome.as_ref().err().is_some_and(|why|
+                !why.contains("nothing was sent") && !why.contains("did not accept"));
+        if omp_text {
+            result["of"] = serde_json::json!(req.operation);
+            result["ref"] = serde_json::json!(req.operation);
+            result["occurrence"] = serde_json::json!(by);
+            result["drive_scope"] = serde_json::json!(1);
+            result["phase"] = serde_json::json!(if outcome.is_ok() { "queued" } else if uncertain { "unconfirmed" } else { "refused" });
+        }
         sink.activity(node, &req.session, vec![result.to_string()], None)
             .await;
         if let Action::File {
@@ -2783,13 +3000,13 @@ impl Router {
             Ok(said) => Answer {
                 ok: true,
                 said,
-                code: None,
+                code: omp_text.then(|| "drive-queued".to_owned()),
                 pause: None,
             },
             Err(said) => Answer {
                 ok: false,
                 said,
-                code: None,
+                code: uncertain.then(|| "drive-unknown".to_owned()),
                 pause: None,
             },
         }
@@ -3965,8 +4182,9 @@ impl Router {
                     None => {
                         // A protected node needs the person's Unlock. A passphrase-free
                         // node can start only through the same real credential check below.
-                        if matches!(want, Some(Want::IfAttached | Want::Session(_)))
-                            && !self.no_passphrase(node)?
+                        if matches!(&want, Some(Want::Session(s)) if s.harness == "omp")
+                            || (matches!(want, Some(Want::IfAttached | Want::Session(_)))
+                                && !self.no_passphrase(node)?)
                         {
                             Step::NotAttached
                         } else {
@@ -4205,15 +4423,14 @@ impl Router {
             Want::Session(s) => {
                 let ending = lock(&self.inner.omp_ending);
                 if ending.contains(&(node.clone(), s.session.clone())) {
-                    return Err(Refusal::Failed {
+                    return Err(Refusal::RegistrationRetryable {
                         node: node.clone(),
-                        why: "the Session is ending; retry registration".into(),
+                        reason: vox_core::node::daemonipc::RegistrationRetryReason::SessionEnding,
                     });
                 }
-                crate::wake::store_checked(&a.paths, &s).map_err(|why| Refusal::Failed {
-                    node: node.clone(),
-                    why: format!("session was not registered: {why}"),
-                })?;
+                let _fence = self.registration_fence(node, &s, a.fingerprint)?;
+                crate::wake::store_checked(&a.paths, &s)
+                    .map_err(|error| Self::registration_store_refusal(node, error))?;
                 drop(ending);
                 self.watch_harness(node, &s);
                 a.sessions.insert(s.session.clone());
@@ -5083,8 +5300,16 @@ impl Dispatch for Router {
                 dir,
                 link,
                 passphrase,
-            } => self.room_bind(&dir, &link, passphrase).await,
+            } => self.room_bind(&dir, &link, passphrase, None).await,
             DaemonRequest::RoomDecline { dir } => self.room_decline(&dir),
+            DaemonRequest::RoomDecision { dir } => self.room_decision(&dir, false).await,
+            DaemonRequest::RoomDecisionExplicit { dir } => self.room_decision(&dir, true).await,
+            DaemonRequest::RoomDecisionCancel { token } => {
+                lock(&self.inner.room_decisions).remove(&token);
+                DaemonFrame::Ok
+            }
+            DaemonRequest::RoomReplace { token, link, passphrase, node } => self.room_replace(&token, &link, passphrase, &node).await,
+            DaemonRequest::RoomAnswerBind { dir, token, link, passphrase } => self.room_bind(&dir, &link, passphrase, Some(&token)).await,
             DaemonRequest::Status => match self.public_nodes().await {
                 Ok(nodes) => DaemonFrame::Status(DaemonStatus {
                     version: env!("CARGO_PKG_VERSION").to_owned(),

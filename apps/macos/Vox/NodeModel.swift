@@ -157,6 +157,7 @@ final class NodeModel: ObservableObject {
     }
     private var roomReadGeneration = UUID() {
         didSet {
+            if rosterOwner != nil { invalidateRosterObservation() }
             invalidateHistoryObservation()
             cancelSidebarSelection()
             invalidateSessionPause()
@@ -180,7 +181,7 @@ final class NodeModel: ObservableObject {
     private var rejectedRoomMark: String?
     private var roomMessageRevision = UUID()
     @Published private var roomNeedsPage = false
-    var roomMembersPending: Bool { roomNeedsPage }
+    var roomMembersPending: Bool { !rosterKnown && memberObservationError == nil }
     /// The first message that was unread when the room came on screen, and how many were: where
     /// the timeline draws its unread line. It stays while the room is on screen; what arrives
     /// meanwhile is read as it is shown.
@@ -255,6 +256,9 @@ final class NodeModel: ObservableObject {
     private var roomInstance: Data? {
         didSet {
             if oldValue != roomInstance {
+                if let owner = rosterOwner, owner.instance != roomInstance {
+                    invalidateRosterObservation()
+                }
                 invalidateMemberRoles()
                 roomHistoryPoll?.cancel()
                 roomHistoryPoll = nil
@@ -829,6 +833,81 @@ final class NodeModel: ObservableObject {
             }
         }
     }
+    /// A failed roster or consent projection leaves the last useful rows visible but stale.
+    @Published private var rosterObservationError: String?
+    @Published private(set) var keyringObservationError: String?
+    var memberObservationError: String? { rosterObservationError ?? keyringObservationError }
+    private struct RosterOwner: Equatable {
+        let room: String
+        let instance: Data
+        let generation: UUID
+        let epoch: UUID
+    }
+    private var rosterOwner: RosterOwner?
+    private var rosterRevision = UUID()
+    private var rosterKnown = false
+
+    private func invalidateRosterObservation(clearError: Bool = false) {
+        rosterOwner = nil
+        rosterKnown = false
+        rosterRevision = UUID()
+        if clearError {
+            rosterObservationError = nil
+        } else if !members.isEmpty && rosterObservationError == nil {
+            rosterObservationError = "Room membership observation unavailable; displayed information may be stale."
+        }
+        joinCaptionRead = UUID()
+        joins = []
+    }
+
+    private func commitRoster(_ observation: (rows: [MemberRow], trustsMe: Set<String>, presented: [String: String], instance: Data, failure: String),
+                              owner: RosterOwner, revision: UUID, allowRecovery: Bool = false, watcher: Bool = false) -> Bool {
+        guard !Task.isCancelled, selection == .room(owner.room),
+              roomReadGeneration == owner.generation, nodeObservationEpoch == owner.epoch,
+              rosterRevision == revision, ended == nil || allowRecovery && observationNeedsRestart,
+              roomInstance == nil || roomInstance == owner.instance else { return false }
+        if rosterOwner != owner {
+            rosterKnown = false
+            joins = []
+            joinCaptionRead = UUID()
+        }
+        let before = Set(members.map(\.id))
+        let current = Set(observation.rows.map(\.id))
+        #if VOX_PROOF_STUB_SERVICES && VOX_PROOF_MUTANT_GHOST
+        if !rosterKnown && watcher {
+            let at = UInt64(Date().timeIntervalSince1970 * 1000)
+            for member in observation.rows { joins.append(JoinLine(fingerprint: member.id, at: at, said: "")) }
+        }
+        #endif
+        #if VOX_PROOF_STUB_SERVICES && VOX_PROOF_MUTANT_EMPTY
+        let shouldDiff = rosterKnown && !before.isEmpty
+        #else
+        let shouldDiff = rosterKnown
+        #endif
+        if shouldDiff {
+            joins.removeAll { !current.contains($0.fingerprint) }
+            let at = UInt64(Date().timeIntervalSince1970 * 1000)
+            for member in observation.rows where !before.contains(member.id)
+                && !joins.contains(where: { $0.fingerprint == member.id }) {
+                joins.append(JoinLine(fingerprint: member.id, at: at, said: ""))
+            }
+        }
+        rosterOwner = owner
+        rosterKnown = true
+        rosterRevision = UUID()
+        members = observation.rows
+        trustsMe = observation.trustsMe
+        rosterObservationError = nil
+        for (fingerprint, name) in observation.presented { rememberPresentation(fingerprint, name) }
+        scheduleMemberPlatformRead(owner.room)
+        return true
+    }
+
+    private func rosterFailure(_ error: Error, room: String, generation: UUID, epoch: UUID, revision: UUID) {
+        guard !Task.isCancelled, selection == .room(room), roomReadGeneration == generation,
+              nodeObservationEpoch == epoch, rosterRevision == revision else { return }
+        rosterObservationError = "Room membership and consent refresh incomplete; displayed information may be stale: " + sentence(error)
+    }
     enum MemberRole: String {
         case creator = "Creator", admin = "Admin", member = "Member"
     }
@@ -847,6 +926,8 @@ final class NodeModel: ObservableObject {
         case approveThere
     }
     @Published private(set) var computerPairingAttention: ComputerPairingAttention?
+    /// Nodes bound to computers with verified receipts for the current policy frontier.
+    @Published private(set) var computerApplicationConfirmed: Set<String> = []
     private var computerPairingRead = UUID()
     @Published private(set) var trusted: [TrustedNode] = []
     /// Trust offers waiting on this node: newcomers, and nodes that trust it (ADR-028 K-15, K-17).
@@ -857,10 +938,14 @@ final class NodeModel: ObservableObject {
     @Published private(set) var roomAskDialog: RoomAskInfo?
     /// What the last answer to an ask did, or why it was not done: for the ask's view.
     @Published private(set) var roomAskSaid: RoomAnswerInfo?
+    /// Keep the ask visible while its explicit decision and result are being reviewed.
+    var roomDecisionOpen = false
     /// The directories already notified, so each ask notifies once (M-23).
     private var roomAsksNotified: Set<String> = []
     /// The trusted nodes that trust this node back, as the rooms shared with them record it (L-4).
     @Published private(set) var trustsBack: Set<String> = []
+    @Published private(set) var trustsBackError: String?
+    private var trustsBackRead = UUID()
     /// The members of the room on screen whose trust in this node has reached it, in the keyring
     /// or not (ADR-028 R-5, D4).
     @Published private(set) var trustsMe: Set<String> = []
@@ -940,6 +1025,10 @@ final class NodeModel: ObservableObject {
     @Published private(set) var daemonReachable = true
     private var nodeObservationEpoch = UUID() {
         didSet {
+            if rosterOwner != nil { invalidateRosterObservation() }
+            trustsBackRead = UUID()
+            trustsBackError = "Room consent observation unavailable; displayed information may be stale."
+            keyringObservationError = "Node trust observation unavailable; displayed information may be stale."
             invalidateHistoryObservation()
             cancelSidebarSelection()
             invalidateSessionPause()
@@ -1637,9 +1726,20 @@ final class NodeModel: ObservableObject {
             reportBackground(error)
             return
         }
-        let currentTrust = try? await client.trustList()
-        guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
-        if let currentTrust, currentTrust != trusted { trusted = currentTrust }
+        do {
+            let currentTrust = try await client.trustList()
+            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
+            if currentTrust != trusted {
+                trusted = currentTrust
+                if rosterKnown && rosterObservationError == nil {
+                    rosterObservationError = "Node trust changed; displayed room members are being refreshed."
+                }
+            }
+            keyringObservationError = nil
+        } catch {
+            guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
+            keyringObservationError = "Node trust refresh unavailable; displayed information may be stale: " + sentence(error)
+        }
         let currentOffers = try? await client.pendingOffers()
         guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
         if let currentOffers, currentOffers != offers { offers = currentOffers }
@@ -1658,6 +1758,11 @@ final class NodeModel: ObservableObject {
                 }
             }
             if attention != computerPairingAttention { computerPairingAttention = attention }
+            let confirmedComputers = Set((computer?.applications ?? []).filter(\.confirmed).map { $0.computer.fingerprint })
+            let confirmedNodes = Set((computer?.nodes ?? []).filter {
+                confirmedComputers.contains($0.computer)
+            }.map(\.fingerprint))
+            if confirmedNodes != computerApplicationConfirmed { computerApplicationConfirmed = confirmedNodes }
         }
         let eligibilityTargets = Set(members.map(\.id) + offers.map(\.fingerprint) + (card.map { [$0.fingerprint] } ?? []))
         for fingerprint in eligibilityTargets {
@@ -1676,21 +1781,55 @@ final class NodeModel: ObservableObject {
         await readHealth()
         await recheckLanHelper()
         if selection == .keyring {
-            let back = await readTrustsBack()
-            if back != trustsBack { trustsBack = back }
+            await refreshTrustsBack()
         }
     }
 
-    /// The nodes that trust this one back, from each open room's consents.
-    private func readTrustsBack() async -> Set<String> {
-        var back: Set<String> = []
-        for room in rooms where room.open {
-            if let consents = try? await client.memberConsents(room: room.id) {
-                back.formUnion(consents.inbound)
+    /// Refresh the aggregate without turning a failed or retained room projection into no consent.
+    private func refreshTrustsBack() async {
+        let token = UUID(), epoch = nodeObservationEpoch
+        let targets = rooms.filter(\.open).map(\.id)
+        trustsBackRead = token
+        do {
+            var back: Set<String> = []
+            for room in targets {
+                let observation = try await client.roomMemberObservation(room: room)
+                if !observation.failure.isEmpty {
+                    throw VoxError.Failed(reason: "The room projection is retained: " + observation.failure)
+                }
+                back.formUnion(observation.inbound)
             }
+            guard !Task.isCancelled, trustsBackRead == token, nodeObservationEpoch == epoch,
+                  rooms.filter(\.open).map(\.id) == targets else { return }
+            trustsBack = back
+            trustsBackError = nil
+        } catch {
+            guard !Task.isCancelled, trustsBackRead == token, nodeObservationEpoch == epoch,
+                  rooms.filter(\.open).map(\.id) == targets else { return }
+            trustsBackError = "Room consent observation unavailable; displayed information may be stale: " + sentence(error)
         }
-        return back
     }
+
+    #if VOX_PROOF_STUB_SERVICES
+    /// Coordinate real roster reads with the isolated native journey, never replace their data.
+    private func proofRosterGate(_ phase: String) async {
+        guard let path = ProcessInfo.processInfo.environment["VOX_PROOF_ROSTER_GATE"], !path.isEmpty else { return }
+        let root = URL(fileURLWithPath: path)
+        let hold = root.appendingPathComponent("hold-" + phase).path
+        guard FileManager.default.fileExists(atPath: hold) else { return }
+        FileManager.default.createFile(atPath: root.appendingPathComponent("held-" + phase).path, contents: Data())
+        let deadline = Date().addingTimeInterval(90)
+        while !Task.isCancelled && Date() < deadline && FileManager.default.fileExists(atPath: hold) {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+    }
+
+    private func proofRosterPublished(_ phase: String) {
+        guard let path = ProcessInfo.processInfo.environment["VOX_PROOF_ROSTER_GATE"], !path.isEmpty else { return }
+        let marker = URL(fileURLWithPath: path).appendingPathComponent("published-" + phase).path
+        FileManager.default.createFile(atPath: marker, contents: Data())
+    }
+    #endif
 
     /// Rooms whose unread was counted from what the node recorded as read.
     private var seeded: Set<String> = []
@@ -1799,9 +1938,8 @@ final class NodeModel: ObservableObject {
             guard epoch == nodeObservationEpoch, !Task.isCancelled else { return false }
             await readFacts(restartObservation: restartObservation)
             guard epoch == nodeObservationEpoch, !Task.isCancelled else { return false }
-            let back = await readTrustsBack()
+            await refreshTrustsBack()
             guard epoch == nodeObservationEpoch, !Task.isCancelled else { return false }
-            if back != trustsBack { trustsBack = back }
             if let id = openedOnScreen, selection == .room(id) { await show(.room(id)) }
             return true
         } catch {
@@ -1863,6 +2001,8 @@ final class NodeModel: ObservableObject {
         // An external choice supersedes queued UI intent even when it selects the current row.
         cancelSidebarSelection()
         guard selection != self.selection else { return }
+        invalidateRosterObservation(clearError: true)
+        trustsMe.removeAll()
         // Preserve the room's reply draft when leaving it (D12).
         if case let .room(left) = self.selection {
             roomDrafts[left, default: RoomDraft()].reply = replyTo
@@ -1971,6 +2111,9 @@ final class NodeModel: ObservableObject {
         if !whileRecovering { watchReads(id) }
         let view = selectedRoomView, viewGeneration = roomViewGeneration
         let generation = roomReadGeneration
+        let epoch = nodeObservationEpoch
+        let startingInstance = roomInstance
+        var rosterReadRevision = rosterRevision
         let messageRevision = roomMessageRevision
         let metadataToken = sessionsMetadataRead
         let liveAfter = sessionsOpenAfter, historyAfter = sessionsHistoryAfter
@@ -1984,19 +2127,51 @@ final class NodeModel: ObservableObject {
             let page = try await client.roomViewRead(room: id, view: view)
             let read = page.messages
             guard viewGeneration == roomViewGeneration, generation == roomReadGeneration,
+                  epoch == nodeObservationEpoch, (roomInstance == startingInstance || roomInstance == page.instance),
                   self.selection == .room(id),
                   ended == nil || whileRecovering && observationNeedsRestart else { return false }
+            if let instance = roomInstance, instance != page.instance {
+                roomInstance = nil
+            }
             let services = try await client.servicesPage(room: id, after: nil, revision: nil)
-            let rows = try await memberRows(id)
+            rosterReadRevision = rosterRevision
+            let rows: (rows: [MemberRow], trustsMe: Set<String>, presented: [String: String], instance: Data, failure: String)
+            do {
+                rows = try await memberRows(id)
+                #if VOX_PROOF_STUB_SERVICES
+                await proofRosterGate("initial")
+                #endif
+                let rosterInstance = rows.instance
+                guard rosterInstance == page.instance else {
+                    throw VoxError.Failed(reason: "The saved room changed while reading its members.")
+                }
+                if !rows.failure.isEmpty {
+                    throw VoxError.Failed(reason: "The room projection is retained: " + rows.failure)
+                }
+            } catch {
+                rosterFailure(error, room: id, generation: generation, epoch: epoch, revision: rosterReadRevision)
+                throw error
+            }
             let kept = (try? await client.retention(room: id)) ?? ""
             let keptSecs = try? await client.retentionSecs(room: id)
             let done = try await client.noticesPage(room: id, before: nil, revision: nil)
             let livePage = try await client.sessionsOpenPage(room: id, after: liveAfter)
             let historyPage = try await client.sessionsPage(room: id, after: historyAfter)
             guard viewGeneration == roomViewGeneration, generation == roomReadGeneration,
-                  self.selection == .room(id),
+                  epoch == nodeObservationEpoch, self.selection == .room(id),
                   ended == nil || whileRecovering && observationNeedsRestart else { return false }
             guard messageRevision == roomMessageRevision else { return false }
+            let owner = RosterOwner(room: id, instance: page.instance, generation: generation, epoch: epoch)
+            if rosterRevision != rosterReadRevision {
+                // A newer watcher publication already owns the inspector. Never roll it back.
+                guard rosterKnown, rosterOwner == owner, memberObservationError == nil else { return false }
+            } else {
+                guard commitRoster(rows, owner: owner, revision: rosterReadRevision,
+                                   allowRecovery: whileRecovering) else { return false }
+            }
+            #if VOX_PROOF_STUB_SERVICES
+            proofRosterPublished("initial")
+            #endif
             // The page and its inspector replace the prior view together, after both reads
             // have succeeded. An ordinary refresh must not publish a half-empty room.
             roomInstance = page.instance
@@ -2014,10 +2189,7 @@ final class NodeModel: ObservableObject {
             roomServices = services.shared
             roomServicesNext = services.next
             roomServicesRevision = services.revision
-            members = rows.rows
-            scheduleMemberPlatformRead(id)
-            trustsMe = rows.trustsMe
-            for (fingerprint, name) in rows.presented { rememberPresentation(fingerprint, name) }
+            // Members, reciprocal consent and presentation were committed together above.
             retention = kept
             retentionSecs = keptSecs
             notices = done.rows
@@ -2046,7 +2218,7 @@ final class NodeModel: ObservableObject {
             return true
         } catch {
             guard viewGeneration == roomViewGeneration, generation == roomReadGeneration,
-                  self.selection == .room(id),
+                  epoch == nodeObservationEpoch, self.selection == .room(id),
                   ended == nil || whileRecovering && observationNeedsRestart else { return false }
             reportBackground(error)
             return false
@@ -2246,7 +2418,8 @@ final class NodeModel: ObservableObject {
             if let fresh = asks.first(where: { $0.dir == current.dir }) {
                 roomAskDialog = fresh
             } else if !activeOperations.values.contains("bind-room")
-                        && !activeOperations.values.contains("decline-room") {
+                        && !activeOperations.values.contains("decline-room")
+                        && !roomDecisionOpen {
                 finishRoomAsk()
             }
         }
@@ -2258,6 +2431,44 @@ final class NodeModel: ObservableObject {
             sheet = .repoRoom
         }
     }
+    func inspectRoomDecision(_ dir: String) async throws -> RoomDecisionInfo {
+        try await client.roomDecision(dir: dir)
+    }
+
+    func inspectExplicitRoomDecision(_ dir: String) async throws -> RoomDecisionInfo {
+        try await client.roomDecisionExplicit(dir: dir)
+    }
+
+    func cancelRoomDecision(_ decision: RoomDecisionInfo) async {
+        try? await client.cancelRoomDecision(token: decision.token)
+    }
+
+    func reportRoomDecision(_ answer: RoomAnswerInfo) {
+        report(operation: "bind-room", done: answer.said.joined(separator: "\n"))
+    }
+
+    private func reportRoomDecisionFailure(_ answer: RoomAnswerInfo) {
+        let words = answer.said.joined(separator: "\n")
+        if words.contains("durability could not be confirmed") {
+            report(VoxError.Unknown(reason: words), operation: "bind-room")
+        }
+    }
+
+    func replaceRoomDecision(_ decision: RoomDecisionInfo, room: String?, link: String,
+                             secret: Secret) async throws -> RoomAnswerInfo {
+        let attempt = begin("decline-room")
+        defer { end(attempt) }
+        var address = link
+        if let room { address = try await client.link(room: room).url }
+        let passphrase = try secret.passphrase()
+        defer { passphrase.wipe() }
+        let answer = try await client.replaceRoom(token: decision.token, link: address,
+                                                  passphrase: passphrase, node: node)
+        if answer.done { reportRoomDecision(answer) }
+        else { reportRoomDecisionFailure(answer) }
+        return answer
+    }
+
 
     /// Creation uses the app's selected (person's) node. The room secret is reused only for the
     /// verified bind; no identity passphrase or keyring change is involved (RM-2, KP-1).
@@ -2290,7 +2501,8 @@ final class NodeModel: ObservableObject {
     /// Bind `dir` to the room this node holds by `room`'s id, or to the room `link` names (one of
     /// them is given), joined with the passphrase the person typed (RB-6): what `vox room join
     /// <link> --node <node> --bind <dir>` does. Whether it was done.
-    func bindRoom(_ dir: String, room: String?, link: String?, passphrase secret: Secret) async -> Bool {
+    func bindRoom(_ dir: String, room: String?, link: String?, passphrase secret: Secret,
+                  decision: RoomDecisionInfo? = nil) async -> Bool {
         let operation = "bind-room"
         let attempt = begin(operation)
         defer { end(attempt) }
@@ -2300,8 +2512,15 @@ final class NodeModel: ObservableObject {
             if let room { address = try await client.link(room: room).url }
             let passphrase = try secret.passphrase()
             defer { passphrase.wipe() }
-            let answer = try await client.bindRoom(dir: dir, link: address, passphrase: passphrase)
+            let answer: RoomAnswerInfo
+            if let decision {
+                answer = try await client.bindRoomDecision(dir: dir, token: decision.token,
+                                                           link: address, passphrase: passphrase)
+            } else {
+                answer = try await client.bindRoom(dir: dir, link: address, passphrase: passphrase)
+            }
             roomAskSaid = answer
+            if !answer.done { reportRoomDecisionFailure(answer) }
             await readRoomAsks()
             return answer.done
         } catch {
@@ -3482,11 +3701,11 @@ final class NodeModel: ObservableObject {
     }
 
     /// The members of `room` other than this node, with the trust each has here.
-    private func memberRows(_ room: String) async throws -> (rows: [MemberRow], trustsMe: Set<String>, presented: [String: String]) {
-        let roster = try await client.roster(room: room)
-        let consents = try await client.memberConsents(room: room)
+    private func memberRows(_ room: String) async throws -> (rows: [MemberRow], trustsMe: Set<String>, presented: [String: String], instance: Data, failure: String) {
+        let observation = try await client.roomMemberObservation(room: room)
+        let roster = observation.members
         let keyring = Dictionary(trusted.map { ($0.fingerprint, $0.drive) }) { $1 }
-        let back = Set(consents.inbound)
+        let back = Set(observation.inbound)
         // Their trust in this node, whether or not this node trusts them (D4): both directions.
         let displayNames = roster.map { m in (m.fingerprint, m.name.isEmpty ? m.presentedName : m.name) }
         let rows = roster.filter { $0.fingerprint != me }.map { m in
@@ -3502,7 +3721,7 @@ final class NodeModel: ObservableObject {
                              keyWaits: m.keyWaits)
         }
         return (rows, back, Dictionary(uniqueKeysWithValues: roster.filter { !$0.presentedName.isEmpty }
-            .map { ($0.fingerprint, $0.presentedName) }))
+            .map { ($0.fingerprint, $0.presentedName) }), observation.instance, observation.failure)
     }
 
     /// General and the independent thread window are the only consumers of these file maps.
@@ -3677,7 +3896,25 @@ final class NodeModel: ObservableObject {
                 await self.refreshMessageFooters(room)
                 let fileIDs = self.displayedFileIDs
                 let fileFacts = try? await self.displayedFileFacts(room, ids: fileIDs)
-                let rows = try? await self.memberRows(room)
+                let rosterReadRevision = self.rosterRevision
+                do {
+                    let rows = try await self.memberRows(room)
+                    #if VOX_PROOF_STUB_SERVICES
+                    await self.proofRosterGate("watch")
+                    #endif
+                    if !rows.failure.isEmpty {
+                        throw VoxError.Failed(reason: "The room projection is retained: " + rows.failure)
+                    }
+                    let owner = RosterOwner(room: room, instance: rows.instance, generation: generation, epoch: scope.epoch)
+                    if self.commitRoster(rows, owner: owner, revision: rosterReadRevision, watcher: true) {
+                        #if VOX_PROOF_STUB_SERVICES
+                        self.proofRosterPublished("watch")
+                        #endif
+                    }
+                } catch {
+                    self.rosterFailure(error, room: room, generation: generation, epoch: scope.epoch,
+                                       revision: rosterReadRevision)
+                }
                 let kept = try? await self.client.retention(room: room)
                 let keptSecs = try? await self.client.retentionSecs(room: room)
                 await self.readGovernancePages()
@@ -3715,25 +3952,6 @@ final class NodeModel: ObservableObject {
                         .map { ($0.entry, $0.state) }) { $1 }
                     if now != self.pulling { self.pulling = now }
                 }
-                if let rows {
-                    if rows.trustsMe != self.trustsMe { self.trustsMe = rows.trustsMe }
-                    for (fingerprint, name) in rows.presented { self.rememberPresentation(fingerprint, name) }
-                    self.roomNeedsPage = false
-                    if rows.rows != self.members {
-                        // A member not listed before joined while the room was on screen (K-7).
-                        let before = Set(self.members.map(\.id))
-                        let came = rows.rows.filter { !before.contains($0.id) }
-                        self.members = rows.rows
-                        let current = Set(rows.rows.map(\.id))
-                        self.joins.removeAll { !current.contains($0.fingerprint) }
-                        if !before.isEmpty || !came.isEmpty {
-                            let at = UInt64(Date().timeIntervalSince1970 * 1000)
-                            for m in came where !self.joins.contains(where: { $0.fingerprint == m.id }) {
-                                self.joins.append(JoinLine(fingerprint: m.id, at: at, said: ""))
-                            }
-                        }
-                    }
-                }
                 self.scheduleThreadRefresh()
                 await self.refreshJoinCaptions(room)
             }
@@ -3746,11 +3964,12 @@ final class NodeModel: ObservableObject {
     /// remove its old directory, rather than leaving a once-authorized caption on screen.
     private func refreshJoinCaptions(_ room: String) async {
         let token = UUID(), generation = roomReadGeneration, epoch = nodeObservationEpoch
+        let owner = rosterOwner
         joinCaptionRead = token
         for fingerprint in joins.map(\.fingerprint) {
             let said = try? await client.joinSaid(room: room, member: fingerprint)
             guard !Task.isCancelled, token == joinCaptionRead, generation == roomReadGeneration,
-                  epoch == nodeObservationEpoch, roomOnScreen == room, ended == nil else { return }
+                  epoch == nodeObservationEpoch, rosterOwner == owner, roomOnScreen == room, ended == nil else { return }
             guard let i = joins.firstIndex(where: { $0.fingerprint == fingerprint }) else { continue }
             let current = said ?? "\(nodeName(fingerprint)) joined."
             if joins[i].said != current { joins[i].said = current }
@@ -4426,6 +4645,8 @@ extension NodeModel {
         case let .taken(words): report(operation: operation, done: asSentence(words))
         case let .refused(words): report(VoxError.Failed(reason: asSentence(words)), operation: operation)
         case let .unknown(words): report(VoxError.Unknown(reason: asSentence(words)), operation: operation)
+        case let .queued(words, _), let .unconfirmed(words, _):
+            report(VoxError.Unknown(reason: asSentence(words)), operation: operation)
         }
         await readSession()
     }

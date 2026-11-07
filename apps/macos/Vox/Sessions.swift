@@ -38,6 +38,9 @@ extension NodeModel {
     var roomRosterWords: String {
         guard daemonReachable else { return "members unavailable" }
         guard !roomMembersPending else { return "members loading" }
+        if memberObservationError != nil {
+            return members.isEmpty ? "members unavailable" : "\(members.count + 1) members (stale)"
+        }
         let count = members.count + 1
         return count == 1 ? "1 member" : "\(count) members"
     }

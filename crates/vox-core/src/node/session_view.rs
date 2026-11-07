@@ -41,6 +41,19 @@ pub struct Line {
     pub file: Option<FileLine>,
     /// An approval or a question the session asked.
     pub request: Option<RequestLine>,
+    /// Correlated OMP Drive delivery, when this is an attributed Drive operation.
+    pub drive: Option<DriveLine>,
+}
+
+/// Delivery evidence for one scoped OMP Drive operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriveLine {
+    /// Sender-generated operation identity.
+    pub operation: String,
+    /// Authenticated operator node.
+    pub by: String,
+    /// `unconfirmed`, `refused`, `queued`, or `accepted`.
+    pub phase: String,
 }
 
 impl Line {
@@ -348,12 +361,17 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
     let mut done: BTreeMap<String, usize> = BTreeMap::new();
     let resolved = request_outcomes(&bodies);
     // A drive's results, by the drive's tag (`of` on the result, `id` on the drive), in order.
-    let mut results: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-    let mut driven: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut results: BTreeMap<(String, String), Vec<usize>> = BTreeMap::new();
+    let mut driven: std::collections::BTreeSet<(String, String)> = std::collections::BTreeSet::new();
     // Calls that asked first: their request's line names them, so an unanswered or refused call
     // is not shown twice.
     let mut asked: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for (i, b) in bodies.iter().enumerate() {
+        let scope = if b.fields.get("drive_scope").and_then(Value::as_u64) == Some(1) {
+            b.str("by")
+        } else {
+            ""
+        };
         if matches!(b.kind(), "approval" | "question") {
             asked.insert(b.reference().to_owned());
         }
@@ -362,10 +380,10 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
                 done.insert(b.reference().to_owned(), i);
             }
             "drive" if !b.str("id").is_empty() => {
-                driven.insert(b.str("id").to_owned());
+                driven.insert((scope.to_owned(), b.str("id").to_owned()));
             }
             "drive-result" if !b.str("of").is_empty() => {
-                results.entry(b.str("of").to_owned()).or_default().push(i);
+                results.entry((scope.to_owned(), b.str("of").to_owned())).or_default().push(i);
             }
             _ => {}
         }
@@ -380,6 +398,7 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
         let mut details: Vec<(String, String)> = Vec::new();
         let mut file = None;
         let mut request = None;
+        let mut drive = None;
         let mut waiting = None;
         let text = match b.kind() {
             "user" => {
@@ -533,7 +552,35 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
                 match b.str("action") {
                     "text" => {
                         details.push(("typed".into(), b.str("text").to_owned()));
-                        format!("typed in Vox by {by}: {}", one_line(b.str("text")))
+                        let mut line = format!("typed in Vox by {by}: {}", one_line(b.str("text")));
+                        if b.fields.get("drive_scope").and_then(Value::as_u64) == Some(1) {
+                            let mut phase = "unconfirmed";
+                            let key = (b.str("by").to_owned(), b.str("id").to_owned());
+                            for &r in results.get(&key).into_iter().flatten() {
+                                let r = &bodies[r];
+                                match r.str("phase") {
+                                    "accepted" => {
+                                        phase = "accepted";
+                                        details.push(("response step".into(), r.str("text").to_owned()));
+                                    }
+                                    "queued" if phase != "accepted" => phase = "queued",
+                                    "refused" if phase == "unconfirmed" => {
+                                        phase = "refused";
+                                        details.push(("not sent".into(), r.str("why").to_owned()));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            line.push_str(match phase {
+                                "accepted" => " — native/provider accepted; response step recorded",
+                                "queued" => " — bridge queued; native delivery unconfirmed",
+                                "refused" => " — refused",
+                                _ => " — delivery unconfirmed",
+                            });
+                            drive = Some(DriveLine { operation: b.str("id").to_owned(),
+                                by: b.str("by").to_owned(), phase: phase.to_owned() });
+                        }
+                        line
                     }
                     "interrupt" => format!("interrupt sent by {by}"),
                     "stop" => format!("stop sent by {by}"),
@@ -557,7 +604,7 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
                             size(b.fields.get("size").and_then(Value::as_u64).unwrap_or(0))
                         );
                         // What came of it, in order: each result names this drive's tag as `of`.
-                        for r in results.get(b.str("id")).into_iter().flatten() {
+                        for r in results.get(&(String::new(), b.str("id").to_owned())).into_iter().flatten() {
                             let r = &bodies[*r];
                             if r.fields.get("ok").and_then(Value::as_bool) == Some(true) {
                                 line.push_str(&format!(" — {}", r.str("said")));
@@ -578,7 +625,8 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
             }
             "drive-result" => {
                 // A result paired with its drive's tag is drawn on that drive's line.
-                if !b.str("of").is_empty() && driven.contains(b.str("of")) {
+                let scope = if b.fields.get("drive_scope").and_then(Value::as_u64) == Some(1) { b.str("by") } else { "" };
+                if !b.str("of").is_empty() && driven.contains(&(scope.to_owned(), b.str("of").to_owned())) {
                     continue;
                 }
                 if b.fields.get("ok").and_then(Value::as_bool) == Some(true) {
@@ -595,6 +643,7 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
             kind: b.kind().to_owned(),
             text: format!("{prefix}{text}"),
             details,
+            drive,
             reference: b.reference().to_owned(),
             waiting,
             file,

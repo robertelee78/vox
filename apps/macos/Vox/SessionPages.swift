@@ -97,6 +97,9 @@ struct SessionPages: Equatable {
 
     private static func textBytes(_ entry: FfiSessionEntry) -> Int {
         var size = entry.id.utf8.count + entry.line.utf8.count + entry.details.utf8.count
+        if let drive = entry.drive {
+            size += drive.operation.utf8.count + drive.by.utf8.count
+        }
         if let file = entry.file {
             size += file.name.utf8.count + file.sha256.utf8.count + file.entry.utf8.count
             size += file.pulledPath?.utf8.count ?? 0

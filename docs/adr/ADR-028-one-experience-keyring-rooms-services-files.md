@@ -5,6 +5,9 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 **Status**: Accepted for v0.4.0 (the decider, 2026-10-05); §2a added, and the lanes view (W-3)
 removed, from the decider's answers of 2026-10-06; E-2, E-5, E-7, K-6, K-8, L-1, L-1a, L-1b, L-2, L-6 and L-7 amended
 for v0.4.1 (the decider, 2026-10-08). Nothing in this ADR is built unless a requirement says so.
+
+**Proposed for v0.4.20, not accepted or built:** K-6 and K-7 are amended only as specified
+in K-21–K-26 below; existing accepted requirements remain in force pending decision.
 **Date**: 2026-10-05
 **Deciders**: Robert E. Lee
 **Tags**: ux, tui, macos, keyring, rooms, services, files, look, install
@@ -84,10 +87,15 @@ decider named: read records, the room's shared name, the decision record and the
   fingerprint MUST offer paste or typing, and grouped text; a mismatch MUST be its own action that
   says not to trust the node. Scanning a fingerprint is v0.4.1, with the iOS app.
 - **K-6.** Removing a node from the keyring (Remove, E-2) MUST be the only way to stop reading and
-  being read by it (ADR-007 G-21). There MUST be no separate block.
+  being read by it (ADR-007 G-21). There MUST be no separate block. **Proposed v0.4.20 amendment:**
+  ADR-007 G-28–G-32 also permit authorized removal of a node from one room, distinct from global
+  keyring removal; this is not a personal block or per-room visibility opt-out.
 - **K-7.** When a node joins a room, each member's client MUST say which of this node's trusted
   members trust the newcomer, from the consent grants on the log (ADR-007 G-9), for example
-  `K2M9·Q7RT joined. ann trusts it.` This MUST NOT add it to anyone's keyring.
+  `K2M9·Q7RT joined. ann trusts it.` This MUST NOT add it to anyone's keyring. **Proposed
+  v0.4.20 amendment:** K-23–K-25 govern when an observed roster addition may be presented as a
+  join; current membership and caption data do not prove historical admission time.
+
 - **K-8.** There MUST be no identity backup. Onboarding MUST say plainly that a lost machine means
   a new node, and that the people who trust the old one remove it from their keyrings.
 - **K-9.** The keyring window (ADR-026 N-2, 30 minutes) MUST be visible where the person works:
@@ -167,6 +175,67 @@ by any of them (ADR-001: there is no typed agent or human).
 - **K-20. No trust file.** There MUST be no provision-time import, bulk trust file or other trust
   path beyond ADR-020 3.7's two entry points.
 
+### v0.4.20 — scoped design approval, not built
+
+The operator selected these outcomes; independent Opus review of `37b0ffbf4` approved K-21–K-25
+at design level, with K-22's independent staging clarification below. K-26 member removal
+remains proposed. No implementation, consumer acceptance or publication is approved here.
+
+- **K-26. Room removal action.** The native member UI and CLI MUST allow the creator or authorized
+  admin to select the exact verified member fingerprint for removal from this room under ADR-007
+  G-28–G-32. Before acting and in the result, identify the room and full fingerprint, distinguish
+  same-name replacement nodes, explain that other rooms and global trust are unchanged, that old
+  disclosures cannot be recalled, and show applied versus pending/unknown propagation. Do not
+  confuse this action with removing an admin role or a node from the keyring. Show a non-admin
+  refusal without changing membership. Creator-only explicit readmission MUST likewise identify
+  the room and exact fingerprint and MUST NOT promise access before independent checks succeed.
+- **K-21. Evidence-bounded access warnings.** A client MUST distinguish authenticated computer
+  approval/application, effective local node trust, room membership/reciprocal consent, key
+  delivery, connectivity and private Session permission; none alone implies the others. Absence
+  of inbound room consent MUST NOT be presented as a remote decision not to trust or as an
+  explicit refusal. Show confirmed computer application only when the matching current
+  authenticated receipt establishes it; local application is not a fresh remote receipt. Show
+  pending/unobserved room consent, actual key or governance failure, unreachable, explicit refusal,
+  or unavailable/stale observation only when supported by the corresponding evidence. Failed
+  reads MUST NOT convert unknown into false or present last-good data as current; retained rows
+  MUST identify staleness and the actual failure. No approval, trust or access check is weakened.
+- **K-22. Warning consumer acceptance.** In the existing isolated native paired-computer journey,
+  complete actual approvals and stage genuine unresolved inbound consent or key wait; a failed
+  join may supply it but is not required, so acceptance does not depend on FX-53's repair. The visible warning
+  MUST not accuse the remote node of withholding trust; it MUST show the actual unresolved room or
+  delivery condition. After real repair, exchange distinct new messages both ways before presenting
+  room access as ready. Separately exercise genuine missing approval/refusal, stale and unavailable
+  observations, same-name distinct fingerprints and private Session read/Drive denial. The
+  apparatus is controlled failure and isolated profiles; the PRODUCT verdict is the native
+  display and actual access, not a mocked projection, string search or successful post exit.
+  A mutant that treats missing inbound consent as an explicit remote refusal MUST fail this proof.
+- **K-23. One roster observation owner.** The selected room's initial, refresh and watcher roster
+  publications MUST share one ordered owner bound to room ID, saved-room instance, selection
+  generation and node-observation epoch. Distinguish an unknown baseline from a successfully
+  observed empty baseline. The first successful current snapshot seeds it without join lines;
+  failed reads do not seed it or replace good rows. Later ordered snapshots compare fingerprints
+  against the known baseline, publish at most one line for each newly observed member and remove
+  departed members' lines. Fence async publications and captions so obsolete same-generation
+  reads, replaced room instances, switches and observer recovery cannot regress current state or
+  disclose a previous room's private caption. Reconcile an obsolete page/roster read rather than
+  falsely reporting recovery complete. Preserve existing caption and Drive authorization checks.
+- **K-24. Observation honesty.** A roster-difference line is a local observation, not a durable
+  admission event or authenticated admission timestamp. It MUST NOT assert an exact join time or
+  reconstruct an admission before the baseline or a join and departure between snapshots. Current
+  Session/cwd information MUST be disclosed only under current authority and MUST NOT be implied
+  to have existed at admission.
+- **K-25. Join-line consumer acceptance.** Extend the existing isolated native journey: force both
+  orders of initial and watch reads for a pre-populated room and observe no lines for existing
+  members, then admit a new fingerprint and observe exactly one line. After a successful known-empty
+  peer baseline, the first real peer must produce one line; after a failed first read, the first
+  successful populated snapshot produces none. Hold roster and caption responses over room switch,
+  same-ID instance replacement and observation recovery, and exercise reordered same-generation
+  reads; verify no stale member, false join or unauthorized cwd appears and a later real addition
+  remains visible. Apparatus is bounded controlled interleaving and real isolated members; PRODUCT
+  verdicts are native timeline, roster and authorized disclosure. Mutants reproducing the old
+  initial/watch race and suppressing all joins after an empty baseline MUST each fail the relevant
+  consumer proof. These are proposed proofs, not results.
+
 ### 3. Rooms
 
 - **R-1.** A room MUST have one **shared name** that every member sees, set at creation and
@@ -181,6 +250,11 @@ by any of them (ADR-001: there is no typed agent or human).
   or admin gives a room the same name as another room on a node, that node, and only that node,
   MUST show every room involved by its room ID instead of its name, in every view and in readable
   addresses, until the clash is gone; it MUST say why once.
+  **Proposed v0.4.20 exception, not built:** ADR-023 RL-8.7 checks and reserves the authenticated
+  proposed name before remote admission. If the authoritative name changes after admission,
+  complete that admitted join and use the same by-ID clash presentation, explaining the
+  outcome; do not claim the remote admission was rolled back or invent responder erasure
+  authority. Preflight collisions still refuse and preserve the existing room.
 - **R-4.** The verb that prints a room's link MUST be `vox room link` (built in v0.3.0) and `:link`
   in the TUI. A room link MUST NOT expire; it stops working only when the room is ended (ADR-023
   RL-8.2). The link and the passphrase MUST be presented as two things sent two ways.

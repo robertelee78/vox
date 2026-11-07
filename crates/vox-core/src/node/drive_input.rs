@@ -18,6 +18,20 @@ use crate::node::ipc::{read_frame, write_frame, Frame, NodeSocket};
 const T_DRIVE_OWN: u64 = 5440;
 const T_DRIVE_OWN_ANSWER: u64 = 5441;
 
+/// Generate a correlation identity before sending a Drive operation.
+///
+/// # Errors
+/// The operating system could not supply secure randomness.
+pub fn operation_id() -> Result<String, String> {
+    use std::fmt::Write as _;
+    let bytes = crate::identity::rng::random_array::<16>().map_err(|error| error.to_string())?;
+    let mut id = String::with_capacity(32);
+    for byte in bytes {
+        let _ = write!(id, "{byte:02x}");
+    }
+    Ok(id)
+}
+
 /// A drive request for a Session on the node the client is attached as, sent on that node's
 /// control socket: `[T_DRIVE_OWN, room, request JSON]`. The daemon serves it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,7 +115,11 @@ pub async fn send(
     peer: Digest32,
     request: &Request,
 ) -> Result<Answer, Unsent> {
-    send_checked(at, room, peer, request, None).await
+    let mut request = request.clone();
+    if request.operation.is_none() {
+        request.operation = Some(operation_id().map_err(Unsent::Unreachable)?);
+    }
+    send_checked(at, room, peer, &request, None).await
 }
 
 /// Drive input bound to the caller's captured identity and saved room instance. Used for a

@@ -16,6 +16,10 @@ struct RoomAskDialog: View {
     @State private var field = SecureFieldHolder()
     @State private var noPassphrase = true
     @State private var submitting = false
+    @State private var deciding = false
+    @State private var bindingDecision: RoomDecisionInfo?
+    @State private var decisionError: String?
+    @State private var inspectionGeneration = 0
 
     /// One DNS label (ADR-028 R-2), with an editable name when the directory has no such letters.
     private var suggestedName: String {
@@ -50,11 +54,12 @@ struct RoomAskDialog: View {
                     choose(.choosing)
                 }
                 .accessibilityIdentifier("room-ask-choose")
-                if ask.room.isEmpty {
-                    Button("Not This Repo") { decline() }
-                        .help("No session started in this repository is asked again.")
-                        .accessibilityIdentifier("room-ask-decline")
+                Button("Not This Repo") {
+                    model.roomDecisionOpen = true
+                    deciding = true
                 }
+                    .help("Review the scope before changing the repository decision.")
+                    .accessibilityIdentifier("room-ask-decline")
             } else {
                 form
             }
@@ -72,11 +77,35 @@ struct RoomAskDialog: View {
         .interactiveDismissDisabled()
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("room-ask-dialog")
-        .onDisappear { field.clear() }
+        .onDisappear {
+            model.roomDecisionOpen = false
+            field.clear()
+            inspectionGeneration += 1
+            if let decision = bindingDecision { Task { await model.cancelRoomDecision(decision) } }
+        }
+        .sheet(isPresented: $deciding, onDismiss: { model.roomDecisionOpen = false }) {
+            RepoDecisionView(model: model, directory: ask.dir, decline: true) {
+                deciding = false
+                model.finishRoomAsk()
+                Task { await model.readRoomAsks() }
+            }
+        }
     }
 
     @ViewBuilder private var form: some View {
         Hairline()
+        if !ask.room.isEmpty {
+            if let decision = bindingDecision {
+                Text("Repository: \(decision.target)")
+                Text("Current room: \(decision.room); source: \(decision.source)")
+                Text(decision.source == decision.target ? "Exact binding." : "Inherited binding; the parent remains unchanged.")
+                    .secondaryText()
+            } else if let decisionError {
+                Text(decisionError)
+            } else {
+                ProgressView("Inspecting repository decision…")
+            }
+        }
         if choice == .creating {
             TextField("Room name", text: $name)
                 .accessibilityIdentifier("room-ask-name")
@@ -117,20 +146,37 @@ struct RoomAskDialog: View {
             Button(choice == .creating ? "Create Room" : "Bind") { submit() }
                 .keyboardShortcut(.defaultAction)
                 .buttonStyle(.voxPrimary)
-                .disabled(choice == .creating ? name.isEmpty : (room == nil && link.isEmpty))
+                .disabled((!ask.room.isEmpty && bindingDecision == nil) ||
+                          (choice == .creating ? name.isEmpty : (room == nil && link.isEmpty)))
                 .accessibilityIdentifier("room-ask-bind")
         }
     }
 
     private func choose(_ next: Choice?) {
+        inspectionGeneration += 1
+        let generation = inspectionGeneration
+        if let decision = bindingDecision { Task { await model.cancelRoomDecision(decision) } }
         field.clear()
         noPassphrase = true
         choice = next
         model.clearRoomAskFailure()
+        bindingDecision = nil
+        decisionError = nil
+        if next == .choosing && !ask.room.isEmpty {
+            Task {
+                do {
+                    let decision = try await model.inspectRoomDecision(ask.dir)
+                    if generation == inspectionGeneration { bindingDecision = decision }
+                    else { await model.cancelRoomDecision(decision) }
+                }
+                catch { decisionError = sentence(error) }
+            }
+        }
     }
 
     private func submit() {
-        guard !submitting, choice == .creating ? !name.isEmpty : (room != nil || !link.isEmpty) else { return }
+        guard !submitting, (ask.room.isEmpty || bindingDecision != nil),
+              choice == .creating ? !name.isEmpty : (room != nil || !link.isEmpty) else { return }
         submitting = true
         let secret = field.copyAllowingEmpty()
         let (r, l, n, creating) = (room, link, name, choice == .creating)
@@ -145,9 +191,15 @@ struct RoomAskDialog: View {
                     choice = .choosing
                 }
             } else {
-                done = await model.bindRoom(ask.dir, room: r, link: r == nil ? l : nil, passphrase: secret)
+                done = await model.bindRoom(ask.dir, room: r, link: r == nil ? l : nil,
+                                            passphrase: secret, decision: bindingDecision)
             }
             submitting = false
+            if !done && !ask.room.isEmpty {
+                if let decision = bindingDecision { await model.cancelRoomDecision(decision) }
+                bindingDecision = nil
+                decisionError = "The decision must be inspected again. Choose Back to review it."
+            }
             if done { field.clear(); model.finishRoomAsk() }
         }
     }
@@ -162,13 +214,120 @@ struct RoomAskDialog: View {
         }
     }
 
-    private func decline() {
-        guard !submitting else { return }
-        submitting = true
+}
+
+/// An explicitly inspected, stale-safe repository decision, independent of any pending ask.
+struct RepoDecisionView: View {
+    @ObservedObject var model: NodeModel
+    let directory: String
+    let decline: Bool
+    let finished: () -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var decision: RoomDecisionInfo?
+    @State private var error: String?
+    @State private var answer: RoomAnswerInfo?
+    @State private var room: String?
+    @State private var link = ""
+    @State private var field = SecureFieldHolder()
+    @State private var empty = true
+    @State private var busy = false
+    @State private var disappeared = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Space.s12) {
+            Text(decline ? "Not This Repo" : "Rebind Repository").title()
+            if let decision {
+                Text("Repository: \(decision.target)")
+                Text("Resolved decision: \(decision.room.isEmpty ? "unbound" : decision.room)")
+                Text(decision.source.isEmpty ? "No source block." :
+                     "Source: \(decision.source)" + (decision.source == decision.target ? " (exact)" : " (inherited)"))
+                Text("This affects future sessions across all nodes and harnesses in this data root. Existing sessions do not move; no room is left and trust does not change. More-specific overrides remain effective. Replacing an exact block discards its saved link and passphrase; these are needed again to rebind.")
+                    .secondaryText()
+                if !decline {
+                    let open = model.rooms.filter(\.open)
+                    if !open.isEmpty {
+                        Picker("Room", selection: $room) {
+                            Text("Use a link").tag(Optional<String>.none)
+                            ForEach(open) { r in Text(r.name).tag(Optional(r.id)) }
+                        }
+                        .accessibilityIdentifier("repo-decision-room")
+                    }
+                    if room == nil {
+                        TextField("Room link (vox://…)", text: $link)
+                            .accessibilityIdentifier("repo-decision-link")
+                    }
+                    Text("The passphrase is saved in the room map, readable by every node in this data root; agents are not given it.").secondaryText()
+                    SecureInput(holder: field, onEmpty: { empty = $0 }) { submit() }
+                        .accessibilityLabel("Room passphrase")
+                        .accessibilityIdentifier("repo-decision-passphrase")
+                }
+                if answer?.done == true {
+                    Button("Done") { finished(); dismiss() }.buttonStyle(.voxPrimary)
+                        .accessibilityIdentifier("repo-decision-done")
+                } else {
+                    HStack {
+                        Button("Cancel") { dismiss() }
+                        Button(decline ? "Confirm Not This Repo" : "Rebind") { submit() }
+                            .buttonStyle(.voxPrimary)
+                            .accessibilityIdentifier("repo-decision-submit")
+                            .disabled(busy || (!decline && room == nil && link.isEmpty))
+                    }
+                }
+            } else {
+                Button("Cancel") { dismiss() }
+                if error != nil {
+                    Button("Inspect Again") { inspect() }
+                        .accessibilityIdentifier("repo-decision-inspect-again")
+                }
+            }
+            if busy { ProgressView("Updating repository decision…") }
+            if let error { Text(error) }
+            if let answer {
+                Text(answer.said.joined(separator: "\n"))
+                    .accessibilityIdentifier("repo-decision-result")
+            }
+        }
+        .padding(Space.s24)
+        .frame(width: Theme.scaled(500))
+        .accessibilityIdentifier("repo-decision-dialog")
+        .task { inspect() }
+        .onDisappear {
+            disappeared = true
+            field.clear()
+            if let decision { Task { await model.cancelRoomDecision(decision) } }
+        }
+    }
+    private func inspect() {
+        error = nil
         Task {
-            let done = await model.declineRoom(ask.dir)
-            submitting = false
-            if done { model.finishRoomAsk() }
+            do {
+                let inspected = try await (decline ? model.inspectRoomDecision(directory) : model.inspectExplicitRoomDecision(directory))
+                if disappeared { await model.cancelRoomDecision(inspected) }
+                else { decision = inspected }
+            }
+            catch { self.error = sentence(error) }
+        }
+    }
+
+
+    private func submit() {
+        guard let decision, !busy else { return }
+        busy = true
+        let secret = decline ? Secret(Data()) : field.copyAllowingEmpty()
+        Task {
+            do {
+                let result = try await model.replaceRoomDecision(decision, room: decline ? nil : room,
+                                                                  link: decline ? "" : link, secret: secret)
+                answer = result
+                if result.done {
+                    field.clear()
+                } else { self.decision = nil; error = "The decision must be inspected again before retrying." }
+            } catch {
+                await model.cancelRoomDecision(decision)
+                self.decision = nil
+                self.error = sentence(error)
+            }
+            busy = false
         }
     }
 }

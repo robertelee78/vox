@@ -22,9 +22,8 @@ extension Trust {
     /// `name`'s direction, to this node, as far as this node knows (G2, R-5).
     static func theyTrust(_ name: String, _ back: Bool) -> String {
         back
-            ? "\(name) trusts you too. Each node accepts the other's keys: you read each other."
-            : "\(name)'s trust in you has not reached this node yet: waiting for the other side. "
-                + "Until it does, neither reads the other."
+            ? "Reciprocal room consent from \(name) is observed. Keys and reachability are separate."
+            : "Reciprocal room consent from \(name) has not been observed. This is not evidence of a refusal."
     }
 }
 
@@ -42,17 +41,23 @@ struct KeyringCard: View {
             // its own label recursed in SwiftUI's accessibility and crashed, #579).
             HStack(spacing: 0) { Text("\(node.name) \(back ? "⇄" : "→") you").title() }
                 .accessibilityElement(children: .ignore)
-                .accessibilityLabel("\(node.name), \(back ? "trusted both ways" : "waiting for the other side")")
+                .accessibilityLabel("\(node.name), \(back ? "room consent observed" : "room consent not observed")")
                 .accessibilityIdentifier("keyring-card-heading")
             VStack(alignment: .leading, spacing: Space.s4) {
                 Text("you → \(node.name)").fontWeight(.bold)
                 Text(Trust.youTrust(node.name))
                     .accessibilityIdentifier("keyring-card-yours")
+                if let error = model.keyringObservationError {
+                    Text(error).secondaryText().accessibilityIdentifier("keyring-card-trust-unavailable")
+                }
             }
             VStack(alignment: .leading, spacing: Space.s4) {
                 Text("\(node.name) → you").fontWeight(.bold)
                 Text(Trust.theyTrust(node.name, back))
                     .accessibilityIdentifier("keyring-card-theirs")
+                if let error = model.trustsBackError {
+                    Text(error).secondaryText().accessibilityIdentifier("keyring-card-consent-unavailable")
+                }
             }
             Group {
                 switch shared {

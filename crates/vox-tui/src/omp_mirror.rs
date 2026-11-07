@@ -56,6 +56,8 @@ pub struct OmpMirror {
     session_end: SessionEnd,
     activity: Activity,
     conns: Mutex<BTreeMap<String, Connection>>,
+    operation_journal: Mutex<()>,
+    receipts: Arc<Mutex<BTreeMap<String, (String, crate::host::OmpDriveGuard)>>>,
     live: Arc<Semaphore>,
 }
 
@@ -91,7 +93,8 @@ impl Deferred {
     fn frame(&self, id: &str) -> String {
         format!(
             "{}\n",
-            json!({"type":"materialized","id":id,"ok":true,"text":self.text})
+            json!({"type":"materialized","id":id,"ok":true,"text":self.text,
+                "operator":self.guard.operator,"room":self.guard.room})
         )
     }
 }
@@ -105,8 +108,50 @@ impl OmpMirror {
             session_end,
             activity,
             conns: Mutex::new(BTreeMap::new()),
+            operation_journal: Mutex::new(()),
+            receipts: Arc::new(Mutex::new(BTreeMap::new())),
             live: Arc::new(Semaphore::new(MAX_FOLLOWS)),
         })
+    }
+
+    /// Reserve an authored operation durably before it can reach OMP. The fixed-size
+    /// journal fails closed when full or damaged rather than permitting a replay.
+    pub(crate) fn reserve_operation(
+        &self,
+        paths: &vox_core::node::paths::Paths,
+        room: &[u8; 32],
+        author: &[u8; 32],
+        session: &str,
+        operation: &str,
+    ) -> Result<(), String> {
+        use std::io::{Read as _, Write as _};
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let _lock = self.operation_journal.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = paths.session_dir();
+        vox_core::node::paths::create_private_dir(&dir).map_err(|e| e.to_string())?;
+        let journal = dir.with_extension("omp-drive-operations");
+        let key = vox_core::hash::sha256_concat(&[
+            b"vox/omp-drive-operation/v1", room, author,
+            &(session.len() as u64).to_be_bytes(), session.as_bytes(), operation.as_bytes(),
+        ]);
+        let mut file = std::fs::OpenOptions::new().read(true).append(true).create(true)
+            .mode(0o600).open(&journal)
+            .map_err(|e| format!("Drive operation journal unavailable: {e}"))?;
+        let length = file.metadata().map_err(|e| e.to_string())?.len();
+        const MAX_JOURNAL: u64 = 4 * 1024 * 1024;
+        if length % 32 != 0 || length >= MAX_JOURNAL {
+            return Err("Drive operation journal is full or damaged; nothing was sent".into());
+        }
+        let mut previous = [0u8; 32];
+        for _ in 0..length / 32 {
+            file.read_exact(&mut previous).map_err(|e| e.to_string())?;
+            if previous == key {
+                return Err("this Drive operation was already submitted; it will not be replayed".into());
+            }
+        }
+        file.write_all(&key).and_then(|()| file.sync_all())
+            .and_then(|()| std::fs::File::open(journal.parent().expect("node directory")).and_then(|dir| dir.sync_all()))
+            .map_err(|e| format!("Drive operation could not be reserved; nothing was sent: {e}"))
     }
 
     fn conns(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Connection>> {
@@ -166,6 +211,7 @@ impl OmpMirror {
             activity: Arc::clone(&self.activity),
             calls: BTreeMap::new(),
             deferred: BTreeMap::new(),
+            receipts: Arc::clone(&self.receipts),
             next_id: 1,
             failed: false,
             ended: false,
@@ -254,6 +300,7 @@ struct Follow {
     activity: Activity,
     calls: BTreeMap<u64, PendingCall>,
     deferred: BTreeMap<String, Deferred>,
+    receipts: Arc<Mutex<BTreeMap<String, (String, crate::host::OmpDriveGuard)>>>,
     next_id: u64,
     failed: bool,
     ended: bool,
@@ -403,14 +450,20 @@ impl Follow {
                     return None;
                 }
                 self.deferred.retain(|_, item| item.guard.allowed());
-                if self.deferred.len() >= MAX_COMMANDS {
+                let receipt_count = {
+                    let mut receipts = self.receipts.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    receipts.retain(|_, (_, guard)| guard.allowed());
+                    receipts.values().filter(|(session, _)| session == &self.session).count()
+                };
+                if self.deferred.len() + receipt_count >= MAX_COMMANDS {
                     let _ = reply.send(Err(
                         "OMP has 32 queued Drive messages; nothing was sent".into()
                     ));
                     return None;
                 }
                 let key = match opaque_id() {
-                    Ok(key) if !self.deferred.contains_key(&key) => key,
+                    Ok(key) if !self.deferred.contains_key(&key)
+                        && !self.receipts.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(&key) => key,
                     _ => {
                         let _ = reply.send(Err(
                             "a unique OMP Drive capability could not be created; nothing was sent"
@@ -430,7 +483,14 @@ impl Follow {
                 deferred = Some(key.clone());
                 json!({"type":"prompt", "id":key})
             }
-            Steer::Interrupt | Steer::Stop => json!({"type":"abort"}),
+            Steer::Interrupt => json!({"type":"abort"}),
+            Steer::Stop => {
+                let _ = reply.send(Err(
+                    "OMP cannot end the Session through Vox; use Interrupt for the current operation"
+                        .into(),
+                ));
+                return None;
+            }
             Steer::Slash { .. } => {
                 let _ = reply.send(Err("OMP slash commands are unavailable through Vox".into()));
                 return None;
@@ -475,11 +535,16 @@ impl Follow {
             return Self::write(write, &format!("{}\n", json!({"type":"materialized","id":id,"ok":false,"error":"the driver, room or Session changed"}))).await;
         }
         let frame = item.frame(id);
-        tokio::select! {
+        let written = tokio::select! {
             biased;
             () = item.guard.cancelled() => false,
             written = Self::write(write, &frame) => written,
+        };
+        if written && item.guard.operator.is_some() && item.guard.operation.is_some() {
+            self.receipts.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(id.to_owned(), (self.session.clone(), item.guard));
         }
+        written
     }
 
     async fn line(&mut self, value: &Value) {
@@ -579,6 +644,29 @@ impl Follow {
             .and_then(Value::as_str)
             .unwrap_or_default();
         match kind {
+            "drive-accepted" => {
+                let Some(id) = event.get("id").and_then(Value::as_str) else { return };
+                let guard = {
+                    let mut receipts = self.receipts.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if !receipts.get(id).is_some_and(|(session, _)| session == &self.session) { return; }
+                    receipts.remove(id).map(|(_, guard)| guard)
+                };
+                let Some(guard) = guard else { return };
+                if !guard.allowed() { return; }
+                let (Some(operation), Some(author)) = (guard.operation.as_deref(), guard.operator.as_deref()) else { return };
+                let Some(response) = event.get("response").and_then(Value::as_str) else { return };
+                let mut entry = self.envelope("drive-result", None);
+                entry.insert("of".into(), json!(operation));
+                entry.insert("ref".into(), json!(operation));
+                entry.insert("occurrence".into(), json!(author));
+                entry.insert("drive_scope".into(), json!(1));
+                entry.insert("by".into(), json!(author));
+                entry.insert("action".into(), json!("text"));
+                entry.insert("phase".into(), json!("accepted"));
+                entry.insert("ok".into(), json!(true));
+                entry.insert("text".into(), json!(response));
+                self.post(entry, "text").await;
+            }
             "user" | "reply" => {
                 let Some(text) = event.get("text").and_then(Value::as_str) else {
                     self.fail("an OMP text event has no text").await;

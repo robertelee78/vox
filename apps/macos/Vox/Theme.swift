@@ -454,13 +454,13 @@ struct Hairline: View {
 /// Who trusts whom between this node and another, each direction (ADR-028 L-4, R-5), shown by
 /// glyph, weight and words, never by colour alone (E-6). Words for every state, the TUI's (CL-1).
 enum Trust: Equatable {
-    /// In the keyring, and it trusts this node back: they read each other.
+    /// In the keyring, with reciprocal room consent observed.
     case mutual
-    /// In the keyring; its trust in this node has not reached it: waiting for the other side.
+    /// In the keyring, with reciprocal room consent not observed.
     case oneWay
-    /// Not in the keyring, and it trusts this node.
+    /// Not in the keyring, with reciprocal room consent observed.
     case theyOnly
-    /// Not in the keyring, and no trust of it in this node has reached it.
+    /// Not in the keyring, and reciprocal room consent not observed.
     case none
 
     /// The state from its two directions.
@@ -488,7 +488,7 @@ enum Trust: Equatable {
     var words: String {
         switch self {
         case .mutual: return "trusted both ways"
-        case .oneWay: return "waiting for the other side"
+        case .oneWay: return "local trust, room consent not observed"
         case .theyOnly: return "not in keyring, trusts you"
         case .none: return "not in keyring"
         }
@@ -499,16 +499,13 @@ enum Trust: Equatable {
     func sentence(_ name: String) -> String {
         switch self {
         case .mutual:
-            return "You trust \(name), and \(name) trusts you: you read each other."
+            return "You trust \(name), and reciprocal room consent is observed. Room access also depends on keys and reachability."
         case .oneWay:
-            return "You trust \(name); \(name)'s trust in you has not reached this node yet, so "
-                + "you can't read each other. Waiting for the other side."
+            return "You trust \(name); reciprocal room consent has not been observed. This does not establish a refusal."
         case .theyOnly:
-            return "\(name) trusts you; you haven't trusted \(name), so you can't read each other "
-                + "until you do."
+            return "Room consent from \(name) is observed; you haven't granted local node trust."
         case .none:
-            return "You haven't trusted \(name), and no trust of \(name)'s in you has reached "
-                + "this node: you can't read each other."
+            return "You haven't granted local node trust to \(name), and reciprocal room consent has not been observed."
         }
     }
 }

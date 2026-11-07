@@ -815,6 +815,19 @@ pub struct Member {
     pub key_waits: Option<String>,
 }
 
+/// One saved-room membership projection, with its actual freshness.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct RoomMemberObservation {
+    /// Saved-room instance that owns this projection.
+    pub instance: Vec<u8>,
+    /// Members and their locally known names and key status.
+    pub members: Vec<Member>,
+    /// Members whose consent for this node is observed in this room.
+    pub inbound: Vec<String>,
+    /// Actual projection failure, or empty when current.
+    pub failure: String,
+}
+
 /// Current daemon-derived eligibility for individual Trust controls. Refresh when policy
 /// changes; the daemon separately rechecks authorization when the person performs the action.
 #[derive(Debug, Clone, uniffi::Record)]
@@ -898,13 +911,26 @@ pub struct RoomAskInfo {
     /// How many sessions wait on the answer.
     pub sessions: u32,
 }
+/// An opaque operator decision and its non-secret scope.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct RoomDecisionInfo {
+    /// Opaque, single-use token invalid after expiry or daemon restart.
+    pub token: String,
+    /// Canonical directory affected by a replacement.
+    pub target: String,
+    /// Effective source block, or empty when unbound.
+    pub source: String,
+    /// Effective room id, `none`, or empty when unbound.
+    pub room: String,
+}
 
-/// What binding or declining an ask did: whether it was done, and its lines, said for a person.
+
+/// The reported outcome of a repository decision or ask, including any durability uncertainty.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct RoomAnswerInfo {
-    /// It was done.
+    /// The requested outcome was confirmed, including map durability when changed.
     pub done: bool,
-    /// What was done, or why not.
+    /// What happened; an unconfirmed operation may already be visible.
     pub said: Vec<String>,
 }
 
@@ -1085,6 +1111,8 @@ pub struct FfiSession {
     pub name: Option<String>,
     /// How every client labels it (SE-3): `codex@device-2 · gso-cap · 3f0c25bf`.
     pub label: String,
+    /// Whether this harness can end its Session through Drive.
+    pub can_stop: bool,
     /// Open, or ended (SE-5).
     pub open: bool,
     /// When it opened, milliseconds since the Unix epoch.
@@ -1108,6 +1136,7 @@ fn ffi_session(
         node_alias: known.names.get(&s.node).cloned().unwrap_or_default(),
         short_id: s.id.chars().take(8).collect(),
         label: known.label(s),
+        can_stop: s.harness != "omp",
         session_id: s.id.clone(),
         opening: b32_encode(&s.opening),
         name: s.name.clone(),
@@ -1234,6 +1263,32 @@ pub struct FfiSessionEntry {
     pub file: Option<FfiSessionFile>,
     /// An approval or a question the session asked.
     pub request: Option<FfiRequest>,
+    /// Scoped OMP Drive evidence, if this is a Drive operation.
+    pub drive: Option<FfiDriveEvidence>,
+}
+
+/// Evidence for one attributed OMP Drive operation.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiDriveEvidence {
+    /// Sender-generated operation identity.
+    pub operation: String,
+    /// Authenticated driver fingerprint.
+    pub by: String,
+    /// The most authoritative observed delivery phase.
+    pub phase: FfiDrivePhase,
+}
+
+/// Evidence of delivery to an OMP Session.
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum FfiDrivePhase {
+    /// No native conclusion is known.
+    Unconfirmed,
+    /// The request was refused.
+    Refused,
+    /// The bridge queued it, but native delivery is not confirmed.
+    Queued,
+    /// The marker-associated native response step was observed.
+    Accepted,
 }
 
 fn session_entry(
@@ -1247,6 +1302,16 @@ fn session_entry(
         kind: l.kind.clone(),
         line: l.text.clone(),
         details: details_text(l),
+        drive: l.drive.as_ref().map(|d| FfiDriveEvidence {
+            operation: d.operation.clone(),
+            by: d.by.clone(),
+            phase: match d.phase.as_str() {
+                "accepted" => FfiDrivePhase::Accepted,
+                "queued" => FfiDrivePhase::Queued,
+                "refused" => FfiDrivePhase::Refused,
+                _ => FfiDrivePhase::Unconfirmed,
+            },
+        }),
         file: l.file.as_ref().map(|f| FfiSessionFile {
             name: shown_name(&f.name),
             size: f.size,
@@ -1594,6 +1659,10 @@ pub struct DriveAnswer {
     pub said: String,
     /// Whether the session's node answered at all.
     pub delivery: DriveDelivery,
+    /// Sender-generated operation identity, including when the outcome is unknown.
+    pub operation: String,
+    /// Immediate OMP Drive evidence, separate from later activity receipts.
+    pub phase: Option<FfiDrivePhase>,
 }
 
 /// Something done to a room, said among its messages (ADR-028 R-1, R-7): its retention set, its
@@ -3845,9 +3914,9 @@ impl VoxClient {
                 other => return Err(unexpected(&other)),
             };
             let waits: std::collections::HashMap<Digest32, String> =
-                match ask(c, &Request::KeyWaits { channel_id }).await {
-                    Ok(Frame::KeyWaits { waits }) => waits.into_iter().collect(),
-                    _ => std::collections::HashMap::new(),
+                match ask(c, &Request::KeyWaits { channel_id }).await? {
+                    Frame::KeyWaits { waits } => waits.into_iter().collect(),
+                    other => return Err(unexpected(&other)),
                 };
             Ok(members
                 .into_iter()
@@ -3858,6 +3927,37 @@ impl VoxClient {
                     key_waits: waits.get(&m).cloned(),
                 })
                 .collect())
+        })
+    }
+
+    /// Read roster, reciprocal room consent and key status from one room publication.
+    ///
+    /// # Errors
+    /// A malformed room id or an unavailable node projection.
+    pub async fn room_member_observation(&self, room: String) -> Result<RoomMemberObservation, VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        on_held!(self, |c| {
+            let names = names(c).await?;
+            let presented: HashMap<_, _> = c.presented_names().await
+                .unwrap_or_default().into_iter().collect();
+            let (instance, members, inbound, waits, failure) =
+                match ask(c, &Request::MemberObservation { channel_id }).await? {
+                    Frame::MemberObservation { instance, members, inbound, waits, failure } =>
+                        (instance, members, inbound, waits, failure),
+                    other => return Err(unexpected(&other)),
+                };
+            let waits: HashMap<_, _> = waits.into_iter().collect();
+            Ok(RoomMemberObservation {
+                instance: instance.to_vec(),
+                members: members.into_iter().map(|m| Member {
+                    presented_name: presented.get(&m).cloned().unwrap_or_default(),
+                    fingerprint: b32_encode(&m),
+                    name: names.get(&m).cloned().unwrap_or_default(),
+                    key_waits: waits.get(&m).cloned(),
+                }).collect(),
+                inbound: inbound.iter().map(b32_encode).collect(),
+                failure,
+            })
         })
     }
 
@@ -5217,6 +5317,47 @@ impl VoxClient {
             )),
         }
     }
+    /// Inspect the current repository decision before an operator replacement.
+    pub async fn room_decision(&self, dir: String) -> Result<RoomDecisionInfo, VoxError> {
+        match self.daemon(DaemonRequest::RoomDecision { dir }).await? {
+            DaemonFrame::RoomDecision { token, target, source, room } =>
+                Ok(RoomDecisionInfo { token, target, source, room }),
+            DaemonFrame::RoomAnswer { said, .. } => Err(failed(&said.join("\n"))),
+            _ => Err(failed("the daemon did not inspect the repository decision")),
+        }
+    }
+    /// Inspect an explicitly selected directory rather than a waiting session's scope.
+    pub async fn room_decision_explicit(&self, dir: String) -> Result<RoomDecisionInfo, VoxError> {
+        match self.daemon(DaemonRequest::RoomDecisionExplicit { dir }).await? {
+            DaemonFrame::RoomDecision { token, target, source, room } =>
+                Ok(RoomDecisionInfo { token, target, source, room }),
+            DaemonFrame::RoomAnswer { said, .. } => Err(failed(&said.join("\n"))),
+            _ => Err(failed("the daemon did not inspect the repository decision")),
+        }
+    }
+
+    /// Discard an unused inspection token.
+    pub async fn cancel_room_decision(&self, token: String) -> Result<(), VoxError> {
+        match self.daemon(DaemonRequest::RoomDecisionCancel { token }).await? {
+            DaemonFrame::Ok => Ok(()),
+            _ => Err(failed("the daemon did not cancel the repository decision")),
+        }
+    }
+
+    /// Replace a captured decision; an empty link opts out.
+    pub async fn replace_room(&self, token: String, link: String, passphrase: Arc<Passphrase>, node: String) -> Result<RoomAnswerInfo, VoxError> {
+        self.room_answer(DaemonRequest::RoomReplace {
+            token, link: link.trim().to_owned(), passphrase: passphrase.copy(), node,
+        }).await
+    }
+    /// Answer a waiting ask against the decision displayed to the operator.
+    pub async fn bind_room_decision(&self, dir: String, token: String, link: String, passphrase: Arc<Passphrase>) -> Result<RoomAnswerInfo, VoxError> {
+        self.room_answer(DaemonRequest::RoomAnswerBind {
+            dir, token, link: link.trim().to_owned(), passphrase: passphrase.copy(),
+        }).await
+    }
+
+
 
     /// Bind the directory `dir` to the room `link` names (ADR-029 RB-6), the person's answer to
     /// its ask: what `vox room join <link> --node <node> --bind <dir>` does. The room's
@@ -6473,6 +6614,7 @@ impl VoxClient {
         use vox_agentcomms::drive::{Action, Request as Drive};
         let channel_id = digest(&room, "room id")?;
         let node = input_fingerprint(&node)?;
+        let operation = vox_core::node::drive_input::operation_id().map_err(failed)?;
         // A file is served before it is said: its share is started once the Session's node is
         // known, below.
         let mut file = None;
@@ -6497,7 +6639,7 @@ impl VoxClient {
         };
         let held = Arc::clone(&self.held);
         self.on_rt(async move {
-            let (at, attachment, node, trusted, action, shown) = {
+            let (at, attachment, node, trusted, action, shown, omp_text) = {
                 let mut slot = held.lock().await;
                 let h = slot.as_mut().ok_or_else(not_attached)?;
                 h.mend().await?;
@@ -6526,12 +6668,15 @@ impl VoxClient {
                                     ok: false,
                                     said: format!("not sent: {said}"),
                                     delivery: DriveDelivery::Unreachable,
+                                    operation: operation.clone(),
+                                    phase: None,
                                 })
                             }
                         }
                     }
                     _ => action,
                 };
+                let omp_text = row.harness == "omp" && matches!(&action, Action::Text { .. });
                 (
                     h.at.clone(),
                     Arc::clone(&h.attachment),
@@ -6539,6 +6684,7 @@ impl VoxClient {
                     trusted,
                     action,
                     shown,
+                    omp_text,
                 )
             };
             // The app gate opens a stream only between nodes that trust each other; a member
@@ -6551,11 +6697,14 @@ impl VoxClient {
                         "you do not trust {shown}, so you cannot drive or read its Sessions"
                     ),
                     delivery: DriveDelivery::Unreachable,
+                    operation: operation.clone(),
+                    phase: omp_text.then_some(FfiDrivePhase::Refused),
                 });
             }
             let request = Drive {
                 v: 1,
                 session,
+                operation: Some(operation.clone()),
                 action,
             };
             let file_tag = match &request.action {
@@ -6567,17 +6716,33 @@ impl VoxClient {
                     Ok(a) => DriveAnswer {
                         ok: a.ok,
                         said: a.said_to(&shown),
-                        delivery: DriveDelivery::Answered,
+                        delivery: if a.code.as_deref() == Some("drive-unknown") {
+                            DriveDelivery::NoAnswer
+                        } else {
+                            DriveDelivery::Answered
+                        },
+                        operation: operation.clone(),
+                        phase: if omp_text {
+                            Some(match a.code.as_deref() {
+                                Some("drive-queued") => FfiDrivePhase::Queued,
+                                Some("drive-unknown") => FfiDrivePhase::Unconfirmed,
+                                _ => FfiDrivePhase::Refused,
+                            })
+                        } else { None },
                     },
                     Err(vox_core::node::drive_input::Unsent::Unreachable(said)) => DriveAnswer {
                         ok: false,
                         said,
                         delivery: DriveDelivery::Unreachable,
+                        operation: operation.clone(),
+                        phase: omp_text.then_some(FfiDrivePhase::Refused),
                     },
                     Err(vox_core::node::drive_input::Unsent::NoAnswer(said)) => DriveAnswer {
                         ok: false,
                         said,
                         delivery: DriveDelivery::NoAnswer,
+                        operation: operation.clone(),
+                        phase: omp_text.then_some(FfiDrivePhase::Unconfirmed),
                     },
                 };
             // A file not taken is served to no one, so not served at all.

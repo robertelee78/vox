@@ -7,6 +7,13 @@
   source-bound issues, separately from decision status. Each product requirement MUST land
   with its proof (ADR-018) in a small release (FX-19).
   FX-52's 2026-11-02 pairing design is approved; implementation and acceptance are separate.
+  For v0.4.20, independent Opus reviews approved FX-55–FX-57, FX-59–FX-60 and FX-63 at
+  `37b0ffbf4`, FX-53–FX-54 at `e8ad3b894`, and FX-58/FX-62 at `0f5988648`.
+  These nine corrective designs are accepted, not implemented or release-approved.
+  FX-61 remains Designing/Blocked until its consumer-sensitive causal boundary is established.
+  The operator selected minimal non-secret leave continuity retention and automatic empty
+  initialization when prior history cannot be derived; known signed history/conflicts remain
+  protected. Technical approval, actual acceptance and publication are separate.
 - **Date**: 2026-10-19; amended 2026-10-20 (FX-22–FX-27, the daemon's CPU); amended
   2026-10-20 (FX-28–FX-34: the idle daemon's disk and CPU, measured on v0.4.9, the own-feed
   recovery ruling of 2026-10-19, a retention change that poisoned a room, and a node on Linux
@@ -1400,6 +1407,92 @@ lessons. It changes neither this record's decision status nor any requirement or
   remains separate. An inviter-only selection inverse and an authorization inverse MUST fail
   their product assertions; a client without successful invitation PoP MUST receive no group
   history. Failure to stage that client is an apparatus failure, not a confidentiality proof.
+
+### v0.4.20 incident corrections — scoped design approval, not built
+
+- **FX-53. Failed join recovery.** A failed join or policy-rejected reopen MUST NOT install a
+  terminal whole-room board withdrawal. Corrected retry on the same daemon MUST exchange
+  distinct fresh posts both ways while preserving the original room, real member-departure
+  evidence and genuine signed room ends. Implement ADR-023 RL-8.6–RL-8.8, including authenticated
+  name preflight/reservation and truthful post-admission outcomes. In source and the isolated
+  reproduction, local rollback calls the terminal room-withdraw operation. The matching Vince
+  incident attribution remains inference, not inspection of his current board/profile.
+- **FX-54. Returning author continuity.** Normal leave/rejoin MUST NOT sign a replacement
+  author prefix. Implement ADR-023 RL-8.4–RL-8.5 and the returning-author exception in ADR-037 R5:
+  retain only the operator-approved non-secret continuity marker, fence every implicit and
+  explicit append before recovery, keep permitted reading live, and resume distinct post/read
+  only after verified history and sender-generation recovery. Preserve genuine fork/backup
+  refusal and signed peer history. The diagnostic run committed different Presence and
+  PrivateSupport hashes at reused sequence 1 and 2 before learning the peer's retained head.
+  For previously erased history with no marker, apply RL-8.5/RL-8.7's authenticated
+  recovery attempt and operator-selected automatic empty fallback when no prior authored
+  history can be derived. Never discard a known signed head, marker or conflict; explain
+  the residual erased/withheld-history risk, without a confirmation prompt or blanket
+  read-only treatment of upgraded identities in newly joined rooms.
+- **FX-55. Repository decision escape.** A bound-repository Join It ask MUST support persistent
+  explicit operator opt-out and deliberate native rebind under ADR-029 P420-RB-1–P420-RB-5.
+  Canonical `room none`, stale-safe atomic scope replacement, inherited-scope isolation and the
+  existing agent prohibition on replacing an operator's binding are required. Declining leaves
+  rooms, trust and running sessions unchanged; a failed join alone never edits the map.
+- **FX-56. Truthful room access warning.** Apply ADR-028 K-21–K-22: absent reciprocal room
+  consent MUST NOT be described as the other computer refusing to trust. Distinguish observed
+  computer-policy application, effective node trust, membership, consent, key delivery,
+  connectivity and stale/unavailable evidence without weakening authorization.
+- **FX-57. Actual room-join observation.** Apply ADR-028 K-23–K-25: initial roster loading is
+  an unknown baseline, not an empty room. One room-generation-owned publication path MUST
+  establish that baseline without announcing existing members as new joins, preserve genuine
+  additions after a known empty roster, and reject stale initial/watch completions.
+- **FX-58. Native OMP registration recovery.** Apply ADR-029 P420-OR-1–P420-OR-5. The same actual
+  native session MUST recover after startup registration fails, after node/daemon readiness
+  returns and after an unambiguously pre-envelope prepare failure, without restarting OMP,
+  borrowing identity or silently replaying a failed post. A fresh daemon-timeout case and a
+  resumed absent-node-to-Ready case are separate acceptance rows. Exact receipts and stale
+  generation/rollback inverses remain required; ordinary OMP must stay usable during failure.
+  Recovery must also restore authorized urgent attention to that same idle Session without
+  another operator prompt. Current-generation ownership must fence daemon/deferred and
+  cold-start registration mutation, not merely ignore an old child's completion.
+- **FX-59. Native OMP private Drive.** Apply ADR-029 P420-OD-1–P420-OD-4. Explicit authenticated
+  private Drive under the existing node Drive capability is operator input, unlike ordinary
+  room attention. Preserve provenance and consumption-time authority, correlate eventual native
+  receipts to the original action, distinguish queued/accepted/linked response step, and show only controls
+  the actual native client supports. No new human/agent identity classification is introduced.
+- **FX-60. Semantic OMP Session presentation.** Apply ADR-029 P420-OP-1–P420-OP-4. Preserve
+  intent, typed tool presentation, live progress, async outcomes, long details and authorized
+  rich content through the full native producer-to-Vox view, rather than presenting protocol
+  envelopes as normal UI. Use existing supported OMP lifecycle, branch and async-snapshot APIs;
+  no upstream export prerequisite, private renderer import, new runtime or arbitrary custom
+  renderer visual-parity claim is needed for this meaningful presentation.
+- **FX-61. Policy-interrupted delivery.** A currently owned ordinary governance or key-package
+  selection interrupted by ComputerPolicySuperseded MUST retain its room-instance/work-kind
+  obligation and resume on the current accepted policy, without an unrelated command or restart.
+  Release stale authority/resources, coalesce requeue, preserve original replies and progress,
+  revalidate current attachment/trust and retire replaced/removed rooms. Keep permanent and
+  malformed refusals terminal; no timer-driven generic retry or spin. Observe consumer post/read,
+  service/activity and key delivery, not queue counts. The controlled diagnostic exercised both
+  rejection paths but fresh posts still crossed both ways: this source hole is not established
+  as the sole cause of the historical screenshot. “Only on this machine” means no acknowledged
+  peer holding is known; it is not proof no bytes ever arrived. Health must identify actionable
+  room recovery/integrity failure rather than falsely claiming nothing needs attention.
+  The current green overlap does not supply a consumer-sensitive regression. Before Ready,
+  stage selected-then-superseded key delivery as the only pending obligation for a newly
+  admitted member, with no later unrelated command, and observe its actual fresh read. A
+  source queue assertion or unstaged mutant is invalid. Until that causal consumer boundary
+  is proved, this correction remains Designing/Blocked, not an invented accepted defect.
+- **FX-62. Remove a room member.** Deliver ADR-007 G-28–G-32, ADR-012 N-27a–N-27c and ADR-028
+  K-26: creator/admin removal targets one exact room-member identity, preserves signed history,
+  unrelated rooms and global trust, and excludes future access under current room authority.
+  A retained passphrase cannot undo removal. Explicit creator readmission, concurrency,
+  stale-egress, non-admin, offline catch-up and replacement-identity inverses require actual
+  product proof; no retroactive secrecy or instantaneous partition-wide enforcement is claimed.
+- **FX-63. Review and release boundary.** Record each FX-53–FX-62 outcome individually in
+  v0.4.20, including Designing/Blocked records while decisions or prerequisites remain open.
+  Proposed source is not design approval or execution readiness. Before permanent implementation,
+  obtain independent Opus review of the complete RCA/ADR/task design and resolve every finding;
+  after execution obtain independent Opus review of exact candidate and real-product acceptance.
+  One integration owner handles coupled board/history/policy and OMP contracts; independent
+  outcomes execute in parallel. Each claim needs a valid consumer proof or reported disposable
+  spike per ADR-018, never an internal-value gate. Publish only the accepted integrated result,
+  update release/docs and reconcile every affected issue/Project with verified evidence.
 
 
 ## Unchanged rulings

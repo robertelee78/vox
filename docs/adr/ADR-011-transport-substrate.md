@@ -94,6 +94,14 @@ Requirements 5–8 are **superseded** by requirements 27–40 and are not in the
     label changed). It runs in the release gate's suite, before every tag. *Not built:* a second
     implementation.
 
+    **Proposed v0.4.20 incompatible cutover (not accepted or built).** This release's
+    supported matrix, authorized by the decider's ADR-026 F-3 compatibility scope ruling,
+    replaces the previous-release room-interoperability requirement: the new cohort MUST
+    interoperate with itself, and MUST refuse `vox/2` peers at transport rather than
+    pretending that a mixed-version room is safe. The refusal MUST be surfaced as protocol
+    incompatibility when known, not as a bad passphrase or an unreachable anchor; a generic
+    network failure alone MUST NOT be asserted to prove an old version.
+
 ### Datagram flows (ADR-022 M22.1)
 
 15. `VoxConnection` MUST start one `DatagramRouter` with the connection, and it MUST be the only
@@ -167,7 +175,39 @@ connection, bound to the TLS session by its exporter.
 
 27. **Neutral leaf.** The TLS 1.3 handshake MUST authenticate only the daemon: a self-signed leaf with
     no identity extension, generated once per daemon run and used for every connection of that run.
-    The handshake MUST keep requirements 4, 10 and 13. The ALPN MUST be `vox/2`.
+    The handshake MUST keep requirements 4, 10 and 13. The current ALPN is `vox/2`; the proposed
+    v0.4.20 global replacement and its auxiliary ALPNs are specified below.
+
+    **Proposed v0.4.20 protocol gate (not accepted or built).** The entire matching cohort
+    switches `vox/2`, `vox/2-own-recovery` and `vox/2-own-availability` respectively to
+    `vox/3`, `vox/3-own-recovery` and `vox/3-own-availability`; clients and servers MUST never
+    offer or accept a `vox/2` fallback. Every currently participating or reachable peer, including
+    an anchor board, MUST negotiate the applicable new ALPN and complete node identity proof before
+    any room mutation or data exchange. This is global, not undefined room-by-room negotiation.
+    Actual negotiated ALPN plus node identity proof authenticates protocol participation, not the
+    installed binary or its correct behavior. The unchanged identity exchange below remains version 2
+    and its exporter binds it to the new TLS connection.
+
+    The source `provider.rs` currently puts all three ALPNs in both client and server offers;
+    `quic.rs` `SharedEndpoint::finish_incoming` and `VoxEndpoint::connect` run identity before
+    `finish_connection` calls `confirm_handshake`, which currently accepts all three and sets
+    recovery/availability flags. Implementation MUST replace both offer lists and validate the
+    actual negotiated value for the intended protocol before routing or dispatch, on inbound and
+    outbound shared endpoints, direct paths and relay circuits, including auxiliary recovery and
+    availability streams and board traffic. Existing protocol-specific authorization remains
+    required; ALPN is not room membership or permission to read keys. No raw or auxiliary path may
+    bypass the gate. These are required changes, not claims about current enforcement.
+    `SharedEndpoint::lookup_anchor` additionally uses raw `mux.lookup_anchor` discovery followed
+    by a separate `connect_with`, `confirm_handshake` and responder-only `identity::probe`.
+    Raw lookup is untrusted bootstrap, and the probe is not full mutual protocol participation:
+    neither may exchange room or board data. A subsequent board connection MUST pass the new ALPN
+    and full node identity gate. The current `confirm_handshake` classifies an unknown ALPN as
+    `SignatureInvalid`; the cutover MUST report a known protocol mismatch truthfully instead.
+
+    Offline legacy or retired members need not acknowledge upgrade before removal. They cannot
+    receive future keys or sync with the new cohort until updated and their current governance fold
+    is applied; an unaware partition may still operate under the old protocol and cannot be
+    instantaneously revoked. Direct and no-anchor operation remains supported.
 28. **One exchange per connection,** on the first client-opened bidirectional stream, typed by its
     first frame as the `identity` stream kind (requirement 19; its number assigned at build time),
     immediately after the handshake, in three flights:

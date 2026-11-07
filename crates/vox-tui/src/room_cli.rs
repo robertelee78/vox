@@ -5562,53 +5562,71 @@ fn room_passphrase(
     Ok(crate::tunnel_cli::encouraged(p, "room").to_owned())
 }
 
-async fn check_room_passphrase(
-    client: &mut IpcClient,
-    room: Digest32,
-    passphrase: &str,
-) -> Result<(), AppError> {
-    match client
-        .request(&Request::CheckRoomPassphrase {
-            channel_id: room,
-            passphrase: zeroize::Zeroizing::new(passphrase.to_owned()),
-        })
-        .await
-    {
-        Ok(Frame::Ok) => Ok(()),
-        Ok(Frame::Error { reason }) => Err(AppError::Usage(format!(
-            "the room passphrase was not authenticated; the repo was not bound: {reason}"
-        ))),
-        Ok(other) => Err(crate::client::unexpected(&other)),
-        Err(e) => Err(AppError::Usage(e.to_string())),
+
+fn require_operator_binding() -> Result<(), AppError> {
+    let harness_marked = [
+        "CLAUDE_CODE_ENTRYPOINT",
+        "VOX_OPENCODE_WAKE_SOCKET",
+        "VOX_OPENCODE_MIRROR_SOCKET",
+        "VOX_HARNESS",
+    ]
+    .iter()
+    .any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()));
+    if crate::coord::agent_marked() || harness_marked {
+        return Err(AppError::Usage(
+            "repository replacement is an operator action; run --bind in your own terminal or use Vox.app, outside the agent session".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn repo_decision(paths: &Paths, dir: &std::path::Path) -> Result<String, AppError> {
+    use vox_core::node::daemonipc::{DaemonClient, DaemonFrame, DaemonRequest};
+    let mut daemon = DaemonClient::open(&paths.account().socket()).await?;
+    match daemon.request(DaemonRequest::RoomDecisionExplicit {
+        dir: dir.to_string_lossy().into_owned(),
+    }).await? {
+        DaemonFrame::RoomDecision { token, target, source, room } => {
+            let resolved = if room.is_empty() { "unbound" } else { &room };
+            let source = if source.is_empty() { "none" } else { &source };
+            println!("vox: binding selected directory {target}; current decision {resolved}, source {source}. Future sessions use the new binding; existing sessions do not move. Every node of this data root can read the room map, including the saved passphrase.");
+            Ok(token)
+        }
+        DaemonFrame::RoomAnswer { said, .. } => Err(AppError::Usage(said.join("\n"))),
+        _ => Err(AppError::Usage("the daemon did not provide a repository decision; nothing was bound".into())),
+    }
+}
+
+async fn cancel_repo_decision(paths: &Paths, token: Option<&str>) {
+    use vox_core::node::daemonipc::{DaemonClient, DaemonRequest};
+    let Some(token) = token else { return };
+    if let Ok(mut daemon) = DaemonClient::open(&paths.account().socket()).await {
+        let _ = daemon.request(DaemonRequest::RoomDecisionCancel { token: token.to_owned() }).await;
     }
 }
 
 async fn save_repo_binding(
-    client: &mut IpcClient,
-    data_root: &std::path::Path,
-    dir: &std::path::Path,
-    room: Digest32,
+    paths: &Paths,
+    token: &str,
     link: &str,
     passphrase: &str,
 ) -> Result<(), AppError> {
-    if !rooms_of(client)
-        .await?
-        .into_iter()
-        .any(|(id, _, open, over, ..)| id == room && open && over.is_empty())
-    {
-        return Err(AppError::Usage(
-            "the room is no longer open; the repo was not bound".into(),
-        ));
+    use vox_core::node::daemonipc::{DaemonClient, DaemonFrame, DaemonRequest};
+    let node = paths.profile_dir.file_name().and_then(|n| n.to_str())
+        .ok_or_else(|| AppError::Usage("cannot identify the node; repository was not bound".into()))?;
+    let mut daemon = DaemonClient::open(&paths.account().socket()).await?;
+    match daemon.request(DaemonRequest::RoomReplace {
+        token: token.to_owned(),
+        link: link.to_owned(),
+        passphrase: zeroize::Zeroizing::new(passphrase.to_owned()),
+        node: node.to_owned(),
+    }).await? {
+        DaemonFrame::RoomAnswer { done, said } => {
+            for line in &said { println!("vox: {line}"); }
+            if done { Ok(()) } else { Err(AppError::Usage("repository update was not confirmed; see the result above".into())) }
+        }
+        _ => Err(AppError::Usage("the daemon did not confirm the repository decision; its outcome is unknown".into())),
     }
-    println!("vox: binding {} to this room in the room map {}: every agent session started there, from any harness, is to work in it; every node of this data root can read the map, the passphrase included", dir.display(), crate::room_map::path(data_root).display());
-    match crate::room_map::bind(data_root, dir, link, passphrase)? {
-        Some(was) => println!(
-            "vox: bound {}, replacing what the room map held for it: {was}",
-            dir.display()
-        ),
-        None => println!("vox: bound {}", dir.display()),
-    }
-    Ok(())
 }
 
 /// `vox room join` — join a room over a running node (ADR-020 §12).
@@ -5633,6 +5651,9 @@ pub async fn join(
     // `--bind DIR` (ADR-029 RB-6): a directory that exists, and a room map that can be read,
     // checked before anything is asked. What the map held for it is replaced, and said.
     let data_root = paths.account().data_root;
+    if bind.is_some() {
+        require_operator_binding()?;
+    }
     let bind = match bind {
         Some(dir) => {
             let dir = std::fs::canonicalize(dir).map_err(|e| {
@@ -5652,6 +5673,11 @@ pub async fn join(
         }
         None => None,
     };
+    let decision = match bind.as_ref() {
+        Some(dir) => Some(repo_decision(paths, dir).await?),
+        None => None,
+    };
+    let result = async {
     let mut client = attach(paths).await?;
     // A room this node holds open, and has not left, is not joined again: its address is taken
     // as where the room's host is now, and the host is dialled there (V210-167). No passphrase is read for it: none
@@ -5672,23 +5698,13 @@ pub async fn join(
             }),
         Err(_) => None,
     };
-    if let (Some(name), Some(dir)) = (held.as_ref(), bind.as_ref()) {
+    if let (Some(name), Some(token)) = (held.as_ref(), decision.as_deref()) {
         let passphrase = zeroize::Zeroizing::new(room_passphrase(
             passphrase_file,
             "the room's passphrase",
             false,
         )?);
-        let parsed = vox_core::node::link::InviteLink::parse(link)
-            .map_err(|e| AppError::Usage(e.to_string()))?;
-        check_room_passphrase(&mut client, parsed.channel_id, &passphrase).await?;
-        save_repo_binding(
-            &mut client,
-            &data_root,
-            dir,
-            parsed.channel_id,
-            link,
-            &passphrase,
-        )
+        save_repo_binding(paths, token, link, &passphrase)
         .await?;
         println!("vox: checked the passphrase for held room {name}; its membership is unchanged");
         return Ok(());
@@ -5750,23 +5766,8 @@ pub async fn join(
                 Err(_) => None,
             };
             println!("vox: joined {}", joined.as_deref().unwrap_or("the room"));
-            if let Some(dir) = bind.as_ref() {
-                // Said before it is written (ADR-028 E-5): who can read what is saved.
-                println!(
-                    "vox: binding {} to this room in the room map {}: every agent session started \
-                     there, from any harness, is to work in it, its node joining with this \
-                     passphrase; every node of this data root can read the map, the passphrase \
-                     included",
-                    dir.display(),
-                    crate::room_map::path(&data_root).display()
-                );
-                match crate::room_map::bind(&data_root, dir, link, &passphrase_kept)? {
-                    Some(was) => println!(
-                        "vox: bound {}, replacing what the room map held for it: {was}",
-                        dir.display()
-                    ),
-                    None => println!("vox: bound {}", dir.display()),
-                }
+            if let Some(token) = decision.as_deref() {
+                save_repo_binding(paths, token, link, &passphrase_kept).await?;
             }
             // Computer approval is separate from this room's membership and consent.
             // Offer its authenticated local action without attributing any member's state to it.
@@ -5824,6 +5825,11 @@ pub async fn join(
         Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
+    }.await;
+    if result.is_err() {
+        cancel_repo_decision(paths, decision.as_deref()).await;
+    }
+    result
 }
 
 /// How long a join waits for the trust of members this node trusts to reach it before saying who
@@ -5910,6 +5916,9 @@ pub async fn create(
     let name = vox_core::governance::name::room_name(name)
         .map_err(|why| AppError::Usage(format!("cannot create the room: {why}")))?;
     let data_root = paths.account().data_root;
+    if bind.is_some() {
+        require_operator_binding()?;
+    }
     let bind = match bind {
         Some(dir) => {
             let dir = std::fs::canonicalize(dir).map_err(|e| {
@@ -5929,6 +5938,11 @@ pub async fn create(
         }
         None => None,
     };
+    let decision = match bind.as_ref() {
+        Some(dir) => Some(repo_decision(paths, dir).await?),
+        None => None,
+    };
+    let result = async {
     // Checked before anything is made: a typo must not leave a room with no idle end behind.
     let idle_secs = match idle_end {
         None => None,
@@ -5983,7 +5997,7 @@ pub async fn create(
     {
         Ok(Frame::Ok) => {
             println!("vox: created {name}");
-            if let Some(dir) = bind.as_ref() {
+            if let Some(token) = decision.as_deref() {
                 let made = rooms_of(&mut client)
                     .await?
                     .into_iter()
@@ -5995,14 +6009,13 @@ pub async fn create(
                                 .into(),
                         )
                     })?;
-                check_room_passphrase(&mut client, made, &kept).await?;
                 let link = match client.request(&Request::Invite { channel_id: made }).await {
                     Ok(Frame::Link { url, .. }) => url,
                     Ok(Frame::Error { reason }) => return Err(AppError::Usage(format!("the room was created, but its link was not made and the repo was not bound: {reason}"))),
                     Ok(other) => return Err(crate::client::unexpected(&other)),
                     Err(e) => return Err(AppError::Usage(e.to_string())),
                 };
-                save_repo_binding(&mut client, &data_root, dir, made, &link, &kept).await?;
+                save_repo_binding(paths, token, &link, &kept).await?;
             }
             if let Some(idle_secs) = idle_secs {
                 let made = rooms_of(&mut client)
@@ -6049,6 +6062,11 @@ pub async fn create(
         Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
+    }.await;
+    if result.is_err() {
+        cancel_repo_decision(paths, decision.as_deref()).await;
+    }
+    result
 }
 
 /// Show the exact capped link routes, separately from the complete signed room configuration.
