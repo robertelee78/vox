@@ -10,6 +10,7 @@ use crate::node::store::Store;
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Presence {
     pub last: (u64, bool),
+    pub last_ms: Option<u64>,
     pub back: Option<(u64, u64)>,
 }
 
@@ -554,10 +555,12 @@ impl ChannelState {
                                     .entry(entry.skeleton.author_id)
                                     .or_insert(Presence {
                                         last: (entry.skeleton.seq, presence.body.here),
+                                        last_ms: Some(entry.skeleton.claimed_ms),
                                         back: None,
                                     });
                             if entry.skeleton.seq >= held.last.0 {
                                 held.last = (entry.skeleton.seq, presence.body.here);
+                                held.last_ms = Some(entry.skeleton.claimed_ms);
                             }
                             if presence.body.here
                                 && held.back.is_none_or(|(seq, _)| seq < entry.skeleton.seq)

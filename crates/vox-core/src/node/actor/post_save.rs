@@ -66,6 +66,7 @@ impl EndPreparation {
             PendingWithdrawal {
                 wire,
                 routes: self.routes,
+                awaiting_departure: false,
             },
         );
         let bytes = pending_withdrawals_bytes(&next).map_err(|error| fault_of(&error))?;
@@ -347,6 +348,15 @@ impl Node {
                     let _ = reply.send(Outcome::Failed(Fault::NotARoomName));
                     return;
                 }
+                if self
+                    .join_name_reservations
+                    .iter()
+                    .chain(self.rename_name_reservations.iter())
+                    .any(|(room, reserved)| *room != channel_id && reserved == &name)
+                {
+                    let _ = reply.send(Outcome::Failed(Fault::RoomNameTaken));
+                    return;
+                }
                 (
                     String::new(),
                     None,
@@ -489,6 +499,10 @@ impl Node {
             )),
             _ => None,
         };
+        if let Some(GovernanceWrite::Rename(name)) = &governance {
+            self.rename_name_reservations
+                .insert(channel_id, name.clone());
+        }
         #[cfg(feature = "test-knobs")]
         self.hold_text_append_publication_for_proof().await;
         let worker = tokio::spawn(async move {
@@ -838,6 +852,9 @@ impl Node {
                 }
                 drop(publication);
                 self.publish().await;
+                if matches!(pending.kind, ReplyKind::Rename) && (!installed || !outcome.is_done()) {
+                    self.rename_name_reservations.remove(&room);
+                }
                 if installed && !matches!(pending.kind, ReplyKind::Text) && outcome.is_done() {
                     self.queue_room_publication(
                         room,
@@ -855,6 +872,9 @@ impl Node {
                 }
             }
             Err(fault) => {
+                if matches!(pending.kind, ReplyKind::Rename) {
+                    self.rename_name_reservations.remove(&room);
+                }
                 #[cfg(feature = "mutant-sender")]
                 if matches!(pending.kind, ReplyKind::End)
                     && matches!(fault, Fault::NotCreator)

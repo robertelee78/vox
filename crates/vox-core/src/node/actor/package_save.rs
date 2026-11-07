@@ -1623,13 +1623,15 @@ impl Node {
             return;
         }
         let pair = (room, peer);
-        if self.sessions.contains_key(&pair) {
+        let existing = self.sessions.contains_key(&pair);
+        if existing || matches!(&next, JoinNext::Answered) {
             let existing_mine = self.initiated.contains_key(&pair);
-            let incoming_wins = match self.profile.as_ref().map(Profile::fingerprint) {
-                Some(me) if mine => existing_mine || me < peer,
-                Some(me) => incoming_session_wins(&me, &peer, existing_mine),
-                None => true,
-            };
+            let incoming_wins = !existing
+                || match self.profile.as_ref().map(Profile::fingerprint) {
+                    Some(me) if mine => existing_mine || me < peer,
+                    Some(me) => incoming_session_wins(&me, &peer, existing_mine),
+                    None => true,
+                };
             if !incoming_wins {
                 if existing_mine {
                     if let Some(initial) = self.initiated.get_mut(&pair) {

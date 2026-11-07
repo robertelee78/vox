@@ -59,6 +59,7 @@ use crate::time::Clock;
 use crate::transport::quic::{VoxConnection, VoxEndpoint};
 use crate::transport::streams::accept_typed_on;
 use crate::transport::streams::StreamKind;
+use std::future::Future;
 
 /// The peer classification the accept path reads, refreshed by the actor whenever
 /// channel membership or the pending-joiner set changes.
@@ -2647,6 +2648,15 @@ impl NodeNet {
             .withdraw_member(channel_id, author, at);
     }
 
+    /// Remove only this node's transient board projection, not room-end or member evidence.
+    pub(crate) fn retract_room_on_board(&self, channel_id: &Digest32) {
+        let store = self.service.store();
+        store
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retract_channel(channel_id, &self.local_id());
+    }
+
     /// Take a room that ended off **this node's own** board (V030-14), for good.
     pub fn forget_room_on_board(&self, channel_id: &Digest32) {
         let store = self.service.store();
@@ -2789,7 +2799,7 @@ impl NodeNet {
     /// the binding is the caller's single decision — `ChannelState::join_context` in
     /// production.
     #[allow(clippy::too_many_arguments)] // each argument is a distinct required input
-    pub async fn answer_join<F, Fut>(
+    pub async fn answer_join<F, Fut, P, PFut>(
         &self,
         peer: Digest32,
         send: SendStream,
@@ -2804,6 +2814,7 @@ impl NodeNet {
             std::sync::Arc<std::sync::atomic::AtomicBool>,
             Option<tokio::sync::oneshot::Receiver<()>>,
         )>,
+        proposal_inputs: P,
         admit_before_accepting: F,
     ) -> Result<JoinOutcome>
     where
@@ -2812,6 +2823,8 @@ impl NodeNet {
             crate::nat::record::JoinWitness,
         ) -> Fut,
         Fut: std::future::Future<Output = Result<Option<String>>>,
+        P: FnOnce(crate::identity::composite::CompositePublicKey) -> PFut,
+        PFut: Future<Output = Result<(Option<String>, crate::node::joinstream::OwnHistory)>>,
     {
         let cfg = ResponderConfig {
             ctx,
@@ -2833,6 +2846,7 @@ impl NodeNet {
             store,
             ring,
             ended,
+            proposal_inputs,
             admit_before_accepting,
         )
         .await
@@ -2846,7 +2860,7 @@ impl NodeNet {
     /// The preparation callback must durably retain rollback covering the exact verified
     /// proposal's epoch and timestamp before it returns: admission cannot commit until that handoff.
     #[allow(clippy::too_many_arguments)] // authenticated exchange plus durable preparation
-    pub async fn start_join<F, Fut>(
+    pub async fn start_join<F, Fut, A, AFut>(
         &self,
         conn: &VoxConnection,
         ctx: JoinContext,
@@ -2854,12 +2868,24 @@ impl NodeNet {
         signer: &(dyn RootSigner + Send + Sync),
         ik: &X25519IdentityKey,
         prepare_before_admission: F,
+        retain_accepted: A,
     ) -> Result<JoinOutcome>
     where
         F: FnOnce(crate::node::joinstream::AdmissionProposal) -> Fut,
         Fut: std::future::Future<Output = Result<()>>,
+        A: FnOnce(Vec<u8>, Vec<u8>, crate::identity::composite::CompositePublicKey) -> AFut,
+        AFut: Future<Output = Result<()>>,
     {
-        run_initiator(conn, ctx, passphrase, signer, ik, prepare_before_admission).await
+        run_initiator(
+            conn,
+            ctx,
+            passphrase,
+            signer,
+            ik,
+            prepare_before_admission,
+            retain_accepted,
+        )
+        .await
     }
 
     /// Read everything the board holds for `(channel_id, epoch)`: the genesis, the

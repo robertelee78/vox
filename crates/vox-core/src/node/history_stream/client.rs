@@ -1593,6 +1593,15 @@ impl Receiver {
         } else {
             (false, false)
         };
+        // Keep a remote departure's effect pending while the leaver probes a live head.
+        #[cfg(feature = "test-knobs")]
+        if needs_transition
+            && !self_departure
+            && std::env::var_os("VOX_TEST_DEPARTURE_HOLD_FILE")
+                .is_some_and(|path| std::path::Path::new(&path).is_file())
+        {
+            return Ok(Lookup::Busy);
+        }
         let transition = if needs_transition {
             let gate = {
                 let room = tokio::select! {

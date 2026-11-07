@@ -1887,6 +1887,10 @@ impl Batch<'_> {
                 gone += 1;
             }
         }
+        #[cfg(feature = "test-knobs")]
+        if crate::node::computer::fx28_mutant("leave-keep-sek-wrap") {
+            return Ok(gone);
+        }
         let mut wraps = self
             .txn
             .open_table(SEK_WRAPS)

@@ -16,7 +16,9 @@ impl Node {
         let Some(profile) = self.profile.as_ref() else {
             return;
         };
-        let Ok(signer) = profile.signer() else { return };
+        let Ok(signer) = profile.signer_arc() else {
+            return;
+        };
         let me = signer.fingerprint();
         let Ok(retained_legacy) = crate::node::history_demand::retained_legacy_owner(profile)
         else {
@@ -53,6 +55,7 @@ impl Node {
             retry.attempts = retry.attempts.saturating_add(1);
             let id = *id;
             let store = profile.store_handle();
+            let signer = Arc::clone(&signer);
             let paused_legacy_owner = retained_legacy_owner_for(retained_legacy, id);
             let original = Arc::downgrade(shared);
             let tx = self.net_tx.clone();
@@ -74,6 +77,7 @@ impl Node {
                     store.resave_room_after_write_failure(&id)?;
                     ChannelState::open_with_sek_owned(
                         &store,
+                        &signer,
                         &id,
                         crate::atrest::sek::Sek::from_bytes(keys.sek),
                         &keys.passphrase,

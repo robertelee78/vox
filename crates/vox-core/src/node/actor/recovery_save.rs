@@ -482,10 +482,12 @@ impl Node {
                 if let Some(reply) = reply {
                     let _ = reply.send(Outcome::Done);
                 }
-                if let Some(lifetime) = continuation.lifetime.filter(|_| continuation.settle) {
-                    // The synchronous producer used to return before its caller released
-                    // owed keys. Transfer that causal tail only after the real native
-                    // settlement terminal, under its original publication/secret lifetime.
+                if let Some(lifetime) = continuation
+                    .lifetime
+                    .filter(|_| continuation.settle || continuation.completed)
+                {
+                    // Recovery mints a new sender generation just like settlement, so its
+                    // consent-checked delivery must run even on a recovery-only continuation.
                     Box::pin(self.begin_owned_rekeys_for(
                         room,
                         false,
@@ -586,6 +588,12 @@ impl Node {
         if continuation.changed || continuation.completed {
             let note = if continuation.completed {
                 "this node recovered its own history; it can write here again"
+            } else if shared
+                .try_lock()
+                .ok()
+                .is_some_and(|channel| channel.own_history_forked())
+            {
+                "this room has conflicting signed history for this node; writes remain frozen, and cached readable data is retained"
             } else {
                 "this node is behind its own history; it cannot write here until recovery completes"
             };

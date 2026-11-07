@@ -36,7 +36,9 @@ impl ChannelState {
         owner: Arc<()>,
         now: crate::time::Ms,
     ) -> Result<Option<Prepared>> {
-        if self.said_left(&self.me()) {
+        // A verified newer admission makes the old final Presence(false) a prior leave,
+        // not this request's departure. Recovery must finish before signing a new one.
+        if self.has_left(&self.me()) {
             let pin = self.reserve_pending_write(store, Arc::clone(&owner))?;
             return Ok(Some(Prepared::Unchanged(Unchanged {
                 owner,

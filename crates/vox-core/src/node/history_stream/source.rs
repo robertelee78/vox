@@ -122,6 +122,8 @@ pub(super) struct Source {
     authorization: Option<(Digest32, Digest32)>,
     // Only a server clone bound to Control/Head(peer) may return a departed peer receipt.
     own_head_receipt: bool,
+    // Set only on a server clone whose exact query is separately restricted to the peer's feed.
+    own_recovery: bool,
     work_committed: Arc<AtomicBool>,
     retirement_request: Option<RequestId>,
 }
@@ -257,6 +259,7 @@ impl Source {
             deadline,
             authorization,
             own_head_receipt: false,
+            own_recovery: false,
             work_committed,
             retirement_request,
         }
@@ -281,6 +284,41 @@ impl Source {
         let mut source = self.clone();
         source.own_head_receipt = true;
         source
+    }
+    pub(super) fn for_own_recovery(&self) -> Self {
+        let mut source = self.clone();
+        source.own_recovery = true;
+        source
+    }
+    /// Persist only contexts already exposed by a proof/header of this requester's own
+    /// authenticated head. The native owner commits before the proof leaves this node.
+    pub(super) async fn authorize_recovery_contexts(
+        &self,
+        job: &Job,
+        head: &SignedHead,
+        contexts: Vec<Digest32>,
+    ) -> Result<bool> {
+        if !self.own_recovery || head.binding.author != self.peer || contexts.is_empty() {
+            return Ok(true);
+        }
+        let author = self.peer;
+        let head = head.id();
+        match self
+            .write_owned(
+                job,
+                (128 * 1024, 128 * 1024, false),
+                move |room, store| room.prepare_recovery_contexts(store, author, head, contexts),
+                |pending, store| pending.commit(store),
+                |room, _, ()| {
+                    room.history_index_committed();
+                    Ok(())
+                },
+            )
+            .await?
+        {
+            Lookup::Found(_) => Ok(true),
+            Lookup::Busy | Lookup::Missing => Ok(false),
+        }
     }
 
     fn current(&self) -> Result<()> {
@@ -497,7 +535,15 @@ impl Source {
             let departed_receipt = source.own_head_receipt
                 && room.is_author(&source.peer)
                 && room.has_left(&source.peer);
-            if room.epoch() != source.epoch || (!room.is_member(&source.peer) && !departed_receipt)
+            let recovery =
+                source.own_recovery && room.recovery_standing(&source.store, &source.peer)?;
+            #[cfg(feature = "test-knobs")]
+            let mutant = crate::node::computer::fx28_mutant("sync-departed-peer")
+                && room.has_left(&source.peer);
+            #[cfg(not(feature = "test-knobs"))]
+            let mutant = false;
+            if room.epoch() != source.epoch
+                || (!mutant && !room.is_member(&source.peer) && !departed_receipt && !recovery)
             {
                 return Err(Error::Unreachable("history room access changed"));
             }
@@ -668,7 +714,15 @@ impl Source {
                 let departed_receipt = self.own_head_receipt
                     && room.is_author(&self.peer)
                     && room.has_left(&self.peer);
-                if room.epoch() != self.epoch || (!room.is_member(&self.peer) && !departed_receipt)
+                let recovery =
+                    self.own_recovery && room.recovery_standing(&self.store, &self.peer)?;
+                #[cfg(feature = "test-knobs")]
+                let mutant = crate::node::computer::fx28_mutant("sync-departed-peer")
+                    && room.has_left(&self.peer);
+                #[cfg(not(feature = "test-knobs"))]
+                let mutant = false;
+                if room.epoch() != self.epoch
+                    || (!mutant && !room.is_member(&self.peer) && !departed_receipt && !recovery)
                 {
                     return Err(Error::Unreachable("history room access changed"));
                 }
@@ -774,14 +828,13 @@ impl Source {
                 });
                 room.release_pending_text(&owner, false);
                 let publication = if owns {
-                    let released = room.history_write_released(&source.store);
                     let published = room
                         .publish_history_read(Arc::clone(&source.store))
                         .map(|_| ());
                     if published.is_err() {
                         pin.retain_saved_read();
                     }
-                    released.and(published)
+                    published.and_then(|()| room.history_write_released(&source.store))
                 } else {
                     Ok(())
                 };
@@ -1435,6 +1488,46 @@ impl Source {
         }
     }
 
+    pub(super) async fn transient_scope(
+        &self,
+        job: &Job,
+        room_id: Digest32,
+        author: Digest32,
+        connection: u64,
+    ) -> Result<super::hints::TransientScope> {
+        let peer = self.peer;
+        let epoch = self.epoch;
+        let captured = self.authorization.map(|(_, generation)| generation);
+        match self
+            .read(job, 128, move |room, store| {
+                if room.channel_id() != room_id {
+                    return Err(Error::MalformedBundle("history refusal room binding"));
+                }
+                Ok(Some(super::hints::TransientScope {
+                    connection,
+                    // A late response belongs to its original grant, never a later regrant.
+                    authorization: match captured {
+                        Some(generation) => generation,
+                        None => super::authorization_generation(
+                            store,
+                            room.me(),
+                            room_id,
+                            room.history_instance(store)?,
+                            epoch,
+                        )?,
+                    },
+                    incarnations: room
+                        .history_inventory_incarnation(&peer)
+                        .zip(room.history_author_inventory_incarnation(&author)),
+                }))
+            })
+            .await?
+        {
+            Lookup::Found(scope) => Ok(scope.value),
+            Lookup::Busy | Lookup::Missing => Err(Error::Unreachable("history refusal scope busy")),
+        }
+    }
+
     /// Filter at most 64 already decoded hints using exact accepted/settled local facts.
     /// A completed terminal control is not receipt of the content before it. Keep hints
     /// eligible until their selected newest window is visited and has no missing positions.
@@ -1447,6 +1540,7 @@ impl Source {
         inbox: &super::HintInbox,
         generation: u64,
         room_id: Digest32,
+        connection: u64,
         hints: &[super::HeadHint],
     ) -> Result<super::hints::Offer> {
         if hints.len() > 64 {
@@ -1466,6 +1560,8 @@ impl Source {
         let output_envelope = 64
             * (std::mem::size_of::<super::HeadHint>()
                 + std::mem::size_of::<(Digest32, Digest32)>()
+                + std::mem::size_of::<super::hints::TransientScope>()
+                + std::mem::size_of::<super::HeadHint>()
                 + std::mem::size_of::<Digest32>())
             + std::mem::size_of::<usize>();
         let filtered = self
@@ -1485,6 +1581,13 @@ impl Source {
                 let mut missing = Vec::with_capacity(slice.len());
                 let mut changed = Vec::new();
                 for hint in slice {
+                    let scope = super::hints::TransientScope {
+                        connection,
+                        authorization: current_authorization,
+                        incarnations: room
+                            .history_inventory_incarnation(&peer)
+                            .zip(room.history_author_inventory_incarnation(&hint.author)),
+                    };
                     if let Some((declined, authorization, peer_incarnation, author_incarnation)) =
                         read.history_declined_head(&peer, &hint.author)?
                     {
@@ -1511,7 +1614,7 @@ impl Source {
                         // receipt. A previously recorded later receipt makes an older echo
                         // redundant; no scalar echo itself may advance held_through.
                         if room.held_through(&peer).is_none_or(|held| held < hint.size) {
-                            missing.push(hint);
+                            missing.push((hint, scope));
                         }
                         continue;
                     }
@@ -1571,7 +1674,7 @@ impl Source {
                     {
                         // Keep this hint as a bounded signed-head receipt probe. It is not
                         // itself acknowledgement and grants no source or authority.
-                        missing.push(hint);
+                        missing.push((hint, scope));
                     }
                 }
                 drop(read);
@@ -1587,7 +1690,24 @@ impl Source {
         match filtered {
             Lookup::Found(filtered) => {
                 self.current()?;
-                let (missing, rearmed) = filtered.value;
+                let (mut missing, mut rearmed) = filtered.value;
+                let mut failure = None;
+                missing.retain(|(hint, scope)| {
+                    match inbox.transient_blocked(generation, room_id, self.peer, *hint, *scope) {
+                        Ok((blocked, changed)) => {
+                            rearmed += usize::from(changed);
+                            !blocked
+                        }
+                        Err(error) => {
+                            failure = Some(error);
+                            false
+                        }
+                    }
+                });
+                if let Some(error) = failure {
+                    return Err(error);
+                }
+                let missing: Vec<_> = missing.into_iter().map(|(hint, _)| hint).collect();
                 let mut offer = inbox.offer(job, generation, room_id, self.peer, &missing)?;
                 offer.rearmed = rearmed;
                 Ok(offer)

@@ -584,17 +584,10 @@ impl ChannelState {
     }
 
     /// The current membership incarnation whose inventory a refusal describes. A leave makes
-    /// this absent; a readmission uses the leave position until the member's signed `back`
-    /// statement supplies its newer position. Thus the same scalar head after a real scope
-    /// removal is a changed inventory lifetime, while a socket reconnect is not.
+    /// this absent until the member's signed return supplies a newer position.
     pub(crate) fn history_inventory_incarnation(&self, member: &Digest32) -> Option<u64> {
         if !self.is_member(member) {
             return None;
-        }
-        if let Some(left) = self.left_at(member) {
-            if self.readmitted.get(member) == Some(&left) {
-                return Some(left);
-            }
         }
         Some(
             self.presence

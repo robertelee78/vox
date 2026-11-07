@@ -18,6 +18,7 @@ pub(crate) mod recovery;
 pub(crate) struct PendingText {
     owner: Arc<()>,
     room: Digest32,
+    genesis: Genesis,
     epoch: u64,
     origin: u64,
     creator: Digest32,
@@ -26,6 +27,7 @@ pub(crate) struct PendingText {
     dag: Dag,
     entries: entry_store::EntryIndex,
     sek: WeakSek,
+    continuity_key: WeakSek,
     sender: SenderChain,
     next_log_id: u64,
     sparse: bool,
@@ -341,6 +343,7 @@ impl ChannelState {
         let pending = PendingText {
             owner: Arc::clone(&owner),
             room: self.channel_id,
+            genesis: self.genesis.clone(),
             epoch: self.epoch,
             origin: self.genesis.body.created_ms,
             creator: self.genesis.creator_pubkey().fingerprint(),
@@ -349,6 +352,7 @@ impl ChannelState {
             dag: self.dag.authored_candidate(),
             entries: entry_store::EntryIndex::default(),
             sek: self.sek.reader(),
+            continuity_key: self.continuity_key.reader(),
             sender,
             next_log_id: self.next_log_id,
             sparse,
@@ -1012,6 +1016,24 @@ impl PendingText {
                 index.seal()?;
                 settlement
             };
+            if let Some(prepared) = &prepared {
+                let generation = match GovEntry::body_bound_to(&entry) {
+                    Ok(GovBody::Presence(presence)) => {
+                        self.sender.chain_id().max(presence.body.chain_id)
+                    }
+                    _ => self.sender.chain_id(),
+                };
+                self.continuity_key.with(|key| {
+                    own_history::save_continuity(
+                        &mut batch,
+                        key,
+                        prepared.head.head(),
+                        self.epoch,
+                        generation,
+                        &self.genesis,
+                    )
+                })?;
+            }
             session_projection::private_index::observe_public(
                 &mut batch, sek, &self.room, &entry, self.epoch,
             )?;
@@ -1036,9 +1058,11 @@ impl PendingText {
                 if let Ok(GovBody::Presence(presence)) = GovEntry::body_bound_to(&entry) {
                     let mut state = self.presence.unwrap_or(governance::Presence {
                         last: (entry.skeleton.seq, presence.body.here),
+                        last_ms: Some(entry.skeleton.claimed_ms),
                         back: None,
                     });
                     state.last = (entry.skeleton.seq, presence.body.here);
+                    state.last_ms = Some(entry.skeleton.claimed_ms);
                     if presence.body.here {
                         state.back = Some((entry.skeleton.seq, entry.skeleton.claimed_ms));
                     }
@@ -1152,9 +1176,11 @@ impl PendingText {
         if let Ok(GovBody::Presence(presence)) = GovEntry::body_bound_to(&entry) {
             let mut state = self.presence.unwrap_or(governance::Presence {
                 last: (seq, presence.body.here),
+                last_ms: Some(entry.skeleton.claimed_ms),
                 back: None,
             });
             state.last = (seq, presence.body.here);
+            state.last_ms = Some(entry.skeleton.claimed_ms);
             if presence.body.here {
                 state.back = Some((seq, self.now_millis));
             }

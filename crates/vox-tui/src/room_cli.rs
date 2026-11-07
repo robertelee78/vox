@@ -7171,7 +7171,13 @@ pub fn print_identity(
 /// told in time (the node then leaves as soon as one can be).
 pub async fn leave(paths: &Paths, room: &str) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
-    let channel_id = room_of(&mut client, room).await?;
+    let (channel_id, pending_only) = match room_of(&mut client, room).await {
+        Ok(id) => (id, false),
+        Err(error) => match b32_decode(room, "room") {
+            Ok(id) => (id, true),
+            Err(_) => return Err(error),
+        },
+    };
     let name = rooms_of(&mut client)
         .await?
         .into_iter()
@@ -7186,8 +7192,8 @@ pub async fn leave(paths: &Paths, room: &str) -> Result<(), AppError> {
     // What it is to do, said before it is done (ADR-028 E-5).
     let services = offered_in(&mut client, channel_id).await;
     println!(
-        "vox: about to leave {which}: its other members are to see that you left, and this node \
-         is to delete it with everything it holds of it"
+        "vox: about to leave {which}, or cancel its retained pending admission: this node will \
+         delete the local room and queue its own member withdrawal"
     );
     if !services.is_empty() {
         println!(
@@ -7197,8 +7203,11 @@ pub async fn leave(paths: &Paths, room: &str) -> Result<(), AppError> {
     }
     match client.request(&Request::Leave { channel_id }).await {
         Ok(Frame::Ok) => {
-            println!("vox: left {which}");
-            println!("     its other members see that you left; this node no longer holds it");
+            if pending_only {
+                println!("vox: cancelled the pending admission for {which}; its member withdrawal is queued");
+            } else {
+                println!("vox: left {which} or cancelled its pending admission; its member withdrawal is queued");
+            }
             if !services.is_empty() {
                 println!(
                     "     your services there are no longer offered: {}",

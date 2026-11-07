@@ -87,6 +87,8 @@ pub(crate) use proof_range::{ProofRangeRestore, ProofRangeStep};
 pub(crate) mod session_floor;
 pub(crate) mod session_projection;
 mod sparse_history;
+pub(crate) use own_history::confirm_creator_end;
+pub(crate) use own_history::erase_continuity as erase_own_continuity;
 pub(crate) use own_history::OwnReadability;
 pub(crate) use own_history::OwnRecoveryPage;
 pub(crate) use sparse_history::KeyDebtPage;
@@ -127,7 +129,8 @@ use crate::log::dag::{AdmissionPolicy, Dag, ForkProof};
 use crate::log::entry::{Entry, EntryKind, EntryRead, EntrySkeleton, ZERO_HASH};
 use crate::log::feed::lipmaa;
 use crate::log::history::{
-    ConsistentPrefix, Descriptor, LocalAppendBudget, LogScope, SignedHead, TreeBinding,
+    ConsistentPrefix, Descriptor, HistoryStep, LocalAppendBudget, LogScope, SignedHead,
+    TreeBinding, WorkBudget,
 };
 use crate::log::sync::{frontier_session_peer, AuthorResolver, Transport};
 use crate::nat::bootstrap::BootstrapSet;
@@ -139,6 +142,17 @@ use crate::node::profile::Profile;
 use crate::node::retention::Tracked;
 use crate::node::store::{ReceivedFlow, Store};
 use crate::suite::{algo, SuiteFloor};
+
+fn withdrawal_veto_enabled() -> bool {
+    #[cfg(feature = "test-knobs")]
+    {
+        !crate::node::computer::fx28_mutant("readmission-no-withdrawal-veto")
+    }
+    #[cfg(not(feature = "test-knobs"))]
+    {
+        true
+    }
+}
 
 /// Segment id of the manifest in `KeyMaterial`.
 const SEG_MANIFEST: u64 = 0;
@@ -1206,6 +1220,7 @@ pub struct ChannelState {
     created: u64,
     epoch: u64,
     sek: Sek,
+    continuity_key: Sek,
     /// Author fingerprint → composite root key (M13: the creator only).
     authors: BTreeMap<Digest32, CompositePublicKey>,
     admission: AdmissionPolicy,
@@ -1413,13 +1428,6 @@ pub struct ChannelState {
     gen: Arc<std::sync::atomic::AtomicU64>,
     /// Revocable committed history publication, independent of the mutable room lane.
     history_read: Option<Arc<history::ReadResource>>,
-    /// Members that left and that this node let in again by answering their join (V030-08):
-    /// members here until their signed return reaches it, which it then carries to the others.
-    /// Each with the position in its feed of the departure the join undid: only that one. A
-    /// departure it writes later, after it joined again, is a leave like any other; a member
-    /// let in again kept its readmission for good, so a second leave was never applied (#564).
-    /// In memory: a join is answered again after a restart.
-    readmitted: BTreeMap<Digest32, u64>,
 }
 
 impl Drop for ChannelState {
@@ -2207,6 +2215,7 @@ impl ChannelState {
             created: now_ms,
             epoch,
             sek,
+            continuity_key: own_history::continuity_key(signer)?,
             authors,
             admission,
             dag: Dag::for_room(origin_ms),
@@ -2289,7 +2298,6 @@ impl ChannelState {
             settled: true,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             history_read: None,
-            readmitted: BTreeMap::new(),
         };
         // The room's name is stated on its log as its first entry after the genesis, so every
         // member that joins reads it there (ADR-028 R-1).
@@ -2367,13 +2375,24 @@ impl ChannelState {
                     author,
                 },
             );
-        Self::open_with_sek_owned(store, channel_id, sek, channel_passphrase, me, now, paused)
+        Self::open_with_sek_owned(
+            store,
+            signer,
+            channel_id,
+            sek,
+            channel_passphrase,
+            me,
+            now,
+            paused,
+        )
     }
 
     /// The post-unlock half of [`Self::open`]. The actor verifies paused legacy ownership before
     /// moving keys to its blocking opener, so restart cannot mistake retained work for an orphan.
+    #[allow(clippy::too_many_arguments)] // The owned opener keeps key, identity and recovery authority explicit.
     pub(crate) fn open_with_sek_owned(
         store: &Store,
+        signer: &crate::atrest::vault::VaultRootSigner,
         channel_id: &Digest32,
         sek: Sek,
         channel_passphrase: &[u8],
@@ -2821,6 +2840,7 @@ impl ChannelState {
             created,
             epoch,
             sek,
+            continuity_key: own_history::continuity_key(signer)?,
             authors,
             admission,
             dag,
@@ -2902,10 +2922,43 @@ impl ChannelState {
             settled,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             history_read: None,
-            readmitted: BTreeMap::new(),
         };
         room.entries
             .reopen_rendered(store, &room.sek, &room.channel_id)?;
+        // Older restart rows lack the signed presence clock. Recover it only from
+        // an authenticated held entry; absent evidence keeps readmission closed.
+        let missing_clocks: Vec<_> = room
+            .presence
+            .iter()
+            .filter_map(|(author, presence)| {
+                presence
+                    .last_ms
+                    .is_none()
+                    .then_some((*author, presence.last.0))
+            })
+            .collect();
+        if !missing_clocks.is_empty() {
+            let read = room.history_read(store)?;
+            let mut recovered = Vec::new();
+            for (author, seq) in missing_clocks {
+                let entry = match read.get(&author, seq)? {
+                    Some(entry) => Some(entry),
+                    None if read.sparse_enabled() => read
+                        .history_validated_header(&author, seq)?
+                        .map(|(_, entry)| entry),
+                    None => None,
+                };
+                if let Some(entry) = entry {
+                    recovered.push((author, entry.skeleton.claimed_ms));
+                }
+            }
+            drop(read);
+            for (author, clock) in recovered {
+                if let Some(presence) = room.presence.get_mut(&author) {
+                    presence.last_ms = Some(clock);
+                }
+            }
+        }
         room.display_tail = room
             .entries
             .render_view(store, &room.sek, &room.channel_id)?
@@ -2921,6 +2974,57 @@ impl ChannelState {
             room.private_sessions.legacy_pending.insert(hash);
         }
         room.private_sessions.upgrading = !room.private_sessions.legacy_pending.is_empty();
+        // Upgrade a held, intact own prefix before this reopened room can append or leave.
+        // A behind/forked profile keeps its recovery fence instead of blessing a branch.
+        if !room.own_behind
+            && own_history::load_continuity(store, &room.continuity_key, channel_id, &me)?.is_none()
+            && !room.own_history_conflict(store)?
+        {
+            if let Some(head) = room.history_head(store, &me)? {
+                if head.binding.room != *channel_id
+                    || head.binding.author != me
+                    || head.binding.scope != LogScope::Public
+                    || !matches!(
+                        head.verify(&signer.public_key(), &mut WorkBudget::default())?,
+                        HistoryStep::Complete(_)
+                    )
+                {
+                    return Err(Error::MalformedAtRest("own continuity seed head"));
+                }
+                let held = room
+                    .history_read(store)?
+                    .history_held_through(&me)
+                    .map_or(0, |(seq, _)| seq);
+                if head.root.leaves > held {
+                    let recovery = own_history::Recovery::Head(head);
+                    let segment = seal_segment(
+                        &room.sek,
+                        SegmentKind::KeyMaterial,
+                        SEG_OWN_BEHIND,
+                        &recovery.bytes(),
+                    )?;
+                    store.put_segment(
+                        channel_id,
+                        SegmentKind::KeyMaterial,
+                        SEG_OWN_BEHIND,
+                        &segment,
+                    )?;
+                    room.own_behind = true;
+                    room.own_recovery = recovery;
+                } else if head.root.leaves != 0 {
+                    let mut batch = store.batch()?;
+                    own_history::save_continuity(
+                        &mut batch,
+                        &room.continuity_key,
+                        &head,
+                        room.epoch,
+                        room.sender.chain_id(),
+                        &room.genesis,
+                    )?;
+                    batch.commit()?;
+                }
+            }
+        }
         // The actor establishes current governance and this node's retention settings
         // before sweeping or refreshing. The constructor's placeholder policies must
         // never reset an already completed durable projection on an ordinary restart.
@@ -2977,30 +3081,116 @@ impl ChannelState {
         now: crate::time::Ms,
         sealed: (Sek, crate::atrest::SekWrap),
         own_admission: Admission,
+        responder_key: &CompositePublicKey,
+        own_history: crate::node::joinstream::OwnHistory,
     ) -> Result<Self> {
         let now_ms = now.get();
         Self::join_checks_store(store, genesis, channel_id)?;
         let name_hint = name_hint.unwrap_or_default();
         let (sek, wrap) = sealed;
         let me = signer.fingerprint();
+        let continuity_key = own_history::continuity_key(signer)?;
+        let retained = own_history::load_continuity(store, &continuity_key, channel_id, &me)?;
+        if let Some(marker) = &retained {
+            if marker.head.binding.room != *channel_id
+                || marker.head.binding.author != me
+                || marker.head.binding.scope != LogScope::Public
+            {
+                return Err(Error::MalformedAtRest("own continuity head binding"));
+            }
+            match marker
+                .head
+                .verify(&signer.public_key(), &mut WorkBudget::default())?
+            {
+                HistoryStep::Complete(_) => {}
+                _ => return Err(Error::OwnHistoryBehind),
+            }
+        }
+        let unknown_higher = match &own_history {
+            crate::node::joinstream::OwnHistory::Unavailable(wire) => Some(wire.clone()),
+            _ => None,
+        };
+        let mut recovery = match own_history {
+            crate::node::joinstream::OwnHistory::None => None,
+            crate::node::joinstream::OwnHistory::Unavailable(_) => {
+                Some(own_history::Recovery::UnknownBehind)
+            }
+            crate::node::joinstream::OwnHistory::Head(wire) => {
+                let head = SignedHead::from_wire(&wire)?;
+                if head.binding.room != *channel_id
+                    || head.binding.author != me
+                    || head.binding.scope != LogScope::Public
+                {
+                    return Err(Error::MalformedGovernance("joiner history head binding"));
+                }
+                match head.verify(&signer.public_key(), &mut WorkBudget::default())? {
+                    HistoryStep::Complete(_) => {}
+                    _ => return Err(Error::OwnHistoryBehind),
+                }
+                Some(own_history::Recovery::Head(head))
+            }
+        };
+        let mut recovery_boundary = None;
+        if let Some(marker) = &retained {
+            recovery = match recovery {
+                Some(own_history::Recovery::UnknownBehind) => {
+                    Some(own_history::Recovery::Head(marker.head.clone()))
+                }
+                Some(own_history::Recovery::Head(head)) if head.id() != marker.head.id() => {
+                    if head.root.leaves == marker.head.root.leaves {
+                        recovery_boundary = Some(head);
+                        Some(own_history::Recovery::Fork)
+                    } else if head.root.leaves > marker.head.root.leaves {
+                        Some(own_history::Recovery::Head(head))
+                    } else {
+                        recovery_boundary = Some(head);
+                        Some(own_history::Recovery::Head(marker.head.clone()))
+                    }
+                }
+                _ => Some(own_history::Recovery::Head(marker.head.clone())),
+            };
+        }
         let epoch = 0u64;
-        let sender = SenderChain::new(channel_id, epoch, &me, 0, now_ms)?;
+        let generation = retained
+            .as_ref()
+            .filter(|marker| marker.epoch == epoch)
+            .map_or(0, |marker| marker.generation);
+        let sender = SenderChain::new(channel_id, epoch, &me, generation, now_ms)?;
         let mut origins = OriginKeyStore::new();
-        let mint_seq = crate::node::consent_order::stamp_mint(store, signer, 0)?;
-        retain_generation(
-            &mut origins,
-            channel_id,
-            epoch,
-            &me,
-            &sender,
-            now_ms,
-            mint_seq,
-        )?;
+        if recovery.is_none() {
+            let mint_seq = crate::node::consent_order::stamp_mint(store, signer, 0)?;
+            retain_generation(
+                &mut origins,
+                channel_id,
+                epoch,
+                &me,
+                &sender,
+                now_ms,
+                mint_seq,
+            )?;
+        }
 
         let creator = genesis.body.creator_pubkey.fingerprint();
         let mut authors = BTreeMap::new();
         authors.insert(creator, genesis.body.creator_pubkey.clone());
         authors.insert(me, signer.public_key());
+        let witness = match &own_admission {
+            Admission::Witnessed(witness) => witness,
+            Admission::Creator => return Err(Error::MalformedGovernance("join requires witness")),
+        };
+        witness.verify(responder_key, channel_id, epoch, &me)?;
+        let own_notice =
+            crate::nat::notice::AdmissionNotice::new(signer.public_key(), (**witness).clone())?;
+        let mut board_kept = BoardKept::default();
+        board_kept
+            .notices
+            .insert(me, (witness.timestamp_ms, own_notice.to_wire()));
+        let board_seg = seal_segment(
+            &sek,
+            SegmentKind::KeyMaterial,
+            SEG_BOARD_KEPT,
+            &board_kept_bytes(&board_kept),
+        )?;
 
         let manifest = manifest_bytes(genesis, name_hint, now_ms, epoch);
         let manifest_seg = seal_segment(&sek, SegmentKind::KeyMaterial, SEG_MANIFEST, &manifest)?;
@@ -3063,6 +3253,31 @@ impl ChannelState {
         batch.put_segment(
             channel_id,
             SegmentKind::KeyMaterial,
+            SEG_BOARD_KEPT,
+            &board_seg,
+        )?;
+        if let Some(recovery) = &recovery {
+            batch.put_segment(
+                channel_id,
+                SegmentKind::KeyMaterial,
+                SEG_OWN_BEHIND,
+                &seal_segment(
+                    &sek,
+                    SegmentKind::KeyMaterial,
+                    SEG_OWN_BEHIND,
+                    &recovery.bytes(),
+                )?,
+            )?;
+        }
+        if let Some(head) = &recovery_boundary {
+            own_history::save_recovery_boundary(&mut batch, &sek, channel_id, head)?;
+        }
+        if let Some(header) = &unknown_higher {
+            own_history::save_unknown_higher(&mut batch, &sek, channel_id, header)?;
+        }
+        batch.put_segment(
+            channel_id,
+            SegmentKind::KeyMaterial,
             SEG_UNSETTLED,
             &seal_segment(&sek, SegmentKind::KeyMaterial, SEG_UNSETTLED, &[1])?,
         )?;
@@ -3082,7 +3297,19 @@ impl ChannelState {
         index.initialize_restart(epoch)?;
         if genesis.body.authenticated_history() {
             index.initialize_sparse_history()?;
-            initialize_sparse_identity(&mut index, signer, *channel_id, epoch)?;
+            if let Some(own_history::Recovery::Head(head)) = &recovery {
+                let verified =
+                    match head.verify(&signer.public_key(), &mut WorkBudget::default())? {
+                        HistoryStep::Complete(verified) => verified,
+                        _ => return Err(Error::OwnHistoryBehind),
+                    };
+                if index.observe_history_head(&verified)? {
+                    return Err(Error::OwnHistoryBehind);
+                }
+            }
+            if recovery.is_none() {
+                initialize_sparse_identity(&mut index, signer, *channel_id, epoch)?;
+            }
         }
         index.empty_rendered()?;
         index.seal()?;
@@ -3103,6 +3330,7 @@ impl ChannelState {
             created: now_ms,
             epoch,
             sek,
+            continuity_key,
             authors,
             admission,
             dag: Dag::for_room(genesis.body.created_ms),
@@ -3110,8 +3338,8 @@ impl ChannelState {
             governance_display,
             governance_ready: false,
             governance_semantic: std::sync::Mutex::new(governance::SemanticState::default()),
-            own_behind: false,
-            own_recovery: own_history::Recovery::UnknownBehind,
+            own_behind: recovery.is_some(),
+            own_recovery: recovery.unwrap_or(own_history::Recovery::UnknownBehind),
             historical_retirement: own_historical_keys::Retirement::default(),
             availability: availability::State::new()?,
             presence: BTreeMap::new(),
@@ -3167,7 +3395,7 @@ impl ChannelState {
             trust_marks: BTreeMap::new(),
             known_members: BTreeSet::new(),
             drive: DriveState::default(),
-            board_kept: BoardKept::default(),
+            board_kept,
             room_pause: vox_agentcomms::drive::PauseState::default(),
             pause_resume_after: 0,
             skipped: std::collections::VecDeque::new(),
@@ -3184,7 +3412,6 @@ impl ChannelState {
             settled: false,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             history_read: None,
-            readmitted: BTreeMap::new(),
         })
     }
 
@@ -3254,15 +3481,15 @@ impl ChannelState {
             .is_some_and(|(at, _)| *at >= since)
     }
 
-    /// Keep `notice`, the newest witnessed for its joiner (#520), persisted so this node passes it
-    /// on after a restart. A notice its joiner's kept withdraw refuses is not kept.
+    /// Keep the newest witnessed notice unless the joiner has withdrawn it.
     pub fn keep_notice(
         &mut self,
         store: &Store,
         notice: &crate::nat::notice::AdmissionNotice,
     ) -> Result<()> {
         let (joiner, at) = (notice.joiner(), notice.witness.timestamp_ms);
-        if self.withdrawn_since(&joiner, at)
+        if (withdrawal_veto_enabled() || !self.is_author(&joiner))
+            && self.withdrawn_since(&joiner, at)
             || self
                 .board_kept
                 .notices
@@ -3282,9 +3509,8 @@ impl ChannelState {
         self.save_board_kept(store, false)
     }
 
-    /// Keep a member's own withdraw (#520), checked by the caller against the member's key: the
-    /// newest one, persisted, so this node refuses every admission of that member it witnessed
-    /// before, and passes the withdraw on wherever it passes the member's notice.
+    /// Keep a member's own withdraw (#520), checked by the caller against the member's key:
+    /// the newest one fences admissions witnessed at or before it.
     pub fn keep_withdraw(
         &mut self,
         store: &Store,
@@ -3803,6 +4029,22 @@ impl ChannelState {
             None
         };
         index.seal()?;
+        if let Some(prepared) = &self.local_history {
+            let generation = match GovEntry::body_bound_to(entry) {
+                Ok(GovBody::Presence(presence)) => {
+                    self.sender.chain_id().max(presence.body.chain_id)
+                }
+                _ => self.sender.chain_id(),
+            };
+            own_history::save_continuity(
+                batch,
+                &self.continuity_key,
+                prepared.head.head(),
+                self.epoch,
+                generation,
+                &self.genesis,
+            )?;
+        }
         session_projection::private_index::observe_public(
             batch,
             &self.sek,
@@ -7334,7 +7576,7 @@ impl ChannelState {
         }
         self.require_legacy_current(store)?;
         self.current_governance(store)?;
-        if !self.is_member(&author) || self.has_left(&self.me()) {
+        if !self.recovery_standing(store, &author)? || self.has_left(&self.me()) {
             return Ok(None);
         }
         let Some(receiver) = self.receivers.get(&(author, chain)) else {
@@ -8654,6 +8896,11 @@ impl ChannelState {
         Ok(out)
     }
 
+    pub(crate) fn own_history_forked(&self) -> bool {
+        (self.own_behind && matches!(&self.own_recovery, own_history::Recovery::Fork))
+            || self.dag.is_frozen(&self.me())
+    }
+
     /// Whether `fingerprint` is a member: an admitted author that has not left.
     #[must_use]
     pub fn is_member(&self, fingerprint: &Digest32) -> bool {
@@ -8671,13 +8918,63 @@ impl ChannelState {
             .collect()
     }
 
-    /// Whether `author` has left the room: the last entry this node holds of its feed is its
-    /// own statement that it left (V210-164), and this node has not let it back in since
-    /// ([`Self::readmit`]). Anything it authored after one — it joined again — puts it back.
+    /// The authenticated last departure's clock, never the time this peer observes it.
+    pub(crate) fn last_departure_ms(&self, author: &Digest32) -> Option<u64> {
+        let seq = self.left_at(author)?;
+        self.presence
+            .get(author)
+            .filter(|presence| presence.last.0 == seq)
+            .and_then(|presence| presence.last_ms)
+    }
+
+    /// An authenticated newer admission restores membership independently of own recovery.
+    /// A later self-withdraw removes board records, not the admission's causal evidence:
+    /// only the later signed departure closes that return.
     #[must_use]
     pub fn has_left(&self, author: &Digest32) -> bool {
-        self.left_at(author)
-            .is_some_and(|seq| self.readmitted.get(author) != Some(&seq))
+        #[cfg(feature = "test-knobs")]
+        if *author != self.me()
+            && crate::node::computer::fx28_mutant("sync-departed-peer")
+            && std::env::var_os("VOX_TEST_DEPARTED_AS_MEMBER_FILE")
+                .is_some_and(|path| std::path::Path::new(&path).is_file())
+        {
+            return false;
+        }
+        let Some(seq) = self.left_at(author) else {
+            return false;
+        };
+        let Some(left_ms) = self
+            .presence
+            .get(author)
+            .filter(|presence| presence.last.0 == seq)
+            .and_then(|presence| presence.last_ms)
+        else {
+            return true;
+        };
+        let Some((at, wire)) = self.board_kept.notices.get(author) else {
+            return true;
+        };
+        if *at <= left_ms
+            || *at
+                > self
+                    .now_hint
+                    .saturating_add(crate::nat::store::MAX_CLOCK_SKEW_MS)
+            || (withdrawal_veto_enabled() && self.withdrawn_since(author, *at))
+        {
+            return true;
+        }
+        let Ok(notice) = crate::nat::notice::AdmissionNotice::from_wire(wire) else {
+            return true;
+        };
+        let Some(witness) = self.authors.get(&notice.witness.witness_id) else {
+            return true;
+        };
+        notice.joiner() != *author
+            || notice.witness.timestamp_ms != *at
+            || self.said_left(&notice.witness.witness_id)
+            || notice
+                .verify(witness, &self.channel_id, self.epoch)
+                .is_err()
     }
 
     /// Whether `author`'s feed, as this node holds it, ends in its statement that it left.
@@ -8705,19 +9002,6 @@ impl ChannelState {
             .filter(|author| self.has_left(author))
             .copied()
             .collect()
-    }
-
-    /// Let `who`, which left, back in on this node: it just proved the room's passphrase in a
-    /// join this node answered. It is a member here until its own statement that it is back
-    /// reaches the others through this node.
-    pub fn readmit(&mut self, who: Digest32) {
-        let was_member = self.is_member(&who);
-        if let Some(seq) = self.left_at(&who) {
-            self.readmitted.insert(who, seq);
-        }
-        if !was_member && self.is_member(&who) {
-            self.key_member_became_current(who);
-        }
     }
 
     fn key_member_became_current(&self, who: Digest32) {
@@ -8978,6 +9262,7 @@ impl ChannelState {
             resource.revoke();
         }
         self.sek.lock_now();
+        self.continuity_key.lock_now();
         self.history_publication_changed.notify_waiters();
         // Wipe the retained passphrase with the SEK: after an app-lock this channel
         // can neither unseal nor answer a join until it is reopened (ADR-010/015).

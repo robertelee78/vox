@@ -133,6 +133,13 @@ impl super::ChannelState {
             .store(true, Ordering::Release);
         self.flush_available(store)
     }
+    /// A newly applied signed entry can make previously unavailable public evidence
+    /// serveable to any connected member, not only to that entry's author.
+    pub(super) fn note_history_available(&mut self) {
+        for peer in self.availability.peers.values() {
+            peer.pending.store(true, Ordering::Release);
+        }
+    }
     pub(super) fn flush_available(&mut self, store: &super::Store) -> Result<()> {
         if self.history_publication_busy(store)? {
             return Ok(());

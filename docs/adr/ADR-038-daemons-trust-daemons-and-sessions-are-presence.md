@@ -547,9 +547,13 @@ lessons. It changes neither this record's decision status nor any requirement or
   not already hold) MUST write nothing: over a quiet minute a member's store MUST gain no
   commit at all from its rounds. Decision: a hint this node holds (its committed head, its
   control readiness and its live window all at the hint) is not pulled again each period; a
-  hint whose missing pages a peer said it does not hold is not pulled from that peer again
-  until that peer's inventory changes; a head or header already held is not saved again; and a
-  verifier persists its progress once per proof verified to its end (an inclusion proof or a
+  hint whose missing pages a peer said it does not hold MUST NOT be pulled again from that peer
+  while the same connection, authority incarnation and serving-progress evidence stand, including
+  a directly selected own-recovery verification. A peer's newly applied signed entry advances its
+  serving-progress announcement so a sibling can retry retained unavailable evidence, even when
+  the author's head does not change. A different advertised head alone, including in a role hint,
+  is not new evidence for the old head; a head or header already held is not saved again; and a verifier
+  persists its progress once per proof verified to its end (an inclusion proof or a
   control range), never once per Merkle join, since a proof is bounded and is verified again
   from its bytes after a crash. Measured cause, the same daemon: 1,367 durable store commits per second across the four node stores
   (redb transaction ids read 30 s apart: robert-work 524/s, opencode-work 495/s, codex-work
@@ -579,6 +583,15 @@ lessons. It changes neither this record's decision status nor any requirement or
   lifetime by retrying. The shipped proof binds its Content verdict to one exact accepted entry
   hash observed at Bob's effect outcome and then performs one `vox room read`; a polling read may
   not relabel a later unrelated refusal as this defect.
+
+  Head or dependency `EvidenceUnavailable` and `BodyNotHeld` MUST park the exact selected hint,
+  not persist an absence verdict. `Busy` retains its existing retry semantics. A bounded,
+  charged connection-scoped refusal MUST suppress only the same peer, author and head until the
+  connection, authorization generation, peer or author inventory incarnation changes, or
+  authenticated role or held-through progress rearms it. Another advertised head alone MUST NOT
+  rearm the refused head. Connection closure MUST retire its refusals and fence late workers;
+  older untyped durable declines MUST NOT suppress hints. A finishing flow MUST release only its
+  own selected hint incarnation, never a successor or a retried owner.
 
   **Causal handoffs and access.** A response already consumed from a peer MUST retain its exact
   local continuation until its result is committed or the request is invalidated; local

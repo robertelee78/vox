@@ -482,6 +482,9 @@ impl ChannelState {
                 if let Some((author, progress)) = contiguous {
                     self.note_contiguous_advance(author, progress)?;
                 }
+                if matches!(&work, Work::Effect { .. }) && effect.is_some() {
+                    self.note_history_available();
+                }
                 Ok(())
             })();
             if let Err(error) = projection_result.and(install) {
@@ -736,19 +739,23 @@ impl PendingReceived {
                             let old = self.presence;
                             let mut state = old.unwrap_or(governance::Presence {
                                 last: (entry.skeleton.seq, body.body.here),
+                                last_ms: Some(entry.skeleton.claimed_ms),
                                 back: None,
                             });
                             if entry.skeleton.seq >= state.last.0 {
                                 state.last = (entry.skeleton.seq, body.body.here);
+                                state.last_ms = Some(entry.skeleton.claimed_ms);
                             }
                             if body.body.here
                                 && state.back.is_none_or(|(seq, _)| seq < entry.skeleton.seq)
                             {
                                 state.back = Some((entry.skeleton.seq, entry.skeleton.claimed_ms));
                             }
-                            if old
-                                .is_none_or(|old| old.last != state.last || old.back != state.back)
-                            {
+                            if old.is_none_or(|old| {
+                                old.last != state.last
+                                    || old.last_ms != state.last_ms
+                                    || old.back != state.back
+                            }) {
                                 let mut index = self.index.write(&mut batch, sek, &self.room)?;
                                 index.note_presence(author, state)?;
                                 index.seal()?;

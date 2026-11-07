@@ -194,8 +194,12 @@ impl ChannelState {
             .chain(
                 tail.iter()
                     .flat_map(|tail| tail.notices.iter())
-                    .filter(|notice| !self.authors.contains_key(&notice.joiner()))
                     .map(|notice| notice.witness.witness_id),
+            )
+            .chain(
+                tail.iter()
+                    .flat_map(|tail| tail.withdraws.iter())
+                    .map(|w| w.author_id),
             );
         let mut witnesses = BTreeMap::new();
         for id in witness_ids {
@@ -360,6 +364,20 @@ impl Prepared {
                 });
                 if let Some(tail) = &self.tail {
                     for withdraw in &tail.withdraws {
+                        let Some(key) = witnesses.get(&withdraw.author_id) else {
+                            continue;
+                        };
+                        if withdraw.channel_id != self.room
+                            || withdraw.scope != crate::nat::withdraw::WithdrawScope::Member
+                            || withdraw.timestamp_ms
+                                > self
+                                    .now
+                                    .get()
+                                    .saturating_add(crate::nat::store::MAX_CLOCK_SKEW_MS)
+                        {
+                            return Err(Error::MalformedGovernance("invalid member withdrawal"));
+                        }
+                        withdraw.verify(key)?;
                         if let Err(error) =
                             kernel.keep_withdraw(store, sek, self.room, &mut board, withdraw)
                         {
@@ -369,8 +387,12 @@ impl Prepared {
                     }
                     let mut pending = Vec::new();
                     for notice in &tail.notices {
-                        if kernel.is_known(&self.known, &notice.joiner()) {
-                            let _ = kernel.keep_notice(store, sek, self.room, &mut board, notice);
+                        if kernel.is_known(&self.known, &notice.joiner())
+                            && witnesses.contains_key(&notice.witness.witness_id)
+                        {
+                            let witness = &witnesses[&notice.witness.witness_id];
+                            notice.verify(witness, &self.room, self.epoch)?;
+                            kernel.keep_notice(store, sek, self.room, &mut board, notice)?;
                         } else {
                             pending.push(notice);
                         }
@@ -391,6 +413,24 @@ impl Prepared {
                                     ),
                                 )?;
                                 notice.verify(witness, &self.room, self.epoch)?;
+                                // The notice authenticates this previously unknown key. Apply
+                                // its signed withdrawals before deciding whether it may join.
+                                for withdraw in tail.withdraws.iter().filter(|withdraw| {
+                                    withdraw.author_id == notice.joiner()
+                                        && withdraw.channel_id == self.room
+                                        && withdraw.scope
+                                            == crate::nat::withdraw::WithdrawScope::Member
+                                        && withdraw.timestamp_ms
+                                            <= self.now.get().saturating_add(
+                                                crate::nat::store::MAX_CLOCK_SKEW_MS,
+                                            )
+                                }) {
+                                    if withdraw.verify(&notice.key).is_ok() {
+                                        kernel.keep_withdraw(
+                                            store, sek, self.room, &mut board, withdraw,
+                                        )?;
+                                    }
+                                }
                                 if !kernel.is_known(&self.known, &notice.joiner())
                                     && board
                                         .withdraws
@@ -477,8 +517,14 @@ impl Completed {
                 )),
             };
         }
+        let changed_notices: Vec<_> = self.notices.keys().copied().collect();
         channel.board_kept.notices.extend(self.notices);
         channel.board_kept.withdraws.extend(self.withdraws);
+        for author in changed_notices {
+            if channel.is_member(&author) {
+                channel.key_member_became_current(author);
+            }
+        }
         if !self.added.is_empty() {
             channel.now_hint = channel.now_hint.max(self.pending.now.get());
             for key in self.added {
@@ -494,14 +540,11 @@ impl Completed {
             channel.owe_private_support();
             channel.governance_ready = false;
         }
-        if self.saved.result.is_ok() {
-            if let Some(joined) = &self.saved.joined {
-                channel.now_hint = channel.now_hint.max(self.pending.now.get());
-                channel
-                    .role_owed
-                    .retain_authors(|peer| channel.authors.contains_key(peer));
-                channel.readmit(joined.notice.joiner());
-            }
+        if self.saved.result.is_ok() && self.saved.joined.is_some() {
+            channel.now_hint = channel.now_hint.max(self.pending.now.get());
+            channel
+                .role_owed
+                .retain_authors(|peer| channel.authors.contains_key(peer));
         }
         if let Some(error) = self.poison {
             channel.poisoned = true;
@@ -543,10 +586,11 @@ impl NativeRoster {
     ) -> Result<()> {
         let fingerprint = notice.joiner();
         let at = notice.witness.timestamp_ms;
-        if board
-            .withdraws
-            .get(&fingerprint)
-            .is_some_and(|(held, _)| *held >= at)
+        if (withdrawal_veto_enabled()
+            && board
+                .withdraws
+                .get(&fingerprint)
+                .is_some_and(|(held, _)| *held >= at))
             || board
                 .notices
                 .get(&fingerprint)
@@ -565,7 +609,7 @@ impl NativeRoster {
                 SEG_BOARD_KEPT,
                 &board_kept_bytes(board),
             )?;
-            store.put_segment_derived(&room, SegmentKind::KeyMaterial, SEG_BOARD_KEPT, &segment)
+            store.put_segment(&room, SegmentKind::KeyMaterial, SEG_BOARD_KEPT, &segment)
         })();
         if let Err(error) = save {
             match previous {
@@ -653,6 +697,31 @@ impl NativeRoster {
             key,
             admission,
         )? {
+            if let Some(tail) = &pending.tail {
+                for withdraw in tail.withdraws.iter().filter(|withdraw| {
+                    withdraw.author_id == notice.joiner()
+                        && withdraw.channel_id == pending.room
+                        && withdraw.scope == crate::nat::withdraw::WithdrawScope::Member
+                        && withdraw.timestamp_ms
+                            <= pending
+                                .now
+                                .get()
+                                .saturating_add(crate::nat::store::MAX_CLOCK_SKEW_MS)
+                }) {
+                    if withdraw.verify(key).is_ok() {
+                        self.keep_withdraw(store, sek, pending.room, board, withdraw)?;
+                    }
+                }
+                if board
+                    .withdraws
+                    .get(&notice.joiner())
+                    .is_some_and(|(at, _)| *at >= notice.witness.timestamp_ms)
+                {
+                    return Err(Error::MalformedGovernance(
+                        "admission withdrawn: the member left the room",
+                    ));
+                }
+            }
             self.keep_notice(store, sek, pending.room, board, &notice)?;
         }
         let admitted = self.admit_key(store, sek, pending.room, authors, key)?;

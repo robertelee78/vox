@@ -1558,7 +1558,8 @@ impl RendezvousService {
                     WithdrawScope::Room => {
                         let creator = store
                             .genesis(&w.channel_id)
-                            .map(|g| g.body.creator_pubkey.clone());
+                            .map(|g| g.body.creator_pubkey.clone())
+                            .or_else(|| store.ended_creator(&w.channel_id).cloned());
                         match creator {
                             Some(c) if c.fingerprint() == w.author_id => Some(c),
                             Some(_) if store.is_roster_admin(&w.channel_id, &w.author_id) => {

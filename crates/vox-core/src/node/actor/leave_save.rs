@@ -1,6 +1,7 @@
 //! Leave, close and deletion retain the original command until their real native result.
 use super::*;
 use crate::atrest::vault::VaultRootSigner;
+use crate::identity::composite::RootSigner as _;
 use crate::node::channel::pending_text::leave;
 use crate::node::store::Store;
 
@@ -80,6 +81,7 @@ enum NativeWork {
         epoch: u64,
         now: u64,
         routes: BTreeMap<Digest32, Vec<std::net::SocketAddr>>,
+        awaiting_departure: bool,
     },
     Close,
     ForgetWithdrawal,
@@ -87,6 +89,7 @@ enum NativeWork {
         paths: crate::node::paths::Paths,
         name: String,
         retirement: Option<RetirementPermit>,
+        ended: bool,
     },
 }
 enum NativeSaved {
@@ -217,7 +220,12 @@ fn native(
     signer: &VaultRootSigner,
 ) -> NativeSaved {
     match work {
-        NativeWork::Withdrawal { epoch, now, routes } => NativeSaved::Withdrawal((|| {
+        NativeWork::Withdrawal {
+            epoch,
+            now,
+            routes,
+            awaiting_departure,
+        } => NativeSaved::Withdrawal((|| {
             let statement = crate::nat::withdraw::BoardWithdraw::build(
                 signer,
                 &room,
@@ -228,6 +236,7 @@ fn native(
             let pending = PendingWithdrawal {
                 wire: statement.to_wire(),
                 routes,
+                awaiting_departure,
             };
             // Admission precedes the read: a concurrent canonical metadata writer is never lost.
             let mut batch = store.batch()?;
@@ -267,6 +276,7 @@ fn native(
             paths,
             name,
             retirement,
+            ended,
         } => {
             paths.remove_room_cursors(&crate::node::link::b32_encode(&room), &name);
             let mut committed_retirement = None;
@@ -288,11 +298,38 @@ fn native(
                     &room,
                     retirement.is_some(),
                 )?;
+                if ended {
+                    crate::node::channel::erase_own_continuity(
+                        &mut batch,
+                        &room,
+                        &signer.fingerprint(),
+                    )?;
+                }
+                // Purge follows a role receipt (or an alone Leave); release the retained
+                // withdrawal atomically with forgetting the room so restart cannot publish
+                // it before the departure is heard.
+                let mut withdrawn = match store.get_meta(PENDING_WITHDRAWALS_META_KEY)? {
+                    Some(bytes) => read_pending_withdrawals(&bytes)?,
+                    None => BTreeMap::new(),
+                };
+                if let Some(pending) = withdrawn.get_mut(&room) {
+                    if pending.awaiting_departure {
+                        pending.awaiting_departure = false;
+                        batch.put_meta(
+                            PENDING_WITHDRAWALS_META_KEY,
+                            &pending_withdrawals_bytes(&withdrawn)?,
+                        )?;
+                    }
+                }
                 batch.commit()?;
                 committed_retirement = pending;
                 if let (Some(permit), Some(pending)) = (retirement, pending) {
                     // This exact receipt is already durable. Rewrite failure cannot strand it.
                     permit.send(pending);
+                }
+                #[cfg(feature = "test-knobs")]
+                if crate::node::computer::fx28_mutant("leave-skip-rewrite") {
+                    return Ok(());
                 }
                 store.rewrite_fresh()
             })();
@@ -459,6 +496,7 @@ impl Node {
             epoch: departure.epoch,
             now: self.now_ms().get(),
             routes: self.withdrawal_routes(&room),
+            awaiting_departure: !departure.alone,
         };
         let instance = Some(Arc::clone(&next.instance));
         let secret = Arc::clone(&next.secret);
@@ -739,6 +777,7 @@ impl Node {
                 paths: self.paths.clone(),
                 name,
                 retirement,
+                ended: purpose.is_none(),
             },
             After::Purge {
                 transition,
@@ -793,11 +832,13 @@ impl Node {
                     return;
                 }
                 self.withdrawn.insert(room, withdrawal.clone());
-                if let Some(net) = self.net.as_ref() {
-                    let _ = net.publish_local(&withdrawal.wire);
-                    for board in withdrawal.routes.keys() {
-                        if let Some(connection) = net.manager().existing(board) {
-                            Self::put_withdraws(&connection, vec![withdrawal.wire.clone()]);
+                if departure.alone {
+                    if let Some(net) = self.net.as_ref() {
+                        let _ = net.publish_local(&withdrawal.wire);
+                        for board in withdrawal.routes.keys() {
+                            if let Some(connection) = net.manager().existing(board) {
+                                Self::put_withdraws(&connection, vec![withdrawal.wire.clone()]);
+                            }
                         }
                     }
                 }
@@ -847,6 +888,11 @@ impl Node {
                 },
                 NativeSaved::Purge { retirement, result },
             ) => {
+                if let Some(pending) = self.withdrawn.get_mut(&room) {
+                    if result.is_ok() {
+                        pending.awaiting_departure = false;
+                    }
+                }
                 if let Some(retirement) = retirement {
                     self.session_rooms_retiring.insert(retirement);
                 }

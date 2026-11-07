@@ -550,6 +550,8 @@ fn detail_of(
             .collect(),
         synced: ch.is_settled(),
         own_feed_through: ch.own_verified_head(),
+        own_history_behind: ch.own_history_behind(),
+        own_history_forked: ch.own_history_forked(),
         equivocations: ch.equivocations(),
         creator: ch.genesis().creator_pubkey().fingerprint(),
         member_consent,
@@ -815,6 +817,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::AnchorNoteDue { .. } => "saying which anchors never took a room",
         NetEvent::SkdmTaken { .. } => "noting a key the recipient took",
         NetEvent::JoinBoardPublication { .. } => "retaining a join publication's rollback",
+        NetEvent::JoinNamePreflight { .. } => "reserving a joining room name",
         NetEvent::BoardGrew { .. } => "passing on a record that landed on our board",
         NetEvent::LeaveWaitOver { .. } => "answering a leave nobody took",
         NetEvent::BoardWithdrew => "showing a board a withdraw took records off",
@@ -1604,6 +1607,7 @@ enum NetEvent {
         availability: Option<crate::node::channel::availability::Token>,
         instance: std::sync::Weak<tokio::sync::Mutex<ChannelState>>,
         head: crate::node::history_stream::HeadHint,
+        departure_receipt: bool,
         epoch: u64,
         room_instance: [u8; 16],
         generation: Digest32,
@@ -1937,6 +1941,13 @@ enum NetEvent {
         attachment: u64,
         board: Arc<VoxConnection>,
         withdrawal: Option<Vec<u8>>,
+        ack: oneshot::Sender<crate::error::Result<()>>,
+    },
+    JoinNamePreflight {
+        channel_id: Digest32,
+        attachment: u64,
+        name: String,
+        timestamp_ms: u64,
         ack: oneshot::Sender<crate::error::Result<()>>,
     },
     /// A joiner's task finished: make the room, or say why not, and answer the command.
@@ -3523,6 +3534,8 @@ struct Joiner {
     parsed: crate::node::link::InviteLink,
     routes: Vec<(Digest32, crate::nat::multiaddr::EndpointList)>,
     signer: Arc<crate::atrest::vault::VaultRootSigner>,
+    store: Arc<crate::node::store::Store>,
+    resume_accepted: bool,
     ring: Arc<tokio::sync::Mutex<PrekeyRing>>,
     seq: u64,
     now: u64,
@@ -3610,7 +3623,7 @@ impl Drop for AnsweredIfAborted {
 
 /// A join that got in: what the actor needs to make the room.
 struct JoinerWon {
-    joined: crate::node::joinstream::JoinOutcome,
+    joined: JoinAccepted,
     responder: Digest32,
     conn: Arc<VoxConnection>,
     set: crate::nat::service::RecordSet,
@@ -3618,6 +3631,11 @@ struct JoinerWon {
     sealed: (crate::atrest::sek::Sek, crate::atrest::SekWrap),
     /// How long each step took: see `JoinSteps`.
     steps: JoinSteps,
+}
+
+enum JoinAccepted {
+    Fresh(Box<crate::node::joinstream::JoinOutcome>),
+    Resumed(Box<metadata_save::AcceptedJoin>),
 }
 
 /// A join that did not: the fault to answer with, and each responder's reason.
@@ -3666,7 +3684,7 @@ impl Joiner {
     /// identity remotely visible. The actor serializes the public recovery journal; a crash,
     /// failed seal or policy refusal can then withdraw without needing a stored room key.
     async fn retain_board_cleanup(&self, board: &Arc<VoxConnection>) -> Result<(), JoinerLost> {
-        self.retain_board_cleanup_at(board, 0, self.now)
+        self.retain_board_cleanup_at(board, 0, self.now, None)
             .await
             .map_err(|error| JoinerLost::of(fault_of(&error)))
     }
@@ -3679,7 +3697,22 @@ impl Joiner {
         board: &Arc<VoxConnection>,
         epoch: u64,
         timestamp_ms: u64,
+        name: Option<String>,
     ) -> crate::error::Result<()> {
+        if let Some(name) = name {
+            let (ack, received) = oneshot::channel();
+            self.tx
+                .send(NetEvent::JoinNamePreflight {
+                    channel_id: self.parsed.channel_id,
+                    attachment: self.attachment,
+                    name,
+                    timestamp_ms,
+                    ack,
+                })
+                .await
+                .map_err(|_| Error::AtRestLocked)?;
+            received.await.map_err(|_| Error::AtRestLocked)??;
+        }
         let withdrawal = crate::nat::withdraw::BoardWithdraw::build(
             self.signer.as_ref(),
             &self.parsed.channel_id,
@@ -3732,6 +3765,66 @@ impl Joiner {
             extra_helpers: self.routes.iter().map(|(peer, _)| *peer).collect(),
         }
     }
+
+    async fn erase_marker_for_verified_end(
+        &self,
+        genesis: Option<&crate::governance::genesis::Genesis>,
+        withdrawals: &[crate::nat::withdraw::BoardWithdraw],
+    ) -> crate::error::Result<bool> {
+        let room = self.parsed.channel_id;
+        let store = Arc::clone(&self.store);
+        let signer = Arc::clone(&self.signer);
+        let genesis = genesis.cloned();
+        #[cfg(not(feature = "test-knobs"))]
+        let withdrawals = withdrawals.to_vec();
+        #[cfg(feature = "test-knobs")]
+        let withdrawals = {
+            let mut evidence = withdrawals.to_vec();
+            if let (Some(path), Some(first)) = (
+                std::env::var_os("VOX_TEST_FORGED_END_FIRST_FILE"),
+                evidence.first().cloned(),
+            ) {
+                let path = std::path::PathBuf::from(path);
+                let mut receipt = path.as_os_str().to_owned();
+                receipt.push(".engaged");
+                let receipt = std::path::PathBuf::from(receipt);
+                if receipt.is_file() || std::fs::rename(path, &receipt).is_ok() {
+                    let mut forged = first;
+                    forged.timestamp_ms = forged.timestamp_ms.saturating_sub(1);
+                    evidence.insert(0, forged);
+                }
+            }
+            if !evidence.is_empty() {
+                if let Some(path) = std::env::var_os("VOX_TEST_END_EVIDENCE_FILE") {
+                    let path = std::path::PathBuf::from(path);
+                    if let Ok(bytes) = std::fs::read(&path) {
+                        if let Ok(withdrawal) =
+                            crate::nat::withdraw::BoardWithdraw::from_wire(&bytes)
+                        {
+                            let mut receipt = path.as_os_str().to_owned();
+                            receipt.push(".engaged");
+                            let _ = std::fs::write(std::path::PathBuf::from(receipt), b"engaged");
+                            evidence = vec![withdrawal];
+                        }
+                    }
+                }
+            }
+            evidence
+        };
+        let now = self.now;
+        secret_blocking(&self.secret_work, move || {
+            crate::node::channel::confirm_creator_end(
+                &store,
+                &signer,
+                &room,
+                genesis.as_ref(),
+                &withdrawals,
+                now,
+            )
+        })
+        .await
+        .unwrap_or(Err(Error::AtRestLocked))
+    }
     /// A board holding the room, when the boards in `tried` — starting with the one
     /// `reach_a_board` chose — had nothing for it, could not be read, or took no pre-join record:
     /// every other board the join's routes name, asked at once, and the first that holds it.
@@ -3751,6 +3844,7 @@ impl Joiner {
         tried: &std::collections::BTreeSet<Digest32>,
         mut why: Vec<String>,
         fault: Fault,
+        mut ends: Vec<crate::nat::withdraw::BoardWithdraw>,
         steps: &mut JoinSteps,
     ) -> std::result::Result<(Arc<VoxConnection>, crate::nat::service::RecordSet), JoinerLost> {
         use crate::node::network::short_id;
@@ -3786,19 +3880,6 @@ impl Joiner {
                             ),
                             None => format!("board {} could not be read: {e}", short_id(id)),
                         }),
-                        Ok(set) if set.genesis.is_none() => Err(match set.ended_by {
-                            Some(by) => format!(
-                                "board {} says room {} has ended: {} ended it",
-                                short_id(id),
-                                short_id(room),
-                                short_id(by)
-                            ),
-                            None => format!(
-                                "board {} has nothing for room {}",
-                                short_id(id),
-                                short_id(room)
-                            ),
-                        }),
                         Ok(set) => Ok((conn, set)),
                     },
                 };
@@ -3808,20 +3889,50 @@ impl Joiner {
         let mut others: Vec<(usize, String)> = Vec::new();
         while let Some(done) = asked.join_next().await {
             match done {
-                Ok((_, Ok(found))) => {
-                    steps.took("another board", t);
-                    return Ok(found);
+                Ok((at, Ok((conn, set)))) => {
+                    ends.extend(set.room_withdraws.iter().cloned());
+                    if !ends.is_empty()
+                        && self
+                            .erase_marker_for_verified_end(set.genesis.as_ref(), &ends)
+                            .await
+                            .map_err(|error| JoinerLost::of(fault_of(&error)))?
+                    {
+                        return Err(JoinerLost::of(Fault::JoinedRoomEnded));
+                    }
+                    if set.genesis.is_some() {
+                        steps.took("another board", t);
+                        return Ok((conn, set));
+                    }
+                    let said = match set.ended_by {
+                        Some(by) => format!(
+                            "board {} says room {} has ended: {} ended it",
+                            short_id(conn.peer_id()),
+                            short_id(room),
+                            short_id(by),
+                        ),
+                        None => format!(
+                            "board {} has nothing for room {}",
+                            short_id(conn.peer_id()),
+                            short_id(room)
+                        ),
+                    };
+                    others.push((at, said));
                 }
                 Ok((at, Err(said))) => others.push((at, said)),
-                Err(_) => {} // a task that panicked: nothing to take
+                Err(_) => {}
             }
         }
         others.sort();
         why.extend(others.into_iter().map(|(_, said)| said));
         steps.took("the other boards (none held the room)", t);
-        // A board that took the room off at its end says so (V030-14): that is the answer, not a
-        // room nobody published.
+        // A withdrawal without the room's authenticated authority is not proof of its end.
         let ended = why.iter().any(|w| w.contains(" has ended: "));
+        if !ends.is_empty() {
+            why.push(
+                "the room withdrawal could not be verified against this node's checkpoint"
+                    .to_owned(),
+            );
+        }
         Err(JoinerLost {
             fault: if ended { Fault::JoinedRoomEnded } else { fault },
             why,
@@ -3832,6 +3943,31 @@ impl Joiner {
     /// Say which step the join has begun, so a join stopped part-way can name it (V210-85).
     fn begin(&self, step: String) {
         let _ = self.events.send(NodeEvent::JoinStep { step });
+    }
+
+    #[cfg(feature = "test-knobs")]
+    async fn hold_durable_accepted_for_proof(&self) {
+        let Ok(spec) = std::env::var("VOX_TEST_HOLD_DURABLE_ACCEPTED") else {
+            return;
+        };
+        let mut paths = spec.splitn(3, '\t');
+        let (Some(arm), Some(engaged), Some(release)) = (paths.next(), paths.next(), paths.next())
+        else {
+            return;
+        };
+        if std::fs::remove_file(arm).is_err() {
+            return;
+        }
+        let _ = std::fs::remove_file(release);
+        let Ok(listener) = tokio::net::UnixListener::bind(release) else {
+            return;
+        };
+        if std::fs::write(engaged, b"durable accepted\n").is_err() {
+            return;
+        }
+        let _ = listener.accept().await;
+        let _ = std::fs::remove_file(engaged);
+        let _ = std::fs::remove_file(release);
     }
 
     /// Dial a peer, and tell the actor at once so it serves the connection's streams — the
@@ -4077,6 +4213,32 @@ impl Joiner {
             crate::node::network::short_id(board.peer_id())
         ));
         let fetched = net.fetch_channel(&board, &parsed.channel_id, 0).await;
+        #[cfg(feature = "test-knobs")]
+        let fetched = if fetched.is_ok() {
+            if let Some(path) = std::env::var_os("VOX_TEST_STALE_BOARD_FILE") {
+                let path = std::path::PathBuf::from(path);
+                let mut receipt = path.as_os_str().to_owned();
+                receipt.push(".engaged");
+                let receipt = std::path::PathBuf::from(receipt);
+                match std::fs::read(&path)
+                    .ok()
+                    .and_then(|wire| crate::nat::withdraw::BoardWithdraw::from_wire(&wire).ok())
+                {
+                    Some(withdrawal) if std::fs::rename(path, receipt).is_ok() => {
+                        Ok(crate::nat::service::RecordSet {
+                            ended_by: Some(withdrawal.author_id),
+                            room_withdraws: vec![withdrawal],
+                            ..Default::default()
+                        })
+                    }
+                    _ => fetched,
+                }
+            } else {
+                fetched
+            }
+        } else {
+            fetched
+        };
         steps.took(
             if fetched.is_ok() {
                 "fetch"
@@ -4092,8 +4254,34 @@ impl Joiner {
         let short = crate::node::network::short_id;
         let tried: std::collections::BTreeSet<Digest32> = [board.peer_id()].into();
         let found = match fetched {
-            Ok(set) if set.genesis.is_some() => (board, set),
+            Ok(set) if set.genesis.is_some() => {
+                if !set.room_withdraws.is_empty()
+                    && self
+                        .erase_marker_for_verified_end(set.genesis.as_ref(), &set.room_withdraws)
+                        .await
+                        .map_err(|error| JoinerLost::of(fault_of(&error)))?
+                {
+                    return Err(JoinerLost::of(Fault::JoinedRoomEnded));
+                }
+                (board, set)
+            }
             Ok(set) => {
+                #[cfg(feature = "test-knobs")]
+                if set.room_withdraws.is_empty()
+                    && crate::node::computer::fx28_mutant("end-erases-without-evidence")
+                {
+                    self.erase_marker_for_verified_end(None, &[])
+                        .await
+                        .map_err(|error| JoinerLost::of(fault_of(&error)))?;
+                }
+                if !set.room_withdraws.is_empty()
+                    && self
+                        .erase_marker_for_verified_end(None, &set.room_withdraws)
+                        .await
+                        .map_err(|error| JoinerLost::of(fault_of(&error)))?
+                {
+                    return Err(JoinerLost::of(Fault::JoinedRoomEnded));
+                }
                 let why = vec![match set.ended_by {
                     Some(by) => format!(
                         "board {} says room {} has ended: {} ended it",
@@ -4107,8 +4295,14 @@ impl Joiner {
                         short(parsed.channel_id)
                     ),
                 }];
-                self.another_board_with_the_room(&tried, why, Fault::RoomNotOnBoard, steps)
-                    .await?
+                self.another_board_with_the_room(
+                    &tried,
+                    why,
+                    Fault::RoomNotOnBoard,
+                    set.room_withdraws,
+                    steps,
+                )
+                .await?
             }
             Err(e) => {
                 let fault = on_the_board(fault_of(&e));
@@ -4144,7 +4338,7 @@ impl Joiner {
                     ),
                     None => format!("board {} could not be read: {e}", short(board.peer_id())),
                 }];
-                self.another_board_with_the_room(&tried, why, fault, steps)
+                self.another_board_with_the_room(&tried, why, fault, Vec::new(), steps)
                     .await
                     .map_err(|mut lost| {
                         if offline.is_some()
@@ -4227,6 +4421,39 @@ impl Joiner {
         {
             return Err(JoinerLost::of(Fault::UnsupportedRoomFormat));
         }
+        if self.resume_accepted {
+            let store = Arc::clone(&self.store);
+            let signer = Arc::clone(&self.signer);
+            let room = parsed.channel_id;
+            let passphrase = self.passphrase.clone();
+            let (accepted, sek) = secret_blocking(&self.secret_work, move || {
+                let mut accepted = metadata_save::load_accepted_joins(&store, &signer)?;
+                let accepted = accepted
+                    .remove(&room)
+                    .ok_or(Error::Profile("accepted join obligation missing"))?;
+                let factor = crate::atrest::idfactor::SignatureIdentityFactor::new(&*signer);
+                let sek = accepted.wrap.unwrap_sek(&factor, &room, &passphrase)?;
+                Ok::<_, Error>((accepted, sek))
+            })
+            .await
+            .unwrap_or(Err(Error::AtRestLocked))
+            .map_err(|error| JoinerLost::of(fault_of(&error)))?;
+            if set.genesis.as_ref().map(|g| g.channel_id()) != Some(accepted.genesis.channel_id()) {
+                return Err(JoinerLost::of(Fault::BadLink));
+            }
+            let responder = accepted.responder_key.fingerprint();
+            let genesis = accepted.genesis.clone();
+            let wrap = accepted.wrap.clone();
+            return Ok(JoinerWon {
+                joined: JoinAccepted::Resumed(Box::new(accepted)),
+                responder,
+                conn: board,
+                set,
+                genesis,
+                sealed: (sek, wrap),
+                steps: JoinSteps::default(),
+            });
+        }
         let short = crate::node::network::short_id;
         let prejoin_wire = {
             let signer: &crate::atrest::vault::VaultRootSigner = &self.signer;
@@ -4278,7 +4505,7 @@ impl Joiner {
             tried.insert(board.peer_id());
             let fault = on_the_board(fault_of(&e));
             (board, set) = self
-                .another_board_with_the_room(&tried, refused.clone(), fault, steps)
+                .another_board_with_the_room(&tried, refused.clone(), fault, Vec::new(), steps)
                 .await?;
         }
         let Some(genesis) = set.genesis.clone() else {
@@ -4317,6 +4544,17 @@ impl Joiner {
             ordered.truncate(MAX_JOIN_RESPONDERS);
             ordered
         };
+        // Generate the double-lock wrap before the responder can commit admission.
+        let sek = crate::atrest::sek::Sek::generate().map_err(|e| JoinerLost::of(fault_of(&e)))?;
+        let factor_id = id_factor_for(&self.signer, &parsed.channel_id)
+            .map_err(|e| JoinerLost::of(fault_of(&e)))?;
+        let (passphrase, argon2) = (self.passphrase.clone(), self.argon2);
+        let t = std::time::Instant::now();
+        self.begin("sealing the room key under the passphrase".to_owned());
+        let sealed = seal_off_actor(&self.secret_work, &factor_id, sek, passphrase, argon2)
+            .await
+            .map_err(|e| JoinerLost::of(fault_of(&e)))?;
+        steps.took("seal", t);
         let mut why: Vec<String> = Vec::new();
         let mut last_fault = Fault::Unreachable;
         let mut joined_outcome = None;
@@ -4465,10 +4703,86 @@ impl Joiner {
                 "the join exchange with member {short} (this machine's proof of work, then \
                  the member's answer)"
             ));
+            let mut board_withdrawal = None;
+            for withdrawal in &set.withdraws {
+                if withdrawal.channel_id == parsed.channel_id
+                    && withdrawal.author_id == self.me
+                    && withdrawal.scope == crate::nat::withdraw::WithdrawScope::Member
+                {
+                    withdrawal
+                        .verify(&crate::identity::composite::RootSigner::public_key(
+                            self.signer.as_ref(),
+                        ))
+                        .map_err(|e| JoinerLost::of(fault_of(&e)))?;
+                    board_withdrawal = Some(
+                        board_withdrawal.map_or(withdrawal.timestamp_ms, |old: u64| {
+                            old.max(withdrawal.timestamp_ms)
+                        }),
+                    );
+                }
+            }
+            let prepared = std::sync::atomic::AtomicBool::new(false);
+            let accepted = std::sync::atomic::AtomicBool::new(false);
             let exchanged = net
-                .start_join(&conn, ctx, &self.passphrase, signer, &ik, |proposal| {
-                    self.retain_board_cleanup_at(&conn, proposal.epoch, proposal.timestamp_ms)
-                })
+                .start_join(
+                    &conn,
+                    ctx,
+                    &self.passphrase,
+                    signer,
+                    &ik,
+                    |proposal| {
+                        let prepared = &prepared;
+                        let conn = &conn;
+                        async move {
+                            if board_withdrawal.is_some_and(|at| at >= proposal.timestamp_ms) {
+                                return Err(Error::Profile(
+                                    "admission is not newer than the retained member withdrawal",
+                                ));
+                            }
+                            self.retain_board_cleanup_at(
+                                conn,
+                                proposal.epoch,
+                                proposal.timestamp_ms,
+                                proposal.room_name,
+                            )
+                            .await?;
+                            prepared.store(true, std::sync::atomic::Ordering::Release);
+                            Ok(())
+                        }
+                    },
+                    |proposal, witness, responder_key| {
+                        let store = Arc::clone(&self.store);
+                        let signer = Arc::clone(&self.signer);
+                        let genesis = genesis.clone();
+                        let wrap = sealed.1.clone();
+                        let room = parsed.channel_id;
+                        let accepted = &accepted;
+                        async move {
+                            secret_blocking(&self.secret_work, move || {
+                                metadata_save::retain_accepted_join_native(
+                                    &store,
+                                    &signer,
+                                    room,
+                                    &proposal,
+                                    &witness,
+                                    &genesis,
+                                    &wrap,
+                                    &responder_key,
+                                )
+                            })
+                            .await
+                            .unwrap_or(Err(Error::AtRestLocked))?;
+                            accepted.store(true, std::sync::atomic::Ordering::Release);
+                            #[cfg(feature = "test-knobs")]
+                            if std::env::var_os("VOX_TEST_FAIL_RETAINED_ACCEPTED").is_some() {
+                                return Err(Error::Profile("test interrupted retained Accepted"));
+                            }
+                            #[cfg(feature = "test-knobs")]
+                            self.hold_durable_accepted_for_proof().await;
+                            Ok(())
+                        }
+                    },
+                )
                 .await;
             // **The solve apart from the rest** (V210-62): the proof of work is this machine's
             // own CPU and random in length by design, the rest is waiting on the responder. One
@@ -4503,6 +4817,18 @@ impl Joiner {
                     } else {
                         why.push(format!("{short}: exchange: {e}"));
                     }
+                    if prepared.load(std::sync::atomic::Ordering::Acquire) {
+                        why.push(if accepted.load(std::sync::atomic::Ordering::Acquire) {
+                            "admission was accepted and retained; local completion remains pending".to_owned()
+                        } else {
+                            "remote admission may have occurred; retry requires a new authenticated exchange".to_owned()
+                        });
+                        return Err(JoinerLost {
+                            fault: last_fault,
+                            why,
+                            steps: JoinSteps::default(),
+                        });
+                    }
                     if !worth_another_responder(last_fault) {
                         return Err(JoinerLost {
                             fault: last_fault,
@@ -4520,22 +4846,8 @@ impl Joiner {
                 steps: JoinSteps::default(),
             });
         };
-        // The room key, sealed under the passphrase with production Argon2id — seconds of CPU,
-        // on a blocking thread and not the actor. That thread gets the passphrase and nothing
-        // else (V210-94): the identity half of the key is taken here, where a lock's abort
-        // reaches, and so is the SEK.
-        let sek = crate::atrest::sek::Sek::generate().map_err(|e| JoinerLost::of(fault_of(&e)))?;
-        let factor_id = id_factor_for(&self.signer, &parsed.channel_id)
-            .map_err(|e| JoinerLost::of(fault_of(&e)))?;
-        let (passphrase, argon2) = (self.passphrase.clone(), self.argon2);
-        let t = std::time::Instant::now();
-        self.begin("sealing the room key under the passphrase".to_owned());
-        let sealed = seal_off_actor(&self.secret_work, &factor_id, sek, passphrase, argon2)
-            .await
-            .map_err(|e| JoinerLost::of(fault_of(&e)))?;
-        steps.took("seal", t);
         Ok(JoinerWon {
-            joined,
+            joined: JoinAccepted::Fresh(Box::new(joined)),
             responder,
             conn,
             set,
@@ -5647,7 +5959,7 @@ impl EventStream {
 
 const PENDING_WITHDRAWALS_META_KEY: &str = "pending-board-withdrawals";
 const PENDING_JOIN_CLEANUP_META_KEY: &str = "pending-join-board-cleanup";
-const PENDING_WITHDRAWALS_VERSION: u64 = 1;
+const PENDING_WITHDRAWALS_VERSION: u64 = 2;
 const MAX_PENDING_WITHDRAWALS: usize = 4096;
 const MAX_WITHDRAWAL_TARGETS: usize = 4096;
 const MAX_WITHDRAWAL_ROUTES: usize = 64;
@@ -5657,6 +5969,8 @@ const MAX_WITHDRAWAL_ROUTES: usize = 64;
 struct PendingWithdrawal {
     wire: Vec<u8>,
     routes: BTreeMap<Digest32, Vec<std::net::SocketAddr>>,
+    /// A normal Leave must first deliver its signed departure to a peer.
+    awaiting_departure: bool,
 }
 
 fn pending_withdrawals_bytes(
@@ -5673,7 +5987,7 @@ fn pending_withdrawals_bytes(
         if withdrawal.routes.len() > MAX_WITHDRAWAL_TARGETS {
             return Err(Error::SizeLimitExceeded("pending withdrawal targets"));
         }
-        e.array(3)
+        e.array(4)
             .bytes(room)
             .bytes(&withdrawal.wire)
             .array(withdrawal.routes.len());
@@ -5686,6 +6000,7 @@ fn pending_withdrawals_bytes(
                 e.text(&route.to_string());
             }
         }
+        e.uint(u64::from(withdrawal.awaiting_departure));
     }
     Ok(e.finish())
 }
@@ -5695,9 +6010,11 @@ fn read_pending_withdrawals(
 ) -> crate::error::Result<BTreeMap<Digest32, PendingWithdrawal>> {
     let bad = |why| Error::MalformedAtRest(why);
     let mut d = crate::cbor::Decoder::new(bytes);
-    if d.array().map_err(|_| bad("pending withdrawals"))? != 2
-        || d.uint().map_err(|_| bad("pending withdrawals version"))? != PENDING_WITHDRAWALS_VERSION
-    {
+    if d.array().map_err(|_| bad("pending withdrawals"))? != 2 {
+        return Err(bad("pending withdrawals version"));
+    }
+    let version = d.uint().map_err(|_| bad("pending withdrawals version"))?;
+    if version != 1 && version != PENDING_WITHDRAWALS_VERSION {
         return Err(bad("pending withdrawals version"));
     }
     let count = d.array().map_err(|_| bad("pending withdrawals count"))?;
@@ -5706,7 +6023,7 @@ fn read_pending_withdrawals(
     }
     let mut pending = BTreeMap::new();
     for _ in 0..count {
-        if d.array().map_err(|_| bad("pending withdrawal"))? != 3 {
+        if d.array().map_err(|_| bad("pending withdrawal"))? != if version == 1 { 3 } else { 4 } {
             return Err(bad("pending withdrawal arity"));
         }
         let room = Digest32::try_from(d.bytes().map_err(|_| bad("pending withdrawal room"))?)
@@ -5746,7 +6063,23 @@ fn read_pending_withdrawals(
             }
             routes.insert(target, target_routes);
         }
-        pending.insert(room, PendingWithdrawal { wire, routes });
+        let awaiting_departure = if version == 1 {
+            false
+        } else {
+            match d.uint().map_err(|_| bad("pending withdrawal departure"))? {
+                0 => false,
+                1 => true,
+                _ => return Err(bad("pending withdrawal departure")),
+            }
+        };
+        pending.insert(
+            room,
+            PendingWithdrawal {
+                wire,
+                routes,
+                awaiting_departure,
+            },
+        );
     }
     d.finish()
         .map_err(|_| bad("pending withdrawals trailing"))?;
@@ -6239,6 +6572,8 @@ pub struct Node {
     sync_book: crate::node::status::SharedSyncBook,
     /// Rooms this node is joining right now (their join is on a `Joiner` task).
     joining: std::collections::BTreeSet<Digest32>,
+    join_name_reservations: BTreeMap<Digest32, String>,
+    rename_name_reservations: BTreeMap<Digest32, String>,
     /// Joins this node answered, `(room, joiner)`, and when: until the joiner's first clean
     /// session, or [`JOINER_SEAL_GRACE`], a session with it that fails is the join still settling,
     /// not a failed sync, and is not reported (#406).
@@ -6919,6 +7254,8 @@ impl Node {
             seat_promises: BTreeMap::new(),
             secret_work: Arc::new(tokio::sync::RwLock::new(())),
             joining: std::collections::BTreeSet::new(),
+            join_name_reservations: BTreeMap::new(),
+            rename_name_reservations: BTreeMap::new(),
             joins_answered: BTreeMap::new(),
             reopening: std::collections::BTreeSet::new(),
             reopen_failures: BTreeMap::new(),
@@ -7646,7 +7983,17 @@ impl Node {
                         continue;
                     }
                     if let NodeCommand::LeaveRoom { channel_id } = command {
-                        self.begin_own_key_leave(channel_id, reply).await;
+                        if self.join_name_reservations.contains_key(&channel_id)
+                            && self.join_cleanup.contains_key(&channel_id)
+                        {
+                            if self.joining.contains(&channel_id) {
+                                let _ = reply.send(Outcome::Failed(Fault::RoomChangePending));
+                            } else {
+                                self.begin_metadata_cancel_accepted(channel_id, reply);
+                            }
+                        } else {
+                            self.begin_own_key_leave(channel_id, reply).await;
+                        }
                         self.note_if_stalled(name, started);
                         self.publish().await;
                         self.schedule().await;
@@ -7888,6 +8235,9 @@ impl Node {
                         self.publish().await;
                         continue;
                     }
+                    // Give lifecycle work the room's free save turn before no-op reads or
+                    // settlement can take it on every tick and starve an ended room forever.
+                    let tended = self.tend_lifecycle().await;
                     self.reclaim_session_drive_receipt().await;
                     // Empty read and key-prune work both take a room's durable owner.
                     // Alternate priority so neither can starve the other; advance the
@@ -7936,9 +8286,6 @@ impl Node {
                     }
                     self.redial_anchors_if_due();
                     self.say_where_if_due().await;
-                    // A room forgotten, gone quiet, or back from a join changes what a person is
-                    // shown: the view is published for it below, not left until the next event.
-                    let tended = self.tend_lifecycle().await;
                     // A rotation's re-keys go out as the remaining consenters become
                     // reachable, which is why they are retried here and not only at
                     // the moment of rotation (M18.1).
@@ -9120,6 +9467,7 @@ impl Node {
         if waiting.kind != RoomPublicationKind::Open {
             match self.publish_room_settings(room, &waiting) {
                 Ok(true) => {
+                    self.rename_name_reservations.remove(&room);
                     if let Some(reply) = waiting.reply {
                         let _ = reply.send(waiting.outcome);
                     }
@@ -9140,6 +9488,7 @@ impl Node {
                     self.publish_waiters.insert(room, waiting);
                 }
                 Err(error) => {
+                    self.rename_name_reservations.remove(&room);
                     let fault =
                         if matches!(error, Error::Profile("room publication instance changed")) {
                             Fault::ChannelNotOpen
@@ -10738,6 +11087,51 @@ impl Node {
                 });
                 let _ = ack.send(());
             }
+            NetEvent::JoinNamePreflight {
+                channel_id,
+                attachment,
+                name,
+                timestamp_ms,
+                ack,
+            } => {
+                let me = self.net.as_ref().map(|net| net.local_id());
+                let retained = self
+                    .withdrawn
+                    .get(&channel_id)
+                    .and_then(|entry| {
+                        crate::nat::withdraw::BoardWithdraw::from_wire(&entry.wire).ok()
+                    })
+                    .filter(|w| {
+                        Some(w.author_id) == me
+                            && w.scope == crate::nat::withdraw::WithdrawScope::Member
+                    })
+                    .map(|w| w.timestamp_ms);
+                let board = self.net.as_ref().and_then(|net| {
+                    net.board_member_withdraws(&channel_id)
+                        .into_iter()
+                        .filter(|w| Some(w.author_id) == me)
+                        .map(|w| w.timestamp_ms)
+                        .max()
+                });
+                let newest = retained.into_iter().chain(board).max();
+                let result =
+                    if attachment != self.delivery_epoch || !self.joining.contains(&channel_id) {
+                        Err(Error::AtRestLocked)
+                    } else if self
+                        .room_named(&name)
+                        .is_some_and(|held| held != channel_id)
+                    {
+                        Err(Error::Profile("room name already reserved"))
+                    } else if newest.is_some_and(|at| at >= timestamp_ms) {
+                        Err(Error::Profile(
+                            "admission is not newer than the retained member withdrawal",
+                        ))
+                    } else {
+                        self.join_name_reservations.insert(channel_id, name);
+                        Ok(())
+                    };
+                let _ = ack.send(result);
+            }
             NetEvent::JoinBoardPublication {
                 channel_id,
                 attachment,
@@ -10769,6 +11163,9 @@ impl Node {
                         self.begin_construct_joined(*parsed, passphrase, now, me, won, reply);
                     }
                     Err(lost) => {
+                        if !self.join_cleanup.contains_key(&room) {
+                            self.join_name_reservations.remove(&room);
+                        }
                         let _ = self.event_tx.send(NodeEvent::JoinSteps {
                             joined: false,
                             steps: lost.steps.render(),
@@ -10793,6 +11190,7 @@ impl Node {
                 let room = genesis.channel_id();
                 match sealed {
                     Err(error) => {
+                        self.join_name_reservations.remove(&room);
                         self.answer_when_published(room, reply, Outcome::Failed(fault_of(&error)))
                             .await
                     }
@@ -11288,11 +11686,13 @@ impl Node {
                 }
                 puts.extend(
                     self.withdrawn
-                        .values()
-                        .filter(|pending| {
-                            pending.routes.contains_key(&peer) || self.anchors.get(&peer).is_some()
+                        .iter()
+                        .filter(|(_, pending)| {
+                            !pending.awaiting_departure
+                                && (pending.routes.contains_key(&peer)
+                                    || self.anchors.get(&peer).is_some())
                         })
-                        .map(|pending| pending.wire.clone()),
+                        .map(|(_, pending)| pending.wire.clone()),
                 );
                 Self::put_withdraws(&conn, puts);
                 self.read_anchor_boards(Some(peer)).await;
@@ -11364,6 +11764,7 @@ impl Node {
                     .and_then(|net| net.manager().existing(&peer));
                 if let Some(conn) = &conn {
                     self.note_peer_endpoint(conn);
+                    self.rearm_routed_origin(peer, conn.serial());
                     self.pull_presentation(peer);
                 }
                 // A fresh connection syncs at once (ADR-016): a request on every port it shares,
@@ -11430,6 +11831,14 @@ impl Node {
                 }
             }
             NetEvent::ConnectionClosed { peer, serial } => {
+                if self.history_hints.retire_connection(peer, serial) {
+                    for ((room, member), port) in &mut self.ports {
+                        if *member == peer && self.history_hints.pending(*room, peer) {
+                            port.raise();
+                            self.sched_rooms.insert(*room);
+                        }
+                    }
+                }
                 let current = self
                     .net
                     .as_ref()
@@ -11703,7 +12112,9 @@ impl Node {
                 if let Some(wire) = self
                     .withdrawn
                     .get(&channel_id)
-                    .filter(|pending| pending.routes.contains_key(&board))
+                    .filter(|pending| {
+                        !pending.awaiting_departure && pending.routes.contains_key(&board)
+                    })
                     .map(|pending| pending.wire.clone())
                 {
                     if let Some(conn) = self
@@ -12445,6 +12856,7 @@ impl Node {
                 availability,
                 instance,
                 head,
+                departure_receipt,
                 epoch,
                 room_instance,
                 generation,
@@ -12491,7 +12903,10 @@ impl Node {
                                         )
                                     })
                                     .is_some_and(|result| matches!(result, Ok(true)));
-                            let acknowledged = if current {
+                            #[cfg(feature = "test-knobs")]
+                            let departure_receipt = departure_receipt
+                                || crate::node::computer::fx28_mutant("leave-any-head");
+                            let acknowledged = if current && departure_receipt {
                                 room.note_history_head_complete(profile.store(), head)
                                     .ok()
                                     .flatten()
@@ -12551,6 +12966,9 @@ impl Node {
                 let departure_receipt = current
                     .as_ref()
                     .is_some_and(|attempt| attempt.is_departure_receipt());
+                let limited_recovery = current
+                    .as_ref()
+                    .is_some_and(|attempt| attempt.limited_recovery);
                 // Count the actual user-visible transfer edge even if the round later ends
                 // partial, fails, or its actor attempt has already retired. A sent history
                 // object, or a newly accepted symmetric inventory hint, did happen and must not
@@ -12601,7 +13019,7 @@ impl Node {
                     // extra inventory request when a scoped parked hint is later discarded.
                     self.sched_rooms.insert(channel_id);
                 }
-                let still_departed = if departure_receipt {
+                let still_departed = if departure_receipt || limited_recovery {
                     match self.channels.get(&channel_id) {
                         Some(shared) => {
                             let room = shared.lock().await;
@@ -13466,6 +13884,8 @@ impl Node {
         self.join_tasks.spawn(async move {
             let _slot = slot;
             let _carried = conn;
+            let proposal_room = Arc::clone(&shared);
+            let proposal_store = Arc::clone(&store);
             let original = admission_room.clone();
             let mut lifetime = None;
             let admission_lifetime = &mut lifetime;
@@ -13481,6 +13901,15 @@ impl Node {
                     &ring,
                     pending_joins,
                     signals,
+                    move |identity| async move {
+                        let channel = proposal_room.lock().await;
+                        if !channel.can_answer_join() || channel.epoch() != epoch {
+                            return Err(Error::JoinRefused("room changed before proposal"));
+                        }
+                        let history =
+                            channel.classify_joiner_history(&proposal_store, &identity)?;
+                        Ok((channel.name().map(str::to_owned), history))
+                    },
                     // **The admission lands before the joiner is told it is in.** Awaited here, on
                     // this task, so the actor is never the thing waiting — which is the whole point
                     // of the slot. See `NetEvent::JoinAdmit`.
@@ -14681,6 +15110,16 @@ impl Node {
             let _ = reply.send(Outcome::Failed(Fault::RoomChangePending));
             return;
         }
+        if self
+            .withdrawn
+            .get(&parsed.channel_id)
+            .is_some_and(|pending| pending.awaiting_departure)
+        {
+            let _ = reply.send(Outcome::Failed(Fault::LeaveNotHeard));
+            return;
+        }
+        let resume_accepted = self.join_name_reservations.contains_key(&parsed.channel_id)
+            && self.join_cleanup.contains_key(&parsed.channel_id);
         let (Some(net), Some(ring)) = (
             self.net.as_ref().map(Arc::clone),
             self.prekeys.as_ref().map(Arc::clone),
@@ -14690,7 +15129,12 @@ impl Node {
         };
         // A room this identity left is joined again from scratch (V030-08: rejoining is just
         // joining again): what this node still holds of it goes first.
-        if let Some(shared) = self.channels.get(&parsed.channel_id).map(Arc::clone) {
+        if let Some(shared) = self
+            .channels
+            .get(&parsed.channel_id)
+            .filter(|_| !resume_accepted)
+            .map(Arc::clone)
+        {
             let left = {
                 let ch = shared.lock().await;
                 ch.has_left(&ch.me())
@@ -14724,7 +15168,7 @@ impl Node {
                 Ok(_) => {}
             }
         }
-        if self.channels.contains_key(&parsed.channel_id) {
+        if self.channels.contains_key(&parsed.channel_id) && !resume_accepted {
             // A held room's address is where its host is now (V210-167), not a refusal: see
             // `reach_by_address`.
             self.reach_by_address(&parsed, net, reply).await;
@@ -14737,10 +15181,12 @@ impl Node {
         // **A room this profile holds, closed, is opened by its passphrase** (#412): joining it
         // again found it in the profile and failed as an internal error, so a member whose room
         // stayed closed could not get back in. Its address and passphrase are what open it.
-        if matches!(
-            profile.store().get_sek_wrap(&parsed.channel_id),
-            Ok(Some(_))
-        ) {
+        if !resume_accepted
+            && matches!(
+                profile.store().get_sek_wrap(&parsed.channel_id),
+                Ok(Some(_))
+            )
+        {
             self.begin_open_channel(parsed.channel_id, passphrase, reply);
             return;
         }
@@ -14748,6 +15194,7 @@ impl Node {
             let _ = reply.send(Outcome::Failed(Fault::Locked));
             return;
         };
+        let store = profile.store_handle();
         let now_ms = self.now_ms();
         // The pre-join record is stamped in milliseconds.
         let now = now_ms.get();
@@ -14807,6 +15254,8 @@ impl Node {
             parsed: parsed.clone(),
             routes,
             signer,
+            store,
+            resume_accepted,
             ring,
             seq,
             now,
@@ -15467,6 +15916,26 @@ impl Node {
     /// refusals. Retire selected logical roots even for a newly untrusted peer; physical
     /// workers retain their own staging until cleanup. Ordinary room traffic does not do this.
     fn note_key_body_trust_change(&mut self) {
+        let revoked_limited: Vec<_> = self
+            .ports
+            .iter()
+            .filter(|((_, peer), _)| !self.trust.is_trusted(peer))
+            .flat_map(|(key, port)| {
+                port.inbound.iter().filter_map(|(token, attempt)| {
+                    attempt.limited_recovery.then_some((*key, *token))
+                })
+            })
+            .collect();
+        for ((room, peer), token) in revoked_limited {
+            if let Some(attempt) = self
+                .ports
+                .get_mut(&(room, peer))
+                .and_then(|port| port.take(token))
+            {
+                attempt.retire();
+            }
+            self.retire_departed_port(room, peer);
+        }
         for ((_, peer), attempt) in &self.own_key_active {
             if !self.trust.is_trusted(peer) {
                 attempt.cancel.send_replace(true);
@@ -15786,6 +16255,18 @@ impl Node {
                 let observed = (connection.serial(), token);
                 if port.availability_seen != Some(observed) {
                     port.availability_seen = Some(observed);
+                    self.history_hints.rearm_source_progress(
+                        *room,
+                        *peer,
+                        connection.serial(),
+                        token,
+                    );
+                    self.bounded_sync.rehome_source_progress(
+                        *room,
+                        *peer,
+                        connection.serial(),
+                        token,
+                    );
                     port.support_discovery_check = true;
                     port.support_discovery = None;
                     port.support_discovery_unavailable = None;
@@ -16603,6 +17084,7 @@ impl Node {
             fence: Arc::clone(&fence),
             running,
             departure_receipt: None,
+            limited_recovery: false,
             reason,
         });
         if !port.out.install(service, &mut attempt) {
@@ -16770,6 +17252,7 @@ impl Node {
                 fence: Arc::clone(&fence),
                 running,
                 departure_receipt: None,
+                limited_recovery: false,
                 reason: crate::node::status::RoundReason::Served,
             },
         );
@@ -17508,6 +17991,19 @@ impl Node {
         } else {
             false
         };
+        // A verified post-departure admission permits only authenticated own-history recovery.
+        // The history server checks the requester's exact author and object scope again.
+        let recovery_standing = if history.is_some() && self.trust.is_trusted(&peer) {
+            match (self.channels.get(&channel_id), self.log_store()) {
+                (Some(shared), Some(store)) => {
+                    let room = shared.lock().await;
+                    room.has_left(&peer) && room.recovery_standing(&store, &peer).unwrap_or(false)
+                }
+                _ => false,
+            }
+        } else {
+            false
+        };
         // The server still permits ONLY Head(peer) in this case; purpose alone never
         // permits inventory, another author's head, proofs, contexts or bodies.
         if !departure_receipt && !roster_attempted {
@@ -17548,7 +18044,11 @@ impl Node {
             }
             None => false,
         };
-        if !departure_receipt && !admitted {
+        #[cfg(feature = "test-knobs")]
+        let departed_mutant = crate::node::computer::fx28_mutant("sync-departed-peer");
+        #[cfg(not(feature = "test-knobs"))]
+        let departed_mutant = false;
+        if !departed_mutant && !departure_receipt && !recovery_standing && !admitted {
             // Refused explicitly, with the same coded reset as a stream kind the peer may not
             // open, rather than left to read for a frame that never comes.
             let (mut send, mut recv) = (send, recv);
@@ -17570,7 +18070,7 @@ impl Node {
         }
         // Admitted: the port exists for the room instance held now (it may not have been
         // discovered yet, since the peer spoke first).
-        if departure_receipt {
+        if departed_mutant || departure_receipt || recovery_standing {
             if let Some((room, gen, epoch, sparse, availability)) =
                 self.room_ref(&channel_id, &peer).await
             {
@@ -17585,7 +18085,7 @@ impl Node {
             return;
         }
         if let Some(preamble) = history {
-            self.start_bounded_inbound(peer, conn, preamble, send, recv);
+            self.start_bounded_inbound(peer, conn, preamble, send, recv, recovery_standing);
         } else {
             let transport = accept_sync(tokio::runtime::Handle::current(), send, recv);
             self.start_inbound(channel_id, peer, conn, transport);
@@ -17599,6 +18099,7 @@ impl Node {
         preamble: crate::node::history_stream::Preamble,
         mut send: quinn::SendStream,
         mut recv: quinn::RecvStream,
+        limited_recovery: bool,
     ) {
         use crate::node::history_budget::Lane;
         use crate::node::history_stream::Purpose;
@@ -17652,6 +18153,7 @@ impl Node {
                 fence: Arc::clone(&fence),
                 running,
                 departure_receipt: Some(Arc::clone(&departure_receipt)),
+                limited_recovery,
                 reason: crate::node::status::RoundReason::Served,
             },
         );
@@ -18603,6 +19105,8 @@ impl Node {
         // An aborted joiner never reports back, so nothing is being joined any more, and what was
         // held for the join goes with the network.
         self.joining.clear();
+        self.join_name_reservations.clear();
+        self.rename_name_reservations.clear();
         // **Refused, never dropped** (ADR-030 W-4): a stream ended without an answer is what a node
         // older than key delivery in a session of its own does, and its sender would mark this node
         // older and send it its keys without post-compromise protection. A held key is refused as
@@ -18850,6 +19354,8 @@ impl Node {
                 return;
             }
         };
+        self.join_name_reservations
+            .insert(genesis.channel_id(), room_name.clone());
         let argon2 = self.argon2;
         let tx = self.net_tx.clone();
         let secret_work = Arc::clone(&self.secret_work);
@@ -18921,7 +19427,7 @@ impl Node {
         self.board_routes.retain(|(room, _), _| room != channel_id);
         if let Some(net) = self.net.as_ref() {
             net.membership().clear_channel(channel_id);
-            net.forget_room_on_board(channel_id);
+            net.retract_room_on_board(channel_id);
         }
     }
     /// Reopen every room this node held open, as it was before it stopped (#208).
@@ -18941,7 +19447,7 @@ impl Node {
         // re-verifies its whole log, and that runs **off the actor**, one room at a time, each
         // held as soon as it is open: with many rooms, a reopen on the actor answered nobody until
         // the last one was open.
-        let (store, rooms, me, retained_legacy) = {
+        let (store, rooms, me, signer, retained_legacy) = {
             let Some(profile) = self.profile.as_ref() else {
                 return;
             };
@@ -18954,14 +19460,21 @@ impl Node {
             };
             let rooms: Vec<_> = set
                 .rooms()
-                .filter(|(id, _)| !self.channels.contains_key(*id))
+                .filter(|(id, _)| {
+                    !(self.channels.contains_key(*id)
+                        || self.join_cleanup.contains_key(*id)
+                            && self.join_name_reservations.contains_key(*id))
+                })
                 .map(|(id, keys)| (*id, keys.sek.clone(), keys.passphrase.clone()))
                 .collect();
             let Ok(retained_legacy) = crate::node::history_demand::retained_legacy_owner(profile)
             else {
                 return;
             };
-            (profile.store_handle(), rooms, me, retained_legacy)
+            let Ok(signer) = profile.signer_arc() else {
+                return;
+            };
+            (profile.store_handle(), rooms, me, signer, retained_legacy)
         };
         if rooms.is_empty() {
             return;
@@ -18972,6 +19485,7 @@ impl Node {
         let task = tokio::spawn(async move {
             for (id, sek, passphrase) in rooms {
                 let store = Arc::clone(&store);
+                let signer = Arc::clone(&signer);
                 let paused_legacy_owner = retained_legacy_owner_for(retained_legacy, id);
                 // The room's key and passphrase go to a blocking thread, which a lock waits for
                 // (V210-94).
@@ -18989,6 +19503,7 @@ impl Node {
                     }
                     ChannelState::open_with_sek_owned(
                         &store,
+                        &signer,
                         &id,
                         sek,
                         &passphrase,
@@ -19091,6 +19606,7 @@ impl Node {
                 let sek = wrap.unwrap_sek(&factor, &channel_id, &passphrase)?;
                 ChannelState::open_with_sek_owned(
                     &store,
+                    &signer,
                     &channel_id,
                     sek,
                     &passphrase,
@@ -20521,6 +21037,17 @@ impl Node {
         if !current_departure {
             return;
         }
+        // The signed departure is now applied by a peer. Only now may a board withdrawal
+        // veto the readmission that allowed that peer to receive the departure.
+        if let (Some(net), Some(withdrawal)) = (self.net.as_ref(), self.withdrawn.get(&channel_id))
+        {
+            let _ = net.publish_local(&withdrawal.wire);
+            for board in withdrawal.routes.keys() {
+                if let Some(connection) = net.manager().existing(board) {
+                    Self::put_withdraws(&connection, vec![withdrawal.wire.clone()]);
+                }
+            }
+        }
         if let Some(instance) = self.channels.get(&channel_id).cloned() {
             self.begin_own_key_left_purge(
                 channel_id,
@@ -20759,10 +21286,10 @@ impl Node {
                 .filter(|d| !departed.contains(d))
                 .copied()
                 .collect();
-            let newly: Vec<Digest32> = departed
+            let newly: Vec<(Digest32, Option<u64>)> = departed
                 .iter()
                 .filter(|d| !seen.contains(*d))
-                .copied()
+                .map(|d| (*d, ch.last_departure_ms(d)))
                 .collect();
             // Durable refusals are scoped by the source and author's signed membership
             // incarnations. They are invalidated lazily, one indexed relationship at a time,
@@ -20773,13 +21300,11 @@ impl Node {
             // Returning peers stay in this same book until the actual native reset terminal.
             seen.extend(departed.iter().copied());
             let over = ch.ended(now_ms).is_some();
-            // An idle end has nobody to sign it: the creator's node takes the room off boards
-            // when it sees it run out (V030-14).
-            let idle_ended_here = me == ch.genesis().creator_pubkey().fingerprint()
-                && matches!(
-                    ch.ended(now_ms),
-                    Some(crate::node::channel::RoomEnd::Idle { .. })
-                );
+            // The creator endorses a valid End it observes, including a delegated End,
+            // using the same durable room withdrawal used for idle expiry.
+            let creator_ended_here = me == ch.genesis().creator_pubkey().fingerprint()
+                && !ch.has_left(&me)
+                && ended_here;
             let members: Vec<Digest32> = ch.members().into_iter().filter(|m| *m != me).collect();
             let gen = ch.generation().load(std::sync::atomic::Ordering::Relaxed);
             drop(ch);
@@ -20787,7 +21312,7 @@ impl Node {
                 self.begin_owned_rejoin_reset(cid, None).await;
             }
             if let Some(owner) = self.role_wake.owner(cid) {
-                for d in &newly {
+                for (d, _) in &newly {
                     owner.mark_key_provider_prune(*d);
                 }
             }
@@ -20803,9 +21328,11 @@ impl Node {
             // a member that left, or the whole room once it ended. A joiner reading it, or an
             // anchor this node mirrors to, would otherwise be handed them.
             if let Some(net) = self.net.as_ref() {
-                let now_ms = self.now_ms().get();
-                for d in &newly {
-                    net.forget_member_on_board(&cid, d, now_ms);
+                for (d, departure_ms) in &newly {
+                    if let Some(departure_ms) = departure_ms {
+                        // Reopening an old leave must not supersede a newer admission.
+                        net.forget_member_on_board(&cid, d, *departure_ms);
+                    }
                 }
                 if ended_here {
                     net.forget_room_on_board(&cid);
@@ -20815,14 +21342,40 @@ impl Node {
             if self.pending_posts.contains_key(&cid) || self.metadata_room_journal_pending(&cid) {
                 continue;
             }
-            if idle_ended_here
-                && !self.withdrawn.contains_key(&cid)
-                && !self.winding.contains_key(&cid)
+            let mut retrying_endorsement = false;
+            #[cfg(feature = "test-knobs")]
+            let retry_allowed = !crate::node::computer::fx28_mutant("end-wind-down-on-failure")
+                || !self.winding.contains_key(&cid);
+            #[cfg(not(feature = "test-knobs"))]
+            let retry_allowed = true;
+            if creator_ended_here
+                && retry_allowed
+                && !self.withdrawn.get(&cid).is_some_and(|pending| {
+                    crate::nat::withdraw::BoardWithdraw::from_wire(&pending.wire).is_ok_and(
+                        |withdrawal| {
+                            withdrawal.scope == crate::nat::withdraw::WithdrawScope::Room
+                                && withdrawal.author_id == me
+                        },
+                    )
+                })
             {
-                if let Some(authority) = self.computer_authority() {
-                    self.begin_metadata_idle_withdrawal(cid, Arc::clone(&shared), gen, authority)
+                // Retry transient capture, authority and journal failures on lifecycle ticks,
+                // but do not keep an ended room indefinitely if endorsement is impossible.
+                let winding = self.winding.entry(cid).or_insert(Winding {
+                    gen,
+                    since: std::time::Instant::now(),
+                });
+                if winding.since.elapsed() < WIND_DOWN {
+                    if let Some(authority) = self.computer_authority() {
+                        self.begin_metadata_idle_withdrawal(
+                            cid,
+                            Arc::clone(&shared),
+                            gen,
+                            authority,
+                        )
                         .await;
-                    continue;
+                    }
+                    retrying_endorsement = true;
                 }
             }
             if !over {
@@ -20844,7 +21397,7 @@ impl Node {
                     handed += 1;
                 }
             }
-            if handed < members.len() && since.elapsed() < WIND_DOWN {
+            if retrying_endorsement || (handed < members.len() && since.elapsed() < WIND_DOWN) {
                 continue;
             }
             // A successful local end/idle-policy change still owes its checked
@@ -20876,13 +21429,19 @@ impl Node {
         let mut touched = std::collections::BTreeSet::new();
         for (room, peer, seq) in std::mem::take(&mut self.held_notes) {
             if let Some(shared) = self.channels.get(&room).map(Arc::clone) {
-                let changed = {
+                let (changed, progressed, author) = {
                     let mut channel = shared.lock().await;
-                    let changed = channel.held_through(&peer) != Some(seq);
+                    let previous = channel.held_through(&peer);
+                    let changed = previous != Some(seq);
+                    let progressed = previous.is_none_or(|old| seq > old);
+                    let author = channel.me();
                     channel.note_held(&store, peer, seq);
-                    changed
+                    (changed, progressed, author)
                 };
                 if changed {
+                    if progressed {
+                        self.history_hints.rearm_held(room, peer, author, seq);
+                    }
                     if let Some(port) = self.ports.get_mut(&(room, peer)) {
                         port.raise();
                     }
@@ -21601,6 +22160,30 @@ impl Node {
         // `lanes.bounded.admissions`. A daemon-wide count cannot identify which room is waiting.
         report.diagnose(&self.bounded_sync.retained_pool_rooms());
         self.storage_health(&mut report);
+        for room in &view.open_channels {
+            let (behind, forked) =
+                self.channels
+                    .get(&room.channel_id)
+                    .and_then(|channel| {
+                        channel.try_lock().ok().map(|channel| {
+                            (channel.own_history_behind(), channel.own_history_forked())
+                        })
+                    })
+                    .unwrap_or((room.own_history_behind, room.own_history_forked));
+            if behind || forked || self.own_recovery_rooms.contains_key(&room.channel_id) {
+                report.unhealthy.push(crate::node::status::Unhealthy {
+                    key: format!(
+                        "room-own-history:{}",
+                        crate::node::link::b32_encode(&room.channel_id)
+                    ),
+                    message: if forked {
+                        "conflicting signed own history; writes remain frozen".into()
+                    } else {
+                        "own history recovery is pending; writes remain fenced".into()
+                    },
+                });
+            }
+        }
         if let Some(message) = self.prekey_maintenance_error.as_ref() {
             report.unhealthy.push(crate::node::status::Unhealthy {
                 key: "prekey-maintenance".into(),
@@ -23111,12 +23694,22 @@ impl Node {
 
     /// The room this node holds under `name`, as last published (ADR-028 R-3).
     fn room_named(&self, name: &str) -> Option<Digest32> {
-        self.view_tx
-            .borrow()
-            .channels
+        self.join_name_reservations
             .iter()
-            .find(|c| c.name.as_deref() == Some(name))
-            .map(|c| c.channel_id)
+            .find_map(|(id, reserved)| (reserved == name).then_some(*id))
+            .or_else(|| {
+                self.rename_name_reservations
+                    .iter()
+                    .find_map(|(id, reserved)| (reserved == name).then_some(*id))
+            })
+            .or_else(|| {
+                self.view_tx
+                    .borrow()
+                    .channels
+                    .iter()
+                    .find(|c| c.name.as_deref() == Some(name))
+                    .map(|c| c.channel_id)
+            })
     }
 
     async fn publish(&mut self) {
@@ -24074,6 +24667,7 @@ async fn offer_board_records(
         }
     };
     let mut complete = true;
+    let mut rejected = false;
     for wire in records {
         if !scope.is_live() {
             client.finish();
@@ -24094,13 +24688,10 @@ async fn offer_board_records(
             }
             Err(error @ Error::RendezvousRejected(_)) => {
                 net.note_board_exchange(scope, book, board, (0, 1, false), anchor_path);
-                if board_record_superseded(&error) {
-                    complete = false;
-                } else {
-                    client.finish();
-                    net.note_board_exchange(scope, book, board, (0, 0, true), anchor_path);
-                    return Err(());
-                }
+                // An address can precede the notice that makes its author current.
+                // Offer the remaining independent evidence, but retry this snapshot.
+                complete = false;
+                rejected |= !board_record_superseded(&error);
             }
             Err(_) => {
                 client.finish();
@@ -24110,6 +24701,10 @@ async fn offer_board_records(
         }
     }
     client.finish();
+    if rejected {
+        net.note_board_exchange(scope, book, board, (0, 0, true), anchor_path);
+        return Err(());
+    }
     Ok(complete.then_some(revision))
 }
 
@@ -24756,6 +25351,7 @@ pub fn fault_of(e: &Error) -> Fault {
         Error::ServiceNameTaken(..) => Fault::NameTaken,
         Error::RoomNotSynced => Fault::RoomNotSynced,
         Error::OwnHistoryBehind => Fault::OwnHistoryBehind,
+        Error::Profile("room name already reserved") => Fault::RoomNameTaken,
         Error::Profile("no identity on this node") => Fault::NoIdentity,
         Error::Profile("identity already exists on this node") => Fault::IdentityExists,
         Error::Profile("locked") => Fault::Locked,

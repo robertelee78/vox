@@ -192,6 +192,12 @@ impl Encoder {
         self.out.extend_from_slice(s.as_bytes());
         self
     }
+    /// Encode the canonical CBOR null value.
+    pub fn null(&mut self) -> &mut Self {
+        self.room(1);
+        self.out.push(0xf6);
+        self
+    }
 
     /// Emit an array header of `len` items. The caller then emits exactly `len`
     /// items.
@@ -325,6 +331,15 @@ impl<'a> Decoder<'a> {
         self.checked_len(len)?;
         let raw = self.take(len as usize)?;
         core::str::from_utf8(raw).map_err(|_| CborError::InvalidUtf8)
+    }
+    /// Consume canonical null when present, leaving any other value untouched.
+    pub fn null(&mut self) -> bool {
+        if self.buf.get(self.pos) == Some(&0xf6) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
     }
 
     /// Read an array header (major type 4), returning the element count.

@@ -649,6 +649,10 @@ pub struct ChannelDetail {
     pub synced: bool,
     /// Last contiguous authenticated position in this node's own room feed.
     pub own_feed_through: u64,
+    /// Own-history write fence captured with this nonblocking room snapshot.
+    pub(crate) own_history_behind: bool,
+    /// Whether the fence protects conflicting signed histories.
+    pub(crate) own_history_forked: bool,
     /// The members this node holds back for equivocating in this room (V210-63): each
     /// `(author, seq)` at which two different messages signed by that author were seen.
     pub equivocations: Vec<(Digest32, u64)>,
