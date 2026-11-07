@@ -4385,7 +4385,7 @@ impl Router {
                         reason: vox_core::node::daemonipc::RegistrationRetryReason::SessionEnding,
                     });
                 }
-                let _fence = self.registration_fence(node, &s, Some(a.fingerprint))?;
+                let _fence = self.registration_fence(node, &s, a.fingerprint)?;
                 crate::wake::store_checked(&a.paths, &s)
                     .map_err(|error| Self::registration_store_refusal(node, error))?;
                 drop(ending);

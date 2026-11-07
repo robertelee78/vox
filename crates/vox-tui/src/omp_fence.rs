@@ -24,7 +24,13 @@ fn opaque(s: &str) -> bool {
 fn random_id() -> Result<String, FenceError> {
     let mut bytes = [0u8; 32];
     getrandom::fill(&mut bytes).map_err(|_| FenceError::Invalid)?;
-    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut id = String::with_capacity(64);
+    for byte in bytes {
+        id.push(char::from(HEX[usize::from(byte >> 4)]));
+        id.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    Ok(id)
 }
 fn checked(file: File, dir: bool, private: bool) -> Result<File, FenceError> {
     let m = file.metadata().map_err(|_| FenceError::Invalid)?;
@@ -125,7 +131,7 @@ impl Owner {
         lock(&mutation, true)?;
         let lifetime = private_file(&dir, "lifetime", false)?;
         lock(&lifetime, true)?;
-        let mut compatibility = private_file(&dir, "compatibility", false)?;
+        let compatibility = private_file(&dir, "compatibility", false)?;
         compatibility.set_len(0).map_err(|_| FenceError::Invalid)?;
         write_binding(&dir, None)?;
         drop(mutation);
