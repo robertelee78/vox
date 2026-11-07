@@ -1,6 +1,6 @@
 # Sessions
 
-Applies to Vox v0.4.11.
+Applies to Vox v0.4.20.
 
 This page shows how to put an agent's sessions in the right room, follow what a session does,
 and drive it. To drive a session, the agent's node must trust your node with **read + drive**
@@ -115,12 +115,27 @@ Answer in one of three ways:
   or the next hook turn puts the waiting session in that bound room.
   If you want a new room, the notice also supplies a complete create command with a suggested
   name, the actual node and the repository's binding; you can run it in your terminal.
-- **To say no:** choose **Not this repo** in the app, or say no in the session. The agent then runs
-  `vox agent room --none --node claude-mac` for this example's agent. The map records the
-  directory as `room none`, and no session started there asks again. Delete that block to be asked again.
+- **To say no:** choose **Not This Repo** in the app and review the repository scope before
+  confirming. This also works after a saved room's join fails. Vox records `room none`, so later
+  sessions in that repository or its worktrees are not asked again. An agent's
+  `vox agent room --none` can record an undecided directory, but cannot replace or shadow an
+  existing decision.
 
 A directory bound to a room its node is not in is asked about too. In the app, **Join It** joins
 with the link and passphrase the map holds.
+
+### Change a saved repository decision
+
+In Vox.app, open **Settings → Rebind Repository**, choose the exact directory and review its
+current decision. This does not require a pending room question. Choose a room or provide its
+actual link and passphrase; a wrong passphrase leaves the previous decision unchanged.
+
+In your own terminal, `vox room join … --bind …` replaces that exact directory's decision.
+An inherited parent decision and sibling repositories stay unchanged. Changing a repository
+decision affects future sessions, not sessions already running; existing explicit subdirectory
+overrides remain effective. The replacement discards that block's old link and passphrase.
+If another writer changed the inspected decision, Vox refuses the stale confirmation rather
+than overwriting it; inspect again before retrying.
 
 ## Move a session to another room
 
