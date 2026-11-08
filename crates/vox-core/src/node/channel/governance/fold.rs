@@ -1,7 +1,7 @@
 //! Checked authority and display effects. Historical inputs and intermediate
 //! decisions stay in sealed records; a turn opens only its current entry/query.
 
-use super::authority::{self, Grant, Scope};
+use super::authority::{self, Grant, RootCutoff, Scope};
 use super::canonical::{rank_from, rank_key};
 use super::context::CachedQuery;
 use super::facts::{hash_key, Cursor, Table, Write};
@@ -20,6 +20,8 @@ const DONE: u64 = 4;
 // One-time reconstruction of the fingerprint that format-1 cursors did not carry.
 const BASELINE_EFFECTS: u64 = 5;
 const BASELINE_AUTHORITY: u64 = 6;
+const MEMBERSHIP: u64 = 7;
+const FORK_AUTHORITY: u64 = 8;
 
 pub(super) const NAME: u64 = 1;
 pub(super) const MESSAGES: u64 = 2;
@@ -146,6 +148,9 @@ struct State {
     log: u64,
     query: Option<CachedQuery>,
     grant: Option<Grant>,
+    cutoff: Option<RootCutoff>,
+    membership: Option<super::member_fold::DelegatedMembership>,
+    membership_checked: bool,
     after_revoke: Option<Digest32>,
     target: Option<Digest32>,
     after_cert: Option<Digest32>,
@@ -185,6 +190,9 @@ impl State {
             log: 0,
             query: None,
             grant: None,
+            cutoff: None,
+            membership: None,
+            membership_checked: false,
             after_revoke: None,
             target: None,
             after_cert: None,
@@ -201,7 +209,10 @@ impl State {
         };
         let mut d = Decoder::new(&bytes);
         let (arity, version) = (d.array()?, d.uint()?);
-        if !matches!((arity, version), (16, 1) | (17, 2) | (18, 3)) {
+        if !matches!(
+            (arity, version),
+            (16, 1) | (17, 2) | (18, 3) | (19, 4) | (21, 5)
+        ) {
             return Err(invalid("governance fold cursor format"));
         }
         let phase = d.uint()?;
@@ -232,7 +243,7 @@ impl State {
             // using or publishing its projection; it never resumes the partial old fold.
             writer.projection()
         };
-        let force_publication = if version == 3 {
+        let force_publication = if version >= 3 {
             match d.uint()? {
                 0 => false,
                 1 => true,
@@ -241,8 +252,35 @@ impl State {
         } else {
             false
         };
+        let cutoff = if version >= 4 {
+            match d.array()? {
+                0 => None,
+                1 => Some(RootCutoff::read(&mut d)?),
+                _ => return Err(invalid("governance fold cutoff arity")),
+            }
+        } else {
+            None
+        };
+        let membership = if version >= 5 {
+            match d.array()? {
+                0 => None,
+                1 => Some(super::member_fold::DelegatedMembership::read(&mut d)?),
+                _ => return Err(invalid("governance membership arity")),
+            }
+        } else {
+            None
+        };
+        let membership_checked = if version >= 5 {
+            match d.uint()? {
+                0 => false,
+                1 => true,
+                _ => return Err(invalid("governance membership boolean")),
+            }
+        } else {
+            false
+        };
         d.finish()?;
-        if phase > BASELINE_AUTHORITY
+        if phase > FORK_AUTHORITY
             || (version == 1 && phase > DONE)
             || from == 0
             || generation == 0
@@ -261,6 +299,9 @@ impl State {
             log,
             query,
             grant,
+            cutoff,
+            membership,
+            membership_checked,
             after_revoke,
             target,
             after_cert,
@@ -273,8 +314,8 @@ impl State {
     }
     fn save(&self, writer: &mut Write<'_, '_>) -> Result<()> {
         let mut e = Encoder::new();
-        e.array(18)
-            .uint(3)
+        e.array(21)
+            .uint(5)
             .uint(self.phase)
             .uint(self.ordered)
             .uint(self.generation)
@@ -300,12 +341,34 @@ impl State {
         write_grant(&mut e, self.head_grant);
         e.bytes(&self.projection);
         e.uint(u64::from(self.force_publication));
+        match &self.cutoff {
+            Some(cutoff) => {
+                e.array(1);
+                cutoff.write(&mut e);
+            }
+            None => {
+                e.array(0);
+            }
+        }
+        match &self.membership {
+            Some(membership) => {
+                e.array(1);
+                membership.write(&mut e);
+            }
+            None => {
+                e.array(0);
+            }
+        }
+        e.uint(u64::from(self.membership_checked));
         writer.save_cursor(Cursor::Evaluation, &e.finish())
     }
     fn clear_query(&mut self) {
         self.log = 0;
         self.query = None;
         self.grant = None;
+        self.cutoff = None;
+        self.membership = None;
+        self.membership_checked = false;
         self.after_revoke = None;
     }
     fn query(
@@ -420,6 +483,20 @@ pub(super) fn advance(
     }
     match state.phase {
         AUTHORITY => authority_step(writer, root, &mut state)?,
+        FORK_AUTHORITY => fork_authority_step(writer, root, &mut state)?,
+        MEMBERSHIP => {
+            if let Some(deadline) = super::member_fold::advance(writer, root)? {
+                if deadline != 0 {
+                    state.deadline = if state.deadline == 0 {
+                        deadline
+                    } else {
+                        state.deadline.min(deadline)
+                    };
+                }
+                state.phase = CLEAR;
+                state.after_rank = 0;
+            }
+        }
         CLEAR => clear_step(writer, &mut state)?,
         ACTIONS => action_step(writer, input, root, &mut state)?,
         HEAD => head_step(writer, root, &mut state)?,
@@ -470,7 +547,7 @@ fn authority_step(writer: &mut Write<'_, '_>, root: &Digest32, state: &mut State
             // Head projections are rebuilt in the same generation before public
             // authority reads become ready; actions can already use these facts.
             writer.authority_published(state.generation, state.deadline)?;
-            state.phase = CLEAR;
+            state.phase = FORK_AUTHORITY;
             state.after_rank = 0;
             return Ok(());
         };
@@ -495,7 +572,10 @@ fn authority_step(writer: &mut Write<'_, '_>, root: &Digest32, state: &mut State
             writer.put(Table::IssuerRoles, key, Some(record))?;
         }
         GovBody::AdminRevocation(rev) => {
-            let authorization = if rev.body.epoch == 0 {
+            let authorization = if rev.body.epoch == 0
+                && writer.get(Table::Incomplete, &hash_key(&hash))?.is_none()
+                && (entry.skeleton.author_id == *root || writer.fork_safe(&entry)?)
+            {
                 let Some(grant) =
                     state.query(writer, root, Scope(Some(hash)), rev.body.issuer_id)?
                 else {
@@ -536,6 +616,57 @@ fn authority_step(writer: &mut Write<'_, '_>, root: &Digest32, state: &mut State
     }
     state.clear_query();
     Ok(())
+}
+
+/// Exclusionary creator revocations on verified alternate branches remain
+/// effective even though no other fork-branch governance gains authority.
+fn fork_authority_step(
+    writer: &mut Write<'_, '_>,
+    root: &Digest32,
+    state: &mut State,
+) -> Result<()> {
+    let after = state.target.map(|hash| hash_key(&hash));
+    let Some((key, log)) = writer.first(Table::ForkRevocations, after)? else {
+        state.target = None;
+        state.phase = MEMBERSHIP;
+        return Ok(());
+    };
+    let hash: Digest32 = key[..32]
+        .try_into()
+        .map_err(|_| invalid("fork revocation hash"))?;
+    state.target = Some(hash);
+    let entry = writer.entry(log)?;
+    let GovBody::AdminRevocation(revocation) = GovEntry::body_bound_to(&entry)? else {
+        return Err(invalid("fork revocation kind"));
+    };
+    let mut authorized = false;
+    if entry.skeleton.author_id == *root
+        && revocation.body.issuer_id == *root
+        && revocation.body.epoch == 0
+    {
+        if let Some(named_log) = writer.get(
+            Table::Hashes,
+            &hash_key(&revocation.body.revoked_delegation_hash),
+        )? {
+            let named = writer.entry(named_log)?;
+            if let GovBody::AdminCert(cert) = GovEntry::body_bound_to(&named)? {
+                authorized = !Scope(Some(named.entry_hash())).contains(writer, &entry)?;
+                if authorized {
+                    writer.put(
+                        Table::NamedRevoked,
+                        hash_key(&named.entry_hash()),
+                        Some(state.generation),
+                    )?;
+                }
+                writer.put(
+                    Table::Revocations,
+                    pair(&cert.body.delegate_id(), &hash),
+                    Some(log),
+                )?;
+            }
+        }
+    }
+    authority::save_revocation(writer, &hash, state.generation, authorized)
 }
 
 fn effect_kind(body: &GovBody) -> Option<u64> {
@@ -616,6 +747,39 @@ fn action_step(
         state.clear_query();
         return Ok(());
     };
+    if !writer.fork_safe(&entry)? || writer.get(Table::Incomplete, &hash_key(&hash))?.is_some() {
+        state.clear_query();
+        return Ok(());
+    }
+    if entry.skeleton.author_id != *root {
+        let cutoff = state
+            .cutoff
+            .get_or_insert_with(|| RootCutoff::new(hash, entry.skeleton.author_id));
+        match cutoff.advance(writer, root, state.generation)? {
+            None => return Ok(()),
+            Some(false) => {
+                state.clear_query();
+                return Ok(());
+            }
+            Some(true) => {}
+        }
+        if !state.membership_checked {
+            let membership = state.membership.get_or_insert_with(|| {
+                super::member_fold::DelegatedMembership::new(hash, entry.skeleton.author_id)
+            });
+            match membership.advance(writer, state.generation)? {
+                None => return Ok(()),
+                Some(false) => {
+                    state.clear_query();
+                    return Ok(());
+                }
+                Some(true) => {
+                    state.membership = None;
+                    state.membership_checked = true;
+                }
+            }
+        }
+    }
     let authorized = match kind {
         IDLE => entry.skeleton.author_id == *root,
         END if entry.skeleton.author_id == *root => true,

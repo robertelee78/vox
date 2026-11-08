@@ -392,11 +392,6 @@ impl ReceiverChain {
         iteration >= self.next_iteration || self.skipped.contains_key(&iteration)
     }
 
-    /// Automatic private delivery cannot treat a ratchet with unresolved gaps as contiguous.
-    pub(crate) fn has_skipped_iterations(&self) -> bool {
-        !self.skipped.is_empty()
-    }
-
     /// Build a receiver chain from a **verified** SKDM. The caller MUST have
     /// called [`Skdm::verify`] (or [`Skdm::verify_and_signing_key`]) first; this
     /// re-verifies the SKDM against `author_root` and the expected channel/epoch
@@ -704,6 +699,33 @@ impl ReceiverChain {
         }
         if release.history_iteration >= self.history_iteration {
             return Ok(false);
+        }
+        let gap = self.history_iteration - release.history_iteration;
+        if gap > MAX_SKIP {
+            return Err(Error::MalformedBundle("group history gap exceeds MAX_SKIP"));
+        }
+        let mut key = release.history_key.clone();
+        for _ in 0..gap {
+            key = key.advance()?;
+        }
+        let body = crate::group::skdm::SkdmBody {
+            channel_id: release.channel_id,
+            epoch: release.epoch,
+            author_id: release.author_id,
+            chain_id: release.chain_id,
+            iteration: self.history_iteration,
+            chain_key: key,
+            signing_pubkey: release.signing_pubkey.to_bytes(),
+            algo_ids: [
+                crate::suite::algo::COMPOSITE_ED25519_ML_DSA_65,
+                crate::suite::algo::AES_256_GCM,
+            ],
+        };
+        use subtle::ConstantTimeEq;
+        if !bool::from(
+            crate::hash::sha256(&body.canonical_body()).ct_eq(&self.history_release_binding().1),
+        ) {
+            return Err(Error::MalformedBundle("inconsistent group history release"));
         }
         self.history_key = release.history_key.clone();
         self.history_iteration = release.history_iteration;

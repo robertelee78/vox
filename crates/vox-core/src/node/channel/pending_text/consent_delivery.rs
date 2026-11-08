@@ -10,6 +10,7 @@ pub(crate) struct PendingDelivery {
     history: BTreeMap<Digest32, u64>,
     delivered_changed: bool,
     history_changed: bool,
+    removal_generation: u64,
     pin: Option<history::PendingHistoryRead>,
 }
 pub(crate) struct CompletedDelivery {
@@ -24,7 +25,21 @@ impl ChannelState {
         target: Digest32,
         generation: u64,
         history_sent: bool,
+        expected_removal_generation: Option<u64>,
     ) -> Result<PendingDelivery> {
+        let removal_generation = self.removal_generation(store)?;
+        if expected_removal_generation.is_some_and(|expected| expected != removal_generation)
+            || self.is_member_removed(store, &self.me())?
+            || self.is_member_removed(store, &target)?
+        {
+            return Err(Error::Profile(governance::REFRESHING));
+        }
+        governance::check_removal_generation(
+            store,
+            &self.sek,
+            &self.channel_id,
+            removal_generation,
+        )?;
         let mut delivered = self.delivered.clone();
         let mut history = self.history.clone();
         let delivered_changed = delivered.get(&target).is_none_or(|old| *old < generation);
@@ -41,6 +56,7 @@ impl ChannelState {
             delivered,
             history,
             delivered_changed,
+            removal_generation,
             history_changed,
             pin: Some(pin),
         })
@@ -85,6 +101,12 @@ impl PendingDelivery {
             }
             let mut batch = store.batch()?;
             self.sek.with(|sek| {
+                governance::check_removal_generation_in(
+                    &batch,
+                    sek,
+                    &self.room,
+                    self.removal_generation,
+                )?;
                 if self.delivered_changed {
                     batch.put_segment(
                         &self.room,

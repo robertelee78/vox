@@ -367,6 +367,9 @@ const T_SET_ADMIN: u64 = 34;
 const T_ADMINS: u64 = 35;
 /// `[36, channel_id, name]` — [`Request::RenameRoom`] (ADR-028 R-1).
 const T_RENAME_ROOM: u64 = 36;
+/// Exact room-member governance requests, additive to the existing IPC protocol.
+const T_REMOVE_ROOM_MEMBER: u64 = 11710;
+const T_READMIT_ROOM_MEMBER: u64 = 11711;
 /// Room anchor governance (ADR-032 AN-5); no identity-passphrase gate.
 const T_ROOM_ANCHORS: u64 = 781;
 /// Read one room's signed anchor configuration, without machine/other-room sources.
@@ -1103,6 +1106,20 @@ pub enum Request {
         channel_id: Digest32,
         /// The new name, one DNS label.
         name: String,
+    },
+    /// Remove one exact room member, without changing global trust.
+    RemoveRoomMember {
+        /// The room.
+        channel_id: Digest32,
+        /// The member fingerprint.
+        member: Digest32,
+    },
+    /// Creator readmission; ordinary admission and trust remain required.
+    ReadmitRoomMember {
+        /// The room.
+        channel_id: Digest32,
+        /// The member fingerprint.
+        member: Digest32,
     },
     /// End a room for everyone (V030-08); its creator only.
     End {
@@ -1936,6 +1953,18 @@ impl Request {
             Request::RenameRoom { channel_id, name } => {
                 e.array(3).uint(T_RENAME_ROOM).bytes(channel_id).text(name);
             }
+            Request::RemoveRoomMember { channel_id, member } => {
+                e.array(3)
+                    .uint(T_REMOVE_ROOM_MEMBER)
+                    .bytes(channel_id)
+                    .bytes(member);
+            }
+            Request::ReadmitRoomMember { channel_id, member } => {
+                e.array(3)
+                    .uint(T_READMIT_ROOM_MEMBER)
+                    .bytes(channel_id)
+                    .bytes(member);
+            }
             Request::Invite { channel_id } => {
                 e.array(2).uint(T_INVITE).bytes(channel_id);
             }
@@ -2619,6 +2648,17 @@ impl Request {
                 d.finish()
                     .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
                 Ok(Request::RenameRoom { channel_id, name })
+            }
+            (T_REMOVE_ROOM_MEMBER | T_READMIT_ROOM_MEMBER, 3) => {
+                let channel_id = digest(&mut d)?;
+                let member = digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                if tag == T_REMOVE_ROOM_MEMBER {
+                    Ok(Request::RemoveRoomMember { channel_id, member })
+                } else {
+                    Ok(Request::ReadmitRoomMember { channel_id, member })
+                }
             }
             (T_STEP_RETENTION, 3) => {
                 let channel_id = digest(&mut d)?;
@@ -7591,6 +7631,8 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         | Request::RoomAnchors { channel_id, .. }
         | Request::ChangeRoomAnchors { channel_id, .. }
         | Request::RenameRoom { channel_id, .. }
+        | Request::RemoveRoomMember { channel_id, .. }
+        | Request::ReadmitRoomMember { channel_id, .. }
         | Request::End { channel_id, .. }
         | Request::SetAdmin { channel_id, .. }
         | Request::Admins { channel_id, .. }
@@ -8038,6 +8080,24 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         // Not gated on the passphrase (ADR-028 K-11): the room's governance says who may.
         Request::RenameRoom { channel_id, name } => match handle
             .apply(crate::node::api::NodeCommand::RenameRoom { channel_id, name })
+            .await
+        {
+            crate::node::api::Outcome::Appended(entry) => Frame::Appended { entry },
+            other => Frame::Error {
+                reason: other.to_string(),
+            },
+        },
+        Request::RemoveRoomMember { channel_id, member } => match handle
+            .apply(crate::node::api::NodeCommand::RemoveRoomMember { channel_id, member })
+            .await
+        {
+            crate::node::api::Outcome::Appended(entry) => Frame::Appended { entry },
+            other => Frame::Error {
+                reason: other.to_string(),
+            },
+        },
+        Request::ReadmitRoomMember { channel_id, member } => match handle
+            .apply(crate::node::api::NodeCommand::ReadmitRoomMember { channel_id, member })
             .await
         {
             crate::node::api::Outcome::Appended(entry) => Frame::Appended { entry },

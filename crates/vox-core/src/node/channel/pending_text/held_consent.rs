@@ -6,6 +6,9 @@ pub(crate) struct PendingHeld {
     owner: Arc<()>,
     room: Digest32,
     epoch: u64,
+    sek: crate::atrest::sek::WeakSek,
+    removal_generation: u64,
+    forward_only: bool,
     candidate: Option<Box<Skdm>>,
     pin: Option<history::PendingHistoryRead>,
 }
@@ -25,13 +28,36 @@ impl ChannelState {
         &mut self,
         store: &Arc<Store>,
         owner: Arc<()>,
+        target: Digest32,
         candidate: Box<Skdm>,
     ) -> Result<PendingHeld> {
+        let removal_generation = self.removal_generation(store)?;
+        if self.is_member_removed(store, &self.me())?
+            || self.is_member_removed(store, &target)?
+            || self.room_removal_rotation_needed(store)?
+        {
+            return Err(Error::Profile(governance::REFRESHING));
+        }
+        governance::check_removal_generation(
+            store,
+            &self.sek,
+            &self.channel_id,
+            removal_generation,
+        )?;
+        let forward_only = !self
+            .validated_member_removals(store, &target, crate::time::Ms(self.now_hint))?
+            .is_empty();
+        if forward_only && candidate.body.chain_id != self.sender.chain_id() {
+            return Err(Error::Profile(governance::REFRESHING));
+        }
         let pin = self.reserve_pending_write(store, Arc::clone(&owner))?;
         Ok(PendingHeld {
             owner,
             room: self.channel_id,
             epoch: self.epoch,
+            sek: self.sek.reader(),
+            removal_generation,
+            forward_only,
             candidate: Some(candidate),
             pin: Some(pin),
         })
@@ -77,11 +103,20 @@ impl PendingHeld {
                 .ok_or(Error::Profile("held consent candidate missing"))?;
             // Admission precedes the read, so another room's exact map delta cannot be lost.
             let mut batch = store.batch()?;
+            self.sek.with(|sek| {
+                governance::check_removal_generation_in(
+                    &batch,
+                    sek,
+                    &self.room,
+                    self.removal_generation,
+                )
+            })?;
             let mut held = PendingConsents::load(store, signer)?;
             if let Some(skdm) = held
                 .get(&self.room, &target)
                 .and_then(|wire| Skdm::from_wire(wire).ok())
                 .filter(|skdm| skdm.body.epoch == self.epoch)
+                .filter(|skdm| !self.forward_only || skdm.body.chain_id == candidate.body.chain_id)
             {
                 *candidate = skdm;
                 return Ok(HeldConsent {

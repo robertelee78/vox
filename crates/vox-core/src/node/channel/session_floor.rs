@@ -185,7 +185,7 @@ impl ChannelState {
                 (want.from_seq <= want.to_seq).then_some(want)
             })
             .collect();
-        crate::log::sync::entries_for_wants_bounded(
+        let served = crate::log::sync::entries_for_wants_bounded(
             &self.dag,
             &entries,
             &accepted_wants,
@@ -193,30 +193,39 @@ impl ChannelState {
             max_bytes,
         )?
         .into_iter()
-        .map(|wire| {
-            let mut entry = Entry::from_wire(&wire)?;
-            // Physical expiry is page-bounded. The saved age still withholds an
-            // expired body immediately, including while a shorter TTL drains a backlog.
-            let expired = entries.retention(&entry.entry_hash())?.is_some_and(|t| {
-                let ttl = if t.steps {
-                    self.effective_step_retention()
-                } else {
-                    self.effective_retention()
-                };
-                expired_at(t.base(), self.now_hint, ttl)
-            });
-            if expired
-                || !self.session_body_allowed(
-                    Transaction::Snapshot(&store.snapshot()?),
-                    &entry,
-                    peer,
-                )?
-            {
-                entry.payload = None;
-            }
-            Ok(entry.to_wire())
-        })
-        .collect()
+        .map(|wire| Entry::from_wire(&wire))
+        .collect::<Result<Vec<_>>>()?;
+        // #1171: a once-removed peer never newly receives an old ordinary or key-package body.
+        // An undecided body is also sent header-only, never withheld with its successors:
+        // governance and controls keep flowing, and the receiver's ordinary demand refills it.
+        let recipient = self.recipient_bodies_eligibility(store, peer, &served)?;
+        served
+            .into_iter()
+            .zip(recipient)
+            .map(|(mut entry, decision)| {
+                // Physical expiry is page-bounded. The saved age still withholds an
+                // expired body immediately, including while a shorter TTL drains a backlog.
+                let expired = entries.retention(&entry.entry_hash())?.is_some_and(|t| {
+                    let ttl = if t.steps {
+                        self.effective_step_retention()
+                    } else {
+                        self.effective_retention()
+                    };
+                    expired_at(t.base(), self.now_hint, ttl)
+                });
+                if expired
+                    || decision != governance::ContentEligibility::Eligible
+                    || !self.session_body_allowed(
+                        Transaction::Snapshot(&store.snapshot()?),
+                        &entry,
+                        peer,
+                    )?
+                {
+                    entry.payload = None;
+                }
+                Ok(entry.to_wire())
+            })
+            .collect()
     }
 
     /// Learn every verified floor before publication decides which received bodies to keep.

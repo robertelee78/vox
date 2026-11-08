@@ -237,6 +237,8 @@ pub enum RejectReason {
     /// generic policy so a publisher does not proceed as though the record landed and later blame
     /// the responder's authentication when the board never authorized it.
     Clock = 8,
+    /// The member board cannot authorize this identity: removed or its fold is refreshing.
+    RoomAuthorization = 9,
 }
 
 impl RejectReason {
@@ -250,6 +252,7 @@ impl RejectReason {
             6 => Some(Self::Stale),
             7 => Some(Self::Withdrawn),
             8 => Some(Self::Clock),
+            9 => Some(Self::RoomAuthorization),
             _ => None,
         }
     }
@@ -267,6 +270,7 @@ impl RejectReason {
             Self::Stale => "rejected: the board holds a newer record from that author",
             Self::Withdrawn => "rejected: withdrawn, its author left the room",
             Self::Clock => "rejected: timestamp is outside the board's accepted clock window",
+            Self::RoomAuthorization => "rejected: room authorization is removed or refreshing",
         }
     }
 
@@ -554,6 +558,30 @@ pub trait MembershipOracle: Send + Sync {
         epoch: u64,
         author_id: &Digest32,
     ) -> Option<CompositePublicKey>;
+    /// Only validated room-local exclusions may suppress a member-board record.
+    fn removed(&self, _channel_id: &Digest32, _epoch: u64, _author_id: &Digest32) -> bool {
+        false
+    }
+
+    /// Pre-join has no epoch; use the member board's current epoch.
+    fn removed_current(&self, _channel_id: &Digest32, _author_id: &Digest32) -> bool {
+        false
+    }
+
+    /// Published incarnation of that exclusion set, for board snapshot tokens.
+    fn removal_generation(&self, _channel_id: &Digest32, _epoch: u64) -> u64 {
+        0
+    }
+
+    /// Member boards expose their serialized profile writer for egress fencing;
+    /// discovery-only anchors do not own a room profile.
+    fn room_store(
+        &self,
+        _channel_id: &Digest32,
+        _epoch: u64,
+    ) -> Option<Arc<crate::node::store::Store>> {
+        None
+    }
 }
 
 /// The live records a `GET` returned, parsed by kind. Records whose signer is carried in the
@@ -1304,7 +1332,19 @@ impl RendezvousService {
                 // unchanged room checks only its next-expiry scalar and causal token; it neither
                 // scans nor serializes its records.
                 let mut store = lock(&self.store);
-                let revision = store.revision(channel_id, now);
+                let stored_revision = store.revision(channel_id, now);
+                let generation = self.oracle.removal_generation(channel_id, *epoch);
+                let revision = if generation == 0 {
+                    stored_revision
+                } else {
+                    crate::hash::sha256_concat(&[
+                        b"vox/board-removal-revision/v1",
+                        channel_id,
+                        &epoch.to_be_bytes(),
+                        &generation.to_be_bytes(),
+                        &stored_revision,
+                    ])
+                };
                 if known_revision
                     .as_ref()
                     .is_some_and(|known| bool::from(known.ct_eq(&revision)))
@@ -1317,6 +1357,7 @@ impl RendezvousService {
                         store
                             .current_members(channel_id, *epoch, now)
                             .into_iter()
+                            .filter(|r| !self.oracle.removed(channel_id, *epoch, &r.author_id))
                             .map(|r| RendezvousResponse::Record(r.to_wire())),
                     );
                 }
@@ -1325,6 +1366,7 @@ impl RendezvousService {
                         store
                             .current_bundles(channel_id, *epoch, now)
                             .into_iter()
+                            .filter(|r| !self.oracle.removed(channel_id, *epoch, &r.author_id))
                             .map(|r| RendezvousResponse::Record(r.to_wire())),
                     );
                 }
@@ -1333,6 +1375,7 @@ impl RendezvousService {
                         store
                             .current_prejoins(channel_id, now)
                             .into_iter()
+                            .filter(|r| !self.oracle.removed(channel_id, *epoch, &r.asserted_id()))
                             .map(|r| RendezvousResponse::Record(r.to_wire())),
                     );
                 }
@@ -1349,6 +1392,7 @@ impl RendezvousService {
                         store
                             .notices(channel_id)
                             .into_iter()
+                            .filter(|n| !self.oracle.removed(channel_id, *epoch, &n.joiner()))
                             .map(|n| RendezvousResponse::Record(n.to_wire())),
                     );
                 }
@@ -1381,6 +1425,9 @@ impl RendezvousService {
         author: &Digest32,
         now: u64,
     ) -> Option<CompositePublicKey> {
+        if self.oracle.removed(channel, epoch, author) {
+            return None;
+        }
         if let Some(key) = self.oracle.member_key(channel, epoch, author) {
             return Some(key);
         }
@@ -1441,6 +1488,63 @@ impl RendezvousService {
         let tag = parse_frame(record)
             .map(|f| f.tag)
             .map_err(|e| RejectReason::for_error(&e))?;
+        let room_epoch = match tag {
+            StructTag::RendezvousRecord => {
+                let rec =
+                    RendezvousRecord::from_wire(record).map_err(|e| RejectReason::for_error(&e))?;
+                Some((rec.channel_id, rec.epoch))
+            }
+            StructTag::MemberBundleRecord => {
+                let rec = MemberBundleRecord::from_wire(record)
+                    .map_err(|e| RejectReason::for_error(&e))?;
+                Some((rec.channel_id, rec.epoch))
+            }
+            StructTag::PreJoinRecord => {
+                let rec =
+                    PreJoinRecord::from_wire(record).map_err(|e| RejectReason::for_error(&e))?;
+                Some((rec.channel_id, 0))
+            }
+            StructTag::AdmissionNotice => {
+                let rec = crate::nat::notice::AdmissionNotice::from_wire(record)
+                    .map_err(|e| RejectReason::for_error(&e))?;
+                Some((rec.channel_id(), rec.witness.epoch))
+            }
+            StructTag::BoardWithdraw => {
+                let rec = crate::nat::withdraw::BoardWithdraw::from_wire(record)
+                    .map_err(|e| RejectReason::for_error(&e))?;
+                Some((rec.channel_id, rec.epoch))
+            }
+            _ => None,
+        };
+        if let Some((room, epoch)) = room_epoch {
+            if let Some(store) = self.oracle.room_store(&room, epoch) {
+                let generation = self.oracle.removal_generation(&room, epoch);
+                return store
+                    .with_publication_fence(|| {
+                        if crate::node::channel::governance::removal_generation(&store, &room)?
+                            != generation
+                        {
+                            return Err(Error::StreamRefused("room authorization changed"));
+                        }
+                        Ok(self.put_unfenced(publisher, source, record, now, local))
+                    })
+                    .map_err(|e| RejectReason::for_error(&e))?;
+            }
+        }
+        self.put_unfenced(publisher, source, record, now, local)
+    }
+
+    fn put_unfenced(
+        &self,
+        publisher: Option<&Digest32>,
+        source: Option<Source>,
+        record: &[u8],
+        now: u64,
+        local: bool,
+    ) -> std::result::Result<(Digest32, Digest32), RejectReason> {
+        let tag = parse_frame(record)
+            .map(|f| f.tag)
+            .map_err(|e| RejectReason::for_error(&e))?;
         // Set by the arms below for a member-kind record that arrived **from a peer** rather than
         // from this node's own local publish, **and taught this board something**: an author it
         // held nothing for, or a changed claim. The narrower test "the publisher is not the
@@ -1480,6 +1584,9 @@ impl RendezvousService {
                 let rec = MemberBundleRecord::from_wire(record)
                     .map_err(|e| RejectReason::for_error(&e))?;
                 let (cid, epoch, author) = (rec.channel_id, rec.epoch, rec.author_id);
+                if self.oracle.removed(&cid, epoch, &author) {
+                    return Err(RejectReason::NotMember);
+                }
                 let mut store = lock(&self.store);
                 let previous_revision = store.revision(&cid, now);
                 let key = self
@@ -1507,6 +1614,9 @@ impl RendezvousService {
                     return Err(RejectReason::Policy);
                 }
                 let cid = rec.channel_id;
+                if self.oracle.removed_current(&cid, &rec.asserted_id()) {
+                    return Err(RejectReason::RoomAuthorization);
+                }
                 let mut store = lock(&self.store);
                 let previous_revision = store.revision(&cid, now);
                 store
@@ -1542,6 +1652,9 @@ impl RendezvousService {
                 use crate::nat::withdraw::{BoardWithdraw, WithdrawScope};
                 let w =
                     BoardWithdraw::from_wire(record).map_err(|e| RejectReason::for_error(&e))?;
+                if self.oracle.removed(&w.channel_id, w.epoch, &w.author_id) {
+                    return Err(RejectReason::NotMember);
+                }
                 // Permanent negative state must pass the current signed-clock policy before
                 // either the authenticated or the pending-withdraw path mutates.
                 crate::nat::store::check_clock_sanity(w.timestamp_ms, now)
@@ -1558,7 +1671,8 @@ impl RendezvousService {
                     WithdrawScope::Room => {
                         let creator = store
                             .genesis(&w.channel_id)
-                            .map(|g| g.body.creator_pubkey.clone());
+                            .map(|g| g.body.creator_pubkey.clone())
+                            .or_else(|| store.ended_creator(&w.channel_id).cloned());
                         match creator {
                             Some(c) if c.fingerprint() == w.author_id => Some(c),
                             Some(_) if store.is_roster_admin(&w.channel_id, &w.author_id) => {
@@ -1610,6 +1724,9 @@ impl RendezvousService {
                 let notice = crate::nat::notice::AdmissionNotice::from_wire(record)
                     .map_err(|e| RejectReason::for_error(&e))?;
                 let (cid, epoch) = (notice.channel_id(), notice.witness.epoch);
+                if self.oracle.removed(&cid, epoch, &notice.joiner()) {
+                    return Err(RejectReason::NotMember);
+                }
                 let mut store = lock(&self.store);
                 let previous_revision = store.revision(&cid, now);
                 let Some(key) =
@@ -1716,10 +1833,46 @@ impl RendezvousService {
                     return Ok(());
                 }
             }
+            let fence = match &request {
+                RendezvousRequest::Get {
+                    channel_id, epoch, ..
+                } => self.oracle.room_store(channel_id, *epoch).map(|store| {
+                    (
+                        *channel_id,
+                        *epoch,
+                        self.oracle.removal_generation(channel_id, *epoch),
+                        store,
+                    )
+                }),
+                _ => None,
+            };
             let responses = self.handle(Some(&publisher), Some(source), &request);
             request.clear_transport_secret();
             for response in responses {
-                if let Err(e) = write_frame(&mut send, &response.to_frame()).await {
+                let wire = response.to_frame();
+                let result = if let Some((room, epoch, generation, store)) = &fence {
+                    use std::future::Future as _;
+                    use std::task::Poll;
+                    let mut write = std::pin::pin!(write_frame(&mut send, &wire));
+                    std::future::poll_fn(|cx| {
+                        match store.with_publication_fence(|| {
+                            if crate::node::channel::governance::removal_generation(store, room)?
+                                != *generation
+                                || self.oracle.removed(room, *epoch, &publisher)
+                            {
+                                return Err(Error::StreamRefused("room authorization changed"));
+                            }
+                            Ok(write.as_mut().poll(cx))
+                        }) {
+                            Ok(result) => result,
+                            Err(error) => Poll::Ready(Err(error)),
+                        }
+                    })
+                    .await
+                } else {
+                    write_frame(&mut send, &wire).await
+                };
+                if let Err(e) = result {
                     reset(&mut send, &mut recv, &e);
                     return Err(e);
                 }

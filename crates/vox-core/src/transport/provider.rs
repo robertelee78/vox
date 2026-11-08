@@ -41,12 +41,11 @@ pub const X25519MLKEM768_CODE_POINT: u16 = 0x11EC;
 
 /// The ALPN of the Vox transport: the neutral handshake followed by the identity exchange
 /// (ADR-011 requirement 27). Pinning it means a Vox endpoint never completes a handshake with a
-/// non-Vox QUIC service that happened to share the port, and a `vox/1` peer — which expected
-/// its identity in the certificate — never completes one either.
-pub const VOX_ALPN: &[u8] = b"vox/2";
+/// non-Vox QUIC service or an older Vox protocol on the same port.
+pub const VOX_ALPN: &[u8] = b"vox/3";
 /// Explicit opt-in to the authenticated self-author key-recovery exchange.
-pub const VOX_OWN_RECOVERY_ALPN: &[u8] = b"vox/2-own-recovery";
-pub(crate) const VOX_AVAILABILITY_ALPN: &[u8] = b"vox/2-own-availability";
+pub const VOX_OWN_RECOVERY_ALPN: &[u8] = b"vox/3-own-recovery";
+pub(crate) const VOX_AVAILABILITY_ALPN: &[u8] = b"vox/3-own-availability";
 
 /// Build the Vox crypto provider: the `aws-lc-rs` provider with `kx_groups`
 /// restricted to exactly the X25519MLKEM768 hybrid group, so there is no classical

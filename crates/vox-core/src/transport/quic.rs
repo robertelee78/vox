@@ -1078,6 +1078,7 @@ impl SharedEndpoint {
                 ))
             })?
             .map_err(handshake_failed)?;
+        confirm_handshake(&connection)?;
         // A circuit's asks are limited by the relay carrying them: this end never sees the
         // asker's address.
         let source = match &carrier {
@@ -1369,6 +1370,7 @@ impl VoxEndpoint {
             return Err(Error::Handshake("this node is detached".to_owned()));
         }
         let connection = connecting.await.map_err(handshake_failed)?;
+        confirm_handshake(&connection)?;
         // **The node must still be attached when the handshake ends**, not only when the dial
         // began. A handshake can take as long as the path takes to open (a punch, a forward that
         // lets packets through later): one begun by an attach that has since detached completed
@@ -1549,6 +1551,10 @@ fn handshake_failed(e: quinn::ConnectionError) -> Error {
         format!("TLS alert {n} ({:?})", rustls::AlertDescription::from(n))
     };
     match e {
+        // TLS no_application_protocol (120) is a known ALPN mismatch, not an
+        // authentication failure or evidence that the peer is unreachable.
+        C::TransportError(t) if u64::from(t.code) == 0x178 => Error::ProtocolMismatch,
+        C::ConnectionClosed(c) if u64::from(c.error_code) == 0x178 => Error::ProtocolMismatch,
         // This end refused the peer's TLS: not a Vox daemon's neutral leaf, or not the group.
         C::TransportError(t) if tls(t.code) => Error::HandshakeAuth(format!(
             "this node refused the peer's TLS handshake ({}): {}",
@@ -1658,7 +1664,7 @@ fn confirm_handshake(connection: &Connection) -> Result<(u16, bool, bool)> {
         Some(p) if p.as_slice() == crate::transport::provider::VOX_AVAILABILITY_ALPN => {
             Ok((u16::from(hd.negotiated_key_exchange_group), true, true))
         }
-        _ => Err(Error::SignatureInvalid),
+        _ => Err(Error::ProtocolMismatch),
     }
 }
 

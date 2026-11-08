@@ -685,9 +685,20 @@ impl Node {
             prepared.save.stage = Stage::Governance;
         }
         if prepared.save.stage == Stage::Packages
-            && !(channel.needs_session_upgrade() && channel.key_packages_pending())
+            && (channel.is_member_removed(&store, &channel.me())?
+                || !(channel.needs_session_upgrade() && channel.key_packages_pending()))
         {
             prepared.save.stage = Stage::Legacy;
+        }
+        // Publish the room before work that needs restored membership or peer history.
+        // Its normal governance/Drive owners retain and complete rotation and refresh;
+        // closing it here would prevent the readmission or missing history from arriving.
+        if prepared.save.stage == Stage::Refresh
+            && (channel.is_member_removed(&store, &channel.me())?
+                || channel.room_removal_rotation_needed(&store)?
+                || channel.room_removal_drive_rotation_needed(&store)?)
+        {
+            prepared.save.stage = Stage::Retention(Step::OwedCleanup);
         }
         if prepared.save.stage == Stage::Classification
             && !channel.legacy_classification_pending(&store)?
@@ -788,6 +799,7 @@ impl Node {
                     Some(Work::Packages(package_save::Work::Select {
                         trust_digest: crate::hash::sha256(&self.trust.to_bytes()),
                         replay: false,
+                        abandon_unopened: false,
                     }))
                 }
                 _ => return Err(Error::Profile("unexpected preparation stage")),

@@ -11,7 +11,7 @@ extension Notification.Name {
 
 /// A sheet a menu, key or palette action opens.
 enum NodeSheet: String, Identifiable {
-    case palette, newRoom, joinRoom, repoRoom, fingerprint, rename, retention, admins, roomAnchors, pause, resume, leave, end
+    case palette, newRoom, joinRoom, repoRoom, fingerprint, rename, retention, admins, membership, roomAnchors, pause, resume, leave, end
     var id: String { rawValue }
 }
 
@@ -94,6 +94,7 @@ extension VoxAction {
             VoxAction("Room", "Rename…", enabled: inRoom) { node?.sheet = .rename },
             VoxAction("Room", "Retention…", enabled: inRoom) { node?.sheet = .retention },
             VoxAction("Room", "Admins…", enabled: inRoom) { node?.sheet = .admins },
+            VoxAction("Room", "Remove or Readmit Member…", enabled: inRoom) { node?.sheet = .membership },
             VoxAction("Room", "Anchors…", enabled: inRoom) {
                 Task { await node?.openRoomAnchors() }
             },
@@ -286,6 +287,7 @@ struct NodeSheets: View {
             case .rename: RenameSheet(model: model)
             case .retention: RetentionSheet(model: model)
             case .admins: AdminsSheet(model: model)
+            case .membership: RoomMembershipSheet(model: model)
             case .roomAnchors: RoomAnchorEditor(model: model)
             case .pause: RoomPauseSheet(model: model, pausing: true)
             case .resume: RoomPauseSheet(model: model, pausing: false)
@@ -690,6 +692,117 @@ private struct AdminsSheet: View {
         .padding(Space.s24).frame(width: Theme.scaled(440))
         .onAppear { model.clearOutcome(of: "admins") }
         .task { await read(first: true) }
+    }
+}
+
+/// Room membership is distinct from the admin role and global keyring trust.
+private struct RoomMembershipSheet: View {
+    @ObservedObject var model: NodeModel
+    @State private var room = ""
+    @State private var roomName = ""
+    @State private var context = ""
+    @State private var member = ""
+    @State private var readmit = false
+    @State private var confirming = false
+    @State private var working = false
+    @State private var result: String?
+
+    private var current: Bool {
+        !room.isEmpty && model.roomPauseContext == context && model.roomOnScreen == room
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Space.s12) {
+            Text("Room membership").title()
+            Text("Room: \(roomName)\n\(room)").textSelection(.enabled)
+            Text("Removal affects this room only, not global trust or other rooms. Already readable history remains; information and keys already disclosed cannot be recalled. Readmission does not restore history. A different fingerprint is a different node, even if its name is the same.")
+                .fixedSize(horizontal: false, vertical: true)
+            if !current {
+                Text("The room or acting node changed. Close this sheet and select the room again.")
+            } else if !confirming {
+                Text("Select the exact member to remove:")
+                ScrollView {
+                    VStack(alignment: .leading, spacing: Space.s8) {
+                        ForEach(model.members) { row in
+                            Button {
+                                member = row.id
+                                readmit = false
+                                confirming = true
+                                result = nil
+                            } label: {
+                                VStack(alignment: .leading) {
+                                    Text(row.name)
+                                    Text("Remove…")
+                                    Text(row.id).textSelection(.enabled).secondaryText()
+                                }
+                            }
+                            .accessibilityIdentifier("room-remove-\(row.id)")
+                        }
+                    }
+                }.frame(maxHeight: Theme.scaled(180))
+                Text("Creator only: readmit an exact removed fingerprint. Readmission does not restore history or automatically grant access; ordinary authorization and trust checks still apply.")
+                    .fixedSize(horizontal: false, vertical: true)
+                TextField("Full fingerprint", text: $member)
+                    .accessibilityIdentifier("room-readmit-fingerprint")
+                Button("Review Readmission") {
+                    member = member.trimmingCharacters(in: .whitespacesAndNewlines)
+                    readmit = true
+                    confirming = true
+                    result = nil
+                }
+                .disabled(member.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            } else {
+                Text("\(readmit ? "Readmit" : "Remove") this exact fingerprint in \(roomName)?")
+                Text(member).textSelection(.enabled)
+                Text(readmit
+                     ? "Only the creator can readmit. Readmission does not restore history; access still requires independent authorization and trust checks."
+                     : "Only the creator or an authorized admin can remove a non-creator. Prior disclosures cannot be recalled; other rooms and global trust are unchanged.")
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack {
+                    Button("Back") { confirming = false }.disabled(working)
+                    Button(readmit ? "Readmit" : "Remove", role: readmit ? nil : .destructive) {
+                        submit()
+                    }
+                    .disabled(working)
+                    .accessibilityIdentifier("room-membership-confirm")
+                }
+            }
+            if let result {
+                Text(result).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("room-membership-result")
+            }
+            Button("Done") { model.sheet = nil }.disabled(working)
+        }
+        .padding(Space.s24).frame(width: Theme.scaled(500))
+        .onAppear {
+            room = model.roomOnScreen ?? ""
+            roomName = model.rooms.first(where: { $0.id == room })?.name ?? room
+            context = model.roomPauseContext
+            if let target = model.roomMemberToRemove,
+               model.members.contains(where: { $0.id == target }) {
+                member = target
+                confirming = true
+            }
+            model.roomMemberToRemove = nil
+        }
+    }
+
+    private func submit() {
+        guard current, !working else { return }
+        let target = member, selectedRoom = room, selectedName = roomName
+        let captured = context, restoring = readmit
+        working = true
+        Task {
+            defer { working = false }
+            do {
+                try await model.changeRoomMembership(room: selectedRoom, member: target,
+                                                     readmit: restoring, context: captured)
+                result = "\(restoring ? "Readmission" : "Removal") of \(target) in \(selectedName) (\(selectedRoom)) was applied on this node. Propagation to other nodes is unknown. \(restoring ? "Readmission does not restore history; access still requires ordinary authorization and trust checks." : "Other rooms and global trust are unchanged; prior disclosures cannot be recalled.")"
+                confirming = false
+            } catch {
+                result = "Could not confirm \(restoring ? "readmission" : "removal") of \(target) in \(selectedName) (\(selectedRoom)): \(sentence(error)). If the connection failed after sending, the outcome may be unknown."
+            }
+        }
     }
 }
 

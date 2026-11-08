@@ -219,6 +219,9 @@ pub struct Attempt {
     /// lifecycle cleanup may retain this attempt long enough to return its semantic receipt;
     /// it grants no inventory, body, proof, archive or membership access.
     pub departure_receipt: Option<Arc<AtomicBool>>,
+    /// Inbound authenticated-history transport admitted only for own-author recovery.
+    /// The server still binds and revalidates each query; this flag is not authority.
+    pub limited_recovery: bool,
 }
 
 impl Attempt {

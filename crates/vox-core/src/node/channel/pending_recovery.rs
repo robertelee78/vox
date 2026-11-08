@@ -95,6 +95,8 @@ impl AppendBoundary {
         if self.recover.is_some() {
             batch.delete_segment(room, SegmentKind::KeyMaterial, SEG_OWN_BEHIND)?;
             batch.delete_segment(room, SegmentKind::KeyMaterial, SEG_OWN_READABILITY)?;
+            own_history::delete_recovery_boundary(batch, room)?;
+            own_history::delete_unknown_higher(batch, room)?;
         }
         Ok(())
     }
@@ -351,6 +353,7 @@ impl ChannelState {
                 let slot = (me, self.sender.chain_id());
                 if !self.own_behind
                     || !matches!(self.own_recovery, Recovery::Head(_))
+                    || !self.origins.has(&self.channel_id, self.epoch, slot.1)
                     || self
                         .receivers
                         .get(&slot)
@@ -358,9 +361,8 @@ impl ChannelState {
                 {
                     Operation::Unchanged(Saved::Receiver(false))
                 } else {
-                    if !self.origins.has(&self.channel_id, self.epoch, slot.1)
-                        || (!self.receivers.contains_key(&slot)
-                            && self.receivers.len() >= MAX_RECEIVER_CHAINS)
+                    if !self.receivers.contains_key(&slot)
+                        && self.receivers.len() >= MAX_RECEIVER_CHAINS
                     {
                         return Err(Error::OwnHistoryBehind);
                     }
@@ -388,7 +390,7 @@ impl ChannelState {
             }
             Work::Settle => {
                 let sparse = self.uses_sparse_history(store)?;
-                if !self.recovery_settlement_eligible(store, now, sparse)? {
+                if self.own_behind || !self.recovery_settlement_eligible(store, now, sparse)? {
                     Operation::Unchanged(Saved::Settlement {
                         changed: false,
                         sparse,
@@ -431,26 +433,51 @@ impl ChannelState {
                 }
             }
             Work::Complete => {
+                // Stage a readmitted author's verified old departure before the return
+                // Presence is appended; no room or disk owner is held while it waits.
+                #[cfg(feature = "test-knobs")]
+                if self.own_behind && self.said_left(&self.me()) {
+                    if let Some(path) = std::env::var_os("VOX_TEST_HOLD_RETURN_PRESENCE_FILE")
+                        .map(std::path::PathBuf::from)
+                        .filter(|path| path.is_file())
+                    {
+                        let _ = std::fs::write(path.with_extension("engaged"), b"held");
+                        return Err(Error::OwnHistoryBehind);
+                    }
+                }
                 if !self.own_behind {
                     Operation::Unchanged(Saved::Recovered(false))
                 } else {
                     self.require_own_recovery_complete(store)?;
+                    let retained = super::super::own_history::load_continuity(
+                        store,
+                        &self.continuity_key,
+                        &self.channel_id,
+                        &self.me(),
+                    )?;
+                    let retained_generation = retained
+                        .as_ref()
+                        .filter(|marker| marker.epoch == self.epoch)
+                        .map_or(0, |marker| marker.generation);
+                    let recovered_generation = self
+                        .current_governance(store)?
+                        .presence_sender_generation(&self.me())?
+                        .unwrap_or(0);
                     let next = self
-                        .dag
-                        .verified_head(&self.me())
-                        .checked_add(2)
+                        .sender
+                        .chain_id()
+                        .max(retained_generation)
+                        .max(recovered_generation)
+                        .checked_add(1)
                         .ok_or(Error::MalformedBundle("chain_id overflow"))?;
-                    if self.sender.chain_id() >= next {
-                        return Err(Error::OwnHistoryBehind);
-                    }
                     return self
                         .prepare_recovery_append(
                             store,
                             owner,
                             AppendMode::Rotate {
                                 next,
-                                here: !self.said_left(&self.me()),
-                                settle: false,
+                                here: true,
+                                settle: !self.settled,
                                 recover: true,
                             },
                             now,
@@ -559,7 +586,7 @@ impl ChannelState {
         let (settle, recover, after_departure) = match &mode {
             AppendMode::Rotate {
                 settle, recover, ..
-            } => (*settle, *recover, *settle),
+            } => (*settle, *recover, *settle || *recover),
             AppendMode::Presence => (false, false, true),
             AppendMode::Shares(_) => (false, false, false),
         };

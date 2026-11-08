@@ -288,22 +288,8 @@ impl ChannelState {
         }
         match completed.delta {
             Delta::Contiguous { author, progress } => {
-                if let Some(state) = progress.state {
-                    let was_member = self.is_member(&author);
-                    if let Err(error) = self.dag.restore_contiguous_author(author, &state) {
-                        completed.result = Err(error);
-                    } else {
-                        if !was_member && self.is_member(&author) {
-                            self.key_member_became_current(author);
-                        }
-                        self.role_cuts.insert(author, state.seq);
-                        self.note_role_progress(author, state.seq);
-                    }
-                }
-                if progress.more {
-                    self.sparse_contiguous_pending.insert(author);
-                } else {
-                    self.sparse_contiguous_pending.remove(&author);
+                if let Err(error) = self.note_contiguous_advance(author, progress) {
+                    completed.result = Err(error);
                 }
             }
             Delta::Startup(preparation) => {
@@ -342,6 +328,11 @@ impl ChannelState {
             self.install_legacy_projection_context(context);
         }
         self.release_pending_text(&completed.pending.owner, false);
+        if matches!(&completed.pending.native, Native::Contiguous(_)) && completed.result.is_ok() {
+            if let Err(error) = self.flush_available(store) {
+                completed.result = Err(error);
+            }
+        }
         if let Err(error) = &completed.result {
             if !matches!(
                 &completed.pending.native,
@@ -491,7 +482,8 @@ impl ChannelState {
                 if !matches!(classify_payload(payload), Ok(EntryKind::Content)) {
                     continue;
                 }
-                let prepared = projection.prepare(self, store, author, hash, payload, true)?;
+                let prepared =
+                    projection.prepare(self, store, &entry, author, hash, payload, true)?;
                 rows.push((entry, prepared));
             }
         }
@@ -542,6 +534,9 @@ impl Prepared {
                         .ok_or(Error::Profile("backfill projection owner missing"))?;
                     let mut batch = store.batch()?;
                     batch.derived();
+                    for (_, prepared) in rows.iter() {
+                        prepared.check_generation(&batch, sek, &self.room)?;
+                    }
                     {
                         let mut writer = index.write(&mut batch, sek, &self.room)?;
                         for (author, next) in edits {

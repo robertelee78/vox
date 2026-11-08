@@ -2754,6 +2754,9 @@ private struct Inspector: View {
                         role(model.me)
                         work(model.me)
                     }
+                    Button("Remove or Readmit Member…") { model.sheet = .membership }
+                        .disabled(model.ended != nil)
+                        .accessibilityIdentifier("member-manage-membership")
                     if let problem = model.memberWorkError {
                         Text(problem).secondaryText().fixedSize(horizontal: false, vertical: true)
                             .accessibilityIdentifier("member-work-unavailable")
@@ -2802,6 +2805,12 @@ private struct Inspector: View {
                             .fixedSize(horizontal: false, vertical: true)
                             .accessibilityIdentifier("member-trust-directions-" + member.id)
                         MemberTrustActions(model: model, fingerprint: member.id, name: member.name, room: room)
+                        Button("Remove from Room…", role: .destructive) {
+                            model.roomMemberToRemove = member.id
+                            model.sheet = .membership
+                        }
+                        .disabled(model.ended != nil)
+                        .accessibilityIdentifier("member-remove-" + member.id)
                         // What this node's keyring grants it (K-14), once it is in the keyring.
                         if member.trust.inKeyring {
                             Text(Capability.words(member.drive)).eyebrow().secondaryText()

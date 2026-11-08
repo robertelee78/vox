@@ -157,6 +157,12 @@ impl Record {
             Proof::Legacy(entry) => entry.entry_hash(),
         }
     }
+    pub(crate) fn legacy_entry(&self) -> Option<&Entry> {
+        match &self.proof {
+            Proof::Legacy(entry) => Some(entry),
+            Proof::Private(_) => None,
+        }
+    }
 
     pub fn legacy_claimed_ms(&self) -> Option<u64> {
         match &self.proof {
@@ -276,6 +282,8 @@ pub(crate) struct Ask {
 pub(crate) struct Page {
     /// The initiating node's grant revision and query are local, never accepted from the peer.
     pub revision: u64,
+    /// Captured local room authorization; never carried on the wire.
+    pub removal_generation: Option<u64>,
     pub query: Query,
     pub cursor: Cursor,
     pub more: bool,
@@ -352,7 +360,12 @@ pub(crate) async fn read_ask(recv: &mut RecvStream) -> Result<Ask> {
     Ok(ask)
 }
 
-pub(crate) async fn answer(mut send: SendStream, page: Page) -> Result<()> {
+pub(crate) async fn answer(
+    mut send: SendStream,
+    page: Page,
+    store: &crate::node::store::Store,
+    room: &Digest32,
+) -> Result<()> {
     if page.records.len() > PAGE_RECORDS
         || page.records.len() != page.positions.len()
         || page.hints.len() > PAGE_RECORDS
@@ -378,7 +391,27 @@ pub(crate) async fn answer(mut send: SendStream, page: Page) -> Result<()> {
     if wire.len() + 4 > MAX_PAGE {
         return Err(Error::SizeLimitExceeded("private Session page"));
     }
-    write_frame(&mut send, &wire).await?;
+    let generation = page
+        .removal_generation
+        .ok_or(Error::Profile("private Session authorization missing"))?;
+    {
+        use std::future::Future as _;
+        use std::task::Poll;
+        let mut write = std::pin::pin!(write_frame(&mut send, &wire));
+        std::future::poll_fn(|cx| {
+            match store.with_publication_fence(|| {
+                if crate::node::channel::governance::removal_generation(store, room)? != generation
+                {
+                    return Err(Error::StreamRefused("room authorization changed"));
+                }
+                Ok(write.as_mut().poll(cx))
+            }) {
+                Ok(result) => result,
+                Err(error) => Poll::Ready(Err(error)),
+            }
+        })
+        .await?;
+    }
     send.finish()
         .map_err(|_| Error::Unreachable("private Session answer closed"))
 }
@@ -485,6 +518,7 @@ pub(crate) async fn pull_precharged(
     }
     Ok(Page {
         revision: ask.revision,
+        removal_generation: None,
         query: ask.query,
         cursor,
         more,

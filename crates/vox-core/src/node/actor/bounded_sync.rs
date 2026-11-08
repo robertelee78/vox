@@ -971,6 +971,27 @@ impl Drop for Controller {
 }
 
 impl Controller {
+    pub(super) fn rehome_source_progress(
+        &mut self,
+        room: Digest32,
+        peer: Digest32,
+        connection: u64,
+        token: crate::node::channel::availability::Token,
+    ) {
+        for flow in &mut self.deferred {
+            if flow.room == room
+                && flow.route_origin == Some(peer)
+                && flow.transient_refused
+                && flow.availability_connection == connection
+                && flow.availability_captured.is_none_or(|old| old < token)
+            {
+                flow.peer = peer;
+                flow.route_origin = None;
+                flow.brought = std::mem::take(&mut flow.route_origin_brought);
+                flow.transient_refused = false;
+            }
+        }
+    }
     pub(super) fn set_completion_wake(&mut self, wake: Arc<tokio::sync::Notify>) {
         self.completion_wake = wake;
     }
@@ -2627,18 +2648,18 @@ fn take_foreground_hint(
     node: Digest32,
     parked_receipt: Option<Digest32>,
     connection: Option<u64>,
-) -> Option<stream::HeadHint> {
+) -> Option<(stream::HeadHint, u64)> {
     // Inbound producers may replenish the inbox while this scalar selection runs.
     // Bound this turn by the existing inventory quantum; remaining hints keep their
     // ordinary inbox/port-queue ownership and their producer's completion wake.
     for _ in 0..crate::log::history::MAX_CONTEXT_AUTHORS {
-        let (hint, role_signal, role_connection) = inbox.take(room, peer, node)?;
+        let (hint, role_signal, role_connection, owner) = inbox.take(room, peer, node)?;
         if (role_signal && role_connection != connection)
             || (!role_signal && hint.author == node && parked_receipt == Some(hint.head))
         {
-            inbox.finish(room, peer, hint.author, hint.head);
+            inbox.finish_owned(room, peer, owner, false);
         } else {
-            return Some(hint);
+            return Some((hint, owner));
         }
     }
     None
@@ -2763,14 +2784,17 @@ impl Node {
         AdmissionWork::unowned("inventory", Lane::Control, service)
     }
 
-    /// Retire every operation for a departed member except an already decoded
-    /// `Control/Head(peer)` response. That response is bounded by its existing fence and
-    /// deadline and can return only the peer's own semantic departure receipt.
+    /// Retire ordinary departed-member traffic while preserving independently scoped,
+    /// already admitted own-recovery responses and exact departure receipts.
     pub(super) fn retire_departed_port(&mut self, room: Digest32, peer: Digest32) {
+        #[cfg(feature = "test-knobs")]
+        if crate::node::computer::fx28_mutant("sync-departed-peer") {
+            return;
+        }
         let keep_receipt = self.ports.get(&(room, peer)).is_some_and(|port| {
             port.inbound
                 .values()
-                .any(|attempt| attempt.is_departure_receipt())
+                .any(|attempt| attempt.is_departure_receipt() || attempt.limited_recovery)
         });
         if !keep_receipt {
             if self.ports.contains_key(&(room, peer)) {
@@ -2787,7 +2811,9 @@ impl Node {
             let ordinary: Vec<_> = port
                 .inbound
                 .iter()
-                .filter_map(|(token, attempt)| (!attempt.is_departure_receipt()).then_some(*token))
+                .filter_map(|(token, attempt)| {
+                    (!attempt.is_departure_receipt() && !attempt.limited_recovery).then_some(*token)
+                })
                 .collect();
             for token in ordinary {
                 if let Some(attempt) = port.inbound.remove(&token) {
@@ -2966,11 +2992,39 @@ impl Node {
     /// removes it first, making this a no-op for teardown rather than leaving an in-flight orphan.
     fn dispose_rearming_hint(&mut self, mut flow: Flow) {
         self.rearm_required(&flow);
-        if let Some(hint) = flow.hint.take().filter(|_| !flow.local_own_root()) {
+        if let Some(owner) = flow.hint_owner.take() {
             self.history_hints
-                .retry(flow.room, flow.hint_peer, hint.author, hint.head);
+                .finish_owned(flow.room, flow.hint_peer, owner, true);
         }
         self.bounded_sync.dispose(flow);
+    }
+    /// A fresh advertising connection can serve the exact continuation parked on an offline
+    /// author. Move that retained flow, not a reconstructed scalar, back to its origin.
+    pub(super) fn rearm_routed_origin(&mut self, peer: Digest32, serial: u64) {
+        for flow in &mut self.bounded_sync.deferred {
+            if flow.route_origin == Some(peer)
+                && flow.transient_refused
+                && flow.availability_connection != serial
+            {
+                #[cfg(feature = "test-knobs")]
+                eprintln!(
+                    "history rearm retained origin={} previous={} current={} owner={:?}",
+                    crate::node::link::b32_encode(&peer),
+                    flow.availability_connection,
+                    serial,
+                    flow.hint_owner
+                );
+                flow.peer = peer;
+                flow.route_origin = None;
+                flow.brought = std::mem::take(&mut flow.route_origin_brought);
+                flow.transient_refused = false;
+                if let Some(port) = self.ports.get_mut(&(flow.room, peer)) {
+                    port.raise();
+                    port.clear_service_backoff(flow.service);
+                }
+                self.sched_rooms.insert(flow.room);
+            }
+        }
     }
 
     /// Settle the exact archive operation before retiring a Flow which can no longer return
@@ -3209,6 +3263,121 @@ impl Node {
         self.bounded_sync.poll_cleanup();
     }
 
+    /// A canonical room authorization edge retires obsolete parked capabilities locally,
+    /// including an owner whose peer is offline. No connection or new history authority is
+    /// needed to finish that exact owner's existing retirement.
+    pub(super) fn retire_stale_bounded_room(
+        &mut self,
+        room: Digest32,
+        instance: [u8; 16],
+        epoch: u64,
+        generation: Digest32,
+    ) {
+        let stale = |flow: &Flow| {
+            flow.room == room
+                && flow.initialized_authorization().is_some_and(|captured| {
+                    flow.instance != instance || flow.epoch != epoch || captured != generation
+                })
+        };
+        for index in 0..self.bounded_sync.ready.len() {
+            if self.bounded_sync.ready[index].as_ref().is_some_and(stale) {
+                if let Some(mut flow) = self.bounded_sync.ready[index].take() {
+                    self.bounded_sync.cancel_work_admissions(WorkKey::of(&flow));
+                    flow.authorization_changed = true;
+                    self.retire_changed_bounded_flow(flow);
+                }
+            }
+        }
+        let mut index = 0;
+        while index < self.bounded_sync.deferred.len() {
+            if stale(&self.bounded_sync.deferred[index]) {
+                if let Some(mut flow) = self.bounded_sync.deferred.remove(index) {
+                    self.bounded_sync.cancel_work_admissions(WorkKey::of(&flow));
+                    flow.authorization_changed = true;
+                    self.retire_changed_bounded_flow(flow);
+                }
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    fn retire_changed_bounded_flow(&mut self, flow: Flow) {
+        let room = flow.room;
+        let peer = flow.peer;
+        let service = flow.service;
+        let retry_peer = flow.route_origin.unwrap_or(flow.hint_peer);
+        if let Some(token) = flow.key_body_token.as_ref() {
+            if let Some(port) = self.ports.get_mut(&(room, flow.hint_peer)) {
+                if port
+                    .key_body_token
+                    .as_ref()
+                    .is_some_and(|owner| Arc::ptr_eq(owner, token))
+                {
+                    port.key_body = None;
+                    port.key_body_instance = None;
+                    port.key_body_token = None;
+                    port.key_body_after = None;
+                    port.key_body_initialized = false;
+                }
+            }
+        }
+        let archive = flow.archive_request.and_then(|request| {
+            let fence = flow.request_fence.as_ref()?;
+            if !self.history_demand.owns_running_fence(request, flow.generation, fence) {
+                return None;
+            }
+            let other_resume = self.history_demand.has_other_resume(room, flow.instance, request);
+            let detail = if other_resume {
+                "Authorization changed; the saved history request can be resumed."
+            } else {
+                "Authorization changed while this history page was running; the exact request is being resumed."
+            };
+            self.history_demand.failed_current(
+                room,
+                flow.instance,
+                request,
+                flow.generation,
+                detail,
+            ).then_some((request, flow.instance)).filter(|_| !other_resume)
+        });
+        if let Some(owner) = flow.hint_owner {
+            self.history_hints
+                .finish_owned(room, flow.hint_peer, owner, true);
+        }
+        if let Some((head, seq)) = flow.required_root {
+            let need = RequiredOwner {
+                room,
+                peer: flow.hint_peer,
+                head,
+                seq,
+                request: flow
+                    .required_owner_request
+                    .unwrap_or(flow.retirement_request()),
+                instance: flow.instance,
+            };
+            if !self.bounded_sync.required.contains(&need) {
+                self.bounded_sync.required.push_front(need);
+            }
+        }
+        self.bounded_sync.dispose(flow);
+        crate::node::status::SyncBook::with(&self.sync_book, room, peer, |counts| {
+            counts.stale += 1;
+            counts.backoff = None;
+        });
+        if let Some(port) = self.ports.get_mut(&(room, retry_peer)) {
+            if service == OutboundService::Public {
+                port.raise();
+            }
+            port.clear_service_backoff(service);
+        }
+        if let Some((request, instance)) = archive {
+            // Own the exact Resume before any fallible replacement admission.
+            self.history_demand.owe_resume(room, instance, request);
+        }
+        self.sched_rooms.insert(room);
+    }
+
     pub(super) fn accept_bounded_sync(&mut self) {
         self.bounded_sync.poll_cleanup();
         for index in 0..crate::node::history_budget::BOUNDED_SYNC_RUNNING_SLOTS {
@@ -3322,6 +3491,24 @@ impl Node {
                     .channels
                     .get(&work.room)
                     .is_some_and(|room| Arc::ptr_eq(room, &flow.shared));
+            if valid {
+                if let Some(captured) = flow.initialized_authorization() {
+                    if self.profile.as_ref().is_some_and(|profile| {
+                        stream::authorization_generation(
+                            profile.store(),
+                            flow.node,
+                            flow.room,
+                            flow.instance,
+                            flow.epoch,
+                        )
+                        .is_ok_and(|generation| generation != captured)
+                    }) {
+                        // A worker can return Busy after the canonical refresh scanned parked
+                        // owners. Recheck before retaining its now-obsolete capability.
+                        flow.authorization_changed = true;
+                    }
+                }
+            }
             if valid {
                 if let Some(response) = flow.unavailable_response.take() {
                     if let Some(port) = self.ports.get_mut(&(work.room, work.peer)) {
@@ -3440,91 +3627,15 @@ impl Node {
                 }
             }
             if flow.authorization_changed {
-                let retry_peer = flow.route_origin.unwrap_or(flow.hint_peer);
-                if let Some(token) = flow.key_body_token.as_ref() {
-                    if let Some(port) = self.ports.get_mut(&(work.room, flow.hint_peer)) {
-                        if port
-                            .key_body_token
-                            .as_ref()
-                            .is_some_and(|owner| Arc::ptr_eq(owner, token))
-                        {
-                            port.key_body = None;
-                            port.key_body_instance = None;
-                            port.key_body_token = None;
-                            port.key_body_after = None;
-                            port.key_body_initialized = false;
-                        }
-                    }
-                }
-                let archive = flow.archive_request.and_then(|request| {
-                    let fence = flow.request_fence.as_ref()?;
-                    if !self.history_demand.owns_running_fence(request, flow.generation, fence) {
-                        return None;
-                    }
-                    let other_resume = self.history_demand.has_other_resume(work.room, flow.instance, request);
-                    let detail = if other_resume {
-                        "Authorization changed; the saved history request can be resumed."
-                    } else {
-                        "Authorization changed while this history page was running; the exact request is being resumed."
-                    };
-                    self.history_demand.failed_current(
-                        work.room,
-                        flow.instance,
-                        request,
-                        flow.generation,
-                        detail,
-                    ).then_some((request, flow.instance)).filter(|_| !other_resume)
-                });
-                if let Some(hint) = flow.hint.filter(|_| !flow.local_own_root()) {
-                    self.history_hints
-                        .retry(work.room, flow.hint_peer, hint.author, hint.head);
-                }
-                if let Some((head, seq)) = flow.required_root {
-                    let need = RequiredOwner {
-                        room: work.room,
-                        peer: flow.hint_peer,
-                        head,
-                        seq,
-                        request: flow
-                            .required_owner_request
-                            .unwrap_or(flow.retirement_request()),
-                        instance: flow.instance,
-                    };
-                    if !self.bounded_sync.required.contains(&need) {
-                        self.bounded_sync.required.push_front(need);
-                    }
-                }
-                self.bounded_sync.dispose(flow);
-                crate::node::status::SyncBook::with(
-                    &self.sync_book,
-                    work.room,
-                    work.peer,
-                    |counts| {
-                        counts.stale += 1;
-                        counts.backoff = None;
-                    },
-                );
-                if let Some(port) = self.ports.get_mut(&(work.room, retry_peer)) {
-                    if work.service == OutboundService::Public {
-                        port.raise();
-                    }
-                    port.clear_service_backoff(work.service);
-                }
-                if let Some((request, instance)) = archive {
-                    // `failed_current` retired the still-owned running generation. Retain the exact Resume as
-                    // its replacement owner before any fallible profile/room/admission preflight;
-                    // `schedule` either installs preparation or keeps its fair Control ticket.
-                    self.history_demand.owe_resume(work.room, instance, request);
-                }
-                self.sched_rooms.insert(work.room);
+                self.retire_changed_bounded_flow(flow);
                 continue;
             }
             if let Some(error) = flow.local_retry.take() {
                 let retry_peer = flow.route_origin.unwrap_or(flow.hint_peer);
                 self.settle_archive_exit(&mut flow, &error);
-                if let Some(hint) = flow.hint.filter(|_| !flow.local_own_root()) {
+                if let Some(owner) = flow.hint_owner {
                     self.history_hints
-                        .retry(work.room, flow.hint_peer, hint.author, hint.head);
+                        .finish_owned(work.room, flow.hint_peer, owner, true);
                 }
                 if let Some((head, seq)) = flow.required_root {
                     let need = RequiredOwner {
@@ -3655,7 +3766,35 @@ impl Node {
                     self.bounded_sync.required.push_back(need);
                 }
             }
+            if let Some(retry) = flow.refusal_retry.take() {
+                // No refusal was parked for this result. Keep its exact task, request and
+                // in-flight hint owner instead of blaming a healthy peer or selecting anew.
+                self.shelve_exact(flow, work.service.index());
+                if let Some(port) = self.ports.get_mut(&(work.room, work.peer)) {
+                    port.raise();
+                    port.clear_service_backoff(work.service);
+                }
+                if matches!(retry, stream::RefusalRetry::Busy) {
+                    self.enter_backoff(
+                        work.room,
+                        work.peer,
+                        work.service,
+                        crate::node::status::BackoffKind::Busy,
+                    );
+                }
+                self.sched_rooms.insert(work.room);
+                continue;
+            }
             if let Some(target) = flow.reroute.take() {
+                #[cfg(feature = "test-knobs")]
+                eprintln!(
+                    "history reroute origin={} target={} serial={} owner={:?} transient={}",
+                    crate::node::link::b32_encode(&work.peer),
+                    crate::node::link::b32_encode(&target),
+                    flow.availability_connection,
+                    flow.hint_owner,
+                    flow.transient_refused
+                );
                 // EvidenceUnavailable named the author of the exact missing signed dependency.
                 // Keep this flow, its in-flight hint owner and its exact query/continuation
                 // intact; only the next wire turn moves to the authoritative port.
@@ -3678,6 +3817,31 @@ impl Node {
                         || self.bounded_sync.required.iter().any(|required| {
                             required.room == work.room && required.peer == work.peer
                         });
+                if flow.transient_refused
+                    && (self
+                        .net
+                        .as_ref()
+                        .and_then(|net| net.manager().existing(&work.peer))
+                        .is_some_and(|conn| conn.serial() != flow.availability_connection)
+                        || self
+                            .ports
+                            .get(&(work.room, work.peer))
+                            .and_then(|port| port.availability.remote(flow.availability_connection))
+                            .is_some_and(|token| {
+                                flow.availability_captured.is_none_or(|old| old < token)
+                            }))
+                {
+                    // A new connection or serving-progress edge arrived while the worker
+                    // was returning. Retry the exact continuation at its origin.
+                    flow.transient_refused = false;
+                    self.shelve_exact(flow, work.service.index());
+                    if let Some(port) = self.ports.get_mut(&(work.room, work.peer)) {
+                        port.raise();
+                        port.clear_service_backoff(work.service);
+                    }
+                    self.sched_rooms.insert(work.room);
+                    continue;
+                }
                 flow.peer = target;
                 flow.route_origin = Some(work.peer);
                 flow.route_origin_brought = flow.brought;
@@ -3784,20 +3948,13 @@ impl Node {
                         .to_string();
                 self.settle_archive_exit(&mut flow, &error);
 
-                if let Some(hint) = flow.hint.filter(|_| !flow.local_own_root()) {
-                    if !self.history_hints.retry_role(
+                if let Some(owner) = flow.hint_owner {
+                    self.history_hints.fail_owned(
                         work.room,
                         flow.hint_peer,
-                        hint.author,
-                        hint.head,
-                    ) {
-                        self.history_hints.finish(
-                            work.room,
-                            flow.hint_peer,
-                            hint.author,
-                            hint.head,
-                        );
-                    }
+                        owner,
+                        flow.transient_refused,
+                    );
                 }
                 if !cancelled {
                     self.rearm_required(&flow);
@@ -4116,6 +4273,7 @@ impl Node {
                             channel_id: work.room,
                             instance: Arc::downgrade(&flow.shared),
                             head,
+                            departure_receipt: flow.departure_receipt == Some(head),
                             epoch: flow.epoch,
                             room_instance: flow.instance,
                             generation: flow.generation,
@@ -4152,9 +4310,13 @@ impl Node {
                         }
                     }
                 }
-                if let Some(hint) = flow.hint.filter(|_| !flow.local_own_root()) {
-                    self.history_hints
-                        .finish(work.room, flow.hint_peer, hint.author, hint.head);
+                if let Some(owner) = flow.hint_owner {
+                    self.history_hints.finish_owned(
+                        work.room,
+                        flow.hint_peer,
+                        owner,
+                        flow.transient_refused,
+                    );
                 }
                 let mut raised = false;
                 if let Some(port) = self.ports.get_mut(&(work.room, work.peer)) {
@@ -4457,197 +4619,197 @@ impl Node {
             .map(|_| ready_index);
         let mut admitted_archive = None;
         let mut admitted_control = None;
-        let mut flow = if let Some(index) = existing {
-            let Some(flow) = self.bounded_sync.ready[index].take() else {
-                return false;
-            };
-            flow
-        } else {
-            // A retained waiting slice is retried by the existing bounded port backoff. It
-            // cannot monopolize the other lane or cause an archive continuation to run.
-            if let Some(index) = self.bounded_sync.ready[ready_index]
-                .as_ref()
-                .filter(|flow| {
-                    flow.service == service
-                        && flow.room == room
-                        && flow.peer == peer
-                        && !self.bounded_sync.record_bytes_blocked(flow)
-                        && !(flow.service == OutboundService::Archive
-                            && flow.waiting
-                            && self.bounded_sync.required.iter().any(|required| {
-                                required.room == flow.room
-                                    && required.peer == flow.peer
-                                    && required.instance == flow.instance
-                                    && flow.owns_request(required.request)
-                            }))
-                })
-                .map(|_| ready_index)
-            {
+        let mut flow =
+            if let Some(index) = existing {
                 let Some(flow) = self.bounded_sync.ready[index].take() else {
                     return false;
                 };
                 flow
             } else {
-                if record_waiting {
-                    return false;
-                }
-                if !self.bounded_sync.can_retain_new(service) {
-                    // This is controller retention preflight, before a Flow/start attempt owns
-                    // the port. Its release is driven by the exact retiring/completion owner;
-                    // do not overwrite the last ended attempt with a start_reason ADR-038 does
-                    // not define.
-                    self.bounded_sync
-                        .cancel_matching_control_admission(room, peer, service);
-                    return false;
-                }
-                if page_only || self.bounded_sync.ready[ready_index].is_some() {
-                    let control_ready = self.bounded_sync.control_would_admit(
-                        &self.history_budget,
-                        node,
-                        room,
-                        peer,
-                        service,
-                    );
-                    self.bounded_sync
-                        .cancel_matching_control_admission(room, peer, service);
-                    self.note_start(
-                        room,
-                        peer,
-                        service,
-                        if control_ready {
-                            "live_lane_busy"
-                        } else {
-                            "control_budget_busy"
-                        },
-                    );
-                    return false;
-                }
-                if service == OutboundService::Archive {
-                    if let Some((request, generation, instance)) =
-                        self.history_demand.ready_binding(room, peer)
-                    {
-                        match self.bounded_sync.archive_turn(
+                // A retained waiting slice is retried by the existing bounded port backoff. It
+                // cannot monopolize the other lane or cause an archive continuation to run.
+                if let Some(index) = self.bounded_sync.ready[ready_index]
+                    .as_ref()
+                    .filter(|flow| {
+                        flow.service == service
+                            && flow.room == room
+                            && flow.peer == peer
+                            && !self.bounded_sync.record_bytes_blocked(flow)
+                            && !(flow.service == OutboundService::Archive
+                                && flow.waiting
+                                && self.bounded_sync.required.iter().any(|required| {
+                                    required.room == flow.room
+                                        && required.peer == flow.peer
+                                        && required.instance == flow.instance
+                                        && flow.owns_request(required.request)
+                                }))
+                    })
+                    .map(|_| ready_index)
+                {
+                    let Some(flow) = self.bounded_sync.ready[index].take() else {
+                        return false;
+                    };
+                    flow
+                } else {
+                    if record_waiting {
+                        return false;
+                    }
+                    if !self.bounded_sync.can_retain_new(service) {
+                        // This is controller retention preflight, before a Flow/start attempt owns
+                        // the port. Its release is driven by the exact retiring/completion owner;
+                        // do not overwrite the last ended attempt with a start_reason ADR-038 does
+                        // not define.
+                        self.bounded_sync
+                            .cancel_matching_control_admission(room, peer, service);
+                        return false;
+                    }
+                    if page_only || self.bounded_sync.ready[ready_index].is_some() {
+                        let control_ready = self.bounded_sync.control_would_admit(
                             &self.history_budget,
-                            &self.net_tx,
-                            &mut self.next_token,
                             node,
                             room,
                             peer,
-                            request,
-                            generation,
-                            instance,
-                        ) {
-                            ArchiveTurn::Ready(job) => admitted_archive = Some(job),
-                            ArchiveTurn::Waiting => {
-                                self.note_start(room, peer, service, "archive_budget_busy");
-                                return false;
+                            service,
+                        );
+                        self.bounded_sync
+                            .cancel_matching_control_admission(room, peer, service);
+                        self.note_start(
+                            room,
+                            peer,
+                            service,
+                            if control_ready {
+                                "live_lane_busy"
+                            } else {
+                                "control_budget_busy"
+                            },
+                        );
+                        return false;
+                    }
+                    if service == OutboundService::Archive {
+                        if let Some((request, generation, instance)) =
+                            self.history_demand.ready_binding(room, peer)
+                        {
+                            match self.bounded_sync.archive_turn(
+                                &self.history_budget,
+                                &self.net_tx,
+                                &mut self.next_token,
+                                node,
+                                room,
+                                peer,
+                                request,
+                                generation,
+                                instance,
+                            ) {
+                                ArchiveTurn::Ready(job) => admitted_archive = Some(job),
+                                ArchiveTurn::Waiting => {
+                                    self.note_start(room, peer, service, "archive_budget_busy");
+                                    return false;
+                                }
                             }
                         }
                     }
-                }
-                let Ok(lease) = self.secret_work.clone().try_read_owned() else {
-                    self.bounded_sync.wait_for_secret(
-                        &self.net_tx,
-                        &mut self.next_token,
-                        room,
-                        peer,
-                        pending_work,
-                        self.secret_work.clone(),
-                    );
-                    // Secret-work admission is preflight, before the documented start gates.
-                    // Its exact waiter wakes this port; the latest ended attempt stays intact.
-                    return false;
-                };
-                let lease = Arc::new(lease);
-                let state_job = match self.bounded_sync.foreground_turn(
-                    &self.history_budget,
-                    &self.net_tx,
-                    &mut self.next_token,
-                    node,
-                    room,
-                    peer,
-                    AdmissionWork {
-                        lane: crate::node::history_budget::Lane::Control,
-                        ..pending_work
-                    },
-                ) {
-                    ForegroundTurn::Ready(job) => job,
-                    ForegroundTurn::Waiting => {
-                        self.note_start(room, peer, service, "control_budget_busy");
-                        return false;
-                    }
-                };
-                let actor_incarnation = state_job.flow_owner();
-                admitted_control = Some(state_job.clone());
-
-                // Inventory must first advertise the new local departure. Once that fixed
-                // exchange completes, probe only our own exact head; no archive is followed.
-                let departure_hint = if service == OutboundService::Public
-                    && self.leave_waiters.iter().any(|(r, generation, _, _, _)| {
-                        *r == room
-                            && self
-                                .ports
-                                .get(&(room, peer))
-                                .is_some_and(|p| p.done_gen >= *generation)
-                    }) {
-                    let bytes_wake = state_job.bytes_wake();
-                    let Some(_read_charge) = state_job.reserve(4 * 1024 * 1024) else {
-                        self.bounded_sync.wait_for_bytes(
+                    let Ok(lease) = self.secret_work.clone().try_read_owned() else {
+                        self.bounded_sync.wait_for_secret(
                             &self.net_tx,
                             &mut self.next_token,
                             room,
                             peer,
                             pending_work,
-                            ByteWait {
-                                owner: pending_work.key,
-                                port_request: pending_public_request,
-                                wake: bytes_wake,
-                            },
+                            self.secret_work.clone(),
                         );
-                        self.note_start(room, peer, service, "control_budget_busy");
+                        // Secret-work admission is preflight, before the documented start gates.
+                        // Its exact waiter wakes this port; the latest ended attempt stays intact.
                         return false;
                     };
-                    if let Ok(channel) = shared.try_lock() {
-                        match channel.history_head(&store, &node) {
-                            Ok(Some(head)) => {
-                                let hint = stream::HeadHint {
-                                    author: node,
-                                    head: head.id(),
-                                    size: head.root.leaves,
-                                };
-                                channel
-                                    .history_departure_matches(&store, hint)
-                                    .ok()
-                                    .filter(|yes| *yes)
-                                    .map(|_| hint)
+                    let lease = Arc::new(lease);
+                    let state_job = match self.bounded_sync.foreground_turn(
+                        &self.history_budget,
+                        &self.net_tx,
+                        &mut self.next_token,
+                        node,
+                        room,
+                        peer,
+                        AdmissionWork {
+                            lane: crate::node::history_budget::Lane::Control,
+                            ..pending_work
+                        },
+                    ) {
+                        ForegroundTurn::Ready(job) => job,
+                        ForegroundTurn::Waiting => {
+                            self.note_start(room, peer, service, "control_budget_busy");
+                            return false;
+                        }
+                    };
+                    let actor_incarnation = state_job.flow_owner();
+                    admitted_control = Some(state_job.clone());
+
+                    // Inventory must first advertise the new local departure. Once that fixed
+                    // exchange completes, probe only our own exact head; no archive is followed.
+                    let departure_hint = if service == OutboundService::Public
+                        && self.leave_waiters.iter().any(|(r, generation, _, _, _)| {
+                            *r == room
+                                && self
+                                    .ports
+                                    .get(&(room, peer))
+                                    .is_some_and(|p| p.done_gen >= *generation)
+                        }) {
+                        let bytes_wake = state_job.bytes_wake();
+                        let Some(_read_charge) = state_job.reserve(4 * 1024 * 1024) else {
+                            self.bounded_sync.wait_for_bytes(
+                                &self.net_tx,
+                                &mut self.next_token,
+                                room,
+                                peer,
+                                pending_work,
+                                ByteWait {
+                                    owner: pending_work.key,
+                                    port_request: pending_public_request,
+                                    wake: bytes_wake,
+                                },
+                            );
+                            self.note_start(room, peer, service, "control_budget_busy");
+                            return false;
+                        };
+                        if let Ok(channel) = shared.try_lock() {
+                            match channel.history_head(&store, &node) {
+                                Ok(Some(head)) => {
+                                    let hint = stream::HeadHint {
+                                        author: node,
+                                        head: head.id(),
+                                        size: head.root.leaves,
+                                    };
+                                    channel
+                                        .history_departure_matches(&store, hint)
+                                        .ok()
+                                        .filter(|yes| *yes)
+                                        .map(|_| hint)
+                                }
+                                _ => None,
                             }
-                            _ => None,
+                        } else {
+                            // This is an optional exact-head shortcut after the inventory that
+                            // advertises the departure. Room contention cannot block starting that
+                            // inventory; the peer's later receipt event offers the shortcut again.
+                            None
                         }
                     } else {
-                        // This is an optional exact-head shortcut after the inventory that
-                        // advertises the departure. Room contention cannot block starting that
-                        // inventory; the peer's later receipt event offers the shortcut again.
                         None
-                    }
-                } else {
-                    None
-                };
+                    };
 
-                let control = match crate::node::history_demand::Context::current_unlocked(
-                    profile,
-                    Purpose::Control,
-                    lease.clone(),
-                ) {
-                    Ok(value) => Arc::new(value),
-                    Err(_) => return false,
-                };
-                let needs_own_state = service != OutboundService::Private
-                    && (self.own_recovery_rooms.contains_key(&room)
-                        || self.ports.get(&(room, peer)).is_some_and(|port| {
-                            port.support_discovery_check || port.own_receipt_lower.is_some()
-                        }));
-                let own_state =
-                    if needs_own_state {
+                    let control = match crate::node::history_demand::Context::current_unlocked(
+                        profile,
+                        Purpose::Control,
+                        lease.clone(),
+                    ) {
+                        Ok(value) => Arc::new(value),
+                        Err(_) => return false,
+                    };
+                    let needs_own_state = service != OutboundService::Private
+                        && (self.own_recovery_rooms.contains_key(&room)
+                            || self.ports.get(&(room, peer)).is_some_and(|port| {
+                                port.support_discovery_check || port.own_receipt_lower.is_some()
+                            }));
+                    let own_state = if needs_own_state {
                         let bytes_wake = state_job.bytes_wake();
                         let Some(_read) = state_job.reserve(4 * 1024 * 1024) else {
                             self.bounded_sync.wait_for_bytes(
@@ -4717,6 +4879,18 @@ impl Node {
                                 let probe_incarnations = channel
                                     .history_inventory_incarnation(&peer)
                                     .zip(channel.history_author_inventory_incarnation(&node));
+                                // Own-recovery verification is selected directly, not through
+                                // inbox.take. Honor the same exact refusal before giving it
+                                // priority over unrelated foreground history.
+                                let verification = verification.filter(|hint| {
+                                    self.history_hints.own_verification_allowed(
+                                        room,
+                                        peer,
+                                        *hint,
+                                        scope,
+                                        probe_incarnations,
+                                    )
+                                });
                                 let discovery = discovery.filter(|hint| {
                                     !self
                                         .ports
@@ -4758,6 +4932,7 @@ impl Node {
                                     discovery,
                                     probe_incarnations,
                                     parked_receipt,
+                                    channel.unknown_own_recovery_probe(&store, &peer),
                                 )
                             }
                             Err(_) => {
@@ -4780,229 +4955,261 @@ impl Node {
                             }
                         }
                     } else {
-                        (None, None, None, None, None)
+                        (None, None, None, None, None, false)
                     };
-                let (own_page, own_verification, own_discovery, probe_incarnations, parked_receipt) =
-                    own_state;
-                let own_page = own_page.and_then(|(instance, page)| {
-                    let generation =
-                        match stream::authorization_generation(&store, node, room, instance, epoch)
-                        {
+                    let (
+                        own_page,
+                        own_verification,
+                        own_discovery,
+                        probe_incarnations,
+                        parked_receipt,
+                        unknown_own_probe,
+                    ) = own_state;
+                    let own_page = own_page.and_then(|(instance, page)| {
+                        let generation = match stream::authorization_generation(
+                            &store, node, room, instance, epoch,
+                        ) {
                             Ok(generation) => generation,
                             Err(_) => return None,
                         };
-                    let mut encoded = crate::cbor::Encoder::new();
-                    encoded
-                        .array(9)
-                        .bytes(&page.head)
-                        .uint(page.lo)
-                        .uint(page.donor_through)
-                        .bytes(&generation)
-                        .bytes(&instance)
-                        .uint(epoch)
-                        .uint(conn.serial());
-                    let availability = self
-                        .ports
-                        .get(&(room, peer))
-                        .and_then(|p| p.availability.remote(conn.serial()));
-                    encoded
-                        .uint(availability.map_or(0, |t| t.open))
-                        .uint(availability.map_or(0, |t| t.revision));
-                    let trigger = crate::hash::sha256(&encoded.finish());
-                    if self
-                        .ports
-                        .get(&(room, peer))
-                        .is_some_and(|port| port.own_recovery_parked == Some(trigger))
-                    {
-                        return None;
-                    }
-                    Some((instance, page, trigger))
-                });
-                if let Some((instance, page, trigger)) = own_page {
-                    match own_recovery_flow(
-                        profile,
-                        room,
-                        peer,
-                        epoch,
-                        instance,
-                        page,
-                        shared.clone(),
-                        control,
-                        lease,
-                        self.bounded_sync.body_slots.clone(),
-                        store.clone(),
-                        Arc::clone(&self.history_budget),
-                        &state_job,
-                        trigger,
-                    )
-                    .await
-                    {
-                        Ok(flow) if flow.own_recovery_cleanup => {
-                            self.bounded_sync.dispose(flow);
+                        let mut encoded = crate::cbor::Encoder::new();
+                        encoded
+                            .array(9)
+                            .bytes(&page.head)
+                            .uint(page.lo)
+                            .uint(page.donor_through)
+                            .bytes(&generation)
+                            .bytes(&instance)
+                            .uint(epoch)
+                            .uint(conn.serial());
+                        let availability = self
+                            .ports
+                            .get(&(room, peer))
+                            .and_then(|p| p.availability.remote(conn.serial()));
+                        encoded
+                            .uint(availability.map_or(0, |t| t.open))
+                            .uint(availability.map_or(0, |t| t.revision));
+                        let trigger = crate::hash::sha256(&encoded.finish());
+                        if self
+                            .ports
+                            .get(&(room, peer))
+                            .is_some_and(|port| port.own_recovery_parked == Some(trigger))
+                        {
+                            return None;
+                        }
+                        Some((instance, page, trigger))
+                    });
+                    if let Some((instance, page, trigger)) = own_page {
+                        match own_recovery_flow(
+                            profile,
+                            room,
+                            peer,
+                            epoch,
+                            instance,
+                            page,
+                            shared.clone(),
+                            control,
+                            lease,
+                            self.bounded_sync.body_slots.clone(),
+                            store.clone(),
+                            Arc::clone(&self.history_budget),
+                            &state_job,
+                            trigger,
+                        )
+                        .await
+                        {
+                            Ok(flow) if flow.own_recovery_cleanup => {
+                                self.bounded_sync.dispose(flow);
+                                return false;
+                            }
+                            Ok(flow) => flow,
+                            Err(_) => return false,
+                        }
+                    } else if service == OutboundService::Archive {
+                        if let Some(dispatch) = self
+                            .trust
+                            .is_trusted(&peer)
+                            .then(|| self.history_demand.take_ready(room, peer))
+                            .flatten()
+                        {
+                            let mut flow = Flow::archive(
+                                room,
+                                peer,
+                                node,
+                                epoch,
+                                dispatch.instance,
+                                dispatch.generation,
+                                shared.clone(),
+                                control,
+                                dispatch.staging,
+                                dispatch.query,
+                                dispatch.request,
+                                dispatch.fence,
+                                self.bounded_sync.body_slots.clone(),
+                                store.clone(),
+                                Arc::clone(&self.history_budget),
+                                actor_incarnation,
+                            );
+                            flow.archive_selected_author = Some(dispatch.selected_author);
+                            flow
+                        } else {
+                            if self.own_recovery_rooms.contains_key(&room)
+                                && !self.bounded_sync.owns_archive_room(room)
+                            {
+                                if let Some(port) = self.ports.get_mut(&(room, peer)) {
+                                    port.own_recovery_checked = true;
+                                }
+                            }
                             return false;
                         }
-                        Ok(flow) => flow,
-                        Err(_) => return false,
-                    }
-                } else if service == OutboundService::Archive {
-                    if let Some(dispatch) = self
-                        .trust
-                        .is_trusted(&peer)
-                        .then(|| self.history_demand.take_ready(room, peer))
-                        .flatten()
-                    {
-                        let mut flow = Flow::archive(
+                    } else {
+                        let live = match crate::node::history_demand::Context::current_unlocked(
+                            profile,
+                            Purpose::Live,
+                            lease.clone(),
+                        ) {
+                            Ok(value) => Arc::new(value),
+                            Err(_) => return false,
+                        };
+                        let required_at = (service == OutboundService::Public && !announce_first)
+                            .then(|| {
+                                self.bounded_sync.required.iter().position(|required| {
+                                    required.room == room && required.peer == peer
+                                })
+                            })
+                            .flatten();
+                        let required = required_at
+                            .and_then(|at| self.bounded_sync.required.get(at))
+                            .map(|required| (required.head, required.seq));
+                        let required_owner_request = required_at
+                            .and_then(|at| self.bounded_sync.required.get(at))
+                            .map(|required| required.request);
+                        // Classify before any Entry future starts. Private may consume only its
+                        // addressed recipient-key debt/catalog; Public never consumes those roots.
+                        let selected_key_body = (service == OutboundService::Private)
+                            .then(|| {
+                                self.ports.get(&(room, peer)).and_then(|port| {
+                                    Some((
+                                        port.key_body?,
+                                        port.key_body_instance?,
+                                        port.key_body_token.clone()?,
+                                    ))
+                                })
+                            })
+                            .flatten();
+                        let selected_key_availability = (service == OutboundService::Private
+                            && selected_key_body.is_none())
+                        .then(|| {
+                            self.ports
+                                .get(&(room, peer))
+                                .and_then(|port| port.key_availability_request.clone())
+                        })
+                        .flatten();
+                        let mut hint_owner = None;
+                        let hint = if service != OutboundService::Public
+                            || announce_first
+                            || required.is_some()
+                        {
+                            None
+                        } else if let Some(priority) =
+                            departure_hint.or(own_verification).or(own_discovery)
+                        {
+                            Some(priority)
+                        } else {
+                            let selected = take_foreground_hint(
+                                &self.history_hints,
+                                room,
+                                peer,
+                                node,
+                                parked_receipt,
+                                self.net
+                                    .as_ref()
+                                    .and_then(|net| net.manager().existing(&peer))
+                                    .map(|conn| conn.serial()),
+                            );
+                            hint_owner = selected.map(|(_, owner)| owner);
+                            selected.map(|(hint, _)| hint)
+                        };
+                        let unknown_own_probe = unknown_own_probe
+                            && service == OutboundService::Public
+                            && !announce_first
+                            && required.is_none()
+                            && hint.is_none()
+                            && self.trust.is_trusted(&peer);
+                        let class_owed = if service == OutboundService::Private {
+                            selected_key_body.is_some() || selected_key_availability.is_some()
+                        } else {
+                            hint.is_some()
+                                || unknown_own_probe
+                                || required.is_some()
+                                || self
+                                    .ports
+                                    .get(&(room, peer))
+                                    .is_some_and(|port| port.needs_public())
+                        };
+                        if !class_owed {
+                            self.bounded_sync
+                                .cancel_matching_control_admission(room, peer, service);
+                            return false;
+                        }
+                        let reason = foreground_reason(
+                            node,
+                            hint,
+                            required.is_some()
+                                || selected_key_body.is_some()
+                                || selected_key_availability.is_some(),
+                            announce_owed,
+                            periodic_pending,
+                        );
+                        // Stage an ordinary Live own-head discovery ahead of the Control
+                        // departure probe while the peer's departure effect is held.
+                        #[cfg(feature = "test-knobs")]
+                        let staged_live = departure_hint.is_some()
+                            && std::env::var_os("VOX_TEST_DEPARTURE_HOLD_FILE")
+                                .is_some_and(|path| std::path::Path::new(&path).is_file());
+                        #[cfg(not(feature = "test-knobs"))]
+                        let staged_live = false;
+                        match Flow::foreground(
                             room,
                             peer,
                             node,
                             epoch,
-                            dispatch.instance,
-                            dispatch.generation,
                             shared.clone(),
+                            live,
                             control,
-                            dispatch.staging,
-                            dispatch.query,
-                            dispatch.request,
-                            dispatch.fence,
+                            hint,
+                            own_verification.is_some()
+                                && hint == own_verification
+                                && departure_hint.is_none()
+                                && required.is_none(),
+                            (staged_live
+                                || (own_discovery.is_some()
+                                    && hint == own_discovery
+                                    && own_verification.is_none()
+                                    && departure_hint.is_none()))
+                                && required.is_none(),
+                            departure_hint.is_some() && required.is_none() && !staged_live,
+                            required,
                             self.bounded_sync.body_slots.clone(),
                             store.clone(),
                             Arc::clone(&self.history_budget),
                             actor_incarnation,
-                        );
-                        flow.archive_selected_author = Some(dispatch.selected_author);
-                        flow
-                    } else {
-                        if self.own_recovery_rooms.contains_key(&room)
-                            && !self.bounded_sync.owns_archive_room(room)
-                        {
-                            if let Some(port) = self.ports.get_mut(&(room, peer)) {
-                                port.own_recovery_checked = true;
-                            }
-                        }
-                        return false;
-                    }
-                } else {
-                    let live = match crate::node::history_demand::Context::current_unlocked(
-                        profile,
-                        Purpose::Live,
-                        lease.clone(),
-                    ) {
-                        Ok(value) => Arc::new(value),
-                        Err(_) => return false,
-                    };
-                    let required_at = (service == OutboundService::Public && !announce_first)
-                        .then(|| {
-                            self.bounded_sync
-                                .required
-                                .iter()
-                                .position(|required| required.room == room && required.peer == peer)
-                        })
-                        .flatten();
-                    let required = required_at
-                        .and_then(|at| self.bounded_sync.required.get(at))
-                        .map(|required| (required.head, required.seq));
-                    let required_owner_request = required_at
-                        .and_then(|at| self.bounded_sync.required.get(at))
-                        .map(|required| required.request);
-                    // Classify before any Entry future starts. Private may consume only its
-                    // addressed recipient-key debt/catalog; Public never consumes those roots.
-                    let selected_key_body = (service == OutboundService::Private)
-                        .then(|| {
-                            self.ports.get(&(room, peer)).and_then(|port| {
-                                Some((
-                                    port.key_body?,
-                                    port.key_body_instance?,
-                                    port.key_body_token.clone()?,
-                                ))
-                            })
-                        })
-                        .flatten();
-                    let selected_key_availability = (service == OutboundService::Private
-                        && selected_key_body.is_none())
-                    .then(|| {
-                        self.ports
-                            .get(&(room, peer))
-                            .and_then(|port| port.key_availability_request.clone())
-                    })
-                    .flatten();
-                    let hint = if service != OutboundService::Public
-                        || announce_first
-                        || required.is_some()
-                    {
-                        None
-                    } else if let Some(priority) =
-                        departure_hint.or(own_verification).or(own_discovery)
-                    {
-                        Some(priority)
-                    } else {
-                        take_foreground_hint(
-                            &self.history_hints,
-                            room,
-                            peer,
-                            node,
-                            parked_receipt,
-                            self.net
-                                .as_ref()
-                                .and_then(|net| net.manager().existing(&peer))
-                                .map(|conn| conn.serial()),
                         )
-                    };
-                    let class_owed = if service == OutboundService::Private {
-                        selected_key_body.is_some() || selected_key_availability.is_some()
-                    } else {
-                        hint.is_some()
-                            || required.is_some()
-                            || self
-                                .ports
-                                .get(&(room, peer))
-                                .is_some_and(|port| port.needs_public())
-                    };
-                    if !class_owed {
-                        self.bounded_sync
-                            .cancel_matching_control_admission(room, peer, service);
-                        return false;
-                    }
-                    let reason = foreground_reason(
-                        node,
-                        hint,
-                        required.is_some()
-                            || selected_key_body.is_some()
-                            || selected_key_availability.is_some(),
-                        announce_owed,
-                        periodic_pending,
-                    );
-                    match Flow::foreground(
-                        room,
-                        peer,
-                        node,
-                        epoch,
-                        shared.clone(),
-                        live,
-                        control,
-                        hint,
-                        own_verification.is_some()
-                            && hint == own_verification
-                            && departure_hint.is_none()
-                            && required.is_none(),
-                        own_discovery.is_some()
-                            && hint == own_discovery
-                            && own_verification.is_none()
-                            && departure_hint.is_none()
-                            && required.is_none(),
-                        departure_hint.is_some() && required.is_none(),
-                        required,
-                        self.bounded_sync.body_slots.clone(),
-                        store.clone(),
-                        Arc::clone(&self.history_budget),
-                        actor_incarnation,
-                    ) {
-                        Ok(mut flow) => {
-                            flow.required_owner_request = required_owner_request;
-                            if let Some((after, token, _, _)) = selected_key_availability {
-                                flow = flow.with_key_availability(after, token);
+                        .and_then(|flow| {
+                            if unknown_own_probe {
+                                flow.probe_unknown_own()
+                            } else {
+                                Ok(flow)
                             }
-                            if let Some((need, instance, token)) = selected_key_body {
-                                let context =
+                        }) {
+                            Ok(mut flow) => {
+                                flow.hint_owner = hint_owner;
+                                flow.required_owner_request = required_owner_request;
+                                if let Some((after, token, _, _)) = selected_key_availability {
+                                    flow = flow.with_key_availability(after, token);
+                                }
+                                if let Some((need, instance, token)) = selected_key_body {
+                                    let context =
                                     match crate::node::history_demand::Context::key_body_unlocked(
                                         profile,
                                         lease.clone(),
@@ -5010,31 +5217,28 @@ impl Node {
                                         Ok(value) => Arc::new(value),
                                         Err(_) => return false,
                                     };
-                                flow = flow.with_key_body(need, instance, context, token);
+                                    flow = flow.with_key_body(need, instance, context, token);
+                                }
+                                flow.reason = reason;
+                                flow.discovery_incarnations = probe_incarnations;
+                                flow.local_own_after_inventory = flow.inventory
+                                    && announce_first
+                                    && (own_verification.is_some() || own_discovery.is_some());
+                                if let Some(at) = required_at {
+                                    let _ = self.bounded_sync.required.remove(at);
+                                }
+                                flow
                             }
-                            flow.reason = reason;
-                            flow.discovery_incarnations = probe_incarnations;
-                            flow.local_own_after_inventory = flow.inventory
-                                && announce_first
-                                && (own_verification.is_some() || own_discovery.is_some());
-                            if let Some(at) = required_at {
-                                let _ = self.bounded_sync.required.remove(at);
+                            Err(_) => {
+                                if let Some(owner) = hint_owner {
+                                    self.history_hints.finish_owned(room, peer, owner, true);
+                                }
+                                return false;
                             }
-                            flow
-                        }
-                        Err(_) => {
-                            if let Some(hint) = hint.filter(|_| {
-                                departure_hint.is_some()
-                                    || (hint != own_verification && hint != own_discovery)
-                            }) {
-                                self.history_hints.retry(room, peer, hint.author, hint.head);
-                            }
-                            return false;
                         }
                     }
                 }
-            }
-        };
+            };
         let index = flow.service.index();
         let announcement = flow.announcement_can_run()
             && (flow.announcement_pending()
@@ -5317,6 +5521,7 @@ impl Node {
             fence: fence.clone(),
             running,
             departure_receipt: None,
+            limited_recovery: false,
             reason: if announcement {
                 crate::node::status::RoundReason::Announce
             } else {

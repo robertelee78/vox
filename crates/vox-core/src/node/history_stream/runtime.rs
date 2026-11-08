@@ -245,6 +245,10 @@ pub(crate) struct Flow {
     pub(crate) key_availability_result: super::KeyAvailabilityResult,
     key_body_checked: bool,
     pub(crate) hint: Option<super::HeadHint>,
+    pub(crate) hint_owner: Option<u64>,
+    pub(crate) transient_refused: bool,
+    /// Local refusal bookkeeping yielded without parking or losing the selected operation.
+    pub(crate) refusal_retry: Option<super::hints::RefusalRetry>,
     /// Canonical local recovery proof root, not a consumed advisory inbox item.
     pub(crate) local_own_verification: bool,
     pub(crate) local_own_discovery: bool,
@@ -261,6 +265,8 @@ pub(crate) struct Flow {
     pub(crate) hint_peer: Digest32,
     /// Exact signed head selected for this hinted flow, not the inventory claim.
     pub(crate) authenticated_head: Option<super::HeadHint>,
+    /// A Control Head response from this peer's semantically complete role cut.
+    pub(crate) departure_receipt: Option<super::HeadHint>,
     /// How far the peer said, in this round, it holds this node's own feed: its answer to
     /// the own-author head probe, or its inventory naming an own head this node accepted
     /// (ADR-028 R-6). The actor records it, and the settlement tick stops offering the own
@@ -416,6 +422,9 @@ pub(crate) enum Resumed {
 }
 
 impl Flow {
+    pub(crate) fn initialized_authorization(&self) -> Option<Digest32> {
+        self.initialized.then_some(self.generation)
+    }
     pub(crate) fn local_own_root(&self) -> bool {
         self.local_own_verification || self.local_own_discovery
     }
@@ -520,6 +529,9 @@ impl Flow {
             key_body_checked: false,
             state_charge: None,
             hint,
+            hint_owner: None,
+            transient_refused: false,
+            refusal_retry: None,
             local_own_verification,
             local_own_discovery,
             local_own_after_inventory: false,
@@ -529,6 +541,7 @@ impl Flow {
             discovery_reply: None,
             hint_peer: peer,
             authenticated_head: None,
+            departure_receipt: None,
             mine_held: None,
             reason: crate::node::status::RoundReason::Request,
             waiting: false,
@@ -657,6 +670,23 @@ impl Flow {
         }
         Ok(flow)
     }
+    /// Ask an authenticated member for this author's head without inventing an inventory hint.
+    /// The returned signed head is verified normally; absence never clears recovery debt.
+    pub(crate) fn probe_unknown_own(mut self) -> Result<Self> {
+        if self.hint.is_some() || self.required_root.is_some() || self.departure_probe {
+            return Err(Error::Profile("unknown own-head probe has another root"));
+        }
+        self.tasks.clear();
+        self.inventory = false;
+        self.local_own_discovery = true;
+        self.push(Task {
+            request: self.request,
+            purpose: Purpose::Live,
+            operation: Operation::Wire(Query::Head(self.node)),
+        })?;
+        Ok(self)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn archive(
         room: Digest32,
@@ -708,6 +738,9 @@ impl Flow {
             key_body_checked: false,
             state_charge: None,
             hint: None,
+            hint_owner: None,
+            transient_refused: false,
+            refusal_retry: None,
             local_own_verification: false,
             local_own_discovery: false,
             local_own_after_inventory: false,
@@ -717,6 +750,7 @@ impl Flow {
             discovery_reply: None,
             hint_peer: peer,
             authenticated_head: None,
+            departure_receipt: None,
             mine_held: None,
             reason: crate::node::status::RoundReason::Page,
             waiting: false,
@@ -1020,6 +1054,90 @@ impl Flow {
     ) -> Result<bool> {
         self.decline_exact(source, job, inbox, author, head).await
     }
+    async fn transient_decline(
+        &mut self,
+        source: &super::source::Source,
+        job: &Job,
+        inbox: &super::hints::HintInbox,
+        inbox_generation: u64,
+        author: Digest32,
+        head: Digest32,
+    ) -> Result<bool> {
+        #[cfg(feature = "test-knobs")]
+        let mutant = std::env::var_os("VOX_TEST_DURABLE_TRANSIENT_DECLINE").is_some();
+        #[cfg(not(feature = "test-knobs"))]
+        let mutant = false;
+        if mutant {
+            if !self.decline(source, job, inbox, author, head).await? {
+                return Ok(false);
+            }
+        } else {
+            let Some(scope) = source
+                .transient_scope(job, self.room, author, self.availability_connection)
+                .await?
+            else {
+                self.refusal_retry = Some(super::hints::RefusalRetry::Busy);
+                return Ok(false);
+            };
+            if let super::hints::RefusalDisposition::Retry(retry) = inbox.transient_decline(
+                job,
+                inbox_generation,
+                (self.room, source.peer),
+                (author, head),
+                scope,
+                self.availability_captured,
+            )? {
+                self.refusal_retry = Some(retry);
+                return Ok(false);
+            }
+            if let Some(hint) = self.hint.filter(|hint| {
+                self.hint_peer == source.peer && (hint.author != author || hint.head != head)
+            }) {
+                let Some(hint_scope) = source
+                    .transient_scope(job, self.room, hint.author, self.availability_connection)
+                    .await?
+                else {
+                    self.refusal_retry = Some(super::hints::RefusalRetry::Busy);
+                    return Ok(false);
+                };
+                if let super::hints::RefusalDisposition::Retry(retry) = inbox.transient_decline(
+                    job,
+                    inbox_generation,
+                    (self.room, source.peer),
+                    (hint.author, hint.head),
+                    hint_scope,
+                    self.availability_captured,
+                )? {
+                    self.refusal_retry = Some(retry);
+                    return Ok(false);
+                }
+            }
+            self.transient_refused = true;
+            self.declined = self.declined.saturating_add(1);
+        }
+        #[cfg(feature = "test-knobs")]
+        eprintln!(
+            "history transient decline mode={} peer={} author={} head={} connection={}",
+            if mutant { "durable" } else { "connection" },
+            crate::node::link::b32_encode(&source.peer),
+            crate::node::link::b32_encode(&author),
+            crate::node::link::b32_encode(&head),
+            self.availability_connection
+        );
+        #[cfg(feature = "test-knobs")]
+        if let Some(path) = std::env::var_os("VOX_TEST_TRANSIENT_DECLINE_MARKER") {
+            let mode = if mutant { "durable" } else { "connection" };
+            let _ = std::fs::write(
+                path,
+                format!(
+                    "{} {} {mode}",
+                    crate::node::link::b32_encode(&author),
+                    crate::node::link::b32_encode(&source.peer)
+                ),
+            );
+        }
+        Ok(true)
+    }
     async fn decline_exact(
         &mut self,
         source: &super::source::Source,
@@ -1086,8 +1204,14 @@ impl Flow {
                 return Ok(false);
             }
         };
-        if !self.local_own_root() {
-            inbox.finish(self.room, source.peer, author, head);
+        if self.hint_peer == source.peer
+            && self
+                .hint
+                .is_some_and(|hint| hint.author == author && hint.head == head)
+        {
+            if let Some(owner) = self.hint_owner {
+                inbox.finish_owned(self.room, self.hint_peer, owner, false);
+            }
         }
         self.declined = self.declined.saturating_add(u64::from(remembered));
         Ok(true)
@@ -1370,9 +1494,13 @@ impl Flow {
                 Operation::Reclaim(Purpose::Control) | Operation::ReclaimKeyUnavailable
             )
         });
-        let staging = if reclaim_live && self.live.is_some() {
+        // A stale foreground capability cannot resume even when its peer reconnects. Retire
+        // its exact partial body before lending the fixed slot to another flow. Explicit
+        // archive staging remains owned by its saved Pause/Resume controller.
+        let stale_foreground = self.authorization_changed && self.archive_request.is_none();
+        let staging = if (reclaim_live || stale_foreground) && self.live.is_some() {
             self.live.clone().map(|stage| (Purpose::Live, stage))
-        } else if reclaim_control && self.control.is_some() {
+        } else if (reclaim_control || stale_foreground) && self.control.is_some() {
             self.control.clone().map(|stage| (Purpose::Control, stage))
         } else if self.automatic_own_recovery {
             self.history.clone().map(|stage| (Purpose::History, stage))
@@ -1499,12 +1627,11 @@ impl Flow {
             let result = result.and_then(|slice| settled.map(|()| slice));
             channel.release_pending_text(&owner, false);
             let publication = if owns {
-                let released = channel.history_write_released(&store);
                 let published = channel.publish_history_read(Arc::clone(&store)).map(|_| ());
                 if published.is_err() {
                     pin.retain_saved_read();
                 }
-                released.and(published)
+                published.and_then(|()| channel.history_write_released(&store))
             } else {
                 Ok(())
             };
@@ -2002,6 +2129,26 @@ impl Flow {
             self.brought = ordinary_brought.unwrap_or(false);
             brought
         });
+        if self.refusal_retry.is_some() {
+            // The response was real, but its refusal is obsolete or local bookkeeping is
+            // busy. Restore this exact popped query before returning ownership to the actor.
+            if let Some(task) = retry_task {
+                if announcement_task {
+                    self.restore_announcement_task(task)?;
+                } else {
+                    self.push(task)?;
+                }
+            }
+            self.discovery_unavailable = None;
+            if let Some(brought) = announcement_brought {
+                if let Some(announcement) = self.announcement.as_mut() {
+                    announcement.brought |= brought;
+                }
+            }
+            self.announcement_active = false;
+            self.selected_request = None;
+            return Ok(());
+        }
         let result = match result {
             Err(Error::HistoryCapacity(pressure)) => {
                 if let Some(task) = retry_task {
@@ -2804,7 +2951,14 @@ impl Flow {
                     };
                     for page in inventory.hints.chunks(64) {
                         let offered = source
-                            .offer_inventory(job, inbox, inbox_generation, self.room, page)
+                            .offer_inventory(
+                                job,
+                                inbox,
+                                inbox_generation,
+                                self.room,
+                                conn.serial(),
+                                page,
+                            )
                             .await?;
                         self.offered = self.offered.saturating_add(offered.added as u64);
                         self.rearmed = self.rearmed.saturating_add(offered.rearmed as u64);
@@ -2832,6 +2986,7 @@ impl Flow {
                         ));
                     }
                     self.authenticated_head = result.departure_receipt;
+                    self.departure_receipt = result.departure_receipt;
                     return Ok(());
                 }
                 // Inventory is a hint. The first signed Head(author) response selects the
@@ -2876,10 +3031,24 @@ impl Flow {
                                     };
                                 }
                             }
+                            #[cfg(feature = "test-knobs")]
+                            if receipt && task.purpose == Purpose::Live {
+                                if let Some(path) = std::env::var_os("VOX_TEST_DEPARTURE_HOLD_FILE")
+                                    .map(std::path::PathBuf::from)
+                                    .filter(|path| path.is_file())
+                                {
+                                    let _ = std::fs::write(path.with_extension("live"), b"live");
+                                }
+                            }
                             if receipt {
+                                if task.purpose == Purpose::Control
+                                    && result.status == Status::Complete
+                                {
+                                    self.departure_receipt = Some(*head);
+                                }
                                 self.authenticated_head = Some(*head);
-                                // Only a verified echo matching our already accepted departure.
-                                // It must not request Header/Proof/Body from a peer we have left.
+                                // This exact head is already held locally; it needs no
+                                // Header/Proof/Body work on this flow.
                                 self.tasks.retain(|pending| {
                                     !matches!(pending.operation, Operation::LiveWindow { .. })
                                 });
@@ -2895,7 +3064,14 @@ impl Flow {
                 if let Some(inventory) = result.inventory {
                     for page in inventory.hints.chunks(64) {
                         let offered = source
-                            .offer_inventory(job, inbox, inbox_generation, self.room, page)
+                            .offer_inventory(
+                                job,
+                                inbox,
+                                inbox_generation,
+                                self.room,
+                                conn.serial(),
+                                page,
+                            )
                             .await?;
                         self.offered = self.offered.saturating_add(offered.added as u64);
                         self.rearmed = self.rearmed.saturating_add(offered.rearmed as u64);
@@ -2928,12 +3104,9 @@ impl Flow {
                             "live body refusal has no exact entry",
                         ));
                     };
-                    // The peer does not hold a missing body of this author's newest window:
-                    // an answer that says it cannot fill the hint. Its inventory's same head
-                    // is not pulled from it again until it names another (ADR-038 FX-29), in
-                    // a required flow as in a hinted one: an author whose missing bodies no
-                    // peer held any more was pulled from every peer every period, about 370
-                    // commits a sync, for bodies none of them had.
+                    // BodyNotHeld is local availability, not a durable authority refusal.
+                    // Park this head for this connection to avoid the FX-29 re-pull loop;
+                    // authenticated progress or a new connection may offer it again.
                     let author = self
                         .tasks
                         .iter()
@@ -2946,13 +3119,23 @@ impl Flow {
                             _ => None,
                         });
                     if let Some(author) = author {
-                        if !self.decline(&source, job, inbox, author, head).await? {
+                        if !self
+                            .transient_decline(&source, job, inbox, inbox_generation, author, head)
+                            .await?
+                        {
                             return Ok(());
                         }
                     }
                     if let Some(hint) = self.hint {
                         if !self
-                            .decline(&source, job, inbox, hint.author, hint.head)
+                            .transient_decline(
+                                &source,
+                                job,
+                                inbox,
+                                inbox_generation,
+                                hint.author,
+                                hint.head,
+                            )
                             .await?
                         {
                             return Ok(());
@@ -2999,12 +3182,22 @@ impl Flow {
                         return Ok(());
                     }
                     if result.status == Status::BodyNotHeld {
-                        // The peer said it cannot fill this body: not asked for it again until
-                        // its inventory names another head of the author (ADR-038 FX-29).
+                        // This source cannot fill the body now. Park the exact head for
+                        // this connection, without asserting a global absence.
                         if let Query::Entry { head, .. } | Query::Page { head, .. } = &query {
                             let head = *head;
                             if let Some(author) = self.head_author(&source, job, head).await? {
-                                if !self.decline(&source, job, inbox, author, head).await? {
+                                if !self
+                                    .transient_decline(
+                                        &source,
+                                        job,
+                                        inbox,
+                                        inbox_generation,
+                                        author,
+                                        head,
+                                    )
+                                    .await?
+                                {
                                     return Ok(());
                                 }
                             }
@@ -3030,14 +3223,19 @@ impl Flow {
                         // the healthy room/peer port can strand a later fresh head behind it.
                         // Third-party heads route to their author below; dependency failures
                         // after a head was selected remain hard failures.
-                        // A peer that cannot serve the head it advertised, its own feed's or
-                        // this node's own (the echo settlement asks for), is not asked for that
-                        // hint again until its inventory names another head of the author
-                        // (ADR-038 FX-29): the asking side stops, whatever the serving side does.
+                        // Keep the unchanged head parked on this connection; a fresh
+                        // connection or changed advertisement is a new reason to ask.
                         match (&query, self.hint) {
                             (Query::Head(author), Some(hint)) if hint.author == *author => {
                                 if !self
-                                    .decline(&source, job, inbox, *author, hint.head)
+                                    .transient_decline(
+                                        &source,
+                                        job,
+                                        inbox,
+                                        inbox_generation,
+                                        *author,
+                                        hint.head,
+                                    )
                                     .await?
                                 {
                                     return Ok(());
@@ -3087,14 +3285,18 @@ impl Flow {
                             | Query::KeyAvailability { .. }
                             | Query::Context(_) => None,
                         };
-                        // The peer said it cannot serve this header or proof: the hint that
-                        // depends on it is not pulled from that peer again until its inventory
-                        // names another head of the author (ADR-038 FX-29), whether the flow
-                        // was hinted or required. The route to the author's port below still
-                        // runs once for this exact query.
+                        // Park this source's exact unavailable dependency, and try the
+                        // author through the existing reroute when it is another peer.
                         if let Some(dependency) = dependency {
                             if !self
-                                .decline(&source, job, inbox, dependency.author, dependency.head)
+                                .transient_decline(
+                                    &source,
+                                    job,
+                                    inbox,
+                                    inbox_generation,
+                                    dependency.author,
+                                    dependency.head,
+                                )
                                 .await?
                             {
                                 return Ok(());

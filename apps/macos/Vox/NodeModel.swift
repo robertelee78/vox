@@ -705,6 +705,18 @@ final class NodeModel: ObservableObject {
         "\(me)/\(roomOnScreen ?? "")/\(nodeObservationEpoch)/\(roomReadGeneration)/\(sheetInstance)/\(sheet?.rawValue ?? "")/\(ended ?? "")/\(daemonReachable)"
     }
 
+    func changeRoomMembership(room: String, member: String, readmit: Bool, context: String) async throws {
+        guard roomPauseContext == context, roomOnScreen == room, sheet == .membership,
+              ended == nil, daemonReachable, !Task.isCancelled else {
+            throw VoxError.Failed(reason: "The room or acting node changed before the action.")
+        }
+        if readmit {
+            try await client.readmitRoomMember(room: room, member: member, actor: me)
+        } else {
+            try await client.removeRoomMember(room: room, member: member, actor: me)
+        }
+    }
+
     func roomPauseName(_ fingerprint: String) -> String {
         if fingerprint == me { return "\(node) (you)" }
         return members.first { $0.id == fingerprint }?.name ?? fingerprint
@@ -739,6 +751,8 @@ final class NodeModel: ObservableObject {
         return page
     }
 
+    /// An inspector action selects an exact identity, never a displayed alias.
+    var roomMemberToRemove: String?
     private var sheetInstance = UUID()
     @Published var sheet: NodeSheet? {
         didSet { if oldValue != sheet { sheetInstance = UUID() } }

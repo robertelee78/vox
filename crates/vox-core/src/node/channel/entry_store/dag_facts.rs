@@ -48,6 +48,21 @@ pub(super) fn predecessor(mut key: Key) -> Option<Key> {
     None
 }
 
+impl Read<'_> {
+    /// The exact snapshot and sealing context used by this pinned entry view.
+    pub(crate) fn snapshot(&self) -> &crate::node::store::Snapshot {
+        &self.snapshot
+    }
+
+    pub(crate) fn sek(&self) -> &Sek {
+        self.sek
+    }
+
+    pub(crate) fn channel(&self) -> &Digest32 {
+        self.channel
+    }
+}
+
 /// One pinned published order view. Drop it before waiting on a client or network operation.
 /// A cursor across separate views must also carry `revision`: late parents can move keys.
 pub struct OrderView<'a> {

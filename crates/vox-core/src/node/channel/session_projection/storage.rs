@@ -19,6 +19,22 @@ const HEADER: u64 = 0;
 // descriptor allocation and is not a bound on any member-written metadata field.
 const DESCRIPTOR_BYTES: usize = 16 * 1024;
 
+// Counts' original author keys have an all-zero suffix. These namespaces contain only
+// derived opening-set lanes and a publication marker, never descriptor identifiers.
+pub(super) fn opening_lane_key(author: &Digest32, lane: u8) -> Key {
+    let mut key = [0; 64];
+    key[..32].copy_from_slice(author);
+    key[32] = 1;
+    key[33] = lane;
+    key
+}
+
+pub(super) const OPENING_FINGERPRINT_MARKER: Key = {
+    let mut key = [0; 64];
+    key[32] = 2;
+    key
+};
+
 #[derive(Clone, Copy)]
 pub(super) enum Tree {
     PrivateHash,
@@ -58,9 +74,17 @@ pub(super) enum Tree {
     FloorFirst,
     OpenSessions,
     PrivateUnread,
+    /// Signed floor source hashes, keyed by author and source sequence.
+    FloorSources,
+    /// Bounded reconstruction of floor-source provenance from retained public entries.
+    FloorReplay,
+    /// Bounded author-restoration proof for individual signed floor entries.
+    FloorAuthorization,
+    /// Bounded selection of signed, currently authorized recipient floors.
+    FloorSelection,
 }
 
-const TREES: usize = 37;
+const TREES: usize = 41;
 
 impl Tree {
     fn index(self) -> usize {
@@ -102,6 +126,10 @@ impl Tree {
             Self::FloorFirst => 34,
             Self::OpenSessions => 35,
             Self::PrivateUnread => 36,
+            Self::FloorSources => 37,
+            Self::FloorReplay => 38,
+            Self::FloorAuthorization => 39,
+            Self::FloorSelection => 40,
         }
     }
 }
@@ -221,7 +249,12 @@ impl Header {
         let stored_trees = d.array()?;
         // These are append-only derived roots within the current development format. Keep
         // every original locator; startup streams the absent private/control facts.
-        if next == 0 || !matches!(stored_trees, 26 | 29 | 30 | 35 | 36 | TREES) {
+        if next == 0
+            || !matches!(
+                stored_trees,
+                26 | 29 | 30 | 35 | 36 | 37 | 38 | 39 | 40 | TREES
+            )
+        {
             return Err(invalid("Session index header roots"));
         }
         let mut roots = [0; TREES];
@@ -866,6 +899,10 @@ impl<'a, 's> Write<'a, 's> {
             Tree::FloorContinuity,
             Tree::FloorFirst,
             Tree::PrivateUnread,
+            Tree::FloorSources,
+            Tree::FloorReplay,
+            Tree::FloorAuthorization,
+            Tree::FloorSelection,
         ];
         self.working = true;
         for _ in 0..limit {

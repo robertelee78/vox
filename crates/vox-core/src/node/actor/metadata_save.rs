@@ -1,9 +1,193 @@
 //! Reopen-map mutations and running prekey maintenance finish on actual native workers.
 use super::*;
 use crate::atrest::vault::VaultRootSigner;
+use crate::identity::composite::RootSigner as _;
 use crate::node::channel::history::PendingHistoryRead;
 use crate::node::open_rooms::RoomKeys;
 use crate::node::store::{Batch, Store};
+
+const ACCEPTED_JOIN_META_KEY: &str = "accepted-join-obligations";
+const ACCEPTED_JOIN_KEY_INFO: &[u8] = b"vox/accepted-join-obligations/v1";
+
+/// The verified admission and double-lock wrap retained until publication or explicit cancellation.
+pub(super) struct AcceptedJoin {
+    pub(super) proposal: Vec<u8>,
+    pub(super) witness: Vec<u8>,
+    pub(super) genesis: crate::governance::genesis::Genesis,
+    pub(super) wrap: crate::atrest::sek::SekWrap,
+    pub(super) responder_key: crate::identity::composite::CompositePublicKey,
+    pub(super) name: String,
+}
+
+fn accepted_join_key(signer: &VaultRootSigner) -> crate::error::Result<crate::atrest::sek::Sek> {
+    let hk = hkdf::Hkdf::<sha2::Sha256>::new(None, signer.self_seed());
+    let mut key = zeroize::Zeroizing::new([0u8; crate::atrest::sek::SEK_LEN]);
+    hk.expand(ACCEPTED_JOIN_KEY_INFO, key.as_mut())
+        .map_err(|_| Error::AtRestUnlockFailed)?;
+    Ok(crate::atrest::sek::Sek::from_bytes(key))
+}
+
+fn verify_accepted_join(
+    signer: &VaultRootSigner,
+    room: &Digest32,
+    proposal_wire: &[u8],
+    witness_wire: &[u8],
+    genesis: &crate::governance::genesis::Genesis,
+    responder_key: &crate::identity::composite::CompositePublicKey,
+) -> crate::error::Result<String> {
+    genesis.verify()?;
+    if genesis.channel_id() != *room {
+        return Err(Error::MalformedAtRest("accepted join genesis binding"));
+    }
+    let proposal = crate::node::joinstream::AdmissionProposal::from_body(proposal_wire)?;
+    let context = crate::node::channel::join_context_from_genesis(genesis, proposal.epoch)?;
+    proposal.verify(responder_key, &context, &signer.public_key())?;
+    let witness = crate::nat::record::JoinWitness::from_body(witness_wire)?;
+    witness.verify(responder_key, room, proposal.epoch, &signer.fingerprint())?;
+    if !proposal.covers(&witness) {
+        return Err(Error::MalformedAtRest("accepted join witness binding"));
+    }
+    proposal
+        .room_name
+        .ok_or(Error::MalformedAtRest("accepted join name"))
+}
+
+pub(super) fn load_accepted_joins(
+    store: &Store,
+    signer: &VaultRootSigner,
+) -> crate::error::Result<BTreeMap<Digest32, AcceptedJoin>> {
+    use crate::atrest::store::{open_segment, SealedSegment, SegmentKind};
+    let Some(blob) = store.get_meta(ACCEPTED_JOIN_META_KEY)? else {
+        return Ok(BTreeMap::new());
+    };
+    let nonce_len = crate::atrest::sek::NONCE_LEN;
+    if blob.len() < nonce_len {
+        return Err(Error::MalformedAtRest("accepted joins blob"));
+    }
+    let (nonce, ciphertext) = blob.split_at(nonce_len);
+    let sealed = SealedSegment {
+        nonce: nonce
+            .try_into()
+            .map_err(|_| Error::MalformedAtRest("accepted joins nonce"))?,
+        ciphertext: ciphertext.to_vec(),
+    };
+    let plain = open_segment(&accepted_join_key(signer)?, SegmentKind::Trust, 0, &sealed)?;
+    let mut d = crate::cbor::Decoder::new(&plain);
+    if d.array()? != 2 || d.uint()? != 1 {
+        return Err(Error::MalformedAtRest("accepted joins version"));
+    }
+    let count = d.array()?;
+    if count > MAX_PENDING_WITHDRAWALS {
+        return Err(Error::MalformedAtRest("accepted joins count"));
+    }
+    let mut joins = BTreeMap::new();
+    for _ in 0..count {
+        if d.array()? != 6 {
+            return Err(Error::MalformedAtRest("accepted join arity"));
+        }
+        let room = Digest32::try_from(d.bytes()?)
+            .map_err(|_| Error::MalformedAtRest("accepted join room"))?;
+        let proposal = d.bytes()?.to_vec();
+        let witness = d.bytes()?.to_vec();
+        let genesis = crate::governance::genesis::Genesis::from_wire(d.bytes()?)?;
+        let wrap = crate::atrest::sek::SekWrap::from_canonical_slice(d.bytes()?)?;
+        let responder_bytes = <[u8; crate::hash::COMPOSITE_PUB_LEN]>::try_from(d.bytes()?)
+            .map_err(|_| Error::MalformedAtRest("accepted responder key length"))?;
+        let responder_key =
+            crate::identity::composite::CompositePublicKey::from_bytes(&responder_bytes)?;
+        if proposal.len() > crate::node::joinstream::MAX_JOIN_FRAME
+            || witness.len() > crate::node::joinstream::MAX_JOIN_FRAME
+            || genesis.channel_id() != room
+        {
+            return Err(Error::MalformedAtRest("accepted join binding"));
+        }
+        let name =
+            verify_accepted_join(signer, &room, &proposal, &witness, &genesis, &responder_key)?;
+        if joins
+            .insert(
+                room,
+                AcceptedJoin {
+                    proposal,
+                    witness,
+                    genesis,
+                    wrap,
+                    responder_key,
+                    name,
+                },
+            )
+            .is_some()
+        {
+            return Err(Error::MalformedAtRest("duplicate accepted join"));
+        }
+    }
+    d.finish()?;
+    Ok(joins)
+}
+
+fn queue_accepted_joins(
+    batch: &mut Batch<'_>,
+    signer: &VaultRootSigner,
+    joins: &BTreeMap<Digest32, AcceptedJoin>,
+) -> crate::error::Result<()> {
+    use crate::atrest::store::{seal_segment, SegmentKind};
+    let mut e = crate::cbor::Encoder::new();
+    e.array(2).uint(1).array(joins.len());
+    for (room, join) in joins {
+        e.array(6)
+            .bytes(room)
+            .bytes(&join.proposal)
+            .bytes(&join.witness)
+            .bytes(&join.genesis.to_wire())
+            .bytes(&join.wrap.to_canonical_vec())
+            .bytes(&join.responder_key.to_bytes());
+    }
+    let sealed = seal_segment(
+        &accepted_join_key(signer)?,
+        SegmentKind::Trust,
+        0,
+        &e.finish(),
+    )?;
+    let mut blob = Vec::with_capacity(sealed.nonce.len() + sealed.ciphertext.len());
+    blob.extend_from_slice(&sealed.nonce);
+    blob.extend_from_slice(&sealed.ciphertext);
+    batch.put_meta(ACCEPTED_JOIN_META_KEY, &blob)
+}
+
+#[allow(clippy::too_many_arguments)] // The durable boundary keeps its distinct authenticated inputs explicit.
+pub(super) fn retain_accepted_join_native(
+    store: &Store,
+    signer: &VaultRootSigner,
+    room: Digest32,
+    proposal: &[u8],
+    witness: &[u8],
+    genesis: &crate::governance::genesis::Genesis,
+    wrap: &crate::atrest::sek::SekWrap,
+    responder_key: &crate::identity::composite::CompositePublicKey,
+) -> crate::error::Result<()> {
+    let mut batch = store.batch()?;
+    let pending = load_journal(store, PENDING_JOIN_CLEANUP_META_KEY)?;
+    if !pending.contains_key(&room) || genesis.channel_id() != room {
+        return Err(Error::Profile("accepted join has no owned cleanup"));
+    }
+    let mut joins = load_accepted_joins(store, signer)?;
+    if joins.contains_key(&room) || joins.len() >= MAX_PENDING_WITHDRAWALS {
+        return Err(Error::Profile("accepted join obligation already exists"));
+    }
+    let name = verify_accepted_join(signer, &room, proposal, witness, genesis, responder_key)?;
+    joins.insert(
+        room,
+        AcceptedJoin {
+            proposal: proposal.to_vec(),
+            witness: witness.to_vec(),
+            genesis: genesis.clone(),
+            wrap: wrap.clone(),
+            responder_key: responder_key.clone(),
+            name,
+        },
+    );
+    queue_accepted_joins(&mut batch, signer, &joins)?;
+    batch.commit()
+}
 
 /// One room's owned reopen keys, never a replacement snapshot of the shared map.
 pub(super) enum MapChange {
@@ -437,7 +621,7 @@ pub(super) struct JoinTail {
     pub(super) channel: Box<ChannelState>,
     pub(super) parsed: crate::node::link::InviteLink,
     pub(super) me: Digest32,
-    pub(super) joined: crate::node::joinstream::JoinOutcome,
+    pub(super) joined: Option<crate::node::joinstream::JoinOutcome>,
     pub(super) responder: Digest32,
     pub(super) conn: Arc<VoxConnection>,
     pub(super) authority: computer::ComputerAuthority,
@@ -490,6 +674,9 @@ pub(super) fn purge_unpublished(
     room: Digest32,
 ) -> crate::error::Result<()> {
     let mut batch = store.batch()?;
+    if load_accepted_joins(store, signer)?.contains_key(&room) {
+        return Err(Error::Profile("accepted join remains pending"));
+    }
     MapChange::Forget(room).queue(store, signer, &mut batch)?;
     crate::node::history_demand::purge_own_recovery_in(&mut batch, node, room)?;
     batch.purge_channel(&room)?;
@@ -814,22 +1001,39 @@ impl Node {
                     .await
                 {
                     Ok(joined) => {
-                        let after = JoinAdoption {
-                            authority: joined.authority,
-                            responder: joined.responder,
-                            conn: joined.conn,
-                            members: joined.members,
-                            reply: pending.reply,
-                        };
-                        self.begin_owned_join_adoption(
-                            room,
-                            joined.responder,
-                            joined.session,
-                            true,
-                            lifetime,
-                            after,
-                        )
-                        .await;
+                        if let Some(session) = joined.session {
+                            let after = JoinAdoption {
+                                authority: joined.authority,
+                                responder: joined.responder,
+                                conn: joined.conn,
+                                members: joined.members,
+                                reply: pending.reply,
+                            };
+                            self.begin_owned_join_adoption(
+                                room,
+                                joined.responder,
+                                session,
+                                true,
+                                lifetime,
+                                after,
+                            )
+                            .await;
+                        } else {
+                            self.adopt_channel_anchors(&room).await;
+                            self.refresh_network_view().await;
+                            self.reach_members_of(&room).await;
+                            self.begin_local_publication(
+                                room,
+                                Some(PublicationAfter::Joined {
+                                    authority: joined.authority,
+                                    responder: joined.responder,
+                                    conn: joined.conn,
+                                    reply: pending.reply,
+                                }),
+                                Some(lifetime),
+                            )
+                            .await;
+                        }
                     }
                     Err(fault) => self.begin_metadata_abort_join(
                         room,
@@ -851,7 +1055,10 @@ impl Node {
         lifetime: Option<Arc<maintenance_save::Lifetime>>,
     ) {
         match after {
-            RoomAfter::Create { .. } => self.answer_when_published(room, reply, outcome).await,
+            RoomAfter::Create { .. } => {
+                self.join_name_reservations.remove(&room);
+                self.answer_when_published(room, reply, outcome).await
+            }
             RoomAfter::Join(_) => {
                 self.finish_metadata_join_reply(room, reply, outcome, lifetime, None)
                     .await
@@ -976,7 +1183,7 @@ impl Node {
             responder,
             conn,
             members,
-            session: joined.session,
+            session: joined.map(|joined| joined.session),
         })
     }
 }
@@ -1630,6 +1837,7 @@ impl Node {
     ) {
         match after {
             PublicationAfter::Created { reply, .. } => {
+                self.join_name_reservations.remove(&room);
                 let Some(node) = self.profile.as_ref().map(Profile::fingerprint) else {
                     let _ = reply.send(Outcome::Failed(Fault::NoIdentity));
                     return;
@@ -1653,6 +1861,7 @@ impl Node {
                         fault,
                         reply: Some(reply),
                         joining: false,
+                        cancelled: false,
                     },
                     lifetime,
                 );
@@ -1695,6 +1904,7 @@ impl Node {
                     })
                     .is_some()
                 {
+                    self.join_name_reservations.remove(&room);
                     self.answer_when_published(room, reply, Outcome::Done).await;
                 } else {
                     self.reject_metadata_publication(
@@ -1831,6 +2041,10 @@ enum JournalWork {
         room: Digest32,
         node: Digest32,
     },
+    CancelAccepted {
+        room: Digest32,
+        node: Digest32,
+    },
     AbortCompleted {
         room: Digest32,
         node: Digest32,
@@ -1944,7 +2158,14 @@ impl JournalWork {
                     )?
                     .to_wire();
                     let mut withdrawn = load_journal(store, PENDING_WITHDRAWALS_META_KEY)?;
-                    withdrawn.insert(room, PendingWithdrawal { wire, routes });
+                    withdrawn.insert(
+                        room,
+                        PendingWithdrawal {
+                            wire,
+                            routes,
+                            awaiting_departure: false,
+                        },
+                    );
                     delta.withdrawal = Some(withdrawn.get(&room).cloned());
                     batch.put_meta(
                         PENDING_WITHDRAWALS_META_KEY,
@@ -1979,11 +2200,39 @@ impl JournalWork {
                 }
                 return Ok(delta);
             }
+            Self::CancelAccepted { room, node } => {
+                let mut accepted = load_accepted_joins(store, signer)?;
+                let obligation = accepted
+                    .remove(&room)
+                    .ok_or(Error::Profile("accepted join obligation missing"))?;
+                if store
+                    .get_sek_wrap(&room)?
+                    .is_some_and(|wrap| wrap != obligation.wrap)
+                {
+                    return Err(Error::Profile("accepted join wrap changed"));
+                }
+                let proposal =
+                    crate::node::joinstream::AdmissionProposal::from_body(&obligation.proposal)?;
+                let mut unfinished = load_journal(store, PENDING_JOIN_CLEANUP_META_KEY)?;
+                let cleanup = unfinished
+                    .remove(&room)
+                    .ok_or(Error::Profile("accepted join cleanup missing"))?;
+                verify_join_rollback(&cleanup, signer, room, proposal.epoch)?;
+                queue_accepted_joins(&mut batch, signer, &accepted)?;
+                delta = queue_join_rollback(
+                    store, signer, &mut batch, node, room, cleanup, unfinished, true,
+                )?;
+                batch.commit()?;
+                return Ok(delta);
+            }
             Self::AbortCompleted {
                 room,
                 node,
                 completed,
             } => {
+                if load_accepted_joins(store, signer)?.contains_key(&room) {
+                    return Err(Error::Profile("accepted join remains pending"));
+                }
                 let epoch = completed.instance.blocking_lock().epoch();
                 if epoch != completed.epoch
                     || store.get_sek_wrap(&room)?.as_ref() != Some(&completed.wrap)
@@ -1996,7 +2245,7 @@ impl JournalWork {
                     .ok_or(Error::Profile("completed join has no rollback journal"))?;
                 verify_join_rollback(&cleanup, signer, room, completed.epoch)?;
                 delta = queue_join_rollback(
-                    store, signer, &mut batch, node, room, cleanup, unfinished,
+                    store, signer, &mut batch, node, room, cleanup, unfinished, false,
                 )?;
                 batch.commit()?;
                 return Ok(delta);
@@ -2013,6 +2262,14 @@ impl JournalWork {
                     .remove(&room)
                     .ok_or(Error::Profile("accepted join has no rollback journal"))?;
                 verify_join_rollback(&cleanup, signer, room, completed.epoch)?;
+                let mut accepted = load_accepted_joins(store, signer)?;
+                let obligation = accepted
+                    .remove(&room)
+                    .ok_or(Error::Profile("accepted join obligation missing"))?;
+                if obligation.wrap != completed.wrap {
+                    return Err(Error::Profile("accepted join wrap changed"));
+                }
+                queue_accepted_joins(&mut batch, signer, &accepted)?;
                 batch.put_meta(
                     PENDING_JOIN_CLEANUP_META_KEY,
                     &pending_withdrawals_bytes(&pending)?,
@@ -2052,7 +2309,7 @@ impl JournalWork {
                 return Ok(delta);
             }
             Self::PurgeUnpublished { room, node } => {
-                queue_unpublished_purge(store, signer, &mut batch, node, room)?;
+                queue_unpublished_purge(store, signer, &mut batch, node, room, false)?;
                 batch.commit()?;
                 delta.purged = true;
                 return Ok(delta);
@@ -2076,7 +2333,14 @@ impl JournalWork {
                     crate::nat::withdraw::BoardWithdraw::build(signer, &room, epoch, scope, now)?
                         .to_wire();
                 let mut withdrawn = load_journal(store, PENDING_WITHDRAWALS_META_KEY)?;
-                withdrawn.insert(room, PendingWithdrawal { wire, routes });
+                withdrawn.insert(
+                    room,
+                    PendingWithdrawal {
+                        wire,
+                        routes,
+                        awaiting_departure: false,
+                    },
+                );
                 delta.withdrawal = Some(withdrawn.get(&room).cloned());
                 batch.put_meta(
                     PENDING_WITHDRAWALS_META_KEY,
@@ -2137,6 +2401,7 @@ impl JournalWork {
                         let entry = pending.entry(room).or_insert_with(|| PendingWithdrawal {
                             wire: wire.clone(),
                             routes: BTreeMap::new(),
+                            awaiting_departure: false,
                         });
                         let prior = crate::nat::withdraw::BoardWithdraw::from_wire(&entry.wire)?;
                         if withdrawal.timestamp_ms >= prior.timestamp_ms {
@@ -2160,6 +2425,7 @@ impl JournalWork {
                         room
                     }
                     Self::Abort { .. }
+                    | Self::CancelAccepted { .. }
                     | Self::Complete { .. }
                     | Self::AbortCompleted { .. }
                     | Self::AcceptCompleted { .. }
@@ -2192,6 +2458,7 @@ impl Node {
                 }
                 None => {
                     self.join_cleanup.remove(&room);
+                    self.join_name_reservations.remove(&room);
                 }
             }
         }
@@ -2226,6 +2493,7 @@ enum JournalAfter {
         fault: Fault,
         reply: Option<oneshot::Sender<Outcome>>,
         joining: bool,
+        cancelled: bool,
     },
     Board {
         board: Digest32,
@@ -2680,6 +2948,23 @@ impl Node {
                     if let Some((room_cancel, instance, room_epoch, now, idle, authority)) =
                         &withdrawal_fence
                     {
+                        #[cfg(feature = "test-knobs")]
+                        if *idle {
+                            if let Some(path) =
+                                std::env::var_os("VOX_TEST_FAIL_END_WITHDRAWAL_FILE")
+                                    .filter(|path| !path.is_empty())
+                            {
+                                let path = std::path::PathBuf::from(path);
+                                let mut receipt = path.as_os_str().to_owned();
+                                receipt.push(".engaged");
+                                if std::fs::rename(path, std::path::PathBuf::from(receipt)).is_ok()
+                                {
+                                    return Err(Error::Profile(
+                                        "proof-injected withdrawal save failure",
+                                    ));
+                                }
+                            }
+                        }
                         if *room_cancel.borrow() || *attachment.borrow() != epoch {
                             return Err(Error::AtRestLocked);
                         }
@@ -2690,12 +2975,12 @@ impl Node {
                             }
                             if *idle
                                 && (channel.genesis().creator_pubkey().fingerprint() != node
-                                    || !matches!(
-                                        channel.ended(*now),
-                                        Some(crate::node::channel::RoomEnd::Idle { .. })
-                                    ))
+                                    || channel.has_left(&node)
+                                    || channel.ended(*now).is_none())
                             {
-                                return Err(Error::Profile("idle room changed before withdrawal"));
+                                return Err(Error::Profile(
+                                    "ended room changed before creator withdrawal",
+                                ));
                             }
                         }
                         if !authority.current()
@@ -2823,8 +3108,31 @@ impl Node {
                 fault,
                 reply,
                 joining: true,
+                cancelled: false,
             },
             lifetime,
+        );
+    }
+
+    pub(super) fn begin_metadata_cancel_accepted(
+        &mut self,
+        room: Digest32,
+        reply: oneshot::Sender<Outcome>,
+    ) {
+        let Some(node) = self.profile.as_ref().map(Profile::fingerprint) else {
+            let _ = reply.send(Outcome::Failed(Fault::Locked));
+            return;
+        };
+        self.begin_metadata_journal(
+            room,
+            JournalWork::CancelAccepted { room, node },
+            JournalAfter::Abort {
+                fault: Fault::Internal,
+                reply: Some(reply),
+                joining: false,
+                cancelled: true,
+            },
+            None,
         );
     }
 
@@ -2981,6 +3289,7 @@ impl Node {
                                     fault: Fault::ComputerPolicy,
                                     reply: Some(reply),
                                     joining: true,
+                                    cancelled: false,
                                 },
                                 lifetime,
                             );
@@ -2999,6 +3308,19 @@ impl Node {
                 JournalAfter::PublicationRejected(mut rejected) => {
                     let delta = match result {
                         Ok(delta) => delta,
+                        Err(Error::Profile("accepted join remains pending")) => {
+                            self.say_why_the_join_failed(&[
+                                "admission was accepted and retained; local completion remains pending".to_owned(),
+                            ]);
+                            self.fail_room_publication(
+                                room,
+                                rejected.waiting,
+                                Fault::RoomChangePending,
+                            );
+                            drop(rejected.transition);
+                            self.resume_metadata_withdrawal(room, following);
+                            continue;
+                        }
                         Err(error) => {
                             self.fail_room_publication(room, rejected.waiting, fault_of(&error));
                             drop(rejected.transition);
@@ -3054,6 +3376,7 @@ impl Node {
                     fault,
                     reply,
                     joining,
+                    cancelled,
                 } => {
                     if !current {
                         if let Some(reply) = reply {
@@ -3075,12 +3398,25 @@ impl Node {
                                     }
                                 }
                             }
-                            Outcome::Failed(fault)
+                            if cancelled {
+                                Outcome::Done
+                            } else {
+                                Outcome::Failed(fault)
+                            }
+                        }
+                        Err(Error::Profile("accepted join remains pending")) => {
+                            self.say_why_the_join_failed(&[
+                                "admission was accepted and retained; local completion remains pending".to_owned(),
+                            ]);
+                            Outcome::Failed(Fault::RoomChangePending)
                         }
                         Err(error) => Outcome::Failed(fault_of(&error)),
                     };
                     if let Some(reply) = reply {
-                        if joining {
+                        if cancelled {
+                            self.publish().await;
+                            let _ = reply.send(outcome);
+                        } else if joining {
                             self.finish_metadata_join_reply(room, reply, outcome, lifetime, None)
                                 .await;
                         } else {
@@ -3547,6 +3883,7 @@ impl Node {
                 fault,
                 reply,
                 joining: false,
+                cancelled: false,
             },
             Some(lifetime),
         );
@@ -3882,7 +4219,7 @@ struct JoinedFields {
     responder: Digest32,
     conn: Arc<VoxConnection>,
     members: Vec<Digest32>,
-    session: crate::pairwise::session::Session,
+    session: Option<crate::pairwise::session::Session>,
 }
 pub(super) struct JoinAdoption {
     pub(super) authority: computer::ComputerAuthority,
@@ -3936,7 +4273,11 @@ fn queue_unpublished_purge(
     batch: &mut Batch<'_>,
     node: Digest32,
     room: Digest32,
+    allow_accepted: bool,
 ) -> crate::error::Result<()> {
+    if !allow_accepted && load_accepted_joins(store, signer)?.contains_key(&room) {
+        return Err(Error::Profile("accepted join remains pending"));
+    }
     MapChange::Forget(room).queue(store, signer, batch)?;
     crate::node::history_demand::purge_own_recovery_in(batch, node, room)?;
     batch.purge_channel(&room).map(|_| ())
@@ -3949,14 +4290,18 @@ fn queue_abort_join(
     node: Digest32,
     room: Digest32,
 ) -> crate::error::Result<JournalDelta> {
+    if load_accepted_joins(store, signer)?.contains_key(&room) {
+        return Err(Error::Profile("accepted join remains pending"));
+    }
     let delta = JournalDelta::default();
     let mut unfinished = load_journal(store, PENDING_JOIN_CLEANUP_META_KEY)?;
     let Some(cleanup) = unfinished.remove(&room) else {
         return Ok(delta);
     };
-    queue_join_rollback(store, signer, batch, node, room, cleanup, unfinished)
+    queue_join_rollback(store, signer, batch, node, room, cleanup, unfinished, false)
 }
 
+#[allow(clippy::too_many_arguments)] // Rollback owns both the exact cleanup and the remaining shared ledger.
 fn queue_join_rollback(
     store: &Store,
     signer: &VaultRootSigner,
@@ -3965,6 +4310,7 @@ fn queue_join_rollback(
     room: Digest32,
     cleanup: PendingWithdrawal,
     unfinished: BTreeMap<Digest32, PendingWithdrawal>,
+    allow_accepted: bool,
 ) -> crate::error::Result<JournalDelta> {
     let mut delta = JournalDelta::default();
     let mut withdrawn = load_journal(store, PENDING_WITHDRAWALS_META_KEY)?;
@@ -4001,7 +4347,7 @@ fn queue_join_rollback(
         PENDING_JOIN_CLEANUP_META_KEY,
         &pending_withdrawals_bytes(&unfinished)?,
     )?;
-    queue_unpublished_purge(store, signer, batch, node, room)?;
+    queue_unpublished_purge(store, signer, batch, node, room, allow_accepted)?;
     Ok(delta)
 }
 
@@ -4207,11 +4553,6 @@ impl Node {
             Some((store, signer, secret, lifetime))
         })();
         let Some((store, signer, secret, lifetime)) = captured else {
-            // The original best-effort attempt also advanced wind-down after an immediate error.
-            self.winding.entry(room).or_insert(Winding {
-                gen,
-                since: std::time::Instant::now(),
-            });
             return;
         };
         let room_epoch = instance.lock().await.epoch();
@@ -4339,14 +4680,16 @@ impl Node {
         } else {
             Err(Fault::ChannelNotOpen)
         };
-        if attached {
+        if attached && result.is_ok() {
             if let Some(gen) = withdrawal.purpose.idle_generation() {
-                // A failed save was always best effort. The wait, not success, precedes wind-down.
-                let still_idle = matches!(
-                    withdrawal.instance.lock().await.ended(self.now_ms().get()),
-                    Some(crate::node::channel::RoomEnd::Idle { .. })
-                );
-                if still_idle {
+                // A durable withdrawal permits the ended room to wind down.
+                let still_ended = withdrawal
+                    .instance
+                    .lock()
+                    .await
+                    .ended(self.now_ms().get())
+                    .is_some();
+                if still_ended {
                     self.winding.entry(room).or_insert(Winding {
                         gen,
                         since: std::time::Instant::now(),

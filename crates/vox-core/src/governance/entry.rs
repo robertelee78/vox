@@ -39,6 +39,7 @@ use crate::governance::cert::{AdminCert, AdminRevocation};
 use crate::governance::consent::{ConsentGrant, ConsentRevocation};
 use crate::governance::genesis::Genesis;
 use crate::governance::lifecycle::RoomLifecycle;
+use crate::governance::membership::{MemberReadmission, MemberRemoval};
 use crate::governance::name::RoomName;
 use crate::governance::policy::PolicyUpdate;
 use crate::governance::presence::Presence;
@@ -81,6 +82,10 @@ pub enum GovBody {
     RoomName(Box<RoomName>),
     /// The room's complete anchor set, stated by its creator or an admin (ADR-032 AN-5).
     RoomAnchors(Box<crate::governance::anchors::RoomAnchors>),
+    /// A room-scoped member removal.
+    MemberRemoval(Box<MemberRemoval>),
+    /// A creator-signed room-scoped member readmission.
+    MemberReadmission(Box<MemberReadmission>),
 }
 
 impl GovBody {
@@ -124,6 +129,12 @@ impl GovBody {
             StructTag::PolicyRotation => Ok(GovBody::PolicyUpdate(Box::new(
                 PolicyUpdate::from_wire(bytes)?,
             ))),
+            StructTag::MemberRemoval => Ok(GovBody::MemberRemoval(Box::new(
+                MemberRemoval::from_wire(bytes)?,
+            ))),
+            StructTag::MemberReadmission => Ok(GovBody::MemberReadmission(Box::new(
+                MemberReadmission::from_wire(bytes)?,
+            ))),
             _ => Err(Error::MalformedGovernance("not a governance struct tag")),
         }
     }
@@ -146,6 +157,8 @@ impl GovBody {
             Self::ServiceShare(s) => s.verify(author_key),
             Self::RoomName(n) => n.verify(author_key),
             Self::RoomAnchors(a) => a.verify(author_key),
+            Self::MemberRemoval(r) => r.verify(author_key),
+            Self::MemberReadmission(r) => r.verify(author_key),
         }
     }
 
@@ -166,6 +179,8 @@ impl GovBody {
             GovBody::Presence(p) => (p.body.channel_id, p.body.epoch),
             GovBody::RoomName(n) => (n.body.channel_id, n.body.epoch),
             GovBody::RoomAnchors(a) => (a.body.channel_id, a.body.epoch),
+            GovBody::MemberRemoval(r) => (r.channel_id, r.epoch),
+            GovBody::MemberReadmission(r) => (r.channel_id, r.epoch),
         }
     }
 
@@ -186,6 +201,8 @@ impl GovBody {
             GovBody::Presence(p) => p.body.author_id,
             GovBody::RoomName(n) => n.body.issuer_id,
             GovBody::RoomAnchors(a) => a.body.issuer_id,
+            GovBody::MemberRemoval(r) => r.issuer_id,
+            GovBody::MemberReadmission(r) => r.issuer_id,
         }
     }
 }
@@ -299,6 +316,15 @@ impl GovEntry {
                     "signed governance author differs from issuer",
                 ));
             }
+        }
+        if matches!(
+            body,
+            GovBody::MemberRemoval(_) | GovBody::MemberReadmission(_)
+        ) && body.issuer_id() != entry.skeleton.author_id
+        {
+            return Err(Error::MalformedGovernance(
+                "member fact author differs from issuer",
+            ));
         }
         let (body_channel, body_epoch) = body.channel_and_epoch();
         if body_channel != entry.skeleton.channel_id {

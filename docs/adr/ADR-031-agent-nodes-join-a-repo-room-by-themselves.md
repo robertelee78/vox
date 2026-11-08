@@ -326,9 +326,10 @@ on a point the decider left open).
   Receivers enforce the strictly-greater check against previously floored generations;
   this does not prove when a never-before-floored generation was minted.
 
-  **Recipient restoration.** For every validated removal of a floor's named recipient, that
-  floor supplies history authority only if it is strictly prior to that removal or descends
-  from a valid creator readmission superseding it. Historical authority MUST NOT become
+  **Recipient restoration.** For a recipient with any validated removal, a floor supplies history
+  authority only if it causally descends from a valid creator readmission covering every such
+  removal; a floor strictly prior to a removal no longer authorizes serving or releasing to that
+  recipient (v0.4.20, with ADR-007 G-30). Historical authority MUST NOT become
   current access: immediately before serving a page or releasing a key, independently
   require the recipient's current restored room membership and ordinary trust/Drive.
   Remaining authors MUST NOT publish floors or release drive keys to a currently removed
@@ -342,6 +343,8 @@ on a point the decider left open).
   release iteration. SC-2a's whole-generation floor zero applies only if that recipient was
   an eligible room member with Drive when the generation was minted; retained trust alone
   MUST NOT backfill the period of removal.
+  Private history the restored recipient already accepted stays readable locally; pre-removal and
+  removal-period private history it lacks is not re-served or rendered.
 
   **Bypasses and queued work.** `current_drive` and the locally-held legacy receive path
   MUST refuse a currently removed author or one failing the author-restoration rule.

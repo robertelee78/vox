@@ -66,6 +66,7 @@ pub(super) enum NativeKind {
     Upgrade,
     Migration,
     Serve,
+    AutoFailure,
     Flow(Box<pending_upgrade::PageFlow>),
 }
 
@@ -257,15 +258,49 @@ impl Work {
                 received_at,
                 guard,
             } => {
-                let flow = pending_upgrade::PageFlow::live(
-                    channel,
-                    store,
-                    peer,
-                    revision,
-                    page,
-                    received_at,
-                    guard.nonce,
-                )?;
+                if page.is_err() && channel.private_auto_in_flight(&peer, revision) {
+                    let error = page
+                        .err()
+                        .ok_or(Error::Profile("private refetch failure missing"))?;
+                    let pending = channel.prepare_pending_private_auto_failure(
+                        store,
+                        owner,
+                        (peer, revision, guard.nonce),
+                        error,
+                        now,
+                    )?;
+                    return Ok(Some(Prepared::Native {
+                        pending,
+                        kind: NativeKind::AutoFailure,
+                        boundary: Some(Boundary::Current {
+                            guard,
+                            before: true,
+                            after: false,
+                        }),
+                    }));
+                }
+                let automatic = page.as_ref().is_ok_and(|page| page.query.archive());
+                let flow = if automatic {
+                    pending_upgrade::PageFlow::automatic(
+                        channel,
+                        store,
+                        peer,
+                        revision,
+                        page,
+                        received_at,
+                        guard.nonce,
+                    )?
+                } else {
+                    pending_upgrade::PageFlow::live(
+                        channel,
+                        store,
+                        peer,
+                        revision,
+                        page,
+                        received_at,
+                        guard.nonce,
+                    )?
+                };
                 Self::Flow {
                     flow: Box::new(flow),
                     guard: FlowGuard::Live {
@@ -417,6 +452,14 @@ fn native_saved(mut saved: Native, kind: NativeKind) -> Result<Saved> {
             .take()
             .map(Saved::Page)
             .ok_or(Error::Profile("native private page receipt missing")),
+        NativeKind::AutoFailure => {
+            if !saved.cursor_committed {
+                return Err(Error::Profile("private refetch failure receipt missing"));
+            }
+            Ok(Saved::PageFinished(pending_upgrade::PageResult::Live(
+                pending_upgrade::LivePageResult::Complete(true),
+            )))
+        }
         NativeKind::Flow(mut flow) => {
             flow.accept(saved)?;
             Ok(Saved::Flow(flow))

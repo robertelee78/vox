@@ -24,6 +24,10 @@ enum Action {
         revoke: bool,
         here: bool,
     },
+    RoomRotation {
+        generation: u64,
+        here: bool,
+    },
 }
 
 struct Issuance {
@@ -37,6 +41,7 @@ struct Issuance {
 pub(crate) enum ConsentSaved {
     Issued { history_owed: bool },
     Withdrawn(Option<Box<ConsentRevocation>>),
+    RoomRotated,
 }
 
 pub(crate) struct CompletedConsent {
@@ -74,6 +79,162 @@ impl CompletedConsent {
 }
 
 impl ChannelState {
+    /// A newly applied room-removal generation must have a durable fresh sender chain
+    /// before this node can encrypt or release another room key.
+    pub(crate) fn room_removal_rotation_needed(&self, store: &Store) -> Result<bool> {
+        let generation = governance::removal_generation(store, &self.channel_id)?;
+        let Some(segment) = store.get_segment(
+            &self.channel_id,
+            SegmentKind::KeyMaterial,
+            SEG_ROOM_REMOVAL_SENDER,
+        )?
+        else {
+            return Ok(generation != 0);
+        };
+        let bytes = open_segment(
+            &self.sek,
+            SegmentKind::KeyMaterial,
+            SEG_ROOM_REMOVAL_SENDER,
+            &segment,
+        )?;
+        let mut d = Decoder::new(&bytes);
+        if d.array()? != 3 || d.uint()? != 1 {
+            return Err(Error::MalformedAtRest("room sender rotation checkpoint"));
+        }
+        let checked = d.uint()?;
+        let chain = d.uint()?;
+        d.finish()?;
+        if checked > generation || chain > self.sender.chain_id() {
+            return Err(Error::MalformedAtRest(
+                "room sender rotation checkpoint ahead",
+            ));
+        }
+        Ok(checked != generation)
+    }
+
+    pub(crate) fn prepare_room_removal_rotation(
+        &mut self,
+        store: &Arc<Store>,
+        owner: Arc<()>,
+        now: crate::time::Ms,
+    ) -> Result<Option<PendingConsent>> {
+        self.require_governance_ready(store, now)?;
+        let me = self.me();
+        if self.is_member_removed(store, &me)? || !self.room_removal_rotation_needed(store)? {
+            return Ok(None);
+        }
+        self.require_legacy_current(store)?;
+        let generation = governance::removal_generation(store, &self.channel_id)?;
+        let view = self.checked_governance(store, now.get())?;
+        let next_chain = self
+            .sender
+            .chain_id()
+            .checked_add(1)
+            .ok_or(Error::MalformedBundle("sender chain_id overflow"))?;
+        let mut entitled = self.entitled.clone();
+        let mut history = self.history.clone();
+        let mut delivered = self.delivered.clone();
+        let targets: BTreeSet<_> = self
+            .authors
+            .keys()
+            .chain(entitled.keys())
+            .copied()
+            .collect();
+        for target in targets {
+            let removals = view.validated_member_removals(&target)?;
+            if removals.is_empty() {
+                continue;
+            }
+            let mut cut = None;
+            let mut had_entitlement = entitled.contains_key(&target);
+            #[cfg(feature = "test-knobs")]
+            let mut previous_entitlement = None;
+            for hash in removals {
+                let (chain, old) = view
+                    .sender_cut(&hash, &target, &me)?
+                    .ok_or(Error::Profile(governance::REFRESHING))?;
+                cut = Some(cut.map_or(chain, |held: u64| held.max(chain)));
+                had_entitlement |= old.is_some();
+                #[cfg(feature = "test-knobs")]
+                if old.is_some() {
+                    previous_entitlement = old;
+                }
+            }
+            let removed = view.is_member_removed(&target)?;
+            let needs_boundary = removed
+                || (had_entitlement
+                    && entitled
+                        .get(&target)
+                        .is_none_or(|(chain, _)| *chain <= cut.unwrap_or(0)));
+            if needs_boundary {
+                history.remove(&target);
+                delivered.remove(&target);
+                if removed {
+                    entitled.remove(&target);
+                } else {
+                    entitled.insert(target, (next_chain, 0));
+                    #[cfg(feature = "test-knobs")]
+                    if let Some(old) = previous_entitlement.filter(|_| {
+                        std::env::var("VOX_TEST_FX62_MUTANT").as_deref() == Ok("old-entitlement")
+                    }) {
+                        entitled.insert(target, old);
+                    }
+                }
+            }
+        }
+        drop(view);
+        let readers = self.with_consent_facts(|facts| {
+            entitled
+                .keys()
+                .filter(|target| facts.can_read(target, &me))
+                .copied()
+                .collect::<BTreeSet<_>>()
+        })?;
+        let retired = self.sender.chain_id();
+        let mut owed = Vec::new();
+        for (reader, (from, _)) in &entitled {
+            if *reader == me
+                || self.has_left(reader)
+                || !readers.contains(reader)
+                || self.is_member_removed(store, reader)?
+            {
+                continue;
+            }
+            let floor = match delivered.get(reader) {
+                None => *from,
+                Some(delivered) if *delivered < retired => (*delivered + 1).max(*from),
+                Some(_) => continue,
+            };
+            if floor <= retired {
+                owed.push((*reader, floor));
+            }
+        }
+        let rotation = Rotation {
+            origins: OriginKeyStore::from_state(&self.origins.to_state())?,
+            newest_mint: self.newest_mint_seq(),
+            history: rotation_history_bytes(&history, &owed),
+            owed,
+        };
+        let delivered = Some(delivered);
+        let here = !self.said_left(&me);
+        let mut append = self.prepare_pending_control(store, owner, now)?;
+        append.removal_fence = Some(generation);
+        Ok(Some(PendingConsent {
+            append,
+            action: Action::RoomRotation { generation, here },
+            entitled,
+            history,
+            delivered,
+            rotation: Some(rotation),
+            ledgers_committed: false,
+            origins_committed: None,
+            held_committed: None,
+            package_seq: None,
+            package_attempted: false,
+            consent_seq: None,
+        }))
+    }
+
     /// Full-history consent needs positions and its live key, not a signed copy of every
     /// retained historical key. Actual history deliveries still sign their selected keys.
     pub(crate) fn full_consent_release(
@@ -107,6 +268,27 @@ impl ChannelState {
     ) -> Result<PendingConsent> {
         self.require_legacy_current(store)?;
         self.require_governance_ready(store, now)?;
+        let generation = self.removal_generation(store)?;
+        if self.is_member_removed(store, &self.me())?
+            || self.is_member_removed(store, &target)?
+            || self.room_removal_rotation_needed(store)?
+        {
+            return Err(Error::Profile(governance::REFRESHING));
+        }
+        governance::check_removal_generation(store, &self.sek, &self.channel_id, generation)?;
+        let once_removed = !self
+            .validated_member_removals(store, &target, now)?
+            .is_empty();
+        #[cfg(feature = "test-knobs")]
+        let once_removed = once_removed
+            && std::env::var("VOX_TEST_FX62_MUTANT").as_deref() != Ok("readmission-full-plan");
+        if once_removed
+            && (skdm.body.chain_id != self.sender.chain_id()
+                || entitled_from.0 != self.sender.chain_id()
+                || full_history)
+        {
+            return Err(Error::Profile(governance::REFRESHING));
+        }
         if !self.is_author(&target) {
             return Err(Error::MalformedGovernance(
                 "consent target is not an author",
@@ -114,7 +296,8 @@ impl ChannelState {
         }
         let entitled = self.entitled.clone();
         let history = self.history.clone();
-        let append = self.prepare_pending_control(store, owner, now)?;
+        let mut append = self.prepare_pending_control(store, owner, now)?;
+        append.removal_fence = Some(generation);
         Ok(PendingConsent {
             append,
             action: Action::Issue(Issuance {
@@ -296,7 +479,13 @@ impl PendingConsent {
         let result =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.save(store, signer)))
                 .unwrap_or_else(|_| Err(Error::Profile("consent save worker stopped")));
-        let failure = result.as_ref().err().map(ToString::to_string);
+        // Every committed package, held-key deletion and rotation is carried by the
+        // completion below. A generation refusal must not turn the room into a storage fault.
+        let failure = result
+            .as_ref()
+            .err()
+            .filter(|error| !governance::refreshing(error))
+            .map(ToString::to_string);
         let hash = self.append.committed.last().map(Entry::entry_hash);
         let (package, release) = match self.action {
             Action::Issue(issue) => (
@@ -307,7 +496,7 @@ impl PendingConsent {
                 },
                 result.is_ok().then_some(issue.skdm),
             ),
-            Action::Withdraw { .. } => (None, None),
+            Action::Withdraw { .. } | Action::RoomRotation { .. } => (None, None),
         };
         let append = CompletedText {
             pending: Some(self.append),
@@ -451,7 +640,7 @@ impl PendingConsent {
                 let revoke = *revoke;
                 let here = *here;
                 let revocation = if revoke {
-                    self.rotate_for_withdrawal(store, signer, here)?;
+                    self.rotate_for_withdrawal(store, signer, here, None)?;
                     let revocation = issue_consent_revocation(
                         signer,
                         &self.append.room,
@@ -509,6 +698,12 @@ impl PendingConsent {
                 }
                 Ok(ConsentSaved::Withdrawn(revocation))
             }
+            Action::RoomRotation { generation, here } => {
+                let generation = *generation;
+                let here = *here;
+                self.rotate_for_withdrawal(store, signer, here, Some(generation))?;
+                Ok(ConsentSaved::RoomRotated)
+            }
         }
     }
 
@@ -517,6 +712,7 @@ impl PendingConsent {
         store: &Store,
         signer: &crate::atrest::vault::VaultRootSigner,
         here: bool,
+        checkpoint: Option<u64>,
     ) -> Result<()> {
         let mut rotation = self
             .rotation
@@ -568,6 +764,50 @@ impl PendingConsent {
                         &delivered_bytes(&self.history),
                     )?),
                 ),
+                (
+                    SEG_ENTITLED,
+                    checkpoint
+                        .map(|_| {
+                            seal_segment(
+                                sek,
+                                SegmentKind::KeyMaterial,
+                                SEG_ENTITLED,
+                                &positions_bytes(&self.entitled),
+                            )
+                        })
+                        .transpose()?,
+                ),
+                (
+                    SEG_DELIVERED,
+                    checkpoint
+                        .map(|_| {
+                            let delivered = self.delivered.as_ref().ok_or(
+                                Error::MalformedAtRest("room rotation delivered state missing"),
+                            )?;
+                            seal_segment(
+                                sek,
+                                SegmentKind::KeyMaterial,
+                                SEG_DELIVERED,
+                                &delivered_bytes(delivered),
+                            )
+                        })
+                        .transpose()?,
+                ),
+                (
+                    SEG_ROOM_REMOVAL_SENDER,
+                    checkpoint
+                        .map(|generation| {
+                            let mut e = Encoder::new();
+                            e.array(3).uint(1).uint(generation).uint(next.chain_id());
+                            seal_segment(
+                                sek,
+                                SegmentKind::KeyMaterial,
+                                SEG_ROOM_REMOVAL_SENDER,
+                                &e.finish(),
+                            )
+                        })
+                        .transpose()?,
+                ),
             ])
         })?;
         if self.append.sparse {
@@ -590,6 +830,16 @@ impl PendingConsent {
             )?;
         } else {
             let mut batch = store.batch()?;
+            if let Some(generation) = checkpoint {
+                self.append.sek.with(|sek| {
+                    governance::check_removal_generation_in(
+                        &batch,
+                        sek,
+                        &self.append.room,
+                        generation,
+                    )
+                })?;
+            }
             for (slot, segment) in &rows {
                 if let Some(segment) = segment {
                     batch.put_segment(

@@ -164,6 +164,25 @@ vox: trusting f7l2q44g56mzd62nsvck7mofib as "ann": read
 Trust covers every room you share with the node, including rooms you share later. `--history full`
 also releases your own earlier messages that you still hold a key for. The default, `now`, releases
 only what you write from now on. Neither releases anyone else's messages.
+In a room that removed this identity, readmission does not restore earlier history, even with
+`--history full`. Previously readable messages remain readable. Undelivered messages from before
+removal and messages sent during removal stay unavailable, including messages on an old key chain
+the node already held. After readmission, new messages are available subject to each sender's
+trust and consent. Peers cannot enforce a removal they have not received; previously disclosed
+messages and keys cannot be recalled.
+Trust grants already saved by the daemon wait for current room permissions before releasing
+keys. A room still reading its permissions does not undo that grant or turn it into a trust
+withdrawal.
+
+To remove one exact node from just one room, use **Remove from Room…** beside its member row,
+or **Room > Remove or Readmit Member…**. Review the full fingerprint and room before confirming.
+Only the creator or an authorized admin can remove a non-creator; only the creator can readmit.
+This leaves global trust, other rooms and already readable history unchanged. The result says
+what was applied locally; propagation to other nodes is not an acknowledgement.
+For the CLI, use `vox room remove-member` or `vox room readmit-member` with the room id,
+the exact full fingerprint from `vox room roster`, and your acting `--node`.
+A removed node can still run `vox room leave` to delete its local copy. This does not undo the
+signed removal, and needs no acknowledgement from peers that already exclude it.
 
 Trusting sends the node your key for each room you share. The key is locked to keys the other
 node publishes in the room. If those have not reached your node yet, your key waits and goes when

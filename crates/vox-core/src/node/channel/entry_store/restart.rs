@@ -44,13 +44,21 @@ impl RestartState {
         }
         e.array(self.presence.len());
         for (author, state) in &self.presence {
-            e.array(4)
+            e.array(5)
                 .bytes(author)
                 .uint(state.last.0)
                 .uint(u64::from(state.last.1));
             match state.back {
                 Some((seq, ms)) => {
                     e.array(2).uint(seq).uint(ms);
+                }
+                None => {
+                    e.array(0);
+                }
+            }
+            match state.last_ms {
+                Some(ms) => {
+                    e.array(1).uint(ms);
                 }
                 None => {
                     e.array(0);
@@ -108,7 +116,8 @@ impl RestartState {
         }
         let mut presence = BTreeMap::new();
         for _ in 0..n {
-            if d.array()? != 4 {
+            let row = d.array()?;
+            if !matches!(row, 4 | 5) {
                 return Err(invalid("restart presence row"));
             }
             let author = digest(d)?;
@@ -118,9 +127,27 @@ impl RestartState {
                 2 => Some((d.uint()?, d.uint()?)),
                 _ => return Err(invalid("restart presence back")),
             };
+            let last_ms = if row == 5 {
+                match d.array()? {
+                    0 => None,
+                    1 => Some(d.uint()?),
+                    _ => return Err(invalid("restart presence timestamp")),
+                }
+            } else {
+                None
+            };
             if last.0 == 0
                 || back.is_some_and(|(seq, _)| seq == 0 || seq > last.0)
-                || presence.insert(author, Presence { last, back }).is_some()
+                || presence
+                    .insert(
+                        author,
+                        Presence {
+                            last,
+                            last_ms,
+                            back,
+                        },
+                    )
+                    .is_some()
             {
                 return Err(invalid("restart presence binding"));
             }

@@ -4,6 +4,7 @@ use crate::atrest::sek::Sek;
 use crate::atrest::SekWrap;
 use crate::governance::genesis::Genesis;
 use crate::governance::share::ServiceKind;
+use crate::identity::composite::RootSigner as _;
 use crate::node::store::Store;
 
 pub(super) struct Created {
@@ -17,27 +18,23 @@ pub(super) struct Created {
 }
 
 enum Work {
-    Create {
-        name: String,
-        passphrase: Secret,
-        genesis: Genesis,
-        sek: Sek,
-        wrap: SekWrap,
-        now: crate::time::Ms,
-        anchors: BootstrapSet,
-        service: Option<(String, SocketAddr, ServiceKind)>,
-    },
-    Join {
-        genesis: Genesis,
-        room: Digest32,
-        name: Option<String>,
-        passphrase: Secret,
-        now: crate::time::Ms,
-        sealed: (Sek, SekWrap),
-        admission: crate::nat::record::Admission,
-        set: Box<crate::nat::service::RecordSet>,
-        net: Option<Arc<NodeNet>>,
-    },
+    Create(Box<Created>),
+    Join(Box<JoinConstruction>),
+}
+
+struct JoinConstruction {
+    genesis: Genesis,
+    room: Digest32,
+    name: Option<String>,
+    passphrase: Secret,
+    now: crate::time::Ms,
+    sealed: (Sek, SekWrap),
+    admission: crate::nat::record::Admission,
+    responder_key: crate::identity::composite::CompositePublicKey,
+    resuming: bool,
+    own_history: crate::node::joinstream::OwnHistory,
+    set: crate::nat::service::RecordSet,
+    net: Option<Arc<NodeNet>>,
 }
 
 enum After {
@@ -45,7 +42,7 @@ enum After {
     Join {
         parsed: crate::node::link::InviteLink,
         me: Digest32,
-        joined: Box<crate::node::joinstream::JoinOutcome>,
+        joined: Option<Box<crate::node::joinstream::JoinOutcome>>,
         responder: Digest32,
         conn: Arc<VoxConnection>,
     },
@@ -88,16 +85,16 @@ impl Work {
         let store = &lifetime.store;
         let signer = lifetime.signer.as_ref();
         match self {
-            Self::Create {
-                name,
-                passphrase,
-                genesis,
-                sek,
-                wrap,
-                now,
-                anchors,
-                service,
-            } => {
+            Self::Create(created) => {
+                let Created {
+                    name,
+                    passphrase,
+                    genesis,
+                    sealed: (sek, wrap),
+                    now,
+                    anchors,
+                    service,
+                } = *created;
                 let mut channel = ChannelState::create_from_sealed_owned(
                     store,
                     signer,
@@ -126,28 +123,48 @@ impl Work {
                 }
                 Ok(channel)
             }
-            Self::Join {
-                genesis,
-                room,
-                name,
-                passphrase,
-                now,
-                sealed,
-                admission,
-                set,
-                net,
-            } => {
-                let mut channel = ChannelState::join_channel_from_sealed_owned(
-                    store,
-                    signer,
-                    &genesis,
-                    &room,
-                    name.as_deref(),
-                    &passphrase,
+            Self::Join(joined) => {
+                let JoinConstruction {
+                    genesis,
+                    room,
+                    name,
+                    passphrase,
                     now,
                     sealed,
                     admission,
-                )?;
+                    responder_key,
+                    resuming,
+                    own_history,
+                    set,
+                    net,
+                } = *joined;
+                let mut channel = match (resuming, store.get_sek_wrap(&room)?) {
+                    (true, Some(saved)) if saved == sealed.1 => ChannelState::open_with_sek_owned(
+                        store,
+                        signer,
+                        &room,
+                        sealed.0,
+                        &passphrase,
+                        signer.fingerprint(),
+                        now,
+                        None,
+                    )?,
+                    (true, Some(_)) => return Err(Error::Profile("accepted join wrap changed")),
+                    (_, None) => ChannelState::join_channel_from_sealed_owned(
+                        store,
+                        signer,
+                        &genesis,
+                        &room,
+                        name.as_deref(),
+                        &passphrase,
+                        now,
+                        sealed,
+                        admission,
+                        &responder_key,
+                        own_history,
+                    )?,
+                    (false, Some(_)) => return Err(Error::Profile("room already stored")),
+                };
                 let known = channel.author_fingerprints().into_iter().collect();
                 let pending = verify_unknown_records(&known, &set.bundles);
                 admit_verified_records(
@@ -158,6 +175,11 @@ impl Work {
                     now,
                     net.as_deref(),
                 );
+                if resuming && !channel.is_member(&responder_key.fingerprint()) {
+                    return Err(Error::Profile(
+                        "accepted join responder authority is unavailable",
+                    ));
+                }
                 Ok(channel)
             }
         }
@@ -250,8 +272,8 @@ impl Node {
         let Some(parked) = self.parked_construction.take() else {
             return;
         };
-        if let Work::Create { name, .. } = &parked.work {
-            if self.room_named(name).is_some() {
+        if let Work::Create(created) = &parked.work {
+            if self.room_named(&created.name).is_some() {
                 let _ = parked.reply.send(Outcome::Failed(Fault::RoomNameTaken));
                 return;
             }
@@ -268,36 +290,16 @@ impl Node {
             let _ = reply.send(Outcome::Failed(Fault::RoomChangePending));
             return;
         }
-        let Created {
-            name,
-            passphrase,
-            genesis,
-            sealed,
-            now,
-            anchors,
-            service,
-        } = created;
-        let room = genesis.channel_id();
-        if self.room_named(&name).is_some() {
+        let room = created.genesis.channel_id();
+        if self
+            .room_named(&created.name)
+            .is_some_and(|held| held != room)
+        {
+            self.join_name_reservations.remove(&room);
             let _ = reply.send(Outcome::Failed(Fault::RoomNameTaken));
             return;
         }
-        let (sek, wrap) = sealed;
-        self.begin_construction(
-            room,
-            Work::Create {
-                name,
-                passphrase,
-                genesis,
-                sek,
-                wrap,
-                now,
-                anchors,
-                service,
-            },
-            After::Create,
-            reply,
-        );
+        self.begin_construction(room, Work::Create(Box::new(created)), After::Create, reply);
     }
 
     pub(super) fn begin_construct_joined(
@@ -319,42 +321,90 @@ impl Node {
             steps: _,
         } = won;
         let room = parsed.channel_id;
-        if let Some(holder) = joined
-            .room_name
-            .as_deref()
-            .and_then(|name| self.room_named(name).map(|id| (name, id)))
-        {
-            let _ = self.event_tx.send(NodeEvent::JoinFailed {
-                reason: format!(
-                    "the room is called {}, and the room {} on this node already is",
+        let (name, admission, responder_key, own_history, joined, resuming) = match joined {
+            JoinAccepted::Fresh(joined) => {
+                let Some(history) = joined.own_history.clone() else {
+                    let _ = reply.send(Outcome::Failed(Fault::Internal));
+                    return;
+                };
+                (
+                    joined.room_name.clone(),
+                    crate::nat::record::Admission::Witnessed(Box::new(joined.witness.clone())),
+                    joined.peer.identity.clone(),
+                    history,
+                    Some(joined),
+                    false,
+                )
+            }
+            JoinAccepted::Resumed(accepted) => {
+                let parsed =
+                    crate::node::joinstream::AdmissionProposal::from_body(&accepted.proposal);
+                let witness = crate::nat::record::JoinWitness::from_body(&accepted.witness);
+                let (Ok(proposal), Ok(witness)) = (parsed, witness) else {
+                    let _ = reply.send(Outcome::Failed(Fault::Storage));
+                    return;
+                };
+                (
+                    Some(accepted.name),
+                    crate::nat::record::Admission::Witnessed(Box::new(witness)),
+                    accepted.responder_key,
+                    proposal.own_history,
+                    None,
+                    true,
+                )
+            }
+        };
+        if let Some(holder) = name.as_deref().and_then(|name| {
+            self.view_tx
+                .borrow()
+                .channels
+                .iter()
+                .find(|channel| channel.channel_id != room && channel.name.as_deref() == Some(name))
+                .map(|channel| (name, channel.channel_id))
+        }) {
+            let _ = self.event_tx.send(NodeEvent::JoinStep {
+                step: format!(
+                    "joined room {} but its name {} also belongs to room {}; distinguish them by their full IDs",
+                    crate::node::link::b32_encode(&room),
                     holder.0,
-                    crate::node::link::b32_encode(&holder.1)
-                        .chars()
-                        .take(12)
-                        .collect::<String>(),
+                    crate::node::link::b32_encode(&holder.1),
                 ),
             });
-            self.begin_metadata_abort_join(room, Fault::RoomNameTaken, Some(reply), None);
-            return;
         }
-        let work = Work::Join {
+        if resuming && self.channels.contains_key(&room) {
+            let same = self
+                .profile
+                .as_ref()
+                .and_then(|profile| profile.store().get_sek_wrap(&room).ok().flatten())
+                .as_ref()
+                == Some(&sealed.1);
+            if !same {
+                let _ = reply.send(Outcome::Failed(Fault::RoomChangePending));
+                return;
+            }
+            self.retract_live_channel(&room);
+        }
+        let work = Work::Join(Box::new(JoinConstruction {
             genesis,
             room,
-            name: joined.room_name.clone(),
+            name,
             passphrase,
             now,
             sealed,
-            admission: crate::nat::record::Admission::Witnessed(Box::new(joined.witness.clone())),
-            set: Box::new(set),
+            admission,
+            responder_key,
+            resuming,
+            own_history,
+            set,
             net: self.net.as_ref().map(Arc::clone),
-        };
+        }));
         self.begin_construction(
             room,
             work,
             After::Join {
                 parsed,
                 me,
-                joined: Box::new(joined),
+                joined,
                 responder,
                 conn,
             },
@@ -400,6 +450,7 @@ impl Node {
                 if matches!(after, After::Join { .. }) {
                     self.begin_metadata_abort_join(room, fault, Some(reply), None);
                 } else {
+                    self.join_name_reservations.remove(&room);
                     let _ = reply.send(Outcome::Failed(fault));
                 }
                 return;
@@ -587,6 +638,7 @@ impl Node {
         match result {
             Err(error) => match pending.after {
                 After::Create => {
+                    self.join_name_reservations.remove(&pending.room);
                     self.answer_when_published(
                         pending.room,
                         pending.reply,
@@ -624,7 +676,7 @@ impl Node {
                             channel: Box::new(channel),
                             parsed,
                             me,
-                            joined: *joined,
+                            joined: joined.map(|joined| *joined),
                             responder,
                             conn,
                             authority,

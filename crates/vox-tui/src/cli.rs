@@ -502,6 +502,15 @@ enum RoomCmd {
     /// The name is one DNS label (a-z, 0-9 and `-`), because it is the room part of every service
     /// address in the room.
     Rename(RenameArgs),
+    /// Remove an exact node fingerprint from one room (creator or authorized admin).
+    ///
+    /// History, other rooms and global trust remain unchanged; past disclosures cannot be
+    /// recalled. Propagation to other nodes is not guaranteed by local success.
+    RemoveMember(RoomMemberArgs),
+    /// Readmit an exact removed fingerprint (creator only).
+    ///
+    /// Readmission does not grant ordinary admission or trust; those checks still apply.
+    ReadmitMember(RoomMemberArgs),
     /// Change the room's signed anchor set. Only its creator or an admin may.
     Anchors(RoomAnchorsArgs),
     /// Set message lifetime, or use --steps to set Session-step lifetime separately.
@@ -639,6 +648,16 @@ pub struct RenameArgs {
     pub room: String,
     /// The new name: one DNS label (a-z, 0-9 and `-`). Asks for no passphrase.
     pub name: String,
+}
+/// An exact room-member governance target.
+#[derive(Args, Debug, Clone)]
+pub struct RoomMemberArgs {
+    #[command(flatten)]
+    pub profile: NodeArgs,
+    /// The room name, ID, or unique ID prefix.
+    pub room: String,
+    /// The verified full 52-character node fingerprint, not its name or a prefix.
+    pub fingerprint: String,
 }
 
 /// `vox room retention`
@@ -2764,6 +2783,7 @@ pub fn run() -> ExitCode {
                 RoomCmd::Link(a) => &a.profile,
                 RoomCmd::Retention(a) => &a.profile,
                 RoomCmd::Rename(a) => &a.profile,
+                RoomCmd::RemoveMember(a) | RoomCmd::ReadmitMember(a) => &a.profile,
                 RoomCmd::Anchors(a) => &a.profile,
                 RoomCmd::Leave(a) | RoomCmd::End(a) => &a.profile,
                 RoomCmd::Admin(a) => &a.profile,
@@ -2981,6 +3001,24 @@ pub fn run() -> ExitCode {
                         }
                         RoomCmd::Rename(a) => {
                             crate::room_cli::rename(&paths, &a.room, &a.name).await
+                        }
+                        RoomCmd::RemoveMember(a) => {
+                            crate::room_cli::member_governance(
+                                &paths,
+                                &a.room,
+                                &a.fingerprint,
+                                false,
+                            )
+                            .await
+                        }
+                        RoomCmd::ReadmitMember(a) => {
+                            crate::room_cli::member_governance(
+                                &paths,
+                                &a.room,
+                                &a.fingerprint,
+                                true,
+                            )
+                            .await
                         }
                         RoomCmd::Retention(a) => {
                             match (a.steps.as_deref(), a.duration.as_deref()) {

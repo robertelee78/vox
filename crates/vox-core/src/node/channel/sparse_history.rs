@@ -584,17 +584,10 @@ impl ChannelState {
     }
 
     /// The current membership incarnation whose inventory a refusal describes. A leave makes
-    /// this absent; a readmission uses the leave position until the member's signed `back`
-    /// statement supplies its newer position. Thus the same scalar head after a real scope
-    /// removal is a changed inventory lifetime, while a socket reconnect is not.
+    /// this absent until the member's signed return supplies a newer position.
     pub(crate) fn history_inventory_incarnation(&self, member: &Digest32) -> Option<u64> {
         if !self.is_member(member) {
             return None;
-        }
-        if let Some(left) = self.left_at(member) {
-            if self.readmitted.get(member) == Some(&left) {
-                return Some(left);
-            }
         }
         Some(
             self.presence
@@ -1304,12 +1297,14 @@ pub(crate) struct PendingHistoryBegin {
     action: HistoryBeginAction,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum HistoryBeginAction {
     Start,
     Duplicate,
     Busy,
     Fork {
         proof: Box<crate::log::dag::VerifiedFork>,
+        issuer_key: CompositePublicKey,
         sealed: SealedSegment,
         invalid: Vec<(Digest32, u64)>,
         kept: usize,
@@ -1373,6 +1368,7 @@ impl PendingHistoryBegin {
                 }
                 HistoryBeginAction::Fork {
                     proof,
+                    issuer_key,
                     sealed,
                     invalid,
                     kept: count,
@@ -1389,6 +1385,15 @@ impl PendingHistoryBegin {
                         index.resolve_legacy_required_invalid(&author, seq);
                     }
                     index.seal()?;
+                    drop(index);
+                    governance::note_fork_in(
+                        &mut batch,
+                        sek,
+                        &self.room,
+                        proof.proof(),
+                        &issuer_key,
+                        Some(validated),
+                    )?;
                     batch.commit()?;
                     committed.store(true, std::sync::atomic::Ordering::Release);
                     poison = false;
@@ -1690,7 +1695,7 @@ impl ChannelState {
                         author_id: entry.skeleton.author_id,
                         seq: entry.skeleton.seq,
                         existing: prior,
-                        conflicting: validated.included().header().entry().clone(),
+                        conflicting: entry.clone(),
                     },
                     key,
                 )
@@ -1711,6 +1716,7 @@ impl ChannelState {
                 let kept = proofs.len();
                 HistoryBeginAction::Fork {
                     proof: Box::new(proof),
+                    issuer_key: key.clone(),
                     sealed,
                     invalid,
                     kept,
@@ -2143,6 +2149,7 @@ impl ChannelState {
             }
             self.role_cuts.insert(author, state.seq);
             self.note_role_progress(author, state.seq);
+            self.note_history_available();
         }
         if progress.more {
             self.sparse_contiguous_pending.insert(author);

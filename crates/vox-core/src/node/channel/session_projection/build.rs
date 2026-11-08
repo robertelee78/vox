@@ -345,6 +345,32 @@ fn interpret(read: &Read<'_>, envelope: EnvelopeRef) -> Result<Option<Event>> {
     }
 }
 
+fn opening_fingerprint_add(
+    index: &mut Write<'_, '_>,
+    author: &Digest32,
+    opening: &Digest32,
+    old: Option<&Digest32>,
+) -> Result<()> {
+    let item =
+        |opening: &Digest32| sha256_concat(&[b"vox/session-opening-set/v1", author, opening]);
+    let new = item(opening);
+    let old = old.map(item);
+    for lane in 0..4 {
+        let offset = lane as usize * 8;
+        let value = |digest: &Digest32| {
+            u64::from_be_bytes(std::array::from_fn(|byte| digest[offset + byte]))
+        };
+        let key = super::storage::opening_lane_key(author, lane);
+        let sum = index
+            .find(Tree::Counts, &key)?
+            .unwrap_or(0)
+            .wrapping_add(value(&new))
+            .wrapping_sub(old.as_ref().map_or(0, value));
+        index.set(Tree::Counts, key, (sum != 0).then_some(sum))?;
+    }
+    Ok(())
+}
+
 fn fold(index: &mut Write<'_, '_>, event: Event) -> Result<()> {
     let group = hash_key(&sha256_concat(&[
         b"vox/session-projection/id/v1",
@@ -426,6 +452,7 @@ fn fold(index: &mut Write<'_, '_>, event: Event) -> Result<()> {
     if !new {
         if let Some(old) = old_opening.filter(|old| *old != row.opening.position.hash) {
             index.set(Tree::OpeningHash, hash_key(&old), None)?;
+            opening_fingerprint_add(index, &row.node, &row.opening.position.hash, Some(&old))?;
         }
     } else {
         let key = hash_key(&row.node);
@@ -435,6 +462,7 @@ fn fold(index: &mut Write<'_, '_>, event: Event) -> Result<()> {
             .checked_add(1)
             .ok_or_else(|| invalid("Session opening count exhausted"))?;
         index.set(Tree::Counts, key, Some(count))?;
+        opening_fingerprint_add(index, &row.node, &row.opening.position.hash, None)?;
     }
     let is_open = row.ended.is_none();
     if new || was_open != is_open {
@@ -508,18 +536,36 @@ pub(super) fn advance_owned(
         .as_ref()
         .map(|read| read.header.clone())
         .unwrap_or_default();
+    let fingerprint_ready = captured
+        .as_ref()
+        .map(|read| read.find(Tree::Counts, &super::storage::OPENING_FINGERPRINT_MARKER))
+        .transpose()?
+        .flatten()
+        .is_some();
+    // A fold interrupted in an older binary may already have processed openings without
+    // lanes. Retire its work roots, rather than publishing a partial fingerprint.
+    let work_fingerprint_ready = if header.building.as_ref().is_some_and(|work| work.phase != 7) {
+        Read::open(snapshot, sek, room)?
+            .work()?
+            .find(Tree::Counts, &super::storage::OPENING_FINGERPRINT_MARKER)?
+            .is_some()
+    } else {
+        true
+    };
     let mut batch = store.batch()?;
     batch.derived();
     let mut index = Write::open(&mut batch, sek, room)?;
     let current = (public, header.private_generation);
+    let mut started = false;
     if let Some(work) = &mut index.header.building {
-        if work.phase != 7 && (work.public, work.private) != current {
+        if work.phase != 7 && ((work.public, work.private) != current || !work_fingerprint_ready) {
             work.phase = 7;
             work.cursor = None;
             work.cleanup = 0;
         }
-    } else if index.header.published != Some(current) {
+    } else if index.header.published != Some(current) || !fingerprint_ready {
         index.header.building = Some(Building::new(current.0, current.1));
+        started = true;
     } else {
         return Ok(false);
     }
@@ -529,6 +575,13 @@ pub(super) fn advance_owned(
         .clone()
         .ok_or_else(|| invalid("Session build absent"))?;
     let mut index = index.work()?;
+    if started {
+        index.set(
+            Tree::Counts,
+            super::storage::OPENING_FINGERPRINT_MARKER,
+            Some(1),
+        )?;
+    }
     let mut cursor = state.cursor;
     match state.phase {
         1 => {
@@ -546,6 +599,24 @@ pub(super) fn advance_owned(
                     order: clock,
                     hash,
                 };
+                let entry = view
+                    .order()
+                    .entry(&hash)?
+                    .ok_or_else(|| invalid("Session public candidate entry missing"))?;
+                match super::super::governance::content_eligibility_in(
+                    view.read_index(),
+                    &entry,
+                    now,
+                )? {
+                    super::super::governance::ContentEligibility::Eligible => {}
+                    super::super::governance::ContentEligibility::Ineligible => {
+                        cursor = Some(position.key());
+                        continue;
+                    }
+                    super::super::governance::ContentEligibility::Refreshing => {
+                        return Err(Error::Profile(super::super::governance::REFRESHING));
+                    }
+                }
                 let row = view
                     .row(&hash)?
                     .ok_or_else(|| invalid("Session public candidate missing"))?;
@@ -634,7 +705,14 @@ pub(super) fn advance_owned(
                 cursor = Some(key);
             }
         }
-        6 => index.publish()?,
+        6 => {
+            index.set(
+                Tree::Counts,
+                super::storage::OPENING_FINGERPRINT_MARKER,
+                Some(1),
+            )?;
+            index.publish()?;
+        }
         7 => {
             index.cleanup(WORK_ROWS)?;
         }

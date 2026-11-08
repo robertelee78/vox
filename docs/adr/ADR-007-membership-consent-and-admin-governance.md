@@ -211,6 +211,10 @@ only room governance is who sets the room's retention. This builds on identity (
   history and still bars ordinary rejoin until creator readmission. Robert explicitly chose
   this existing-room/read-only-member boundary on 2026-11-06, rather than new public admission
   certificates (issue #1171, decision comment 6701696825). Removal never grants membership.
+  Ordinary `vox room admin add` delegations have no expiry and persist until the creator
+  explicitly revokes them. A delegation carrying an expiry MUST NOT authorize member
+  removal: the issuer refuses it and receivers keep such a removal inert. This does not
+  add a timed-admin user feature or change G-11 for other capabilities.
 - **G-29. Signed authority and ordering.** A removal MUST be an authenticated governance-log
   fact using G-9's canonical encoding, composite signature, channel/epoch and author/causal
   bindings. The proposed appended tags, unallocated in the source registry through `0x0023`,
@@ -226,10 +230,13 @@ only room governance is who sets the room's retention. This builds on identity (
   ADR-008's registry MUST be updated when this proposal is implemented; reserved old tags MUST
   NOT be reused.
 
-  The creator is root admin; delegated authority is proved by an unexpired, in-effect,
-  creator-issued `policy` certificate, the issuer's own signed leave/return Presence, and
-  removal/restoration state in the action's strict causal past. A known own leave without
-  a subsequent eligible return denies authority. Do not substitute the receiver's current
+  The creator is root admin; delegated removal authority requires the latest eligible
+  creator-issued `policy` certificate in the action's strict causal past to have no expiry.
+  It also requires the issuer's own signed leave/return Presence and removal/restoration
+  state in that past. Selecting the certificate MUST NOT depend on the receiver's wall clock
+  or fall back past an expiring certificate after time passes. Shared timed capability caches
+  MUST NOT change this selection or be populated with its timeless result. A known own leave
+  without a subsequent eligible return denies authority. Do not substitute the receiver's current
   admitted-author set, a board timestamp or an invented admission certificate for that proof.
   The issuer's existing root delegation supplies governance authority; ordinary joining and
   read/Drive remain separate. Evaluate signed authority in the strict causal past rather
@@ -283,6 +290,8 @@ only room governance is who sets the room's retention. This builds on identity (
   G-26's canonical order for otherwise concurrent presentation, not to turn concurrent readmission
   into authority. Readmission is subject to ordinary admission/cap and trust checks and grants no
   sender, Drive or service authority by itself.
+  **Approved v0.4.20 history limitation (operator decision 2026-11-07; amends ADR-006 S-18 and ADR-023 RL-5.1–RL-5.2 for this case).** Readmission restores room sender-key access forward only, per sender. When a sender's validated fold first applies a covering readmission, whether or not it applied the removal earlier, it MUST rotate to a fresh sender chain before releasing another room key. The readmitted identity's entitlement from that sender starts no earlier than that chain. The sender MUST NOT release, re-offer or backfill any chain it minted earlier, whether minted before the removal, during it, or at an unknown time. For an identity with any validated removal in this room, a `full` history grant releases only the live position. Identities never removed keep S-18/RL-5 unchanged. Messages the readmitted node already read stay readable (G-27). Messages it holds no key for are not rendered, as for history sealed before a fresh join (G-15a). Clients and the K-26 readmission action MUST NOT present readmission as restoring history. A sender that has applied the removal but not the readmission releases nothing to the target. Keys a sender released before it applied the removal fall in the disclosed unaware-partition window (G-29, G-31). This covers keys sent directly and keys sealed into a key-package log entry, which ordinary replication can still carry to the target after readmission. A sender that has not yet applied the removal is in that same window. None of these keys can be recalled, and release notes MUST say so.
+  **Unseen-body cut (#1171, v0.4.20).** Keys are not the only path: an old chain key the target retained can open an old body replicated to it after readmission. So for a target with any validated removal, the checked membership fold projects, per target and fold generation, one cut: for each validated removal, its earliest covering valid creator readmission (a later duplicate readmission cannot hide content already eligible under an earlier one), and across removals the latest of those. A target whose removal is not covered projects as removed. The fold also keeps one generation-stamped room row, the latest such cut on the creator's single chain. Every fresh locally authored Content, KeyPackage or ContextUpdate entry names it as a required ancestor through the existing required-ancestor selection, so other senders' post-readmission activity reaches the readmitted member; governance, presence, retention and other control writes never wait on it. Until this author's committed frontier or the creator's settled tip reaches the cut, or while the room row is stale, that one append is the existing retryable refreshing deferral, never skipped; a legacy feed names it as an ordinary seen ancestor. Another member's ordinary content or key-package body is newly served to, or newly rendered or installed by, that target only if the entry causally contains the cut, by indexed causal frontier, by the unforked author chain, or by a signed parent that contains it. Otherwise an informed provider sends the authenticated header and `BodyNotHeld` before any body read (history stream; the existing ADR-038 FX-29 decline, re-asked only when that author's head changes) or the body-less skeleton (log sync). The decision uses only the signed header (author, signed kind, causal references), never a private body. "Known" means this node applied a validated removal (nonzero removal generation) and indexed a removal row for the target; a removal still in an unindexed tail is the disclosed unaware-partition window. A known target with a missing or stale cut, or an entry whose causal facts are not yet indexed, is refreshing: history-stream `Busy`, a header-only log-sync entry that does not hold back its successors, receiver deferred, never rendered or installed, and never treated as never removed. The target's own entries, governance, controls, Session floors and step policies keep their existing policies; identities never removed and rooms without an applied removal need no fold read. The target's own node fences by the same rule regardless of which peer relayed the body: it does not render such content or open or install such a key package; plaintext and keys it already rendered, cached or installed stay readable across restart and reprojection through the existing render logic, and a denied body it receives is kept, not pruned.
 - **G-31. Forward enforcement.** Before irreversible room egress, each member MUST check current
   validated room authorization and fence stale in-flight work against the current room authorization
   generation; an applied, validated removal MUST win over queued sends, key delivery, Session
@@ -291,6 +300,20 @@ only room governance is who sets the room's retention. This builds on identity (
   keys/credentials and distribute them only to still-authorized, independently trusted nodes.
   Close or reauthorize existing affected sessions. Catching up peers MUST apply the barrier before
   resuming egress, including after restart.
+
+  Public room sync and history MUST refuse an applied-removed peer even when another room,
+  an explicit anchor or a cached board record keeps its connection alive. Retire the affected
+  room's ports and private pulls, not the shared connection or another room's authority.
+  Public reception MUST NOT depend on this node's own removal being cleared: a removed node
+  MUST be able to reopen and receive covering creator readmission from a current peer without
+  manually joining again. Private egress remains subject to the ordinary current checks.
+  A node whose own bundle was refused while removed MUST republish it after restored checked
+  membership, through the existing guarded local publication and connected-member push.
+  This recovery MUST work without an anchor.
+
+  A bounded membership-fold restart MUST preserve an unfinished removal-generation obligation.
+  Completion MUST clear that obligation with its generation bump; unrelated later governance
+  changes MUST NOT repeat the rotation or invalidate in-flight work as another removal.
 
   For each validated removal, a target-authored public log entry is historical if it is in that
   removal's strict causal past. For any removal not in the entry's causal future, the entry is
@@ -306,7 +329,7 @@ only room governance is who sets the room's retention. This builds on identity (
   readmission, not by wall clock or arrival order. Deny the removed target's sender keys during
   removal, including replayed keys; after readmission apply ordinary consent and fresh-key checks.
 
-  **Private Session records (proposed clarification, pending review).** Off-log records have
+  **Private Session records.** Off-log records have
   no public Entry ancestry. Enforce ADR-031 SA-14 through the existing signed public Session
   floors; do not invent chronology from first-seen time, add per-activity public entries, or
   introduce a second record/envelope authority. Keep existing private record versions and
@@ -314,9 +337,11 @@ only room governance is who sets the room's retention. This builds on identity (
   descending from covering creator readmission, and a drive generation strictly greater than
   every generation that author floored outside that restoration's causal descendants.
   An author MUST rotate after applying its own readmission and issue new eligible floors.
-  A recipient's historical floor is not current access: release/serve requires its current
-  restored membership and ordinary trust/Drive, with a floor either historically prior to
-  its removal or descending from covering readmission as SA-14 specifies.
+  For a recipient with any validated removal, a floor supplies history authority only if it
+  causally descends from a valid creator readmission covering every such removal; a floor
+  strictly prior to a removal no longer authorizes serving or releasing to that recipient
+  (v0.4.20, with ADR-007 G-30). Release/serve also requires current restored membership and
+  ordinary trust/Drive.
   Deny removed-author keys, `current_drive` and locally-held legacy bypasses; fence queued
   key/Drive/service work at the current room authorization generation. Preserve exact signed
   floor provenance and necessary ancestry for re-evaluation, not just folded maxima.
@@ -349,6 +374,14 @@ only room governance is who sets the room's retention. This builds on identity (
   node reading them or using future room-bound Session read/Drive or services. The retained
   passphrase, old records and concurrent/replayed readmission cannot bypass removal; an explicit
   creator readmission followed by ordinary authorization restores only appropriate access.
+  A readmitted target with undelivered pre-removal debt reads its already-held messages and new posts only. Exercise this with a sender that applied the removal and readmission separately, and with one that applied both in one offline fold. The target must not read pre-removal or removal-period posts, and a `full` grant must not change this. A never-removed rejoiner, as the control, still receives `full` history.
+  Privacy proofs MUST keep both key-release and body-cut defenses in the shipped product.
+  A single-layer mutant masked by the other defense MUST be reported as surviving, never as a
+  kill. Explicitly combined inverses MAY bypass the masking body cut in disposable apparatus
+  to show that re-offering SEG_HISTORY debt or releasing the full plan fails the native-view
+  assertion. Record every bypass and its exact consumer verdict; do not weaken the product
+  to make a single-layer mutant observable. The operator approved this layer-aware proof
+  boundary on 2026-11-08; the forward-only product boundary is unchanged.
   Demonstrate unrelated rooms and global trust remain unchanged, including a same-name replacement
   fingerprint. Exercise stale queued egress and removal/readmission permutations through actual
   consumers. After a creator removes or revokes a delegated admin, submit attacker-crafted

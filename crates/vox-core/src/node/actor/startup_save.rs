@@ -22,6 +22,7 @@ pub(super) struct Loaded {
     hints_unreadable: bool,
     withdrawals: BTreeMap<Digest32, PendingWithdrawal>,
     joins: BTreeMap<Digest32, PendingWithdrawal>,
+    accepted_names: BTreeMap<Digest32, String>,
 }
 
 struct Returned {
@@ -103,6 +104,7 @@ fn prepare(profile: &Profile, decisions: &DecisionLog, now: u64) -> crate::error
         }
         _ => return Err(Error::Profile("unexpected blacklist import completion")),
     }
+    let accepted = metadata_save::load_accepted_joins(profile.store(), signer)?;
     let unfinished = profile
         .store()
         .get_meta(PENDING_JOIN_CLEANUP_META_KEY)?
@@ -110,6 +112,9 @@ fn prepare(profile: &Profile, decisions: &DecisionLog, now: u64) -> crate::error
         .transpose()?
         .unwrap_or_default();
     for room in unfinished.keys() {
+        if accepted.contains_key(room) {
+            continue;
+        }
         metadata_save::abort_join_cleanup_native(
             profile.store(),
             signer,
@@ -128,6 +133,10 @@ fn prepare(profile: &Profile, decisions: &DecisionLog, now: u64) -> crate::error
         hints_unreadable,
         withdrawals,
         joins,
+        accepted_names: accepted
+            .into_iter()
+            .map(|(room, join)| (room, join.name))
+            .collect(),
     })
 }
 
@@ -540,6 +549,7 @@ impl Node {
                 self.anchor_hints_save = peer_book_save::State::default();
                 self.withdrawn = loaded.withdrawals;
                 self.join_cleanup = loaded.joins;
+                self.join_name_reservations = loaded.accepted_names;
                 if let Some(policy) = returned.policy {
                     self.trust = policy.trust;
                     self.consent_keys = policy.consent_keys;

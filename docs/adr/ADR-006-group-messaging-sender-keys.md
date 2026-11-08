@@ -61,12 +61,16 @@ recipient, which is what per-sender trust needs.
   `(author_id, chain_id)`, MUST cache skipped keys within `MAX_SKIP` = 1000 per chain and 2000 in all
   (ADR-004 W3), and MUST reject beyond. It MUST plan the ratchet advance in temporaries and commit only
   after the AEAD and signature pass, and MUST delete a consumed key.
+  A separate authorized history release and retained-record decryption are subject to the same
+  `MAX_SKIP` derivation bound; they do not restore consumed live keys.
 - **S-11. (M14.7d)** The `pairwise` frame that carries an SKDM MUST name its channelID beside the sealed
   message, so the recipient knows which session opens it.
 - **S-12. (M14.5b)** A receiver chain MUST persist its live state (`next_iteration` and the skipped-key
   cache), sealed as a `KeyMaterial` segment (ADR-010), never the SKDM it came from. A restored chain MUST
   refuse a replay as the live one does, and a cached key at or above the head MUST be refused on decode.
-  A second SKDM for a generation already held MUST be ignored, never rewind the head.
+  A second SKDM for a generation already held MUST NOT rewind the live head. An authorized earlier
+  history release MAY be retained separately only after deriving it forward at most `MAX_SKIP` steps
+  and checking it matches the held release in constant time.
 - **S-13.** Accepting an SKDM MUST retry every content entry already stored from that author and render
   those that open.
 
@@ -102,6 +106,7 @@ recipient, which is what per-sender trust needs.
     history.
   History MUST be per sender and trust-gated exactly as live messages are: a node that never trusts a
   member reveals no history to it, and nobody can release another member's history.
+  Except as limited for once-removed identities by ADR-007 G-30 (v0.4.20).
 - **S-19.** A superseded generation's origin key MUST be deleted once no full-history grant is still owed
   in the room (`prune_superseded_origins`, PRD-001 R14). For a trusted identity that has not joined, it
   MUST be kept `UNJOINED_HOLD_SECS` = 30 days in a room kept forever, or for the room's retention.

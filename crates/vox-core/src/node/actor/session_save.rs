@@ -168,6 +168,7 @@ pub(super) enum Saved {
     Prelude(SessionWrite),
     OutboundPackage {
         package: Option<crate::node::keypackage::KeyPackage>,
+        removal_generation: u64,
         reservation: Option<crate::node::prekeys::OneTimeReservation>,
     },
 }
@@ -838,6 +839,7 @@ impl Node {
             }
             Saved::OutboundPackage {
                 package,
+                removal_generation,
                 reservation,
             } => {
                 let SessionContinuation {
@@ -873,7 +875,10 @@ impl Node {
                     };
                     self.continue_owned_session(
                         room,
-                        SessionWrite::Package { package },
+                        SessionWrite::Package {
+                            package,
+                            removal_generation,
+                        },
                         continuation,
                         reply,
                     )

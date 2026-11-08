@@ -69,12 +69,20 @@ impl ChannelState {
         }
         self.ensure_local_append_available(store)?;
         let me = self.me();
-        if !self.settled || self.has_left(&me) || !self.authors.contains_key(&me) {
+        if !self.settled
+            || self.has_left(&me)
+            || !self.authors.contains_key(&me)
+            || self.is_member_removed(store, &me)?
+        {
             return Ok(None);
         }
         let mut readers = BTreeMap::new();
         for peer in self.authors.keys() {
-            if *peer == me || self.has_left(peer) || !self.has_consented(store, peer)? {
+            if *peer == me
+                || self.has_left(peer)
+                || !self.has_consented(store, peer)?
+                || self.is_member_removed(store, peer)?
+            {
                 continue;
             }
             if !self.current_session_control_ready(store, peer)? {
@@ -103,8 +111,11 @@ impl ChannelState {
         }
         let previous = self.legacy_announced.clone();
         let feed = self.dag.feed(&me).cloned();
+        let generation = self.removal_generation(store)?;
+        let mut append = self.prepare_pending_control(store, owner, now)?;
+        append.fence_removal(generation);
         Ok(Some(PendingAnnouncement {
-            append: self.prepare_pending_control(store, owner, now)?,
+            append,
             room: self.channel_id,
             me,
             sek: self.sek.reader(),

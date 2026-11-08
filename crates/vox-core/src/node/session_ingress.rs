@@ -78,6 +78,8 @@ pub struct DriveAdmission {
 pub struct DriveDelivery {
     /// Authenticated requester, room incarnation and actual opening.
     pub admission: DriveAdmission,
+    /// Captured room-removal generation, held through each physical write.
+    pub authority: crate::node::api::RoomRemovalGuard,
     /// Acquire the exact native registration fence, retained through one socket write.
     pub current: std::sync::Arc<dyn Fn() -> Option<Box<dyn Send>> + Send + Sync>,
     /// One owned, cancellable frame and its monotonic byte offset.

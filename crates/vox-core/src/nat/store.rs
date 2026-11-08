@@ -36,7 +36,7 @@
 //! All time is caller-supplied `now` (milliseconds since the Unix epoch): policy has no ambient
 //! clock. Construction draws only the random board incarnation used by opaque read revisions.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use crate::error::{Error, Result};
 use crate::governance::genesis::Genesis;
@@ -332,6 +332,9 @@ pub struct RendezvousStore {
     /// withdraw that took it off when the room was ended, which a joiner is shown so it can be
     /// told the room ended rather than that nobody published it; `None` for a node's own forget.
     withdrawn_rooms: HashMap<Digest32, Option<Vec<u8>>>,
+    /// Creator keys of tombstoned rooms, retained only for this board's RAM lifetime.
+    ended_creators: HashMap<Digest32, crate::identity::composite::CompositePublicKey>,
+    ended_creator_order: VecDeque<Digest32>,
     /// `channelID` → its newest admin roster as the creator signed it: `(timestamp_ms, admins)`
     /// (V030-14). Who besides the creator may take the room off this board.
     rosters: HashMap<Digest32, (u64, BTreeSet<Digest32>)>,
@@ -408,7 +411,20 @@ impl RendezvousStore {
     /// again (V030-14). `ended` is the signed room withdraw when the room was ended, kept to show
     /// a joiner. Returns how many records went.
     pub fn withdraw_room(&mut self, channel_id: &Digest32, ended: Option<Vec<u8>>) -> usize {
-        let mut gone = usize::from(self.genesis.remove(channel_id).is_some());
+        let genesis = self.genesis.remove(channel_id);
+        let mut gone = usize::from(genesis.is_some());
+        if let Some(genesis) = genesis {
+            if !self.ended_creators.contains_key(channel_id) {
+                if self.ended_creator_order.len() == MAX_GENESIS_CHANNELS {
+                    if let Some(oldest) = self.ended_creator_order.pop_front() {
+                        self.ended_creators.remove(&oldest);
+                    }
+                }
+                self.ended_creator_order.push_back(*channel_id);
+            }
+            self.ended_creators
+                .insert(*channel_id, genesis.creator_pubkey().clone());
+        }
         let mut changed = gone != 0;
         self.members.retain(|(cid, _), b| {
             let keep = cid != channel_id;
@@ -462,6 +478,14 @@ impl RendezvousStore {
     #[must_use]
     pub fn room_ended(&self, channel_id: &Digest32) -> Option<&[u8]> {
         self.withdrawn_rooms.get(channel_id)?.as_deref()
+    }
+
+    /// The creator key retained when this board tombstoned a room.
+    pub(crate) fn ended_creator(
+        &self,
+        channel_id: &Digest32,
+    ) -> Option<&crate::identity::composite::CompositePublicKey> {
+        self.ended_creators.get(channel_id)
     }
 
     /// Take the room's admin roster, if it is newer than the one held (V030-14). The caller has
@@ -650,6 +674,8 @@ impl RendezvousStore {
             notices: HashMap::new(),
             pending_withdraws: HashMap::new(),
             withdrawn_rooms: HashMap::new(),
+            ended_creators: HashMap::new(),
+            ended_creator_order: VecDeque::new(),
             rosters: HashMap::new(),
             pinned: HashSet::new(),
             genesis_arrived: HashMap::new(),
@@ -1088,6 +1114,26 @@ impl RendezvousStore {
                     .map(|((cid, _), _)| *cid),
             )
             .collect()
+    }
+
+    /// Retract only this node's transient advertisements, preserving the remote room.
+    pub(crate) fn retract_channel(&mut self, channel_id: &Digest32, author: &Digest32) {
+        let mut changed = false;
+        for ((room, _), bucket) in &mut self.members {
+            if room == channel_id {
+                changed |= bucket.remove(author).is_some();
+            }
+        }
+        for ((room, _), bucket) in &mut self.bundles {
+            if room == channel_id {
+                changed |= bucket.remove(author).is_some();
+            }
+        }
+        self.forget_prejoin(channel_id, author);
+        if changed {
+            self.bump_revision(channel_id);
+            self.refresh_next_expiry(channel_id);
+        }
     }
 
     /// Evict the room's genesis and advertisements, retaining its existing signed authority and

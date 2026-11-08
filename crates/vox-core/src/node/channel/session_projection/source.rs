@@ -86,6 +86,24 @@ pub(super) fn retained(read: &Read<'_>, scope: &Eligibility<'_>, source: Source)
     if fact.created != source.position.created {
         return Err(invalid("Session metadata source binding"));
     }
+    let entry = scope
+        .dag
+        .get_by_hash(scope.view.read_index(), &source.position.hash)?
+        .ok_or_else(|| invalid("Session metadata entry missing"))?;
+    if entry.skeleton.channel_id != *room || entry.skeleton.author_id != source.author {
+        return Err(invalid("Session metadata source binding"));
+    }
+    match super::super::governance::content_eligibility_in(
+        scope.view.read_index(),
+        &entry,
+        scope.now,
+    )? {
+        super::super::governance::ContentEligibility::Eligible => {}
+        super::super::governance::ContentEligibility::Ineligible => return Ok(false),
+        super::super::governance::ContentEligibility::Refreshing => {
+            return Err(Error::Profile(super::super::governance::REFRESHING));
+        }
+    }
     let row = scope
         .view
         .row(&source.position.hash)?
@@ -99,13 +117,6 @@ pub(super) fn retained(read: &Read<'_>, scope: &Eligibility<'_>, source: Source)
         .ok_or_else(|| invalid("Session metadata retention missing"))?;
     if tracked.cache_id != Some(fact.cache) {
         return Err(invalid("Session metadata retention binding"));
-    }
-    let entry = scope
-        .dag
-        .get_by_hash(scope.view.read_index(), &source.position.hash)?
-        .ok_or_else(|| invalid("Session metadata entry missing"))?;
-    if entry.skeleton.channel_id != *room || entry.skeleton.author_id != source.author {
-        return Err(invalid("Session metadata source binding"));
     }
     if fact.cache != source.id {
         // All replacement body, age and author bindings above remain mandatory.

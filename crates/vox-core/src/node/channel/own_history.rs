@@ -6,6 +6,361 @@ use crate::log::history::{
     LogScope, SignedHead, TreeBinding, TreeRange, TreeRangeSource, WorkBudget,
 };
 
+/// A separate identity-keyed scope survives the room's cryptographic purge.
+fn continuity_scope(room: &Digest32, author: &Digest32) -> Digest32 {
+    let mut input = b"vox/own-continuity-scope/v1".to_vec();
+    input.extend_from_slice(room);
+    input.extend_from_slice(author);
+    sha256(&input)
+}
+
+pub(super) fn continuity_key(signer: &crate::atrest::vault::VaultRootSigner) -> Result<Sek> {
+    let hk = hkdf::Hkdf::<sha2::Sha256>::new(None, signer.self_seed());
+    let mut key = Zeroizing::new([0u8; crate::atrest::sek::SEK_LEN]);
+    hk.expand(b"vox/own-continuity-key/v1", key.as_mut())
+        .map_err(|_| Error::AtRestUnlockFailed)?;
+    Ok(Sek::from_bytes(key))
+}
+
+pub(super) struct Continuity {
+    pub(super) head: SignedHead,
+    pub(super) epoch: u64,
+    pub(super) generation: u64,
+    pub(super) genesis: crate::governance::genesis::Genesis,
+}
+
+impl Continuity {
+    fn parse(bytes: &[u8]) -> Result<Self> {
+        let mut d = Decoder::new(bytes);
+        if d.array()? != 5 || d.uint()? != 1 {
+            return Err(Error::MalformedAtRest("own continuity marker"));
+        }
+        let head = SignedHead::from_wire(d.bytes()?)?;
+        let epoch = d.uint()?;
+        let generation = d.uint()?;
+        let genesis = crate::governance::genesis::Genesis::from_wire(d.bytes()?)?;
+        genesis.accept_for_channel(&head.binding.room)?;
+        d.finish()?;
+        Ok(Self {
+            head,
+            epoch,
+            generation,
+            genesis,
+        })
+    }
+
+    fn bytes(&self) -> Vec<u8> {
+        let mut e = Encoder::new();
+        e.array(5)
+            .uint(1)
+            .bytes(&self.head.to_wire())
+            .uint(self.epoch)
+            .uint(self.generation)
+            .bytes(&self.genesis.to_wire());
+        e.finish()
+    }
+}
+
+const CONTINUITY_MAX_BYTES: usize = crate::log::history::MAX_HEADER_BYTES
+    + crate::hash::COMPOSITE_PUB_LEN
+    + crate::hash::COMPOSITE_SIG_LEN
+    + 1024;
+
+pub(super) fn load_continuity(
+    store: &Store,
+    key: &Sek,
+    room: &Digest32,
+    author: &Digest32,
+) -> Result<Option<Continuity>> {
+    let scope = continuity_scope(room, author);
+    store
+        .snapshot()?
+        .get_segment_bounded(&scope, SegmentKind::KeyMaterial, 0, CONTINUITY_MAX_BYTES)?
+        .map(|segment| {
+            let marker =
+                Continuity::parse(&open_segment(key, SegmentKind::KeyMaterial, 0, &segment)?)?;
+            if marker.head.binding.room != *room
+                || marker.head.binding.author != *author
+                || marker.head.binding.scope != LogScope::Public
+            {
+                return Err(Error::MalformedAtRest("own continuity binding"));
+            }
+            Ok(marker)
+        })
+        .transpose()
+}
+
+pub(super) fn save_continuity(
+    batch: &mut crate::node::store::Batch<'_>,
+    key: &Sek,
+    head: &SignedHead,
+    epoch: u64,
+    generation: u64,
+    genesis: &crate::governance::genesis::Genesis,
+) -> Result<()> {
+    genesis.accept_for_channel(&head.binding.room)?;
+    let scope = continuity_scope(&head.binding.room, &head.binding.author);
+    let previous = batch
+        .get_segment_bounded(&scope, SegmentKind::KeyMaterial, 0, CONTINUITY_MAX_BYTES)?
+        .map(|segment| {
+            Continuity::parse(&open_segment(key, SegmentKind::KeyMaterial, 0, &segment)?)
+        })
+        .transpose()?;
+    let (epoch, generation) = if let Some(previous) = previous {
+        if previous.head.binding != head.binding
+            || previous.genesis.body != genesis.body
+            || previous.genesis.signature != genesis.signature
+            || previous.head.root.leaves > head.root.leaves
+            || (previous.head.root.leaves == head.root.leaves && previous.head.id() != head.id())
+        {
+            return Err(Error::OwnHistoryBehind);
+        }
+        (epoch, generation).max((previous.epoch, previous.generation))
+    } else {
+        (epoch, generation)
+    };
+    let marker = Continuity {
+        head: head.clone(),
+        epoch,
+        generation,
+        genesis: genesis.clone(),
+    };
+    let segment = seal_segment(key, SegmentKind::KeyMaterial, 0, &marker.bytes())?;
+    batch.put_segment(&scope, SegmentKind::KeyMaterial, 0, &segment)?;
+    batch.ruled();
+    Ok(())
+}
+
+pub(crate) fn erase_continuity(
+    batch: &mut crate::node::store::Batch<'_>,
+    room: &Digest32,
+    author: &Digest32,
+) -> Result<()> {
+    batch.purge_channel(&continuity_scope(room, author))?;
+    Ok(())
+}
+
+/// Confirm an End with the creator key retained in the former member's checkpoint.
+pub(crate) fn confirm_creator_end(
+    store: &Store,
+    signer: &crate::atrest::vault::VaultRootSigner,
+    room: &Digest32,
+    supplied_genesis: Option<&crate::governance::genesis::Genesis>,
+    withdrawals: &[crate::nat::withdraw::BoardWithdraw],
+    now: u64,
+) -> Result<bool> {
+    let me = signer.fingerprint();
+    let key = continuity_key(signer)?;
+    let mut batch = store.batch()?;
+    let marker = batch
+        .get_segment_bounded(
+            &continuity_scope(room, &me),
+            SegmentKind::KeyMaterial,
+            0,
+            CONTINUITY_MAX_BYTES,
+        )?
+        .map(|segment| {
+            let marker =
+                Continuity::parse(&open_segment(&key, SegmentKind::KeyMaterial, 0, &segment)?)?;
+            if marker.head.binding.room != *room
+                || marker.head.binding.author != me
+                || marker.head.binding.scope != LogScope::Public
+            {
+                return Err(Error::MalformedAtRest("own continuity binding"));
+            }
+            Ok(marker)
+        })
+        .transpose()?;
+    let genesis = match marker.as_ref() {
+        Some(marker) => &marker.genesis,
+        None => match supplied_genesis {
+            Some(genesis) => genesis,
+            None => return Ok(false),
+        },
+    };
+    genesis.accept_for_channel(room)?;
+    let creator = genesis.creator_pubkey();
+    #[cfg(feature = "test-knobs")]
+    let first_only = crate::node::computer::fx28_mutant("end-first-withdrawal-only");
+    #[cfg(not(feature = "test-knobs"))]
+    let first_only = false;
+    #[cfg(feature = "test-knobs")]
+    let ignore_room = crate::node::computer::fx28_mutant("end-ignore-room");
+    #[cfg(not(feature = "test-knobs"))]
+    let ignore_room = false;
+    #[cfg(feature = "test-knobs")]
+    let ignore_future = crate::node::computer::fx28_mutant("end-ignore-future");
+    #[cfg(not(feature = "test-knobs"))]
+    let ignore_future = false;
+    #[cfg(feature = "test-knobs")]
+    let trust_delegated = crate::node::computer::fx28_mutant("end-trust-revoked-admin");
+    #[cfg(not(feature = "test-knobs"))]
+    let trust_delegated = false;
+    let verified = withdrawals
+        .iter()
+        .take(if first_only { 1 } else { usize::MAX })
+        .any(|withdrawal| {
+            (ignore_room || withdrawal.channel_id == *room)
+                && withdrawal.scope == crate::nat::withdraw::WithdrawScope::Room
+                && (trust_delegated || withdrawal.author_id == creator.fingerprint())
+                && marker
+                    .as_ref()
+                    .is_none_or(|marker| withdrawal.epoch == marker.epoch)
+                && (ignore_future
+                    || withdrawal.timestamp_ms
+                        <= now.saturating_add(crate::nat::store::MAX_CLOCK_SKEW_MS))
+                && (trust_delegated || withdrawal.verify(creator).is_ok())
+        });
+    #[cfg(feature = "test-knobs")]
+    let keep_marker = crate::node::computer::fx28_mutant("end-keeps-checkpoint");
+    #[cfg(not(feature = "test-knobs"))]
+    let keep_marker = false;
+    #[cfg(feature = "test-knobs")]
+    let erase_without_evidence = crate::node::computer::fx28_mutant("end-erases-without-evidence");
+    #[cfg(not(feature = "test-knobs"))]
+    let erase_without_evidence = false;
+    if marker.is_some() && ((verified && !keep_marker) || erase_without_evidence) {
+        erase_continuity(&mut batch, room, &me)?;
+        batch.commit()?;
+    }
+    Ok(verified)
+}
+// A second signed boundary is needed when the responder's valid head is older than the
+// retained one. It is a room-scoped recovery input and is erased with the room.
+const SEG_OWN_RECOVERY_BOUNDARY: u64 = 26;
+const SEG_OWN_UNKNOWN_HIGHER: u64 = 27;
+
+/// Keep the proposer's unavailable classification until verified recovery completes.
+pub(super) fn save_unknown_higher(
+    batch: &mut crate::node::store::Batch<'_>,
+    sek: &Sek,
+    room: &Digest32,
+    header: &[u8],
+) -> Result<()> {
+    let segment = seal_segment(
+        sek,
+        SegmentKind::KeyMaterial,
+        SEG_OWN_UNKNOWN_HIGHER,
+        header,
+    )?;
+    batch.put_segment(
+        room,
+        SegmentKind::KeyMaterial,
+        SEG_OWN_UNKNOWN_HIGHER,
+        &segment,
+    )
+}
+
+pub(super) fn delete_unknown_higher(
+    batch: &mut crate::node::store::Batch<'_>,
+    room: &Digest32,
+) -> Result<()> {
+    batch.delete_segment(room, SegmentKind::KeyMaterial, SEG_OWN_UNKNOWN_HIGHER)?;
+    Ok(())
+}
+
+fn unknown_higher(store: &Store, sek: &Sek, room: &Digest32) -> Result<Option<Entry>> {
+    let Some(segment) = store.snapshot()?.get_segment_bounded(
+        room,
+        SegmentKind::KeyMaterial,
+        SEG_OWN_UNKNOWN_HIGHER,
+        crate::log::history::MAX_HEADER_BYTES,
+    )?
+    else {
+        return Ok(None);
+    };
+    let wire = open_segment(
+        sek,
+        SegmentKind::KeyMaterial,
+        SEG_OWN_UNKNOWN_HIGHER,
+        &segment,
+    )?;
+    let entry = Entry::from_wire(&wire)?;
+    if entry.payload.is_some() || entry.skeleton.channel_id != *room || entry.skeleton.seq == 0 {
+        return Err(Error::MalformedAtRest("own history extent binding"));
+    }
+    Ok(Some(entry))
+}
+
+pub(super) fn save_recovery_boundary(
+    batch: &mut crate::node::store::Batch<'_>,
+    sek: &Sek,
+    room: &Digest32,
+    head: &SignedHead,
+) -> Result<()> {
+    let segment = seal_segment(
+        sek,
+        SegmentKind::KeyMaterial,
+        SEG_OWN_RECOVERY_BOUNDARY,
+        &head.to_wire(),
+    )?;
+    batch.put_segment(
+        room,
+        SegmentKind::KeyMaterial,
+        SEG_OWN_RECOVERY_BOUNDARY,
+        &segment,
+    )
+}
+
+pub(super) fn delete_recovery_boundary(
+    batch: &mut crate::node::store::Batch<'_>,
+    room: &Digest32,
+) -> Result<()> {
+    batch.delete_segment(room, SegmentKind::KeyMaterial, SEG_OWN_RECOVERY_BOUNDARY)?;
+    Ok(())
+}
+
+fn load_recovery_boundary(store: &Store, sek: &Sek, room: &Digest32) -> Result<Option<SignedHead>> {
+    store
+        .snapshot()?
+        .get_segment_bounded(
+            room,
+            SegmentKind::KeyMaterial,
+            SEG_OWN_RECOVERY_BOUNDARY,
+            crate::log::history::MAX_HEADER_BYTES,
+        )?
+        .map(|segment| {
+            SignedHead::from_wire(&open_segment(
+                sek,
+                SegmentKind::KeyMaterial,
+                SEG_OWN_RECOVERY_BOUNDARY,
+                &segment,
+            )?)
+        })
+        .transpose()
+}
+
+pub(crate) struct RecoveryContexts {
+    room: Digest32,
+    key: crate::atrest::sek::WeakSek,
+    author: Digest32,
+    head: Digest32,
+    contexts: Vec<Digest32>,
+}
+
+impl RecoveryContexts {
+    pub(crate) fn commit(self, store: &Store) -> Result<()> {
+        let Self {
+            room,
+            key,
+            author,
+            head,
+            contexts,
+        } = self;
+        key.with(|sek| {
+            let mut batch = store.batch()?;
+            batch.ruled();
+            let entries = entry_store::EntryIndex::default();
+            let mut index = entries.write(&mut batch, sek, &room)?;
+            for context in contexts {
+                index.keep_recovery_context(&author, &head, &context)?;
+            }
+            index.seal()?;
+            batch.commit()
+        })
+    }
+}
+
 /// Serving-cache descriptors are only verification inputs here. They never become an
 /// authored lookup fallback: the whole forest must reproduce the already committed signed root
 /// before a separate canonical-index transaction can publish any missing subtree.
@@ -47,6 +402,52 @@ impl TreeRangeSource for AppendForest<'_, '_> {
         self.read
             .history_proof_range(&self.target.id(), binding, range.start, range.leaves)
     }
+}
+
+/// Reconstruct an exact prefix from authenticated canonical/serving subtrees without scanning
+/// the feed. The caller compares the result with a separately verified signed boundary.
+fn recovered_prefix(
+    read: &entry_store::Read<'_>,
+    target: &SignedHead,
+    leaves: u64,
+) -> Result<Option<Descriptor>> {
+    if leaves == 0 {
+        return Ok(Some(Descriptor::empty(target.binding)));
+    }
+    if let Some(root) = read.history_range(target.binding, 1, leaves)? {
+        return Ok(Some(root));
+    }
+    let next = leaves.checked_add(1).ok_or(Error::OwnHistoryBehind)?;
+    let ranges = inclusion_ranges(next, next)?;
+    let mut source = AppendForest {
+        read,
+        target,
+        joined: None,
+    };
+    let mut budget = LocalAppendBudget::new();
+    let mut root: Option<(u64, Descriptor)> = None;
+    for range in ranges {
+        let Some(node) = budget.range(&source, target.binding, range)? else {
+            return Ok(None);
+        };
+        root = Some(match root {
+            None => (range.start, node),
+            Some((start, right)) => {
+                if range.start.checked_add(node.leaves) != Some(start) {
+                    return Err(Error::MalformedAtRest("own recovery prefix ranges"));
+                }
+                match budget.join_ranges(target.binding, node, right, &source)? {
+                    HistoryStep::Complete((joined, context)) => {
+                        source.joined = Some(context);
+                        (range.start, joined)
+                    }
+                    HistoryStep::MissingContext(_) => return Ok(None),
+                    _ => return Err(Error::OwnHistoryBehind),
+                }
+            }
+        });
+    }
+    Ok(root.and_then(|(start, node)| (start == 1).then_some(node)))
 }
 
 pub(super) enum Recovery {
@@ -191,6 +592,199 @@ impl ReadabilityCursor {
 }
 
 impl ChannelState {
+    pub(crate) fn prepare_recovery_contexts(
+        &self,
+        store: &Store,
+        author: Digest32,
+        head: Digest32,
+        contexts: Vec<Digest32>,
+    ) -> Result<RecoveryContexts> {
+        if contexts.len() > crate::log::history::MAX_PROOF_TOKENS + 2
+            || !self.recovery_standing(store, &author)?
+        {
+            return Err(Error::OwnHistoryBehind);
+        }
+        let signed = self
+            .history_head_by_id(store, &head)?
+            .ok_or(Error::OwnHistoryBehind)?;
+        if signed.binding.room != self.channel_id
+            || signed.binding.author != author
+            || signed.binding.scope != LogScope::Public
+        {
+            return Err(Error::OwnHistoryBehind);
+        }
+        let key = self.authors.get(&author).ok_or(Error::OwnHistoryBehind)?;
+        if !matches!(
+            signed.verify(key, &mut WorkBudget::default())?,
+            HistoryStep::Complete(_)
+        ) {
+            return Err(Error::OwnHistoryBehind);
+        }
+        Ok(RecoveryContexts {
+            room: self.channel_id,
+            key: self.sek.reader(),
+            author,
+            head,
+            contexts,
+        })
+    }
+
+    pub(crate) fn recovery_context_allowed(
+        &self,
+        store: &Store,
+        author: &Digest32,
+        context: &Digest32,
+    ) -> Result<bool> {
+        let read = self.history_read(store)?;
+        let Some(id) = read.recovery_context_head(author, context)? else {
+            return Ok(false);
+        };
+        let head = read
+            .history_head(&id)?
+            .ok_or(Error::MalformedAtRest("recovery context head missing"))?;
+        Ok(head.binding.room == self.channel_id
+            && head.binding.author == *author
+            && head.binding.scope == LogScope::Public)
+    }
+
+    /// Narrow standing for reconstructing a returning author's own signed prefix and keys.
+    /// It is not membership and must never authorize general history, Read, Drive or services.
+    pub(crate) fn recovery_standing(&self, store: &Store, author: &Digest32) -> Result<bool> {
+        if !self.is_author(author) || self.dag.is_frozen(author) {
+            return Ok(false);
+        }
+        let Some(seq) = self.left_at(author) else {
+            return Ok(self.is_member(author));
+        };
+        let Some((at, wire)) = self.board_kept.notices.get(author) else {
+            return Ok(false);
+        };
+        if *at
+            > self
+                .now_hint
+                .saturating_add(crate::nat::store::MAX_CLOCK_SKEW_MS)
+            || self.withdrawn_since(author, *at)
+        {
+            return Ok(false);
+        }
+        let notice = crate::nat::notice::AdmissionNotice::from_wire(wire)?;
+        if notice.joiner() != *author || notice.witness.timestamp_ms != *at {
+            return Err(Error::MalformedAtRest("recovery notice binding"));
+        }
+        let Some(witness) = self.authors.get(&notice.witness.witness_id) else {
+            return Ok(false);
+        };
+        if !self.is_member(&notice.witness.witness_id) {
+            return Ok(false);
+        }
+        notice.verify(witness, &self.channel_id, self.epoch)?;
+        let read = self.history_read(store)?;
+        let departure = match read.get(author, seq)? {
+            Some(entry) => Some(entry),
+            None if read.sparse_enabled() => read
+                .history_validated_header(author, seq)?
+                .map(|(_, entry)| entry),
+            None => None,
+        };
+        Ok(departure.is_some_and(|entry| notice.witness.timestamp_ms > entry.skeleton.claimed_ms))
+    }
+
+    /// Classify only locally held, authenticated evidence for the joining author.
+    /// A board withdrawal or admission alone does not prove an authored sequence.
+    pub(crate) fn classify_joiner_history(
+        &self,
+        store: &Store,
+        key: &CompositePublicKey,
+    ) -> Result<crate::node::joinstream::OwnHistory> {
+        use crate::node::joinstream::OwnHistory;
+
+        let author = key.fingerprint();
+        if self.dag.is_frozen(&author) {
+            return Err(Error::OwnHistoryBehind);
+        }
+        let held = self.dag.feed(&author).map_or(0, |feed| feed.max_seq());
+        let read = self.history_read(store)?;
+        let extent = |seq: u64| -> Result<OwnHistory> {
+            let entry = match read.get(&author, seq)? {
+                Some(entry) => Some(entry),
+                None if read.sparse_enabled() => read
+                    .history_validated_header(&author, seq)?
+                    .map(|(_, entry)| entry),
+                None => None,
+            }
+            .ok_or(Error::OwnHistoryBehind)?;
+            if entry.skeleton.channel_id != self.channel_id
+                || entry.skeleton.author_id != author
+                || entry.skeleton.seq != seq
+            {
+                return Err(Error::MalformedAtRest("joiner history extent binding"));
+            }
+            entry.verify(key)?;
+            let wire = entry.header_wire();
+            if wire.len() > crate::log::history::MAX_HEADER_BYTES {
+                return Err(Error::SizeLimitExceeded("own history extent header"));
+            }
+            Ok(OwnHistory::Unavailable(wire))
+        };
+        if !read.sparse_enabled() {
+            return if held == 0 {
+                Ok(OwnHistory::None)
+            } else {
+                extent(held)
+            };
+        }
+        if read.publication_busy() {
+            return Err(Error::OwnHistoryBehind);
+        }
+        let settled = read
+            .history_settled_tip(&author)?
+            .map_or(0, |entry| entry.skeleton.seq);
+        #[cfg(feature = "test-knobs")]
+        if crate::node::computer::fx28_mutant("join-extent-without-head") && held.max(settled) != 0
+        {
+            return extent(held.max(settled));
+        }
+        let mut selected: Option<SignedHead> = None;
+        if let Some(state) = read.sparse_author(&author, LogScope::Public)? {
+            if state.observed_conflict.is_some() {
+                return Err(Error::OwnHistoryBehind);
+            }
+            for id in [state.observed, state.committed].into_iter().flatten() {
+                let head = read
+                    .history_head(&id)?
+                    .ok_or(Error::MalformedAtRest("joiner history head missing"))?;
+                if head.binding.room != self.channel_id
+                    || head.binding.author != author
+                    || head.binding.scope != LogScope::Public
+                {
+                    return Err(Error::MalformedAtRest("joiner history head binding"));
+                }
+                match head.verify(key, &mut WorkBudget::default())? {
+                    HistoryStep::Complete(_) => {}
+                    _ => return Err(Error::OwnHistoryBehind),
+                }
+                if selected
+                    .as_ref()
+                    .is_some_and(|old| old.root.leaves == head.root.leaves && old.id() != head.id())
+                {
+                    return Err(Error::OwnHistoryBehind);
+                }
+                if selected
+                    .as_ref()
+                    .is_none_or(|old| head.root.leaves > old.root.leaves)
+                {
+                    selected = Some(head);
+                }
+            }
+        }
+        match selected {
+            Some(head) if head.root.leaves < held.max(settled) => extent(held.max(settled)),
+            Some(head) if head.root.leaves != 0 => Ok(OwnHistory::Head(head.to_wire())),
+            _ if held != 0 || settled != 0 => extent(held.max(settled)),
+            _ => Ok(OwnHistory::None),
+        }
+    }
+
     /// Check one bounded chunk of the exact own-author prefix. An already-settled receipt
     /// alone is not evidence that ciphertext from a later sender generation can be read.
     pub(crate) fn prepare_own_readability(
@@ -510,6 +1104,41 @@ impl ChannelState {
             }
         }
         if let Some(head) = target {
+            if self.own_behind && read.history_head_accepted(&head.id(), head.binding)? {
+                let retained =
+                    load_continuity(store, &self.continuity_key, &self.channel_id, &own)?;
+                let supplied = load_recovery_boundary(store, &self.sek, &self.channel_id)?;
+                for boundary in retained
+                    .as_ref()
+                    .map(|marker| &marker.head)
+                    .into_iter()
+                    .chain(supplied.as_ref())
+                {
+                    self.checked_own_head(boundary)?;
+                    if boundary.root.leaves <= head.root.leaves {
+                        if let Some(root) = recovered_prefix(&read, &head, boundary.root.leaves)? {
+                            if root != boundary.root {
+                                return Ok(Some(Recovery::Fork));
+                            }
+                        }
+                    }
+                }
+                if let Some(extent) = unknown_higher(store, &self.sek, &self.channel_id)? {
+                    if extent.skeleton.author_id != own {
+                        return Err(Error::MalformedAtRest("own history extent author"));
+                    }
+                    extent.verify(self.authors.get(&own).ok_or(Error::OwnHistoryBehind)?)?;
+                    if extent.skeleton.seq <= head.root.leaves {
+                        if let Some((_, actual)) =
+                            read.history_validated_header(&own, extent.skeleton.seq)?
+                        {
+                            if actual.entry_hash() != extent.entry_hash() {
+                                return Ok(Some(Recovery::Fork));
+                            }
+                        }
+                    }
+                }
+            }
             if head.root.leaves < tip {
                 return Ok(Some(Recovery::UnknownBehind));
             }
@@ -583,6 +1212,20 @@ impl ChannelState {
         }
     }
 
+    /// Ask trusted admitted peers for a signed head when an extent still needs coverage.
+    pub(crate) fn unknown_own_recovery_probe(&self, store: &Store, peer: &Digest32) -> bool {
+        self.own_behind
+            && self.is_member(peer)
+            && (matches!(self.own_recovery, Recovery::UnknownBehind)
+                || unknown_higher(store, &self.sek, &self.channel_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|extent| match &self.own_recovery {
+                        Recovery::Head(head) => head.root.leaves < extent.skeleton.seq,
+                        _ => false,
+                    }))
+    }
+
     /// Derive one exact local verification root at ordinary foreground admission. No scalar
     /// inbox insertion is required, and a donor's role receipt cannot suppress local proof debt.
     /// A durable exact metadata refusal remains parked until its real authority/incarnation
@@ -647,7 +1290,16 @@ impl ChannelState {
         let held = read
             .history_held_through(&self.me())
             .map_or(0, |(seq, _)| seq);
-        let donor_through = self.held_through(peer).unwrap_or(0);
+        // The admitting witness is the authenticated source of the join proposal. Its
+        // signed-head offer is a reason to try, not proof that it still has every body.
+        // A failed page remains recovery debt and never advances the held prefix.
+        let donor_through = self
+            .held_through(peer)
+            .unwrap_or(0)
+            .max(match &self.own_admission {
+                Admission::Witnessed(witness) if witness.witness_id == *peer => head.root.leaves,
+                _ => 0,
+            });
         if !self.is_member(peer) {
             return Ok(None);
         }
@@ -711,9 +1363,17 @@ impl ChannelState {
     }
 
     pub(super) fn require_own_recovery_complete(&self, store: &Store) -> Result<()> {
-        if !self.own_behind || !self.is_member(&self.me()) {
+        if !self.own_behind || !self.recovery_standing(store, &self.me())? {
             return Err(Error::OwnHistoryBehind);
         }
+        #[cfg(feature = "test-knobs")]
+        let extent = if crate::node::computer::fx28_mutant("drop-recovery-extent") {
+            None
+        } else {
+            unknown_higher(store, &self.sek, &self.channel_id)?
+        };
+        #[cfg(not(feature = "test-knobs"))]
+        let extent = unknown_higher(store, &self.sek, &self.channel_id)?;
         let Recovery::Head(target) = &self.own_recovery else {
             return Err(Error::OwnHistoryBehind);
         };
@@ -730,6 +1390,43 @@ impl ChannelState {
             || read.history_range(target.binding, 1, target.root.leaves)? != Some(target.root)
         {
             return Err(Error::OwnHistoryBehind);
+        }
+        if let Some(extent) = extent {
+            if extent.skeleton.author_id != self.me() || extent.skeleton.seq > target.root.leaves {
+                return Err(Error::OwnHistoryBehind);
+            }
+            extent.verify(
+                self.authors
+                    .get(&self.me())
+                    .ok_or(Error::OwnHistoryBehind)?,
+            )?;
+            let Some((_, actual)) =
+                read.history_validated_header(&self.me(), extent.skeleton.seq)?
+            else {
+                return Err(Error::OwnHistoryBehind);
+            };
+            if actual.entry_hash() != extent.entry_hash() {
+                return Err(Error::OwnHistoryBehind);
+            }
+        }
+        // A larger signed head is not evidence that it extends either previously known
+        // signed boundary. Check the actual recovered prefix root against each witness.
+        let retained = load_continuity(store, &self.continuity_key, &self.channel_id, &self.me())?;
+        let supplied = load_recovery_boundary(store, &self.sek, &self.channel_id)?;
+        for boundary in retained
+            .as_ref()
+            .map(|marker| &marker.head)
+            .into_iter()
+            .chain(supplied.as_ref())
+        {
+            self.checked_own_head(boundary)?;
+            if boundary.root.leaves > target.root.leaves {
+                return Err(Error::OwnHistoryBehind);
+            }
+            let actual = recovered_prefix(&read, target, boundary.root.leaves)?;
+            if actual != Some(boundary.root) {
+                return Err(Error::OwnHistoryBehind);
+            }
         }
         if self
             .entries
@@ -758,7 +1455,7 @@ impl ChannelState {
         }
         self.require_legacy_current(store)?;
         let governance = self.current_governance(store)?;
-        let generation = match governance.presence_sender_generation(&self.me())? {
+        let _generation = match governance.presence_sender_generation(&self.me())? {
             Some(generation) => generation,
             // A creator starts settled at generation zero without appending Presence. Sparse
             // rotations publish Presence and the fresh sender atomically; absence is not an
@@ -770,15 +1467,6 @@ impl ChannelState {
             }
             None => return Err(Error::OwnHistoryBehind),
         };
-        // A restored sender may be older than the latest authenticated Presence. The
-        // target-bound audit above proves the required own content is readable before we
-        // mint a fresh sender; the old sender itself must never be used to write again.
-        // A Presence outside this signed prefix, or behind the retained sender, cannot
-        // establish a consistent generation for recovery.
-        if generation < self.sender.chain_id() || generation > target.root.leaves.saturating_add(1)
-        {
-            return Err(Error::OwnHistoryBehind);
-        }
         Ok(())
     }
 

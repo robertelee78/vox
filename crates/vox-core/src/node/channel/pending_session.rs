@@ -12,6 +12,8 @@ pub(crate) enum SessionWrite {
         content: crate::node::content::SessionEntry,
         completion: Option<Completion>,
     },
+    /// Rotate the room-bound Drive chain before any post-removal egress.
+    RemovalRotation,
     /// `ensure` is the committed HasOpen answer, not absence inferred from a failed query.
     Drive {
         ensure: bool,
@@ -25,6 +27,7 @@ pub(crate) enum SessionWrite {
     },
     Package {
         package: crate::node::keypackage::KeyPackage,
+        removal_generation: u64,
     },
 }
 
@@ -43,6 +46,7 @@ impl SessionWrite {
 }
 
 pub(crate) enum SessionSaved {
+    RemovalRotated,
     Appended(Digest32),
     Drive {
         refresh: SessionRefresh,
@@ -61,6 +65,8 @@ pub(crate) struct PendingSession {
     room: Digest32,
     epoch: u64,
     me: Digest32,
+    root: Digest32,
+    removal_generation: u64,
     sek: WeakSek,
     controls: Option<PendingText>,
     history_pin: Option<history::PendingHistoryRead>,
@@ -140,6 +146,48 @@ impl CompletedSession {
 }
 
 impl ChannelState {
+    pub(crate) fn room_removal_drive_rotation_needed(&self, store: &Store) -> Result<bool> {
+        let generation = governance::removal_generation(store, &self.channel_id)?;
+        let Some(segment) = store.get_segment(
+            &self.channel_id,
+            SegmentKind::KeyMaterial,
+            SEG_ROOM_REMOVAL_DRIVE,
+        )?
+        else {
+            return Ok(generation != 0);
+        };
+        let bytes = open_segment(
+            &self.sek,
+            SegmentKind::KeyMaterial,
+            SEG_ROOM_REMOVAL_DRIVE,
+            &segment,
+        )?;
+        let mut d = Decoder::new(&bytes);
+        if d.array()? != 3 || d.uint()? != 1 {
+            return Err(Error::MalformedAtRest("room Drive rotation checkpoint"));
+        }
+        let checked = d.uint()?;
+        let chain = match d.array()? {
+            0 => None,
+            1 => Some(d.uint()?),
+            _ => return Err(Error::MalformedAtRest("room Drive rotation chain")),
+        };
+        d.finish()?;
+        if checked > generation
+            || chain.is_some_and(|chain| {
+                self.drive
+                    .chain
+                    .as_ref()
+                    .is_none_or(|current| current.chain_id() < chain)
+            })
+        {
+            return Err(Error::MalformedAtRest(
+                "room Drive rotation checkpoint ahead",
+            ));
+        }
+        Ok(checked != generation)
+    }
+
     /// Called under the original Computer publication lease and one short room preparation.
     /// No batch, floor continuation, projection advancement or ratchet advancement occurs here.
     pub(crate) fn prepare_pending_session(
@@ -156,6 +204,20 @@ impl ChannelState {
         let delivered = matches!(&write, SessionWrite::Delivered { .. });
         let package = matches!(&write, SessionWrite::Package { .. });
         let refresh_request = matches!(&write, SessionWrite::Refresh { .. });
+        let removal_rotation = matches!(&write, SessionWrite::RemovalRotation);
+        let removal_generation = governance::removal_generation(store, &self.channel_id)?;
+        if let SessionWrite::Package {
+            package,
+            removal_generation: expected,
+        } = &write
+        {
+            if *expected != removal_generation {
+                return Err(Error::Profile(governance::REFRESHING));
+            }
+            if self.is_member_removed(store, &package.recipient)? {
+                return Err(Error::StreamRefused("key recipient is removed"));
+            }
+        }
         let refresh_wait = if delivered || package {
             None
         } else if !self.private_policy_ready(store, now.get())? {
@@ -173,6 +235,24 @@ impl ChannelState {
             self.require_governance_ready(store, now)?;
         }
         let me = self.me();
+        if !delivered {
+            self.require_governance_ready(store, now)?;
+            if self.is_member_removed(store, &me)? {
+                return Err(Error::StreamRefused("this node was removed from the room"));
+            }
+            if !removal_rotation
+                && (self.room_removal_rotation_needed(store)?
+                    || self.room_removal_drive_rotation_needed(store)?)
+            {
+                return Err(Error::StreamRefused("room authorization keys are rotating"));
+            }
+            governance::check_removal_generation(
+                store,
+                &self.sek,
+                &self.channel_id,
+                removal_generation,
+            )?;
+        }
         if let SessionWrite::Append {
             content,
             completion,
@@ -258,16 +338,30 @@ impl ChannelState {
         } else {
             None
         };
-        let members = if passive {
+        let mut members = if passive {
             BTreeSet::new()
         } else {
             self.drive_members()
         };
+        if !passive {
+            let mut error = None;
+            members.retain(|member| match self.is_member_removed(store, member) {
+                Ok(removed) => !removed,
+                Err(failure) => {
+                    error = Some(failure);
+                    false
+                }
+            });
+            if let Some(error) = error {
+                return Err(error);
+            }
+        }
         let memberships = if passive {
             BTreeMap::new()
         } else {
             self.authors
                 .keys()
+                .filter(|peer| **peer == me || members.contains(*peer))
                 .map(|peer| (*peer, self.admission(peer).0))
                 .collect()
         };
@@ -278,7 +372,7 @@ impl ChannelState {
         };
         let release_ready = matches!(&write, SessionWrite::Drive { .. })
             && self.require_legacy_current(store).is_ok();
-        let (controls, history_pin) = if (passive && !package) || authoring_error.is_some() {
+        let (mut controls, history_pin) = if (passive && !package) || authoring_error.is_some() {
             (
                 None,
                 Some(self.reserve_pending_write(store, Arc::clone(&owner))?),
@@ -300,11 +394,16 @@ impl ChannelState {
                 Err(error) => return Err(error),
             }
         };
+        if let Some(controls) = &mut controls {
+            controls.fence_removal(removal_generation);
+        }
         Ok(PendingSession {
             owner,
             room: self.channel_id,
             epoch: self.epoch,
             me,
+            root: self.genesis.creator_pubkey().fingerprint(),
+            removal_generation,
             sek: self.sek.reader(),
             authoring_error,
             controls,
@@ -494,7 +593,7 @@ impl PendingSession {
             .write
             .take()
             .ok_or(Error::Profile("Session save input missing"))?;
-        if let SessionWrite::Package { package } = write {
+        if let SessionWrite::Package { package, .. } = write {
             let controls = self
                 .controls
                 .as_mut()
@@ -531,6 +630,15 @@ impl PendingSession {
             self.drive.note_delivered(member, generation);
             self.persist_drive(store, sek)?;
             return Ok(SessionSaved::Delivered);
+        }
+        if matches!(&write, SessionWrite::RemovalRotation) {
+            governance::check_removal_generation(store, sek, &self.room, self.removal_generation)?;
+            if self.drive.chain.is_some() {
+                self.begin_drive(store, sek)?;
+                self.drive.change_unsaid = Some(true);
+            }
+            self.persist_removal_rotation(store, sek)?;
+            return Ok(SessionSaved::RemovalRotated);
         }
         let lost = self.drive.lost(&self.holders);
         let rotated = !lost.is_empty() && self.drive.chain.is_some();
@@ -608,7 +716,9 @@ impl PendingSession {
                     key_changed,
                 })
             }
-            SessionWrite::Delivered { .. } | SessionWrite::Package { .. } => unreachable!(),
+            SessionWrite::Delivered { .. }
+            | SessionWrite::Package { .. }
+            | SessionWrite::RemovalRotation => unreachable!(),
         }
     }
 
@@ -681,7 +791,42 @@ impl PendingSession {
         let state = self.drive.to_state();
         let segment = seal_segment(sek, SegmentKind::KeyMaterial, SEG_DRIVE, &state)?;
         let mut batch = store.batch()?;
+        governance::check_removal_generation_in(&batch, sek, &self.room, self.removal_generation)?;
         batch.put_segment(&self.room, SegmentKind::KeyMaterial, SEG_DRIVE, &segment)?;
+        receiver_overlay::wrote_drive(&mut batch, sek, &self.room, self.receiver_version)?;
+        batch.commit()?;
+        self.committed_drive = Some(state);
+        self.committed_change_unsaid = Some(self.drive.change_unsaid);
+        Ok(())
+    }
+    fn persist_removal_rotation(&mut self, store: &Store, sek: &Sek) -> Result<()> {
+        let state = self.drive.to_state();
+        let segment = seal_segment(sek, SegmentKind::KeyMaterial, SEG_DRIVE, &state)?;
+        let mut e = Encoder::new();
+        e.array(3).uint(1).uint(self.removal_generation);
+        match &self.drive.chain {
+            Some(chain) => {
+                e.array(1).uint(chain.chain_id());
+            }
+            None => {
+                e.array(0);
+            }
+        }
+        let checkpoint = seal_segment(
+            sek,
+            SegmentKind::KeyMaterial,
+            SEG_ROOM_REMOVAL_DRIVE,
+            &e.finish(),
+        )?;
+        let mut batch = store.batch()?;
+        governance::check_removal_generation_in(&batch, sek, &self.room, self.removal_generation)?;
+        batch.put_segment(&self.room, SegmentKind::KeyMaterial, SEG_DRIVE, &segment)?;
+        batch.put_segment(
+            &self.room,
+            SegmentKind::KeyMaterial,
+            SEG_ROOM_REMOVAL_DRIVE,
+            &checkpoint,
+        )?;
         receiver_overlay::wrote_drive(&mut batch, sek, &self.room, self.receiver_version)?;
         batch.commit()?;
         self.committed_drive = Some(state);
@@ -810,6 +955,7 @@ impl PendingSession {
         if let Some(error) = self.authoring_error.take() {
             return Err(error);
         }
+        governance::check_removal_generation(store, sek, &self.room, self.removal_generation)?;
         if self
             .drive
             .chain
@@ -863,6 +1009,7 @@ impl PendingSession {
         let state = self.drive.to_state();
         let drive = seal_segment(sek, SegmentKind::KeyMaterial, SEG_DRIVE, &state)?;
         let mut batch = store.batch()?;
+        governance::check_removal_generation_in(&batch, sek, &self.room, self.removal_generation)?;
         // Unchanged ruled durability; inbox receipt, record, index and advanced ratchet are atomic.
         batch.ruled();
         if let Some(old) = batch.get_segment(&self.room, SegmentKind::PrivateSession, id)? {
@@ -978,13 +1125,36 @@ impl PendingSession {
             return Ok(false);
         }
         let h = &record.message.header;
+        governance::check_removal_generation(store, sek, &self.room, self.removal_generation)?;
+        let snapshot = store.snapshot()?;
+        let view = governance::View::pinned(&snapshot, sek, &self.room, self.root, self.now)?;
+        if view.is_member_removed(&h.author_id)? || view.is_member_removed(peer)? {
+            return Ok(false);
+        }
+        if let Some(entry) = record.legacy_entry() {
+            match view.content_eligibility(entry)? {
+                governance::ContentEligibility::Eligible => {}
+                governance::ContentEligibility::Ineligible => return Ok(false),
+                governance::ContentEligibility::Refreshing => {
+                    return Err(Error::StreamRefused(floor_index::REFRESHING));
+                }
+            }
+        }
+        let restored = !view.validated_member_removals(peer)?.is_empty();
+        drop(view);
+        drop(snapshot);
         let membership = self.memberships.get(peer).copied().unwrap_or(0);
-        let Some((old, iteration, _)) = floor_index::floor(
-            Transaction::Snapshot(&store.snapshot()?),
+        let Some((old, iteration, _)) = floor_index::authorized_floor_step(
+            store,
             sek,
             &self.room,
+            self.root,
+            self.now,
             &(h.author_id, *peer, h.epoch, h.chain_id),
+            membership,
+            restored,
         )?
+        .ok_or(Error::StreamRefused(floor_index::REFRESHING))?
         else {
             return Ok(false);
         };

@@ -352,6 +352,89 @@ pub async fn write_pairwise(
         .map_err(|_| Error::Unreachable("the peer did not take a pairwise stream in time"))?
 }
 
+/// Immutable authorization captured before a room-key delivery was queued.
+pub(crate) struct RoomSendFence {
+    pub resource: std::sync::Arc<crate::node::channel::history::ReadResource>,
+    #[cfg(feature = "test-knobs")]
+    pub store: std::sync::Arc<crate::node::store::Store>,
+    pub room: crate::hash::Digest32,
+    pub generation: u64,
+}
+
+impl std::fmt::Debug for RoomSendFence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RoomSendFence")
+            .field("generation", &self.generation)
+            .finish()
+    }
+}
+
+/// A queued key frame may not cross a durable room-authorization transition.
+pub(crate) async fn write_pairwise_fenced(
+    conn: &VoxConnection,
+    frames: &[impl AsRef<[u8]>],
+    fence: &RoomSendFence,
+) -> Result<RecvStream> {
+    #[cfg(feature = "test-knobs")]
+    if let Some(path) = std::env::var_os("VOX_TEST_HOLD_PAIRWISE_KEY_FILE")
+        .filter(|path| !path.is_empty())
+        .map(std::path::PathBuf::from)
+    {
+        if std::fs::read_to_string(&path)
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            == Some(crate::node::link::b32_encode(&conn.peer_id()).as_str())
+        {
+            std::fs::write(path.with_extension("engaged"), b"queued room key")
+                .map_err(|_| Error::Profile("pairwise proof gate marker could not be written"))?;
+            while path.is_file() {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        }
+    }
+    let written = async {
+        let (mut send, recv) = open_typed(conn, StreamKind::Pairwise).await?;
+        for frame in frames {
+            use std::future::Future as _;
+            use std::task::Poll;
+            let mut write = std::pin::pin!(write_frame(&mut send, frame.as_ref()));
+            std::future::poll_fn(|cx| {
+                #[cfg(feature = "test-knobs")]
+                if std::env::var("VOX_TEST_FX62_MUTANT").as_deref() == Ok("pairwise-equality-only")
+                {
+                    return match fence.store.with_publication_fence(|| {
+                        if crate::node::channel::governance::removal_generation(
+                            &fence.store,
+                            &fence.room,
+                        )? != fence.generation
+                        {
+                            return Err(Error::StreamRefused("room authorization changed"));
+                        }
+                        Ok(write.as_mut().poll(cx))
+                    }) {
+                        Ok(result) => result,
+                        Err(error) => Poll::Ready(Err(error)),
+                    };
+                }
+                match fence
+                    .resource
+                    .with_removal_fence(&fence.room, fence.generation, || write.as_mut().poll(cx))
+                {
+                    Some(result) => result,
+                    None => Poll::Ready(Err(Error::StreamRefused("room authorization changed"))),
+                }
+            })
+            .await?;
+        }
+        let _ = send.finish();
+        Ok::<RecvStream, Error>(recv)
+    };
+    tokio::time::timeout(WRITE_PATIENCE, written)
+        .await
+        .map_err(|_| Error::Unreachable("the peer did not take a pairwise stream in time"))?
+}
+
 /// The recipient's answer on a pairwise stream that carried a key it took.
 pub const KEY_TAKEN: u8 = 1;
 

@@ -90,6 +90,7 @@ pub(super) enum Saved {
     SessionPrelude(pending_session::SessionWrite),
     SessionOutbound {
         package: Option<crate::node::keypackage::KeyPackage>,
+        removal_generation: u64,
         reservation: Option<crate::node::prekeys::OneTimeReservation>,
     },
     Consent(consent_save::Effect),
@@ -469,9 +470,11 @@ impl Saved {
             session_save::Saved::Prelude(write) => Self::SessionPrelude(write),
             session_save::Saved::OutboundPackage {
                 package,
+                removal_generation,
                 reservation,
             } => Self::SessionOutbound {
                 package,
+                removal_generation,
                 reservation,
             },
         }
@@ -1021,6 +1024,34 @@ impl Node {
         if installable
             && matches!(
                 &result,
+                Ok(Saved::Projection(
+                    session_projection::ProjectionProgress::Sessions { advanced: true }
+                )) | Ok(Saved::Trust(_))
+                    | Ok(Saved::Governance(_))
+            )
+        {
+            if let Some(store) = self.profile.as_ref().map(Profile::store_handle) {
+                let changed = {
+                    let channel = instance.lock().await;
+                    channel.private_refetch_evidence_changed(&store)
+                };
+                match changed {
+                    Ok(true) => self.wake_private_refetch(room, &instance).await,
+                    Ok(false) => {}
+                    Err(error) if matches!(fault_of(&error), Fault::GovernanceRefreshing) => {}
+                    Err(error) => {
+                        let _ = self.event_tx.send(NodeEvent::NodeNote {
+                            note: format!(
+                                "private Session recovery evidence could not be read: {error}"
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        if installable
+            && matches!(
+                &result,
                 Ok(Saved::Governance(governance_save::Saved::Legacy {
                     advanced: true,
                     ..
@@ -1114,17 +1145,21 @@ impl Node {
                     Saved::SessionPrelude(write) => Ok(session_save::Saved::Prelude(write)),
                     Saved::SessionOutbound {
                         package,
+                        removal_generation,
                         reservation,
                     } => Ok(session_save::Saved::OutboundPackage {
                         package,
+                        removal_generation,
                         reservation,
                     }),
                     Saved::Packages(package_save::Saved::SealedOutbound {
                         package,
                         reservation,
+                        removal_generation,
                         ..
                     }) => Ok(session_save::Saved::OutboundPackage {
                         package,
+                        removal_generation,
                         reservation,
                     }),
                     Saved::Unavailable => {
