@@ -311,10 +311,11 @@ const SEG_UNSETTLED: u64 = 13;
 // 18 is the legacy Session announcement cursor; it was also used by older recovery markers.
 const SEG_OLD_OWN_BEHIND: u64 = 18;
 const SEG_OWN_BEHIND: u64 = 25;
+// KeyMaterial slots 26 and 27 belong to own-history recovery's boundary and higher extent.
 /// Sender rotation checkpoint for the applied room-removal authorization generation.
-const SEG_ROOM_REMOVAL_SENDER: u64 = 26;
+const SEG_ROOM_REMOVAL_SENDER: u64 = 28;
 /// Drive rotation checkpoint for the applied room-removal authorization generation.
-const SEG_ROOM_REMOVAL_DRIVE: u64 = 27;
+const SEG_ROOM_REMOVAL_DRIVE: u64 = 29;
 /// Target-bound progress for checking that recovered own content is actually readable.
 // KeyMaterial slots 21 and 23 belong to the key-package queue and private pulls.
 const SEG_OWN_READABILITY: u64 = 24;
