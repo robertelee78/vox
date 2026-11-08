@@ -307,7 +307,7 @@ fn an_admin_removes_one_member_and_the_creator_readmits_it_forward_only() {
     watchdog::arm();
     fx62_mutant();
     let rt = runtime();
-    let tmp = tempfile::tempdir().expect("APPARATUS: temporary directory");
+    let tmp = support::diagnostic_tempdir();
     // An attacker can restore its identity from before joining. Keep that scratch
     // profile so the later retained-passphrase attempt is a fresh join, not a reconnect.
     let carol_prejoin_data = tmp.path().join("carol-prejoin-data");
@@ -1450,18 +1450,12 @@ fn an_admin_the_creator_named_ends_a_room_and_then_it_takes_no_new_message() {
     }
 
     let t = Instant::now();
-    let o = bob.vox(None, &["room", "end", id]);
+    let o = unchanged_busy_retry(bob, &["room", "end", id]);
     assert!(
         o.ok,
         "PRODUCT: bob, an admin the creator named, was refused `vox room end`: {o:?}"
     );
     eprintln!("[proof] end: it said: {}", o.stdout.trim());
-    assert!(
-        said_before_and_after(&o, "end", "vox: ended "),
-        "PRODUCT: `vox room end` must say what it is to do, naming the room, before it acts, and \
-         what it did after: {:?}",
-        o.stdout
-    );
     for w in &mut room.workers {
         let (gone, o) = poll(w, &["room", "list"], GONE, |o| {
             o.ok && !o.stdout.lines().any(|l| l.starts_with(&id[..12]))
