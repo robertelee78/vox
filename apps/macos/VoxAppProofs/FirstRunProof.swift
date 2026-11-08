@@ -75,10 +75,10 @@
 //     Thread (⌘R) then says; Space and Return on a row whose file alice pulled open it in Quick
 //     Look; Tab from the timeline reaches the composer.
 // 15. Who trusts whom (ADR-028 K-5, K-7, R-5, R-6, E-4). Dave, whom bob trusts, joins mission
-//     while it is on screen: its timeline says "<dave> (not in keyring) joined. bob trusts it."
-//     (D10). Dave trusts alice; her member pane says he is "not in keyring, trusts you", the room
+//     while it is on screen: its timeline says "Observed in this room: <dave> (not in keyring) joined. bob trusts it."
+//     (D10). Dave trusts alice; her member pane says he is "not in keyring, room consent observed", the room
 //     names him as not yet reading each other with her, and his card says both directions; Trust…
-//     there, with his alias, makes him "trusted both ways" and puts him in her keyring, through
+//     there, with his alias, makes him "local trust and room consent observed" and puts him in her keyring, through
 //     the passphrase gate if the keyring window has closed (D4). With bob's and dave's nodes
 //     detached, a message she posts says "only on this machine"; once bob's node is back, "on 1 of
 //     2 members' nodes" (D9). Node > Detach then offers only to attach alice again, never another
@@ -100,6 +100,9 @@
 //     the room header's tag filter set to task:#636 shows it and not the untagged one, and "All
 //     messages" brings the untagged one back. Mutant: the app's `.tag` thread showing the whole
 //     room (timelineItems) turns it red at "must not show the untagged".
+// 15 alone: VOX_PROOF_FROM=15 stages steps 1-5 by `vox`, runs 5b-5d, then skips steps 6 to 14
+//     (their own proofs, NOT RUN), staging only what step 15 reads from them: the quiet rooms
+//     aaa and bbb and mission's link.
 //
 // Mutants for (15), one each: the member rows drop a node's trust in alice unless she trusts it
 // (D4: the row reads "not in keyring"); the timeline drops the whereabouts line (D9); the join
@@ -1874,8 +1877,10 @@ final class FirstRunProof: XCTestCase {
              "VOX_PROXY": "127.0.0.1:0",
              "HOME": computerRoot.appendingPathComponent(name + "/home").path]
         }
+        let incomingConsentHold = computerRoot.appendingPathComponent("incoming-consent.hold").path
         let computerA = computerEnv("a").merging([
-            "VOX_TEST_KEYCHAIN": computerRoot.appendingPathComponent("a/pairing.keychain-db").path
+            "VOX_TEST_KEYCHAIN": computerRoot.appendingPathComponent("a/pairing.keychain-db").path,
+            "VOX_TEST_HOLD_INCOMING_CONSENT_FILE": incomingConsentHold
         ]) { $1 }
         let computerB = computerEnv("b").merging([
             "VOX_TEST_KEYCHAIN": computerRoot.appendingPathComponent("b/pairing.keychain-db").path
@@ -2345,12 +2350,13 @@ final class FirstRunProof: XCTestCase {
         let keptLink = try line(staged(vox, ["room", "link", "--node", "protected", keptRoom], env: computerB)) {
             $0.hasPrefix("vox://")
         }
-        for name in ["paired-personal", "paired-ordinary"] {
-            try staged(vox, ["room", "join", "--node", name, "--passphrase-file", computerPass, keptLink], env: computerA)
-            let joined = try staged(vox, ["room", "list", "--node", name], env: computerA)
-            guard joined.contains(keptRoom) else { throw Apparatus("native drive node \(name) did not join the retained room: \(joined)") }
-        }
         let personalFp = try line(staged(vox, ["id", "--node", "paired-personal"], env: computerA)) { $0.count == 52 }
+        let protectedFp = try line(staged(vox, ["id", "--node", "protected"], env: computerB)) { $0.count == 52 }
+        let fullKeptRoom = String(keptLink.dropFirst("vox://".count).prefix { $0 != "?" && $0 != "/" })
+        guard fullKeptRoom.count == 52 else { throw Apparatus("pairing room link lacks its full identity") }
+        try stager.write(Data("\(fullKeptRoom) \(protectedFp) \(personalFp)".utf8), to: incomingConsentHold)
+        defer { _ = stager.run(["/bin/rm", "-f", incomingConsentHold], env: [:]) }
+        try staged(vox, ["room", "join", "--node", "paired-personal", "--passphrase-file", computerPass, keptLink], env: computerA)
         pairingUI.launchEnvironment = computerA
         try launchVox(pairingUI, appPath, env: computerA, scratch: scratchPath,
                       nodeFingerprint: (name: "paired-personal", fingerprint: personalFp))
@@ -2358,6 +2364,72 @@ final class FirstRunProof: XCTestCase {
         guard present(pairingUI, Key.id("room-pairing-kept"), timeout: 30,
                       "the selected personal node must show its joined retained room") else { return }
         tap(pairingUI, Key.id("room-pairing-kept"), "Open the joined retained room")
+        let enteredConsent = URL(fileURLWithPath: incomingConsentHold).deletingPathExtension().appendingPathExtension("entered").path
+        let heldUntil = Date().addingTimeInterval(90)
+        while Date() < heldUntil && stager.run(["/bin/test", "-e", enteredConsent], env: [:]).status != 0 {
+            Thread.sleep(forTimeInterval: 0.2)
+        }
+        guard stager.run(["/bin/test", "-e", enteredConsent], env: [:]).status == 0 else {
+            throw Apparatus("the real protected-to-personal consent was not held before admission")
+        }
+        func waitProtectedWarning(_ timeout: TimeInterval) -> String? {
+            let until = Date().addingTimeInterval(timeout)
+            while Date() < until {
+                let value = (locate(pairingUI, Key.id("trust-banner-member-" + protectedFp))
+                    ?? locate(pairingUI, Key.id("trust-banner"))).map(shown) ?? ""
+                if value.contains("room consent") && value.contains("not been observed") { return value }
+                Thread.sleep(forTimeInterval: 0.2)
+            }
+            XCTFail("PRODUCT: paired member's missing room consent was not reported: \(onScreen(pairingUI))")
+            return nil
+        }
+        guard let pendingConsent = waitProtectedWarning(90) else { return }
+        XCTAssertFalse(pendingConsent.lowercased().contains("declined") || pendingConsent.contains("trust you back"),
+                       "PRODUCT: a held room consent must not be described as a failed computer approval: \(pendingConsent)")
+        guard present(pairingUI, Key.id("trust-banner-application-" + protectedFp), timeout: 60,
+                      "a matching verified computer application must be shown separately from missing room consent") else { return }
+        try staged(vox, ["room", "post", "--node", "paired-personal", keptRoom, "PAIR-WHILE-CONSENT-HELD"], env: computerA)
+        let oneWayUntil = Date().addingTimeInterval(90)
+        var oneWayRead = ""
+        while Date() < oneWayUntil {
+            oneWayRead = run(vox, ["room", "read", "--node", "protected", keptRoom], env: computerB).out
+            if oneWayRead.contains("PAIR-WHILE-CONSENT-HELD") { break }
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+        guard oneWayRead.contains("PAIR-WHILE-CONSENT-HELD") else {
+            throw Apparatus("the paired one-way message did not arrive while reciprocal consent was held")
+        }
+        guard waitProtectedWarning(20) != nil else { return }
+        guard stager.run(["/bin/rm", "-f", incomingConsentHold], env: [:]).status == 0 else {
+            throw Apparatus("cannot release the held real room consent")
+        }
+        try staged(vox, ["room", "join", "--node", "paired-ordinary", "--passphrase-file", computerPass, keptLink], env: computerA)
+        let joined = try staged(vox, ["room", "list", "--node", "paired-ordinary"], env: computerA)
+        guard joined.contains(keptRoom) else { throw Apparatus("native drive's ordinary node did not join: \(joined)") }
+        try staged(vox, ["room", "post", "--node", "protected", keptRoom, "PAIR-CONSENT-PROTECTED"], env: computerB)
+        try staged(vox, ["room", "post", "--node", "paired-personal", keptRoom, "PAIR-CONSENT-PERSONAL"], env: computerA)
+        let pairReadUntil = Date().addingTimeInterval(90)
+        var protectedRead = "", personalRead = ""
+        while Date() < pairReadUntil {
+            protectedRead = run(vox, ["room", "read", "--node", "protected", keptRoom], env: computerB).out
+            personalRead = run(vox, ["room", "read", "--node", "paired-personal", keptRoom], env: computerA).out
+            if protectedRead.contains("PAIR-CONSENT-PERSONAL") && personalRead.contains("PAIR-CONSENT-PROTECTED") { break }
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+        XCTAssertTrue(protectedRead.contains("PAIR-CONSENT-PERSONAL") && personalRead.contains("PAIR-CONSENT-PROTECTED"),
+                      "PRODUCT: releasing real room consent must allow fresh paired messages both ways")
+        guard words(pairingUI, Key.id("member-trust-directions-" + protectedFp), timeout: 90,
+                    "the paired member must eventually show its observed reciprocal room consent",
+                    until: { $0.contains("Reciprocal room consent is observed") && !$0.contains("stale") }) != nil else { return }
+        let clearedUntil = Date().addingTimeInterval(90)
+        var remainingWarning = ""
+        while Date() < clearedUntil {
+            remainingWarning = locate(pairingUI, Key.id("trust-banner")).map(shown) ?? ""
+            if !remainingWarning.contains("protected") { break }
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+        XCTAssertFalse(remainingWarning.contains("protected"),
+                       "PRODUCT: the protected member's warning must clear after reciprocal delivery: \(remainingWarning)")
         let ordinaryFp = try line(staged(vox, ["id", "--node", "paired-ordinary"], env: computerA)) { $0.count == 52 }
         let rosterUntil = Date().addingTimeInterval(30)
         var nativeRoster = ""
@@ -4160,7 +4232,7 @@ final class FirstRunProof: XCTestCase {
         words(ui, Key.id("card-presented-name"), timeout: 30,
               "Carol's authenticated name stays visible beside her full fingerprint", until: { $0 == "Name it presents: carol" })
         words(ui, Key.id("card-directions"), timeout: 10,
-              "a presented name must not conceal that Carol is outside the keyring", until: { $0.contains("not in your keyring") })
+              "a presented name must not conceal that Carol is outside the keyring", until: { $0.contains("haven't granted local node trust") })
         tap(ui, Key.id("card-alias"), "Carol's editable default")
         el(ui, Key.id("card-alias")).typeKey("a", modifierFlags: .command)
         el(ui, Key.id("card-alias")).typeKey(XCUIKeyboardKey.delete.rawValue, modifierFlags: [])
@@ -4542,7 +4614,9 @@ final class FirstRunProof: XCTestCase {
              "VOX_PROXY": "127.0.0.1:0",
              "VOX_TEST_KEYCHAIN": root.appendingPathComponent("\(name).keychain-db").path]
         }
-        let alice = nodeEnv("alice"), bob = nodeEnv("bob")
+        let firstFailure = root.appendingPathComponent("member-observation.fail").path
+        let alice = nodeEnv("alice").merging(["VOX_TEST_MEMBER_OBSERVATION_FAIL_FILE": firstFailure]) { $1 }
+        let bob = nodeEnv("bob")
         let pass = root.appendingPathComponent("pass").path
         try stager.write(Data("recovery pass\n".utf8), to: pass)
         // Only these owned apparatus daemons target private Keychains through real Security APIs.
@@ -4572,9 +4646,15 @@ final class FirstRunProof: XCTestCase {
         try stager.write(Data("no\n".utf8), to: alice["VOX_CONFIG_DIR"]! + "/app/login-item")
         try staged(vox, ["computer", "personal", "alice"], env: alice)
         try staged(vox, ["room", "post", "--node", "bob", room, "RECOVERY-OLD"], env: bob)
+        let firstGate = root.appendingPathComponent("first-roster-gate").path
+        guard stager.run(["/bin/mkdir", "-p", firstGate], env: [:]).status == 0 else {
+            throw Apparatus("cannot create the first-roster scheduling directory")
+        }
+        try stager.write(Data(), to: firstGate + "/hold-before-initial")
+        try stager.write(Data(), to: firstGate + "/hold-before-watch")
         let ui = voxApp(appPath)
-        ui.launchEnvironment = alice
-        try launchVox(ui, appPath, env: alice, scratch: scratchPath)
+        ui.launchEnvironment = alice.merging(["VOX_PROOF_ROSTER_GATE": firstGate]) { $1 }
+        try launchVox(ui, appPath, env: ui.launchEnvironment, scratch: scratchPath)
         defer { ui.terminate() }
         func timelineBody(_ text: String, timeout: TimeInterval, _ outcome: String) -> Bool {
             guard windowReadable(ui) else { return false }
@@ -4605,7 +4685,61 @@ final class FirstRunProof: XCTestCase {
             XCTFail("PRODUCT: \(outcome); no exact \(text.debugDescription) body is visible inside the timeline. The app shows: \(onScreen(ui))")
             return false
         }
+        // Refuse one actual MemberObservation RPC while Alice remains Ready. Both app
+        // roster writers are held before the request so no successful baseline can win.
+        guard words(ui, Key.id("machine-alice"), timeout: 60, "Alice must be Ready before the fault",
+                    until: { $0 == "alice Ready" }) != nil else { return }
         tap(ui, Key.id("room-recovery"), "the remote recovery room")
+        func waitFirstMarker(_ name: String) throws {
+            let until = Date().addingTimeInterval(90)
+            while Date() < until {
+                if stager.run(["/bin/test", "-e", firstGate + "/" + name], env: [:]).status == 0 { return }
+                Thread.sleep(forTimeInterval: 0.2)
+            }
+            if name.hasPrefix("published-rejected") {
+                // Staging was reached (its held marker was observed); the app then failed to
+                // reject the stale completion it was handed.
+                XCTFail("PRODUCT: the stale first-roster completion was not rejected (no \(name) within 90 s)")
+                return
+            }
+            throw Apparatus("first-roster scheduling did not reach \(name)")
+        }
+        try waitFirstMarker("held-before-initial")
+        let fullRecovery = String(link.dropFirst("vox://".count).prefix { $0 != "?" && $0 != "/" })
+        guard fullRecovery.count == 52 else { throw Apparatus("recovery link has no full room identity") }
+        try stager.write(Data(fullRecovery.utf8), to: firstFailure)
+        guard stager.run(["/bin/rm", "-f", firstGate + "/hold-before-initial"], env: [:]).status == 0 else {
+            throw Apparatus("cannot release the initial roster request")
+        }
+        let consumed = URL(fileURLWithPath: firstFailure).deletingPathExtension().appendingPathExtension("consumed").path
+        let consumedUntil = Date().addingTimeInterval(60)
+        while Date() < consumedUntil && stager.run(["/bin/test", "-e", consumed], env: [:]).status != 0 {
+            Thread.sleep(forTimeInterval: 0.2)
+        }
+        guard stager.run(["/bin/test", "-e", consumed], env: [:]).status == 0 else {
+            throw Apparatus("the real first membership RPC was not refused")
+        }
+        guard words(ui, Key.id("member-observation-unavailable"), timeout: 30,
+                    "the real first-read refusal must be visible",
+                    until: { $0.contains("membership observation was refused") }) != nil,
+              words(ui, Key.id("machine-alice"), timeout: 10, "the node must stay Ready through the refusal",
+                    until: { $0 == "alice Ready" }) != nil else { return }
+        XCTAssertNil(locate(ui, Key.id("node-stopped")),
+                     "PRODUCT: a roster RPC refusal must not stop the ready node or its observer")
+        guard stager.run(["/bin/rm", "-f", firstGate + "/hold-before-watch"], env: [:]).status == 0 else {
+            throw Apparatus("cannot release the fresh watcher request")
+        }
+        guard words(ui, Key.id("room-tab-members"), timeout: 90,
+                    "the first successful populated roster must recover in the same selection",
+                    until: { $0 == "2 members" }) != nil else { return }
+        XCTAssertNil(locate(ui, Key.id("node-stopped")),
+                     "PRODUCT: the same selected room must recover without an observer restart")
+        for _ in 0..<2 {
+            _ = stager.run(["/bin/rm", "-f", firstGate + "/published-watch"], env: [:])
+            try waitFirstMarker("published-watch")
+            XCTAssertNil(locate(ui, Key.id("join-\(bobFp)")),
+                         "PRODUCT: a failed first roster read must not seed an empty baseline")
+        }
         guard timelineBody("RECOVERY-OLD", timeout: 60,
                            "the old remote message body must be visible before pruning") else { return }
         guard present(ui, Key.id("member-bob"), timeout: 30,
@@ -4651,6 +4785,9 @@ final class FirstRunProof: XCTestCase {
         print("[proof] timeline: displayed OLD; shipped CLI confirmed OLD pruned and KEPT complete; resumed same app without another post; KEPT and bob visible")
         // Interrupt only the daemon this journey started, keeping the same app and room open.
         guard let local = daemon else { throw Apparatus("the started Alice daemon handle is absent") }
+        _ = stager.run(["/bin/rm", "-f", firstGate + "/held-watch", firstGate + "/published-rejected-watch"], env: [:])
+        try stager.write(Data(), to: firstGate + "/hold-watch")
+        try waitFirstMarker("held-watch")
         try local.pause()
         defer { try? local.resume() }
         // A suspended daemon answers only when its 60-second IPC deadline expires.
@@ -4659,6 +4796,10 @@ final class FirstRunProof: XCTestCase {
                     until: { $0.contains("members unavailable") }) != nil else { return }
         guard timelineBody("RECOVERY-KEPT", timeout: 10,
                            "a transport interruption must preserve the displayed retained timeline") else { return }
+        guard stager.run(["/bin/rm", "-f", firstGate + "/hold-watch"], env: [:]).status == 0 else {
+            throw Apparatus("cannot release the old-epoch roster response")
+        }
+        try waitFirstMarker("published-rejected-watch")
         // A changed remote roster makes recovery distinguishable from the retained old view.
         try staged(vox, ["node", "create", "charlie"],
                    env: bob.merging(["VOX_IDENTITY_PASSPHRASE": "recovery pass"]) { $1 })
@@ -4715,6 +4856,10 @@ final class FirstRunProof: XCTestCase {
         guard words(ui, Key.id("timeline-title"), timeout: 15,
                     "the room watcher must refresh retention to one hour",
                     until: { $0.contains("1 hour") }) != nil else { return }
+        XCTAssertNil(locate(ui, Key.id("join-\(bobFp)")),
+                     "PRODUCT: recovering the existing room must not report Bob as newly joined")
+        XCTAssertNil(locate(ui, Key.id("join-\(charlieFp)")),
+                     "PRODUCT: an admission during the observation outage cannot be asserted as a live join")
         print("[proof] transport: unavailable retained timeline; same room recovered roster; later remote retention reached header")
     }
 
@@ -4814,8 +4959,37 @@ final class FirstRunProof: XCTestCase {
             print("[proof] started at step \(from): steps 1–5 NOT RUN; what they leave was staged by vox")
         }
 
+        // Scheduling markers only: roster values still come from the real daemon.
+        let rosterGate = scratch.appendingPathComponent("roster-gate").path
+        guard stager.run(["/bin/mkdir", "-p", rosterGate], env: [:]).status == 0 else {
+            throw Apparatus("cannot create the isolated roster scheduling directory")
+        }
+        func rosterMarker(_ name: String, present: Bool) throws {
+            let path = rosterGate + "/" + name
+            if present {
+                try stager.write(Data(), to: path)
+            } else {
+                guard stager.run(["/bin/rm", "-f", path], env: [:]).status == 0 else {
+                    throw Apparatus("cannot remove roster scheduling marker \(name)")
+                }
+            }
+        }
+        func waitRosterMarker(_ name: String) throws {
+            let until = Date().addingTimeInterval(90)
+            while Date() < until {
+                if stager.run(["/bin/test", "-e", rosterGate + "/" + name], env: [:]).status == 0 { return }
+                Thread.sleep(forTimeInterval: 0.2)
+            }
+            if name.hasPrefix("published-rejected") {
+                XCTFail("PRODUCT: the stale roster completion was not rejected (no \(name) within 90 s)")
+                return
+            }
+            throw Apparatus("real roster observation did not reach scheduling marker \(name)")
+        }
+
         let ui = voxApp(appPath)
         ui.launchEnvironment = voxEnv
+        ui.launchEnvironment["VOX_PROOF_ROSTER_GATE"] = rosterGate
         try launchVox(ui, appPath, env: ui.launchEnvironment, scratch: scratchPath)
 
         if from > 5 {
@@ -4897,8 +5071,16 @@ final class FirstRunProof: XCTestCase {
             throw Product("the app's New Room made no room alice's `vox room list` lists: \(rooms)")
         }
         room = made
-        guard present(ui, Key.id("attached"), timeout: 60,
-                      "the native node must recover observation after room creation before room commands are exercised") else { return }
+        // Do not exercise ⌘L against a transitional observer: the real room page and its
+        // successfully observed single-member roster must be visible with the node Ready.
+        guard words(ui, Key.id("machine-alice"), timeout: 90, "the node must automatically reach Ready",
+                    until: { $0 == "alice Ready" }) != nil,
+              words(ui, Key.id("room-tab-members"), timeout: 90,
+                    "the newly created room must publish its actual roster",
+                    until: { $0 == "1 member" }) != nil,
+              present(ui, Key.id("timeline"), timeout: 30, "the created room's page must be visible") else { return }
+        XCTAssertNil(locate(ui, Key.id("node-stopped")),
+                     "PRODUCT: the created room must automatically recover observation before its actions are used")
         NSPasteboard.general.clearContents()
         ui.typeKey("l", modifierFlags: .command)
         var link = ""
@@ -4935,10 +5117,18 @@ final class FirstRunProof: XCTestCase {
         // trusted meanwhile, is listed in its inspector without the room being opened again.
         words(ui, Key.id("member-bob"), timeout: 30,
               "bob joined and was trusted while the room was on screen: its inspector must list him in alice's keyring",
-              until: { $0.hasPrefix("bob, trusted both ways") || $0.hasPrefix("bob, waiting for the other side") })
+              until: { $0.hasPrefix("bob, local trust and room consent observed") || $0.hasPrefix("bob, local trust, room consent not observed") })
         // Off the room, so a message to alice is unread: a room on screen is read.
         ui.menuBars.menuBarItems["View"].click()
         tap(ui, Key.menuItem("Keyring"), "View > Keyring")
+        // Bob's addressed post comes from an agent Session. Open it through the same first-turn
+        // hook a real Claude Code session runs; a VOX_SESSION marker alone is not registration.
+        let bobOpened = run(vox, ["agent", "hook", "--node", "bob", "--room", room, "--format", "text"],
+                            env: voxEnv.merging(["CLAUDE_CODE_ENTRYPOINT": "cli"]) { $1 },
+                            input: "{\"session_id\":\"bob-proof\",\"hook_event_name\":\"UserPromptSubmit\",\"cwd\":\"/tmp\",\"transcript_path\":\"/tmp/t.jsonl\",\"prompt\":\"notify alice\"}")
+        guard bobOpened.status == 0 else {
+            throw Apparatus("bob's Claude Code hook, to open the notification sender Session, exited \(bobOpened.status): \(bobOpened.out)")
+        }
         try staged(vox, ["room", "post", "--node", "bob", "--to", aliceFp, room, "NEEDS-YOU"],
                    env: bobSession)
         // One list of rooms, no headings (the decider, v0.4.3): mission's row says it needs
@@ -4956,7 +5146,7 @@ final class FirstRunProof: XCTestCase {
         tap(ui, row, "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
         let bob = Key.id("member-bob")
         let bobWords = words(ui, bob, timeout: 30, "the inspector must list bob in alice's keyring",
-                             until: { $0.hasPrefix("bob, trusted both ways") || $0.hasPrefix("bob, waiting for the other side") }) ?? ""
+                             until: { $0.hasPrefix("bob, local trust and room consent observed") || $0.hasPrefix("bob, local trust, room consent not observed") }) ?? ""
         let bar = words(ui, Key.id("status"), timeout: 10,
                         "the status bar must say the node, its peers and the keyring window",
                         until: { $0.contains("node alice") && $0.contains("peer") && $0.contains("keyring") }) ?? ""
@@ -5937,7 +6127,7 @@ final class FirstRunProof: XCTestCase {
         let erinOffer = trustGap([("erin", erinFp, true)])
         words(ui, banner, timeout: 60,
               "remote erin trusts alice now: the room must name erin's incoming trust and explain that alice must trust her too",
-              until: { $0.contains(erinShort) && $0.contains("trusts you") && $0.contains("too") },
+              until: { $0.contains(erinShort) && $0.contains("Room consent") && $0.contains("too") },
               premise: erinOffer)
         let offerPremise = Premise("erin's untrusted offer is available to alice") {
             let (gap, said) = erinOffer.read()
@@ -5959,8 +6149,116 @@ final class FirstRunProof: XCTestCase {
         let fayShort = String(fayFp.prefix(12))
         words(ui, banner, timeout: 60,
               "remote erin and fay cannot read alice: the room must name both members and explain that reading needs both sides' trust",
-              until: { $0.contains(erinShort) && $0.contains(fayShort) && $0.contains("reading needs both sides") },
+              until: { $0.contains(erinShort) && $0.contains(fayShort) && $0.contains("room consent") },
               premise: trustGap([("erin", erinFp, true), ("fay", fayFp, false)]))
+        // Real one-way grant: Fay has not granted Alice trust. Absence of room consent
+        // must not be presented as Fay rejecting computer or node trust.
+        try staged(vox, ["trust", "add", "--node", "alice", erinFp, "--name", "erin",
+                         "--identity-passphrase-file", alicePass], env: voxEnv)
+        try staged(vox, ["trust", "add", "--node", "alice", fayFp, "--name", "fay",
+                         "--identity-passphrase-file", alicePass], env: voxEnv)
+        let oneWayUntil = Date().addingTimeInterval(90)
+        var oneWay = ""
+        while Date() < oneWayUntil {
+            oneWay = (locate(ui, Key.id("trust-banner-member-" + fayFp)) ?? locate(ui, banner)).map(shown) ?? ""
+            if oneWay.contains("fay") && oneWay.contains("room consent") && oneWay.contains("not been observed") { break }
+            Thread.sleep(forTimeInterval: 0.2)
+        }
+        guard oneWay.contains("fay") && oneWay.contains("room consent") && oneWay.contains("not been observed") else {
+            XCTFail("PRODUCT: Fay's local grant must name unobserved room consent: \(oneWay)")
+            return
+        }
+        XCTAssertFalse(oneWay.lowercased().contains("declined") || oneWay.contains("trust you back"),
+                       "PRODUCT: missing room consent must not claim Fay refused trust: \(oneWay)")
+        tap(ui, Key.id("member-fay"), "Fay's member card")
+        guard let fayDirections = words(ui, Key.id("card-directions"), timeout: 15,
+                                        "Fay's card must distinguish local grant from missing room evidence",
+                                        until: { $0.contains("reciprocal room consent") && $0.contains("not been observed") }) else { return }
+        XCTAssertFalse(fayDirections.lowercased().contains("declined"),
+                       "PRODUCT: no refusal may be invented from absent consent: \(fayDirections)")
+        tap(ui, Key.id("card-close"), "close Fay's card")
+        // A replacement identity with the same presented name stays distinct by fingerprint.
+        let replacementRoot = scratch.appendingPathComponent("fay-replacement-host")
+        let replacementHome = replacementRoot.appendingPathComponent("home").path
+        let replacementKeychain = replacementRoot.appendingPathComponent("identity.keychain-db").path
+        guard stager.run(["/bin/mkdir", "-p", replacementHome], env: [:]).status == 0,
+              stager.run(["/usr/bin/security", "create-keychain", "-p", "", replacementKeychain],
+                         env: ["HOME": replacementHome]).status == 0 else {
+            throw Apparatus("cannot stage the replacement Fay's private HOME and Keychain")
+        }
+        let replacementEnv = ["VOX_DATA_DIR": replacementRoot.appendingPathComponent("data").path,
+                              "VOX_CONFIG_DIR": replacementRoot.appendingPathComponent("config").path,
+                              "VOX_PROXY": "127.0.0.1:0", "HOME": replacementHome,
+                              "VOX_TEST_KEYCHAIN": replacementKeychain]
+        let replacementDaemon = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: replacementEnv,
+                                          until: "vox daemon: control socket")
+        defer { replacementDaemon.terminate() }
+        let replacementPass = scratch.appendingPathComponent("fay-replacement.pass").path
+        try stager.write(Data("replacement identity\n".utf8), to: replacementPass)
+        try staged(vox, ["node", "create", "fay"],
+                   env: replacementEnv.merging(["VOX_IDENTITY_PASSPHRASE": "replacement identity"]) { $1 })
+        try staged(vox, ["node", "attach", "fay", "--passphrase-file", replacementPass], env: replacementEnv)
+        let replacementFp = try line(staged(vox, ["id", "--node", "fay"], env: replacementEnv)) { $0.count == 52 }
+        guard replacementFp != fayFp else { throw Apparatus("replacement Fay did not get a distinct identity") }
+        try staged(vox, ["room", "join", "--node", "fay", "--passphrase-file", roomPass, erinLink], env: replacementEnv)
+        let oldFay = Key.id("member-fay#\(fayFp.prefix(6))")
+        let replacementFay = Key.id("member-fay#\(replacementFp.prefix(6)) · \(replacementFp.prefix(12))")
+        guard present(ui, oldFay, timeout: 90, "the original Fay must remain separately named"),
+              present(ui, replacementFay, timeout: 90, "the replacement Fay must have its own fingerprint-qualified row") else { return }
+        for (row, fingerprint) in [(oldFay, fayFp), (replacementFay, replacementFp)] {
+            tap(ui, row, "inspect Fay's exact identity")
+            tap(ui, Key.id("card-copy"), "copy Fay's full fingerprint")
+            XCTAssertEqual(NSPasteboard.general.string(forType: .string), fingerprint,
+                           "PRODUCT: same-name identities must retain their own full fingerprints")
+            tap(ui, Key.id("card-close"), "close Fay's identity card")
+        }
+        // The synthetic replacement signs its own real board withdrawal while remaining
+        // connected. Alice still has a real member, but no usable bundle for its key.
+        guard let waitHelper = env["VOX_PROOF_KEY_WAIT_HELPER"], !waitHelper.isEmpty else {
+            throw Apparatus("the signed key-wait apparatus was not built")
+        }
+        replacementDaemon.terminate()
+        let aliceStatus = run(vox, ["status", "--node", "alice", "--json"], env: voxEnv)
+        guard aliceStatus.status == 0 else { throw Apparatus("cannot read Alice's actual listener: \(aliceStatus.out)") }
+        let statusFile = scratch.appendingPathComponent("key-wait-status.json").path
+        let waitHold = scratch.appendingPathComponent("key-wait-hold").path
+        try stager.write(Data(aliceStatus.out.utf8), to: statusFile)
+        try stager.write(Data(), to: waitHold)
+        defer { _ = stager.run(["/bin/rm", "-f", waitHold], env: [:]) }
+        let roomIdentity = String(erinLink.dropFirst("vox://".count).prefix { $0 != "?" && $0 != "/" })
+        guard roomIdentity.count == 52 else { throw Apparatus("the key-wait room link has no full identity") }
+        let waiter = try start(waitHelper, [scratch.path, replacementEnv["VOX_DATA_DIR"]!,
+                                           replacementEnv["VOX_CONFIG_DIR"]!, replacementPass,
+                                           roomIdentity, aliceFp, statusFile, waitHold],
+                               env: [:], until: "withdraw-ready")
+        defer { waiter.terminate() }
+        try staged(vox, ["trust", "add", "--node", "alice", replacementFp, "--name", "fay-replacement",
+                         "--identity-passphrase-file", alicePass], env: voxEnv)
+        let waitUntil = Date().addingTimeInterval(90)
+        var rosterWithWait = ""
+        while Date() < waitUntil {
+            rosterWithWait = run(vox, ["room", "roster", "--node", "alice", room], env: voxEnv).out
+            if rosterWithWait.split(separator: "\n").contains(where: { $0.contains(replacementFp) && $0.contains("waits") }) { break }
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+        guard rosterWithWait.split(separator: "\n").contains(where: { $0.contains(replacementFp) && $0.contains("waits") }) else {
+            throw Apparatus("the real withdrawn prekey did not produce a key wait: \(rosterWithWait)")
+        }
+        guard words(ui, Key.id("member-key-waits-fay-replacement"), timeout: 60,
+                    "the member inspector must show the actual key wait",
+                    until: { $0.contains("waits") }) != nil,
+              present(ui, Key.id("trust-banner-key-wait-" + replacementFp), timeout: 30,
+                      "the room banner must expose the same actual key wait") else { return }
+        guard stager.run(["/bin/rm", "-f", waitHold], env: [:]).status == 0 else {
+            throw Apparatus("cannot release the synthetic key-wait peer")
+        }
+        waiter.terminate()
+        // Fay's node now exists, so the restarted daemon opens it with its passphrase.
+        let replacementAgain = try start(knobs, ["daemon", "--listen", "127.0.0.1:0",
+                                                 "--passphrase-file", replacementPass],
+                                         env: replacementEnv, until: "vox daemon: control socket")
+        defer { replacementAgain.terminate() }
+        try staged(vox, ["node", "attach", "fay", "--passphrase-file", replacementPass], env: replacementEnv)
 
         // The Dock badge (P17) is not checked here: macOS exposes no Dock badge to lsappinfo or to
         // XCUITest (the Dock's item has an empty label and value with a badge set, 2026-10-09), so
@@ -6132,10 +6430,10 @@ final class FirstRunProof: XCTestCase {
         }
         try staged(knobs, ["room", "join", "--node", "dora", "--passphrase-file", roomPass, doraLink],
                    env: doraEnv)
-        try staged(vox, ["trust", "add", "--node", "alice", doraFp, "--name", "dora",
-                         "--identity-passphrase-file", alicePass], env: voxEnv)
-        try staged(knobs, ["trust", "add", "--node", "dora", aliceFp, "--name", "alice",
-                           "--identity-passphrase-file", doraPass], env: doraEnv)
+        try stagedTrustChange(vox, ["trust", "add", "--node", "alice", doraFp, "--name", "dora",
+                                    "--identity-passphrase-file", alicePass], env: voxEnv)
+        try stagedTrustChange(knobs, ["trust", "add", "--node", "dora", aliceFp, "--name", "alice",
+                                      "--identity-passphrase-file", doraPass], env: doraEnv)
         var old: (id: String, millis: UInt64)?
         let oldUntil = Date().addingTimeInterval(120)
         var d = 0
@@ -6190,6 +6488,18 @@ final class FirstRunProof: XCTestCase {
         if from <= 5 {
             try tagThread(ui, vox: vox, voxEnv: voxEnv, room: room)
         }
+        let missionLink = try line(staged(vox, ["room", "link", "--node", "alice", room], env: voxEnv)) {
+            $0.hasPrefix("vox://")
+        }
+        if from == 15 {
+            for name in ["aaa", "bbb"] {
+                try staged(vox, ["room", "create", "--node", "alice", "--passphrase-file", roomPass,
+                                 "--name", name], env: voxEnv)
+            }
+            present(ui, Key.id("room-aaa"), timeout: 30, "room aaa must show in the sidebar",
+                    premise: inRoom(vox, voxEnv, "aaa"))
+            print("[proof] VOX_PROOF_FROM=15: steps 6 to 14 NOT RUN")
+        } else {
 
         // (6) Attach a file to the room, To: bob, with a note.
         tap(ui, Key.id("room-mission"), "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
@@ -6720,9 +7030,6 @@ final class FirstRunProof: XCTestCase {
         try stager.write(Data("carol identity\n".utf8), to: carolPass)
         try stager.write(Data("not the room passphrase\n".utf8), to: wrongPass)
         try staged(vox, ["node", "attach", "carol", "--passphrase-file", carolPass], env: voxEnv)
-        let missionLink = try line(staged(vox, ["room", "link", "--node", "alice", room], env: voxEnv)) {
-            $0.hasPrefix("vox://")
-        }
         let refusedJoin = run(vox, ["room", "join", "--node", "carol", "--passphrase-file", wrongPass,
                                     missionLink], env: voxEnv)
         guard refusedJoin.status != 0 else {
@@ -6886,6 +7193,7 @@ final class FirstRunProof: XCTestCase {
         XCTAssertTrue(el(ui, compose).value(forKey: "hasKeyboardFocus") as? Bool == true,
                       "PRODUCT: Tab from the timeline must reach the composer; after \(tabs) Tabs it has no keyboard focus")
         print("[proof] keyboard: Space and Return opened Quick Look; ↑ ↑ ↓ selected KEYS-B, KEYS-A, KEYS-B; Tab reached the composer in \(tabs)")
+        }
 
         // (15) Who trusts whom, from a member (ADR-028 K-5, K-7, R-5, R-6, E-4; D4, D9, D10, D17).
         // Dave is remote and unpaired: the local automatic trust policy cannot pretrust him.
@@ -6911,9 +7219,259 @@ final class FirstRunProof: XCTestCase {
                    env: daveEnv.merging(["VOX_IDENTITY_PASSPHRASE": "dave identity"]) { $1 })
         try staged(vox, ["node", "attach", "dave", "--passphrase-file", davePass], env: daveEnv)
         let daveFp = try line(staged(vox, ["id", "--node", "dave"], env: daveEnv)) { $0.count == 52 }
-        try staged(vox, ["trust", "add", "--node", "bob", daveFp, "--name", "dave",
-                         "--identity-passphrase-file", bobPass], env: voxEnv)
-        tap(ui, Key.id("room-mission"), "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
+        try stagedTrustChange(vox, ["trust", "add", "--node", "bob", daveFp, "--name", "dave",
+                                    "--identity-passphrase-file", bobPass], env: voxEnv)
+        // A known-empty remote roster must still report its first real admission.
+        tap(ui, Key.id("room-aaa"), "open the room with no remote peers")
+        guard words(ui, Key.id("room-tab-members"), timeout: 60,
+                    "aaa must publish a known one-member roster", until: { $0 == "1 member" }) != nil else { return }
+        try rosterMarker("published-watch", present: false)
+        try waitRosterMarker("published-watch")
+        let listedRooms = try staged(vox, ["room", "list", "--node", "alice"], env: voxEnv)
+        guard let emptyRoom = listedRooms.split(separator: "\n").first(where: { $0.contains(" aaa") })?
+            .split(whereSeparator: \.isWhitespace).first.map(String.init) else {
+            throw Apparatus("the empty-peer room aaa is missing: \(listedRooms)")
+        }
+        let emptyRoster = try staged(vox, ["room", "roster", "--node", "alice", emptyRoom], env: voxEnv)
+        guard !emptyRoster.contains(daveFp) else { throw Apparatus("Dave was already in aaa: \(emptyRoster)") }
+        let emptyLink = try line(staged(vox, ["room", "link", "--node", "alice", emptyRoom], env: voxEnv)) {
+            $0.hasPrefix("vox://")
+        }
+        try staged(vox, ["room", "join", "--node", "dave", "--passphrase-file", roomPass, emptyLink], env: daveEnv)
+        guard present(ui, Key.id("join-\(daveFp)"), timeout: 90,
+                      "the first peer admitted after a known-empty roster must have a join line") else { return }
+        try rosterMarker("published-watch", present: false)
+        try waitRosterMarker("published-watch")
+        XCTAssertEqual(ui.descendants(matching: .any).matching(identifier: "join-\(daveFp)").count, 1,
+                       "PRODUCT: the first genuine admission must remain exactly one line after refresh")
+
+        let rosterBeforeDave = try staged(vox, ["room", "roster", "--node", "alice", room], env: voxEnv)
+        guard [bobFp, erinFp, fayFp, replacementFp].allSatisfy({ rosterBeforeDave.contains($0) }) else {
+            throw Apparatus("the preexisting mission roster must contain all four remote identities: \(rosterBeforeDave)")
+        }
+        func noPreexistingJoins() {
+            for fingerprint in [bobFp, erinFp, fayFp, replacementFp] {
+                XCTAssertNil(locate(ui, Key.id("join-\(fingerprint)")),
+                             "PRODUCT: a preexisting member must not acquire a join line on room open: \(fingerprint)")
+            }
+        }
+        // Force the watcher to commit a real populated roster before the held initial read.
+        try rosterMarker("published-watch", present: false)
+        try rosterMarker("published-initial", present: false)
+        try rosterMarker("held-initial", present: false)
+        try rosterMarker("released-initial", present: false)
+        try rosterMarker("hold-initial", present: true)
+        tap(ui, Key.id("room-mission"), "open populated mission with its initial roster held")
+        try waitRosterMarker("held-initial")
+        try waitRosterMarker("published-watch")
+        guard words(ui, Key.id("room-tab-members"), timeout: 30,
+                    "the watcher must publish the populated roster",
+                    until: { $0.hasSuffix(" members") && !$0.contains("loading") }) != nil else { return }
+        noPreexistingJoins()
+        try rosterMarker("hold-initial", present: false)
+        // The held initial read may complete or be discarded as stale; either way the person
+        // must see the room page with its roster and no fabricated joins.
+        try waitRosterMarker("released-initial")
+        guard present(ui, Key.id("timeline"), timeout: 30, "mission's page must be visible after the held read"),
+              words(ui, Key.id("room-tab-members"), timeout: 30,
+                    "mission's roster must remain published after the held initial read",
+                    until: { $0.hasSuffix(" members") && !$0.contains("loading") }) != nil else { return }
+        noPreexistingJoins()
+        for _ in 0..<2 {
+            try rosterMarker("published-watch", present: false)
+            try waitRosterMarker("published-watch")
+            noPreexistingJoins()
+        }
+        // Opposite order: initial roster first, followed by the held watcher.
+        tap(ui, Key.id("room-aaa"), "leave mission before the opposite read order")
+        try rosterMarker("published-initial", present: false)
+        try rosterMarker("held-watch", present: false)
+        try rosterMarker("hold-watch", present: true)
+        tap(ui, Key.id("room-mission"), "open mission with the watcher held")
+        try waitRosterMarker("published-initial")
+        try waitRosterMarker("held-watch")
+        noPreexistingJoins()
+        try rosterMarker("hold-watch", present: false)
+        try rosterMarker("published-watch", present: false)
+        try waitRosterMarker("published-watch")
+        noPreexistingJoins()
+        // A held old-room response may not populate the next selected room.
+        try rosterMarker("held-watch", present: false)
+        try rosterMarker("published-rejected-watch", present: false)
+        try rosterMarker("hold-watch", present: true)
+        try waitRosterMarker("held-watch")
+        tap(ui, Key.id("room-aaa"), "switch rooms while mission's roster is held")
+        guard words(ui, Key.id("room-tab-members"), timeout: 60,
+                    "aaa must display its own two-member roster", until: { $0 == "2 members" }) != nil else { return }
+        try rosterMarker("hold-watch", present: false)
+        try waitRosterMarker("published-rejected-watch")
+        // The released mission roster must not have replaced aaa's on screen.
+        guard words(ui, Key.id("room-tab-members"), timeout: 10,
+                    "after the held mission roster is released, aaa must still show its own two members",
+                    until: { $0 == "2 members" }) != nil else { return }
+        try rosterMarker("published-watch", present: false)
+        try waitRosterMarker("published-watch")
+        noPreexistingJoins()
+        // Replace Alice's saved instance of the same Bob-owned room while an old roster is held.
+        try staged(vox, ["room", "create", "--node", "bob", "--passphrase-file", roomPass,
+                         "--name", "instance-case"], env: voxEnv)
+        let bobRooms = try staged(vox, ["room", "list", "--node", "bob"], env: voxEnv)
+        guard let instanceRoom = bobRooms.split(separator: "\n").first(where: { $0.contains(" instance-case") })?
+            .split(whereSeparator: \.isWhitespace).first.map(String.init) else {
+            throw Apparatus("Bob's instance-case room was not created: \(bobRooms)")
+        }
+        let instanceLink = try line(staged(vox, ["room", "link", "--node", "bob", instanceRoom], env: voxEnv)) {
+            $0.hasPrefix("vox://")
+        }
+        try staged(vox, ["room", "join", "--node", "alice", "--passphrase-file", roomPass, instanceLink], env: voxEnv)
+        guard present(ui, Key.id("room-instance-case"), timeout: 90,
+                      "Alice's newly joined instance-case room must appear") else { return }
+        tap(ui, Key.id("room-instance-case"), "open Alice's first saved instance")
+        guard words(ui, Key.id("room-tab-members"), timeout: 60, "the original instance must have both members",
+                    until: { $0 == "2 members" }) != nil else { return }
+        func savedInstance() throws -> String {
+            let json = try staged(vox, ["room", "read", "--node", "alice", instanceRoom,
+                                        "--history", "status", "--json"], env: voxEnv)
+            guard let data = json.data(using: .utf8),
+                  let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let value = object["instance"] as? String, !value.isEmpty else {
+                throw Apparatus("the real room history status did not name a saved instance: \(json)")
+            }
+            return value
+        }
+        let oldInstance = try savedInstance()
+        try rosterMarker("held-watch", present: false)
+        try rosterMarker("published-rejected-watch", present: false)
+        try rosterMarker("hold-watch", present: true)
+        try waitRosterMarker("held-watch")
+        try staged(vox, ["room", "leave", "--node", "alice", instanceRoom], env: voxEnv)
+        try staged(vox, ["room", "join", "--node", "alice", "--passphrase-file", roomPass, instanceLink], env: voxEnv)
+        let replacementInstance = try savedInstance()
+        guard oldInstance != replacementInstance else {
+            throw Apparatus("leave and rejoin did not replace Alice's saved room instance")
+        }
+        guard present(ui, Key.id("room-instance-case"), timeout: 90,
+                      "the rejoined same-ID room must return to the sidebar") else { return }
+        tap(ui, Key.id("room-instance-case"), "open the replacement saved instance")
+        try rosterMarker("hold-watch", present: false)
+        try waitRosterMarker("published-rejected-watch")
+        guard words(ui, Key.id("room-tab-members"), timeout: 60, "the replacement instance must show its roster",
+                    until: { $0 == "2 members" }) != nil else { return }
+        XCTAssertNil(locate(ui, Key.id("join-\(bobFp)")),
+                     "PRODUCT: a held response from the prior saved instance must not fabricate a join")
+        // An actual admission after the replacement baseline remains observable once.
+        try staged(vox, ["room", "join", "--node", "dave", "--passphrase-file", roomPass, instanceLink], env: daveEnv)
+        guard present(ui, Key.id("join-\(daveFp)"), timeout: 90,
+                      "an admission after saved-instance replacement must have a join line") else { return }
+        for _ in 0..<2 {
+            try rosterMarker("published-watch", present: false)
+            try waitRosterMarker("published-watch")
+            XCTAssertEqual(ui.descendants(matching: .any).matching(identifier: "join-\(daveFp)").count, 1,
+                           "PRODUCT: the replacement instance's later admission must appear once")
+        }
+        // Caption authority is independent of leave/rejoin recovery (FX-54). Use a fresh
+        // room Alice has never left; the saved-instance replacement assertions stay above.
+        try staged(vox, ["room", "create", "--node", "bob", "--passphrase-file", roomPass,
+                         "--name", "drive-caption-case"], env: voxEnv)
+        let captionRooms = try staged(vox, ["room", "list", "--node", "bob"], env: voxEnv)
+        guard let captionRoom = captionRooms.split(separator: "\n").first(where: { $0.contains(" drive-caption-case") })?
+            .split(whereSeparator: \.isWhitespace).first.map(String.init) else {
+            throw Apparatus("Bob's drive-caption-case room was not created: \(captionRooms)")
+        }
+        let captionLink = try line(staged(vox, ["room", "link", "--node", "bob", captionRoom], env: voxEnv)) {
+            $0.hasPrefix("vox://")
+        }
+        try staged(vox, ["room", "join", "--node", "alice", "--passphrase-file", roomPass, captionLink], env: voxEnv)
+        guard present(ui, Key.id("room-drive-caption-case"), timeout: 90,
+                      "the fresh Drive-caption room must appear") else { return }
+        tap(ui, Key.id("room-drive-caption-case"), "open the fresh room before Dave's admission")
+        guard words(ui, Key.id("room-tab-members"), timeout: 60,
+                    "the fresh room must establish its two-member baseline",
+                    until: { $0 == "2 members" }) != nil else { return }
+        try staged(vox, ["room", "join", "--node", "dave", "--passphrase-file", roomPass, captionLink], env: daveEnv)
+        let privateCwd = scratch.appendingPathComponent("dave-private-caption-cwd").path
+        guard stager.run(["/bin/mkdir", "-p", privateCwd], env: [:]).status == 0 else {
+            throw Apparatus("cannot create the private Session cwd")
+        }
+        let privateSession = "11661166-aaaa-4bbb-8ccc-000000001166"
+        let privateInput: [String: Any] = ["session_id": privateSession, "hook_event_name": "UserPromptSubmit",
+                                           "cwd": privateCwd, "transcript_path": privateCwd + "/transcript.jsonl",
+                                           "prompt": "private caption"]
+        let hookInput = String(decoding: try JSONSerialization.data(withJSONObject: privateInput), as: UTF8.self)
+        let hookResult = run(vox, ["agent", "hook", "--node", "dave", "--room", captionRoom, "--format", "text"],
+                             env: daveEnv.merging(["CLAUDE_CODE_ENTRYPOINT": "cli"]) { $1 }, input: hookInput)
+        guard hookResult.status == 0 else { throw Apparatus("Dave's real private Session could not open: \(hookResult.out)") }
+        let privateOwn = try staged(vox, ["room", "sessions", "--node", "dave", captionRoom, "--json"], env: daveEnv)
+        guard privateOwn.contains(privateSession) else { throw Apparatus("Dave's private Session is not present: \(privateOwn)") }
+        guard present(ui, Key.id("join-\(daveFp)"), timeout: 90,
+                      "Dave's admission to the fresh room must have a join caption") else { return }
+        for _ in 0..<2 {
+            try rosterMarker("published-watch", present: false)
+            try waitRosterMarker("published-watch")
+            XCTAssertFalse(onScreen(ui).contains(privateCwd),
+                           "PRODUCT: a join caption must not reveal a Session cwd without Drive")
+        }
+        let privateList = try staged(vox, ["room", "sessions", "--node", "alice", captionRoom, "--json"], env: voxEnv)
+        XCTAssertFalse(privateList.contains(privateSession),
+                       "PRODUCT: Alice must not discover Dave's private Session without Drive")
+        let deniedDrive = run(vox, ["room", "session", "--node", "alice", captionRoom, privateSession,
+                                   "--say", "MUST-NOT-REACH-DAVE"], env: voxEnv)
+        XCTAssertNotEqual(deniedDrive.status, 0, "PRODUCT: Alice must not drive Dave's private Session")
+        // The positive control is the same real Session after both grants and Drive; the
+        // working directory is current Session state, not evidence of admission-time cwd.
+        try stagedTrustChange(vox, ["trust", "add", "--node", "alice", daveFp, "--name", "temp-dave",
+                                    "--identity-passphrase-file", alicePass], env: voxEnv)
+        try stagedTrustChange(vox, ["trust", "add", "--node", "dave", aliceFp, "--name", "alice",
+                                    "--identity-passphrase-file", davePass], env: daveEnv)
+        try stagedTrustChange(vox, ["trust", "drive", "--node", "dave", aliceFp,
+                                    "--identity-passphrase-file", davePass], env: daveEnv)
+        let visibilityDeadline = Date().addingTimeInterval(180)
+        var visibleSession = false
+        while Date() < visibilityDeadline {
+            let result = run(vox, ["room", "sessions", "--node", "alice", captionRoom, "--json"], env: voxEnv)
+            if result.status == 0 {
+                visibleSession = result.out.split(separator: "\n").contains { line in
+                    guard let data = String(line).data(using: .utf8),
+                          let row = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return false }
+                    return row["id"] as? String == privateSession && row["node"] as? String == daveFp
+                        && row["open"] as? Bool == true && row["can_drive"] as? Bool == true
+                }
+            }
+            if visibleSession { break }
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+        guard visibleSession else {
+            throw Apparatus("Alice never observed Dave's driveable Session in the fresh caption room within 180s")
+        }
+        guard words(ui, Key.id("join-\(daveFp)"), timeout: 90,
+                    "current Drive may disclose the currently active Session cwd",
+                    until: { $0.hasPrefix("Observed in this room:") && $0.contains("is working in") && $0.contains(privateCwd) }) != nil else { return }
+        try rosterMarker("held-caption", present: false)
+        try rosterMarker("published-rejected-caption", present: false)
+        try rosterMarker("hold-caption", present: true)
+        try waitRosterMarker("held-caption")
+        try stagedTrustChange(vox, ["trust", "remove", "--node", "dave", aliceFp,
+                                    "--identity-passphrase-file", davePass], env: daveEnv)
+        try stagedTrustChange(vox, ["trust", "remove", "--node", "alice", daveFp,
+                                    "--identity-passphrase-file", alicePass], env: voxEnv)
+        let withdrawnUntil = Date().addingTimeInterval(90)
+        var afterWithdrawal = "", withdrawalStatus: Int32 = -1
+        while Date() < withdrawnUntil {
+            let result = run(vox, ["room", "sessions", "--node", "alice", captionRoom, "--json"], env: voxEnv)
+            afterWithdrawal = result.out
+            withdrawalStatus = result.status
+            if withdrawalStatus == 0 && !afterWithdrawal.contains(privateSession) { break }
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+        guard withdrawalStatus == 0 && !afterWithdrawal.contains(privateSession) else {
+            throw Apparatus("Dave's withdrawn Drive still appears current to Alice: \(afterWithdrawal)")
+        }
+        tap(ui, Key.id("room-mission"), "switch while the old private caption is held")
+        try rosterMarker("hold-caption", present: false)
+        try waitRosterMarker("published-rejected-caption")
+        XCTAssertFalse(onScreen(ui).contains(privateCwd),
+                       "PRODUCT: an old-room caption must not reveal the private Session cwd after switching")
+        tap(ui, Key.id("room-mission"), "return to mission before admitting Dave")
         try staged(vox, ["room", "join", "--node", "dave", "--passphrase-file", roomPass, missionLink],
                    env: daveEnv)
         let davePremiseUntil = Date().addingTimeInterval(30)
@@ -6934,17 +7492,24 @@ final class FirstRunProof: XCTestCase {
         let daveNamed = "\(daveFp.prefix(26)) (not in keyring)"
         let joinSaid = words(ui, Key.id("join-\(daveFp)"), timeout: 90,
                              "dave joined mission while it was on screen; its timeline must say so, and that bob (whom alice trusts) trusts him: \"\(daveNamed) joined. bob trusts it.\"",
-                             until: { $0 == "\(daveNamed) joined. bob trusts it." }) ?? ""
+                             until: { $0 == "Observed in this room: \(daveNamed) joined. bob trusts it." }) ?? ""
         print("[proof] join: \(joinSaid)")
+        for _ in 0..<2 {
+            try rosterMarker("published-watch", present: false)
+            try waitRosterMarker("published-watch")
+            XCTAssertEqual(ui.descendants(matching: .any).matching(identifier: "join-\(daveFp)").count, 1,
+                           "PRODUCT: a later admission must appear exactly once after refresh")
+            noPreexistingJoins()
+        }
         // (15b, D4) Dave trusts alice; she has not trusted him. His row says so, and his card says
         // each direction and trusts him from there; the room's banner naming who does not read
         // her yet is P2's TrustBanner, proved at 5d.
-        try staged(vox, ["trust", "add", "--node", "dave", aliceFp, "--name", "alice",
-                         "--identity-passphrase-file", davePass], env: daveEnv)
+        try stagedTrustChange(vox, ["trust", "add", "--node", "dave", aliceFp, "--name", "alice",
+                                    "--identity-passphrase-file", davePass], env: daveEnv)
         let daveRow = Key.id("member-dave · \(daveFp.prefix(12))")
         let rowSaid = words(ui, daveRow, timeout: 60,
-                            "dave trusts alice and she has not trusted him: her member pane must say \"not in keyring, trusts you\"",
-                            until: { $0.hasSuffix("not in keyring, trusts you") }) ?? ""
+                            "dave trusts alice and she has not trusted him: her member pane must say \"not in keyring, room consent observed\"",
+                            until: { $0.hasSuffix("not in keyring, room consent observed") }) ?? ""
         // (15e, #624) Compare, group by group: on dave's offer, collapsed until asked for, a
         // partial entry says how far it matches.
         tap(ui, Key.id("room-mission"), "mission in the sidebar")
@@ -6959,7 +7524,7 @@ final class FirstRunProof: XCTestCase {
         tap(ui, daveRow, "dave in the member pane")
         let directions = words(ui, Key.id("card-directions"), timeout: 10,
                                "dave's card must say both directions: he trusts alice, she has not trusted him",
-                               until: { $0.contains("trusts you; you haven't trusted") }) ?? ""
+                               until: { $0.contains("Room consent") && $0.contains("haven't granted local node trust") }) ?? ""
         // The card's Copy puts the fingerprint on the pasteboard whole, as `vox trust add` takes
         // it, not the grouped form shown for reading (#662).
         tap(ui, Key.id("card-copy"), "Copy on dave's card")
@@ -7004,8 +7569,8 @@ final class FirstRunProof: XCTestCase {
             self.run(vox, ["trust", "list", "--node", "alice"], env: voxEnv).out.contains(daveFp)
         }
         let cardSaid = words(ui, Key.id("card-trust"), timeout: 60,
-                             "trusted from his card, dave, who trusts alice, must read \"dave, trusted both ways\"",
-                             until: { $0 == "dave, trusted both ways" }) ?? ""
+                             "trusted from his card, dave, who trusts alice, must read \"dave, local trust and room consent observed\"",
+                             until: { $0 == "dave, local trust and room consent observed" }) ?? ""
         let ring = run(vox, ["trust", "list", "--node", "alice"], env: voxEnv).out
         XCTAssertTrue(ring.contains(daveFp),
                       "PRODUCT: trusted from his card, dave must be in alice's keyring; `vox trust list` said: \(ring)")
@@ -7018,10 +7583,10 @@ final class FirstRunProof: XCTestCase {
         tap(ui, Key.id("keyring-row-dave"), "dave's keyring entry", premise: trusted(vox, voxEnv, daveFp, "dave"))
         let ringHead = words(ui, Key.id("keyring-card-heading"), timeout: 15,
                              "dave's keyring card must head \"dave ⇄ you\": he trusts alice too",
-                             until: { $0 == "dave, trusted both ways" }) ?? ""
+                             until: { $0 == "dave, room consent observed" }) ?? ""
         let theirs = words(ui, Key.id("keyring-card-theirs"), timeout: 5,
                            "dave's direction must say he trusts alice too",
-                           until: { $0.hasPrefix("dave trusts you too.") }) ?? ""
+                           until: { $0.hasPrefix("Reciprocal room consent from dave is observed.") }) ?? ""
         let rooms = words(ui, Key.id("keyring-card-rooms"), timeout: 15,
                           "dave's card must name the room alice shares with him, mission",
                           until: { $0.hasPrefix("Shared rooms: ") && $0.contains("mission") }) ?? ""
@@ -8027,6 +8592,27 @@ final class FirstRunProof: XCTestCase {
             throw Apparatus("`vox \(args.joined(separator: " "))` exited \(status): \(out)")
         }
         return out.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// A trust staging step a person retries: the daemon's explicit "made no change" refusal
+    /// while an earlier room change is still applying, retried for at most 60 s; anything else,
+    /// or a refusal that never clears, stays APPARATUS.
+    private func stagedTrustChange(_ vox: String, _ args: [String], env: [String: String]) throws {
+        let deadline = Date().addingTimeInterval(60)
+        var refusals = 0
+        while true {
+            do {
+                try staged(vox, args, env: env)
+                return
+            } catch let error as Apparatus {
+                guard error.why.contains("a previous change to this room is still being applied; this request made no change")
+                else { throw error }
+                refusals += 1
+                print("[proof] trust staging refusal \(refusals): \(error.why)")
+                guard Date() < deadline else { throw error }
+                Thread.sleep(forTimeInterval: 0.5)
+            }
+        }
     }
 
     /// The line of `out` that `is` picks: `vox` prints its answer on a line of its own.

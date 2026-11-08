@@ -244,6 +244,9 @@ const T_FILTERED_ROWS: u64 = 87201;
 const T_MEMBERS: u64 = 6;
 /// [`Frame::MemberConsents`] (V030-17).
 const T_CONSENTS: u64 = 3271;
+/// Atomic room membership observation and its request.
+const T_MEMBER_OBSERVATION: u64 = 11650002;
+const T_MEMBER_OBSERVATION_REQ: u64 = 11650001;
 const T_ROOMS: u64 = 7;
 
 const T_BOUND: u64 = 8;
@@ -718,6 +721,11 @@ pub enum Request {
     },
     /// The members of a room.
     Roster {
+        /// The room.
+        channel_id: Digest32,
+    },
+    /// One saved-room instance's membership and consent projection.
+    MemberObservation {
         /// The room.
         channel_id: Digest32,
     },
@@ -1650,6 +1658,9 @@ impl Request {
             Request::Roster { channel_id } => {
                 e.array(2).uint(T_ROSTER).bytes(channel_id);
             }
+            Request::MemberObservation { channel_id } => {
+                e.array(2).uint(T_MEMBER_OBSERVATION_REQ).bytes(channel_id);
+            }
             Request::KeyWaits { channel_id } => {
                 e.array(2).uint(T_KEY_WAITS_REQ).bytes(channel_id);
             }
@@ -2372,6 +2383,12 @@ impl Request {
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Roster { channel_id })
+            }
+            (T_MEMBER_OBSERVATION_REQ, 2) => {
+                let channel_id = digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::MemberObservation { channel_id })
             }
             (T_KEY_WAITS_REQ, 2) => {
                 let channel_id = digest(&mut d)?;
@@ -3354,6 +3371,19 @@ pub enum Frame {
         /// Member fingerprints, in the order the node holds them.
         members: Vec<Digest32>,
     },
+    /// One saved-room instance's membership and consent, including retained-projection failure.
+    MemberObservation {
+        /// Saved room instance.
+        instance: [u8; 16],
+        /// Current or retained room members.
+        members: Vec<Digest32>,
+        /// Members whose room consent for this identity has been observed.
+        inbound: Vec<Digest32>,
+        /// Key delivery status for this room.
+        waits: Vec<(Digest32, String)>,
+        /// Actual reason the retained projection is not current, or empty when current.
+        failure: String,
+    },
     /// The answer to a [`Request::KeyWaits`]: `(member, said)`, what is said after its name, in
     /// member order.
     KeyWaits {
@@ -3774,6 +3804,30 @@ impl Frame {
                 for m in members {
                     e.bytes(m);
                 }
+            }
+            Frame::MemberObservation {
+                instance,
+                members,
+                inbound,
+                waits,
+                failure,
+            } => {
+                e.array(6)
+                    .uint(T_MEMBER_OBSERVATION)
+                    .bytes(instance)
+                    .array(members.len());
+                for member in members {
+                    e.bytes(member);
+                }
+                e.array(inbound.len());
+                for member in inbound {
+                    e.bytes(member);
+                }
+                e.array(waits.len());
+                for (member, why) in waits {
+                    e.array(2).bytes(member).text(why);
+                }
+                e.text(failure);
             }
             Frame::KeyWaits { waits } => {
                 e.array(2).uint(T_KEY_WAITS).array(waits.len());
@@ -4845,6 +4899,47 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 members.push(digest(d)?);
             }
             return Ok(Frame::Members { members });
+        }
+        (T_MEMBER_OBSERVATION, 6) => {
+            let instance = d
+                .bytes()?
+                .try_into()
+                .map_err(|_| Error::MalformedIpc("ipc member observation instance"))?;
+            let count = d
+                .array()
+                .map_err(|_| Error::MalformedIpc("ipc observation members"))?;
+            let mut members = Vec::with_capacity(count.min(1024));
+            for _ in 0..count {
+                members.push(digest(d)?);
+            }
+            let count = d
+                .array()
+                .map_err(|_| Error::MalformedIpc("ipc observation consents"))?;
+            let mut inbound = Vec::with_capacity(count.min(1024));
+            for _ in 0..count {
+                inbound.push(digest(d)?);
+            }
+            let count = d
+                .array()
+                .map_err(|_| Error::MalformedIpc("ipc observation key waits"))?;
+            let mut waits = Vec::with_capacity(count.min(1024));
+            for _ in 0..count {
+                if d.array()
+                    .map_err(|_| Error::MalformedIpc("ipc observation key wait"))?
+                    != 2
+                {
+                    return Err(Error::MalformedIpc("ipc observation key wait"));
+                }
+                waits.push((digest(d)?, text(d, "ipc observation key wait reason")?));
+            }
+            let failure = text(d, "ipc observation failure")?;
+            return Ok(Frame::MemberObservation {
+                instance,
+                members,
+                inbound,
+                waits,
+                failure,
+            });
         }
         (T_KEY_WAITS, 2) => {
             let n = d
@@ -7004,6 +7099,7 @@ async fn serve_requests(
                 | Frame::WorkBoard { .. }
                 | Frame::Order { .. }
                 | Frame::Members { .. }
+                | Frame::MemberObservation { .. }
                 | Frame::KeyWaits { .. }
                 | Frame::MemberConsents { .. }
                 | Frame::Trusted { .. }
@@ -7597,6 +7693,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         | Request::Read { channel_id, .. }
         | Request::Order { channel_id, .. }
         | Request::Roster { channel_id, .. }
+        | Request::MemberObservation { channel_id, .. }
         | Request::KeyWaits { channel_id, .. }
         | Request::MemberConsents { channel_id, .. }
         | Request::AddService { channel_id, .. }
@@ -8838,6 +8935,45 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             {
                 Some(detail) => Frame::Members {
                     members: detail.members.clone(),
+                },
+                None => Frame::Error {
+                    reason: "room not open".into(),
+                },
+            }
+        }
+        Request::MemberObservation { channel_id } => {
+            // Proofs can fail one real authenticated RPC without replacing its data.
+            #[cfg(feature = "test-knobs")]
+            if let Some(path) = std::env::var_os("VOX_TEST_MEMBER_OBSERVATION_FAIL_FILE")
+                .filter(|path| !path.is_empty())
+                .map(std::path::PathBuf::from)
+            {
+                let room = crate::node::link::b32_encode(&channel_id);
+                if std::fs::read_to_string(&path).ok().as_deref() == Some(room.as_str())
+                    && std::fs::rename(&path, path.with_extension("consumed")).is_ok()
+                {
+                    return Frame::Error {
+                        reason: "the room membership observation was refused by the node".into(),
+                    };
+                }
+            }
+            let view = handle.view();
+            match view
+                .open_channels
+                .iter()
+                .find(|detail| detail.channel_id == channel_id)
+            {
+                Some(detail) => Frame::MemberObservation {
+                    instance: detail.history_instance,
+                    members: detail.members.clone(),
+                    inbound: detail.consenting.clone(),
+                    waits: view
+                        .key_waits
+                        .iter()
+                        .filter(|(room, _, _)| *room == channel_id)
+                        .map(|(_, member, why)| (*member, why.clone()))
+                        .collect(),
+                    failure: detail.projection_failure.clone().unwrap_or_default(),
                 },
                 None => Frame::Error {
                     reason: "room not open".into(),

@@ -613,6 +613,8 @@ pub enum GovernancePage {
 /// An open channel's full state for display.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelDetail {
+    /// Why this display is retained from an earlier projection, if it is not current.
+    pub projection_failure: Option<String>,
     /// Revocable committed saved-read lane; not an authority or a plaintext room mirror.
     pub(crate) history_read: Option<std::sync::Arc<crate::node::channel::history::ReadResource>>,
     /// Exact metadata publication that belongs to this view's Computer-policy projection.

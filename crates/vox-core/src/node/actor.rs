@@ -540,6 +540,7 @@ fn detail_of(
         }
     }
     Ok(ChannelDetail {
+        projection_failure: None,
         history_read: ch.history_read_resource(),
         history_read_revision: ch
             .history_read_resource()
@@ -8429,7 +8430,14 @@ impl Node {
                     } else {
                         false
                     };
-                    if ran || tended || sessions_changed || self.paths_moved() {
+                    // A retained projection is refreshed by the next publication's locked read.
+                    let retained = self
+                        .view_tx
+                        .borrow()
+                        .open_channels
+                        .iter()
+                        .any(|detail| detail.projection_failure.is_some());
+                    if ran || tended || sessions_changed || retained || self.paths_moved() {
                         self.publish().await;
                     }
                     // Retention on every tick: the index is ordered by age, so a pass that
@@ -24463,16 +24471,20 @@ impl Node {
                 // The summary and detail taken under this room's lock by this node's own latest write,
                 // if any, are newer than the ones last published (see `fresh_details`): a person reads
                 // their own post (read-your-writes), and the room's entry count agrees with it.
-                match self.fresh_details.get(id) {
+                let kept = match self.fresh_details.get(id) {
                     Some((summary, detail)) => {
                         summaries.insert(*id, summary.clone());
-                        open_channels.push(detail.clone());
+                        Some(detail)
                     }
-                    None => {
-                        if let Some(d) = prev.open_channels.iter().find(|d| d.channel_id == *id) {
-                            open_channels.push(d.clone());
-                        }
-                    }
+                    None => prev.open_channels.iter().find(|d| d.channel_id == *id),
+                };
+                // Not read under the lock in this publication: its membership is last-known.
+                if let Some(detail) = kept {
+                    let mut detail = detail.clone();
+                    detail.projection_failure.get_or_insert_with(|| {
+                        "the room was busy; membership is the last observed view".into()
+                    });
+                    open_channels.push(detail);
                 }
                 mlock_active &= prev.mlock_active;
                 continue;
@@ -24559,6 +24571,7 @@ impl Node {
                     summaries.insert(*id, summary_of(&ch, rows));
                     if let Some(detail) = kept {
                         let mut detail = detail.clone();
+                        detail.projection_failure = Some(error.to_string());
                         detail.history_read = ch.history_read_resource();
                         detail.history_read_revision = detail
                             .history_read

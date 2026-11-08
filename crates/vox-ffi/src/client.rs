@@ -815,6 +815,19 @@ pub struct Member {
     pub key_waits: Option<String>,
 }
 
+/// One saved-room membership projection, with its actual freshness.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct RoomMemberObservation {
+    /// Saved-room instance that owns this projection.
+    pub instance: Vec<u8>,
+    /// Members and their locally known names and key status.
+    pub members: Vec<Member>,
+    /// Members whose consent for this node is observed in this room.
+    pub inbound: Vec<String>,
+    /// Actual projection failure, or empty when current.
+    pub failure: String,
+}
+
 /// Current daemon-derived eligibility for individual Trust controls. Refresh when policy
 /// changes; the daemon separately rechecks authorization when the person performs the action.
 #[derive(Debug, Clone, uniffi::Record)]
@@ -3913,6 +3926,52 @@ impl VoxClient {
                     key_waits: waits.get(&m).cloned(),
                 })
                 .collect())
+        })
+    }
+
+    /// Read roster, reciprocal room consent and key status from one room publication.
+    ///
+    /// # Errors
+    /// A malformed room id or an unavailable node projection.
+    pub async fn room_member_observation(
+        &self,
+        room: String,
+    ) -> Result<RoomMemberObservation, VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        on_held!(self, |c| {
+            let names = names(c).await?;
+            let presented: HashMap<_, _> = c
+                .presented_names()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            let (instance, members, inbound, waits, failure) =
+                match ask(c, &Request::MemberObservation { channel_id }).await? {
+                    Frame::MemberObservation {
+                        instance,
+                        members,
+                        inbound,
+                        waits,
+                        failure,
+                    } => (instance, members, inbound, waits, failure),
+                    other => return Err(unexpected(&other)),
+                };
+            let waits: HashMap<_, _> = waits.into_iter().collect();
+            Ok(RoomMemberObservation {
+                instance: instance.to_vec(),
+                members: members
+                    .into_iter()
+                    .map(|m| Member {
+                        presented_name: presented.get(&m).cloned().unwrap_or_default(),
+                        fingerprint: b32_encode(&m),
+                        name: names.get(&m).cloned().unwrap_or_default(),
+                        key_waits: waits.get(&m).cloned(),
+                    })
+                    .collect(),
+                inbound: inbound.iter().map(b32_encode).collect(),
+                failure,
+            })
         })
     }
 

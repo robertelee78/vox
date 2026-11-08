@@ -21,6 +21,11 @@ path = "src/lib.rs"
 name = "vox"
 path = "src/main.rs"
 
+[[example]]
+name = "native_key_wait"
+path = "tests/support/native_key_wait.rs"
+required-features = ["test-knobs"]
+
 # Optional proofs: expensive real-binary proofs of user-facing claims, run by hand and blocking
 # nothing. Without the feature each one compiles a stand-in instead, ignored with the reason
 # "OPTIONAL PROOF NOT RUN" (tests/support/optional_proof.rs), so it is never silent and never red

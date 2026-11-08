@@ -181,6 +181,12 @@ private struct KeyringRow: View {
                     // ⇄ once it trusts this node back, → until then (L-4).
                     TrustMark(name: node.name,
                               trust: model.trustsBack.contains(node.fingerprint) ? .mutual : .oneWay)
+                    if let error = model.trustsBackError {
+                        Text(error).secondaryText().accessibilityIdentifier("keyring-consent-unavailable-\(node.fingerprint)")
+                    }
+                    if let error = model.keyringObservationError {
+                        Text(error).secondaryText().accessibilityIdentifier("keyring-trust-unavailable-\(node.fingerprint)")
+                    }
                     Text(Capability.words(node.drive)).secondaryText()
                         .accessibilityIdentifier("keyring-capability-\(node.name)")
                     Text(card.grouped).font(Theme.mono).textSelection(.enabled)
