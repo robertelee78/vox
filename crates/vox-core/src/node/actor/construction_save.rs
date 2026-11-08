@@ -409,7 +409,42 @@ impl Node {
         let result = Arc::new(std::sync::Mutex::new(None));
         let returned = Arc::clone(&result);
         let wake = Arc::clone(&self.post_save_wake);
+        #[cfg(feature = "test-knobs")]
+        let prelease_hold = if matches!(&work, Work::Join { .. }) {
+            (|| {
+                let spec = std::env::var("VOX_TEST_HOLD_ROOM_JOIN_AFTER_BOARD").ok()?;
+                let mut fields = spec.splitn(4, '\t');
+                let (node, arm, engaged, release) = (
+                    fields.next()?,
+                    fields.next()?,
+                    fields.next()?,
+                    fields.next()?,
+                );
+                if self.paths.profile_dir.file_name()?.to_str()? != node
+                    || std::fs::read(arm).ok()? != b"hold join before publication lease\n"
+                {
+                    return None;
+                }
+                std::fs::remove_file(arm).ok()?;
+                let _ = std::fs::remove_file(release);
+                let listener = tokio::net::UnixListener::bind(release).ok()?;
+                std::fs::write(engaged, crate::node::link::b32_encode(&room)).ok()?;
+                Some((
+                    listener,
+                    std::path::PathBuf::from(engaged),
+                    std::path::PathBuf::from(release),
+                ))
+            })()
+        } else {
+            None
+        };
         let task = tokio::spawn(async move {
+            #[cfg(feature = "test-knobs")]
+            if let Some((listener, engaged, release)) = prelease_hold {
+                let _ = listener.accept().await;
+                let _ = std::fs::remove_file(engaged);
+                let _ = std::fs::remove_file(release);
+            }
             let mut lifetime = lifetime;
             let saved = match lifetime.authority.acquire_publication().await {
                 Some(publication) => {
@@ -423,8 +458,10 @@ impl Node {
                 }
                 None => {
                     #[cfg(feature = "test-knobs")]
-                    if crate::node::computer::fx28_mutant("constructor-stale-commit")
-                        && matches!(work, Work::Create { .. })
+                    if (crate::node::computer::fx28_mutant("constructor-stale-commit")
+                        && matches!(work, Work::Create { .. }))
+                        || (crate::node::computer::fx28_mutant("stale-join-authority")
+                            && matches!(work, Work::Join { .. }))
                     {
                         let lifetime = Arc::new(lifetime);
                         let held = Arc::clone(&lifetime);

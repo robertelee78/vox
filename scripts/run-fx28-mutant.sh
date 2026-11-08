@@ -28,11 +28,19 @@ case "${1-}" in
     verdict='PRODUCT [FX28 deadline-as-storage-failure]:'
     staging='[proof] FX-28 deadline-as-storage-failure apparatus staged:'
     ;;
+  join-writer-fence|join-outcome-refusal|join-policy-not-applied)
+    mutant=$1
+    journey=two_paired_computers_that_are_idle_exchange_nothing
+    verdict='PRODUCT [FX28 join-writer-fence]:'
+    staging='[proof] FX-28 join-writer-fence apparatus staged:'
+    export VOX_PROOF_STEP=join-ordering
+    ;;
   withdrawal-not-durable)
     mutant=$1
     journey=two_paired_computers_that_are_idle_exchange_nothing
     verdict='PRODUCT [FX28 withdrawal-not-durable]:'
     staging='[proof] FX-28 withdrawal-not-durable apparatus staged:'
+    export VOX_PROOF_STEP=join-ordering
     ;;
   stale-tick-authority)
     mutant=$1
@@ -81,6 +89,7 @@ case "${1-}" in
     journey=two_paired_computers_that_are_idle_exchange_nothing
     verdict='PRODUCT [FX28 stale-join-authority]:'
     staging='[proof] FX-28 stale-join-authority apparatus staged:'
+    export VOX_PROOF_STEP=join-ordering
     ;;
   stale-post-authority)
     mutant=$1
@@ -114,6 +123,12 @@ case "${1-}" in
     verdict='PRODUCT [FX28 stale-rekey-authority]:'
     staging='[proof] FX-28 stale-rekey-authority apparatus staged:'
     ;;
+  rekey-writer-fence)
+    mutant=$1
+    journey=two_paired_computers_that_are_idle_exchange_nothing
+    verdict='PRODUCT [FX28 rekey-writer-fence]:'
+    staging='[proof] FX-28 rekey-writer-fence apparatus staged:'
+    ;;
   legacy-ended-unanswered-not-selected)
     mutant=$1
     journey=two_paired_computers_that_are_idle_exchange_nothing
@@ -121,7 +136,7 @@ case "${1-}" in
     staging='[proof] FX-28 legacy rekey route apparatus staged:'
     ;;
   *)
-    printf '%s\n' "usage: $0 preview-approval-not-durable|stopped-reader-fresh-write|lock-through-computer-write|deadline-as-storage-failure|withdrawal-not-durable|stale-tick-authority|redeem-rejects-pending-registration|owner-refusal-decoded-as-payload|due-backoff-drops-causal-cause|fresh-preview-inherits-old-deadline|detach-keeps-reconciliation|late-application-abandons-work|stale-join-authority|stale-post-authority|constructor-terminal-refusal|constructor-stale-commit|stale-trust-projection|stale-rekey-authority|legacy-ended-unanswered-not-selected" >&2
+    printf '%s\n' "usage: $0 preview-approval-not-durable|stopped-reader-fresh-write|lock-through-computer-write|deadline-as-storage-failure|join-writer-fence|join-outcome-refusal|join-policy-not-applied|withdrawal-not-durable|stale-tick-authority|redeem-rejects-pending-registration|owner-refusal-decoded-as-payload|due-backoff-drops-causal-cause|fresh-preview-inherits-old-deadline|detach-keeps-reconciliation|late-application-abandons-work|stale-join-authority|stale-post-authority|constructor-terminal-refusal|constructor-stale-commit|stale-trust-projection|rekey-writer-fence|stale-rekey-authority|legacy-ended-unanswered-not-selected" >&2
     exit 2
     ;;
 esac

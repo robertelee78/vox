@@ -423,8 +423,10 @@ impl Node {
             fields.next()?,
         );
         let mine = self.paths.profile_dir.file_name()?.to_str()?;
+        let staged = std::fs::read(arm).ok()?;
         if mine != node
-            || std::fs::read(arm).ok()?.as_slice() != b"hold delta's next policy application\n"
+            || (staged.as_slice() != b"hold delta's next policy application\n"
+                && staged.as_slice() != b"hold delta's revocation policy message\n")
         {
             return None;
         }
@@ -487,38 +489,34 @@ impl Node {
         Some(delay)
     }
 
-    /// Test apparatus: hold a real remote pause after all asynchronous admission and immediately
-    /// before its current-authority publication fence. A shipped-binary journey moves durable
-    /// Computer policy while this exact request is held, then releases it and judges the command's
-    /// user-visible answer. The knob creates no publication of its own.
-    pub(super) async fn hold_room_pause_publication_for_proof(&self) {
-        let Ok(spec) = std::env::var(TEST_HOLD_ROOM_PAUSE_PUBLICATION_ENV) else {
-            return;
-        };
+    /// Stage one validated pause without parking the actor or retaining a publication reader.
+    pub(super) fn hold_room_pause_publication_for_proof(
+        &self,
+    ) -> Option<(
+        tokio::net::UnixListener,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    )> {
+        let spec = std::env::var(TEST_HOLD_ROOM_PAUSE_PUBLICATION_ENV).ok()?;
         let mut fields = spec.splitn(4, '\t');
-        let (Some(node), Some(arm), Some(engaged), Some(release)) =
-            (fields.next(), fields.next(), fields.next(), fields.next())
-        else {
-            return;
-        };
+        let (node, arm, engaged, release) = (
+            fields.next()?,
+            fields.next()?,
+            fields.next()?,
+            fields.next()?,
+        );
         let mine = self
             .paths
             .profile_dir
             .file_name()
             .and_then(|name| name.to_str());
         if mine != Some(node) || std::fs::remove_file(arm).is_err() {
-            return;
+            return None;
         }
         let _ = std::fs::remove_file(release);
-        let Ok(listener) = tokio::net::UnixListener::bind(release) else {
-            return;
-        };
-        if std::fs::write(engaged, b"room pause publication held\n").is_err() {
-            return;
-        }
-        let _ = listener.accept().await;
-        let _ = std::fs::remove_file(engaged);
-        let _ = std::fs::remove_file(release);
+        let listener = tokio::net::UnixListener::bind(release).ok()?;
+        std::fs::write(engaged, b"room pause publication held\n").ok()?;
+        Some((listener, engaged.into(), release.into()))
     }
 
     /// Test apparatus: hold an ordinary text command after its room lock and every await, at the
@@ -554,18 +552,22 @@ impl Node {
 
     /// Test apparatus: hold a prepared sender/history-key batch after every await and immediately
     /// before its final durable-policy fence and queue admission.
-    pub(super) async fn hold_rekey_enqueue_for_proof(
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn hold_rekey_enqueue_for_proof(
         &self,
         room: Digest32,
         target: Digest32,
         legacy: bool,
+        has_lifetime: bool,
         all_sent: bool,
         live_generation: u64,
         prepared_generations: &[u64],
-    ) -> bool {
-        let Ok(spec) = std::env::var(TEST_HOLD_REKEY_ENQUEUE_ENV) else {
-            return false;
-        };
+    ) -> Option<(
+        tokio::net::UnixListener,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    )> {
+        let spec = std::env::var(TEST_HOLD_REKEY_ENQUEUE_ENV).ok()?;
         let mut fields = spec.splitn(5, '\t');
         let (Some(node), Some(arm), Some(engaged), Some(release), Some(_decision)) = (
             fields.next(),
@@ -574,7 +576,7 @@ impl Node {
             fields.next(),
             fields.next(),
         ) else {
-            return false;
+            return None;
         };
         let mine = self
             .paths
@@ -584,9 +586,13 @@ impl Node {
         let armed_target = std::fs::read_to_string(arm).ok();
         let target = crate::node::link::b32_encode(&target);
         let room = crate::node::link::b32_encode(&room);
-        let expected = format!("{target}\t{room}");
+        let expected = if has_lifetime {
+            format!("{target}\t{room}")
+        } else {
+            format!("{target}\t{room}\tautomatic")
+        };
         if mine != Some(node) || armed_target.as_deref().map(str::trim) != Some(expected.as_str()) {
-            return false;
+            return None;
         }
         if !legacy || !all_sent || !prepared_generations.contains(&live_generation) {
             crate::node::computer::publish_proof_fault(
@@ -595,22 +601,13 @@ impl Node {
                     "exact sender-key batch could not stage: node={node} peer={target} room={room} legacy={legacy} complete={all_sent} live_generation={live_generation} prepared_generations={prepared_generations:?}"
                 ),
             );
-            return false;
+            return None;
         }
-        if std::fs::remove_file(arm).is_err() {
-            return false;
-        }
+        std::fs::remove_file(arm).ok()?;
         let _ = std::fs::remove_file(release);
-        let Ok(listener) = tokio::net::UnixListener::bind(release) else {
-            return false;
-        };
-        if std::fs::write(engaged, b"rekey enqueue held\n").is_err() {
-            return false;
-        }
-        let _ = listener.accept().await;
-        let _ = std::fs::remove_file(engaged);
-        let _ = std::fs::remove_file(release);
-        true
+        let listener = tokio::net::UnixListener::bind(release).ok()?;
+        std::fs::write(engaged, b"rekey enqueue held\n").ok()?;
+        Some((listener, engaged.into(), release.into()))
     }
 
     pub(super) fn mark_rekey_authority_decision_for_proof(&self, published: bool) {

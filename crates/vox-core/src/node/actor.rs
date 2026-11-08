@@ -854,6 +854,10 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::SessionProjection { .. } => "reading bounded Session metadata",
         NetEvent::SessionFiles { .. } => "reading bounded Session file offers",
         NetEvent::MemberDialer(_) => "lending the proxy its dialer",
+        #[cfg(feature = "test-knobs")]
+        NetEvent::HeldRoomPause { .. } => "resuming a held room pause",
+        #[cfg(feature = "test-knobs")]
+        NetEvent::HeldRekey { .. } => "resuming a held sender-key batch",
         NetEvent::ComputerPolicy { .. } => "applying computer trust",
         NetEvent::ConstructorPolicyFailed { .. } => "retiring a failed constructor policy",
         NetEvent::LocalTrustBlacklist(_) => "reading local trust removal decisions",
@@ -1239,6 +1243,22 @@ async fn run_session_worker(
 /// Work the network produced that only the actor can handle, because it needs
 /// channel state (ADR-016: the actor stays the single writer).
 enum NetEvent {
+    #[cfg(feature = "test-knobs")]
+    HeldRoomPause {
+        channel_id: Digest32,
+        by: Digest32,
+        paused: bool,
+        selection: vox_agentcomms::drive::PauseSelection,
+        authority: computer::ComputerAuthority,
+        publication_guard: std::fs::File,
+        reply: oneshot::Sender<Result<vox_agentcomms::drive::PauseSelection, Fault>>,
+    },
+    #[cfg(feature = "test-knobs")]
+    HeldRekey {
+        target: Box<consent_release::HeldRekeyTarget>,
+        authority: Option<computer::ComputerAuthority>,
+        owns_reader: bool,
+    },
     PrivateSessionAsk {
         peer: Digest32,
         ask: crate::node::sessionstream::Ask,
@@ -2060,6 +2080,16 @@ enum NetEvent {
 impl NetEvent {
     /// Only snapshot/transport work may pass an admitted save's store writer.
     fn waits_for_store(&self) -> bool {
+        #[cfg(feature = "test-knobs")]
+        if matches!(
+            self,
+            Self::HeldRekey {
+                owns_reader: true,
+                ..
+            }
+        ) {
+            return false;
+        }
         !matches!(
             self,
             Self::Names(_)
@@ -8025,11 +8055,64 @@ impl Node {
                 publication_guard,
                 reply,
             } => {
+                #[cfg(feature = "test-knobs")]
+                if let (Some(paused), Some(_)) = (paused, publication_guard.as_ref()) {
+                    let authorized = self
+                        .profile
+                        .as_ref()
+                        .filter(|p| p.is_unlocked())
+                        .is_some_and(|profile| {
+                            by == profile.fingerprint() || self.trust.has_drive(&by)
+                        });
+                    if authorized {
+                        let selection = self
+                            .room_pause(&channel_id, by, None, expected_instance, expected, None)
+                            .await;
+                        if let (Ok(selection), Some(authority)) =
+                            (selection, self.computer_authority())
+                        {
+                            if authority.current() {
+                                if let Some((listener, engaged, release)) =
+                                    self.hold_room_pause_publication_for_proof()
+                                {
+                                    let tx = self.net_tx.clone();
+                                    let Some(publication_guard) = publication_guard else {
+                                        return Outcome::Failed(Fault::Internal);
+                                    };
+                                    tokio::spawn(async move {
+                                        let _ = listener.accept().await;
+                                        let _ = std::fs::remove_file(engaged);
+                                        let _ = std::fs::remove_file(release);
+                                        let _ = tx
+                                            .send(NetEvent::HeldRoomPause {
+                                                channel_id,
+                                                by,
+                                                paused,
+                                                selection,
+                                                authority,
+                                                publication_guard,
+                                                reply,
+                                            })
+                                            .await;
+                                    });
+                                    return Outcome::Done;
+                                }
+                            }
+                        }
+                    }
+                }
                 let result = if paused.is_some() && publication_guard.is_none() {
                     Err(Fault::Internal)
                 } else {
-                    self.room_pause(&channel_id, by, paused, expected_instance, expected)
-                        .await
+                    #[cfg(feature = "test-knobs")]
+                    let result = self
+                        .room_pause(&channel_id, by, paused, expected_instance, expected, None)
+                        .await;
+                    #[cfg(not(feature = "test-knobs"))]
+                    let result = self
+                        .room_pause(&channel_id, by, paused, expected_instance, expected)
+                        .await;
+                    result
                 };
                 drop(publication_guard);
                 let _ = reply.send(result);
@@ -12976,6 +13059,35 @@ impl Node {
                 }
                 .await;
                 let _ = reply.send(result);
+            }
+            #[cfg(feature = "test-knobs")]
+            NetEvent::HeldRoomPause {
+                channel_id,
+                by,
+                paused,
+                selection,
+                authority,
+                publication_guard,
+                reply,
+            } => {
+                let result = self
+                    .room_pause(
+                        &channel_id,
+                        by,
+                        Some(paused),
+                        Some(selection.instance),
+                        Some(selection),
+                        Some(authority),
+                    )
+                    .await;
+                drop(publication_guard);
+                let _ = reply.send(result);
+            }
+            #[cfg(feature = "test-knobs")]
+            NetEvent::HeldRekey {
+                target, authority, ..
+            } => {
+                self.resume_held_rekey(*target, authority).await;
             }
             NetEvent::ComputerPolicy {
                 guard,
@@ -22065,6 +22177,7 @@ impl Node {
         paused: Option<bool>,
         expected_instance: Option<[u8; 16]>,
         expected: Option<vox_agentcomms::drive::PauseSelection>,
+        #[cfg(feature = "test-knobs")] held_authority: Option<computer::ComputerAuthority>,
     ) -> Result<vox_agentcomms::drive::PauseSelection, Fault> {
         let profile = self
             .profile
@@ -22104,17 +22217,17 @@ impl Node {
             return Err(Fault::ReadSelectionChanged);
         }
         if let Some(paused) = paused {
-            #[cfg(feature = "test-knobs")]
-            self.hold_room_pause_publication_for_proof().await;
             let write = || ch.set_room_pause(profile.store(), paused, by, (self.millis_clock)());
             // The room lock is already held and every await is complete. Physical publication
             // admission never waits on actor; its lease prevents durable policy movement through
             // the pause write without retaining the Computer state lock. The local
             // owner is fenced too: Computer policy authorizes the node identity, not just remote
             // agents acting through it.
-            let written = self
-                .computer_authority()
-                .and_then(|authority| authority.publish_room_pause(write));
+            #[cfg(feature = "test-knobs")]
+            let authority = held_authority.or_else(|| self.computer_authority());
+            #[cfg(not(feature = "test-knobs"))]
+            let authority = self.computer_authority();
+            let written = authority.and_then(|authority| authority.publish_room_pause(write));
             match written {
                 None => return Err(Fault::Refused),
                 Some(Ok(())) => {}

@@ -9,6 +9,8 @@ use maintenance_save::{Lifetime, Saved, Work};
 mod outbound;
 mod rekeys;
 pub(super) use rekeys::RekeyAfter;
+#[cfg(feature = "test-knobs")]
+pub(super) use rekeys::Target as HeldRekeyTarget;
 
 type Cursor = Arc<std::sync::Mutex<Owed>>;
 type Reply = Option<oneshot::Sender<Outcome>>;
@@ -1139,6 +1141,10 @@ impl Node {
         route: Offline,
         lifetime: Option<Arc<Lifetime>>,
     ) {
+        #[cfg(feature = "test-knobs")]
+        if self.fx28_rekey_pause == Some((room, peer)) {
+            return;
+        }
         let Some(instance) = self.channels.get(&room).cloned() else {
             return;
         };
