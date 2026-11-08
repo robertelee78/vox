@@ -6264,6 +6264,60 @@ pub async fn anchors(
     }
 }
 
+/// Apply exact room-member governance on the attached node.
+pub async fn member_governance(
+    paths: &Paths,
+    room: &str,
+    fingerprint: &str,
+    readmit: bool,
+) -> Result<(), AppError> {
+    let member = crate::tunnel_cli::parse_fingerprint(fingerprint)?;
+    let mut client = attach(paths).await?;
+    let channel_id = room_of(&mut client, room).await?;
+    let action = if readmit { "readmit" } else { "remove" };
+    eprintln!(
+        "vox: {action} member {} in room {}",
+        claim::b32(&member),
+        claim::b32(&channel_id)
+    );
+    eprintln!(
+        "     Other rooms and global trust are unchanged; past disclosures cannot be recalled."
+    );
+    eprintln!("     A same-name replacement has a different fingerprint and is not this node.");
+    if readmit {
+        eprintln!("     Readmission does not restore history; access still requires ordinary admission and trust checks.");
+    } else {
+        eprintln!("     Already readable history remains.");
+    }
+    let request = if readmit {
+        Request::ReadmitRoomMember { channel_id, member }
+    } else {
+        Request::RemoveRoomMember { channel_id, member }
+    };
+    match client.request(&request).await {
+        Ok(Frame::Appended { entry }) => {
+            println!(
+                "vox: {action} applied locally for {} in room {}",
+                claim::b32(&member),
+                claim::b32(&channel_id)
+            );
+            println!(
+                "     signed entry {}; propagation to other nodes is unknown",
+                claim::b32(&entry)
+            );
+            if readmit {
+                println!("     Readmission does not restore history; ordinary authorization and trust checks still apply.");
+            }
+            Ok(())
+        }
+        Ok(Frame::Error { reason }) => {
+            Err(AppError::Usage(format!("cannot {action} member: {reason}")))
+        }
+        Ok(other) => Err(crate::client::unexpected(&other)),
+        Err(e) => Err(AppError::Usage(e.to_string())),
+    }
+}
+
 /// `vox room rename` — give a room a new name, for every member (ADR-028 R-1).
 ///
 /// # Errors
@@ -6729,6 +6783,7 @@ pub async fn trust_add(
             );
             if full_history {
                 println!("     with full history: it may also read what you wrote before now");
+                println!("     In rooms that removed this identity, readmission does not restore earlier history.");
             }
             println!(
                 "     it may now read what you write in {} — now and later",
@@ -7171,7 +7226,13 @@ pub fn print_identity(
 /// told in time (the node then leaves as soon as one can be).
 pub async fn leave(paths: &Paths, room: &str) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
-    let channel_id = room_of(&mut client, room).await?;
+    let (channel_id, pending_only) = match room_of(&mut client, room).await {
+        Ok(id) => (id, false),
+        Err(error) => match b32_decode(room, "room") {
+            Ok(id) => (id, true),
+            Err(_) => return Err(error),
+        },
+    };
     let name = rooms_of(&mut client)
         .await?
         .into_iter()
@@ -7186,8 +7247,8 @@ pub async fn leave(paths: &Paths, room: &str) -> Result<(), AppError> {
     // What it is to do, said before it is done (ADR-028 E-5).
     let services = offered_in(&mut client, channel_id).await;
     println!(
-        "vox: about to leave {which}: its other members are to see that you left, and this node \
-         is to delete it with everything it holds of it"
+        "vox: about to leave {which}, or cancel its retained pending admission: this node will \
+         delete the local room and queue its own member withdrawal"
     );
     if !services.is_empty() {
         println!(
@@ -7197,8 +7258,11 @@ pub async fn leave(paths: &Paths, room: &str) -> Result<(), AppError> {
     }
     match client.request(&Request::Leave { channel_id }).await {
         Ok(Frame::Ok) => {
-            println!("vox: left {which}");
-            println!("     its other members see that you left; this node no longer holds it");
+            if pending_only {
+                println!("vox: cancelled the pending admission for {which}; its member withdrawal is queued");
+            } else {
+                println!("vox: left {which} or cancelled its pending admission; its member withdrawal is queued");
+            }
             if !services.is_empty() {
                 println!(
                     "     your services there are no longer offered: {}",

@@ -118,6 +118,15 @@ impl CachedQuery {
         if self.target == *root {
             return Ok(Some(Grant::root()));
         }
+        // Coordinate-only cache keys cannot represent the distinct hashes at a
+        // forked position. Query the checked hash-aware scope directly instead.
+        if writer.first(Table::ForkBoundary, None)?.is_some() {
+            self.normalized = true;
+            let query = self
+                .query
+                .get_or_insert_with(|| Query::new(self.scope, self.target));
+            return query.advance(writer, root, now_ms, generation);
+        }
         if !self.normalized {
             self.normalize(writer)?;
             return Ok(None);

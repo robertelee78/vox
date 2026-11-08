@@ -16,6 +16,7 @@ use zeroize::Zeroizing;
 const KIND: SegmentKind = SegmentKind::GovernanceIndex;
 const HEADER: u64 = 0;
 const HEADER_BYTES: usize = 1024;
+pub(super) const FORK_LOCATOR: u64 = 1 << 63;
 /// The derived index's own format. 5 adds the canonical projection fingerprint used to publish
 /// semantic revisions only after the authorized fold completes. 4 (v0.4.6, ADR-037 R2c) added
 /// the control settlement queue.
@@ -126,16 +127,60 @@ pub(super) enum Table {
     /// Latest authenticated sequence for each single-writer slot. Kept apart from its semantic
     /// table so a newer repetition can block late older rows without revising the projected value.
     CurrentHeads,
+    /// Authenticated member-removal source locators, keyed by target and entry hash.
+    MemberRemovals,
+    /// Authenticated readmission source locators, keyed by target and entry hash.
+    MemberReadmissions,
+    /// Generation-stamped checked member-fact decisions.
+    MemberDecisions,
+    /// Current effective removals, keyed by target, stamped with their fold generation.
+    CurrentRemoved,
+    /// Earliest proven divergence (or the conservative unknown-prefix boundary) per author.
+    ForkBoundary,
+    /// Authenticated, non-LogDb exclusion evidence from the other fork branch.
+    ForkExclusions,
+    /// Exact authenticated hash for each causal frontier coordinate.
+    FrontierHashes,
+    /// Creator revocations carried on authenticated alternate branches.
+    ForkRevocations,
+    /// Accepted source locators, including non-governance entries.
+    SourceHashes,
+    SourcePositions,
+    /// Exact-entry projection work and published generation-stamped decisions.
+    EligibilityPending,
+    EligibilityDecisions,
+    /// FIFO by source locator, independent of entry hash distribution.
+    EligibilityOrder,
+    /// Missing or unvalidated ancestry; such sources confer no authority.
+    Incomplete,
+    /// Reverse dependencies from an exact parent hash to a retained fork fact.
+    #[allow(dead_code)] // Reserved sealed root slot; removing it would shift later roots.
+    ForkDependencies,
+    /// G-31 eligibility of a signed Session floor for its named recipient.
+    FloorRecipientDecisions,
+    /// Local sender position when an exact verified removal was first applied.
+    SenderRemovalCuts,
+    /// Every verified sender Presence, keyed by author and signed sequence.
+    SenderPresence,
+    /// Generation-stamped history-body cut for each once-removed target: the latest, across
+    /// its validated removals, of each removal's earliest covering creator readmission. One
+    /// extra room row (nonzero key tail) keeps the latest such cut for local authoring.
+    RecipientCuts,
 }
 
-const TABLES: usize = Table::CurrentHeads as usize + 1;
+const TABLES: usize = Table::RecipientCuts as usize + 1;
 
 #[derive(Clone, Copy)]
 pub(super) enum Cursor {
     Canonical,
     Evaluation,
+    Membership,
+    ForkReplay,
+    ForkEvidence,
+    Eligibility,
+    EligibilityReplay,
 }
-const CURSORS: usize = Cursor::Evaluation as usize + 1;
+const CURSORS: usize = Cursor::EligibilityReplay as usize + 1;
 const CURSOR_BYTES: usize = 2048;
 
 #[derive(Clone)]
@@ -296,8 +341,9 @@ impl Header {
         // Format 3 had every table but the control settlement queue, which is read as empty.
         let stored = d.array()?;
         if stored != TABLES
-            && !(version == HEADER_VERSION_WITH_CONTROL_QUEUE && stored == TABLES - 1)
-            && !(version == HEADER_VERSION_BEFORE_CONTROL_QUEUE && stored == TABLES - 2)
+            && !(version == HEADER_VERSION && (41..TABLES).contains(&stored))
+            && !(version == HEADER_VERSION_WITH_CONTROL_QUEUE && stored == 40)
+            && !(version == HEADER_VERSION_BEFORE_CONTROL_QUEUE && stored == 39)
         {
             return Err(invalid("governance root count"));
         }
@@ -305,11 +351,12 @@ impl Header {
         for root in roots.iter_mut().take(stored) {
             *root = d.uint()?;
         }
-        if d.array()? != CURSORS {
+        let stored_cursors = d.array()?;
+        if !(2..=CURSORS).contains(&stored_cursors) {
             return Err(invalid("governance cursor count"));
         }
         let mut cursors = [0; CURSORS];
-        for cursor in &mut cursors {
+        for cursor in cursors.iter_mut().take(stored_cursors) {
             *cursor = d.uint()?;
         }
         let through = d.uint()?;
@@ -383,6 +430,20 @@ impl Header {
         {
             return Err(invalid("governance header bounds"));
         }
+        // A header sealed before RecipientCuts existed may hold a finished membership fold that
+        // never wrote those rows. Only a room with an indexed removal can need one: begin a new
+        // authority generation there, exactly as an expiry does, so every stamped row reads
+        // Refreshing until the existing driver refolds and stamps it.
+        let authority_generation = if initialized
+            && stored <= Table::RecipientCuts as usize
+            && roots[Table::MemberRemovals as usize] != 0
+        {
+            authority_generation
+                .checked_add(1)
+                .ok_or(invalid("governance authority generation exhausted"))?
+        } else {
+            authority_generation
+        };
         Ok(Self {
             next,
             roots,
@@ -410,8 +471,58 @@ impl Header {
     }
 }
 
+/// Check the published fold barrier, not physical LogDb staging. A local append's
+/// sealed promotion is already in LogDb before its source receipt and effects publish.
+pub(super) fn settled_in(batch: &Batch<'_>, sek: &Sek, room: &Digest32) -> Result<bool> {
+    let Some(sealed) = batch.get_segment(room, KIND, HEADER)? else {
+        return Ok(false);
+    };
+    let header = Header::parse(&open_segment(sek, KIND, HEADER, &sealed)?)?;
+    Ok(header.initialized
+        && header.cursors[Cursor::ForkReplay as usize] == 0
+        && header.cursors[Cursor::ForkEvidence as usize] == 0
+        && header.order_ready
+        && header.evaluated == header.ordered
+        && header.authority_folded == header.authority_generation
+        && header.head_generation == header.authority_generation)
+}
+
+enum ReadSnapshot<'a> {
+    Owned(Snapshot),
+    Borrowed(&'a Snapshot),
+    Batch(&'a Batch<'a>),
+}
+
+impl ReadSnapshot<'_> {
+    fn get_segment(
+        &self,
+        room: &Digest32,
+        kind: SegmentKind,
+        id: u64,
+    ) -> Result<Option<crate::atrest::store::SealedSegment>> {
+        match self {
+            Self::Owned(snapshot) => snapshot.get_segment(room, kind, id),
+            Self::Borrowed(snapshot) => snapshot.get_segment(room, kind, id),
+            Self::Batch(batch) => batch.get_segment(room, kind, id),
+        }
+    }
+
+    fn segment_id_after(
+        &self,
+        room: &Digest32,
+        kind: SegmentKind,
+        after: Option<u64>,
+    ) -> Result<Option<u64>> {
+        match self {
+            Self::Owned(snapshot) => snapshot.segment_id_after(room, kind, after),
+            Self::Borrowed(snapshot) => snapshot.segment_id_after(room, kind, after),
+            Self::Batch(batch) => batch.segment_id_after(room, kind, after),
+        }
+    }
+}
+
 pub(super) struct Read<'a> {
-    input: Snapshot,
+    input: ReadSnapshot<'a>,
     sek: &'a Sek,
     room: &'a Digest32,
     header: Header,
@@ -419,21 +530,78 @@ pub(super) struct Read<'a> {
 
 impl<'a> Read<'a> {
     pub(super) fn open(store: &Store, sek: &'a Sek, room: &'a Digest32) -> Result<Self> {
-        let input = store.snapshot()?;
+        Self::open_existing(store, sek, room)?.ok_or(invalid("governance header missing"))
+    }
+    pub(super) fn from_snapshot(
+        input: &'a Snapshot,
+        sek: &'a Sek,
+        room: &'a Digest32,
+    ) -> Result<Self> {
         let header = input
             .get_segment(room, KIND, HEADER)?
             .map(|sealed| Header::parse(&open_segment(sek, KIND, HEADER, &sealed)?))
             .transpose()?
             .ok_or(invalid("governance header missing"))?;
         Ok(Self {
-            input,
+            input: ReadSnapshot::Borrowed(input),
             sek,
             room,
             header,
         })
     }
+    pub(super) fn from_batch(
+        input: &'a Batch<'a>,
+        sek: &'a Sek,
+        room: &'a Digest32,
+    ) -> Result<Self> {
+        Self::from_batch_existing(input, sek, room)?.ok_or(invalid("governance header missing"))
+    }
+    /// A room with no derived header has indexed no removal yet; callers decide that case.
+    pub(super) fn open_existing(
+        store: &Store,
+        sek: &'a Sek,
+        room: &'a Digest32,
+    ) -> Result<Option<Self>> {
+        let input = store.snapshot()?;
+        let Some(sealed) = input.get_segment(room, KIND, HEADER)? else {
+            return Ok(None);
+        };
+        let header = Header::parse(&open_segment(sek, KIND, HEADER, &sealed)?)?;
+        Ok(Some(Self {
+            input: ReadSnapshot::Owned(input),
+            sek,
+            room,
+            header,
+        }))
+    }
+    pub(super) fn from_batch_existing(
+        input: &'a Batch<'a>,
+        sek: &'a Sek,
+        room: &'a Digest32,
+    ) -> Result<Option<Self>> {
+        let Some(sealed) = input.get_segment(room, KIND, HEADER)? else {
+            return Ok(None);
+        };
+        let header = Header::parse(&open_segment(sek, KIND, HEADER, &sealed)?)?;
+        Ok(Some(Self {
+            input: ReadSnapshot::Batch(input),
+            sek,
+            room,
+            header,
+        }))
+    }
     fn tree(&self) -> session_tree::Read<'_> {
-        session_tree::Read::snapshot(&self.input, self.sek, self.room, KIND)
+        match &self.input {
+            ReadSnapshot::Owned(snapshot) => {
+                session_tree::Read::snapshot(snapshot, self.sek, self.room, KIND)
+            }
+            ReadSnapshot::Borrowed(snapshot) => {
+                session_tree::Read::snapshot(snapshot, self.sek, self.room, KIND)
+            }
+            ReadSnapshot::Batch(batch) => {
+                session_tree::Read::batch(batch, self.sek, self.room, KIND)
+            }
+        }
     }
 
     pub(super) fn get(&self, table: Table, key: &session_tree::Key) -> Result<Option<u64>> {
@@ -463,6 +631,7 @@ impl<'a> Read<'a> {
         self.tree()
             .last_before(self.header.roots[table as usize], before)
     }
+
     pub(super) fn record(&self, id: u64) -> Result<Zeroizing<Vec<u8>>> {
         if id == 0 || id >= self.header.next {
             return Err(invalid("governance record id"));
@@ -478,6 +647,40 @@ impl<'a> Read<'a> {
         Ok(bytes)
     }
     pub(super) fn entry(&self, log: u64) -> Result<crate::log::entry::Entry> {
+        if log & FORK_LOCATOR != 0 {
+            let id = log & !FORK_LOCATOR;
+            let sealed = self
+                .input
+                .get_segment(self.room, KIND, id)?
+                .ok_or(invalid("fork exclusion missing"))?;
+            let bytes = open_segment(self.sek, KIND, id, &sealed)?;
+            let mut d = Decoder::new(&bytes);
+            if d.array()? != 4 || d.uint()? != 2 {
+                return Err(invalid("fork exclusion format"));
+            }
+            let entry = crate::log::entry::Entry::from_wire(d.bytes()?)?;
+            match d.array()? {
+                0 => {}
+                1 => {
+                    let _ = d.bytes()?;
+                }
+                _ => return Err(invalid("fork exclusion context")),
+            }
+            match d.array()? {
+                0 => {}
+                1 => {
+                    let _ = d.bytes()?;
+                }
+                _ => return Err(invalid("fork exclusion receipt")),
+            }
+            d.finish()?;
+            if entry.skeleton.channel_id != *self.room
+                || self.get(Table::ForkExclusions, &hash_key(&entry.entry_hash()))? != Some(id)
+            {
+                return Err(invalid("fork exclusion binding"));
+            }
+            return Ok(entry);
+        }
         let sealed = self
             .input
             .get_segment(self.room, SegmentKind::LogDb, log)?
@@ -485,11 +688,73 @@ impl<'a> Read<'a> {
         let bytes = open_segment(self.sek, SegmentKind::LogDb, log, &sealed)?;
         let entry = crate::log::entry::Entry::from_wire(&bytes)?;
         if entry.skeleton.channel_id != *self.room
-            || self.locator(&entry.entry_hash())? != Some(log)
+            || (self.locator(&entry.entry_hash())? != Some(log)
+                && self.get(Table::SourceHashes, &hash_key(&entry.entry_hash()))? != Some(log))
         {
             return Err(invalid("governance source binding"));
         }
         Ok(entry)
+    }
+    /// Strict ancestry on one pinned verified projection. `None` is missing
+    /// branch evidence, never permission to treat a fork as a linear feed.
+    /// Only the ancestor's exact signed identity (author, position, hash) is used.
+    pub(super) fn causal_contains(
+        &self,
+        scope: &Digest32,
+        ancestor: &crate::log::history::EntryReference,
+    ) -> Result<Option<bool>> {
+        if *scope == ancestor.hash {
+            return Ok(Some(false));
+        }
+        if self.get(Table::Complete, &hash_key(scope))?.is_none()
+            || self.get(Table::Incomplete, &hash_key(scope))?.is_some()
+            || self.get(Table::Pending, &hash_key(scope))?.is_some()
+        {
+            return Ok(None);
+        }
+        let author = &ancestor.author;
+        let key = frontier(scope, author);
+        let reached = self.get(Table::Frontiers, &key)?.unwrap_or(0);
+        if reached < ancestor.seq {
+            return Ok(Some(false));
+        }
+        let Some(boundary) = self.get(Table::ForkBoundary, &hash_key(author))? else {
+            return Ok(Some(true));
+        };
+        let Some(record) = self.get(Table::FrontierHashes, &key)? else {
+            return Ok(None);
+        };
+        let bytes = self.record(record)?;
+        let head: Digest32 = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| invalid("frontier hash"))?;
+        if reached == ancestor.seq {
+            return Ok(Some(head == ancestor.hash));
+        }
+        if reached == boundary && ancestor.seq < boundary {
+            if let Some(id) = self.get(Table::ForkExclusions, &hash_key(&head))? {
+                let branch = self.entry(id | FORK_LOCATOR)?;
+                if branch.skeleton.author_id == *author && branch.skeleton.seq == boundary {
+                    let Some(log) =
+                        self.get(Table::SourcePositions, &position(author, ancestor.seq))?
+                    else {
+                        return Ok(None);
+                    };
+                    return Ok(Some(self.entry(log)?.entry_hash() == ancestor.hash));
+                }
+            }
+        }
+        let Some(head_log) = self.get(Table::SourcePositions, &position(author, reached))? else {
+            return Ok(None);
+        };
+        if self.entry(head_log)?.entry_hash() != head {
+            return Ok(None);
+        }
+        let Some(log) = self.get(Table::SourcePositions, &position(author, ancestor.seq))? else {
+            return Ok(None);
+        };
+        Ok(Some(self.entry(log)?.entry_hash() == ancestor.hash))
     }
     pub(super) fn authority_generation(&self) -> u64 {
         self.header.authority_generation
@@ -525,12 +790,17 @@ impl<'a> Read<'a> {
 
     pub(super) fn pending(&self) -> bool {
         self.header.roots[Table::Pending as usize] != 0
+            || self.header.roots[Table::EligibilityPending as usize] != 0
+            || self.header.cursors[Cursor::EligibilityReplay as usize] != 0
+            || self.header.cursors[Cursor::Eligibility as usize] != 0
             || !self.header.initialized
             || !self.settled()
     }
 
     pub(super) fn settled(&self) -> bool {
         self.header.initialized
+            && self.header.cursors[Cursor::ForkReplay as usize] == 0
+            && self.header.cursors[Cursor::ForkEvidence as usize] == 0
             && self.header.order_ready
             && self.header.evaluated == self.header.ordered
             && self.header.authority_folded == self.header.authority_generation
@@ -597,6 +867,26 @@ impl<'a, 'store> Write<'a, 'store> {
             room,
             header,
             control_only: false,
+        })
+    }
+
+    /// Fence in-flight room egress in the same transaction that publishes a changed
+    /// validated membership projection.
+    pub(super) fn advance_removal_generation(&mut self) -> Result<u64> {
+        let key = super::removal_generation_key(self.room);
+        self.batch.update_meta(&key, |old| {
+            let generation = match old {
+                None => 0,
+                Some(bytes) => u64::from_be_bytes(
+                    bytes
+                        .try_into()
+                        .map_err(|_| invalid("room removal generation length"))?,
+                ),
+            };
+            let next = generation
+                .checked_add(1)
+                .ok_or(invalid("room removal generation exhausted"))?;
+            Ok((next.to_be_bytes().to_vec(), next))
         })
     }
 
@@ -708,6 +998,190 @@ impl<'a, 'store> Write<'a, 'store> {
         Ok(id)
     }
 
+    /// Record the exact applied removal and the local sender position in the
+    /// same durable batch. This is an observation boundary, not a claim that an
+    /// off-line peer learned the removal at that position.
+    pub(super) fn record_sender_cut(&mut self, hash: &Digest32, target: &Digest32) -> Result<()> {
+        let key = hash_key(hash);
+        if self.get(Table::SenderRemovalCuts, &key)?.is_some() {
+            return Ok(());
+        }
+        let Some(segment) = self.batch.get_segment(
+            self.room,
+            SegmentKind::KeyMaterial,
+            super::super::SEG_SENDER,
+        )?
+        else {
+            return Err(invalid("removal sender boundary unavailable"));
+        };
+        let bytes = open_segment(
+            self.sek,
+            SegmentKind::KeyMaterial,
+            super::super::SEG_SENDER,
+            &segment,
+        )?;
+        let sender = crate::group::state::SenderChain::from_state(&bytes)?;
+        let entitlement = self
+            .batch
+            .get_segment(
+                self.room,
+                SegmentKind::KeyMaterial,
+                super::super::SEG_ENTITLED,
+            )?
+            .map(|segment| {
+                let bytes = open_segment(
+                    self.sek,
+                    SegmentKind::KeyMaterial,
+                    super::super::SEG_ENTITLED,
+                    &segment,
+                )?;
+                Ok::<_, Error>(super::super::parse_positions(&bytes)?.get(target).copied())
+            })
+            .transpose()?
+            .flatten();
+        let mut e = Encoder::new();
+        e.array(6)
+            .uint(2)
+            .bytes(target)
+            .bytes(&sender.author_id())
+            .uint(sender.chain_id())
+            .uint(sender.next_iteration());
+        match entitlement {
+            Some((chain, iteration)) => {
+                e.array(2).uint(chain).uint(iteration);
+            }
+            None => {
+                e.array(0);
+            }
+        }
+        let record = self.save_record(None, &e.finish())?;
+        self.put(Table::SenderRemovalCuts, key, Some(record))?;
+        self.batch.ruled();
+        Ok(())
+    }
+
+    /// Retain one authenticated alternate fork body without inserting it into
+    /// accepted log positions. The proof itself remains in SEG_FORKS.
+    pub(super) fn retain_fork_exclusion(
+        &mut self,
+        entry: &crate::log::entry::Entry,
+        context: Option<&crate::log::history::ControlContext>,
+        receipt: Option<&[u8]>,
+    ) -> Result<bool> {
+        if context.is_some() != receipt.is_some() {
+            return Err(invalid("fork provenance pairing"));
+        }
+        let hash = entry.entry_hash();
+        let key = hash_key(&hash);
+        let old = self.get(Table::ForkExclusions, &key)?;
+        if let Some(id) = old {
+            let (_, held_context) = self.fork_exclusion(id)?;
+            if held_context.is_some() || context.is_none() {
+                return Ok(false);
+            }
+        }
+        let id = match old {
+            Some(id) => id,
+            None => {
+                let id = self.header.next;
+                self.header.next = id
+                    .checked_add(1)
+                    .ok_or(invalid("governance allocator exhausted"))?;
+                id
+            }
+        };
+        let mut encoded = Encoder::new();
+        encoded.array(4).uint(2).bytes(&entry.to_wire());
+        match context {
+            Some(context) => {
+                encoded.array(1).bytes(&context.to_wire()?);
+            }
+            None => {
+                encoded.array(0);
+            }
+        }
+        match receipt {
+            Some(receipt) => {
+                encoded.array(1).bytes(receipt);
+            }
+            None => {
+                encoded.array(0);
+            }
+        }
+        self.batch.put_segment(
+            self.room,
+            KIND,
+            id,
+            &seal_segment(self.sek, KIND, id, &encoded.finish())?,
+        )?;
+        self.put(Table::ForkExclusions, key, Some(id))?;
+        Ok(true)
+    }
+
+    pub(super) fn fork_exclusion(
+        &self,
+        id: u64,
+    ) -> Result<(
+        crate::log::entry::Entry,
+        Option<crate::log::history::ControlContext>,
+    )> {
+        if id == 0 || id >= self.header.next {
+            return Err(invalid("fork exclusion locator"));
+        }
+        let sealed = self
+            .batch
+            .get_segment(self.room, KIND, id)?
+            .ok_or(invalid("fork exclusion missing"))?;
+        let bytes = open_segment(self.sek, KIND, id, &sealed)?;
+        let mut d = Decoder::new(&bytes);
+        if d.array()? != 4 || d.uint()? != 2 {
+            return Err(invalid("fork exclusion format"));
+        }
+        let entry = crate::log::entry::Entry::from_wire(d.bytes()?)?;
+        let context = match d.array()? {
+            0 => None,
+            1 => Some(crate::log::history::ControlContext::from_wire(d.bytes()?)?),
+            _ => return Err(invalid("fork exclusion context")),
+        };
+        let receipt = match d.array()? {
+            0 => None,
+            1 => Some(crate::log::history::IncludedHeader::from_authenticated_receipt(d.bytes()?)?),
+            _ => return Err(invalid("fork exclusion receipt")),
+        };
+        if context.is_some() != receipt.is_some()
+            || receipt
+                .as_ref()
+                .is_some_and(|proof| proof.header().entry().entry_hash() != entry.entry_hash())
+        {
+            return Err(invalid("fork exclusion provenance binding"));
+        }
+        d.finish()?;
+        if entry.skeleton.channel_id != *self.room
+            || self.get(Table::ForkExclusions, &hash_key(&entry.entry_hash()))? != Some(id)
+        {
+            return Err(invalid("fork exclusion binding"));
+        }
+        Ok((entry, context))
+    }
+
+    /// Resolve an authenticated source or a proof-backed branch with a complete
+    /// causal context, without inserting the branch into accepted positions.
+    pub(super) fn evidence_locator(&self, hash: &Digest32) -> Result<Option<u64>> {
+        if let Some(log) = self.get(Table::SourceHashes, &hash_key(hash))? {
+            return Ok(Some(log));
+        }
+        if self.get(Table::Complete, &hash_key(hash))?.is_none() {
+            return Ok(None);
+        }
+        let Some(id) = self.get(Table::ForkExclusions, &hash_key(hash))? else {
+            return Ok(None);
+        };
+        if id & FORK_LOCATOR != 0 {
+            return Err(invalid("fork exclusion locator overflow"));
+        }
+        Ok(Some(id | FORK_LOCATOR))
+    }
+
     pub(super) fn reached(&self, entry: &Digest32, author: &Digest32) -> Result<u64> {
         if !self.causal_settled()? || self.get(Table::Complete, &hash_key(entry))?.is_none() {
             return Err(invalid("governance causal facts not settled"));
@@ -715,6 +1189,64 @@ impl<'a, 'store> Write<'a, 'store> {
         Ok(self
             .get(Table::Frontiers, &frontier(entry, author))?
             .unwrap_or(0))
+    }
+
+    /// A sequence comparison is sufficient only before equivocation. Once a
+    /// fork is known, the signed coordinate's exact hash must bind the branch.
+    pub(super) fn causal_contains(
+        &self,
+        scope: &Digest32,
+        ancestor: &crate::log::entry::Entry,
+    ) -> Result<bool> {
+        let ancestor_hash = ancestor.entry_hash();
+        if *scope == ancestor_hash {
+            return Ok(false);
+        }
+        let author = &ancestor.skeleton.author_id;
+        let reached = self.reached(scope, author)?;
+        if reached < ancestor.skeleton.seq {
+            return Ok(false);
+        }
+        let Some(boundary) = self.get(Table::ForkBoundary, &hash_key(author))? else {
+            return Ok(true);
+        };
+        let Some(head) = self.frontier_identity(scope, author)? else {
+            return Ok(false);
+        };
+        if reached == ancestor.skeleton.seq {
+            return Ok(head == ancestor_hash);
+        }
+        if reached == boundary && ancestor.skeleton.seq < boundary {
+            if let Some(id) = self.get(Table::ForkExclusions, &hash_key(&head))? {
+                let (branch, _) = self.fork_exclusion(id)?;
+                if branch.skeleton.author_id == *author && branch.skeleton.seq == boundary {
+                    let Some(log) = self.get(
+                        Table::SourcePositions,
+                        &position(author, ancestor.skeleton.seq),
+                    )?
+                    else {
+                        return Ok(false);
+                    };
+                    return Ok(self.entry(log)?.entry_hash() == ancestor_hash);
+                }
+            }
+        }
+        // A canonical accepted feed supplies a verified hash-linked prefix. Do
+        // not infer ancestry through a different or unavailable branch head.
+        let Some(head_log) = self.get(Table::SourcePositions, &position(author, reached))? else {
+            return Ok(false);
+        };
+        if self.entry(head_log)?.entry_hash() != head {
+            return Ok(false);
+        }
+        let Some(ancestor_log) = self.get(
+            Table::SourcePositions,
+            &position(author, ancestor.skeleton.seq),
+        )?
+        else {
+            return Ok(false);
+        };
+        Ok(self.entry(ancestor_log)?.entry_hash() == ancestor_hash)
     }
 
     pub(super) fn cursor(&self, cursor: Cursor) -> Result<Option<Zeroizing<Vec<u8>>>> {
@@ -753,6 +1285,250 @@ impl<'a, 'store> Write<'a, 'store> {
         )
     }
 
+    pub(super) fn clear_cursor(&mut self, cursor: Cursor) -> Result<()> {
+        let id = self.header.cursors[cursor as usize];
+        if id != 0 {
+            self.delete_record(id)?;
+            self.header.cursors[cursor as usize] = 0;
+        }
+        Ok(())
+    }
+
+    pub(super) fn start_eligibility_replay(&mut self) -> Result<()> {
+        let mut e = Encoder::new();
+        e.array(4)
+            .uint(1)
+            .uint(self.authority_generation())
+            .uint(0)
+            .uint(self.header.known_tail);
+        self.save_cursor(Cursor::EligibilityReplay, &e.finish())
+    }
+
+    pub(super) fn eligibility_replay_step(
+        &mut self,
+        input: &super::super::entry_store::Read<'_>,
+    ) -> Result<bool> {
+        use crate::log::entry::EntryRead;
+        let Some(bytes) = self.cursor(Cursor::EligibilityReplay)? else {
+            return Ok(false);
+        };
+        let mut d = Decoder::new(&bytes);
+        if d.array()? != 4 || d.uint()? != 1 {
+            return Err(invalid("eligibility replay cursor"));
+        }
+        let generation = d.uint()?;
+        let after = d.uint()?;
+        let tail = d.uint()?;
+        d.finish()?;
+        if generation != self.authority_generation() {
+            self.clear_cursor(Cursor::EligibilityReplay)?;
+            return Ok(true);
+        }
+        let Some(log) = self
+            .batch
+            .segment_id_after(self.room, SegmentKind::LogDb, Some(after))?
+        else {
+            self.clear_cursor(Cursor::EligibilityReplay)?;
+            return Ok(true);
+        };
+        if log > tail {
+            self.clear_cursor(Cursor::EligibilityReplay)?;
+            return Ok(true);
+        }
+        let entry = self.source_entry(log)?;
+        let hash = entry.entry_hash();
+        if input.clock(&hash)?.is_some() {
+            self.observe_source(log, &entry)?;
+            if self.get(Table::Hashes, &hash_key(&hash))? == Some(log)
+                && matches!(
+                    crate::governance::entry::GovEntry::body_bound_to(&entry),
+                    Ok(crate::governance::entry::GovBody::Presence(_))
+                )
+            {
+                self.put(
+                    Table::SenderPresence,
+                    position(&entry.skeleton.author_id, entry.skeleton.seq),
+                    Some(log),
+                )?;
+            }
+            if self.get(Table::Complete, &hash_key(&hash))?.is_some()
+                && self.get(Table::Pending, &hash_key(&hash))?.is_none()
+            {
+                self.queue_eligibility(&hash, log)?;
+            } else if self.get(Table::Pending, &hash_key(&hash))?.is_none() {
+                self.enqueue(&hash, log, super::is_control(&entry))?;
+            }
+        }
+        let mut e = Encoder::new();
+        e.array(4).uint(1).uint(generation).uint(log).uint(tail);
+        self.save_cursor(Cursor::EligibilityReplay, &e.finish())?;
+        Ok(true)
+    }
+
+    /// Reconstruct exact signed coordinate hashes after a newly proven fork.
+    pub(super) fn start_fork_replay(&mut self) -> Result<()> {
+        let mut e = Encoder::new();
+        e.array(3).uint(1).uint(0).uint(self.header.known_tail);
+        self.save_cursor(Cursor::ForkReplay, &e.finish())?;
+        let mut e = Encoder::new();
+        e.array(4).uint(1).array(0).array(0).uint(0);
+        self.save_cursor(Cursor::ForkEvidence, &e.finish())
+    }
+
+    /// Inspect one retained source row; cursor and queue changes commit together.
+    pub(super) fn fork_replay_step(
+        &mut self,
+        input: &super::super::entry_store::Read<'_>,
+    ) -> Result<bool> {
+        use crate::log::entry::EntryRead;
+        let Some(bytes) = self.cursor(Cursor::ForkReplay)? else {
+            return Ok(false);
+        };
+        let mut d = Decoder::new(&bytes);
+        if d.array()? != 3 || d.uint()? != 1 {
+            return Err(invalid("fork replay cursor"));
+        }
+        let after = d.uint()?;
+        let tail = d.uint()?;
+        d.finish()?;
+        let Some(id) = self
+            .batch
+            .segment_id_after(self.room, SegmentKind::LogDb, Some(after))?
+        else {
+            let cursor = self.header.cursors[Cursor::ForkReplay as usize];
+            self.delete_record(cursor)?;
+            self.header.cursors[Cursor::ForkReplay as usize] = 0;
+            return Ok(true);
+        };
+        if id > tail {
+            self.clear_cursor(Cursor::ForkReplay)?;
+            return Ok(true);
+        }
+        let entry = self.source_entry(id)?;
+        let hash = entry.entry_hash();
+        if input.clock(&hash)?.is_some() {
+            self.observe_source(id, &entry)?;
+            if self.get(Table::Pending, &hash_key(&hash))?.is_none() {
+                self.enqueue(&hash, id, super::is_control(&entry))?;
+            }
+        }
+        let mut e = Encoder::new();
+        e.array(3).uint(1).uint(id).uint(tail);
+        self.save_cursor(Cursor::ForkReplay, &e.finish())?;
+        Ok(true)
+    }
+
+    /// Index one coordinate from a proof-backed sparse fork context. The
+    /// context was obtained from ValidatedSparseEntry and sealed with the proof.
+    pub(super) fn fork_evidence_step(&mut self) -> Result<bool> {
+        let Some(bytes) = self.cursor(Cursor::ForkEvidence)? else {
+            return Ok(false);
+        };
+        let mut d = Decoder::new(&bytes);
+        if d.array()? != 4 || d.uint()? != 1 {
+            return Err(invalid("fork evidence cursor"));
+        }
+        let mut after = read_hash(&mut d)?;
+        let mut current = read_hash(&mut d)?;
+        let mut at = d.uint()?;
+        d.finish()?;
+        if current.is_none() {
+            let row = self.first(Table::ForkExclusions, after.map(|hash| hash_key(&hash)))?;
+            let Some((key, _)) = row else {
+                let cursor = self.header.cursors[Cursor::ForkEvidence as usize];
+                self.delete_record(cursor)?;
+                self.header.cursors[Cursor::ForkEvidence as usize] = 0;
+                return Ok(true);
+            };
+            let hash: Digest32 = key[..32]
+                .try_into()
+                .map_err(|_| invalid("fork evidence hash"))?;
+            if key[32..].iter().any(|byte| *byte != 0) {
+                return Err(invalid("fork evidence key"));
+            }
+            current = Some(hash);
+            at = 0;
+        }
+        let hash = current.ok_or(invalid("fork evidence cursor hash"))?;
+        let id = self
+            .get(Table::ForkExclusions, &hash_key(&hash))?
+            .ok_or(invalid("fork evidence source missing"))?;
+        let (entry, context) = self.fork_exclusion(id)?;
+        if let Some(context) = context {
+            let v2 = entry
+                .skeleton
+                .v2
+                .as_ref()
+                .ok_or(invalid("fork context without v2"))?;
+            if context.hash() != v2.pre_context
+                || context.room != *self.room
+                || context.scope != v2.scope
+            {
+                return Err(invalid("fork context binding"));
+            }
+            let index = usize::try_from(at).map_err(|_| invalid("fork context cursor"))?;
+            let coordinate = if index == 0 {
+                Some((entry.skeleton.author_id, entry.skeleton.seq, hash))
+            } else {
+                context
+                    .coordinates
+                    .get(index - 1)
+                    .map(|c| (c.author, c.seq, c.hash))
+            };
+            if let Some((author, seq, identity)) = coordinate {
+                let key = frontier(&hash, &author);
+                let held = self.get(Table::Frontiers, &key)?.unwrap_or(0);
+                if seq > held {
+                    self.put(Table::Frontiers, key, Some(seq))?;
+                    let old = self.get(Table::FrontierHashes, &key)?;
+                    let record = self.save_record(old, &identity)?;
+                    self.put(Table::FrontierHashes, key, Some(record))?;
+                }
+                at = at
+                    .checked_add(1)
+                    .ok_or(invalid("fork context cursor overflow"))?;
+            } else {
+                if id & FORK_LOCATOR != 0 {
+                    return Err(invalid("fork source locator overflow"));
+                }
+                self.put(Table::Complete, hash_key(&hash), Some(1))?;
+                match crate::governance::entry::GovEntry::body_bound_to(&entry)? {
+                    crate::governance::entry::GovBody::MemberRemoval(body) => {
+                        self.put(
+                            Table::MemberRemovals,
+                            frontier(&body.target_id, &hash),
+                            Some(id | FORK_LOCATOR),
+                        )?;
+                    }
+                    crate::governance::entry::GovBody::AdminRevocation(_) => {
+                        self.put(
+                            Table::ForkRevocations,
+                            hash_key(&hash),
+                            Some(id | FORK_LOCATOR),
+                        )?;
+                    }
+                    _ => return Err(invalid("fork exclusion kind")),
+                }
+                after = Some(hash);
+                current = None;
+                at = 0;
+            }
+        } else {
+            // G-29: an alternate exclusion without proven strict-prefix issuer
+            // authority is inert; it must not block the room or its named target.
+            after = Some(hash);
+            current = None;
+            at = 0;
+        }
+        let mut e = Encoder::new();
+        e.array(4).uint(1);
+        write_hash(&mut e, after);
+        write_hash(&mut e, current);
+        e.uint(at);
+        self.save_cursor(Cursor::ForkEvidence, &e.finish())?;
+        Ok(true)
+    }
+
     pub(super) fn delete_record(&mut self, id: u64) -> Result<()> {
         if id == 0 || id >= self.header.next {
             return Err(invalid("governance record id"));
@@ -765,6 +1541,9 @@ impl<'a, 'store> Write<'a, 'store> {
     /// Signature verification happened before publishing `Hashes`; this is not
     /// a second copy of the log and cannot hide a missing/changed source record.
     pub(super) fn entry(&self, log: u64) -> Result<crate::log::entry::Entry> {
+        if log & FORK_LOCATOR != 0 {
+            return Ok(self.fork_exclusion(log & !FORK_LOCATOR)?.0);
+        }
         let sealed = self
             .batch
             .get_segment(self.room, SegmentKind::LogDb, log)?
@@ -772,7 +1551,8 @@ impl<'a, 'store> Write<'a, 'store> {
         let bytes = open_segment(self.sek, SegmentKind::LogDb, log, &sealed)?;
         let entry = crate::log::entry::Entry::from_wire(&bytes)?;
         if entry.skeleton.channel_id != *self.room
-            || self.get(Table::Hashes, &hash_key(&entry.entry_hash()))? != Some(log)
+            || (self.get(Table::Hashes, &hash_key(&entry.entry_hash()))? != Some(log)
+                && self.get(Table::SourceHashes, &hash_key(&entry.entry_hash()))? != Some(log))
         {
             return Err(invalid("governance source binding"));
         }
@@ -806,6 +1586,74 @@ impl<'a, 'store> Write<'a, 'store> {
             .transpose()?
             .map(Some)
             .ok_or(invalid("governance source replay row missing"))
+    }
+
+    /// Retain exact locators for all accepted source skeletons, including content.
+    pub(super) fn observe_source(
+        &mut self,
+        log: u64,
+        entry: &crate::log::entry::Entry,
+    ) -> Result<()> {
+        if log == 0 || log & FORK_LOCATOR != 0 || entry.skeleton.seq == 0 {
+            return Err(invalid("source locator bounds"));
+        }
+        let hash = hash_key(&entry.entry_hash());
+        let pos = position(&entry.skeleton.author_id, entry.skeleton.seq);
+        if self
+            .get(Table::SourceHashes, &hash)?
+            .is_some_and(|old| old != log)
+            || self
+                .get(Table::SourcePositions, &pos)?
+                .is_some_and(|old| old != log)
+        {
+            return Err(invalid("source locator conflict"));
+        }
+        self.put(Table::SourceHashes, hash, Some(log))?;
+        self.put(Table::SourcePositions, pos, Some(log))
+    }
+
+    pub(super) fn needs_source_replay(&self) -> bool {
+        self.header.known_tail != 0
+            && self.header.roots[Table::SourceHashes as usize] == 0
+            && self.header.cursors[Cursor::EligibilityReplay as usize] == 0
+    }
+
+    pub(super) fn queue_eligibility(&mut self, hash: &Digest32, log: u64) -> Result<()> {
+        self.put(Table::EligibilityPending, hash_key(hash), Some(log))?;
+        self.put(Table::EligibilityOrder, pending_key(log, hash), Some(log))
+    }
+
+    pub(super) fn finish_eligibility(&mut self, hash: &Digest32, log: u64) -> Result<()> {
+        if self.get(Table::EligibilityPending, &hash_key(hash))? == Some(log) {
+            self.put(Table::EligibilityPending, hash_key(hash), None)?;
+            self.put(Table::EligibilityOrder, pending_key(log, hash), None)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn eligibility_replaying(&self) -> bool {
+        self.header.cursors[Cursor::EligibilityReplay as usize] != 0
+    }
+
+    pub(super) fn set_incomplete(&mut self, hash: &Digest32, incomplete: bool) -> Result<bool> {
+        let key = hash_key(hash);
+        if self.get(Table::Incomplete, &key)?.is_some() == incomplete {
+            return Ok(false);
+        }
+        self.put(Table::Incomplete, key, incomplete.then_some(1))?;
+        if let Some(log) = self.get(Table::Hashes, &key)? {
+            let body = crate::governance::entry::GovEntry::body_bound_to(&self.entry(log)?)?;
+            if !Self::current_input_kind(&body) {
+                self.changed()?;
+                self.put(Table::Dirty, key, Some(log))?;
+            }
+            if self.get(Table::AuthorityHashes, &key)?.is_some()
+                || matches!(body, crate::governance::entry::GovBody::Presence(_))
+            {
+                self.authority_changed()?;
+            }
+        }
+        Ok(true)
     }
 
     /// Recover a publication that has no live observation yet. Snapshot the
@@ -887,6 +1735,8 @@ impl<'a, 'store> Write<'a, 'store> {
             Table::PendingOrder
         };
         Ok(self.header.initialized
+            && self.header.cursors[Cursor::ForkReplay as usize] == 0
+            && self.header.cursors[Cursor::ForkEvidence as usize] == 0
             && self
                 .first(queue, None)?
                 .is_none_or(|(key, _)| pending_log(&key) > self.header.barrier))
@@ -982,6 +1832,20 @@ impl<'a, 'store> Write<'a, 'store> {
             }
             GovBody::AdminRevocation(_) => {
                 self.put(Table::AllRevocations, hash_key(hash), Some(log))?;
+            }
+            GovBody::MemberRemoval(removal) => {
+                self.put(
+                    Table::MemberRemovals,
+                    frontier(&removal.target_id, hash),
+                    Some(log),
+                )?;
+            }
+            GovBody::MemberReadmission(readmission) => {
+                self.put(
+                    Table::MemberReadmissions,
+                    frontier(&readmission.target_id, hash),
+                    Some(log),
+                )?;
             }
             _ => return Ok(()),
         }
@@ -1232,6 +2096,20 @@ impl<'a, 'store> Write<'a, 'store> {
             .ok_or(invalid("governance authority generation exhausted"))?;
         Ok(())
     }
+    /// Only the verified common author-chain prefix retains non-exclusion authority.
+    pub(super) fn fork_safe(&self, entry: &crate::log::entry::Entry) -> Result<bool> {
+        Ok(self
+            .get(Table::ForkBoundary, &hash_key(&entry.skeleton.author_id))?
+            .is_none_or(|boundary| entry.skeleton.seq < boundary))
+    }
+
+    /// A mismatched predecessor proves no shared prefix. A branch at sequence
+    /// one needs none; all other such branches lack enough own-history evidence.
+    pub(super) fn fork_prefix_available(&self, entry: &crate::log::entry::Entry) -> Result<bool> {
+        Ok(self
+            .get(Table::ForkBoundary, &hash_key(&entry.skeleton.author_id))?
+            .is_none_or(|boundary| boundary != 1 || entry.skeleton.seq == 1))
+    }
 
     pub(super) fn authority_generation(&self) -> u64 {
         self.header.authority_generation
@@ -1324,7 +2202,7 @@ impl<'a, 'store> Write<'a, 'store> {
         Ok(())
     }
 
-    fn display_changed(&mut self) -> Result<()> {
+    pub(super) fn display_changed(&mut self) -> Result<()> {
         self.header.display_revision = self
             .header
             .display_revision
@@ -1442,6 +2320,7 @@ impl<'a, 'store> Write<'a, 'store> {
     pub(super) fn finish_work(&mut self) -> Result<()> {
         let work = &self.header.work;
         let entry = work.entry.ok_or(invalid("governance work missing"))?;
+        let log = work.log;
         let key = hash_key(&entry);
         let order_key = pending_key(work.log, &entry);
         let queued = self
@@ -1466,6 +2345,7 @@ impl<'a, 'store> Write<'a, 'store> {
                 key,
                 Some(queued),
             )?;
+            self.queue_eligibility(&entry, log)?;
         }
         self.header.work = Work::default();
         Ok(())
@@ -1501,7 +2381,33 @@ impl<'a, 'store> Write<'a, 'store> {
         frontier_row(entry, item)
     }
 
-    pub(super) fn raise(&mut self, entry: &Digest32, author: &Digest32, seq: u64) -> Result<bool> {
+    pub(super) fn frontier_identity(
+        &self,
+        entry: &Digest32,
+        author: &Digest32,
+    ) -> Result<Option<Digest32>> {
+        let Some(record) = self.get(Table::FrontierHashes, &frontier(entry, author))? else {
+            return Ok(None);
+        };
+        let bytes = self.record(record)?;
+        if bytes.is_empty() || bytes.as_slice() == [0] {
+            return Ok(None);
+        }
+        Ok(Some(
+            bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| invalid("frontier identity"))?,
+        ))
+    }
+
+    pub(super) fn raise(
+        &mut self,
+        entry: &Digest32,
+        author: &Digest32,
+        seq: u64,
+        identity: Option<Digest32>,
+    ) -> Result<bool> {
         if self.header.work.entry != Some(*entry) {
             return Err(invalid("governance frontier outside its work"));
         }
@@ -1510,11 +2416,31 @@ impl<'a, 'store> Write<'a, 'store> {
             .tree()
             .find(self.header.roots[Table::Frontiers as usize], &key)?
             .unwrap_or(0);
-        if seq <= held {
+        if seq < held {
             return Ok(false);
         }
-        self.header.roots[Table::Frontiers as usize] =
-            self.set_root(self.header.roots[Table::Frontiers as usize], key, Some(seq))?;
+        let old = self.get(Table::FrontierHashes, &key)?;
+        let prior = old.map(|id| self.record(id)).transpose()?;
+        let next: &[u8] = if seq > held {
+            identity.as_ref().map_or(&[], |hash| hash.as_slice())
+        } else {
+            match (
+                prior.as_ref().map(|value| value.as_slice()),
+                identity.as_ref(),
+            ) {
+                (Some([0]), _) => return Ok(false),
+                (Some(bytes), Some(hash)) if bytes.len() == 32 && bytes != hash => &[0],
+                (Some(bytes), _) if bytes.len() == 32 => return Ok(false),
+                (_, Some(hash)) => hash.as_slice(),
+                _ => return Ok(false),
+            }
+        };
+        let record = self.save_record(old, next)?;
+        self.put(Table::FrontierHashes, key, Some(record))?;
+        if seq > held {
+            self.header.roots[Table::Frontiers as usize] =
+                self.set_root(self.header.roots[Table::Frontiers as usize], key, Some(seq))?;
+        }
         self.header.work.changed = true;
         if let Some(log) = self.get(Table::Hashes, &hash_key(entry))? {
             let source = self.entry(log)?;

@@ -1183,6 +1183,7 @@ impl Node {
             let credit = PairwiseCredit {
                 _node: node_credit,
                 _peer: peer_credit,
+                room_fence: None,
             };
             let secret = tokio::select! {
                 biased;
@@ -1513,7 +1514,13 @@ impl Node {
             });
             return;
         };
-        if channel.has_left(&channel.me()) || !channel.is_member(&peer) || channel.has_left(&peer) {
+        if channel.has_left(&channel.me())
+            || !self.profile.as_ref().is_some_and(|profile| {
+                channel
+                    .recovery_standing(profile.store(), &peer)
+                    .unwrap_or(false)
+            })
+        {
             self.retire_own_key_donor_busy(key);
             return;
         }
@@ -1584,7 +1591,7 @@ impl Node {
                             let peer = peer.acquire_owned().await.ok()?;
                             let node = node.acquire_owned().await.ok()?;
                             let queue = queue.reserve_owned().await.ok()?;
-                            Some(Some(PairwiseAdmission { queue, job: PairwiseCredit { _node: node, _peer: peer }, delivery: None }))
+                            Some(Some(PairwiseAdmission { queue, job: PairwiseCredit { _node: node, _peer: peer, room_fence: None }, delivery: None }))
                         }
                     }
                 } => match result {
@@ -1770,7 +1777,11 @@ impl Node {
             return;
         };
         let context = match room.try_lock() {
-            Ok(channel) if channel.is_member(&peer) && !channel.has_left(&peer) => {
+            Ok(channel)
+                if channel
+                    .recovery_standing(&lifetime.store, &peer)
+                    .unwrap_or(false) =>
+            {
                 channel.join_context()
             }
             Ok(_) => {
@@ -2003,8 +2014,9 @@ impl Node {
         };
         let current = current
             && !channel.has_left(&node)
-            && channel.is_member(&peer)
-            && !channel.has_left(&peer)
+            && channel
+                .recovery_standing(&lifetime.store, &peer)
+                .unwrap_or(false)
             && channel
                 .join_context()
                 .is_ok_and(|current| current == context);
@@ -2227,7 +2239,11 @@ impl Node {
             return;
         };
         if channel.has_left(&ready.node)
-            || !channel.is_member(&ready.peer)
+            || !self.profile.as_ref().is_some_and(|profile| {
+                channel
+                    .recovery_standing(profile.store(), &ready.peer)
+                    .unwrap_or(false)
+            })
             || !channel
                 .join_context()
                 .is_ok_and(|context| context == ready.context)
@@ -2465,7 +2481,7 @@ pub(super) fn prepare_donor_reply(
     sealed: &[u8],
     now: u64,
 ) -> crate::error::Result<crate::node::pairwise_stream::PairwiseFrame> {
-    if channel.join_context()? != *context || !channel.is_member(&peer) || channel.has_left(&peer) {
+    if channel.join_context()? != *context || !channel.recovery_standing(store, &peer)? {
         return Err(Error::Unreachable(
             "the recovery requester is not a current room member",
         ));

@@ -230,6 +230,11 @@ relay circuit.
     fact pending and inert; re-evaluate it when ancestry arrives. Signed negative evidence MUST
     survive local cache retraction and board recovery when available. Unrelated members and rooms
     MUST NOT be suppressed by a per-member removal.
+    Public board membership follows the last applied removal generation, not whether unrelated
+    received rows have finished folding. Pending causal work MUST NOT hide an unremoved member's
+    valid records. Publication withdrawal, a locked or revoked room secret, an unreadable store
+    or a changed removal generation still fail closed. Private key and content egress retain
+    their stricter current-authorization checks.
 
     A nonmember anchor board retains N-27's existing signature, genesis and vouch discovery
     validation; it is not room-authorization authority and is not required to hold the room log.
@@ -277,7 +282,9 @@ relay circuit.
     `REJECTED <reason>`, and `GET <channelID, epoch, kinds>`, answered with `RECORD` frames then
     `END`.
   - The reasons MUST be `NotMember` 1, `Malformed` 2, `Policy` 3, `Capacity` 4, `UnknownKind` 5,
-    `Stale` 6, `Withdrawn` 7 and `Clock` 8. `Clock` means the signed publication timestamp is
+    `Stale` 6, `Withdrawn` 7, `Clock` 8 and `RoomAuthorization` 9. The last means a member
+    board's validated removal or unfinished fold refused current authorization; it is not a
+    verdict about the passphrase. `Clock` means the signed publication timestamp is
     outside the board's accepted window (future by more than N-27's tolerance, or already
     expired), so the publisher can diagnose its clock instead of seeing generic policy.
   - A joiner's pre-join `PUT` MAY treat only `Stale` as success, because that response proves this

@@ -22,6 +22,9 @@ const SEG_PRIVATE_PULLS: u64 = 23;
 const WORK_ROWS: usize = 32;
 const WORK_BYTES: usize = 1024 * 1024;
 const TRUST_CHANGED: &str = "private trust incarnation changed";
+const PULL_MARKS_PER_DONOR: usize = 32;
+const PULL_CHECKPOINT_BYTES: usize = AUTHORS_HARD_LIMIT * (2048 + PULL_MARKS_PER_DONOR * 256) + 256;
+const PROJECTION_UNAVAILABLE: Digest32 = [0; 32];
 
 pub(crate) enum PrivatePullIntent {
     Due(u64),
@@ -29,6 +32,454 @@ pub(crate) enum PrivatePullIntent {
     Ineligible,
 }
 type TrustNonce = Option<[u8; crate::atrest::sek::NONCE_LEN]>;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PullEvidence {
+    floor_revision: u64,
+    authority_generation: u64,
+    membership: u64,
+    release: Digest32,
+    trust: TrustNonce,
+}
+
+#[derive(Clone)]
+struct PullMark {
+    incarnation: Digest32,
+    position: u64,
+    author: Digest32,
+    chain: u64,
+    evidence: PullEvidence,
+    projection_wait: Option<Digest32>,
+}
+
+/// One independent, constant-size overflow obligation. It never widens the main
+/// floor/evidence range, and a completed interval stays dormant on unchanged openings.
+#[derive(Clone)]
+struct PullProjection {
+    range: (u64, u64),
+    basis: Digest32,
+    active_basis: Option<Digest32>,
+    successor_basis: Option<Digest32>,
+    scan_after: Option<u64>,
+    scan_through: Option<u64>,
+}
+
+#[derive(Clone)]
+struct PullDemand {
+    incarnation: Digest32,
+    marks: BTreeMap<Digest32, PullMark>,
+    range: Option<(u64, u64)>,
+    scan_after: Option<u64>,
+    scan_through: Option<u64>,
+    pending: Vec<Locator>,
+    completed_stamp: Option<Digest32>,
+    active_stamp: Option<Digest32>,
+    successor_stamp: Option<Digest32>,
+    unidentified: bool,
+    rediscover: bool,
+    projection: Option<PullProjection>,
+    // Last inventory kind, also the owner of pending: alternate independent intervals.
+    pending_projection: bool,
+}
+
+impl PullDemand {
+    fn extend_range(&mut self, lo: u64, hi: u64, stamp: Option<Digest32>, unscanned: bool) {
+        let previous = self.range;
+        self.range = Some(match previous {
+            Some((first, last)) => (first.min(lo), last.max(hi)),
+            None => (lo, hi),
+        });
+        if let Some(active) = self.active_stamp {
+            if let Some(stamp) = stamp {
+                self.successor_stamp = (stamp != active).then_some(stamp);
+            }
+        } else if let Some(completed) = self.completed_stamp {
+            if stamp == Some(completed) {
+                let frontier = self
+                    .scan_after
+                    .or(previous.map(|(_, last)| last))
+                    .unwrap_or(lo - 1);
+                if unscanned && hi > frontier {
+                    // Keep the old unresolved prefix and its evidence baseline. Only the
+                    // newly exposed tail is work until a genuinely new baseline arrives.
+                    self.active_stamp = Some(completed);
+                    self.scan_after = Some(frontier.max(lo - 1));
+                    self.scan_through = Some(hi);
+                } else if !unscanned {
+                    self.scan_after = Some(frontier.max(hi));
+                }
+            }
+        } else if previous.is_none() && !unscanned {
+            self.completed_stamp = stamp;
+            self.scan_after = Some(hi);
+        }
+    }
+
+    fn extend_projection(&mut self, position: u64, basis: Digest32) {
+        if let Some(projection) = &mut self.projection {
+            projection.range.0 = projection.range.0.min(position);
+            projection.range.1 = projection.range.1.max(position);
+            if let Some(active) = projection.active_basis {
+                projection.successor_basis = (active != basis).then_some(basis);
+            }
+        } else {
+            self.projection = Some(PullProjection {
+                range: (position, position),
+                basis,
+                active_basis: None,
+                successor_basis: None,
+                scan_after: Some(position),
+                scan_through: None,
+            });
+        }
+    }
+
+    fn finish_scan(&mut self) {
+        if !self.pending.is_empty() {
+            return;
+        }
+        if let Some(projection) = &mut self.projection {
+            if let Some(active) = projection.active_basis.filter(|_| {
+                projection
+                    .scan_after
+                    .zip(projection.scan_through)
+                    .is_some_and(|(after, end)| after >= end)
+            }) {
+                projection.active_basis = None;
+                projection.basis = active;
+                projection.scan_through = None;
+                // A later opening basis is coalesced, not allowed to restart a finite pass.
+                if projection
+                    .successor_basis
+                    .take()
+                    .is_some_and(|next| next != projection.basis)
+                {
+                    projection.scan_after = None;
+                }
+            }
+        }
+        if let Some(active) = self.active_stamp {
+            if let Some((after, end)) = self.scan_after.zip(self.scan_through) {
+                if after >= end {
+                    self.completed_stamp = Some(active);
+                    self.active_stamp = None;
+                    self.scan_through = None;
+                    let successor = self.successor_stamp.take();
+                    if successor.is_some_and(|next| next != active) {
+                        // The old obligations remain: a changed baseline must revisit them.
+                        self.completed_stamp = None;
+                    } else if self.range.is_some_and(|(_, hi)| hi > end) {
+                        // Continue above the proven frontier, never at the old range's lo.
+                        self.active_stamp = Some(active);
+                        self.scan_through = self.range.map(|(_, hi)| hi);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct AutoSelection {
+    query: PrivateQuery,
+    cursor: Cursor,
+    stamp: Digest32,
+    authority_generation: u64,
+    projection: bool,
+    attempted: Option<(PullEvidence, Option<Digest32>)>,
+}
+
+fn encode_pull_demands(e: &mut Encoder, demands: &BTreeMap<Digest32, PullDemand>) -> Result<()> {
+    if demands.len() > AUTHORS_HARD_LIMIT {
+        return Err(Error::MalformedAtRest("private pull demand peer bound"));
+    }
+    e.array(demands.len());
+    for (peer, demand) in demands {
+        if demand.marks.len() > PULL_MARKS_PER_DONOR {
+            return Err(Error::MalformedAtRest("private pull demand mark bound"));
+        }
+        e.array(14)
+            .bytes(peer)
+            .bytes(&demand.incarnation)
+            .array(demand.marks.len());
+        for (hash, mark) in &demand.marks {
+            e.array(11)
+                .bytes(hash)
+                .bytes(&mark.incarnation)
+                .uint(mark.position)
+                .bytes(&mark.author)
+                .uint(mark.chain)
+                .uint(mark.evidence.floor_revision)
+                .uint(mark.evidence.authority_generation)
+                .uint(mark.evidence.membership)
+                .bytes(&mark.evidence.release)
+                .bytes(
+                    mark.evidence
+                        .trust
+                        .as_ref()
+                        .map_or(&[][..], |nonce| &nonce[..]),
+                )
+                .bytes(
+                    mark.projection_wait
+                        .as_ref()
+                        .map_or(&[][..], |stamp| &stamp[..]),
+                );
+        }
+        match demand.range {
+            Some((lo, hi)) => {
+                e.array(2).uint(lo).uint(hi);
+            }
+            None => {
+                e.array(0);
+            }
+        }
+        match demand.scan_after {
+            Some(after) => {
+                e.array(1).uint(after);
+            }
+            None => {
+                e.array(0);
+            }
+        }
+        match demand.scan_through {
+            Some(through) => {
+                e.array(1).uint(through);
+            }
+            None => {
+                e.array(0);
+            }
+        }
+        if demand.pending.len() > WORK_ROWS {
+            return Err(Error::MalformedAtRest("private pull pending bound"));
+        }
+        e.array(demand.pending.len());
+        for locator in &demand.pending {
+            e.array(2).uint(locator.id).bytes(&locator.hash);
+        }
+        for stamp in [
+            demand.completed_stamp,
+            demand.active_stamp,
+            demand.successor_stamp,
+        ] {
+            e.bytes(stamp.as_ref().map_or(&[][..], |value| &value[..]));
+        }
+        e.uint(u64::from(demand.unidentified));
+        e.uint(u64::from(demand.rediscover));
+        if let Some(projection) = &demand.projection {
+            e.array(7)
+                .uint(projection.range.0)
+                .uint(projection.range.1)
+                .bytes(&projection.basis);
+            for stamp in [projection.active_basis, projection.successor_basis] {
+                e.bytes(stamp.as_ref().map_or(&[][..], |value| &value[..]));
+            }
+            for cursor in [projection.scan_after, projection.scan_through] {
+                e.array(usize::from(cursor.is_some()));
+                if let Some(cursor) = cursor {
+                    e.uint(cursor);
+                }
+            }
+        } else {
+            e.array(0);
+        }
+        e.uint(u64::from(demand.pending_projection));
+    }
+    Ok(())
+}
+
+fn decode_pull_demands(d: &mut Decoder<'_>) -> Result<BTreeMap<Digest32, PullDemand>> {
+    fn digest(d: &mut Decoder<'_>) -> Result<Digest32> {
+        d.bytes()?
+            .try_into()
+            .map_err(|_| Error::MalformedAtRest("private pull demand digest"))
+    }
+    fn stamp(d: &mut Decoder<'_>) -> Result<Option<Digest32>> {
+        match d.bytes()? {
+            [] => Ok(None),
+            bytes => {
+                Ok(Some(bytes.try_into().map_err(|_| {
+                    Error::MalformedAtRest("private pull demand stamp")
+                })?))
+            }
+        }
+    }
+    let count = d.array()?;
+    if count > AUTHORS_HARD_LIMIT {
+        return Err(Error::MalformedAtRest("private pull demand peer bound"));
+    }
+    let mut demands = BTreeMap::new();
+    for _ in 0..count {
+        let fields = d.array()?;
+        if !matches!(fields, 12 | 14) {
+            return Err(Error::MalformedAtRest("private pull demand row"));
+        }
+        let peer = digest(d)?;
+        let incarnation = digest(d)?;
+        let count = d.array()?;
+        if count > PULL_MARKS_PER_DONOR {
+            return Err(Error::MalformedAtRest("private pull demand mark bound"));
+        }
+        let mut marks = BTreeMap::new();
+        for _ in 0..count {
+            if d.array()? != 11 {
+                return Err(Error::MalformedAtRest("private pull demand mark"));
+            }
+            let hash = digest(d)?;
+            let source = digest(d)?;
+            let position = d.uint()?;
+            let author = digest(d)?;
+            let chain = d.uint()?;
+            let floor_revision = d.uint()?;
+            let authority_generation = d.uint()?;
+            let membership = d.uint()?;
+            let release = digest(d)?;
+            let trust = match d.bytes()? {
+                [] => None,
+                bytes => Some(
+                    bytes
+                        .try_into()
+                        .map_err(|_| Error::MalformedAtRest("private pull trust nonce"))?,
+                ),
+            };
+            let projection_wait = stamp(d)?;
+            let mark = PullMark {
+                incarnation: source,
+                position,
+                author,
+                chain,
+                evidence: PullEvidence {
+                    floor_revision,
+                    authority_generation,
+                    membership,
+                    release,
+                    trust,
+                },
+                projection_wait,
+            };
+            if position == 0 || marks.insert(hash, mark).is_some() {
+                return Err(Error::MalformedAtRest("duplicate private pull demand"));
+            }
+        }
+        let range = match d.array()? {
+            0 => None,
+            2 => {
+                let lo = d.uint()?;
+                let hi = d.uint()?;
+                if lo == 0 || lo > hi {
+                    return Err(Error::MalformedAtRest("private pull demand range"));
+                }
+                Some((lo, hi))
+            }
+            _ => return Err(Error::MalformedAtRest("private pull demand range")),
+        };
+        let scan_after = match d.array()? {
+            0 => None,
+            1 => Some(d.uint()?),
+            _ => return Err(Error::MalformedAtRest("private pull demand scan")),
+        };
+        let scan_through = match d.array()? {
+            0 => None,
+            1 => Some(d.uint()?),
+            _ => return Err(Error::MalformedAtRest("private pull demand frontier")),
+        };
+        let pending_count = d.array()?;
+        if pending_count > WORK_ROWS {
+            return Err(Error::MalformedAtRest("private pull pending bound"));
+        }
+        let mut pending = Vec::with_capacity(pending_count);
+        for _ in 0..pending_count {
+            if d.array()? != 2 {
+                return Err(Error::MalformedAtRest("private pull pending row"));
+            }
+            let id = d.uint()?;
+            let hash = digest(d)?;
+            if id == 0
+                || pending
+                    .last()
+                    .is_some_and(|previous: &Locator| previous.id >= id)
+            {
+                return Err(Error::MalformedAtRest("private pull pending order"));
+            }
+            pending.push(Locator { id, hash });
+        }
+        let completed_stamp = stamp(d)?;
+        let active_stamp = stamp(d)?;
+        let successor_stamp = stamp(d)?;
+        let unidentified = match d.uint()? {
+            0 => false,
+            1 => true,
+            _ => return Err(Error::MalformedAtRest("private pull unidentified flag")),
+        };
+        let rediscover = match d.uint()? {
+            0 => false,
+            1 => true,
+            _ => return Err(Error::MalformedAtRest("private pull rediscovery flag")),
+        };
+        let projection = if fields == 14 {
+            match d.array()? {
+                0 => None,
+                7 => {
+                    let lo = d.uint()?;
+                    let hi = d.uint()?;
+                    if lo == 0 || lo > hi {
+                        return Err(Error::MalformedAtRest("private projection demand range"));
+                    }
+                    let basis = digest(d)?;
+                    let active_basis = stamp(d)?;
+                    let successor_basis = stamp(d)?;
+                    let mut cursor = || match d.array()? {
+                        0 => Ok(None),
+                        1 => Ok(Some(d.uint()?)),
+                        _ => Err(Error::MalformedAtRest("private projection demand cursor")),
+                    };
+                    let scan_after = cursor()?;
+                    let scan_through = cursor()?;
+                    Some(PullProjection {
+                        range: (lo, hi),
+                        basis,
+                        active_basis,
+                        successor_basis,
+                        scan_after,
+                        scan_through,
+                    })
+                }
+                _ => return Err(Error::MalformedAtRest("private projection demand row")),
+            }
+        } else {
+            None
+        };
+        let pending_projection = fields == 14
+            && match d.uint()? {
+                0 => false,
+                1 => true,
+                _ => return Err(Error::MalformedAtRest("private projection pending flag")),
+            };
+        if pending_projection && !pending.is_empty() && projection.is_none() {
+            return Err(Error::MalformedAtRest(
+                "private projection pending without range",
+            ));
+        }
+        let demand = PullDemand {
+            incarnation,
+            marks,
+            range,
+            scan_after,
+            scan_through,
+            pending,
+            completed_stamp,
+            active_stamp,
+            successor_stamp,
+            unidentified,
+            rediscover,
+            projection,
+            pending_projection,
+        };
+        if demands.insert(peer, demand).is_some() {
+            return Err(Error::MalformedAtRest("duplicate private pull demand peer"));
+        }
+    }
+    Ok(demands)
+}
 
 pub(super) fn expired(saved: &Stored, now: u64, retention: (u64, u64)) -> bool {
     let ttl = if saved
@@ -154,6 +605,7 @@ pub(super) struct PrivateSessions {
     pub(super) legacy_pending: LegacyPending,
     legacy_work: Option<LegacyWork>,
     restoring: bool,
+    floor_replay_done: bool,
     restore_after: Option<u64>,
     pending_active: bool,
     pending_after: Option<u64>,
@@ -169,6 +621,10 @@ pub(super) struct PrivateSessions {
     next: u64,
     incarnation: Option<Digest32>,
     cursors: BTreeMap<Digest32, Cursor>,
+    demands: BTreeMap<Digest32, PullDemand>,
+    automatic: BTreeMap<Digest32, AutoSelection>,
+    auto_continue: BTreeSet<Digest32>,
+    auto_yield: BTreeSet<Digest32>,
     observed_tips: BTreeMap<Digest32, Cursor>,
     pulling: BTreeSet<Digest32>,
     attempted: BTreeMap<Digest32, Instant>,
@@ -548,6 +1004,7 @@ impl ChannelState {
     pub(crate) fn needs_session_upgrade(&self) -> bool {
         self.private_sessions.upgrading
             || self.private_sessions.restoring
+            || !self.private_sessions.floor_replay_done
             || self.private_sessions.controls_import
             || !self.private_sessions.legacy_pending.is_empty()
             || self.private_sessions.legacy_work.is_some()
@@ -563,6 +1020,7 @@ impl ChannelState {
     pub(crate) fn session_upgrade_local_work(&self) -> bool {
         self.private_sessions.upgrading
             || self.private_sessions.restoring
+            || !self.private_sessions.floor_replay_done
             || self.private_sessions.controls_import
             || !self.private_sessions.legacy_pending.is_empty()
             || self.private_sessions.legacy_work.is_some()
@@ -694,6 +1152,317 @@ impl ChannelState {
         crate::hash::sha256(&e.finish())
     }
 
+    fn private_refetch_stamp(&self, store: &Store, demand: &PullDemand) -> Result<Digest32> {
+        let snapshot = store.snapshot()?;
+        let view = governance::View::pinned(
+            &snapshot,
+            &self.sek,
+            &self.channel_id,
+            self.genesis.creator_pubkey().fingerprint(),
+            self.now_hint,
+        )?;
+        let trust = store.get_meta_prefix::<{ crate::atrest::sek::NONCE_LEN }>(
+            crate::node::trust::TRUST_META_KEY,
+        )?;
+        let mut authors: BTreeSet<Digest32> =
+            demand.marks.values().map(|mark| mark.author).collect();
+        if demand.range.is_some() || demand.unidentified || demand.rediscover {
+            authors.extend(self.authors.keys().copied());
+        }
+        let mut e = Encoder::new();
+        e.array(7)
+            .uint(self.epoch)
+            .uint(view.authority_generation())
+            .uint(self.admission(&self.me()).0)
+            .bytes(trust.as_ref().map_or(&[][..], |nonce| &nonce[..]))
+            .array(authors.len());
+        for author in &authors {
+            let revision = floor_index::author(
+                entry_store::Transaction::Snapshot(&snapshot),
+                &self.sek,
+                &self.channel_id,
+                author,
+            )?
+            .revision;
+            e.array(2).bytes(author).uint(revision);
+        }
+        let relevant = self
+            .drive
+            .receivers
+            .iter()
+            .filter(|((author, _), _)| authors.contains(author));
+        e.array(relevant.clone().count());
+        for ((author, chain), receiver) in relevant {
+            e.array(3)
+                .bytes(author)
+                .uint(*chain)
+                .bytes(&receiver.history_release_binding().1);
+        }
+        let count = if demand.rediscover {
+            self.private_sessions
+                .demands
+                .values()
+                .map(|held| held.marks.len())
+                .sum()
+        } else {
+            0
+        };
+        e.array(count);
+        if demand.rediscover {
+            for (peer, held) in &self.private_sessions.demands {
+                for hash in held.marks.keys() {
+                    e.array(2).bytes(peer).bytes(hash);
+                }
+            }
+        }
+        Ok(crate::hash::sha256(&e.finish()))
+    }
+
+    fn private_mark_evidence(&self, store: &Store, mark: &PullMark) -> Result<PullEvidence> {
+        let snapshot = store.snapshot()?;
+        let view = governance::View::pinned(
+            &snapshot,
+            &self.sek,
+            &self.channel_id,
+            self.genesis.creator_pubkey().fingerprint(),
+            self.now_hint,
+        )?;
+        Ok(PullEvidence {
+            floor_revision: floor_index::author(
+                entry_store::Transaction::Snapshot(&snapshot),
+                &self.sek,
+                &self.channel_id,
+                &mark.author,
+            )?
+            .revision,
+            authority_generation: view.authority_generation(),
+            membership: self.admission(&self.me()).0,
+            release: self
+                .drive
+                .receivers
+                .get(&(mark.author, mark.chain))
+                .map_or([0; 32], |receiver| receiver.history_release_binding().1),
+            trust: store.get_meta_prefix::<{ crate::atrest::sek::NONCE_LEN }>(
+                crate::node::trust::TRUST_META_KEY,
+            )?,
+        })
+    }
+
+    fn private_mark_attempt(
+        &self,
+        store: &Store,
+        mark: &PullMark,
+    ) -> Result<(PullEvidence, Option<Digest32>)> {
+        let projection = match mark.projection_wait {
+            Some(saved) => Some(
+                self.author_opening_fingerprint(store, &mark.author)?
+                    .unwrap_or(saved),
+            ),
+            None => None,
+        };
+        Ok((self.private_mark_evidence(store, mark)?, projection))
+    }
+
+    pub(crate) fn private_refetch_evidence_changed(&self, store: &Store) -> Result<bool> {
+        for demand in self.private_sessions.demands.values() {
+            for mark in demand.marks.values() {
+                let projection_changed = match mark.projection_wait {
+                    Some(stamp) => self
+                        .author_opening_fingerprint(store, &mark.author)?
+                        .is_some_and(|current| current != stamp),
+                    None => false,
+                };
+                if self.private_mark_evidence(store, mark)? != mark.evidence || projection_changed {
+                    return Ok(true);
+                }
+            }
+            if demand.range.is_some() || demand.unidentified || demand.rediscover {
+                let stamp = self.private_refetch_stamp(store, demand)?;
+                let prior = demand.active_stamp.or(demand.completed_stamp);
+                if prior != Some(stamp) {
+                    return Ok(true);
+                }
+            }
+            if let Some(projection) = &demand.projection {
+                if self.private_opening_basis(store)?.is_some_and(|current| {
+                    Some(current) != projection.active_basis.or(Some(projection.basis))
+                }) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    fn select_private_refetch(
+        &self,
+        store: &Store,
+        peer: Digest32,
+    ) -> Result<Option<AutoSelection>> {
+        let Some(demand) = self.private_sessions.demands.get(&peer) else {
+            return Ok(None);
+        };
+        let Some(boundary) = self
+            .private_sessions
+            .observed_tips
+            .get(&peer)
+            .or_else(|| self.private_sessions.cursors.get(&peer))
+        else {
+            return Ok(None);
+        };
+        if boundary.incarnation != demand.incarnation || boundary.after == 0 {
+            return Ok(None);
+        }
+        let stamp = self.private_refetch_stamp(store, demand)?;
+        let snapshot = store.snapshot()?;
+        let view = governance::View::pinned(
+            &snapshot,
+            &self.sek,
+            &self.channel_id,
+            self.genesis.creator_pubkey().fingerprint(),
+            self.now_hint,
+        )?;
+        let authority_generation = view.authority_generation();
+        if let Some(locator) = demand.pending.first() {
+            return Ok(Some(AutoSelection {
+                query: PrivateQuery::ArchiveRecords {
+                    lo: locator.id,
+                    hi: locator.id,
+                    positions: vec![locator.clone()],
+                },
+                cursor: boundary.clone(),
+                stamp: if demand.pending_projection {
+                    demand
+                        .projection
+                        .as_ref()
+                        .and_then(|projection| projection.active_basis)
+                        .ok_or(Error::MalformedAtRest(
+                            "private projection pending basis missing",
+                        ))?
+                } else {
+                    stamp
+                },
+                authority_generation,
+                projection: demand.pending_projection,
+                attempted: demand
+                    .marks
+                    .get(&locator.hash)
+                    .map(|mark| self.private_mark_attempt(store, mark))
+                    .transpose()?,
+            }));
+        }
+        let mut earliest: Option<(Digest32, &PullMark)> = None;
+        for (hash, mark) in &demand.marks {
+            let projection_changed = match mark.projection_wait {
+                Some(saved) => self
+                    .author_opening_fingerprint(store, &mark.author)?
+                    .is_some_and(|current| current != saved),
+                None => false,
+            };
+            if mark.incarnation == boundary.incarnation
+                && mark.position <= boundary.after
+                && (self.private_mark_evidence(store, mark)? != mark.evidence || projection_changed)
+                && earliest
+                    .as_ref()
+                    .is_none_or(|(_, held)| mark.position < held.position)
+            {
+                earliest = Some((*hash, mark));
+            }
+        }
+        if let Some((hash, mark)) = earliest {
+            return Ok(Some(AutoSelection {
+                query: PrivateQuery::ArchiveRecords {
+                    lo: mark.position,
+                    hi: mark.position,
+                    positions: vec![Locator {
+                        id: mark.position,
+                        hash,
+                    }],
+                },
+                cursor: boundary.clone(),
+                stamp,
+                authority_generation,
+                projection: false,
+                attempted: Some(self.private_mark_attempt(store, mark)?),
+            }));
+        }
+        let opening_basis = if demand.projection.is_some() {
+            self.private_opening_basis(store)?
+        } else {
+            None
+        };
+        let projection_due =
+            demand
+                .projection
+                .as_ref()
+                .zip(opening_basis)
+                .is_some_and(|(projection, basis)| {
+                    projection.active_basis.is_some() || projection.basis != basis
+                });
+        if (demand.range.is_some() || demand.unidentified || demand.rediscover)
+            && (demand.active_stamp.is_some() || demand.completed_stamp != Some(stamp))
+            && (!projection_due || demand.pending_projection)
+        {
+            let (lo, hi) = if demand.unidentified || demand.rediscover {
+                (1, demand.scan_through.unwrap_or(boundary.after))
+            } else {
+                let (lo, hi) = demand
+                    .range
+                    .ok_or(Error::Profile("private refetch range missing"))?;
+                (lo, hi.min(demand.scan_through.unwrap_or(hi)))
+            };
+            let after = demand.active_stamp.and(demand.scan_after);
+            let first = after.map_or(lo, |at| at.saturating_add(1)).max(lo);
+            let last = first
+                .saturating_add(WORK_ROWS as u64 - 1)
+                .min(hi)
+                .min(boundary.after);
+            if first <= last {
+                return Ok(Some(AutoSelection {
+                    query: PrivateQuery::ArchiveInventory {
+                        lo: first,
+                        hi: last,
+                        before: last.saturating_add(1),
+                    },
+                    cursor: boundary.clone(),
+                    stamp,
+                    authority_generation,
+                    projection: false,
+                    attempted: None,
+                }));
+            }
+        }
+        if let Some(projection) = &demand.projection {
+            if let Some(basis) = opening_basis {
+                if projection.active_basis.is_some() || projection.basis != basis {
+                    let (lo, hi) = projection.range;
+                    let after = projection.active_basis.and(projection.scan_after);
+                    let first = after.map_or(lo, |at| at.saturating_add(1)).max(lo);
+                    let last = first
+                        .saturating_add(WORK_ROWS as u64 - 1)
+                        .min(projection.scan_through.unwrap_or(hi))
+                        .min(hi)
+                        .min(boundary.after);
+                    if first <= last {
+                        return Ok(Some(AutoSelection {
+                            query: PrivateQuery::ArchiveInventory {
+                                lo: first,
+                                hi: last,
+                                before: last.saturating_add(1),
+                            },
+                            cursor: boundary.clone(),
+                            stamp: projection.active_basis.unwrap_or(basis),
+                            authority_generation,
+                            projection: true,
+                            attempted: None,
+                        }));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
     fn restore_private_pulls(&mut self, store: &Store) -> Result<()> {
         let Some(segment) = store.get_segment(
             &self.channel_id,
@@ -703,7 +1472,7 @@ impl ChannelState {
         else {
             return Ok(());
         };
-        if segment.ciphertext.len() > AUTHORS_HARD_LIMIT * 96 + 256 {
+        if segment.ciphertext.len() > PULL_CHECKPOINT_BYTES {
             return Err(Error::MalformedAtRest("private pull cursor bound"));
         }
         let bytes = open_segment(
@@ -713,7 +1482,8 @@ impl ChannelState {
             &segment,
         )?;
         let mut d = Decoder::new(&bytes);
-        if d.array()? != 4 || d.uint()? != 1 {
+        let fields = d.array()?;
+        if !matches!(fields, 4 | 5) || d.uint()? != 1 {
             return Err(Error::MalformedAtRest("private pull cursor version"));
         }
         self.private_sessions.incarnation = match d.bytes()? {
@@ -752,7 +1522,25 @@ impl ChannelState {
                 return Err(Error::MalformedAtRest("duplicate private pull peer"));
             }
         }
+        let demands = if fields == 5 {
+            decode_pull_demands(&mut d)?
+        } else {
+            BTreeMap::new()
+        };
         d.finish()?;
+        self.private_sessions
+            .auto_continue
+            .extend(demands.iter().filter_map(|(peer, demand)| {
+                (demand.active_stamp.is_some()
+                    || !demand.pending.is_empty()
+                    || !demand.marks.is_empty()
+                    || demand.range.is_some()
+                    || demand.projection.is_some()
+                    || demand.unidentified
+                    || demand.rediscover)
+                    .then_some(*peer)
+            }));
+        self.private_sessions.demands = demands;
         if binding == self.private_pull_binding() {
             self.private_sessions.cursors = cursors;
         }
@@ -790,6 +1578,12 @@ impl ChannelState {
 pub(crate) mod pending_session;
 
 impl ChannelState {
+    fn private_peer_current(&self, store: &Store, peer: &Digest32) -> Result<bool> {
+        Ok(self.drive_members().contains(peer)
+            && self.room_peer_current(store, peer)?
+            && !self.is_member_removed(store, &self.me())?)
+    }
+
     pub(crate) fn private_pull_revision_matches(&self, peer: Digest32, revision: u64) -> bool {
         self.private_sessions.revision == revision && self.drive_members().contains(&peer)
     }
@@ -808,7 +1602,7 @@ impl ChannelState {
         {
             return PrivatePullIntent::Ineligible;
         }
-        if !projection_causal {
+        if !projection_causal && !self.private_sessions.auto_continue.contains(&peer) {
             if let Some(at) = self.private_sessions.attempted.get(&peer) {
                 let deadline = *at + Duration::from_secs(1);
                 if Instant::now() < deadline {
@@ -834,7 +1628,7 @@ impl ChannelState {
         if self.poisoned
             || self.drive.receivers.is_empty()
             || !self.supports_private(store, &peer)?
-            || !self.drive_members().contains(&peer)
+            || !self.private_peer_current(store, &peer)?
             || (self.private_sessions.pulling.contains(&peer)
                 && self
                     .private_sessions
@@ -842,6 +1636,7 @@ impl ChannelState {
                     .get(&peer)
                     .is_some_and(|at| at.elapsed() < Duration::from_secs(30)))
             || (!projection_causal
+                && !self.private_sessions.auto_continue.contains(&peer)
                 && self
                     .private_sessions
                     .attempted
@@ -852,6 +1647,28 @@ impl ChannelState {
         }
         self.private_sessions.pulling.insert(peer);
         self.private_sessions.attempted.insert(peer, Instant::now());
+        let eligible = projection_causal || self.private_sessions.auto_continue.contains(&peer);
+        let yield_live = self.private_sessions.auto_yield.remove(&peer);
+        if eligible && !yield_live {
+            let boundary_ready = self.private_sessions.observed_tips.contains_key(&peer)
+                || self.private_sessions.cursors.contains_key(&peer);
+            if let Some(selection) = self.select_private_refetch(store, peer)? {
+                self.private_sessions.auto_continue.remove(&peer);
+                let ask = Ask {
+                    revision,
+                    room: self.channel_id,
+                    epoch: self.epoch,
+                    query: selection.query.clone(),
+                    cursor: selection.cursor.clone(),
+                };
+                self.private_sessions.automatic.insert(peer, selection);
+                self.private_sessions.auto_yield.insert(peer);
+                return Ok(Some(ask));
+            }
+            if boundary_ready {
+                self.private_sessions.auto_continue.remove(&peer);
+            }
+        }
         Ok(Some(Ask {
             revision,
             room: self.channel_id,
@@ -870,6 +1687,9 @@ impl ChannelState {
     pub(crate) fn cancel_private_pull(&mut self, peer: Digest32, revision: u64) {
         if self.private_sessions.revision == revision {
             self.private_sessions.pulling.remove(&peer);
+            self.private_sessions.automatic.remove(&peer);
+            self.private_sessions.auto_continue.remove(&peer);
+            self.private_sessions.auto_yield.remove(&peer);
         }
     }
 
@@ -882,7 +1702,7 @@ impl ChannelState {
     ) -> Result<(Cursor, Digest32)> {
         self.require_governance_ready(store, crate::time::Ms(self.now_hint))?;
         if self.poisoned
-            || !self.drive_members().contains(peer)
+            || !self.private_peer_current(store, peer)?
             || !self.current_session_controls_ready(store)?
         {
             return Err(Error::StreamRefused(
@@ -955,6 +1775,9 @@ impl ChannelState {
         self.private_sessions.cursors.clear();
         self.private_sessions.observed_tips.clear();
         self.private_sessions.pulling.clear();
+        self.private_sessions.automatic.clear();
+        self.private_sessions.auto_continue.clear();
+        self.private_sessions.auto_yield.clear();
         self.private_sessions.attempted.clear();
     }
 }

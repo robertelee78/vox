@@ -138,7 +138,22 @@ impl ChannelState {
 pub(crate) struct PreparedContent {
     author: Digest32,
     hash: Digest32,
+    generation: Option<u64>,
     outcome: PreparedOutcome,
+}
+
+impl PreparedContent {
+    pub(crate) fn check_generation(
+        &self,
+        batch: &Batch<'_>,
+        sek: &Sek,
+        room: &Digest32,
+    ) -> Result<()> {
+        if let Some(generation) = self.generation {
+            governance::check_removal_generation_in(batch, sek, room, generation)?;
+        }
+        Ok(())
+    }
 }
 
 enum PreparedOutcome {
@@ -249,21 +264,96 @@ impl SemanticProjection {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare(
         &mut self,
         channel: &ChannelState,
         store: &Store,
+        entry: &Entry,
         author: Digest32,
         hash: Digest32,
         payload: &[u8],
         historical: bool,
     ) -> Result<PreparedContent> {
-        let outcome = self.prepare_inner(channel, store, author, hash, payload, historical)?;
+        let decision = (|| {
+            let generation = channel.removal_generation(store)?;
+            let view = match channel.checked_governance(store, channel.now_hint) {
+                Ok(view) => view,
+                Err(error) if governance::refreshing(&error) => {
+                    return Err(Error::Profile(governance::REFRESHING));
+                }
+                Err(error) => return Err(error),
+            };
+            let eligible = match view.content_eligibility(entry)? {
+                governance::ContentEligibility::Eligible => true,
+                governance::ContentEligibility::Ineligible => false,
+                governance::ContentEligibility::Refreshing => {
+                    return Err(Error::Profile(governance::REFRESHING));
+                }
+            };
+            // #1171: once this node knows its own applied removal, it renders no newly
+            // received old body, whoever relayed it. Plaintext it already rendered or cached
+            // falls through to the existing logic; an undecided body waits, never renders.
+            let eligible = eligible
+                && (generation == 0
+                    || match view.recipient_body_eligibility(
+                        &channel.me(),
+                        entry,
+                        channel.now_hint,
+                    )? {
+                        governance::ContentEligibility::Eligible => true,
+                        _ if self.already_readable(channel, store, &hash)? => true,
+                        governance::ContentEligibility::Ineligible => false,
+                        governance::ContentEligibility::Refreshing => {
+                            return Err(Error::Profile(governance::REFRESHING));
+                        }
+                    });
+            drop(view);
+            governance::check_removal_generation(store, &channel.sek, &self.room, generation)?;
+            Ok((generation, eligible))
+        })();
+        let (generation, outcome) = match decision {
+            Ok((generation, true)) => (
+                Some(generation),
+                self.prepare_inner(channel, store, author, hash, payload, historical)?,
+            ),
+            Ok((generation, false)) => (Some(generation), PreparedOutcome::Applied),
+            Err(error) if governance::refreshing(&error) => (None, PreparedOutcome::Deferred),
+            Err(error) => return Err(error),
+        };
         Ok(PreparedContent {
             author,
             hash,
+            generation,
             outcome,
         })
+    }
+
+    /// This exact body was already rendered, cached, privately classified or staged here.
+    fn already_readable(
+        &self,
+        channel: &ChannelState,
+        store: &Store,
+        hash: &Digest32,
+    ) -> Result<bool> {
+        let input = channel.entries.read(store, &channel.sek, &self.room)?;
+        Ok(channel
+            .entries
+            .render_view(store, &channel.sek, &self.room)?
+            .fact(hash)?
+            .is_some()
+            || input.read_receipt_cache(hash)?.is_some()
+            || input
+                .retention(hash)?
+                .is_some_and(|tracked| tracked.cache_id.is_some())
+            || channel.private_id(store, hash)?.is_some()
+            || channel
+                .drive
+                .pending
+                .iter()
+                .any(|(row, _)| row.entry_hash == *hash)
+            || self.rows.iter().any(|row| row.entry_hash == *hash)
+            || self.sessions.iter().any(|(row, _)| row.entry_hash == *hash))
     }
 
     fn prepare_inner(
@@ -321,28 +411,8 @@ impl SemanticProjection {
                 .ok_or(Error::MalformedAtRest("receiver persistence overflow"))?;
             return Ok(PreparedOutcome::opened(Zeroizing::new(plaintext), true));
         }
-        if historical || own {
-            let input = channel.entries.read(store, &channel.sek, &self.room)?;
-            if channel
-                .entries
-                .render_view(store, &channel.sek, &self.room)?
-                .fact(&hash)?
-                .is_some()
-                || input.read_receipt_cache(&hash)?.is_some()
-                || input
-                    .retention(&hash)?
-                    .is_some_and(|tracked| tracked.cache_id.is_some())
-                || channel.private_id(store, &hash)?.is_some()
-                || channel
-                    .drive
-                    .pending
-                    .iter()
-                    .any(|(row, _)| row.entry_hash == hash)
-                || self.rows.iter().any(|row| row.entry_hash == hash)
-                || self.sessions.iter().any(|(row, _)| row.entry_hash == hash)
-            {
-                return Ok(PreparedOutcome::Applied);
-            }
+        if (historical || own) && self.already_readable(channel, store, &hash)? {
+            return Ok(PreparedOutcome::Applied);
         }
         let old_own = if own && message.header.epoch < self.epoch {
             let root = channel
@@ -442,6 +512,7 @@ impl SemanticProjection {
         let PreparedContent {
             author,
             hash,
+            generation: _,
             outcome,
         } = prepared;
         let (decoded, drive) = match outcome {

@@ -634,6 +634,8 @@ pub struct ChannelDetail {
     pub last_arrival: Option<u64>,
     /// The saved instance that owns local arrival ids, preserved across reopen.
     pub history_instance: [u8; 16],
+    /// Durable room removal/readmission incarnation captured with this view.
+    pub removal_generation: u64,
     /// Local reuse stamp for the already-built display; never serialized or sent to peers.
     pub(crate) display_stamp: crate::node::channel::DisplayStamp,
     /// Local indicator reuse token; never serialized or sent to peers.
@@ -649,6 +651,10 @@ pub struct ChannelDetail {
     pub synced: bool,
     /// Last contiguous authenticated position in this node's own room feed.
     pub own_feed_through: u64,
+    /// Own-history write fence captured with this nonblocking room snapshot.
+    pub(crate) own_history_behind: bool,
+    /// Whether the fence protects conflicting signed histories.
+    pub(crate) own_history_forked: bool,
     /// The members this node holds back for equivocating in this room (V210-63): each
     /// `(author, seq)` at which two different messages signed by that author were seen.
     pub equivocations: Vec<(Digest32, u64)>,
@@ -726,6 +732,65 @@ pub struct ChannelDetail {
     pub drive_from: Vec<Digest32>,
     /// Opaque Session input/publication/drive token; no retained metadata strings.
     pub session_revision: Digest32,
+}
+
+/// A captured room authorization incarnation, independently rechecked at use.
+#[derive(Clone)]
+pub struct RoomRemovalGuard {
+    resource: std::sync::Arc<crate::node::channel::history::ReadResource>,
+    room: Digest32,
+    generation: u64,
+}
+
+impl RoomRemovalGuard {
+    /// The durable incarnation captured before the request was queued.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Compare a later published view to the captured incarnation.
+    #[must_use]
+    pub fn matches(&self, generation: u64) -> bool {
+        #[cfg(feature = "test-knobs")]
+        if std::env::var("VOX_TEST_FX62_MUTANT").as_deref() == Ok("queued-drive-generation") {
+            return true;
+        }
+        self.generation == generation
+    }
+
+    /// Whether this exact incarnation is still current and usable.
+    #[must_use]
+    pub fn current(&self) -> bool {
+        #[cfg(feature = "test-knobs")]
+        if std::env::var("VOX_TEST_FX62_MUTANT").as_deref() == Ok("queued-drive-generation") {
+            return true;
+        }
+        self.resource
+            .removal_authorization_current(&self.room, self.generation)
+    }
+
+    /// Run one nonblocking publication step only while this generation is current.
+    pub fn with_current<T>(&self, step: impl FnOnce() -> T) -> Option<T> {
+        #[cfg(feature = "test-knobs")]
+        if std::env::var("VOX_TEST_FX62_MUTANT").as_deref() == Ok("queued-drive-generation") {
+            return Some(step());
+        }
+        self.resource
+            .with_removal_fence(&self.room, self.generation, step)
+    }
+}
+
+impl ChannelDetail {
+    /// Capture the existing revocable room resource and its authorization generation.
+    #[must_use]
+    pub fn removal_guard(&self) -> Option<RoomRemovalGuard> {
+        Some(RoomRemovalGuard {
+            resource: self.history_read.as_ref()?.clone(),
+            room: self.channel_id,
+            generation: self.removal_generation,
+        })
+    }
 }
 
 /// The node's latest-wins view (published over a `watch`).
@@ -1075,6 +1140,20 @@ pub enum NodeCommand {
         member: Digest32,
         /// `true` to add, `false` to remove.
         admin: bool,
+    },
+    /// Remove the exact member from this room by signed governance.
+    RemoveRoomMember {
+        /// The room.
+        channel_id: Digest32,
+        /// The full member fingerprint.
+        member: Digest32,
+    },
+    /// Creator readmission; ordinary admission and trust still apply.
+    ReadmitRoomMember {
+        /// The room.
+        channel_id: Digest32,
+        /// The full member fingerprint.
+        member: Digest32,
     },
     /// End a room for everyone (V030-08). Only its creator may.
     EndRoom {
@@ -1525,6 +1604,8 @@ pub enum Fault {
     /// board itself was never reached (#192). The two need different fixes: a host (or the anchor
     /// it uses) that is down or out of reach, or a member that is.
     BoardUnreachable,
+    /// A peer answered but its transport protocol is incompatible with this Vox.
+    ProtocolMismatch,
     /// A peer could not be reached (no live endpoint, or the dial failed).
     Unreachable,
     /// A member answered a join and waited for its proof of work, and this device took longer to
@@ -1621,6 +1702,16 @@ pub enum Fault {
     NotCreator,
     /// Only the room's creator adds or removes an admin (#319); an admin may not.
     NotRoomCreator,
+    /// The genesis creator is not a removable room member.
+    RoomCreatorProtected,
+    /// A creator-issued certificate with an expiry cannot authorize member removal.
+    ExpiringRemovalAuthority,
+    /// Readmitting a removed member is the creator's act, not an admin's.
+    NotReadmissionCreator,
+    /// A current member board refused authorization before the join's passphrase exchange.
+    RoomAuthorization,
+    /// A validated room removal excludes this node from new room activity.
+    RoomMemberRemoved,
     /// The member named is not an admin of the room, so there is no admin to take back (V030-08).
     NotAnAdmin,
     /// A join reached a room that has ended (V030-08): a member said so before checking anything,
@@ -1777,6 +1868,9 @@ impl Fault {
             Fault::BoardUnreachable => {
                 "no board the join tried could be read — the room's host, or an anchor if one was tried — so no member was asked\n       check that the host is running and that this machine can reach its address"
             }
+            Fault::ProtocolMismatch => {
+                "a peer answered with an incompatible Vox transport protocol\n       update the peer and this Vox to the matching release"
+            }
             Fault::Unreachable => {
                 "the peer could not be reached — nobody answered on any path\n       it may be offline; the node's log names each path it tried"
             }
@@ -1869,6 +1963,19 @@ impl Fault {
             }
             Fault::NotRoomCreator => {
                 "only the room's creator adds or removes an admin, and this identity did not create the room\n       ask the room's creator to do it"
+            }
+            Fault::RoomCreatorProtected => "the room creator cannot be removed",
+            Fault::ExpiringRemovalAuthority => {
+                "this admin delegation has an expiry and cannot remove members; ask the room creator"
+            }
+            Fault::NotReadmissionCreator => {
+                "only the room's creator may readmit a member; ask that creator to do it"
+            }
+            Fault::RoomAuthorization => {
+                "the member board refused current room authorization: this identity is removed or the room's permissions are still refreshing\n       the passphrase was not checked; only the creator can readmit a removed identity"
+            }
+            Fault::RoomMemberRemoved => {
+                "this node was removed from the room; only its creator can readmit it"
             }
             Fault::NotAnAdmin => {
                 "that member is not an admin of the room\n       `vox room admin list` shows who is"
@@ -1989,6 +2096,7 @@ fault_names!(
     BadLink,
     RoomNotOnBoard,
     BoardUnreachable,
+    ProtocolMismatch,
     Unreachable,
     SolveTooSlow,
     MembersBusy,
@@ -2022,6 +2130,11 @@ fault_names!(
     NotCreator,
     NotAnAdmin,
     NotRoomCreator,
+    RoomCreatorProtected,
+    ExpiringRemovalAuthority,
+    NotReadmissionCreator,
+    RoomAuthorization,
+    RoomMemberRemoved,
     JoinedRoomEnded,
     ResponderLeft,
     TunnelLimit,

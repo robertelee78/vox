@@ -177,11 +177,18 @@ pub(crate) struct OmpDriveGuard {
     pub(crate) operator: Option<String>,
     pub(crate) room: String,
     pub(crate) operation: Option<String>,
+    pub(crate) authority: vox_core::node::api::RoomRemovalGuard,
 }
 
 impl OmpDriveGuard {
     pub(crate) fn allowed(&self) -> bool {
         (self.current)()
+    }
+
+    pub(crate) fn with_publication<T>(&self, step: impl FnOnce() -> T) -> Option<T> {
+        self.authority
+            .with_current(|| self.allowed().then(step))
+            .flatten()
     }
 
     pub(crate) async fn cancelled(&self) {
@@ -2768,6 +2775,21 @@ impl Router {
             return refuse("the Session node is locking or Locked; nothing was sent".into());
         }
         let me = view.identity.as_ref().map(|i| i.fingerprint);
+        let Some(room_authority) = view
+            .open_channels
+            .iter()
+            .find(|channel| {
+                channel.channel_id == info.channel_id
+                    && channel.members.contains(&info.peer)
+                    && me.is_some_and(|me| channel.members.contains(&me))
+            })
+            .and_then(|channel| channel.removal_guard())
+        else {
+            return refuse("the driver or room is no longer present; nothing was sent".into());
+        };
+        if !room_authority.current() {
+            return refuse("room authorization changed or is refreshing; nothing was sent".into());
+        }
         // DR-2: only a member this node trusts with drive, or the node itself, its Sessions'
         // operator (SC-2), which reaches here only from its own socket (`drive_own`).
         // Said without this node's name for itself, which the driver may not know it by: the
@@ -3001,6 +3023,16 @@ impl Router {
                 "the Session node stopped or changed while saving; nothing was sent".into(),
             );
         }
+        if !room_authority.current()
+            || !current.open_channels.iter().any(|channel| {
+                channel.channel_id == info.channel_id
+                    && room_authority.matches(channel.removal_generation)
+                    && channel.members.contains(&info.peer)
+                    && me.is_some_and(|me| channel.members.contains(&me))
+            })
+        {
+            return refuse("room authorization changed while saving; nothing was sent".into());
+        }
         if me != Some(info.peer) && !current.drive.contains(&info.peer) {
             return Answer {
                 ok: false,
@@ -3033,6 +3065,7 @@ impl Router {
                 .find(|channel| {
                     channel.channel_id == info.channel_id && channel.members.contains(&info.peer)
                 })
+                .filter(|channel| room_authority.matches(channel.removal_generation))
                 .map(|channel| channel.history_instance)
             else {
                 return refuse("the driver or room is no longer present; nothing was sent".into());
@@ -3072,6 +3105,7 @@ impl Router {
             );
             let peer = info.peer;
             let channel = info.channel_id;
+            let authority = room_authority.clone();
             Some(OmpDriveGuard {
                 operator: matches!(&req.action, Action::Text { .. }).then(|| by.clone()),
                 room: room.clone(),
@@ -3091,6 +3125,7 @@ impl Router {
                         },
                     )
                 }),
+                authority: room_authority.clone(),
                 views: handle.watch(),
                 current: Arc::new(move || {
                     let same = {
@@ -3105,10 +3140,12 @@ impl Router {
                         && !view.locking
                         && me.is_some()
                         && view.identity.as_ref().map(|identity| identity.fingerprint) == me
+                        && authority.current()
                         && (me == Some(peer) || view.drive.contains(&peer))
                         && view.open_channels.iter().any(|room| {
                             room.channel_id == channel
                                 && room.history_instance == instance
+                                && authority.matches(room.removal_generation)
                                 && room.members.contains(&peer)
                         })
                         && crate::wake::pause_registration(&paths, &reg.session)

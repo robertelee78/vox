@@ -424,8 +424,9 @@ impl PendingText {
         sent_ms: u64,
     ) -> Result<Digest32> {
         let record = crate::node::content::ReadRecord::new(self.now_millis, read)?;
+        let required = self.required(SignedEntryKind::Content)?;
         if self
-            .context(store, signer)?
+            .context(store, signer, &required)?
             .is_some_and(|(_, _, changed)| changed)
         {
             self.append(

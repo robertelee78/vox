@@ -59,6 +59,7 @@ use crate::time::Clock;
 use crate::transport::quic::{VoxConnection, VoxEndpoint};
 use crate::transport::streams::accept_typed_on;
 use crate::transport::streams::StreamKind;
+use std::future::Future;
 
 /// The peer classification the accept path reads, refreshed by the actor whenever
 /// channel membership or the pending-joiner set changes.
@@ -208,11 +209,29 @@ impl SharedPolicy {
 /// One `(channel, epoch)` bucket's members, keyed by fingerprint.
 type MemberMap = BTreeMap<Digest32, CompositePublicKey>;
 
+#[derive(Default)]
+struct MembershipBucket {
+    members: MemberMap,
+    removed: BTreeSet<Digest32>,
+    generation: u64,
+    store: Option<Arc<crate::node::store::Store>>,
+    resource: Option<Arc<crate::node::channel::history::ReadResource>>,
+}
+
+impl MembershipBucket {
+    fn stale(&self, channel: &Digest32) -> bool {
+        self.store.is_some()
+            && self.resource.as_ref().is_none_or(|resource| {
+                !resource.public_membership_current(channel, self.generation)
+            })
+    }
+}
+
 /// A membership snapshot shared between the actor and the served board (see the
 /// module docs).
 #[derive(Clone, Default)]
 pub struct SharedMembership {
-    inner: Arc<Mutex<HashMap<(Digest32, u64), MemberMap>>>,
+    inner: Arc<Mutex<HashMap<(Digest32, u64), MembershipBucket>>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -235,7 +254,15 @@ impl SharedMembership {
             .iter()
             .filter(|((id, _), _)| id == room)
             .max_by_key(|((_, epoch), _)| *epoch)
-            .is_some_and(|(_, members)| members.contains_key(peer))
+            .is_some_and(|(_, bucket)| !bucket.stale(room) && bucket.members.contains_key(peer))
+    }
+    /// Last applied exclusions remain authoritative while unrelated rows settle.
+    fn known_removed(&self, room: &Digest32, peer: &Digest32) -> bool {
+        lock(&self.inner)
+            .iter()
+            .filter(|((id, _), _)| id == room)
+            .max_by_key(|((_, epoch), _)| *epoch)
+            .is_some_and(|(_, bucket)| bucket.removed.contains(peer))
     }
     /// An empty snapshot.
     #[must_use]
@@ -245,7 +272,56 @@ impl SharedMembership {
 
     /// Replace the membership for `(channel_id, epoch)`.
     pub fn set_channel(&self, channel_id: Digest32, epoch: u64, members: MemberMap) {
-        lock(&self.inner).insert((channel_id, epoch), members);
+        lock(&self.inner).insert(
+            (channel_id, epoch),
+            MembershipBucket {
+                members,
+                ..Default::default()
+            },
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn set_member_channel(
+        &self,
+        channel_id: Digest32,
+        epoch: u64,
+        members: MemberMap,
+        removed: BTreeSet<Digest32>,
+        generation: u64,
+        store: Arc<crate::node::store::Store>,
+        resource: Option<Arc<crate::node::channel::history::ReadResource>>,
+    ) {
+        lock(&self.inner).insert(
+            (channel_id, epoch),
+            MembershipBucket {
+                members,
+                removed,
+                generation,
+                store: Some(store),
+                resource,
+            },
+        );
+    }
+
+    /// Replace every epoch with one fail-closed bucket when room authorization is unreadable.
+    pub(crate) fn invalidate_member_channel(
+        &self,
+        channel_id: Digest32,
+        epoch: u64,
+        store: Arc<crate::node::store::Store>,
+        removed: BTreeSet<Digest32>,
+    ) {
+        let mut buckets = lock(&self.inner);
+        buckets.retain(|(cid, _), _| *cid != channel_id);
+        buckets.insert(
+            (channel_id, epoch),
+            MembershipBucket {
+                removed,
+                store: Some(store),
+                ..Default::default()
+            },
+        );
     }
 
     /// Forget every epoch of `channel_id` (the channel was closed or locked).
@@ -281,8 +357,51 @@ impl MembershipOracle for SharedMembership {
     ) -> Option<CompositePublicKey> {
         lock(&self.inner)
             .get(&(*channel_id, epoch))
-            .and_then(|m| m.get(author_id))
+            .filter(|bucket| !bucket.stale(channel_id))
+            .and_then(|bucket| bucket.members.get(author_id))
             .cloned()
+    }
+
+    fn removed(&self, channel: &Digest32, epoch: u64, author: &Digest32) -> bool {
+        let buckets = lock(&self.inner);
+        let current_stale = buckets
+            .iter()
+            .filter(|((room, _), _)| room == channel)
+            .max_by_key(|((_, epoch), _)| *epoch)
+            .is_some_and(|(_, bucket)| bucket.stale(channel));
+        current_stale
+            || buckets
+                .get(&(*channel, epoch))
+                .is_some_and(|bucket| bucket.stale(channel) || bucket.removed.contains(author))
+    }
+
+    fn removed_current(&self, channel: &Digest32, author: &Digest32) -> bool {
+        #[cfg(feature = "test-knobs")]
+        if std::env::var("VOX_TEST_FX62_MUTANT").as_deref() == Ok("admit-removed-fingerprint") {
+            return false;
+        }
+        lock(&self.inner)
+            .iter()
+            .filter(|((room, _), _)| room == channel)
+            .max_by_key(|((_, epoch), _)| *epoch)
+            .is_some_and(|(_, bucket)| bucket.stale(channel) || bucket.removed.contains(author))
+    }
+
+    fn removal_generation(&self, channel: &Digest32, epoch: u64) -> u64 {
+        lock(&self.inner)
+            .get(&(*channel, epoch))
+            .map_or(0, |bucket| {
+                bucket.store.as_ref().map_or(bucket.generation, |store| {
+                    crate::node::channel::governance::removal_generation(store, channel)
+                        .unwrap_or(u64::MAX)
+                })
+            })
+    }
+
+    fn room_store(&self, channel: &Digest32, epoch: u64) -> Option<Arc<crate::node::store::Store>> {
+        lock(&self.inner)
+            .get(&(*channel, epoch))
+            .and_then(|bucket| bucket.store.clone())
     }
 }
 
@@ -1078,6 +1197,9 @@ impl NodeNet {
         let store = self.service.store();
         let guard = store.lock().unwrap_or_else(PoisonError::into_inner);
         guard.channels_with_genesis().iter().any(|cid| {
+            if self.membership.known_removed(cid, peer) {
+                return false;
+            }
             guard
                 .genesis(cid)
                 .is_some_and(|g| g.body.creator_pubkey.fingerprint() == *peer)
@@ -1122,6 +1244,9 @@ impl NodeNet {
         let store = self.service.store();
         let guard = store.lock().unwrap_or_else(PoisonError::into_inner);
         for cid in guard.channels_with_genesis() {
+            if self.membership.known_removed(&cid, peer) {
+                continue;
+            }
             let known = guard
                 .genesis(&cid)
                 .is_some_and(|g| g.body.creator_pubkey.fingerprint() == *peer)
@@ -1923,6 +2048,7 @@ impl NodeNet {
         // candidate, is essentially always the slowest. Keeping "the last error" therefore
         // reported the direct timeout and threw away the circuit's answer every time.
         let mut why: Vec<String> = Vec::with_capacity(set.len());
+        let mut mismatch = false;
         while let Some(joined) = set.join_next().await {
             match joined {
                 Ok((_, Ok(conn))) => {
@@ -1970,13 +2096,19 @@ impl NodeNet {
                     }
                     return Ok(self.manager.existing(&peer).unwrap_or(won));
                 }
-                Ok((rung, Err(e))) => why.push(format!("{rung}: {e}")),
+                Ok((rung, Err(e))) => {
+                    mismatch |= matches!(e, Error::ProtocolMismatch);
+                    why.push(format!("{rung}: {e}"));
+                }
                 Err(_) => why.push("a rung was cancelled".to_owned()),
             }
         }
         // A direct dial elsewhere that landed while the circuits held back is this reach's answer.
         if let Some(conn) = self.manager.existing(&peer) {
             return Ok(conn);
+        }
+        if mismatch {
+            return Err(Error::ProtocolMismatch);
         }
         why.sort(); // a reason a person compares between runs must not reorder itself
         Err(Error::LadderExhausted(why.join("; ")))
@@ -2516,6 +2648,19 @@ impl NodeNet {
         guard.bundle(channel_id, epoch, member, now).cloned()
     }
 
+    /// Whether this board holds one author's live bundle, without copying key material.
+    pub(crate) fn has_board_bundle(
+        &self,
+        channel_id: &Digest32,
+        epoch: u64,
+        author: &Digest32,
+    ) -> bool {
+        let now = self.now_ms();
+        let store = self.service.store();
+        let guard = store.lock().unwrap_or_else(PoisonError::into_inner);
+        guard.bundle(channel_id, epoch, author, now).is_some()
+    }
+
     /// Every *other* member's live records this node's board holds for `(channel,
     /// epoch)` — bundles first, then address records — as wire frames, ready to be
     /// mirrored to an anchor.
@@ -2645,6 +2790,15 @@ impl NodeNet {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .withdraw_member(channel_id, author, at);
+    }
+
+    /// Remove only this node's transient board projection, not room-end or member evidence.
+    pub(crate) fn retract_room_on_board(&self, channel_id: &Digest32) {
+        let store = self.service.store();
+        store
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retract_channel(channel_id, &self.local_id());
     }
 
     /// Take a room that ended off **this node's own** board (V030-14), for good.
@@ -2789,7 +2943,7 @@ impl NodeNet {
     /// the binding is the caller's single decision — `ChannelState::join_context` in
     /// production.
     #[allow(clippy::too_many_arguments)] // each argument is a distinct required input
-    pub async fn answer_join<F, Fut>(
+    pub async fn answer_join<F, Fut, P, PFut>(
         &self,
         peer: Digest32,
         send: SendStream,
@@ -2804,6 +2958,7 @@ impl NodeNet {
             std::sync::Arc<std::sync::atomic::AtomicBool>,
             Option<tokio::sync::oneshot::Receiver<()>>,
         )>,
+        proposal_inputs: P,
         admit_before_accepting: F,
     ) -> Result<JoinOutcome>
     where
@@ -2812,6 +2967,8 @@ impl NodeNet {
             crate::nat::record::JoinWitness,
         ) -> Fut,
         Fut: std::future::Future<Output = Result<Option<String>>>,
+        P: FnOnce(crate::identity::composite::CompositePublicKey) -> PFut,
+        PFut: Future<Output = Result<(Option<String>, crate::node::joinstream::OwnHistory)>>,
     {
         let cfg = ResponderConfig {
             ctx,
@@ -2833,6 +2990,7 @@ impl NodeNet {
             store,
             ring,
             ended,
+            proposal_inputs,
             admit_before_accepting,
         )
         .await
@@ -2846,7 +3004,7 @@ impl NodeNet {
     /// The preparation callback must durably retain rollback covering the exact verified
     /// proposal's epoch and timestamp before it returns: admission cannot commit until that handoff.
     #[allow(clippy::too_many_arguments)] // authenticated exchange plus durable preparation
-    pub async fn start_join<F, Fut>(
+    pub async fn start_join<F, Fut, A, AFut>(
         &self,
         conn: &VoxConnection,
         ctx: JoinContext,
@@ -2854,12 +3012,24 @@ impl NodeNet {
         signer: &(dyn RootSigner + Send + Sync),
         ik: &X25519IdentityKey,
         prepare_before_admission: F,
+        retain_accepted: A,
     ) -> Result<JoinOutcome>
     where
         F: FnOnce(crate::node::joinstream::AdmissionProposal) -> Fut,
         Fut: std::future::Future<Output = Result<()>>,
+        A: FnOnce(Vec<u8>, Vec<u8>, crate::identity::composite::CompositePublicKey) -> AFut,
+        AFut: Future<Output = Result<()>>,
     {
-        run_initiator(conn, ctx, passphrase, signer, ik, prepare_before_admission).await
+        run_initiator(
+            conn,
+            ctx,
+            passphrase,
+            signer,
+            ik,
+            prepare_before_admission,
+            retain_accepted,
+        )
+        .await
     }
 
     /// Read everything the board holds for `(channel_id, epoch)`: the genesis, the

@@ -67,13 +67,56 @@ pub(super) async fn answer(
     served_object: &mut bool,
 ) -> Result<Status> {
     let receipt_source;
+    let recovery_source;
     let source = if preamble.purpose == Purpose::Control
         && matches!(query, Query::Head(author) if author == source.peer)
     {
         receipt_source = source.for_own_head_receipt();
         &receipt_source
     } else {
-        source
+        // The server clone may pass the room gate for a returning author only after this
+        // exact query has been confined to that author's own authenticated public tree.
+        recovery_source = source.for_own_recovery();
+        let peer = source.peer;
+        let check = query.clone();
+        let allowed = recovery_source
+            .read(io.job(), 128 * 1024, move |room, store| {
+                #[cfg(feature = "test-knobs")]
+                let mutant = crate::node::computer::fx28_mutant("sync-departed-peer")
+                    && room.has_left(&peer);
+                #[cfg(not(feature = "test-knobs"))]
+                let mutant = false;
+                if mutant || room.is_member(&peer) {
+                    return Ok(Some((true, false)));
+                }
+                let allowed = match check {
+                    Query::Head(author) => author == peer,
+                    Query::Header { head, .. }
+                    | Query::Proof { head, .. }
+                    | Query::Entry { head, .. }
+                    | Query::Page { head, .. } => {
+                        room.history_head_by_id(store, &head)?.is_some_and(|head| {
+                            head.binding.author == peer
+                                && head.binding.scope == crate::log::history::LogScope::Public
+                        })
+                    }
+                    Query::Context(hash) => {
+                        room.recovery_context_allowed(store, &peer, &hash)?
+                            || room
+                                .history_head(store, &peer)?
+                                .is_some_and(|head| head.root.frontier == hash)
+                    }
+                    _ => false,
+                };
+                Ok(Some((allowed, true)))
+            })
+            .await?;
+        match allowed {
+            Lookup::Found(held) if held.value == (true, true) => &recovery_source,
+            Lookup::Found(held) if held.value == (true, false) => source,
+            Lookup::Busy => return Err(Error::Unreachable("history authorization busy")),
+            _ => return Err(Error::Unreachable("history query outside own recovery")),
+        }
     };
     let request = preamble.request;
     if matches!(query, Query::Inventory) && preamble.purpose != Purpose::Control {
@@ -133,9 +176,16 @@ pub(super) async fn answer(
         }
         for slice in hints.chunks(64) {
             let offered = source
-                .offer_inventory(&work_job, inbox, inbox_generation, preamble.room, slice)
+                .offer_inventory(
+                    &work_job,
+                    inbox,
+                    inbox_generation,
+                    preamble.room,
+                    connection_serial,
+                    slice,
+                )
                 .await?;
-            *inventory_added |= offered.added != 0;
+            *inventory_added |= offered.added != 0 || offered.rearmed != 0;
             if offered.full {
                 return Err(Error::Unreachable("inventory pending capacity busy"));
             }
@@ -143,7 +193,21 @@ pub(super) async fn answer(
         drop(hints);
         drop(incoming);
     }
-    let (status, continuation) = if credit.remaining_wire() < super::DONE_RESERVE {
+    #[cfg(feature = "test-knobs")]
+    let staged_unavailable = std::env::var_os("VOX_TEST_UNAVAILABLE_HEAD_FILE")
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .is_some_and(|text| {
+            let mut ids = text.split_whitespace();
+            let author = ids.next();
+            let peer = ids.next();
+            matches!(query, Query::Head(id) if author == Some(crate::node::link::b32_encode(&id).as_str()))
+                && peer == Some(crate::node::link::b32_encode(&source.peer).as_str())
+        });
+    #[cfg(not(feature = "test-knobs"))]
+    let staged_unavailable = false;
+    let (status, continuation) = if staged_unavailable {
+        (Status::EvidenceUnavailable, None)
+    } else if credit.remaining_wire() < super::DONE_RESERVE {
         (Status::Busy, None)
     } else {
         respond(source, io, preamble, &query, &mut credit, served_object).await?
@@ -364,7 +428,9 @@ async fn respond(
                     if seq > head.root.leaves {
                         return Err(Error::MalformedBundle("requested header exceeds head"));
                     }
-                    room.history_proof_header(store, &head, seq)
+                    Ok(room
+                        .history_proof_header(store, &head, seq)?
+                        .map(|header| (head, header)))
                 })
                 .await?;
             let held = match found {
@@ -372,13 +438,26 @@ async fn respond(
                 Lookup::Busy => return Ok((Status::Busy, None)),
                 Lookup::Missing => return Ok((Status::EvidenceUnavailable, None)),
             };
+            let parsed = Entry::from_wire(&held.value.1.wire)?;
+            let contexts = parsed
+                .skeleton
+                .v2
+                .as_ref()
+                .map(|v2| vec![v2.pre_context])
+                .unwrap_or_default();
+            if !source
+                .authorize_recovery_contexts(&job, &held.value.0, contexts)
+                .await?
+            {
+                return Ok((Status::Busy, None));
+            }
             let status = match send_object(
                 source,
                 io,
                 credit,
                 Frame::Meta {
                     request,
-                    object: Object::Header(&held.value.wire),
+                    object: Object::Header(&held.value.1.wire),
                 },
                 0,
                 served_object,
@@ -415,6 +494,37 @@ async fn respond(
                 Lookup::Busy => return Ok((Status::Busy, None)),
                 Lookup::Missing => return Ok((Status::EvidenceUnavailable, None)),
             };
+            let mut contexts = vec![held_head.value.root.frontier];
+            match &held_proof.value {
+                Proof::Inclusion(proof) => {
+                    contexts.extend(proof.siblings.iter().map(|node| node.frontier))
+                }
+                Proof::Consistency { prefix, proof } => {
+                    contexts.push(prefix.frontier);
+                    contexts.extend(proof.nodes.iter().map(|node| node.frontier));
+                }
+                Proof::Control(proof) => {
+                    for token in &proof.tokens {
+                        match token {
+                            crate::log::history::ControlToken::Collapse(node) => {
+                                contexts.push(node.frontier)
+                            }
+                            crate::log::history::ControlToken::Leaf(entry) => {
+                                if let Some(v2) = &entry.skeleton.v2 {
+                                    contexts.push(v2.pre_context);
+                                }
+                            }
+                            crate::log::history::ControlToken::Branch => {}
+                        }
+                    }
+                }
+            }
+            if !source
+                .authorize_recovery_contexts(&work_job, &held_head.value, contexts)
+                .await?
+            {
+                return Ok((Status::Busy, None));
+            }
             let continuation = match &held_proof.value {
                 Proof::Control(proof) if proof.hi < to => Some(Continuation {
                     query_kind: 2,
@@ -619,6 +729,15 @@ async fn entry(
         Lookup::Missing => return Ok(result),
     };
     let parsed = Entry::from_wire(&header.value.wire)?;
+    if let Some(v2) = &parsed.skeleton.v2 {
+        if !source
+            .authorize_recovery_contexts(&job, &head.value, vec![v2.pre_context])
+            .await?
+        {
+            result.status = Status::Busy;
+            return Ok(result);
+        }
+    }
     let hash = parsed.entry_hash();
     if key_identity
         .is_some_and(|(author, expected)| parsed.skeleton.author_id != author || hash != expected)
@@ -640,6 +759,40 @@ async fn entry(
             "content body cannot use control reservation",
         ));
     }
+    // #1171: an informed provider never emits an ordinary or key-package body that this
+    // once-removed recipient may not newly receive. Decide before any live grant, body
+    // reservation or read; a stale or missing projection is Busy, never permission. A
+    // package for another member keeps its own header-only role path below.
+    let package_for_another = signed_kind == crate::log::history::SignedEntryKind::KeyPackage
+        && parsed.skeleton.v2.as_ref().and_then(|v2| v2.recipient) != Some(source.peer);
+    let recipient_denied = if package_for_another && !explicit_key_body {
+        false
+    } else {
+        let peer = source.peer;
+        let header = parsed.clone();
+        match source
+            .read(&job, 128 * 1024, move |room, store| {
+                Ok(Some(
+                    room.recipient_body_eligibility(store, &peer, &header)?,
+                ))
+            })
+            .await?
+        {
+            Lookup::Found(held) => match held.value {
+                crate::node::channel::governance::ContentEligibility::Eligible => false,
+                crate::node::channel::governance::ContentEligibility::Ineligible => true,
+                crate::node::channel::governance::ContentEligibility::Refreshing => {
+                    result.status = Status::Busy;
+                    return Ok(result);
+                }
+            },
+            Lookup::Busy => {
+                result.status = Status::Busy;
+                return Ok(result);
+            }
+            Lookup::Missing => return Ok(result),
+        }
+    };
     let live = if preamble.purpose == Purpose::Live {
         let through = head.value.root.leaves;
         let latest = source
@@ -706,7 +859,9 @@ async fn entry(
     // Five worst-case record/sealing copies plus fixed work space, scaled to the signed length.
     // A small control uses the small pool; a large record must have the foreground/archive job.
     let envelope = 5 * (length as usize + MAX_HEADER_BYTES + 9) + 4 * MIB;
-    let record_job = if withhold_private_body {
+    // A denied recipient body is answered exactly as a body this provider does not hold:
+    // its authenticated header, then BodyNotHeld (ADR-038 FX-29 decline), with no read.
+    let record_job = if withhold_private_body || recipient_denied {
         None
     } else {
         let Some(record_job) = job.record_job(envelope).await else {
@@ -715,7 +870,7 @@ async fn entry(
         };
         Some(record_job)
     };
-    let payload = if withhold_private_body {
+    let payload = if withhold_private_body || recipient_denied {
         None
     } else {
         let Some(record_job) = record_job.as_ref() else {

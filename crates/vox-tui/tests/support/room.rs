@@ -49,6 +49,19 @@ const DAEMON_START_PATIENCE: Duration = Duration::from_secs(240);
 pub const ID_PASS: &str = "identity passphrase";
 pub const ROOM_PASS: &str = "channel passphrase";
 
+/// Retain real daemon logs when a proof is run with diagnostics enabled.
+pub fn diagnostic_tempdir() -> tempfile::TempDir {
+    let mut dir = tempfile::tempdir().expect("APPARATUS: create proof directory");
+    if std::env::var_os("VOX_PROOF_KEEP_DIRS").is_some() {
+        dir.disable_cleanup(true);
+        eprintln!(
+            "[proof] retained daemon directory: {}",
+            dir.path().display()
+        );
+    }
+    dir
+}
+
 /// Everything a harness might have put in this process's environment that would
 /// silently name a session. **This test process may itself be running inside Claude
 /// Code or Codex**, and a leaked `CLAUDE_CODE_SESSION_ID` would make every worker the
@@ -366,6 +379,13 @@ impl Worker {
         drop(self.daemon.take());
     }
 
+    /// Stop cleanly before copying a committed store or inspecting its redb pages.
+    pub fn stop_daemon_cleanly(&mut self) {
+        if let Some(daemon) = self.daemon.take() {
+            daemon.stop(&self.name, "TERM");
+        }
+    }
+
     /// Stop this worker's daemon, by its own handle, and start it again as it was started.
     #[allow(dead_code)] // not every proof that includes this support module restarts one
     pub fn restart_daemon(&mut self, err: &std::path::Path) {
@@ -464,6 +484,30 @@ impl Room {
             let err = self.tmp.join(format!("{}.daemon.upgraded.err", w.name));
             start_daemon(w, &self.anchor, &err);
         }
+    }
+
+    /// Restart only the RAM-only board, leaving the member daemons stopped.
+    pub fn restart_anchor(&mut self) {
+        if let Some(anchor) = self._anchor.take() {
+            anchor.stop("the anchor", "INT");
+        }
+        let port = self
+            .anchor
+            .rsplit("/udp/")
+            .next()
+            .and_then(|part| part.split('/').next())
+            .expect("APPARATUS: anchor has no port");
+        let (anchor, spec) = spawn_anchor_as(
+            &self.tmp,
+            VOX,
+            &format!("127.0.0.1:{port}"),
+            "anchor.forgotten",
+        );
+        assert_eq!(
+            spec, self.anchor,
+            "APPARATUS: restarted anchor changed address"
+        );
+        self._anchor = Some(anchor);
     }
 
     /// The anchor's pid, for a proof that must stop it: it holds the room's entries too, and
@@ -650,7 +694,12 @@ fn start_daemon_as(
     anchor: &str,
     err: &std::path::Path,
 ) {
-    let child = Command::new(exe)
+    let mut command = Command::new(exe);
+    #[cfg(feature = "test-knobs")]
+    if let Ok(mutant) = std::env::var("VOX_MUTANT_FX28") {
+        command.env("VOX_TEST_FX28_MUTANT", mutant);
+    }
+    let child = command
         .envs(env.iter().copied())
         .args([
             "daemon",
@@ -802,24 +851,92 @@ pub async fn room_as(tmp: &std::path::Path, names: &[&str], exe: &str) -> Room {
             read_log(&host_err)
         );
     }
+    // A join may return while the node is still publishing its room projection.
+    for worker in &workers {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let status = worker.vox(None, &["status", "--json"]);
+            let admins = worker.vox(None, &["room", "admin", "list", &id]);
+            let status_json = serde_json::from_str::<serde_json::Value>(&status.stdout).ok();
+            let ready = status.ok
+                && status_json
+                    .as_ref()
+                    .and_then(|v| v["preparing"].as_array().map(Vec::is_empty))
+                    == Some(true)
+                && status_json
+                    .as_ref()
+                    .and_then(|v| v["governance_pending"].as_bool())
+                    == Some(false)
+                && admins.ok;
+            if ready {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "PRODUCT: {}'s room governance remained pending for 60s before trust: status={status:?}, admins={admins:?}, daemon log={}",
+                worker.name,
+                read_log(&tmp.join(format!("{}.daemon.err", worker.name)))
+            );
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
 
     // Trust after the joins (see the module note), each worker trusting every other.
     for a in &workers {
         for b in &workers {
             if a.fp != b.fp {
-                let o = a.vox(
-                    None,
-                    &[
-                        "trust",
-                        "add",
-                        &b.b32(),
-                        "--name",
-                        &b.name,
-                        "--identity-passphrase-file",
-                        utf8(&a.pass),
-                    ],
-                );
-                o.expect_ok(&format!("{}'s `vox trust add` of {}", a.name, b.name));
+                let started = Instant::now();
+                loop {
+                    let o = a.vox(
+                        None,
+                        &[
+                            "trust",
+                            "add",
+                            &b.b32(),
+                            "--name",
+                            &b.name,
+                            "--identity-passphrase-file",
+                            utf8(&a.pass),
+                        ],
+                    );
+                    if o.ok {
+                        eprintln!(
+                            "[proof] {}'s trust of {} cleared after {:?}",
+                            a.name,
+                            b.name,
+                            started.elapsed()
+                        );
+                        break;
+                    }
+                    let said = format!("{}\n{}", o.stdout, o.stderr);
+                    let permissions_pending = said.contains(
+                        "this room's permissions are still being read from local storage",
+                    ) && said
+                        .contains("try again once the room is ready");
+                    let unchanged_busy = said.contains(
+                        "a previous change to this room is still being applied; this request made no change",
+                    );
+                    if !permissions_pending && !unchanged_busy {
+                        panic!(
+                            "PRODUCT: {}'s trust of {} failed: {o:?}; daemon log: {}",
+                            a.name,
+                            b.name,
+                            read_log(&tmp.join(format!("{}.daemon.err", a.name)))
+                        );
+                    }
+                    eprintln!(
+                        "[proof] {}'s trust of {} refused at {:?}: {o:?}",
+                        a.name,
+                        b.name,
+                        started.elapsed()
+                    );
+                    assert!(
+                        started.elapsed() < Duration::from_secs(60),
+                        "PRODUCT: room permissions never became ready for {}'s trust of {}: {o:?}; daemon log: {}",
+                        a.name, b.name, read_log(&tmp.join(format!("{}.daemon.err", a.name)))
+                    );
+                    std::thread::sleep(Duration::from_millis(500));
+                }
             }
         }
     }

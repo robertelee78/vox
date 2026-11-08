@@ -187,7 +187,10 @@ remains proposed. No implementation, consumer acceptance or publication is appro
   same-name replacement nodes, explain that other rooms and global trust are unchanged, that old
   disclosures cannot be recalled, and show applied versus pending/unknown propagation. Do not
   confuse this action with removing an admin role or a node from the keyring. Show a non-admin
-  refusal without changing membership. Creator-only explicit readmission MUST likewise identify
+  refusal without changing membership. Ordinary admin grants last until explicitly revoked;
+  a certificate carrying an expiry MUST be refused for removal, with a clear permission refusal
+  (not an internal-error report) explaining that the operator must ask the creator. Creator-only
+  explicit readmission MUST likewise identify
   the room and exact fingerprint and MUST NOT promise access before independent checks succeed.
 - **K-21. Evidence-bounded access warnings.** A client MUST distinguish authenticated computer
   approval/application, effective local node trust, room membership/reciprocal consent, key

@@ -19,6 +19,7 @@ pub(super) enum Work {
     Delivered {
         target: Digest32,
         generation: u64,
+        removal_generation: Option<u64>,
         history: bool,
     },
     Issue {
@@ -31,6 +32,7 @@ pub(super) enum Work {
     Withdraw {
         target: Digest32,
     },
+    RoomRotation,
     ReceiverCleanup,
     ControlImport,
     PrivateSupport {
@@ -94,14 +96,22 @@ impl Work {
     ) -> crate::error::Result<Option<Prepared>> {
         match self {
             Self::Hold { target, skdm } => channel
-                .prepare_pending_held_consent(store, owner, skdm)
+                .prepare_pending_held_consent(store, owner, target, skdm)
                 .map(|pending| Some(Prepared::Hold(pending, target))),
             Self::Delivered {
                 target,
                 generation,
+                removal_generation,
                 history,
             } => channel
-                .prepare_pending_consent_delivery(store, owner, target, generation, history)
+                .prepare_pending_consent_delivery(
+                    store,
+                    owner,
+                    target,
+                    generation,
+                    history,
+                    removal_generation,
+                )
                 .map(|pending| Some(Prepared::Delivered(pending))),
             Self::Issue {
                 target,
@@ -124,6 +134,9 @@ impl Work {
             Self::Withdraw { target } => channel
                 .prepare_pending_withdrawal(store, owner, target, now)
                 .map(|pending| Some(Prepared::Consent(pending))),
+            Self::RoomRotation => channel
+                .prepare_room_removal_rotation(store, owner, now)
+                .map(|pending| pending.map(Prepared::Consent)),
             Self::ReceiverCleanup => channel
                 .prepare_pending_receiver_cleanup(store, owner)
                 .map(|pending| pending.map(Prepared::Cleanup)),

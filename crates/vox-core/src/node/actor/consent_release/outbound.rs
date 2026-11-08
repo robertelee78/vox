@@ -192,7 +192,8 @@ impl Node {
             Work::Consent(consent_save::Work::Issue {
                 target: continuation.target,
                 skdm,
-                full_history: continuation.history == crate::node::trust::HistoryGrant::Full,
+                full_history: continuation.history == crate::node::trust::HistoryGrant::Full
+                    && continuation.plan.is_some(),
                 entitled_from,
                 package,
             }),
@@ -305,6 +306,7 @@ impl Node {
                     package,
                     skdm,
                     reservation,
+                    ..
                 }),
             ) => {
                 let Some(package) = package else {
@@ -348,6 +350,7 @@ impl Node {
                 Saved::Packages(package_save::Saved::SealedOutbound {
                     package,
                     reservation,
+                    removal_generation,
                     ..
                 }),
             ) => {
@@ -366,7 +369,10 @@ impl Node {
                 continuation.prekey = reservation;
                 self.begin_pending_maintenance(
                     room,
-                    Work::Session(SessionWrite::Package { package }),
+                    Work::Session(SessionWrite::Package {
+                        package,
+                        removal_generation,
+                    }),
                     maintenance_save::Continuation::Consent(continuation),
                     reply,
                 )

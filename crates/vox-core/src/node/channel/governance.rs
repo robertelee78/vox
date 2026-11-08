@@ -7,6 +7,7 @@ mod channel;
 mod context;
 mod facts;
 mod fold;
+mod member_fold;
 mod sparse;
 mod view;
 pub(in crate::node::channel) use view::{
@@ -31,6 +32,208 @@ const CAUSAL_WORK: usize = 64;
 const SOURCE_ROWS: usize = 64;
 const INPUT_BYTES: usize = 1024 * 1024;
 
+/// Recheck the authority generation under the same writer as a derived checkpoint.
+pub(super) fn check_authority_generation_in(
+    batch: &crate::node::store::Batch<'_>,
+    sek: &Sek,
+    room: &Digest32,
+    root: Digest32,
+    now: u64,
+    expected: u64,
+) -> Result<()> {
+    let view = view::View::in_batch(batch, sek, room, root, now)?;
+    if view.authority_generation() != expected {
+        return Err(Error::Profile(REFRESHING));
+    }
+    Ok(())
+}
+
+/// Index a previously verified fork with the same transaction that retains its signed proof.
+/// Different predecessor hashes do not prove a common prefix, so authority is unavailable
+/// from the first sequence until stronger evidence is supplied.
+pub(super) fn note_fork_in(
+    batch: &mut crate::node::store::Batch<'_>,
+    sek: &Sek,
+    room: &Digest32,
+    proof: &crate::log::dag::ForkProof,
+    issuer_key: &crate::identity::composite::CompositePublicKey,
+    validated: Option<&ValidatedSparseEntry>,
+) -> Result<()> {
+    if proof.seq == 0
+        || proof.existing.skeleton.author_id != proof.author_id
+        || proof.conflicting.skeleton.author_id != proof.author_id
+        || proof.existing.skeleton.seq != proof.seq
+        || proof.conflicting.skeleton.seq != proof.seq
+        || proof.existing.skeleton.channel_id != *room
+        || proof.conflicting.skeleton.channel_id != *room
+        || proof.existing.entry_hash() == proof.conflicting.entry_hash()
+        || issuer_key.fingerprint() != proof.author_id
+    {
+        return Err(Error::MalformedAtRest("fork authority proof binding"));
+    }
+    proof.existing.verify(issuer_key)?;
+    proof.conflicting.verify(issuer_key)?;
+    let context = match validated {
+        Some(validated) => {
+            let entry = &proof.conflicting;
+            let v2 = entry
+                .skeleton
+                .v2
+                .as_ref()
+                .ok_or(Error::MalformedAtRest("fork evidence missing v2 header"))?;
+            let context = validated.pre_context();
+            if validated.entry_hash() != entry.entry_hash()
+                || context.hash() != v2.pre_context
+                || context.room != *room
+                || context.scope != v2.scope
+            {
+                return Err(Error::MalformedAtRest("fork evidence context binding"));
+            }
+            Some(context)
+        }
+        None => None,
+    };
+    let receipt = validated
+        .map(|value| value.included().local_receipt())
+        .transpose()?;
+    let cutoff = if proof.existing.skeleton.prev_hash == proof.conflicting.skeleton.prev_hash {
+        proof.seq
+    } else {
+        1
+    };
+    let mut writer = facts::Write::open(batch, sek, room)?;
+    let key = facts::hash_key(&proof.author_id);
+    let previous = writer.get(facts::Table::ForkBoundary, &key)?;
+    let mut changed = previous.is_none_or(|old| cutoff < old);
+    if changed {
+        writer.put(facts::Table::ForkBoundary, key, Some(cutoff))?;
+    }
+    // An alternate exclusion is evidence, never an accepted author-chain position.
+    // A malformed or unsigned nested body confers nothing and does not poison the room.
+    if let Ok(body) = crate::governance::entry::GovEntry::body_bound_to(&proof.conflicting) {
+        if matches!(
+            &body,
+            crate::governance::entry::GovBody::MemberRemoval(_)
+                | crate::governance::entry::GovBody::AdminRevocation(_)
+        ) && body.channel_and_epoch() == (*room, 0)
+            && body.issuer_id() == proof.author_id
+            && body.verify(issuer_key).is_ok()
+        {
+            changed |=
+                writer.retain_fork_exclusion(&proof.conflicting, context, receipt.as_deref())?;
+        }
+    }
+    if changed {
+        writer.start_fork_replay()?;
+        writer.authority_changed()?;
+    }
+    writer.seal()
+}
+
+fn removal_generation_key(room: &Digest32) -> String {
+    use std::fmt::Write as _;
+    let mut key = String::with_capacity(88);
+    key.push_str("room-removal-generation/");
+    for byte in room {
+        let _ = write!(key, "{byte:02x}");
+    }
+    key
+}
+
+/// Durable incarnation of the validated room membership projection.
+pub(crate) fn removal_generation(store: &Store, room: &Digest32) -> Result<u64> {
+    Ok(store
+        .get_meta_prefix::<8>(&removal_generation_key(room))?
+        .map(u64::from_be_bytes)
+        .unwrap_or(0))
+}
+
+/// Last applied exclusion, independent of later rows awaiting causal settlement.
+/// Public sync must still carry the evidence needed to settle those rows.
+pub(crate) fn peer_removal_applied(
+    store: &Store,
+    sek: &Sek,
+    room: &Digest32,
+    peer: &Digest32,
+) -> Result<bool> {
+    if removal_generation(store, room)? == 0 {
+        return Ok(false);
+    }
+    Ok(facts::Read::open(store, sek, room)?
+        .get(facts::Table::CurrentRemoved, &facts::hash_key(peer))?
+        .is_some())
+}
+
+pub(crate) fn removal_generation_in(
+    batch: &crate::node::store::Batch<'_>,
+    room: &Digest32,
+) -> Result<u64> {
+    Ok(batch
+        .get_meta_prefix::<8>(&removal_generation_key(room))?
+        .map(u64::from_be_bytes)
+        .unwrap_or(0))
+}
+
+/// Recheck a prepared operation's durable membership incarnation and fold barrier.
+pub(crate) fn check_removal_generation(
+    store: &Store,
+    sek: &Sek,
+    room: &Digest32,
+    generation: u64,
+) -> Result<()> {
+    let facts = facts::Read::open(store, sek, room)?;
+    if !facts.current_ready()? || !facts.settled() || removal_generation(store, room)? != generation
+    {
+        return Err(Error::Profile(view::REFRESHING));
+    }
+    Ok(())
+}
+
+/// Recheck the same fence inside the transaction publishing the prepared operation.
+pub(crate) fn check_removal_generation_in(
+    batch: &crate::node::store::Batch<'_>,
+    sek: &Sek,
+    room: &Digest32,
+    generation: u64,
+) -> Result<()> {
+    if !facts::settled_in(batch, sek, room)? || removal_generation_in(batch, room)? != generation {
+        return Err(Error::Profile(view::REFRESHING));
+    }
+    Ok(())
+}
+
+pub(crate) fn content_eligibility_in(
+    read: &super::entry_store::Read<'_>,
+    entry: &crate::log::entry::Entry,
+    now: u64,
+) -> Result<ContentEligibility> {
+    match View::pinned(read.snapshot(), read.sek(), read.channel(), [0; 32], now) {
+        Ok(view) => view.content_eligibility(entry),
+        Err(error) if refreshing(&error) => Ok(ContentEligibility::Refreshing),
+        Err(error) => Err(error),
+    }
+}
+/// Re-evaluate a recovered signed floor so its recipient decision is built from
+/// the same authenticated frontier as the public author decision.
+pub(super) fn queue_floor_eligibility_in(
+    batch: &mut crate::node::store::Batch<'_>,
+    sek: &Sek,
+    room: &Digest32,
+    entry: &crate::log::entry::Entry,
+    log: u64,
+) -> Result<()> {
+    let mut writer = facts::Write::open(batch, sek, room)?;
+    let hash = entry.entry_hash();
+    if writer.get(facts::Table::SourceHashes, &facts::hash_key(&hash))? == Some(log)
+        && writer
+            .get(facts::Table::Complete, &facts::hash_key(&hash))?
+            .is_some()
+    {
+        writer.queue_eligibility(&hash, log)?;
+    }
+    writer.seal()
+}
+
 /// Advance a bounded part of the queue without keeping bodies or tree pages
 /// between turns. Small entries share one transaction and the same work budget.
 /// A frontier includes the entry's own coordinate. Strict-past queries separately
@@ -50,9 +253,12 @@ fn advance_frontiers(
     let mut bytes = 0usize;
     let mut rows = 0;
     let mut drained = false;
+    let mut replayed = false;
     while remaining > 0 {
+        replayed |= writer.fork_replay_step(&input)?;
+        replayed |= writer.fork_evidence_step()?;
         let Some(mut work) = writer.work()?.cloned() else {
-            if rows == 0 {
+            if rows == 0 && !replayed {
                 return Ok(true);
             }
             drained = true;
@@ -90,7 +296,15 @@ fn advance_frontiers(
             &hash,
             clock.ok_or(Error::MalformedAtRest("governance clock missing"))?,
         )?;
-        work.changed |= writer.raise(&hash, &entry.skeleton.author_id, entry.skeleton.seq)?;
+        if work.parent == 0 && work.author.is_none() && work.child.is_none() {
+            work.changed |= writer.set_incomplete(&hash, false)?;
+        }
+        work.changed |= writer.raise(
+            &hash,
+            &entry.skeleton.author_id,
+            entry.skeleton.seq,
+            Some(hash),
+        )?;
         remaining -= 1;
         // A v2 source was admitted with its exact signed parent/control closure. Its
         // authority frontier is that immutable pre-context plus itself. Inheriting a
@@ -136,7 +350,12 @@ fn advance_frontiers(
                             .partition_point(|coordinate| coordinate.author <= after)
                     });
                     if let Some(coordinate) = context.coordinates.get(at) {
-                        work.changed |= writer.raise(&hash, &coordinate.author, coordinate.seq)?;
+                        work.changed |= writer.raise(
+                            &hash,
+                            &coordinate.author,
+                            coordinate.seq,
+                            Some(coordinate.hash),
+                        )?;
                         work.author = Some(coordinate.author);
                     } else {
                         work.parent += 1;
@@ -151,14 +370,25 @@ fn advance_frontiers(
                 };
                 // A missing parent contributes no coordinate yet. Its eventual arrival
                 // queues this child through the already persisted reverse-edge index.
-                let next = if input.clock(parent)?.is_some() {
+                let parent_ready = input.clock(parent)?.is_some()
+                    && writer
+                        .get(facts::Table::Complete, &facts::hash_key(parent))?
+                        .is_some()
+                    && writer
+                        .get(facts::Table::Incomplete, &facts::hash_key(parent))?
+                        .is_none();
+                if !parent_ready {
+                    work.changed |= writer.set_incomplete(&hash, true)?;
+                }
+                let next = if parent_ready {
                     writer.frontier_after(parent, work.author)?
                 } else {
                     None
                 };
                 match next {
                     Some((author, seq)) => {
-                        work.changed |= writer.raise(&hash, &author, seq)?;
+                        let identity = writer.frontier_identity(parent, &author)?;
+                        work.changed |= writer.raise(&hash, &author, seq, identity)?;
                         work.author = Some(author);
                     }
                     None => {
@@ -237,6 +467,7 @@ fn observe(
 ) -> Result<Acceptance> {
     use crate::governance::entry::GovEntry;
     let hash = entry.entry_hash();
+    writer.observe_source(log, entry)?;
     let control = is_control(entry);
     // A late row (a parent observed after its child) can change the order only through the
     // frontiers below it. In a signed-format room a control row's frontier is its own signed
@@ -268,7 +499,9 @@ fn observe(
             current_advanced: false,
         });
     };
-    let _ = payload;
+    // A malformed or unauthenticated member fact is retained as causal evidence,
+    // but must not poison the room's governance replay.
+    let member_fact = payload.starts_with(&[0, 0x24]) || payload.starts_with(&[0, 0x25]);
     if writer
         .get(facts::Table::Hashes, &facts::hash_key(&hash))?
         .is_some()
@@ -284,7 +517,7 @@ fn observe(
         .ok_or(Error::MalformedAtRest("governance source author unknown"))?;
     let body = match GovEntry::body_bound_to(entry) {
         Ok(body) => body,
-        Err(error) if entry.skeleton.v2.is_some() => return Err(error),
+        Err(error) if entry.skeleton.v2.is_some() && !member_fact => return Err(error),
         Err(_) => {
             return Ok(Acceptance {
                 work_changed: changed,
@@ -295,7 +528,7 @@ fn observe(
     // Malformed/unauthenticated nested statements confer nothing, just as in
     // the original pass-1 evaluator. Local Store/index errors above remain errors.
     if let Err(error) = body.verify(key) {
-        return if entry.skeleton.v2.is_some() {
+        return if entry.skeleton.v2.is_some() && !member_fact {
             Err(error)
         } else {
             Ok(Acceptance {
@@ -313,6 +546,13 @@ fn observe(
     // Canonical inputs are always ordered: only the checked fold can decide whether a signed
     // action is authorized and changes the published meaning. Current single-writer facts never
     // enter that order and wake only when their canonical value changes.
+    if matches!(&body, crate::governance::entry::GovBody::Presence(_)) {
+        writer.put(
+            facts::Table::SenderPresence,
+            facts::position(&entry.skeleton.author_id, entry.skeleton.seq),
+            Some(log),
+        )?;
+    }
     let changes_order = !current;
     if changes_order {
         writer.barrier(log);
@@ -411,6 +651,7 @@ fn advance_source(
     Ok(done)
 }
 
+pub(crate) use channel::ContentEligibility;
 pub(super) use channel::Presence;
 pub use channel::{GovernanceNotices, GovernanceProgress, GovernanceShares, GovernanceTargets};
 pub(super) use view::{Display, View};
@@ -457,6 +698,18 @@ pub(super) fn prepare(store: &Store, sek: &Sek, room: &Digest32) -> Result<()> {
         batch.derived();
         facts::Write::open(&mut batch, sek, room)?.seal()?;
         batch.commit()?;
+    }
+    {
+        let mut batch = store.batch()?;
+        batch.derived();
+        let mut writer = facts::Write::open(&mut batch, sek, room)?;
+        if writer.needs_source_replay() {
+            writer.start_fork_replay()?;
+            writer.authority_changed()?;
+            writer.start_eligibility_replay()?;
+            writer.seal()?;
+            batch.commit()?;
+        }
     }
     Ok(())
 }
@@ -581,13 +834,30 @@ pub(super) fn advance(
             // every control entry closed the room for seconds. Each step is itself bounded;
             // the budget bounds the turn. Work left over is the next turn's.
             let started = std::time::Instant::now();
+            let mut fold_ready = false;
             for _ in 0..FOLD_STEPS {
                 let ordered = canonical::advance(&mut writer)?;
                 if ordered && fold::advance(&mut writer, &input, root, now)? {
+                    fold_ready = true;
                     break;
                 }
                 if started.elapsed() >= FOLD_BUDGET {
                     break;
+                }
+            }
+            if fold_ready {
+                for _ in 0..FOLD_STEPS {
+                    if started.elapsed() >= FOLD_BUDGET || !writer.causal_settled()? {
+                        break;
+                    }
+                    let replayed = writer.eligibility_replay_step(&input)?;
+                    if !writer.causal_settled()? {
+                        break;
+                    }
+                    let worked = member_fold::advance_eligibility(&mut writer)?;
+                    if !replayed && !worked {
+                        break;
+                    }
                 }
             }
             writer.seal()?;

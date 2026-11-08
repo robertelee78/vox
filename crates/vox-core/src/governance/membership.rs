@@ -128,3 +128,326 @@ pub fn issue_consent_revocation(
 ) -> Result<ConsentRevocation> {
     ConsentRevocation::build(author_root, channel_id, epoch, target, new_chain_id)
 }
+
+/// The signed, room-bound removal of one exact node identity.
+#[derive(Debug, Clone)]
+pub struct MemberRemoval {
+    /// Channel in which the fact applies.
+    pub channel_id: Digest32,
+    /// Channel epoch.
+    pub epoch: u64,
+    /// Fingerprint of the signer.
+    pub issuer_id: Digest32,
+    /// Fingerprint of the removed node.
+    pub target_id: Digest32,
+    /// Composite signature over the canonical unsigned body.
+    pub signature: crate::identity::composite::CompositeSignature,
+}
+
+impl MemberRemoval {
+    /// Sign a removal. Authorization is checked against the causal governance log.
+    pub fn build(
+        issuer_root: &dyn RootSigner,
+        channel_id: &Digest32,
+        epoch: u64,
+        target_id: &Digest32,
+    ) -> Result<Self> {
+        let issuer_id = issuer_root.fingerprint();
+        let body = member_body(channel_id, epoch, &issuer_id, target_id, None);
+        let signature = issuer_root.sign(&crate::wire::signing_input(
+            crate::wire::StructTag::MemberRemoval,
+            &body,
+        ))?;
+        Ok(Self {
+            channel_id: *channel_id,
+            epoch,
+            issuer_id,
+            target_id: *target_id,
+            signature,
+        })
+    }
+
+    /// Canonical unsigned body covered by the signature.
+    pub fn canonical_body(&self) -> Vec<u8> {
+        member_body(
+            &self.channel_id,
+            self.epoch,
+            &self.issuer_id,
+            &self.target_id,
+            None,
+        )
+    }
+
+    /// Canonical framed fact, including the composite signature.
+    pub fn to_wire(&self) -> Vec<u8> {
+        member_wire(
+            crate::wire::StructTag::MemberRemoval,
+            &self.channel_id,
+            self.epoch,
+            &self.issuer_id,
+            &self.target_id,
+            None,
+            &self.signature,
+        )
+    }
+
+    /// Decode a framed fact without granting authority.
+    pub fn from_wire(bytes: &[u8]) -> Result<Self> {
+        let (channel_id, epoch, issuer_id, target_id, _, signature) =
+            parse_member(bytes, crate::wire::StructTag::MemberRemoval)?;
+        Ok(Self {
+            channel_id,
+            epoch,
+            issuer_id,
+            target_id,
+            signature,
+        })
+    }
+
+    /// Verify the signer binding and signature.
+    pub fn verify(&self, key: &crate::identity::composite::CompositePublicKey) -> Result<()> {
+        verify_member(
+            key,
+            &self.issuer_id,
+            crate::wire::StructTag::MemberRemoval,
+            &member_body(
+                &self.channel_id,
+                self.epoch,
+                &self.issuer_id,
+                &self.target_id,
+                None,
+            ),
+            &self.signature,
+        )
+    }
+}
+
+/// Creator-signed readmission referencing the removal log entry hashes it supersedes.
+#[derive(Debug, Clone)]
+pub struct MemberReadmission {
+    /// Channel in which the fact applies.
+    pub channel_id: Digest32,
+    /// Channel epoch.
+    pub epoch: u64,
+    /// Fingerprint of the signer.
+    pub issuer_id: Digest32,
+    /// Fingerprint of the readmitted node.
+    pub target_id: Digest32,
+    /// Nonempty, strictly sorted removal entry hashes.
+    pub removal_entry_hashes: Vec<Digest32>,
+    /// Composite signature over the canonical unsigned body.
+    pub signature: crate::identity::composite::CompositeSignature,
+}
+
+impl MemberReadmission {
+    /// Sign a readmission. References must already be nonempty, sorted and unique.
+    pub fn build(
+        issuer_root: &dyn RootSigner,
+        channel_id: &Digest32,
+        epoch: u64,
+        target_id: &Digest32,
+        removal_entry_hashes: Vec<Digest32>,
+    ) -> Result<Self> {
+        check_removals(&removal_entry_hashes)?;
+        let issuer_id = issuer_root.fingerprint();
+        let body = member_body(
+            channel_id,
+            epoch,
+            &issuer_id,
+            target_id,
+            Some(&removal_entry_hashes),
+        );
+        let signature = issuer_root.sign(&crate::wire::signing_input(
+            crate::wire::StructTag::MemberReadmission,
+            &body,
+        ))?;
+        Ok(Self {
+            channel_id: *channel_id,
+            epoch,
+            issuer_id,
+            target_id: *target_id,
+            removal_entry_hashes,
+            signature,
+        })
+    }
+
+    /// Canonical unsigned body covered by the signature.
+    pub fn canonical_body(&self) -> Vec<u8> {
+        member_body(
+            &self.channel_id,
+            self.epoch,
+            &self.issuer_id,
+            &self.target_id,
+            Some(&self.removal_entry_hashes),
+        )
+    }
+
+    /// Canonical framed fact, including the composite signature.
+    pub fn to_wire(&self) -> Vec<u8> {
+        member_wire(
+            crate::wire::StructTag::MemberReadmission,
+            &self.channel_id,
+            self.epoch,
+            &self.issuer_id,
+            &self.target_id,
+            Some(&self.removal_entry_hashes),
+            &self.signature,
+        )
+    }
+
+    /// Decode a framed fact without granting authority.
+    pub fn from_wire(bytes: &[u8]) -> Result<Self> {
+        let (channel_id, epoch, issuer_id, target_id, hashes, signature) =
+            parse_member(bytes, crate::wire::StructTag::MemberReadmission)?;
+        Ok(Self {
+            channel_id,
+            epoch,
+            issuer_id,
+            target_id,
+            removal_entry_hashes: hashes,
+            signature,
+        })
+    }
+
+    /// Verify the signer binding and signature.
+    pub fn verify(&self, key: &crate::identity::composite::CompositePublicKey) -> Result<()> {
+        check_removals(&self.removal_entry_hashes)?;
+        verify_member(
+            key,
+            &self.issuer_id,
+            crate::wire::StructTag::MemberReadmission,
+            &member_body(
+                &self.channel_id,
+                self.epoch,
+                &self.issuer_id,
+                &self.target_id,
+                Some(&self.removal_entry_hashes),
+            ),
+            &self.signature,
+        )
+    }
+}
+
+fn check_removals(hashes: &[Digest32]) -> Result<()> {
+    if hashes.is_empty() || hashes.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(crate::error::Error::MalformedGovernance(
+            "readmission removal hashes",
+        ));
+    }
+    Ok(())
+}
+
+fn member_fields(
+    e: &mut crate::cbor::Encoder,
+    channel: &Digest32,
+    epoch: u64,
+    issuer: &Digest32,
+    target: &Digest32,
+    hashes: Option<&[Digest32]>,
+) {
+    e.bytes(channel).uint(epoch).bytes(issuer).bytes(target);
+    if let Some(hashes) = hashes {
+        e.array(hashes.len());
+        for hash in hashes {
+            e.bytes(hash);
+        }
+    }
+}
+
+fn member_body(
+    channel: &Digest32,
+    epoch: u64,
+    issuer: &Digest32,
+    target: &Digest32,
+    hashes: Option<&[Digest32]>,
+) -> Vec<u8> {
+    let mut e = crate::cbor::Encoder::new();
+    e.array(if hashes.is_some() { 5 } else { 4 });
+    member_fields(&mut e, channel, epoch, issuer, target, hashes);
+    e.finish()
+}
+
+fn member_wire(
+    tag: crate::wire::StructTag,
+    channel: &Digest32,
+    epoch: u64,
+    issuer: &Digest32,
+    target: &Digest32,
+    hashes: Option<&[Digest32]>,
+    signature: &crate::identity::composite::CompositeSignature,
+) -> Vec<u8> {
+    let mut e = crate::cbor::Encoder::new();
+    e.array(if hashes.is_some() { 6 } else { 5 });
+    member_fields(&mut e, channel, epoch, issuer, target, hashes);
+    e.bytes(&signature.to_bytes());
+    crate::wire::frame(tag, &e.finish())
+}
+
+fn parse_member(
+    bytes: &[u8],
+    tag: crate::wire::StructTag,
+) -> Result<(
+    Digest32,
+    u64,
+    Digest32,
+    Digest32,
+    Vec<Digest32>,
+    crate::identity::composite::CompositeSignature,
+)> {
+    let frame = crate::wire::parse_frame(bytes)?;
+    if frame.tag != tag {
+        return Err(crate::error::Error::MalformedGovernance("member fact tag"));
+    }
+    let mut d = crate::cbor::Decoder::new(frame.body);
+    let readmission = tag == crate::wire::StructTag::MemberReadmission;
+    if d.array()? != if readmission { 6 } else { 5 } {
+        return Err(crate::error::Error::MalformedGovernance(
+            "member fact arity",
+        ));
+    }
+    fn digest(d: &mut crate::cbor::Decoder<'_>) -> Result<Digest32> {
+        d.bytes()?
+            .try_into()
+            .map_err(|_| crate::error::Error::MalformedGovernance("member fact digest length"))
+    }
+    let channel = digest(&mut d)?;
+    let epoch = d.uint()?;
+    let issuer = digest(&mut d)?;
+    let target = digest(&mut d)?;
+    let mut hashes = Vec::new();
+    if readmission {
+        let count = d.array()?;
+        for _ in 0..count {
+            hashes.push(digest(&mut d)?);
+        }
+        check_removals(&hashes)?;
+    }
+    let signature: [u8; crate::hash::COMPOSITE_SIG_LEN] = d
+        .bytes()?
+        .try_into()
+        .map_err(|_| crate::error::Error::MalformedGovernance("member fact signature length"))?;
+    d.finish()?;
+    Ok((
+        channel,
+        epoch,
+        issuer,
+        target,
+        hashes,
+        crate::identity::composite::CompositeSignature::from_bytes(&signature)?,
+    ))
+}
+
+fn verify_member(
+    key: &crate::identity::composite::CompositePublicKey,
+    issuer: &Digest32,
+    tag: crate::wire::StructTag,
+    body: &[u8],
+    signature: &crate::identity::composite::CompositeSignature,
+) -> Result<()> {
+    if key.fingerprint() != *issuer {
+        return Err(crate::error::Error::MalformedGovernance(
+            "member fact issuer",
+        ));
+    }
+    key.verify(&crate::wire::signing_input(tag, body), signature)
+}

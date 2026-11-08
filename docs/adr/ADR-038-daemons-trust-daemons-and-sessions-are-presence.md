@@ -547,9 +547,20 @@ lessons. It changes neither this record's decision status nor any requirement or
   not already hold) MUST write nothing: over a quiet minute a member's store MUST gain no
   commit at all from its rounds. Decision: a hint this node holds (its committed head, its
   control readiness and its live window all at the hint) is not pulled again each period; a
-  hint whose missing pages a peer said it does not hold is not pulled from that peer again
-  until that peer's inventory changes; a head or header already held is not saved again; and a
-  verifier persists its progress once per proof verified to its end (an inclusion proof or a
+  hint whose missing pages a peer said it does not hold MUST NOT be pulled again from that peer
+  while the same connection, authority incarnation and serving-progress evidence stand, including
+  a directly selected own-recovery verification. A peer's newly applied signed entry advances its
+  serving-progress announcement so a sibling can retry retained unavailable evidence, even when
+  the author's head does not change. Completion of a control prefix or contiguous role cut also
+  advances that announcement after its saved state installs; an earlier entry-application edge
+  cannot stand in for evidence that was not yet serveable. A trust grant's selected key-package
+  turn MUST retain its original room, lifetime and reply while a history publication owns that
+  room; temporary publication ownership is not a failed trust operation. A refusal superseded by
+  already accepted serving progress retains its exact selected query and hint owner as runnable,
+  not as a peer failure or parked refusal. Local refusal-bookkeeping capacity keeps that same
+  owner at the existing Busy cadence. A different advertised head alone, including in a role hint,
+  is not new evidence for the old head; a head or header already held is not saved again; and a verifier
+  persists its progress once per proof verified to its end (an inclusion proof or a
   control range), never once per Merkle join, since a proof is bounded and is verified again
   from its bytes after a crash. Measured cause, the same daemon: 1,367 durable store commits per second across the four node stores
   (redb transaction ids read 30 s apart: robert-work 524/s, opencode-work 495/s, codex-work
@@ -579,6 +590,15 @@ lessons. It changes neither this record's decision status nor any requirement or
   lifetime by retrying. The shipped proof binds its Content verdict to one exact accepted entry
   hash observed at Bob's effect outcome and then performs one `vox room read`; a polling read may
   not relabel a later unrelated refusal as this defect.
+
+  Head or dependency `EvidenceUnavailable` and `BodyNotHeld` MUST park the exact selected hint,
+  not persist an absence verdict. `Busy` retains its existing retry semantics. A bounded,
+  charged connection-scoped refusal MUST suppress only the same peer, author and head until the
+  connection, authorization generation, peer or author inventory incarnation changes, or
+  authenticated role or held-through progress rearms it. Another advertised head alone MUST NOT
+  rearm the refused head. Connection closure MUST retire its refusals and fence late workers;
+  older untyped durable declines MUST NOT suppress hints. A finishing flow MUST release only its
+  own selected hint incarnation, never a successor or a retried owner.
 
   **Causal handoffs and access.** A response already consumed from a peer MUST retain its exact
   local continuation until its result is committed or the request is invalidated; local
@@ -843,6 +863,15 @@ lessons. It changes neither this record's decision status nor any requirement or
   checkpoint has no new fact to seal or commit. Retirement is to distinguish actual progress,
   byte/publication dependencies and failed storage, join real workers, and erase the exact old
   secret-bearing capabilities; a timer or unrelated node's recovery cannot manufacture cleanup.
+
+  A successful stable room-authorization snapshot also retires obsolete parked history
+  capabilities before peer connectivity is considered. A returned physical worker rechecks
+  that authorization before its Flow can be parked again; a failed metadata read does not
+  establish supersession. The existing exact-owner retirement settles received debt and
+  physically reclaims stale foreground staging before releasing its body slot. Explicit
+  archive Pause/Resume ownership and transactional borrowed-staging identity checks remain
+  unchanged. This is local capability retirement, not a new request, retry timer, provider
+  route, membership grant or deletion of already admitted history.
 
   Evidence remains separate from these source corrections. The `3c15d2174` journey accepted all
   32 initial posts and completed all 480 cross-member read observations, then ended APPARATUS
@@ -1311,6 +1340,21 @@ lessons. It changes neither this record's decision status nor any requirement or
   Lock/shutdown, room replacement/removal and current-authority supersession MUST retire the
   exact stale receiver wait without clearing a newer owner's work.
 
+  Implementation detail (#1171): a stable absent-opening obligation records the author's
+  opening-set fingerprint before Lookup, not the room's display revision. The existing bounded
+  fold sums SHA-256 opening hashes in four wrapping u64 lanes in the unused Counts key
+  namespace; replacing an opening subtracts its old hash. A marker in the published work roots
+  permits one bounded derived-cache rebuild for an older unmarked projection without changing
+  its header format or unsupported-format refusal. A read takes five fixed tree lookups; no
+  Session identity, wire field, descriptor walk or additional content retention is introduced.
+  Overflow uses one separate per-donor projection interval and a fingerprint over the bounded
+  author roster, never a widening of the main floor/evidence range. The aggregate is captured
+  lazily on the first actual absent-opening overflow, not on ordinary live pages. Each interval
+  retains finite progress and coalesces successor evidence. Extending a completed main range
+  with a new unscanned tail uses the actual donor demand's evidence composition, including
+  rediscovery, and starts above its saved completed frontier; older unresolved obligations remain
+  dormant under the same evidence and become eligible again on their actual evidence change.
+
   Source at `67eb2367f` makes `PageFlow::Apply` return `Done(false)` for every lookup result
   other than a present opening, including typed provisional-projection refusal. No cursor is
   committed, but `PrivateSessionDone` drops that pull owner and only an advanced page continues
@@ -1536,6 +1580,13 @@ lessons. It changes neither this record's decision status nor any requirement or
   A retained passphrase cannot undo removal. Explicit creator readmission, concurrency,
   stale-egress, non-admin, offline catch-up and replacement-identity inverses require actual
   product proof; no retroactive secrecy or instantaneous partition-wide enforcement is claimed.
+  Public exchange must remain room-scoped across a preserved second-room connection and
+  cached board records. A locally removed node must reopen and receive creator readmission
+  from a current noncreator peer, then exchange fresh content while the creator is offline.
+  Restored members must republish an absent own bundle through the existing guarded renewal
+  and connected-member push, not wait for an address change, an anchor or the next TTL renewal.
+  A partially saved membership decision must retain its pending generation bump across a real
+  authority expiry; completed decisions must not rotate again on unrelated governance.
 - **FX-64. Direct publication target.** Every link route the link marks as a member that a joiner
   dials while finding a board (all routes raced by `reach_a_board`, whether selected or not, and
   `another_board_with_the_room`) is reported as a board dial and inserted into the global anchor

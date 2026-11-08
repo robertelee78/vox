@@ -62,6 +62,8 @@ enum TurnStage {
     Cleanup,
     CleanupRecovery,
     Governance,
+    RoomRotation,
+    RoomDriveRotation,
     CacheDelete,
     Backfill,
     Contiguous,
@@ -450,8 +452,28 @@ impl Node {
                         self.governance_work.again |= progress.pending;
                         if progress.ready && !progress.pending {
                             self.governance_work.settled.insert(room);
+                            if self.key_package_governance_wait.remove(&room) {
+                                self.key_package_rooms.entry(room).or_insert(false);
+                            }
                         }
                     }
+                    (
+                        TurnStage::RoomRotation,
+                        Result::Consent(consent_save::Effect::Consent(
+                            crate::node::channel::pending_text::consent::ConsentSaved::RoomRotated,
+                        )),
+                    ) => {
+                        self.governance_work.wake_room(room);
+                        turn.ready = false;
+                        turn.stage = TurnStage::Cleanup;
+                    }
+                    (TurnStage::RoomRotation, Result::Unavailable) => {}
+                    (
+                        TurnStage::RoomDriveRotation,
+                        Result::Session(
+                            crate::node::channel::pending_session::SessionSaved::RemovalRotated,
+                        ),
+                    ) => {}
                     (
                         TurnStage::CacheDelete,
                         Result::Trust(TrustSaved::Deleted {
@@ -643,6 +665,12 @@ impl Node {
             TurnStage::Governance => {
                 return self.governance_after_fold(room, continuation, reply).await
             }
+            TurnStage::RoomRotation => {
+                return self.governance_after_fold(room, continuation, reply).await
+            }
+            TurnStage::RoomDriveRotation => {
+                return self.governance_after_fold(room, continuation, reply).await
+            }
             TurnStage::Backfill => {
                 #[cfg(feature = "test-knobs")]
                 if continuation
@@ -720,6 +748,57 @@ impl Node {
         let After::Turn(turn) = &mut continuation.after else {
             return;
         };
+        if turn.ready
+            && !matches!(
+                turn.stage,
+                TurnStage::RoomRotation | TurnStage::RoomDriveRotation
+            )
+        {
+            turn.stage = TurnStage::RoomRotation;
+            self.continue_governance_save(
+                room,
+                maintenance_save::Work::Consent(consent_save::Work::RoomRotation),
+                continuation,
+                reply,
+            )
+            .await;
+            return;
+        }
+        if turn.ready && matches!(turn.stage, TurnStage::RoomRotation) {
+            let needs_drive_rotation = {
+                let channel = continuation.instance.lock().await;
+                let store = &continuation.lifetime.store;
+                channel
+                    .is_member_removed(store, &channel.me())
+                    .and_then(|removed| {
+                        if removed {
+                            Ok(false)
+                        } else {
+                            channel.room_removal_drive_rotation_needed(store)
+                        }
+                    })
+            };
+            let needs_drive_rotation = match needs_drive_rotation {
+                Ok(needs) => needs,
+                Err(error) => {
+                    self.reject_owned_governance(room, error, continuation, reply);
+                    return;
+                }
+            };
+            turn.stage = TurnStage::RoomDriveRotation;
+            if needs_drive_rotation {
+                self.continue_governance_save(
+                    room,
+                    maintenance_save::Work::Session(
+                        crate::node::channel::pending_session::SessionWrite::RemovalRotation,
+                    ),
+                    continuation,
+                    reply,
+                )
+                .await;
+                return;
+            }
+        }
         let cache_only = {
             let channel = continuation.instance.lock().await;
             if turn.ready {
@@ -912,6 +991,7 @@ impl Node {
         if turn.ready && (turn.changed || self.governance_work.admin_rosters.contains(&room)) {
             self.adopt_channel_anchors(&room).await;
             self.refresh_network_view().await;
+            self.refresh_reachers().await;
             match self
                 .publish_governance_admin_roster(&room, &continuation.lifetime)
                 .await

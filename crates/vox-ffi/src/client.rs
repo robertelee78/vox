@@ -4780,6 +4780,58 @@ impl VoxClient {
         on_held!(self, |c| done(c, &Request::End { channel_id }).await)
     }
 
+    /// Apply a signed room-member removal on the held node. Propagation is not confirmed.
+    ///
+    /// # Errors
+    /// Invalid identities, a changed acting node, or the daemon's authorization refusal.
+    pub async fn remove_room_member(
+        &self,
+        room: String,
+        member: String,
+        actor: String,
+    ) -> Result<(), VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        let member = digest(&member, "member fingerprint")?;
+        let actor = digest(&actor, "acting node fingerprint")?;
+        on_held!(self, |c| {
+            if c.me() != Some(actor) {
+                return Err(failed(
+                    "The acting node changed before removing the member.",
+                ));
+            }
+            match ask(c, &Request::RemoveRoomMember { channel_id, member }).await? {
+                Frame::Appended { .. } => Ok(()),
+                other => Err(unexpected(&other)),
+            }
+        })
+    }
+
+    /// Apply a creator-signed readmission on the held node. This does not itself grant access.
+    ///
+    /// # Errors
+    /// Invalid identities, a changed acting node, or the daemon's authorization refusal.
+    pub async fn readmit_room_member(
+        &self,
+        room: String,
+        member: String,
+        actor: String,
+    ) -> Result<(), VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        let member = digest(&member, "member fingerprint")?;
+        let actor = digest(&actor, "acting node fingerprint")?;
+        on_held!(self, |c| {
+            if c.me() != Some(actor) {
+                return Err(failed(
+                    "The acting node changed before readmitting the member.",
+                ));
+            }
+            match ask(c, &Request::ReadmitRoomMember { channel_id, member }).await? {
+                Frame::Appended { .. } => Ok(()),
+                other => Err(unexpected(&other)),
+            }
+        })
+    }
+
     /// Keep `room`'s message bodies for `ttl_secs` seconds (0: forever), as
     /// `vox room retention` does (ADR-023 decision 2); its creator or an admin only. No
     /// passphrase (ADR-028 K-11): the room's governance says who may.

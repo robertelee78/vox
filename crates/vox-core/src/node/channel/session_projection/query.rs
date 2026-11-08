@@ -24,6 +24,29 @@ const CANNOT_READ: &str = "this node cannot read that Session";
 const PAGE_ROWS: usize = 64;
 const TEXT_BYTES: usize = 32 * 1024;
 
+fn opening_fingerprint(read: &Read<'_>, author: &Digest32) -> Result<Option<Digest32>> {
+    if !read.header.ready
+        || read.header.published.is_none()
+        || read
+            .find(Tree::Counts, &super::storage::OPENING_FINGERPRINT_MARKER)?
+            .is_none()
+    {
+        return Ok(None);
+    }
+    let mut hash = Sha256::new();
+    hash.update(b"vox/session-opening-fingerprint/v1");
+    hash.update(author);
+    for lane in 0..4 {
+        let value = read
+            .find(
+                Tree::Counts,
+                &super::storage::opening_lane_key(author, lane),
+            )?
+            .unwrap_or(0);
+        hash.update(value.to_be_bytes());
+    }
+    Ok(Some(hash.finalize().into()))
+}
 /// What an answer was made from. A continuation naming another basis is told CHANGED and
 /// re-reads: the basis changes when the fold publishes new inputs, when the drive authority
 /// it answered for changes, and when an author it could not answer becomes current.
@@ -348,6 +371,10 @@ impl ChannelState {
         &self,
         view: &super::super::entry_store::RenderView<'_>,
     ) -> Result<(Vec<Digest32>, Vec<Digest32>)> {
+        if self.is_member_removed_in(view.read_index(), &self.me())? {
+            // Removal revokes live Session authority; it is not a failed store read.
+            return Ok((Vec::new(), Vec::new()));
+        }
         let me = self.me();
         let held: std::collections::BTreeSet<Digest32> = self
             .drive
@@ -449,6 +476,57 @@ impl ChannelState {
         h.update([u8::from(read.as_ref().is_some_and(|r| r.header.ready))]);
         h.update([u8::from(self.needs_session_upgrade())]);
         Ok(h.finalize().into())
+    }
+
+    /// The published retained opening set for one author, independent of activity,
+    /// rebuild allocation and publication identity. Exactly five fixed tree lookups.
+    pub(crate) fn author_opening_fingerprint(
+        &self,
+        store: &Store,
+        author: &Digest32,
+    ) -> Result<Option<Digest32>> {
+        let fingerprint = |view: &super::super::entry_store::RenderView<'_>| {
+            let Some(read) = Read::existing(view.snapshot(), &self.sek, &self.channel_id)? else {
+                return Ok(None);
+            };
+            opening_fingerprint(&read, author)
+        };
+        if let Some(resource) = self.history_read_resource() {
+            return resource.with_snapshot(|_, view, _| fingerprint(view));
+        }
+        let view = self
+            .entries
+            .render_view(store, &self.sek, &self.channel_id)?;
+        fingerprint(&view)
+    }
+
+    /// A constant-size overflow baseline over the bounded author roster, from one snapshot.
+    pub(in crate::node::channel) fn private_opening_basis(
+        &self,
+        store: &Store,
+    ) -> Result<Option<Digest32>> {
+        let basis = |view: &super::super::entry_store::RenderView<'_>| {
+            let Some(read) = Read::existing(view.snapshot(), &self.sek, &self.channel_id)? else {
+                return Ok(None);
+            };
+            let mut hash = Sha256::new();
+            hash.update(b"vox/private-refetch-opening-basis/v1");
+            for author in self.authors.keys() {
+                let Some(fingerprint) = opening_fingerprint(&read, author)? else {
+                    return Ok(None);
+                };
+                hash.update(author);
+                hash.update(fingerprint);
+            }
+            Ok(Some(hash.finalize().into()))
+        };
+        if let Some(resource) = self.history_read_resource() {
+            return resource.with_snapshot(|_, view, _| basis(view));
+        }
+        let view = self
+            .entries
+            .render_view(store, &self.sek, &self.channel_id)?;
+        basis(&view)
     }
 
     pub(crate) fn session_query(

@@ -234,6 +234,7 @@ impl Node {
             return false;
         }
         let replay = self.key_package_rooms.remove(&room).unwrap_or(false);
+        let abandon_unopened = self.key_package_unopened.remove(&room);
         let continuation = Continuation {
             instance,
             attachment: self.delivery_epoch,
@@ -247,6 +248,7 @@ impl Node {
             CommonWork::Packages(Work::Select {
                 trust_digest: crate::hash::sha256(&self.trust.to_bytes()),
                 replay,
+                abandon_unopened,
             }),
             maintenance_save::Continuation::Packages(continuation),
             reply,
@@ -310,6 +312,14 @@ impl Node {
                 }
             }
             After::Logged => {
+                if attached
+                    && matches!(continuation.stage, Stage::Open | Stage::Install)
+                    && matches!(fault_of(&error), Fault::GovernanceRefreshing)
+                {
+                    self.key_package_governance_wait.insert(room);
+                    self.key_package_unopened.insert(room);
+                    self.governance_work.wake_room(room);
+                }
                 if attached {
                     let _ = self.event_tx.send(NodeEvent::NodeNote {
                         note: format!(
@@ -385,6 +395,10 @@ impl Node {
         }
         let work = match (continuation.stage, saved) {
             (Stage::Select, CommonSaved::Packages(Saved::Selected { progress, context })) => {
+                if progress.floor_changed {
+                    self.wake_private_refetch(room, &continuation.instance)
+                        .await;
+                }
                 let Some(pending) = progress.package else {
                     if progress.pending {
                         self.key_package_rooms.entry(room).or_insert(false);
@@ -505,6 +519,8 @@ impl Node {
                     if let Some(author) = attempt.author {
                         self.start_installed_private_pull(room, author);
                     }
+                    self.wake_private_refetch(room, &continuation.instance)
+                        .await;
                 }
                 let peer = match &continuation.after {
                     After::Inbound(inbound) => Some(inbound.peer),
@@ -523,6 +539,11 @@ impl Node {
                         .await;
                     }
                     After::Logged => {
+                        if attempt.floor_wait.is_some() {
+                            // A later governance fold can change floor authority even
+                            // without another package publication.
+                            self.key_package_governance_wait.insert(room);
+                        }
                         if attempt.package_pending {
                             self.key_package_rooms.entry(room).or_insert(false);
                         }
@@ -891,6 +912,21 @@ impl Node {
                 return;
             }
         };
+        if matches!(continuation.after, After::Logged)
+            && reply.is_none()
+            && self.policy_save_pending()
+        {
+            // An ordinary selection must not take the room's single save slot while a policy
+            // owns or is about to reserve it: its next stage would only park behind that
+            // reservation, and the policy's own room marks need this slot to release it.
+            // Retain the same reselected obligation as an interrupted turn; the fresh-gated
+            // package turn resumes it once the policy has finished.
+            self.key_package_unopened.insert(room);
+            self.key_package_rooms.entry(room).or_insert(false);
+            drop(continuation);
+            self.post_save_wake.notify_one();
+            return;
+        }
         Box::pin(self.begin_pending_maintenance(
             room,
             work,
@@ -1623,13 +1659,15 @@ impl Node {
             return;
         }
         let pair = (room, peer);
-        if self.sessions.contains_key(&pair) {
+        let existing = self.sessions.contains_key(&pair);
+        if existing || matches!(&next, JoinNext::Answered) {
             let existing_mine = self.initiated.contains_key(&pair);
-            let incoming_wins = match self.profile.as_ref().map(Profile::fingerprint) {
-                Some(me) if mine => existing_mine || me < peer,
-                Some(me) => incoming_session_wins(&me, &peer, existing_mine),
-                None => true,
-            };
+            let incoming_wins = !existing
+                || match self.profile.as_ref().map(Profile::fingerprint) {
+                    Some(me) if mine => existing_mine || me < peer,
+                    Some(me) => incoming_session_wins(&me, &peer, existing_mine),
+                    None => true,
+                };
             if !incoming_wins {
                 if existing_mine {
                     if let Some(initial) = self.initiated.get_mut(&pair) {

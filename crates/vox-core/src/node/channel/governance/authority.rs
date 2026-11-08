@@ -21,8 +21,7 @@ impl Scope {
     pub(super) fn contains(self, writer: &Write<'_, '_>, entry: &Entry) -> Result<bool> {
         match self.0 {
             None => Ok(true),
-            Some(scope) => Ok(scope != entry.entry_hash()
-                && entry.skeleton.seq <= writer.reached(&scope, &entry.skeleton.author_id)?),
+            Some(scope) => writer.causal_contains(&scope, entry),
         }
     }
 }
@@ -226,6 +225,10 @@ impl Query {
                 return Err(invalid("authority certificate locator binding"));
             }
             if cert.body.epoch != 0
+                || !writer.fork_safe(&entry)?
+                || writer
+                    .get(Table::Incomplete, &hash_key(&entry.entry_hash()))?
+                    .is_some()
                 || (cert.body.expiry_ms != 0 && cert.body.expiry_ms <= now_ms)
                 || !self.scope.contains(writer, &entry)?
             {
@@ -260,7 +263,9 @@ impl Query {
             Some((hash, revoke_log)) => {
                 self.after_revoke = Some(hash);
                 let revoke = writer.entry(revoke_log)?;
-                if !self.scope.contains(writer, &revoke)? {
+                if writer.get(Table::Incomplete, &hash_key(&hash))?.is_some()
+                    || !self.scope.contains(writer, &revoke)?
+                {
                     return Ok(None);
                 }
                 let GovBody::AdminRevocation(body) = GovEntry::body_bound_to(&revoke)? else {
@@ -348,4 +353,240 @@ pub(super) fn save_revocation(
         .uint(u64::from(authorized));
     let record = writer.save_record(old, &e.finish())?;
     writer.put(Table::RevocationDecisions, key, Some(record))
+}
+
+/// A persisted, bounded scan of root cutoffs and their causal restorations.
+#[derive(Clone)]
+pub(super) struct RootCutoff {
+    action: Digest32,
+    author: Digest32,
+    phase: u64,
+    after: Option<Digest32>,
+    cutoff: Option<Digest32>,
+    restore_after: Option<Digest32>,
+    cert_after: Option<u64>,
+}
+
+impl RootCutoff {
+    pub(super) fn new(action: Digest32, author: Digest32) -> Self {
+        Self {
+            action,
+            author,
+            phase: 0,
+            after: None,
+            cutoff: None,
+            restore_after: None,
+            cert_after: None,
+        }
+    }
+
+    pub(super) fn write(&self, e: &mut Encoder) {
+        e.array(7)
+            .bytes(&self.action)
+            .bytes(&self.author)
+            .uint(self.phase);
+        option(e, self.after);
+        option(e, self.cutoff);
+        option(e, self.restore_after);
+        match self.cert_after {
+            Some(seq) => {
+                e.array(1).uint(seq);
+            }
+            None => {
+                e.array(0);
+            }
+        }
+    }
+
+    pub(super) fn read(d: &mut Decoder<'_>) -> Result<Self> {
+        if d.array()? != 7 {
+            return Err(invalid("root cutoff cursor arity"));
+        }
+        let action = d
+            .bytes()?
+            .try_into()
+            .map_err(|_| invalid("root cutoff action"))?;
+        let author = d
+            .bytes()?
+            .try_into()
+            .map_err(|_| invalid("root cutoff author"))?;
+        let phase = d.uint()?;
+        let after = read_option(d)?;
+        let cutoff = read_option(d)?;
+        let restore_after = read_option(d)?;
+        let cert_after = match d.array()? {
+            0 => None,
+            1 => Some(d.uint()?),
+            _ => return Err(invalid("root cutoff certificate cursor")),
+        };
+        if phase > 4 || (matches!(phase, 1 | 3) != cutoff.is_some()) {
+            return Err(invalid("root cutoff cursor bounds"));
+        }
+        Ok(Self {
+            action,
+            author,
+            phase,
+            after,
+            cutoff,
+            restore_after,
+            cert_after,
+        })
+    }
+
+    /// `None` means more bounded work; `Some(false)` rejects the act.
+    pub(super) fn advance(
+        &mut self,
+        writer: &Write<'_, '_>,
+        root: &Digest32,
+        generation: u64,
+    ) -> Result<Option<bool>> {
+        if self.author == *root {
+            return Ok(Some(true));
+        }
+        let action_log = writer
+            .evidence_locator(&self.action)?
+            .ok_or(invalid("root cutoff action missing"))?;
+        let action = writer.entry(action_log)?;
+        match self.phase {
+            0 => {
+                let Some((hash, log)) =
+                    member_row(writer, Table::MemberRemovals, &self.author, self.after)?
+                else {
+                    self.phase = 2;
+                    self.after = None;
+                    return Ok(None);
+                };
+                self.after = Some(hash);
+                let removal = writer.entry(log)?;
+                if removal.skeleton.author_id != *root
+                    || writer.get(Table::MemberDecisions, &hash_key(&hash))? != Some(generation)
+                    || Scope(Some(hash)).contains(writer, &action)?
+                {
+                    return Ok(None);
+                }
+                self.cutoff = Some(hash);
+                self.restore_after = None;
+                self.phase = 1;
+                Ok(None)
+            }
+            1 => {
+                let cutoff = self.cutoff.ok_or(invalid("root removal cutoff missing"))?;
+                let Some((hash, log)) = member_row(
+                    writer,
+                    Table::MemberReadmissions,
+                    &self.author,
+                    self.restore_after,
+                )?
+                else {
+                    return Ok(Some(false));
+                };
+                self.restore_after = Some(hash);
+                if writer.get(Table::MemberDecisions, &hash_key(&hash))? != Some(generation) {
+                    return Ok(None);
+                }
+                let readmission = writer.entry(log)?;
+                let GovBody::MemberReadmission(body) = GovEntry::body_bound_to(&readmission)?
+                else {
+                    return Err(invalid("root readmission locator kind"));
+                };
+                let cutoff_log = writer
+                    .evidence_locator(&cutoff)?
+                    .ok_or(invalid("root removal cutoff locator"))?;
+                if readmission.skeleton.author_id == *root
+                    && body.removal_entry_hashes.binary_search(&cutoff).is_ok()
+                    && Scope(Some(hash)).contains(writer, &writer.entry(cutoff_log)?)?
+                    && Scope(Some(self.action)).contains(writer, &readmission)?
+                {
+                    self.phase = 0;
+                    self.cutoff = None;
+                    self.restore_after = None;
+                }
+                Ok(None)
+            }
+            2 => {
+                let Some((hash, log)) = next_revocation(writer, &self.author, self.after)? else {
+                    self.phase = 4;
+                    return Ok(Some(true));
+                };
+                self.after = Some(hash);
+                let revoke = writer.entry(log)?;
+                if revoke.skeleton.author_id != *root
+                    || writer
+                        .get(Table::RevocationDecisions, &hash_key(&hash))?
+                        .is_none()
+                    || !authorized_revoke(writer, &hash, generation)?
+                    || Scope(Some(hash)).contains(writer, &action)?
+                {
+                    return Ok(None);
+                }
+                self.cutoff = Some(hash);
+                self.cert_after = None;
+                self.phase = 3;
+                Ok(None)
+            }
+            3 => {
+                let cutoff = self
+                    .cutoff
+                    .ok_or(invalid("root revocation cutoff missing"))?;
+                let row = match self.cert_after {
+                    Some(seq) => {
+                        writer.first(Table::CreatorCerts, Some(position(&self.author, seq)))?
+                    }
+                    None => writer.at_or_after(Table::CreatorCerts, hash_key(&self.author))?,
+                };
+                let Some((_, log)) = row.filter(|(key, _)| key[..32] == self.author[..]) else {
+                    return Ok(Some(false));
+                };
+                let cert = writer.entry(log)?;
+                self.cert_after = Some(cert.skeleton.seq);
+                let GovBody::AdminCert(body) = GovEntry::body_bound_to(&cert)? else {
+                    return Err(invalid("root restoration certificate kind"));
+                };
+                let cutoff_log = writer
+                    .evidence_locator(&cutoff)?
+                    .ok_or(invalid("root revocation cutoff locator"))?;
+                if cert.skeleton.author_id == *root
+                    && writer.fork_safe(&cert)?
+                    && body.body.epoch == 0
+                    && body.body.issuer_id == *root
+                    && body.body.delegate_id() == self.author
+                    && Scope(Some(cert.entry_hash()))
+                        .contains(writer, &writer.entry(cutoff_log)?)?
+                    && Scope(Some(self.action)).contains(writer, &cert)?
+                {
+                    self.phase = 2;
+                    self.cutoff = None;
+                    self.cert_after = None;
+                }
+                Ok(None)
+            }
+            4 => Ok(Some(true)),
+            _ => Err(invalid("root cutoff phase")),
+        }
+    }
+}
+
+fn member_row(
+    writer: &Write<'_, '_>,
+    table: Table,
+    target: &Digest32,
+    after: Option<Digest32>,
+) -> Result<Option<(Digest32, u64)>> {
+    let mut key = hash_key(target);
+    let row = if let Some(after) = after {
+        key[32..].copy_from_slice(&after);
+        writer.first(table, Some(key))?
+    } else {
+        writer.at_or_after(table, key)?
+    };
+    row.filter(|(key, _)| key[..32] == target[..])
+        .map(|(key, log)| {
+            Ok((
+                key[32..]
+                    .try_into()
+                    .map_err(|_| invalid("member cutoff locator"))?,
+                log,
+            ))
+        })
+        .transpose()
 }

@@ -155,6 +155,74 @@ fn replace(index: &mut Write<'_, '_>, tree: Tree, key: Key, bytes: &[u8]) -> Res
     index.set(tree, key, Some(id))?;
     Ok(id)
 }
+/// Reconstruction is independent of folded maxima: each source is recovered from
+/// the already authenticated public log and its cursor commits with its locator.
+pub(in crate::node::channel) fn source_replay(
+    transaction: Transaction<'_, '_>,
+    sek: &Sek,
+    room: &Digest32,
+) -> Result<(u64, bool)> {
+    let Some(bytes) = descriptor(transaction, sek, room, Tree::FloorReplay, &[0; 64])? else {
+        return Ok((0, false));
+    };
+    let mut d = Decoder::new(&bytes);
+    if d.array()? != 3 || d.uint()? != 1 {
+        return Err(bad());
+    }
+    let after = d.uint()?;
+    let done = match d.uint()? {
+        0 => false,
+        1 => true,
+        _ => return Err(bad()),
+    };
+    d.finish()?;
+    Ok((after, done))
+}
+
+pub(in crate::node::channel) fn save_source_replay(
+    batch: &mut crate::node::store::Batch<'_>,
+    sek: &Sek,
+    room: &Digest32,
+    after: u64,
+    done: bool,
+) -> Result<()> {
+    let mut e = Encoder::new();
+    e.array(3).uint(1).uint(after).uint(u64::from(done));
+    let mut index = Write::open(batch, sek, room)?;
+    replace(&mut index, Tree::FloorReplay, [0; 64], &e.finish())?;
+    index.seal()
+}
+
+/// The next retained signed floor source in this author's feed.
+pub(in crate::node::channel) fn source_after(
+    snapshot: &crate::node::store::Snapshot,
+    sek: &Sek,
+    room: &Digest32,
+    author: &Digest32,
+    after: u64,
+) -> Result<Option<(u64, Digest32)>> {
+    let Some(read) = Read::existing(snapshot, sek, room)? else {
+        return Ok(None);
+    };
+    let mut key = author_key(author);
+    key[32..40].copy_from_slice(&after.to_be_bytes());
+    let Some((key, id)) = read
+        .next(Tree::FloorSources, Some(key))?
+        .filter(|(key, _)| key[..32] == author[..])
+    else {
+        return Ok(None);
+    };
+    if key[40..].iter().any(|byte| *byte != 0) {
+        return Err(bad());
+    }
+    let seq = u64::from_be_bytes(key[32..40].try_into().map_err(|_| bad())?);
+    let hash = read
+        .descriptor(id)?
+        .as_slice()
+        .try_into()
+        .map_err(|_| bad())?;
+    Ok(Some((seq, hash)))
+}
 /// The caller has authenticated and published the entry in this same Batch. Contiguous
 /// progress is independent of whether it contains a floor, so an absent lookup is meaningful.
 pub(super) fn observe(
@@ -181,6 +249,19 @@ pub(super) fn observe(
             && f.epoch <= current_epoch
             && f.first_seq <= entry.skeleton.seq.saturating_add(1)
     }) {
+        // Keep the identity of every signed statement, not merely the largest folded
+        // boundary. Removal/readmission authorization depends on its causal ancestry.
+        let mut source = author_key(&author);
+        source[32..40].copy_from_slice(&entry.skeleton.seq.to_be_bytes());
+        let hash = entry.entry_hash();
+        if let Some(id) = index.find(Tree::FloorSources, &source)? {
+            if index.descriptor(id)?.as_slice() != hash {
+                return Err(bad());
+            }
+        } else {
+            replace(index, Tree::FloorSources, source, &hash)?;
+            changed = true;
+        }
         let value = (f.membership, f.iteration, f.first_seq);
         let exact = floor_key(&(author, f.recipient, f.epoch, f.generation));
         let old = index
@@ -201,14 +282,424 @@ pub(super) fn observe(
                     .announced
                     .map_or(f.generation, |old| old.max(f.generation)),
             );
-            state.revision = state.revision.checked_add(1).ok_or_else(bad)?;
             changed = true;
         }
+    }
+    if changed {
+        state.revision = state.revision.checked_add(1).ok_or_else(bad)?;
     }
     if changed || state.through != old_through {
         replace(index, Tree::FloorAuthors, key, &state.bytes())?;
     }
     Ok(())
+}
+#[derive(Default)]
+struct FloorProof {
+    generation: u64,
+    revision: u64,
+    phase: u64,
+    after_removal: Option<Digest32>,
+    removal: Option<Digest32>,
+    after_restoration: Option<Digest32>,
+    restoration: Option<Digest32>,
+    after_source: u64,
+}
+
+fn proof_hash(d: &mut Decoder<'_>) -> Result<Option<Digest32>> {
+    let bytes = d.bytes()?;
+    if bytes.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(bytes.try_into().map_err(|_| bad())?))
+    }
+}
+
+fn put_proof_hash(e: &mut Encoder, hash: Option<Digest32>) {
+    e.bytes(hash.as_ref().map_or(&[][..], |hash| &hash[..]));
+}
+
+impl FloorProof {
+    fn read(bytes: &[u8]) -> Result<Self> {
+        let mut d = Decoder::new(bytes);
+        if d.array()? != 9 || d.uint()? != 1 {
+            return Err(bad());
+        }
+        let state = Self {
+            generation: d.uint()?,
+            revision: d.uint()?,
+            phase: d.uint()?,
+            after_removal: proof_hash(&mut d)?,
+            removal: proof_hash(&mut d)?,
+            after_restoration: proof_hash(&mut d)?,
+            restoration: proof_hash(&mut d)?,
+            after_source: d.uint()?,
+        };
+        d.finish()?;
+        if state.phase > 4 {
+            return Err(bad());
+        }
+        Ok(state)
+    }
+    fn bytes(&self) -> Vec<u8> {
+        let mut e = Encoder::new();
+        e.array(9)
+            .uint(1)
+            .uint(self.generation)
+            .uint(self.revision)
+            .uint(self.phase);
+        put_proof_hash(&mut e, self.after_removal);
+        put_proof_hash(&mut e, self.removal);
+        put_proof_hash(&mut e, self.after_restoration);
+        put_proof_hash(&mut e, self.restoration);
+        e.uint(self.after_source);
+        e.finish()
+    }
+}
+
+/// One bounded proof turn for a signed floor. It retains the source hash and
+/// checks every covering creator restoration against every earlier floor generation.
+pub(in crate::node::channel) fn authorization_step(
+    store: &Store,
+    sek: &Sek,
+    room: &Digest32,
+    root: Digest32,
+    now: u64,
+    entry: &crate::log::entry::Entry,
+    recipient_current: bool,
+) -> Result<Option<bool>> {
+    use crate::governance::entry::{GovBody, GovEntry};
+    use crate::node::channel::governance::{ContentEligibility, View};
+    let floor = entry
+        .payload
+        .as_deref()
+        .and_then(Floor::read)
+        .ok_or_else(bad)?;
+    if floor.room != *room
+        || floor.author != entry.skeleton.author_id
+        || floor.epoch != entry.skeleton.epoch
+    {
+        return Err(bad());
+    }
+    let snapshot = store.snapshot()?;
+    let view = View::pinned(&snapshot, sek, room, root, now)?;
+    match view.floor_recipient_eligibility(entry)? {
+        ContentEligibility::Eligible => {}
+        ContentEligibility::Ineligible => return Ok(Some(false)),
+        ContentEligibility::Refreshing => return Ok(None),
+    }
+    let generation = view.authority_generation();
+    let revision = author(Transaction::Snapshot(&snapshot), sek, room, &floor.author)?.revision;
+    let mut key = author_key(&entry.entry_hash());
+    key[63] = u8::from(recipient_current);
+    let mut state = descriptor(
+        Transaction::Snapshot(&snapshot),
+        sek,
+        room,
+        Tree::FloorAuthorization,
+        &key,
+    )?
+    .map(|bytes| FloorProof::read(&bytes))
+    .transpose()?
+    .unwrap_or_default();
+    if state.generation != generation || state.revision != revision {
+        state = FloorProof {
+            generation,
+            revision,
+            ..Default::default()
+        };
+    }
+    for _ in 0..64 {
+        match state.phase {
+            0 => {
+                let target = if recipient_current {
+                    &floor.recipient
+                } else {
+                    &floor.author
+                };
+                let Some((hash, removal)) =
+                    view.member_fact_after(target, false, state.after_removal)?
+                else {
+                    state.phase = 3;
+                    break;
+                };
+                state.after_removal = Some(hash);
+                let Some(_removal) = removal else {
+                    continue;
+                };
+                // New private records need a restored floor even if the floor
+                // predates the cut: private bytes have no public causal position.
+                state.removal = Some(hash);
+                state.after_restoration = None;
+                state.phase = 1;
+            }
+            1 => {
+                let target = if recipient_current {
+                    &floor.recipient
+                } else {
+                    &floor.author
+                };
+                let Some((hash, restoration)) =
+                    view.member_fact_after(target, true, state.after_restoration)?
+                else {
+                    state.phase = 4;
+                    break;
+                };
+                state.after_restoration = Some(hash);
+                let Some(restoration) = restoration else {
+                    continue;
+                };
+                let GovBody::MemberReadmission(body) = GovEntry::body_bound_to(&restoration)?
+                else {
+                    return Err(bad());
+                };
+                if body
+                    .removal_entry_hashes
+                    .binary_search(&state.removal.ok_or_else(bad)?)
+                    .is_err()
+                {
+                    continue;
+                }
+                match view.causal_contains(&entry.entry_hash(), &restoration)? {
+                    Some(true) => {}
+                    Some(false) => continue,
+                    None => return Ok(None),
+                }
+                if recipient_current {
+                    state.phase = 0;
+                    state.removal = None;
+                    continue;
+                }
+                state.restoration = Some(hash);
+                state.after_source = 0;
+                state.phase = 2;
+            }
+            2 => {
+                let Some((seq, hash)) =
+                    source_after(&snapshot, sek, room, &floor.author, state.after_source)?
+                else {
+                    state.phase = 0;
+                    state.removal = None;
+                    state.restoration = None;
+                    continue;
+                };
+                state.after_source = seq;
+                let Some(other) = view.source(&hash)? else {
+                    return Ok(None);
+                };
+                let Some(other_floor) = other.payload.as_deref().and_then(Floor::read) else {
+                    return Err(bad());
+                };
+                if other_floor.generation < floor.generation {
+                    continue;
+                }
+                match view.causal_contains(
+                    &other.entry_hash(),
+                    &view
+                        .source(&state.restoration.ok_or_else(bad)?)?
+                        .ok_or_else(bad)?,
+                )? {
+                    Some(true) => {}
+                    Some(false) => {
+                        state.phase = 1;
+                        state.restoration = None;
+                    }
+                    None => return Ok(None),
+                }
+            }
+            3 => return Ok(Some(true)),
+            4 => return Ok(Some(false)),
+            _ => return Err(bad()),
+        }
+    }
+    drop(view);
+    drop(snapshot);
+    let mut batch = store.batch()?;
+    batch.derived();
+    {
+        let view = View::in_batch(&batch, sek, room, root, now)?;
+        if view.authority_generation() != generation {
+            return Ok(None);
+        }
+        if author(Transaction::Batch(&batch), sek, room, &floor.author)?.revision != revision {
+            return Ok(None);
+        }
+    }
+    let mut index = Write::open(&mut batch, sek, room)?;
+    replace(&mut index, Tree::FloorAuthorization, key, &state.bytes())?;
+    index.seal()?;
+    batch.commit()?;
+    Ok(match state.phase {
+        3 => Some(true),
+        4 => Some(false),
+        _ => None,
+    })
+}
+
+#[derive(Default)]
+struct FloorSelection {
+    generation: u64,
+    revision: u64,
+    membership: u64,
+    after: u64,
+    done: bool,
+    best: Option<(u64, u64)>,
+}
+impl FloorSelection {
+    fn read(bytes: &[u8]) -> Result<Self> {
+        let mut d = Decoder::new(bytes);
+        if d.array()? != 7 || d.uint()? != 1 {
+            return Err(bad());
+        }
+        let generation = d.uint()?;
+        let revision = d.uint()?;
+        let membership = d.uint()?;
+        let after = d.uint()?;
+        let done = match d.uint()? {
+            0 => false,
+            1 => true,
+            _ => return Err(bad()),
+        };
+        let best = match d.array()? {
+            0 => None,
+            2 => Some((d.uint()?, d.uint()?)),
+            _ => return Err(bad()),
+        };
+        d.finish()?;
+        Ok(Self {
+            generation,
+            revision,
+            membership,
+            after,
+            done,
+            best,
+        })
+    }
+    fn bytes(&self) -> Vec<u8> {
+        let mut e = Encoder::new();
+        e.array(7)
+            .uint(1)
+            .uint(self.generation)
+            .uint(self.revision)
+            .uint(self.membership)
+            .uint(self.after)
+            .uint(u64::from(self.done));
+        e.array(if self.best.is_some() { 2 } else { 0 });
+        if let Some((iteration, first)) = self.best {
+            e.uint(iteration).uint(first);
+        }
+        e.finish()
+    }
+}
+
+/// Resolve an exact recipient/generation floor from authenticated source entries.
+/// The returned boundary is published only after the bounded scan completes.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::node::channel) fn authorized_floor_step(
+    store: &Store,
+    sek: &Sek,
+    room: &Digest32,
+    root: Digest32,
+    now: u64,
+    key: &SessionFloorKey,
+    membership: u64,
+    recipient_current: bool,
+) -> Result<Option<Option<SessionFloorBoundary>>> {
+    use crate::node::channel::governance::View;
+    let snapshot = store.snapshot()?;
+    let view = View::pinned(&snapshot, sek, room, root, now)?;
+    let generation = view.authority_generation();
+    let revision = author(Transaction::Snapshot(&snapshot), sek, room, &key.0)?.revision;
+    let mut tree_key = floor_key(key);
+    tree_key[63] = u8::from(recipient_current);
+    let mut state = descriptor(
+        Transaction::Snapshot(&snapshot),
+        sek,
+        room,
+        Tree::FloorSelection,
+        &tree_key,
+    )?
+    .map(|bytes| FloorSelection::read(&bytes))
+    .transpose()?
+    .unwrap_or_default();
+    if state.generation != generation
+        || state.revision != revision
+        || state.membership != membership
+    {
+        state = FloorSelection {
+            generation,
+            revision,
+            membership,
+            ..Default::default()
+        };
+    }
+    if state.done {
+        return Ok(Some(
+            state
+                .best
+                .map(|(iteration, first)| (membership, iteration, first)),
+        ));
+    }
+    for _ in 0..64 {
+        let Some((seq, hash)) = source_after(&snapshot, sek, room, &key.0, state.after)? else {
+            state.done = true;
+            break;
+        };
+        let Some(entry) = view.source(&hash)? else {
+            return Ok(None);
+        };
+        let floor = entry
+            .payload
+            .as_deref()
+            .and_then(Floor::read)
+            .ok_or_else(bad)?;
+        if (floor.author, floor.recipient, floor.epoch, floor.generation) == *key
+            && floor.membership == membership
+        {
+            match authorization_step(store, sek, room, root, now, &entry, false)? {
+                Some(true) => {
+                    if recipient_current {
+                        match authorization_step(store, sek, room, root, now, &entry, true)? {
+                            Some(true) => {}
+                            Some(false) => {
+                                state.after = seq;
+                                continue;
+                            }
+                            None => break,
+                        }
+                    }
+                    let boundary = (floor.iteration, floor.first_seq);
+                    if state.best.is_none_or(|old| boundary < old) {
+                        state.best = Some(boundary);
+                    }
+                }
+                Some(false) => {}
+                None => break,
+            }
+        }
+        state.after = seq;
+    }
+    drop(view);
+    drop(snapshot);
+    let mut batch = store.batch()?;
+    batch.derived();
+    {
+        let view = View::in_batch(&batch, sek, room, root, now)?;
+        if view.authority_generation() != generation {
+            return Ok(None);
+        }
+        if author(Transaction::Batch(&batch), sek, room, &key.0)?.revision != revision {
+            return Ok(None);
+        }
+    }
+    let mut index = Write::open(&mut batch, sek, room)?;
+    replace(&mut index, Tree::FloorSelection, tree_key, &state.bytes())?;
+    index.seal()?;
+    batch.commit()?;
+    Ok(state.done.then_some(
+        state
+            .best
+            .map(|(iteration, first)| (membership, iteration, first)),
+    ))
 }
 
 #[derive(Default)]

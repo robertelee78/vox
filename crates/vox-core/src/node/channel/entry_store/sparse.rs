@@ -217,12 +217,15 @@ pub(crate) enum ObjectKind {
     PendingHeader = 8,
     // Exact-head proof-serving cache only; never used by acceptance or authored appends.
     ProofRange = 9,
+    // A context actually supplied by a proof of this returning author's public head.
+    RecoveryContext = 10,
 }
 impl ObjectKind {
     pub(crate) const fn limit(self) -> usize {
         match self {
             Self::Context => MAX_CONTEXT_BYTES,
             Self::ProofRange => STATE_BYTES,
+            Self::RecoveryContext => 32,
             Self::Head | Self::Header | Self::PendingHeader => MAX_HEADER_BYTES,
             Self::Verifier => MAX_FRAME_BYTES + 12 * MAX_HEADER_BYTES + 512,
             Self::ParentReceipt | Self::InclusionReceipt | Self::PrefixReceipt => {
@@ -236,6 +239,13 @@ fn object_key(kind: ObjectKind, hash: &Digest32) -> Key {
     key[32] = kind as u8;
     key
 }
+fn recovery_context_key(author: &Digest32, context: &Digest32) -> Digest32 {
+    let mut input = b"vox/own-recovery-context/v1".to_vec();
+    input.extend_from_slice(author);
+    input.extend_from_slice(context);
+    sha256(&input)
+}
+
 fn declined_head_key(peer: &Digest32, author: &Digest32) -> Key {
     let mut key = [0; 64];
     key[..32].copy_from_slice(peer);
@@ -1084,7 +1094,9 @@ impl Read<'_> {
             .source()
             .sparse_record(self.sek, self.channel, id, STATE_BYTES)?;
         let mut d = Decoder::new(&bytes);
-        if d.array()? != 7 || d.uint()? != 2 || d.bytes()? != peer || d.bytes()? != author {
+        let count = d.array()?;
+        let version = d.uint()?;
+        if count != 7 || !matches!(version, 2 | 3) || d.bytes()? != peer || d.bytes()? != author {
             return Err(invalid("declined history head binding"));
         }
         let head = d
@@ -1098,6 +1110,9 @@ impl Read<'_> {
         let peer_incarnation = d.uint()?;
         let author_incarnation = d.uint()?;
         d.finish()?;
+        if version == 2 {
+            return Ok(None);
+        }
         Ok(Some((
             head,
             authorization,
@@ -1448,6 +1463,24 @@ impl Read<'_> {
         self.source()
             .sparse_head(self.sek, self.channel, self.directory.active.sparse, hash)
     }
+    pub(crate) fn recovery_context_head(
+        &self,
+        author: &Digest32,
+        context: &Digest32,
+    ) -> Result<Option<Digest32>> {
+        self.history_object(
+            ObjectKind::RecoveryContext,
+            &recovery_context_key(author, context),
+        )?
+        .map(|bytes| {
+            bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| invalid("own recovery context witness"))
+        })
+        .transpose()
+    }
+
     pub(crate) fn history_context(&self, hash: &Digest32) -> Result<Option<ControlContext>> {
         self.history_object(ObjectKind::Context, hash)?
             .map(|bytes| {
@@ -1627,7 +1660,9 @@ impl Write<'_, '_> {
         let bytes =
             Source::Batch(self.batch).sparse_record(self.sek, self.channel, id, STATE_BYTES)?;
         let mut d = Decoder::new(&bytes);
-        if d.array()? != 7 || d.uint()? != 2 || d.bytes()? != peer || d.bytes()? != author {
+        let count = d.array()?;
+        let version = d.uint()?;
+        if count != 7 || !matches!(version, 2 | 3) || d.bytes()? != peer || d.bytes()? != author {
             return Err(invalid("declined history head binding"));
         }
         let head = d
@@ -1641,6 +1676,9 @@ impl Write<'_, '_> {
         let peer_incarnation = d.uint()?;
         let author_incarnation = d.uint()?;
         d.finish()?;
+        if version == 2 {
+            return Ok(None);
+        }
         Ok(Some((
             head,
             authorization,
@@ -1708,7 +1746,7 @@ impl Write<'_, '_> {
         let old = Source::Batch(self.batch).number(self.sek, self.channel, root, &key)?;
         let mut e = Encoder::new();
         e.array(7)
-            .uint(2)
+            .uint(3)
             .bytes(&peer)
             .bytes(&author)
             .bytes(&head)
@@ -2327,6 +2365,18 @@ impl Write<'_, '_> {
         self.directory.active.sparse.objects =
             self.save_history_object_at(self.directory.active.sparse.objects, kind, hash, bytes)?;
         Ok(())
+    }
+    pub(crate) fn keep_recovery_context(
+        &mut self,
+        author: &Digest32,
+        head: &Digest32,
+        context: &Digest32,
+    ) -> Result<()> {
+        self.save_history_object(
+            ObjectKind::RecoveryContext,
+            recovery_context_key(author, context),
+            head,
+        )
     }
 
     /// Return one updated object root without choosing which publication owns it.

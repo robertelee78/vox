@@ -2,7 +2,7 @@
 use super::*;
 
 pub(crate) enum Prepared {
-    Append(Box<PendingText>),
+    Append(Box<PendingText>, bool),
     Unchanged(Unchanged),
 }
 
@@ -10,6 +10,7 @@ pub(crate) struct Unchanged {
     owner: Arc<()>,
     room: Digest32,
     epoch: u64,
+    needs_ack: bool,
     pin: Option<history::PendingHistoryRead>,
 }
 
@@ -20,12 +21,12 @@ pub(crate) enum Saved {
 
 pub(crate) struct Departure {
     pub(crate) generation: u64,
-    pub(crate) alone: bool,
+    pub(crate) needs_ack: bool,
     pub(crate) epoch: u64,
 }
 
 pub(crate) enum Completed {
-    Append(Box<CompletedText>),
+    Append(Box<CompletedText>, bool),
     Unchanged(Unchanged),
 }
 
@@ -36,12 +37,20 @@ impl ChannelState {
         owner: Arc<()>,
         now: crate::time::Ms,
     ) -> Result<Option<Prepared>> {
-        if self.said_left(&self.me()) {
+        // Capture before authoring Presence(false), which itself leaves fold work.
+        // A known removal already excludes us; peers cannot owe its departure an ack.
+        let removed = governance::removal_generation(store, &self.channel_id)? != 0
+            && self.is_member_removed(store, &self.me())?;
+        let needs_ack = !removed && self.members().into_iter().any(|member| member != self.me());
+        // A verified newer admission makes the old final Presence(false) a prior leave,
+        // not this request's departure. Recovery must finish before signing a new one.
+        if self.has_left(&self.me()) {
             let pin = self.reserve_pending_write(store, Arc::clone(&owner))?;
             return Ok(Some(Prepared::Unchanged(Unchanged {
                 owner,
                 room: self.channel_id,
                 epoch: self.epoch,
+                needs_ack,
                 pin: Some(pin),
             })));
         }
@@ -59,15 +68,15 @@ impl ChannelState {
             Vec::new(),
             None,
         )?;
-        Ok(Some(Prepared::Append(Box::new(pending))))
+        Ok(Some(Prepared::Append(Box::new(pending), needs_ack)))
     }
 }
 
 impl Prepared {
     pub(crate) fn run(self, store: &Store, signer: &dyn RootSigner) -> Completed {
-        let mut pending = match self {
+        let (mut pending, needs_ack) = match self {
             Self::Unchanged(unchanged) => return Completed::Unchanged(unchanged),
-            Self::Append(pending) => pending,
+            Self::Append(pending, needs_ack) => (pending, needs_ack),
         };
         let result = (|| {
             let presence = crate::governance::presence::Presence::build(
@@ -89,14 +98,14 @@ impl Prepared {
                 )
                 .map(|hash| super::Saved::Governance(Some(hash)))
         })();
-        Completed::Append(Box::new(pending.complete_control(result)))
+        Completed::Append(Box::new(pending.complete_control(result)), needs_ack)
     }
 }
 
 impl Completed {
     pub(crate) fn can_install(&self, channel: &ChannelState, owner: &Arc<()>) -> bool {
         match self {
-            Self::Append(completed) => {
+            Self::Append(completed, _) => {
                 completed.can_install(channel, owner)
                     && completed.pending.as_ref().is_some_and(|pending| {
                         pending.room == channel.channel_id && pending.epoch == channel.epoch
@@ -115,32 +124,33 @@ impl Completed {
     }
     pub(crate) fn take_history_pin(&mut self) -> Option<history::PendingHistoryRead> {
         match self {
-            Self::Append(completed) => completed.take_history_pin(),
+            Self::Append(completed, _) => completed.take_history_pin(),
             Self::Unchanged(unchanged) => unchanged.pin.take(),
         }
     }
     pub(crate) fn into_result(self) -> Result<Saved> {
         let result = match self {
-            Self::Append(completed) => completed.result.map(|_| ()),
+            Self::Append(completed, _) => completed.result.map(|_| ()),
             Self::Unchanged(_) => Ok(()),
         };
         result.map(|_| Saved::Detached)
     }
     pub(crate) fn finish(self, channel: &mut ChannelState, store: &Store) -> Result<Saved> {
-        match self {
-            Self::Append(completed) => {
+        let needs_ack = match self {
+            Self::Append(completed, needs_ack) => {
                 channel.finish_pending_text(store, *completed)?;
+                needs_ack
             }
-            Self::Unchanged(unchanged) => channel.release_pending_text(&unchanged.owner, false),
-        }
+            Self::Unchanged(unchanged) => {
+                channel.release_pending_text(&unchanged.owner, false);
+                unchanged.needs_ack
+            }
+        };
         Ok(Saved::Installed(Departure {
             generation: channel
                 .generation()
                 .load(std::sync::atomic::Ordering::Relaxed),
-            alone: channel
-                .members()
-                .into_iter()
-                .all(|member| member == channel.me()),
+            needs_ack,
             epoch: channel.epoch,
         }))
     }

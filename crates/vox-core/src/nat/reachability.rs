@@ -888,6 +888,7 @@ async fn connect_dialable(
     let mut set: JoinSet<(SocketAddr, Result<VoxConnection>)> = JoinSet::new();
     let mut next = 0usize;
     let mut why: Vec<String> = Vec::with_capacity(candidates.len());
+    let mut mismatch = false;
 
     loop {
         // Nothing in flight: launch the next candidate at once — there is nothing to
@@ -896,7 +897,7 @@ async fn connect_dialable(
         // defect the M15.1 gate caught when an attempt failed faster than the timer.)
         if set.is_empty() {
             if next >= candidates.len() {
-                return Err(exhausted(&why));
+                return Err(exhausted(&why, mismatch));
             }
             spawn_attempt(
                 &mut set,
@@ -920,7 +921,7 @@ async fn connect_dialable(
                 joined = set.join_next() => {
                     match take_success(joined) {
                         Ok(conn) => return Ok(conn), // JoinSet drop cancels the rest
-                        Err(Some(reason)) => why.push(reason),
+                        Err(Some((reason, incompatible))) => { why.push(reason); mismatch |= incompatible; }
                         Err(None) => {}
                     }
                 }
@@ -930,10 +931,13 @@ async fn connect_dialable(
             match set.join_next().await {
                 Some(joined) => match take_success(Some(joined)) {
                     Ok(conn) => return Ok(conn),
-                    Err(Some(reason)) => why.push(reason),
+                    Err(Some((reason, incompatible))) => {
+                        why.push(reason);
+                        mismatch |= incompatible;
+                    }
                     Err(None) => {}
                 },
-                None => return Err(exhausted(&why)),
+                None => return Err(exhausted(&why, mismatch)),
             }
         }
     }
@@ -1003,11 +1007,14 @@ fn take_success(
     joined: Option<
         std::result::Result<(SocketAddr, Result<VoxConnection>), tokio::task::JoinError>,
     >,
-) -> std::result::Result<VoxConnection, Option<String>> {
+) -> std::result::Result<VoxConnection, Option<(String, bool)>> {
     match joined {
         Some(Ok((_, Ok(conn)))) => Ok(conn),
         // A failure names the address it was for: see the note on the `JoinSet` above.
-        Some(Ok((addr, Err(e)))) => Err(Some(format!("{addr}: {e}"))),
+        Some(Ok((addr, Err(e)))) => {
+            let mismatch = matches!(e, Error::ProtocolMismatch);
+            Err(Some((format!("{addr}: {e}"), mismatch)))
+        }
         // A panicked or cancelled attempt is not a candidate's verdict, so it contributes
         // nothing to the reason — but it must not be read as a success either.
         Some(Err(_)) | None => Err(None),
@@ -1016,7 +1023,10 @@ fn take_success(
 
 /// The error for "every candidate was tried and none connected", carrying each one's
 /// verdict. Ordered so the same failure reads the same way between runs.
-fn exhausted(why: &[String]) -> Error {
+fn exhausted(why: &[String], mismatch: bool) -> Error {
+    if mismatch {
+        return Error::ProtocolMismatch;
+    }
     if why.is_empty() {
         return Error::Unreachable("all direct candidates failed");
     }

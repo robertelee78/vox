@@ -186,6 +186,65 @@ impl Drop for PendingHistoryRead {
 }
 
 impl ReadResource {
+    /// Public board membership follows applied removals, not pending causal work.
+    /// The publication and secret lifetime still fail closed; private egress uses
+    /// the stricter authorization check below.
+    pub(crate) fn public_membership_current(&self, room: &Digest32, generation: u64) -> bool {
+        if self
+            .publication
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_none()
+        {
+            return false;
+        }
+        let Some(store) = self.store.upgrade() else {
+            return false;
+        };
+        self.sek
+            .with(|_| crate::node::channel::governance::removal_generation(&store, room))
+            .is_ok_and(|current| current == generation)
+    }
+
+    pub(crate) fn removal_authorization_current(&self, room: &Digest32, generation: u64) -> bool {
+        if self
+            .publication
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_none()
+        {
+            return false;
+        }
+        let Some(store) = self.store.upgrade() else {
+            return false;
+        };
+        self.sek
+            .with(|sek| {
+                crate::node::channel::governance::check_removal_generation(
+                    &store, sek, room, generation,
+                )
+            })
+            .is_ok()
+    }
+
+    pub(crate) fn with_removal_fence<T>(
+        &self,
+        room: &Digest32,
+        generation: u64,
+        step: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let store = self.store.upgrade()?;
+        store
+            .with_publication_fence(|| {
+                if !self.removal_authorization_current(room, generation) {
+                    return Ok(None);
+                }
+                Ok(Some(step()))
+            })
+            .ok()
+            .flatten()
+    }
+
     /// Only an admitted physical save may retain the preceding committed snapshot.
     pub(crate) fn has_pending_snapshot(&self) -> bool {
         self.publication

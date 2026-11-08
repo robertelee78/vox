@@ -25,6 +25,7 @@ pub(crate) enum Preparation {
 enum Work {
     Restore,
     Controls,
+    FloorReplay,
     Legacy,
     Replay,
     ScheduleReplay {
@@ -47,9 +48,13 @@ enum Work {
         peer: Digest32,
         cursor: Cursor,
         cursors: BTreeMap<Digest32, Cursor>,
+        demands: BTreeMap<Digest32, PullDemand>,
         incarnation: Option<Digest32>,
         binding: Digest32,
         authority: TrustNonce,
+        authority_generation: Option<u64>,
+        automatic: bool,
+        notice: Option<String>,
     },
 }
 
@@ -61,6 +66,24 @@ struct LegacyCursor {
 }
 
 type ReceiverQuery = ((Digest32, u64), Option<u64>);
+type PullCursorCheckpoint = (
+    Digest32,
+    Cursor,
+    BTreeMap<Digest32, PullDemand>,
+    bool,
+    Option<String>,
+);
+pub(crate) type LivePullCursorRequest = (
+    Digest32,
+    Cursor,
+    u64,
+    TrustNonce,
+    Vec<(Locator, CheckedRecord, Option<Digest32>)>,
+    bool,
+    Option<(u64, u64)>,
+    Option<Digest32>,
+    Digest32,
+);
 
 #[derive(Default)]
 struct LegacyReceiverInput {
@@ -74,12 +97,15 @@ pub(crate) struct PendingUpgrade {
     room: Digest32,
     epoch: u64,
     me: Digest32,
+    root: Digest32,
+    removal_generation: u64,
     sek: WeakSek,
     pin: Option<history::PendingHistoryRead>,
     index: entry_store::EntryIndex,
     authors: BTreeMap<Digest32, CompositePublicKey>,
     heads: BTreeMap<Digest32, u64>,
     memberships: BTreeMap<Digest32, u64>,
+    removed: BTreeSet<Digest32>,
     settled: bool,
     me_left: bool,
     controls_pending: bool,
@@ -89,6 +115,7 @@ pub(crate) struct PendingUpgrade {
     receiver_metadata: Option<std::cell::RefCell<LegacyReceiverInput>>,
     receiver_version: receiver_overlay::Stamp,
     drive_committed: bool,
+    floor_replay_done: bool,
     progress: private_index::Restart,
     legacy: Option<LegacyCursor>,
     legacy_pending: bool,
@@ -108,7 +135,7 @@ pub(crate) struct PendingUpgrade {
     invalid: Vec<(Digest32, String)>,
     receive_persisting: bool,
     maintenance: bool,
-    cursor: Option<(Digest32, Cursor)>,
+    cursor: Option<PullCursorCheckpoint>,
     incarnation: Option<Digest32>,
     wait: Option<UpgradeWait>,
 }
@@ -118,7 +145,8 @@ pub(crate) struct CheckedRecord {
     hash: Digest32,
     author_id: Digest32,
     chain_id: u64,
-    iteration: u64,
+    allowed: bool,
+    evidence: PullEvidence,
 }
 
 pub(crate) struct Saved {
@@ -129,6 +157,8 @@ pub(crate) struct Saved {
     pub(crate) preview: Option<Option<SessionRow>>,
     pub(crate) checked_wire: Option<Vec<u8>>,
     checked_record: Option<CheckedRecord>,
+    checked_invalid: bool,
+    checked_unknown: bool,
     pub(crate) cached: Option<bool>,
     pub(crate) cursor_committed: bool,
     pub(crate) page: Option<Page>,
@@ -181,10 +211,18 @@ impl ChannelState {
         if self.private_sessions.upgrading {
             return Ok(Preparation::Waiting(UpgradeWait::LocalPreparation));
         }
+        self.private_sessions.floor_replay_done = floor_index::source_replay(
+            Transaction::Snapshot(&store.snapshot()?),
+            &self.sek,
+            &self.channel_id,
+        )?
+        .1;
         let work = if self.private_sessions.restoring {
             Work::Restore
         } else if self.private_sessions.controls_import {
             return Ok(Preparation::ControlImport);
+        } else if !self.private_sessions.floor_replay_done {
+            Work::FloorReplay
         } else if !self.current_session_controls_ready(store)? {
             if self.legacy_private_controls_ready(store)? {
                 for author in self.authors.keys() {
@@ -264,10 +302,37 @@ impl ChannelState {
         finish_initial: bool,
         work: Work,
     ) -> Result<Box<PendingUpgrade>> {
+        let root = self.genesis.creator_pubkey().fingerprint();
+        let removal_generation = governance::removal_generation(store, &self.channel_id)?;
+        let mut removed = BTreeSet::new();
+        if matches!(
+            &work,
+            Work::Receive { .. }
+                | Work::Check { .. }
+                | Work::Serve(_)
+                | Work::Legacy
+                | Work::Replay
+                | Work::PullCursor { .. }
+        ) {
+            let snapshot = store.snapshot()?;
+            let view =
+                governance::View::pinned(&snapshot, &self.sek, &self.channel_id, root, now.get())?;
+            for author in self.authors.keys() {
+                if view.is_member_removed(author)? {
+                    removed.insert(*author);
+                }
+            }
+            governance::check_removal_generation(
+                store,
+                &self.sek,
+                &self.channel_id,
+                removal_generation,
+            )?;
+        }
         let memberships = self
             .authors
             .keys()
-            .filter(|peer| !self.has_left(peer))
+            .filter(|peer| !self.has_left(peer) && !removed.contains(*peer))
             .map(|peer| (*peer, self.admission(peer).0))
             .collect();
         let progress = private_index::Restart {
@@ -292,6 +357,8 @@ impl ChannelState {
             room: self.channel_id,
             epoch: self.epoch,
             me: self.me(),
+            root,
+            removal_generation,
             sek: self.sek.reader(),
             pin: None,
             index: entry_store::EntryIndex::default(),
@@ -302,6 +369,7 @@ impl ChannelState {
                 .map(|author| (*author, self.dag.verified_head(author)))
                 .collect(),
             memberships,
+            removed,
             settled: self.settled,
             me_left: self.has_left(&self.me()),
             controls_pending: self.private_sessions.controls_import
@@ -310,6 +378,7 @@ impl ChannelState {
                 &work,
                 Work::Restore
                     | Work::Controls
+                    | Work::FloorReplay
                     | Work::Legacy
                     | Work::ScheduleReplay {
                         replay: Ok(false) | Err(_)
@@ -326,6 +395,7 @@ impl ChannelState {
                 .then(|| std::cell::RefCell::new(LegacyReceiverInput::default())),
             receiver_version: self.receiver_persistence.drive(),
             drive_committed: false,
+            floor_replay_done: self.private_sessions.floor_replay_done,
             progress,
             legacy,
             legacy_pending: !self.private_sessions.legacy_pending.is_empty(),
@@ -336,6 +406,7 @@ impl ChannelState {
                 &work,
                 Work::Restore
                     | Work::Controls
+                    | Work::FloorReplay
                     | Work::Legacy
                     | Work::Replay
                     | Work::ScheduleReplay { .. }
@@ -408,6 +479,7 @@ impl ChannelState {
             self.private_sessions.upgrading = false;
         }
         self.private_sessions.restoring = !pending.progress.complete;
+        self.private_sessions.floor_replay_done = pending.floor_replay_done;
         self.private_sessions.restore_after = pending.progress.after;
         self.private_sessions.next = self.private_sessions.next.max(pending.progress.next);
         self.private_sessions.pending_active = pending.progress.pending;
@@ -432,8 +504,15 @@ impl ChannelState {
         self.drive.news.extend(pending.news);
         self.gen
             .fetch_add(pending.records, std::sync::atomic::Ordering::Relaxed);
-        if let Some((peer, cursor)) = pending.cursor {
+        if let Some((peer, cursor, demands, automatic, notice)) = pending.cursor {
             self.private_sessions.cursors.insert(peer, cursor);
+            self.private_sessions.demands = demands;
+            if automatic {
+                self.private_sessions.auto_continue.insert(peer);
+            }
+            if let Some(notice) = notice {
+                self.set_aside.push(notice);
+            }
         }
         if let Some(incarnation) = pending.incarnation {
             self.private_sessions.incarnation = Some(incarnation);
@@ -446,7 +525,7 @@ impl ChannelState {
                 ));
                 self.private_sessions.invalid_noted = true;
             }
-            tracing::warn!(room = ?self.channel_id, ?hash, %error, "discarded invalid unread legacy Session");
+            tracing::warn!(room = ?self.channel_id, ?hash, %error, "discarded invalid unread Session");
         }
         if let Err(error) = &result {
             if !matches!(error, Error::StreamRefused(reason)
@@ -500,10 +579,13 @@ impl PendingUpgrade {
                 let mut cached = None;
                 let mut checked_wire = None;
                 let mut checked_record = None;
+                let mut checked_invalid = false;
+                let mut checked_unknown = false;
                 let mut page = None;
                 let (advance, received) = match work {
                     Work::Restore => (self.restore(store, sek)?, None),
                     Work::Controls => (self.controls(store, sek)?, None),
+                    Work::FloorReplay => (self.floor_sources(store, sek)?, None),
                     Work::Legacy => (self.legacy(store, sek, &check)?, None),
                     Work::Replay => (self.replay(store, sek)?, None),
                     Work::ScheduleReplay { replay } => {
@@ -531,30 +613,87 @@ impl PendingUpgrade {
                     } => {
                         let record = Record::read(&wire)?;
                         let author = record.message.header.author_id;
-                        record.verify(
-                            &self.room,
-                            self.authors
-                                .get(&author)
-                                .ok_or(Error::StreamRefused("private Session author unknown"))?,
-                        )?;
-                        if !self.permitted(store, sek, &record)? {
-                            return Err(Error::StreamRefused(if want_preview {
-                                "private Session has no current drive grant"
+                        checked_unknown = !self.authors.contains_key(&author);
+                        let verified = self
+                            .authors
+                            .get(&author)
+                            .is_some_and(|key| record.verify(&self.room, key).is_ok());
+                        if !verified {
+                            if want_preview {
+                                return Err(Error::StreamRefused(
+                                    "private Session signature invalid",
+                                ));
+                            }
+                            checked_invalid = true;
+                        } else if record.message.header.iteration
+                            >= crate::group::state::ROTATE_AFTER_MESSAGES
+                        {
+                            if want_preview {
+                                return Err(Error::MalformedBundle(
+                                    "private drive iteration exceeds rotation bound",
+                                ));
+                            }
+                            self.invalid.push((
+                                record.hash(),
+                                "private drive iteration exceeds rotation bound".into(),
+                            ));
+                            checked_invalid = true;
+                        } else {
+                            let snapshot = store.snapshot()?;
+                            let view = governance::View::pinned(
+                                &snapshot, sek, &self.room, self.root, self.now,
+                            )?;
+                            let floor_revision = floor_index::author(
+                                entry_store::Transaction::Snapshot(&snapshot),
+                                sek,
+                                &self.room,
+                                &author,
+                            )?
+                            .revision;
+                            let evidence = PullEvidence {
+                                floor_revision,
+                                authority_generation: view.authority_generation(),
+                                membership: self.memberships.get(&self.me).copied().unwrap_or(0),
+                                release: self
+                                    .drive
+                                    .receivers
+                                    .get(&(author, record.message.header.chain_id))
+                                    .map_or([0; 32], |receiver| {
+                                        receiver.history_release_binding().1
+                                    }),
+                                trust: store.get_meta_prefix::<{ crate::atrest::sek::NONCE_LEN }>(
+                                    crate::node::trust::TRUST_META_KEY,
+                                )?,
+                            };
+                            drop(view);
+                            drop(snapshot);
+                            let allowed = self.permitted(store, sek, &record)?;
+                            if want_preview {
+                                preview = Some(if !allowed {
+                                    None
+                                } else {
+                                    match self.preview(store, sek, &record) {
+                                        Ok(row) => row,
+                                        Err(Error::SignatureInvalid)
+                                        | Err(Error::MalformedBundle(
+                                            "group skipped-key cache full",
+                                        ))
+                                        | Err(Error::MalformedBundle(
+                                            "group skip gap exceeds MAX_SKIP",
+                                        )) => None,
+                                        Err(error) => return Err(error),
+                                    }
+                                });
                             } else {
-                                "private Session has no current Drive grant"
-                            }));
-                        }
-                        if want_preview {
-                            preview = Some(self.preview(store, sek, &record)?);
-                        }
-                        if !want_preview {
-                            let header = &record.message.header;
-                            checked_record = Some(CheckedRecord {
-                                hash: record.hash(),
-                                author_id: header.author_id,
-                                chain_id: header.chain_id,
-                                iteration: header.iteration,
-                            });
+                                let header = &record.message.header;
+                                checked_record = Some(CheckedRecord {
+                                    hash: record.hash(),
+                                    author_id: header.author_id,
+                                    chain_id: header.chain_id,
+                                    allowed,
+                                    evidence,
+                                });
+                            }
                         }
                         checked_wire = Some(wire);
                         (SessionAdvance::Waiting, None)
@@ -583,19 +722,26 @@ impl PendingUpgrade {
                         peer,
                         cursor,
                         cursors,
+                        demands,
                         incarnation,
                         binding,
                         authority,
+                        authority_generation,
+                        automatic,
+                        notice,
                     } => {
+                        if self.removed.contains(&peer) || self.removed.contains(&self.me) {
+                            return Err(Error::StreamRefused("private Session room unavailable"));
+                        }
                         self.save_cursor(
                             store,
                             sek,
                             &cursors,
-                            incarnation,
-                            binding,
-                            Some(authority),
+                            &demands,
+                            (incarnation, binding),
+                            (Some(authority), authority_generation),
                         )?;
-                        self.cursor = Some((peer, cursor));
+                        self.cursor = Some((peer, cursor, demands, automatic, notice));
                         cursor_committed = true;
                         (SessionAdvance::Advanced, None)
                     }
@@ -607,6 +753,8 @@ impl PendingUpgrade {
                     preview,
                     checked_wire,
                     checked_record,
+                    checked_invalid,
+                    checked_unknown,
                     cached,
                     cursor_committed,
                     page,
@@ -712,6 +860,54 @@ impl PendingUpgrade {
         }
         Ok(SessionAdvance::Advanced)
     }
+    fn floor_sources(&mut self, store: &Store, sek: &Sek) -> Result<SessionAdvance> {
+        for _ in 0..WORK_ROWS {
+            let snapshot = store.snapshot()?;
+            let (after, done) =
+                floor_index::source_replay(Transaction::Snapshot(&snapshot), sek, &self.room)?;
+            if done {
+                self.floor_replay_done = true;
+                return Ok(SessionAdvance::Advanced);
+            }
+            let next = snapshot.segment_after(
+                &self.room,
+                SegmentKind::LogDb,
+                (after != 0).then_some(after),
+            )?;
+            let Some((id, segment)) = next else {
+                drop(snapshot);
+                let mut batch = store.batch()?;
+                batch.derived();
+                floor_index::save_source_replay(&mut batch, sek, &self.room, after, true)?;
+                batch.commit()?;
+                self.floor_replay_done = true;
+                return Ok(SessionAdvance::Advanced);
+            };
+            let entry = Entry::from_wire(&open_segment(sek, SegmentKind::LogDb, id, &segment)?)?;
+            let hash = entry.entry_hash();
+            let read = self
+                .index
+                .view(Transaction::Snapshot(&snapshot), sek, &self.room)?;
+            let published = read.log_id(&hash)? == Some(id);
+            drop(read);
+            drop(snapshot);
+            let mut batch = store.batch()?;
+            batch.derived();
+            if published
+                && entry
+                    .payload
+                    .as_deref()
+                    .is_some_and(super::super::session_floor::is_session_floor)
+            {
+                private_index::observe_public(&mut batch, sek, &self.room, &entry, self.epoch)?;
+                governance::queue_floor_eligibility_in(&mut batch, sek, &self.room, &entry, id)?;
+            }
+            floor_index::save_source_replay(&mut batch, sek, &self.room, id, false)?;
+            batch.commit()?;
+        }
+        Ok(SessionAdvance::Advanced)
+    }
+
     fn controls(&mut self, store: &Store, sek: &Sek) -> Result<SessionAdvance> {
         let mut bytes = 0usize;
         let mut advanced = false;
@@ -952,12 +1148,10 @@ impl PendingUpgrade {
         self.legacy = Some(work);
         Ok(SessionAdvance::Advanced)
     }
-    fn current_drive(
-        &self,
-        transaction: Transaction<'_, '_>,
-        sek: &Sek,
-        author: &Digest32,
-    ) -> Result<bool> {
+    fn current_drive(&self, store: &Store, sek: &Sek, author: &Digest32) -> Result<bool> {
+        if self.removed.contains(author) || self.removed.contains(&self.me) {
+            return Ok(false);
+        }
         if *author == self.me {
             return Ok(true);
         }
@@ -967,12 +1161,9 @@ impl PendingUpgrade {
         if self.controls_pending {
             return Err(Error::StreamRefused(CONTROL_REFRESHING));
         }
-        let fact = match transaction {
-            Transaction::Snapshot(snapshot) => {
-                private_index::control(snapshot, sek, &self.room, author)?
-            }
-            Transaction::Batch(batch) => private_index::control_in(batch, sek, &self.room, author)?,
-        };
+        let snapshot = store.snapshot()?;
+        let transaction = Transaction::Snapshot(&snapshot);
+        let fact = private_index::control(&snapshot, sek, &self.room, author)?;
         if fact.through < self.heads.get(author).copied().unwrap_or(0) {
             return Err(Error::StreamRefused(CONTROL_REFRESHING));
         }
@@ -994,9 +1185,32 @@ impl PendingUpgrade {
         let Some(generation) = newest else {
             return Ok(false);
         };
+        let view = governance::View::pinned(&snapshot, sek, &self.room, self.root, self.now)?;
+        let restored = !view.validated_member_removals(author)?.is_empty()
+            || !view.validated_member_removals(&self.me)?.is_empty();
+        drop(view);
+        drop(snapshot);
+        if floor.announced == Some(generation) && restored {
+            let membership = self.memberships.get(&self.me).copied().unwrap_or(0);
+            return Ok(floor_index::authorized_floor_step(
+                store,
+                sek,
+                &self.room,
+                self.root,
+                self.now,
+                &(*author, self.me, self.epoch, generation),
+                membership,
+                true,
+            )?
+            .ok_or(Error::StreamRefused(floor_index::REFRESHING))?
+            .is_some());
+        }
+        if restored {
+            return Ok(false);
+        }
         if floor.announced == Some(generation) {
             return Ok(floor_index::floor(
-                transaction,
+                Transaction::Snapshot(&store.snapshot()?),
                 sek,
                 &self.room,
                 &(*author, self.me, self.epoch, generation),
@@ -1048,6 +1262,24 @@ impl PendingUpgrade {
             return Ok(false);
         };
         let header = &record.message.header;
+        governance::check_removal_generation(store, sek, &self.room, self.removal_generation)?;
+        let snapshot = store.snapshot()?;
+        let view = governance::View::pinned(&snapshot, sek, &self.room, self.root, self.now)?;
+        if view.is_member_removed(&header.author_id)? || view.is_member_removed(recipient)? {
+            return Ok(false);
+        }
+        if let Some(entry) = record.legacy_entry() {
+            match view.content_eligibility(entry)? {
+                governance::ContentEligibility::Eligible => {}
+                governance::ContentEligibility::Ineligible => return Ok(false),
+                governance::ContentEligibility::Refreshing => {
+                    return Err(Error::StreamRefused(floor_index::REFRESHING));
+                }
+            }
+        }
+        let restored = !view.validated_member_removals(recipient)?.is_empty();
+        drop(view);
+        drop(snapshot);
         if header.author_id == *recipient {
             return Ok(true);
         }
@@ -1063,20 +1295,23 @@ impl PendingUpgrade {
             return Err(Error::StreamRefused(floor_index::REFRESHING));
         }
         drop(read);
-        let snapshot = store.snapshot()?;
-        let Some((old, iteration, _)) = floor_index::floor(
-            Transaction::Snapshot(&snapshot),
+        let Some((old, iteration, _)) = floor_index::authorized_floor_step(
+            store,
             sek,
             &self.room,
+            self.root,
+            self.now,
             &(header.author_id, *recipient, header.epoch, header.chain_id),
+            membership,
+            restored,
         )?
+        .ok_or(Error::StreamRefused(floor_index::REFRESHING))?
         else {
             return Ok(false);
         };
         if old != membership || header.iteration < iteration {
             return Ok(false);
         }
-        drop(snapshot);
         // Derived continuity may itself acquire the writer: exclusively a native-worker leaf.
         let range = floor_index::continuity_step(
             store,
@@ -1146,6 +1381,12 @@ impl PendingUpgrade {
         } else {
             false
         };
+        let author = entry.skeleton.author_id;
+        let current_drive = if before.cache_id.is_some() {
+            false
+        } else {
+            self.current_drive(store, sek, &author)?
+        };
         let mut batch = store.batch()?;
         let tracked = self
             .index
@@ -1173,35 +1414,16 @@ impl PendingUpgrade {
             }
             None => None,
         };
-        let author = entry.skeleton.author_id;
         private_index::observe_public(&mut batch, sek, &self.room, entry, self.epoch)?;
-        let current_drive = self.current_drive(Transaction::Batch(&batch), sek, &author)?;
-        let generation = private_index::control_in(&batch, sek, &self.room, &author)?.generation;
         let record = Record::legacy(entry.clone()).ok().filter(|record| {
             self.authors
                 .get(&author)
                 .is_some_and(|key| record.verify(&self.room, key).is_ok())
         });
         let mut next = self.progress.next.max(1);
-        let no_announced_floor =
-            floor_index::author(Transaction::Batch(&batch), sek, &self.room, &author)?
-                .announced
-                .is_none();
         if private_index::find_in(&batch, sek, &self.room, &hash)?.is_none() {
-            let retain = if let Some(record) = &record {
-                current_drive
-                    && (cached.is_some()
-                        || permitted
-                        || author == self.me
-                        || (no_announced_floor
-                            && generation == Some(record.message.header.chain_id)
-                            && self.receiver_fact(
-                                (author, record.message.header.chain_id),
-                                Some(record.message.header.iteration),
-                            )?))
-            } else {
-                false
-            };
+            let retain = record.is_some()
+                && (cached.is_some() || (current_drive && (permitted || author == self.me)));
             if let Some(record) = record.filter(|_| retain) {
                 let saved = Stored {
                     record,
@@ -1267,24 +1489,43 @@ impl PendingUpgrade {
             .get(&author)
             .ok_or(Error::StreamRefused("private Session author unknown"))?;
         record.verify(&self.room, key)?;
+        governance::check_removal_generation(store, sek, &self.room, self.removal_generation)?;
+        let snapshot = store.snapshot()?;
+        let view = governance::View::pinned(&snapshot, sek, &self.room, self.root, self.now)?;
+        if view.is_member_removed(&author)? || view.is_member_removed(&self.me)? {
+            return Err(Error::StreamRefused("private Session member was removed"));
+        }
+        let restored = !view.validated_member_removals(&author)?.is_empty()
+            || !view.validated_member_removals(&self.me)?.is_empty();
+        drop(view);
+        drop(snapshot);
         if author == self.me {
             return Ok(hash);
         }
-        let locally_held = known.is_some()
-            && record.legacy_claimed_ms().is_some()
-            && self.current_drive(Transaction::Snapshot(&store.snapshot()?), sek, &author)?;
-        if !locally_held && !self.permitted(store, sek, &record)? {
+        if !self.permitted(store, sek, &record)? {
             return Err(Error::StreamRefused("private Session has no drive grant"));
         }
         let slot = (author, record.message.header.chain_id);
         let receiver = self.drive.receivers.get(&slot).ok_or(Error::StreamRefused(
             "private Session drive key not received",
         ))?;
-        if !receiver.can_open_iteration(record.message.header.iteration) {
-            return Ok(hash);
-        }
+        let iteration = record.message.header.iteration;
         let mut next_receiver = ReceiverChain::from_state(&receiver.to_state())?;
-        let plaintext = Zeroizing::new(next_receiver.decrypt(&record.message)?);
+        let plaintext = if receiver.can_open_iteration(iteration) {
+            Zeroizing::new(next_receiver.decrypt(&record.message)?)
+        } else {
+            let Some(gap) = iteration.checked_sub(receiver.history_release_binding().0) else {
+                return Err(Error::StreamRefused(
+                    "private Session history release unavailable",
+                ));
+            };
+            if !restored || gap > crate::pairwise::MAX_SKIP {
+                return Err(Error::StreamRefused(
+                    "private Session history release unavailable",
+                ));
+            }
+            Zeroizing::new(receiver.decrypt_retained(&record.message)?)
+        };
         let Decoded::Session(content) = crate::node::content::decode(&plaintext)? else {
             return Err(Error::MalformedBundle("private Session content kind"));
         };
@@ -1301,6 +1542,9 @@ impl PendingUpgrade {
             first_seen: known.as_ref().map_or(self.now, |saved| saved.first_seen),
             attention_after: None,
         };
+        if expired(&saved, self.now, self.retention) {
+            return Ok(hash);
+        }
         let id = id.unwrap_or(self.progress.next.max(1));
         let next = id
             .checked_add(1)
@@ -1310,6 +1554,7 @@ impl PendingUpgrade {
         let segment = seal_segment(sek, SegmentKind::PrivateSession, id, &saved.bytes())?;
         let drive_segment = seal_segment(sek, SegmentKind::KeyMaterial, SEG_DRIVE, &drive)?;
         let mut batch = store.batch()?;
+        governance::check_removal_generation_in(&batch, sek, &self.room, self.removal_generation)?;
         batch.ruled();
         if let Some(expected) = authority {
             if batch.get_meta_prefix::<{ crate::atrest::sek::NONCE_LEN }>(
@@ -1499,14 +1744,15 @@ impl ChannelState {
         &mut self,
         store: &Arc<Store>,
         owner: Arc<()>,
-        request: (Digest32, Cursor, u64, TrustNonce),
+        request: LivePullCursorRequest,
         now: crate::time::Ms,
     ) -> Result<Box<PendingUpgrade>> {
-        let (peer, cursor, revision, authority) = request;
+        let (peer, cursor, revision, authority, blocked, gap, unknown, gap_stamp, opening_basis) =
+            request;
         self.require_governance_ready(store, now)?;
         if self.poisoned
             || self.private_sessions.revision != revision
-            || !self.drive_members().contains(&peer)
+            || !self.private_peer_current(store, &peer)?
         {
             return Err(Error::StreamRefused(
                 "private live request or authority changed",
@@ -1514,13 +1760,365 @@ impl ChannelState {
         }
         let mut cursors = self.private_sessions.cursors.clone();
         cursors.insert(peer, cursor.clone());
+        let mut demands = self.private_sessions.demands.clone();
+        let new_demand = !blocked.is_empty() || gap || unknown.is_some();
+        let rediscover = !demands.contains_key(&peer)
+            && demands.values().any(|demand| {
+                !demand.marks.is_empty()
+                    || demand.range.is_some()
+                    || demand.projection.is_some()
+                    || demand.unidentified
+            });
+        let foreign_unknown = demands.values().any(|demand| {
+            demand.range.is_some() || demand.projection.is_some() || demand.unidentified
+        });
+        let incarnation_changed = demands
+            .get(&peer)
+            .is_some_and(|demand| demand.incarnation != cursor.incarnation);
+        if new_demand || incarnation_changed || rediscover {
+            let demand = demands.entry(peer).or_insert_with(|| PullDemand {
+                incarnation: cursor.incarnation,
+                marks: BTreeMap::new(),
+                range: None,
+                scan_after: None,
+                scan_through: None,
+                pending: Vec::new(),
+                completed_stamp: None,
+                active_stamp: None,
+                successor_stamp: None,
+                unidentified: rediscover && foreign_unknown,
+                rediscover,
+                projection: None,
+                pending_projection: false,
+            });
+            if demand.incarnation != cursor.incarnation {
+                demand.unidentified |= demand.range.is_some() || demand.projection.is_some();
+                demand.rediscover |= !demand.marks.is_empty();
+                demand.range = None;
+                demand.scan_after = None;
+                demand.scan_through = None;
+                demand.pending.clear();
+                demand.completed_stamp = None;
+                demand.active_stamp = None;
+                demand.successor_stamp = None;
+                demand.projection = None;
+                demand.pending_projection = false;
+                demand.incarnation = cursor.incarnation;
+            }
+            if let Some((lo, hi)) = unknown {
+                demand.extend_range(lo, hi, gap_stamp, true);
+            }
+            if gap {
+                let lo = self
+                    .private_recovery_after(&peer, cursor.incarnation)
+                    .saturating_add(1)
+                    .max(1);
+                if lo <= cursor.after {
+                    demand.extend_range(lo, cursor.after, gap_stamp, true);
+                }
+            }
+            for (locator, header, projection_wait) in blocked {
+                let mark = PullMark {
+                    incarnation: cursor.incarnation,
+                    position: locator.id,
+                    author: header.author_id,
+                    chain: header.chain_id,
+                    evidence: header.evidence,
+                    projection_wait,
+                };
+                if demand.marks.contains_key(&locator.hash)
+                    || demand.marks.len() < PULL_MARKS_PER_DONOR
+                {
+                    demand.marks.insert(locator.hash, mark);
+                } else if projection_wait.is_some() {
+                    demand.extend_projection(locator.id, opening_basis);
+                } else {
+                    demand.extend_range(locator.id, locator.id, gap_stamp, false);
+                }
+            }
+        }
         let work = Work::PullCursor {
             peer,
             cursor,
             cursors,
+            demands,
             incarnation: self.private_sessions.incarnation,
             binding: self.private_pull_binding(),
             authority,
+            authority_generation: None,
+            automatic: new_demand
+                || rediscover
+                || incarnation_changed
+                || self.private_refetch_evidence_changed(store)?,
+            notice: None,
+        };
+        self.prepare_private_component(store, owner, now, false, work)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn prepare_pending_private_auto_cursor(
+        &mut self,
+        store: &Arc<Store>,
+        owner: Arc<()>,
+        peer: Digest32,
+        revision: u64,
+        authority: TrustNonce,
+        selected: &AutoSelection,
+        page: &Page,
+        missing: Vec<Locator>,
+        blocked: Vec<(Locator, CheckedRecord, Option<Digest32>)>,
+        resolved: Vec<Digest32>,
+        opening_basis: Digest32,
+        now: crate::time::Ms,
+    ) -> Result<Box<PendingUpgrade>> {
+        self.require_governance_ready(store, now)?;
+        if self.poisoned
+            || self.private_sessions.revision != revision
+            || !self.private_peer_current(store, &peer)?
+            || selected.query != page.query
+            || selected.cursor.incarnation != page.cursor.incarnation
+        {
+            return Err(Error::StreamRefused("private refetch authority changed"));
+        }
+        let held = self
+            .private_sessions
+            .demands
+            .get(&peer)
+            .ok_or(Error::StreamRefused("private refetch demand missing"))?;
+        let current_stamp = self.private_refetch_stamp(store, held)?;
+        let attempted_evidence =
+            if let PrivateQuery::ArchiveRecords { positions, .. } = &selected.query {
+                positions
+                    .first()
+                    .zip(selected.attempted)
+                    .map(|(position, (evidence, projection))| (position.hash, evidence, projection))
+            } else {
+                None
+            };
+        let current_basis = if selected.projection {
+            self.private_opening_basis(store)?
+        } else {
+            None
+        };
+        let mut demands = self.private_sessions.demands.clone();
+        for hash in &resolved {
+            for demand in demands.values_mut() {
+                demand.marks.remove(hash);
+            }
+        }
+        if !resolved.is_empty()
+            && blocked.is_empty()
+            && demands.values().all(|demand| demand.marks.is_empty())
+        {
+            for demand in demands.values_mut() {
+                demand.rediscover = false;
+            }
+        }
+        let demand = demands
+            .get_mut(&peer)
+            .ok_or(Error::StreamRefused("private refetch demand missing"))?;
+        if selected.projection {
+            let projection = demand
+                .projection
+                .as_mut()
+                .ok_or(Error::Profile("private projection range missing"))?;
+            if let Some(basis) = current_basis {
+                let active = projection.active_basis.unwrap_or(selected.stamp);
+                projection.successor_basis = (basis != active).then_some(basis);
+            }
+        } else if demand.active_stamp.is_some()
+            || matches!(&selected.query, PrivateQuery::ArchiveInventory { .. })
+        {
+            let active = demand.active_stamp.unwrap_or(selected.stamp);
+            demand.successor_stamp = (current_stamp != active).then_some(current_stamp);
+        }
+        let mut notice = None;
+        match &selected.query {
+            PrivateQuery::ArchiveInventory { lo, hi, .. } => {
+                if !demand.pending.is_empty() {
+                    return Err(Error::Profile(
+                        "private refetch inventory crossed pending records",
+                    ));
+                }
+                demand.pending_projection = selected.projection;
+                if selected.projection {
+                    let projection = demand
+                        .projection
+                        .as_mut()
+                        .ok_or(Error::Profile("private projection range missing"))?;
+                    projection.active_basis.get_or_insert(selected.stamp);
+                    projection
+                        .scan_through
+                        .get_or_insert(projection.range.1.min(selected.cursor.after));
+                    projection.scan_after = Some(*hi);
+                    if current_basis == Some(selected.stamp)
+                        && projection.range.0 == *lo
+                        && page.cursor.after > *lo
+                    {
+                        let next = page.cursor.after.min(hi.saturating_add(1));
+                        projection.range.0 = next.min(projection.range.1.saturating_add(1));
+                        notice = Some(format!(
+                            "private Session donor {} reports no retained records below position {next}",
+                            crate::node::link::b32_encode(&peer),
+                        ));
+                    }
+                } else {
+                    demand.active_stamp.get_or_insert(selected.stamp);
+                    let frontier = if demand.unidentified || demand.rediscover {
+                        selected.cursor.after
+                    } else {
+                        demand
+                            .range
+                            .map_or(*hi, |(_, end)| end.min(selected.cursor.after))
+                    };
+                    demand.scan_through.get_or_insert(frontier);
+                    demand.scan_after = Some(*hi);
+                    if current_stamp == selected.stamp {
+                        if let Some((first, last)) = demand.range {
+                            if first == *lo && page.cursor.after > first {
+                                let next = page.cursor.after.min(hi.saturating_add(1));
+                                notice = Some(format!(
+                                    "private Session donor {} reports no retained records below position {next}",
+                                    crate::node::link::b32_encode(&peer),
+                                ));
+                                demand.range = (next <= last).then_some((next, last));
+                            }
+                        }
+                    }
+                }
+                demand.pending = missing;
+            }
+            PrivateQuery::ArchiveRecords { positions, .. } => {
+                for position in positions {
+                    demand.pending.retain(|pending| {
+                        pending.id != position.id || pending.hash != position.hash
+                    });
+                }
+                if let Some((hash, evidence, projection)) = attempted_evidence {
+                    if let Some(mark) = demand.marks.get_mut(&hash) {
+                        mark.evidence = evidence;
+                        mark.projection_wait = projection;
+                    }
+                }
+                for (locator, header, projection_wait) in blocked {
+                    if let Some(mark) = demand.marks.get_mut(&locator.hash) {
+                        mark.evidence = header.evidence;
+                        mark.projection_wait = projection_wait;
+                    } else if demand.marks.len() < PULL_MARKS_PER_DONOR {
+                        demand.marks.insert(
+                            locator.hash,
+                            PullMark {
+                                incarnation: selected.cursor.incarnation,
+                                position: locator.id,
+                                author: header.author_id,
+                                chain: header.chain_id,
+                                evidence: header.evidence,
+                                projection_wait,
+                            },
+                        );
+                    } else if projection_wait.is_some() {
+                        demand.extend_projection(locator.id, opening_basis);
+                    } else {
+                        demand.extend_range(locator.id, locator.id, Some(current_stamp), false);
+                    }
+                }
+            }
+            PrivateQuery::LiveTail => return Err(Error::Profile("private refetch query changed")),
+        }
+        demand.finish_scan();
+        if demand
+            .projection
+            .as_ref()
+            .is_some_and(|projection| projection.range.0 > projection.range.1)
+        {
+            demand.projection = None;
+        }
+        let cursors = self.private_sessions.cursors.clone();
+        let cursor = cursors
+            .get(&peer)
+            .cloned()
+            .ok_or(Error::StreamRefused("private refetch boundary missing"))?;
+        let work = Work::PullCursor {
+            peer,
+            cursor,
+            cursors,
+            demands,
+            incarnation: self.private_sessions.incarnation,
+            binding: self.private_pull_binding(),
+            authority,
+            authority_generation: Some(selected.authority_generation),
+            automatic: true,
+            notice,
+        };
+        self.prepare_private_component(store, owner, now, false, work)
+    }
+
+    pub(crate) fn private_auto_in_flight(&self, peer: &Digest32, revision: u64) -> bool {
+        self.private_sessions.revision == revision
+            && self.private_sessions.automatic.contains_key(peer)
+    }
+
+    pub(crate) fn prepare_pending_private_auto_failure(
+        &mut self,
+        store: &Arc<Store>,
+        owner: Arc<()>,
+        request: (Digest32, u64, TrustNonce),
+        error: Error,
+        now: crate::time::Ms,
+    ) -> Result<Box<PendingUpgrade>> {
+        let (peer, revision, authority) = request;
+        let selected = self
+            .private_sessions
+            .automatic
+            .remove(&peer)
+            .ok_or(Error::StreamRefused("private refetch selection missing"))?;
+        self.private_sessions.pulling.remove(&peer);
+        let PrivateQuery::ArchiveRecords { positions, .. } = &selected.query else {
+            return Err(error);
+        };
+        self.require_governance_ready(store, now)?;
+        if self.private_sessions.revision != revision || !self.private_peer_current(store, &peer)? {
+            return Err(Error::StreamRefused("private refetch authority changed"));
+        }
+        let updates = positions
+            .first()
+            .zip(selected.attempted)
+            .map(|(position, (evidence, projection))| (position.hash, evidence, projection));
+        let mut demands = self.private_sessions.demands.clone();
+        let demand = demands
+            .get_mut(&peer)
+            .ok_or(Error::Profile("private refetch demand missing"))?;
+        for position in positions {
+            demand
+                .pending
+                .retain(|held| held.id != position.id || held.hash != position.hash);
+        }
+        if let Some((hash, evidence, projection)) = updates {
+            if let Some(mark) = demand.marks.get_mut(&hash) {
+                mark.evidence = evidence;
+                mark.projection_wait = projection;
+            }
+        }
+        demand.finish_scan();
+        self.set_aside.push(format!(
+            "private Session donor could not provide retained activity: {error}"
+        ));
+        let cursors = self.private_sessions.cursors.clone();
+        let cursor = cursors
+            .get(&peer)
+            .cloned()
+            .ok_or(Error::StreamRefused("private refetch boundary missing"))?;
+        let work = Work::PullCursor {
+            peer,
+            cursor,
+            cursors,
+            demands,
+            incarnation: self.private_sessions.incarnation,
+            binding: self.private_pull_binding(),
+            authority,
+            authority_generation: Some(selected.authority_generation),
+            automatic: true,
+            notice: None,
         };
         self.prepare_private_component(store, owner, now, false, work)
     }
@@ -1537,6 +2135,16 @@ impl PendingUpgrade {
             }
         }
         let author = record.message.header.author_id;
+        governance::check_removal_generation(store, sek, &self.room, self.removal_generation)?;
+        let snapshot = store.snapshot()?;
+        let view = governance::View::pinned(&snapshot, sek, &self.room, self.root, self.now)?;
+        if view.is_member_removed(&author)? || view.is_member_removed(&self.me)? {
+            return Err(Error::StreamRefused("private Session member was removed"));
+        }
+        let restored = !view.validated_member_removals(&author)?.is_empty()
+            || !view.validated_member_removals(&self.me)?.is_empty();
+        drop(view);
+        drop(snapshot);
         if author == self.me {
             return Ok(None);
         }
@@ -1547,11 +2155,22 @@ impl PendingUpgrade {
             .ok_or(Error::StreamRefused(
                 "private Session drive key not received",
             ))?;
-        if !receiver.can_open_iteration(record.message.header.iteration) {
-            return Ok(None);
-        }
-        let mut next = ReceiverChain::from_state(&receiver.to_state())?;
-        let plain = Zeroizing::new(next.decrypt(&record.message)?);
+        let iteration = record.message.header.iteration;
+        let plain = if receiver.can_open_iteration(iteration) {
+            let mut next = ReceiverChain::from_state(&receiver.to_state())?;
+            Zeroizing::new(next.decrypt(&record.message)?)
+        } else {
+            let Some(gap) = iteration.checked_sub(receiver.history_release_binding().0) else {
+                return Ok(None);
+            };
+            if !restored
+                || gap > crate::pairwise::MAX_SKIP
+                || !self.permitted(store, sek, record)?
+            {
+                return Ok(None);
+            }
+            Zeroizing::new(receiver.decrypt_retained(&record.message)?)
+        };
         let Decoded::Session(content) = crate::node::content::decode(&plain)? else {
             return Err(Error::MalformedBundle("private Session content kind"));
         };
@@ -1569,16 +2188,18 @@ impl PendingUpgrade {
         store: &Store,
         sek: &Sek,
         cursors: &BTreeMap<Digest32, Cursor>,
-        incarnation: Option<Digest32>,
-        binding: Digest32,
-        authority: Option<TrustNonce>,
+        demands: &BTreeMap<Digest32, PullDemand>,
+        source: (Option<Digest32>, Digest32),
+        authorization: (Option<TrustNonce>, Option<u64>),
     ) -> Result<()> {
+        let (incarnation, binding) = source;
+        let (authority, authority_generation) = authorization;
         if cursors.len() > AUTHORS_HARD_LIMIT {
             return Err(Error::MalformedAtRest("private pull peer bound"));
         }
         self.receive_persisting = true;
         let mut e = Encoder::new();
-        e.array(4)
+        e.array(5)
             .uint(1)
             .bytes(incarnation.as_ref().map_or(&[][..], |v| &v[..]))
             .bytes(&binding)
@@ -1589,6 +2210,7 @@ impl PendingUpgrade {
                 .bytes(&cursor.incarnation)
                 .uint(cursor.after);
         }
+        encode_pull_demands(&mut e, demands)?;
         let segment = seal_segment(
             sek,
             SegmentKind::KeyMaterial,
@@ -1597,6 +2219,12 @@ impl PendingUpgrade {
         )?;
         let mut batch = store.batch()?;
         batch.derived();
+        governance::check_removal_generation_in(&batch, sek, &self.room, self.removal_generation)?;
+        if let Some(expected) = authority_generation {
+            governance::check_authority_generation_in(
+                &batch, sek, &self.room, self.root, self.now, expected,
+            )?;
+        }
         if let Some(expected) = authority {
             if batch.get_meta_prefix::<{ crate::atrest::sek::NONCE_LEN }>(
                 crate::node::trust::TRUST_META_KEY,
@@ -1689,6 +2317,9 @@ pub(super) fn control_ready(
     controls_pending: bool,
 ) -> Result<bool> {
     if controls_pending {
+        return Ok(false);
+    }
+    if !floor_index::source_replay(read.transaction(), sek, room)?.1 {
         return Ok(false);
     }
     let target = if read.sparse_enabled() {

@@ -7,7 +7,8 @@
 //!
 //! 1. **A wrong passphrase is refused**, and the refusal says so — Carol's first join, with the
 //!    wrong passphrase, fails while the room's creator is up to check it.
-//! 2. **The right passphrase joins**, through the anchor, in another process.
+//! 2. **The right passphrase joins**, through the anchor, in another process; Bob and Carol
+//!    read distinct new traffic both ways after Carol's failed attempt and corrected retry.
 //! 3. **Two members who trust each other read each other, both ways.**
 //! 4. **A member nobody consented to reads nothing of theirs** — Carol, joined and synced, never
 //!    renders what Alice said, because Alice never trusted her.
@@ -395,6 +396,29 @@ fn a_room_admits_the_passphrase_and_each_author_decides_who_reads_them() {
              her, so an absence of Alice below would prove nothing"
         );
     }
+    // Carol was the wrong-passphrase joiner. Prove her corrected retry is not merely
+    // admitted: her distinct traffic must also arrive at the peer that trusts her.
+    let retry_deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let mut retry_post = 0;
+    loop {
+        retry_post += 1;
+        post(&carol, &format!("FROM-CAROL-RETRY-{retry_post}"));
+        if until(
+            &bob,
+            "bob to read carol after her corrected join",
+            &read,
+            5,
+            |o| o.contains("FROM-CAROL-RETRY-"),
+        )
+        .is_ok()
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < retry_deadline,
+            "PRODUCT: bob never read carol after her wrong-passphrase retry"
+        );
+    }
     // ...and only now does Alice's absence mean something. She posts *after* Carol is provably
     // receiving keys, then Bob posts once more: once Carol renders Bob's last post she has synced
     // past Alice's, so Alice's absence is her decision and not an unsynced log.
@@ -462,9 +486,12 @@ fn a_room_admits_the_passphrase_and_each_author_decides_who_reads_them() {
         (&["--tag", "task:#999"], &["FROM-BOB-OTHER"]),
     ] {
         let out = read_tag(&bob, extra);
+        let mut got = markers(&out);
+        got.sort_unstable();
+        let mut expected = want.to_vec();
+        expected.sort_unstable();
         assert_eq!(
-            markers(&out),
-            want,
+            got, expected,
             "PRODUCT: claim 5: bob's `vox room read {extra:?}` showed other messages than those \
              tagged so: {out:?}"
         );

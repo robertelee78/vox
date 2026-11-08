@@ -1593,6 +1593,15 @@ impl Receiver {
         } else {
             (false, false)
         };
+        // Keep a remote departure's effect pending while the leaver probes a live head.
+        #[cfg(feature = "test-knobs")]
+        if needs_transition
+            && !self_departure
+            && std::env::var_os("VOX_TEST_DEPARTURE_HOLD_FILE")
+                .is_some_and(|path| std::path::Path::new(&path).is_file())
+        {
+            return Ok(Lookup::Busy);
+        }
         let transition = if needs_transition {
             let gate = {
                 let room = tokio::select! {
@@ -2422,7 +2431,7 @@ impl Receiver {
         let committed = self.source.commit_ledger();
         let value = self
             .source
-            .write_admission(
+            .write_admission_available(
                 &work_job,
                 (VERIFY_ENVELOPE, 4 * 1024 * 1024),
                 move |room, store| {
@@ -2438,6 +2447,7 @@ impl Receiver {
                     } else {
                         input.control_sources_complete(&head, through)?
                     };
+                    let mut serving_progress = !complete;
                     if complete {
                         // Effects may finish while this signed head is still only observed. The
                         // effect walker then cannot publish its exact-head receipt yet. Once the
@@ -2448,10 +2458,13 @@ impl Receiver {
                             input.sparse_author(&target.binding.author, target.binding.scope)?;
                         let receipt_ready = !effects
                             || through < target.root.leaves
-                            || state.is_some_and(|state| state.control_ready == Some(head));
+                            || state
+                                .as_ref()
+                                .is_some_and(|state| state.control_ready == Some(head));
                         if receipt_ready {
-                            return Ok((SourceProgress::Complete { through }, None));
+                            return Ok(((SourceProgress::Complete { through }, None), false));
                         }
+                        serving_progress = state.is_some_and(|state| state.committed == Some(head));
                     }
                     drop(input);
                     let progress = room.history_write_tracked(store, &committed, |index| {
@@ -2476,7 +2489,11 @@ impl Receiver {
                     } else {
                         None
                     };
-                    Ok((progress, needed))
+                    let available = serving_progress
+                        && matches!(progress,
+                        SourceProgress::Complete { through: done }
+                        | SourceProgress::Progress { through: done } if done >= through);
+                    Ok(((progress, needed), available))
                 },
             )
             .await?;

@@ -130,11 +130,15 @@ pub enum StructTag {
     LogHead = 0x0022,
     /// A canonical content-addressed control frontier (ADR-036).
     ControlContext = 0x0023,
+    /// A signed room-scoped member removal (ADR-007 G-29).
+    MemberRemoval = 0x0024,
+    /// A creator-signed member readmission (ADR-007 G-29).
+    MemberReadmission = 0x0025,
 }
 
 impl StructTag {
     /// All registered tags, in ascending order.
-    pub const ALL: [StructTag; 31] = [
+    pub const ALL: [StructTag; 33] = [
         StructTag::LogEntry,
         StructTag::Skdm,
         StructTag::AdminCert,
@@ -166,6 +170,8 @@ impl StructTag {
         StructTag::RoomAnchors,
         StructTag::LogHead,
         StructTag::ControlContext,
+        StructTag::MemberRemoval,
+        StructTag::MemberReadmission,
     ];
 
     /// The 2-byte tag value.
@@ -312,6 +318,8 @@ impl StructTag {
             StructTag::AdmissionNotice => "vox/admission-notice/v1",
             StructTag::LogHead => "vox/log-head/v1",
             StructTag::ControlContext => "vox/log-context/v1",
+            StructTag::MemberRemoval => "vox/member-removal/v1",
+            StructTag::MemberReadmission => "vox/member-readmission/v1",
         }
     }
 }

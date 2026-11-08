@@ -18,6 +18,7 @@ pub(crate) mod recovery;
 pub(crate) struct PendingText {
     owner: Arc<()>,
     room: Digest32,
+    genesis: Genesis,
     epoch: u64,
     origin: u64,
     creator: Digest32,
@@ -26,12 +27,15 @@ pub(crate) struct PendingText {
     dag: Dag,
     entries: entry_store::EntryIndex,
     sek: WeakSek,
+    continuity_key: WeakSek,
     sender: SenderChain,
     next_log_id: u64,
     sparse: bool,
     skipped: Vec<Digest32>,
+    required_ancestors: Vec<Digest32>,
     now_millis: u64,
     rotation_now: u64,
+    removal_fence: Option<u64>,
     committed: Vec<Entry>,
     governance_changed: bool,
     rotation: Option<Rotation>,
@@ -46,6 +50,17 @@ pub(crate) struct PendingText {
     #[cfg(feature = "mutant-sender")]
     history_mode: HistoryMode,
     history_pin: Option<history::PendingHistoryRead>,
+    /// The readmission cut decided under the room lock at preparation (#1171). Only
+    /// Content, KeyPackage and ContextUpdate appends use it; no run reads governance again.
+    authoring_cut: AuthoringCut,
+}
+
+/// Prepared before any write: either the exact cut (or none) a restricted append names,
+/// or the existing retryable REFRESHING, surfaced only if this work authors such an entry.
+#[derive(Clone, Copy)]
+enum AuthoringCut {
+    Ready(Option<Digest32>),
+    Refreshing,
 }
 
 struct Rotation {
@@ -107,6 +122,8 @@ pub(crate) enum GovernanceWrite {
     IdleEnd(u64),
     End,
     AddAdmin(Digest32),
+    RemoveMember(Digest32),
+    ReadmitMember(Digest32),
     Anchors {
         add: BootstrapSet,
         remove: Option<Digest32>,
@@ -256,6 +273,20 @@ impl ChannelState {
         if !self.settled {
             return Err(Error::RoomNotSynced);
         }
+        let removal_generation = governance::removal_generation(store, &self.channel_id)?;
+        self.require_governance_ready(store, crate::time::Ms(now_millis))?;
+        if self.is_member_removed(store, &me)? {
+            return Err(Error::StreamRefused("this node was removed from the room"));
+        }
+        if self.room_removal_rotation_needed(store)? {
+            return Err(Error::StreamRefused("room authorization keys are rotating"));
+        }
+        governance::check_removal_generation(
+            store,
+            &self.sek,
+            &self.channel_id,
+            removal_generation,
+        )?;
         self.require_own_history_current()?;
         if self.dag.is_frozen(&me) {
             return Err(Error::MalformedGovernance(
@@ -312,7 +343,7 @@ impl ChannelState {
         } else {
             None
         };
-        self.prepare_pending_append(
+        let mut pending = self.prepare_pending_append(
             store,
             me,
             owner,
@@ -321,7 +352,9 @@ impl ChannelState {
             sparse,
             skipped,
             rotation,
-        )
+        )?;
+        pending.removal_fence = Some(removal_generation);
+        Ok(pending)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -337,10 +370,18 @@ impl ChannelState {
         rotation: Option<Rotation>,
     ) -> Result<PendingText> {
         let sender = SenderChain::from_state(&self.sender.to_state())?;
+        // Decided before the reservation, under the room lock, for every authored work: a
+        // control-only run never consults it, so it never waits on it.
+        let authoring_cut = match self.authoring_cut(store, &me) {
+            Ok(cut) => AuthoringCut::Ready(cut),
+            Err(error) if governance::refreshing(&error) => AuthoringCut::Refreshing,
+            Err(error) => return Err(error),
+        };
         let history_pin = self.reserve_pending_write(store, Arc::clone(&owner))?;
         let pending = PendingText {
             owner: Arc::clone(&owner),
             room: self.channel_id,
+            genesis: self.genesis.clone(),
             epoch: self.epoch,
             origin: self.genesis.body.created_ms,
             creator: self.genesis.creator_pubkey().fingerprint(),
@@ -349,12 +390,15 @@ impl ChannelState {
             dag: self.dag.authored_candidate(),
             entries: entry_store::EntryIndex::default(),
             sek: self.sek.reader(),
+            continuity_key: self.continuity_key.reader(),
             sender,
             next_log_id: self.next_log_id,
             sparse,
             skipped,
+            required_ancestors: Vec::new(),
             now_millis,
             rotation_now,
+            removal_fence: None,
             committed: Vec::with_capacity(3),
             governance_changed: false,
             rotation,
@@ -367,6 +411,7 @@ impl ChannelState {
             read_committed: false,
             presence: self.presence.get(&me).copied(),
             history_pin: Some(history_pin),
+            authoring_cut,
             #[cfg(feature = "mutant-sender")]
             history_mode: self.genesis.body.policy.history_mode,
         };
@@ -409,6 +454,7 @@ impl ChannelState {
         now: crate::time::Ms,
     ) -> Result<GovernancePreparation> {
         let me = signer.fingerprint();
+        let mut required_ancestors = Vec::new();
         let payload = match write {
             GovernanceWrite::Rename(name) => {
                 if !self.may_rename(store, &me, now)? {
@@ -503,6 +549,37 @@ impl ChannelState {
                 .to_wire()
             }
             GovernanceWrite::AddAdmin(member) => self.admin_payload(store, signer, member, now)?,
+            GovernanceWrite::RemoveMember(member) => {
+                self.validate_member_removal(store, &me, member, now)?;
+                crate::governance::membership::MemberRemoval::build(
+                    signer,
+                    &self.channel_id,
+                    self.epoch,
+                    member,
+                )?
+                .to_wire()
+            }
+            GovernanceWrite::ReadmitMember(member) => {
+                if me != self.genesis.creator_pubkey().fingerprint() {
+                    return Err(Error::Profile(
+                        "only the room's creator may readmit a member",
+                    ));
+                }
+                required_ancestors = self.validated_member_removals(store, member, now)?;
+                // Every covered removal must already be within this author's authored reach
+                // before the readmission is signed, reserved or written: an unsettled removal
+                // is the existing REFRESHING reply, too many uncovered authors the existing
+                // capacity refusal, never a poisoning authored-frontier failure at run time.
+                self.require_authored_ancestors(store, &me, &required_ancestors)?;
+                crate::governance::membership::MemberReadmission::build(
+                    signer,
+                    &self.channel_id,
+                    self.epoch,
+                    member,
+                    required_ancestors.clone(),
+                )?
+                .to_wire()
+            }
             GovernanceWrite::Anchors { add, remove } => {
                 self.require_governance_ready(store, now)?;
                 let mut next = BootstrapSet::new();
@@ -527,7 +604,8 @@ impl ChannelState {
                 .to_wire()
             }
         };
-        let pending = self.prepare_pending_control(store, owner, now)?;
+        let mut pending = self.prepare_pending_control(store, owner, now)?;
+        pending.required_ancestors.extend(required_ancestors);
         Ok(GovernancePreparation::Append(Box::new(pending), payload))
     }
 
@@ -649,6 +727,10 @@ impl ChannelState {
 }
 
 impl PendingText {
+    pub(crate) fn fence_removal(&mut self, generation: u64) {
+        self.removal_fence = Some(generation);
+    }
+
     /// Runs entirely on one physical blocking worker, including nested derived transactions.
     pub(crate) fn run(
         mut self,
@@ -665,7 +747,18 @@ impl PendingText {
         }));
         let (failure, error) = match work {
             Ok(Ok(())) => (None, None),
-            Ok(Err(error)) => (Some(error.to_string()), Some(error)),
+            Ok(Err(error)) => {
+                let failure = if governance::refreshing(&error)
+                    && self.committed.is_empty()
+                    && !self.encrypted_control_committed
+                    && !self.rotation_committed
+                {
+                    None
+                } else {
+                    Some(error.to_string())
+                };
+                (failure, Some(error))
+            }
             Err(_) => (
                 Some("authored save worker stopped".to_owned()),
                 Some(Error::Profile("authored save worker stopped")),
@@ -762,7 +855,16 @@ impl PendingText {
     }
 
     pub(crate) fn complete_control(self, result: Result<Saved>) -> CompletedText {
-        let failure = result.as_ref().err().map(ToString::to_string);
+        let failure = result
+            .as_ref()
+            .err()
+            .filter(|error| {
+                !governance::refreshing(error)
+                    || !self.committed.is_empty()
+                    || self.encrypted_control_committed
+                    || self.rotation_committed
+            })
+            .map(ToString::to_string);
         #[cfg(feature = "test-knobs")]
         let rotated = self.rotation_committed;
         CompletedText {
@@ -774,10 +876,31 @@ impl PendingText {
         }
     }
 
+    /// The existing required ancestors, plus the readmission cut decided at preparation for
+    /// a Content, KeyPackage or ContextUpdate append (#1171). Every such append in every flow
+    /// is that work's first write, so a REFRESHING decision defers it before any commit; a
+    /// cut that changes after preparation bumps the removal generation the work is fenced on.
+    fn required(&self, kind: SignedEntryKind) -> Result<Vec<Digest32>> {
+        let mut required = self.required_ancestors.clone();
+        if matches!(
+            kind,
+            SignedEntryKind::Content | SignedEntryKind::KeyPackage | SignedEntryKind::ContextUpdate
+        ) {
+            match self.authoring_cut {
+                AuthoringCut::Ready(cut) => {
+                    required.extend(cut.filter(|cut| !self.required_ancestors.contains(cut)));
+                }
+                AuthoringCut::Refreshing => return Err(Error::Profile(governance::REFRESHING)),
+            }
+        }
+        Ok(required)
+    }
+
     fn context(
         &self,
         store: &Store,
         signer: &dyn RootSigner,
+        required: &[Digest32],
     ) -> Result<Option<(ControlContext, Vec<EntryReference>, bool)>> {
         if !self.sparse {
             return Ok(None);
@@ -791,6 +914,7 @@ impl PendingText {
                     .feed(&signer.fingerprint())
                     .map_or(0, |feed| feed.max_seq()),
                 &signer.fingerprint(),
+                required,
             )
             .map(Some)
         })
@@ -798,8 +922,9 @@ impl PendingText {
 
     fn append_text(&mut self, store: &Store, signer: &dyn RootSigner, text: &str) -> Result<()> {
         let content = Content::text(self.now_millis, text)?;
+        let required = self.required(SignedEntryKind::Content)?;
         if self
-            .context(store, signer)?
+            .context(store, signer, &required)?
             .is_some_and(|(_, _, changed)| changed)
         {
             self.append(
@@ -873,7 +998,8 @@ impl PendingText {
         boundary: Option<&recovery::AppendBoundary>,
     ) -> Result<()> {
         let keep_log = kind == EntryKind::Governance || signed_kind == SignedEntryKind::StepPolicy;
-        let context = self.context(store, signer)?;
+        let required = self.required(signed_kind)?;
+        let context = self.context(store, signer, &required)?;
         let recipient = if self.sparse && signed_kind == SignedEntryKind::KeyPackage {
             Some(crate::node::keypackage::KeyPackage::from_wire(&payload)?.recipient)
         } else {
@@ -902,7 +1028,44 @@ impl PendingText {
             });
             let seen = match &context {
                 Some((_, seen, _)) => seen.iter().map(|reference| reference.hash).collect(),
-                None => self.dag.seen_for(&read, &me)?,
+                None if required.is_empty() => self.dag.seen_for(&read, &me)?,
+                None => {
+                    let mut required_seen = BTreeMap::new();
+                    for ancestor in &required {
+                        let (author, position) = read.locate(ancestor)?.ok_or(
+                            Error::MalformedGovernance("required removal ancestor missing"),
+                        )?;
+                        if author == me {
+                            if position >= seq {
+                                return Err(Error::MalformedGovernance(
+                                    "removal is not in the local past",
+                                ));
+                            }
+                        } else if read.referenced(&me, &author)? < position {
+                            let slot = required_seen.entry(author).or_insert((position, *ancestor));
+                            if position > slot.0 {
+                                *slot = (position, *ancestor);
+                            }
+                        }
+                    }
+                    if required_seen.len() > crate::log::entry::MAX_SEEN {
+                        return Err(Error::SizeLimitExceeded("readmission causal frontier"));
+                    }
+                    let mut selected = Vec::new();
+                    for candidate in self.dag.seen_for(&read, &me)? {
+                        let (author, _) = read
+                            .locate(&candidate)?
+                            .ok_or(Error::MalformedAtRest("seen head missing"))?;
+                        if !required_seen.contains_key(&author)
+                            && selected.len() + required_seen.len() < crate::log::entry::MAX_SEEN
+                        {
+                            selected.push(candidate);
+                        }
+                    }
+                    selected.extend(required_seen.into_values().map(|(_, hash)| hash));
+                    selected.sort_unstable();
+                    selected
+                }
             };
             Entry::build_signed(
                 signer,
@@ -987,6 +1150,9 @@ impl PendingText {
         // this physical thread, preserving the existing durable received-debt settlement.
         let mut batch = store.batch()?;
         let accepted = self.sek.with(|sek| {
+            if let Some(generation) = self.removal_fence {
+                governance::check_removal_generation_in(&batch, sek, &self.room, generation)?;
+            }
             if let Some(boundary) = boundary {
                 boundary.check(&batch, sek, &self.room)?;
             }
@@ -1012,6 +1178,24 @@ impl PendingText {
                 index.seal()?;
                 settlement
             };
+            if let Some(prepared) = &prepared {
+                let generation = match GovEntry::body_bound_to(&entry) {
+                    Ok(GovBody::Presence(presence)) => {
+                        self.sender.chain_id().max(presence.body.chain_id)
+                    }
+                    _ => self.sender.chain_id(),
+                };
+                self.continuity_key.with(|key| {
+                    own_history::save_continuity(
+                        &mut batch,
+                        key,
+                        prepared.head.head(),
+                        self.epoch,
+                        generation,
+                        &self.genesis,
+                    )
+                })?;
+            }
             session_projection::private_index::observe_public(
                 &mut batch, sek, &self.room, &entry, self.epoch,
             )?;
@@ -1036,9 +1220,11 @@ impl PendingText {
                 if let Ok(GovBody::Presence(presence)) = GovEntry::body_bound_to(&entry) {
                     let mut state = self.presence.unwrap_or(governance::Presence {
                         last: (entry.skeleton.seq, presence.body.here),
+                        last_ms: Some(entry.skeleton.claimed_ms),
                         back: None,
                     });
                     state.last = (entry.skeleton.seq, presence.body.here);
+                    state.last_ms = Some(entry.skeleton.claimed_ms);
                     if presence.body.here {
                         state.back = Some((entry.skeleton.seq, entry.skeleton.claimed_ms));
                     }
@@ -1152,9 +1338,11 @@ impl PendingText {
         if let Ok(GovBody::Presence(presence)) = GovEntry::body_bound_to(&entry) {
             let mut state = self.presence.unwrap_or(governance::Presence {
                 last: (seq, presence.body.here),
+                last_ms: Some(entry.skeleton.claimed_ms),
                 back: None,
             });
             state.last = (seq, presence.body.here);
+            state.last_ms = Some(entry.skeleton.claimed_ms);
             if presence.body.here {
                 state.back = Some((seq, self.now_millis));
             }

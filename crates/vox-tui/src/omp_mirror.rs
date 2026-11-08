@@ -606,6 +606,7 @@ impl Follow {
                         session.clone(),
                         DriveDelivery {
                             admission: admission.clone(),
+                            authority: item.guard.authority.clone(),
                             current: current.clone(),
                             frame: frame.clone(),
                         },
@@ -650,10 +651,16 @@ impl Follow {
             if !item.guard.allowed() {
                 return Self::write(write, &format!("{}\n", json!({"type":"materialized","id":id,"ok":false,"error":"the driver, room or Session changed"}))).await;
             }
+            use std::future::Future as _;
+            use std::task::Poll;
+            let mut publication = std::pin::pin!(Self::write(write, &message));
             tokio::select! {
                 biased;
                 () = item.guard.cancelled() => false,
-                written = Self::write(write, &message) => written,
+                written = std::future::poll_fn(|cx| {
+                    item.guard.with_publication(|| publication.as_mut().poll(cx))
+                        .unwrap_or(Poll::Ready(false))
+                }) => written,
             }
         };
         if written && item.guard.operator.is_some() && item.guard.operation.is_some() {

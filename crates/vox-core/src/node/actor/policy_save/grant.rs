@@ -38,12 +38,24 @@ enum Stage {
     Packages {
         cursor: usize,
         result: Option<oneshot::Receiver<Outcome>>,
+        publication: Option<PackagePublication>,
     },
 }
 pub(crate) struct GrantDelivery {
     ready: GrantReady,
     stage: Stage,
     reply: Reply,
+}
+
+struct PackagePublication {
+    ready: Arc<std::sync::atomic::AtomicBool>,
+    task: tokio::task::JoinHandle<()>,
+    sparse: bool,
+}
+impl Drop for PackagePublication {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 impl GrantWaiting {
@@ -429,14 +441,39 @@ impl Node {
                 pending.stage = Stage::Packages {
                     cursor: 0,
                     result: None,
+                    publication: None,
                 };
                 true
             }
-            Stage::Packages { cursor, result } => {
+            Stage::Packages {
+                cursor,
+                result,
+                publication,
+            } => {
+                if let Some(waiting) = publication {
+                    if waiting.sparse && self.policy_publication_retirement_failed() {
+                        self.fail_grant_delivery(
+                            pending,
+                            Error::Profile("history publication retirement requires recovery"),
+                        )
+                        .await;
+                        return;
+                    }
+                    if !waiting.ready.load(std::sync::atomic::Ordering::Acquire) {
+                        self.pending_policy = Some(Pending::GrantDelivery(pending));
+                        return;
+                    }
+                    *publication = None;
+                }
                 if let Some(receiver) = result {
                     match receiver.try_recv() {
                         Ok(Outcome::Done) => {
                             *cursor += 1;
+                            *result = None;
+                        }
+                        Ok(Outcome::Failed(Fault::RoomChangePending)) => {
+                            // No package save was admitted. Retain this room's selected turn
+                            // behind its actual publication dependency, not an Internal reply.
                             *result = None;
                         }
                         Ok(_) => {
@@ -478,11 +515,74 @@ impl Node {
                     .await;
                     return;
                 }
-                instance.lock().await.release_held_packages();
-                let (sender, receiver) = oneshot::channel();
-                *result = Some(receiver);
-                self.begin_owned_package_turn(*room, Some(Arc::clone(&save)), Some(sender))
-                    .await;
+                if self.pending_posts.contains_key(room) {
+                    // That exact native owner's completion already wakes post_save_wake.
+                    // Do not issue a refused turn and manufacture another wake while it runs.
+                    self.pending_policy = Some(Pending::GrantDelivery(pending));
+                    return;
+                }
+                let blocked = {
+                    let mut channel = instance.lock().await;
+                    match channel.policy_publication_blocker(&save.store) {
+                        Ok(Some(blocked)) => match channel.history_instance(&save.store) {
+                            Ok(history) => Some(Ok((blocked, history))),
+                            Err(error) => Some(Err(error)),
+                        },
+                        Ok(None) => {
+                            channel.release_held_packages();
+                            None
+                        }
+                        Err(error) => Some(Err(error)),
+                    }
+                };
+                if let Some(blocked) = blocked {
+                    let (blocked, history) = match blocked {
+                        Ok(blocked) => blocked,
+                        Err(error) => {
+                            self.fail_grant_delivery(pending, error).await;
+                            return;
+                        }
+                    };
+                    use crate::node::channel::pending_text::PolicyBlocker;
+                    let (sparse, changed) = match blocked {
+                        PolicyBlocker::Physical(changed) => (false, changed),
+                        PolicyBlocker::Sparse {
+                            request,
+                            root,
+                            wake,
+                        } => {
+                            if let Err(error) =
+                                self.retire_policy_publication(*room, history, request, root)
+                            {
+                                self.fail_grant_delivery(pending, error).await;
+                                return;
+                            }
+                            (true, wake)
+                        }
+                    };
+                    let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let signal = Arc::clone(&ready);
+                    let wake = Arc::clone(&self.post_save_wake);
+                    let mut attachment = self.pairwise_epoch.subscribe();
+                    let task = tokio::spawn(async move {
+                        tokio::select! {
+                            () = changed => {}
+                            _ = attachment.changed() => {}
+                        }
+                        signal.store(true, std::sync::atomic::Ordering::Release);
+                        wake.notify_one();
+                    });
+                    *publication = Some(PackagePublication {
+                        ready,
+                        task,
+                        sparse,
+                    });
+                } else {
+                    let (sender, receiver) = oneshot::channel();
+                    *result = Some(receiver);
+                    self.begin_owned_package_turn(*room, Some(Arc::clone(&save)), Some(sender))
+                        .await;
+                }
                 false
             }
         };

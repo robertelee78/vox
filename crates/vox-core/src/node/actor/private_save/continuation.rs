@@ -1645,7 +1645,7 @@ impl Node {
                     let _ = &mut recv;
                     let _ = tokio::time::timeout(
                         Duration::from_secs(10),
-                        crate::node::sessionstream::answer(send, page),
+                        crate::node::sessionstream::answer(send, page, &_lifetime.store, &room),
                     )
                     .await;
                 });

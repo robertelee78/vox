@@ -4219,6 +4219,297 @@ final class FirstRunProof: XCTestCase {
 
     }
 
+    /// Disposable native membership journey; all room traffic uses the bundled CLI and app.
+    /// Bob is removed; a never-removed member presenting Bob's name under another fingerprint
+    /// ("twin", node `bob`, alice's alias `Bob`) is the same-room control.
+    func testRoomMembershipRemovalAndReadmission() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let appPath = env["VOX_PROOF_APP"], let scratch = env["VOX_PROOF_SCRATCH"],
+              let knobs = env["VOX_PROOF_KNOBS_VOX"] else {
+            throw Apparatus("native app, scratch and private-Keychain daemon are required")
+        }
+        let vox = appPath + "/Contents/Helpers/vox"
+        let root = URL(fileURLWithPath: scratch).appendingPathComponent("membership-native")
+        guard stager.run(["/bin/mkdir", "-p", root.path], env: [:]).status == 0 else {
+            throw Apparatus("cannot create membership scratch root")
+        }
+        for name in ["alice", "bob", "twin"] {
+            let made = stager.run(["/usr/bin/security", "create-keychain", "-p", "",
+                                   root.appendingPathComponent("\(name).keychain-db").path],
+                                  env: ["HOME": root.path])
+            guard made.status == 0 else { throw Apparatus("private Keychain \(name): \(made.out)") }
+        }
+        func nodeEnv(_ dir: String) -> [String: String] {
+            ["HOME": root.path, "VOX_DATA_DIR": root.appendingPathComponent(dir + "/data").path,
+             "VOX_CONFIG_DIR": root.appendingPathComponent(dir + "/config").path,
+             "VOX_PROXY": "127.0.0.1:0",
+             "VOX_TEST_KEYCHAIN": root.appendingPathComponent("\(dir).keychain-db").path]
+        }
+        // Bob and the twin are both node `bob`; only their profiles and fingerprints differ.
+        let alice = nodeEnv("alice"), bob = nodeEnv("bob"), twin = nodeEnv("twin")
+        let pass = root.appendingPathComponent("pass").path
+        try stager.write(Data("membership pass\n".utf8), to: pass)
+        daemon = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: alice,
+                           until: "vox daemon: control socket")
+        peer = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: bob,
+                         until: "vox daemon: control socket")
+        trustPeer = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: twin,
+                              until: "vox daemon: control socket")
+        for (name, e) in [("alice", alice), ("bob", bob), ("bob", twin)] {
+            try staged(vox, ["node", "create", name],
+                       env: e.merging(["VOX_IDENTITY_PASSPHRASE": "membership pass"]) { $1 })
+            try staged(vox, ["node", "attach", name, "--passphrase-file", pass], env: e)
+        }
+        let aliceFp = try line(staged(vox, ["id", "--node", "alice"], env: alice)) { $0.count == 52 }
+        let bobFp = try line(staged(vox, ["id", "--node", "bob"], env: bob)) { $0.count == 52 }
+        let twinFp = try line(staged(vox, ["id", "--node", "bob"], env: twin)) { $0.count == 52 }
+        guard twinFp != bobFp else { throw Apparatus("twin and Bob share fingerprint \(bobFp)") }
+        // `Bob` differs from `bob` only by case: the CLI keyring accepts it, and the app must
+        // disambiguate the clash by fingerprint (ADR-028 K-4). Bob and the twin trust each other
+        // through the ordinary keyring, so the twin's own posts are a second author's sender chain.
+        for (name, fp, alias, e) in [("alice", bobFp, "bob", alice), ("alice", twinFp, "Bob", alice),
+                                     ("bob", aliceFp, "alice", bob), ("bob", aliceFp, "alice", twin),
+                                     ("bob", twinFp, "twin", bob), ("bob", bobFp, "bob", twin)] {
+            try staged(vox, ["trust", "add", "--node", name, fp, "--name", alias,
+                             "--identity-passphrase-file", pass], env: e)
+        }
+        func makeRoom(_ name: String, _ joiners: [[String: String]]) throws -> String {
+            try staged(vox, ["room", "create", "--node", "alice", "--passphrase-file", pass,
+                             "--name", name], env: alice)
+            let listing = try staged(vox, ["room", "list", "--node", "alice"], env: alice)
+            let room = try line(listing) { $0.contains(" " + name) }
+                .split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
+            guard !room.isEmpty else { throw Apparatus("no room id in \(listing)") }
+            let link = try line(staged(vox, ["room", "link", "--node", "alice", room], env: alice)) { $0.hasPrefix("vox://") }
+            for e in joiners {
+                try staged(vox, ["room", "join", "--node", "bob", "--passphrase-file", pass, link], env: e)
+            }
+            return room
+        }
+        let room = try makeRoom("membership-proof", [bob, twin])
+        let other = try makeRoom("membership-control", [bob])
+        func post(_ room: String, _ text: String) throws {
+            try staged(vox, ["room", "post", "--node", "alice", room, text], env: alice)
+        }
+        /// A post authored by the never-removed twin, its own sender chain, by the shipped CLI.
+        func twinPost(_ text: String) throws {
+            try staged(vox, ["room", "post", "--node", "bob", room, text], env: twin)
+        }
+        /// The twin's own entry hash for `text`, from its own `--json` read.
+        func twinEntry(_ text: String) -> String? {
+            let rows = run(vox, ["room", "read", "--node", "bob", "--json", room], env: twin).out
+            for line in rows.split(separator: "\n") {
+                guard let row = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                      row["text"] as? String == text, row["author"] as? String == twinFp else { continue }
+                return row["entry_hash"] as? String
+            }
+            return nil
+        }
+        func reads(_ e: [String: String], _ room: String) -> (status: Int32, out: String) {
+            run(vox, ["room", "read", "--node", "bob", room], env: e)
+        }
+        func waitFor(_ room: String, _ texts: [String], seconds: TimeInterval = 60,
+                     as e: [String: String]? = nil) -> String {
+            let end = Date().addingTimeInterval(seconds)
+            var last = ""
+            repeat {
+                let read = reads(e ?? bob, room)
+                last = "status \(read.status): \(read.out)"
+                if read.status == 0 && texts.allSatisfy({ read.out.contains($0) }) { return last }
+                Thread.sleep(forTimeInterval: 0.5)
+            } while Date() < end
+            return last
+        }
+        /// Every entry the node holds, readable or not, as the shipped `--hashes` lists them.
+        func holds(_ e: [String: String], _ ids: [String], seconds: TimeInterval) -> (all: Bool, said: String) {
+            let end = Date().addingTimeInterval(seconds)
+            var said = ""
+            repeat {
+                let r = run(vox, ["room", "read", "--node", "bob", room, "--hashes"], env: e)
+                said = "status \(r.status): \(r.out)"
+                if r.status == 0 && ids.allSatisfy({ r.out.contains($0) }) { return (true, said) }
+                Thread.sleep(forTimeInterval: 0.5)
+            } while Date() < end
+            return (false, said)
+        }
+        func roster(_ e: [String: String], until: (String) -> Bool, seconds: TimeInterval = 60) -> (holds: Bool, said: String) {
+            let end = Date().addingTimeInterval(seconds)
+            var said = ""
+            repeat {
+                let r = run(vox, ["room", "roster", "--node", "bob", room], env: e)
+                said = "status \(r.status): \(r.out)"
+                if r.status == 0 && until(r.out) { return (true, said) }
+                Thread.sleep(forTimeInterval: 0.5)
+            } while Date() < end
+            return (false, said)
+        }
+        try post(room, "NATIVE-BEFORE")
+        let before = waitFor(room, ["NATIVE-BEFORE"])
+        guard before.contains("NATIVE-BEFORE") else { throw Apparatus("initial paired room delivery: \(before)") }
+        let twinBefore = waitFor(room, ["NATIVE-BEFORE"], as: twin)
+        guard twinBefore.contains("NATIVE-BEFORE") else { throw Apparatus("twin initial delivery: \(twinBefore)") }
+        // Premise: the ordinary Twin -> Bob trust/consent path actually delivers a second author.
+        try twinPost("NATIVE-TWIN-BEFORE")
+        let twinAuthored = waitFor(room, ["NATIVE-TWIN-BEFORE"])
+        guard twinAuthored.contains("NATIVE-TWIN-BEFORE") else {
+            throw Apparatus("ordinary twin-authored delivery to Bob before removal: \(twinAuthored)")
+        }
+        try post(other, "NATIVE-OTHER-BEFORE")
+        let controlBefore = waitFor(other, ["NATIVE-OTHER-BEFORE"])
+        guard controlBefore.contains("NATIVE-OTHER-BEFORE") else { throw Apparatus("other-room premise: \(controlBefore)") }
+        try stager.write(Data("no\n".utf8), to: alice["VOX_CONFIG_DIR"]! + "/app/login-item")
+        try staged(vox, ["computer", "personal", "alice"], env: alice)
+        let ui = voxApp(appPath)
+        ui.launchEnvironment = alice
+        try launchVox(ui, appPath, env: alice, scratch: scratch)
+        let bobRow = "member-bob#" + bobFp.prefix(6), twinRow = "member-Bob#" + twinFp.prefix(6)
+        let bobMember = member(vox, alice, room, bobFp, "bob")
+        let twinMember = member(vox, alice, room, twinFp, "twin")
+        guard tap(ui, Key.id("room-membership-proof"), "the membership proof room"),
+              present(ui, Key.id(bobRow), timeout: 60,
+                      "Bob must be shown disambiguated by fingerprint from a same-name member", premise: bobMember),
+              present(ui, Key.id(twinRow), timeout: 60,
+                      "the same-name twin must be shown disambiguated by fingerprint", premise: twinMember) else { return }
+        keepTree(ui, "same-name members disambiguated by fingerprint")
+        // Both have read NATIVE-BEFORE. Detaching closes their live connections before this
+        // second message exists, so it is genuinely unseen by each at Bob's removal.
+        try staged(vox, ["node", "detach", "bob"], env: bob)
+        try staged(vox, ["node", "detach", "bob"], env: twin)
+        try post(room, "NATIVE-UNSEEN-BEFORE")
+        guard tap(ui, Key.id("member-manage-membership"), "room membership management"),
+              tap(ui, Key.id("room-remove-" + bobFp), "remove Bob's full fingerprint") else { return }
+        guard present(ui, Key.showing(bobFp), timeout: 10, "the exact fingerprint being removed") else { return }
+        keepTree(ui, "exact fingerprint removal confirmation")
+        guard tap(ui, Key.id("room-membership-confirm"), "confirm removal") else { return }
+        guard let removal = words(ui, Key.id("room-membership-result"), timeout: 60,
+                                  "removal must distinguish local application from propagation",
+                                  until: { $0.contains(bobFp) && $0.contains("was applied on this node")
+                                      && $0.contains("Propagation to other nodes is unknown") }) else { return }
+        keepTree(ui, "local removal result and unknown propagation")
+        print("[proof] removal \(removal)")
+        guard tap(ui, Key.showing("Done"), "close membership sheet") else { return }
+        let rowGoneBy = Date().addingTimeInterval(30)
+        while locate(ui, Key.id("member-remove-" + bobFp)) != nil && Date() < rowGoneBy {
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        keepTree(ui, "exact-fingerprint removal leaves the same-name twin")
+        XCTAssertNil(locate(ui, Key.id("member-remove-" + bobFp)),
+                     "PRODUCT: the removed exact fingerprint is still listed as a room member")
+        guard present(ui, Key.id("member-remove-" + twinFp), timeout: 10,
+                      "removing Bob's exact fingerprint must leave the same-name twin a member",
+                      premise: twinMember) else { return }
+        let aliceRoster = try staged(vox, ["room", "roster", "--node", "alice", room], env: alice)
+        checkNonUI {
+            XCTAssertFalse(aliceRoster.contains(bobFp), "PRODUCT: alice's roster still lists removed Bob: \(aliceRoster)")
+            XCTAssertTrue(aliceRoster.contains(twinFp), "PRODUCT: exact-fingerprint removal dropped the same-name twin: \(aliceRoster)")
+        }
+        try post(room, "NATIVE-DURING")
+        try post(other, "NATIVE-OTHER-AFTER")
+        guard let unseen = posted(vox, alice, room, "NATIVE-UNSEEN-BEFORE"),
+              let duringRow = posted(vox, alice, room, "NATIVE-DURING") else {
+            throw Apparatus("alice's own read lacks the NATIVE-UNSEEN-BEFORE or NATIVE-DURING entry")
+        }
+        try staged(vox, ["node", "attach", "bob", "--passphrase-file", pass], env: bob)
+        try staged(vox, ["node", "attach", "bob", "--passphrase-file", pass], env: twin)
+        let controlAfter = waitFor(other, ["NATIVE-OTHER-AFTER"])
+        let returnerControl = controlAfter.contains("NATIVE-OTHER-AFTER")
+        if !returnerControl {
+            print("[proof] APPARATUS/dependency #1163: never-removed other-room returner did not recover: \(controlAfter)")
+        }
+        // Never-removed same-room control: ordinary full history, including what it missed offline.
+        let twinDuring = waitFor(room, ["NATIVE-UNSEEN-BEFORE", "NATIVE-DURING"], as: twin)
+        let twinReturned = twinDuring.contains("NATIVE-DURING")
+        let propagated = roster(twin, until: { !$0.contains(bobFp) && $0.contains(aliceFp) })
+        // A second author's removal-period post, made only once the twin has applied the removal.
+        var twinDuringId: String?
+        if propagated.holds {
+            try twinPost("NATIVE-TWIN-DURING")
+            twinDuringId = twinEntry("NATIVE-TWIN-DURING")
+        }
+        let twinReadmit = run(vox, ["room", "readmit-member", "--node", "bob", room, bobFp], env: twin)
+        let trust = try staged(vox, ["trust", "list", "--node", "alice"], env: alice)
+        let otherRoster = try staged(vox, ["room", "roster", "--node", "alice", other], env: alice)
+        let during = waitFor(room, ["NATIVE-DURING"], seconds: 20)
+        let bobRosterRemoved = run(vox, ["room", "roster", "--node", "bob", room], env: bob)
+        checkNonUI {
+            XCTAssertTrue(trust.contains(bobFp), "PRODUCT: room removal must preserve global trust: \(trust)")
+            XCTAssertTrue(otherRoster.contains(bobFp), "PRODUCT: room removal must leave Bob in the other room: \(otherRoster)")
+            XCTAssertTrue(twinReturned, "\(returnerControl ? "PRODUCT: a never-removed member must receive room activity after returning" : "APPARATUS/dependency #1163: returner continuity was not established"): \(twinDuring)")
+            XCTAssertTrue(!twinReturned || twinDuring.contains("NATIVE-UNSEEN-BEFORE"),
+                          "PRODUCT: a never-removed returner must keep ordinary full history: \(twinDuring)")
+            XCTAssertTrue(propagated.holds, "PRODUCT: Bob's removal must reach the never-removed member: \(propagated.said)")
+            XCTAssertTrue(twinReadmit.status != 0, "PRODUCT: a non-creator readmitted Bob: \(twinReadmit.out)")
+            XCTAssertFalse(during.contains("NATIVE-DURING"), "PRODUCT: removed Bob received future room activity: \(during)")
+            XCTAssertFalse(during.contains("NATIVE-UNSEEN-BEFORE"), "PRODUCT: removed Bob newly received unseen pre-removal activity: \(during)")
+            XCTAssertFalse(during.contains("NATIVE-TWIN-DURING"), "PRODUCT: removed Bob received the twin's removal-period activity: \(during)")
+        }
+        print("[proof] before=\(before) removed=\(during) other=\(controlAfter) trust=\(trust) twin=\(twinDuring) twinRoster=\(propagated.said) twinReadmit=\(twinReadmit.status): \(twinReadmit.out) bobRosterWhileRemoved=\(bobRosterRemoved.status): \(bobRosterRemoved.out)")
+        guard tap(ui, Key.id("member-manage-membership"), "readmission management"),
+              tap(ui, Key.id("room-readmit-fingerprint"), "full readmission fingerprint") else { return }
+        el(ui, Key.id("room-readmit-fingerprint")).typeText(bobFp)
+        guard tap(ui, Key.showing("Review Readmission"), "review exact readmission"),
+              present(ui, Key.showing(bobFp), timeout: 10, "the exact fingerprint to readmit") else { return }
+        keepTree(ui, "exact fingerprint readmission confirmation")
+        guard tap(ui, Key.id("room-membership-confirm"), "confirm readmission") else { return }
+        guard let admission = words(ui, Key.id("room-membership-result"), timeout: 60,
+                                    "readmission must report local application and unknown propagation",
+                                    until: { $0.contains(bobFp) && $0.contains("was applied on this node")
+                                        && $0.contains("Propagation to other nodes is unknown")
+                                        && $0.contains("does not restore history") }) else { return }
+        keepTree(ui, "local readmission result and unknown propagation")
+        print("[proof] readmission \(admission)")
+        guard tap(ui, Key.showing("Done"), "close readmission sheet"),
+              present(ui, Key.id("member-remove-" + bobFp), timeout: 30,
+                      "the readmitted exact fingerprint must be listed again", premise: bobMember),
+              present(ui, Key.id("member-remove-" + twinFp), timeout: 10,
+                      "the same-name twin must remain listed after Bob's readmission", premise: twinMember) else { return }
+        keepTree(ui, "readmitted Bob beside the same-name twin")
+        try post(room, "NATIVE-AFTER")
+        guard let afterRow = posted(vox, alice, room, "NATIVE-AFTER") else {
+            throw Apparatus("alice's own read lacks the NATIVE-AFTER entry")
+        }
+        let after = waitFor(room, ["NATIVE-AFTER"], seconds: 90)
+        let twinAfter = waitFor(room, ["NATIVE-AFTER"], as: twin)
+        // The twin authors fresh activity only after it has itself observed the creator's
+        // readmission, both as governance (its roster lists Bob again) and as Alice's chain tip
+        // past it (it renders NATIVE-AFTER, authored after the readmission). Its sender
+        // chain/key package must then reach Bob on the readmitted side; a red here is PRODUCT.
+        let reAdmitted = roster(twin, until: { $0.contains(bobFp) })
+        var twinFresh = "not posted: the twin never observed the readmission and Alice's later post"
+        var twinFreshId: String?
+        if reAdmitted.holds && twinAfter.contains("NATIVE-AFTER") {
+            try twinPost("NATIVE-TWIN-AFTER")
+            twinFreshId = twinEntry("NATIVE-TWIN-AFTER")
+            twinFresh = waitFor(room, ["NATIVE-TWIN-AFTER"], seconds: 90)
+        }
+        // Causal barrier: Bob's node holds the unseen and removal-period entries themselves, so
+        // their absence from what it renders is the product's choice, not a sync still under way.
+        let barrierIds = [unseen.id, duringRow.id, afterRow.id] + [twinDuringId, twinFreshId].compactMap { $0 }
+        let barrier = holds(bob, barrierIds, seconds: 60)
+        let settled = reads(bob, room)
+        let rendered = "status \(settled.status): \(settled.out)"
+        print("[proof] ids unseen=\(unseen.id) during=\(duringRow.id) after=\(afterRow.id) twinDuring=\(twinDuringId ?? "none") twinAfter=\(twinFreshId ?? "none") bobHolds=\(barrier.said)")
+        checkNonUI {
+            XCTAssertTrue(after.contains("NATIVE-AFTER"),
+                          "\(returnerControl ? "PRODUCT: eligible forward activity must arrive after readmission" : "APPARATUS/dependency #1163: returner continuity was not established"): \(after)")
+            XCTAssertTrue(twinAfter.contains("NATIVE-AFTER"), "PRODUCT: the never-removed twin must receive forward activity: \(twinAfter)")
+            XCTAssertTrue(reAdmitted.holds, "PRODUCT: Bob's readmission must reach the never-removed member: \(reAdmitted.said)")
+            XCTAssertNotNil(twinDuringId, "APPARATUS: the twin's removal-period post has no entry of its own to bind the barrier")
+            XCTAssertNotNil(twinFreshId, "APPARATUS: the twin's post-readmission post has no entry of its own to bind the barrier")
+            XCTAssertTrue(twinFresh.contains("NATIVE-TWIN-AFTER"),
+                          "PRODUCT: Bob must read a never-removed member's fresh post made after it observed the readmission: \(twinFresh)")
+            XCTAssertTrue(barrier.all,
+                          "APPARATUS: causal barrier not reached; Bob's node does not hold the unseen/removal-period entries, so a negative would be timing-only: \(barrier.said)")
+            XCTAssertFalse(rendered.contains("NATIVE-DURING"), "PRODUCT: readmission must not backfill removal-period activity: \(rendered)")
+            XCTAssertFalse(rendered.contains("NATIVE-TWIN-DURING"), "PRODUCT: readmission must not backfill another member's removal-period activity: \(rendered)")
+            XCTAssertFalse(rendered.contains("NATIVE-UNSEEN-BEFORE"), "PRODUCT: readmission must not backfill unseen pre-removal activity: \(rendered)")
+            XCTAssertTrue(rendered.contains("NATIVE-BEFORE"), "PRODUCT: already-read activity must remain after readmission: \(rendered)")
+            XCTAssertTrue(rendered.contains("NATIVE-TWIN-BEFORE"), "PRODUCT: already-read twin activity must remain after readmission: \(rendered)")
+            XCTAssertTrue(returnerControl, "APPARATUS/dependency #1163: never-removed other-room returner continuity: \(controlAfter)")
+        }
+        print("[proof] readmitted=\(rendered) twinAfter=\(twinAfter) twinFresh=\(twinFresh) twinRosterReadmitted=\(reAdmitted.said)")
+    }
+
     /// A remote room's retained message is recovered after the displayed forward mark expires,
     /// without another post or reopening the room. All staging uses the shipped CLI.
     func testRoomTimelineRecoversAfterItsDisplayedMarkIsPruned() throws {
@@ -6763,6 +7054,36 @@ final class FirstRunProof: XCTestCase {
                            "once bob's node is back and holds WHERE-15, it must say it is on 1 of the members' nodes, \"on 1 of N members' nodes\"",
                            until: { $0.hasPrefix("on 1 of ") && $0.hasSuffix(" members' nodes") }) ?? ""
         print("[proof] whereabouts: \(alone) → \(spread)")
+        // FX-62: use the native member row, not a CLI removal.
+        guard present(ui, Key.id("member-remove-\(bobFp)"), timeout: 30,
+                      "the exact member row must offer Remove from Room",
+                      premise: member(vox, voxEnv, room, bobFp, "bob")) else { return }
+        tap(ui, Key.id("member-remove-\(bobFp)"), "Remove from Room beside bob's exact member row")
+        guard present(ui, Key.showing("Remove this exact fingerprint in mission?"), timeout: 10,
+                      "Remove must ask before changing mission") else { return }
+        tap(ui, Key.id("room-membership-confirm"), "Confirm removing bob from mission")
+        guard words(ui, Key.id("room-membership-result"), timeout: 60,
+                    "native removal must report the exact identity and room",
+                    until: { $0.contains("Removal of \(bobFp)") && $0.contains("was applied on this node") }) != nil else { return }
+        let removalDeadline = Date().addingTimeInterval(30)
+        var afterRemoval: (status: Int32, out: String) = (1, "")
+        repeat {
+            afterRemoval = run(vox, ["room", "roster", "--node", "alice", room], env: voxEnv)
+            if afterRemoval.status == 0 && !afterRemoval.out.contains(bobFp) { break }
+            Thread.sleep(forTimeInterval: 0.5)
+        } while Date() < removalDeadline
+        checkNonUI {
+            XCTAssertTrue(afterRemoval.status == 0 && !afterRemoval.out.contains(bobFp),
+                          "PRODUCT: the native Remove action left bob in mission: \(afterRemoval)")
+            let keyring = run(vox, ["trust", "list", "--node", "alice"], env: voxEnv)
+            XCTAssertTrue(keyring.status == 0 && keyring.out.contains(bobFp),
+                          "PRODUCT: room removal changed global trust: \(keyring)")
+            let history = run(vox, ["room", "read", "--node", "alice", room], env: voxEnv)
+            XCTAssertTrue(history.status == 0 && history.out.contains("WHERE-15"),
+                          "PRODUCT: native room removal hid readable signed history: \(history)")
+        }
+        print("[proof] FX-62 native: bob's exact member row confirmed room-scoped removal")
+        tap(ui, Key.showing("Done"), "Close the membership sheet")
         // CW-4 supersedes Detach: Forget keeps this window alice's and preserves the draft.
         type(ui, Key.id("compose"), "DRAFT-KEPT-FORGET-D17", "draft before Forget")
         ui.menuBars.menuBarItems["Node"].click()

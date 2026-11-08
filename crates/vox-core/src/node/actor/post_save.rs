@@ -66,6 +66,7 @@ impl EndPreparation {
             PendingWithdrawal {
                 wire,
                 routes: self.routes,
+                awaiting_departure: false,
             },
         );
         let bytes = pending_withdrawals_bytes(&next).map_err(|error| fault_of(&error))?;
@@ -83,6 +84,7 @@ impl EndPreparation {
 enum ReplyKind {
     Text,
     Rename,
+    MemberGovernance,
     Governance,
     Retention,
     End,
@@ -93,9 +95,12 @@ enum ReplyKind {
 impl ReplyKind {
     fn outcome(self, saved: &Saved) -> Outcome {
         match saved {
-            Saved::Governance(Some(hash)) if matches!(self, Self::Rename) => {
+            Saved::Governance(Some(hash))
+                if matches!(self, Self::Rename | Self::MemberGovernance) =>
+            {
                 Outcome::Appended(*hash)
             }
+            _ if matches!(self, Self::MemberGovernance) => Outcome::Failed(Fault::Internal),
             Saved::OwnRetention { own, room } => Outcome::OwnRetention {
                 own: *own,
                 room: *room,
@@ -304,6 +309,8 @@ impl Node {
             | NodeCommand::SendTextAt { channel_id, .. }
             | NodeCommand::SendTextAdmitted { channel_id, .. }
             | NodeCommand::RenameRoom { channel_id, .. }
+            | NodeCommand::RemoveRoomMember { channel_id, .. }
+            | NodeCommand::ReadmitRoomMember { channel_id, .. }
             | NodeCommand::SetRetention { channel_id, .. }
             | NodeCommand::SetStepRetention { channel_id, .. }
             | NodeCommand::ChooseIdleEnd { channel_id, .. }
@@ -341,6 +348,15 @@ impl Node {
                     let _ = reply.send(Outcome::Failed(Fault::NotARoomName));
                     return;
                 }
+                if self
+                    .join_name_reservations
+                    .iter()
+                    .chain(self.rename_name_reservations.iter())
+                    .any(|(room, reserved)| *room != channel_id && reserved == &name)
+                {
+                    let _ = reply.send(Outcome::Failed(Fault::RoomNameTaken));
+                    return;
+                }
                 (
                     String::new(),
                     None,
@@ -349,6 +365,20 @@ impl Node {
                     ReplyKind::Rename,
                 )
             }
+            NodeCommand::RemoveRoomMember { member, .. } => (
+                String::new(),
+                None,
+                None,
+                Some(GovernanceWrite::RemoveMember(member)),
+                ReplyKind::MemberGovernance,
+            ),
+            NodeCommand::ReadmitRoomMember { member, .. } => (
+                String::new(),
+                None,
+                None,
+                Some(GovernanceWrite::ReadmitMember(member)),
+                ReplyKind::MemberGovernance,
+            ),
             NodeCommand::SetRetention { ttl, .. } => (
                 String::new(),
                 None,
@@ -503,6 +533,10 @@ impl Node {
             )),
             _ => None,
         };
+        if let Some(GovernanceWrite::Rename(name)) = &governance {
+            self.rename_name_reservations
+                .insert(channel_id, name.clone());
+        }
         #[cfg(feature = "test-knobs")]
         self.hold_text_append_publication_for_proof().await;
         let worker = tokio::spawn(async move {
@@ -801,6 +835,9 @@ impl Node {
         match result {
             Ok((saved, installed, mut withdrawal, publication)) => {
                 let mut outcome = pending.kind.outcome(&saved);
+                if !installed && matches!(pending.kind, ReplyKind::MemberGovernance) {
+                    outcome = Outcome::Failed(Fault::ChannelNotOpen);
+                }
                 if installed {
                     match &saved {
                         Saved::Text(rendered) => {
@@ -852,6 +889,9 @@ impl Node {
                 }
                 drop(publication);
                 self.publish().await;
+                if matches!(pending.kind, ReplyKind::Rename) && (!installed || !outcome.is_done()) {
+                    self.rename_name_reservations.remove(&room);
+                }
                 if installed && !matches!(pending.kind, ReplyKind::Text) && outcome.is_done() {
                     self.queue_room_publication(
                         room,
@@ -860,6 +900,8 @@ impl Node {
                         false,
                         if matches!(pending.kind, ReplyKind::Anchors) {
                             RoomPublicationKind::Anchors
+                        } else if matches!(pending.kind, ReplyKind::MemberGovernance) {
+                            RoomPublicationKind::MemberGovernance
                         } else {
                             RoomPublicationKind::Settings
                         },
@@ -869,6 +911,9 @@ impl Node {
                 }
             }
             Err(fault) => {
+                if matches!(pending.kind, ReplyKind::Rename) {
+                    self.rename_name_reservations.remove(&room);
+                }
                 #[cfg(feature = "mutant-sender")]
                 if matches!(pending.kind, ReplyKind::End)
                     && matches!(fault, Fault::NotCreator)
@@ -983,6 +1028,9 @@ impl Node {
                     Some(Ok((completed, _publication, withdrawal))) => match completed.result {
                         Ok(saved) => match withdrawal {
                             Some(Err(fault)) => Outcome::Failed(fault),
+                            _ if matches!(pending.kind, ReplyKind::MemberGovernance) => {
+                                Outcome::Failed(Fault::Locked)
+                            }
                             _ => pending.kind.outcome(&saved),
                         },
                         Err(error) => Outcome::Failed(fault_of(&error)),

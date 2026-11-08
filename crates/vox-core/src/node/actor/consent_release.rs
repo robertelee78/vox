@@ -15,6 +15,17 @@ pub(super) use rekeys::Target as HeldRekeyTarget;
 type Cursor = Arc<std::sync::Mutex<Owed>>;
 type Reply = Option<oneshot::Sender<Outcome>>;
 
+enum PrepareFailure {
+    Fault(Fault),
+    Refreshing(Error),
+}
+
+impl From<Fault> for PrepareFailure {
+    fn from(fault: Fault) -> Self {
+        Self::Fault(fault)
+    }
+}
+
 struct Owed {
     rooms: VecDeque<Digest32>,
     room: Option<Digest32>,
@@ -46,6 +57,7 @@ enum Stage {
     Vacant,
     Outbound(outbound::Stage),
     Rekeys(Box<rekeys::Target>),
+    SelectionGovernance,
     RekeyGovernance {
         rekey_after: Option<Digest32>,
         history_after: Option<Digest32>,
@@ -149,6 +161,7 @@ impl Node {
         target: Digest32,
         generation: u64,
         history: bool,
+        removal_generation: u64,
         whole_history: bool,
     ) {
         if self.profile.is_none() {
@@ -178,6 +191,7 @@ impl Node {
             Work::Consent(consent_save::Work::Delivered {
                 target,
                 generation,
+                removal_generation: Some(removal_generation),
                 history: whole_history,
             }),
             maintenance_save::Continuation::Consent(continuation),
@@ -335,20 +349,29 @@ impl Node {
                 {
                     Ok(true) => return,
                     Ok(false) => continue,
-                    Err(fault) => {
+                    Err(PrepareFailure::Refreshing(error))
+                        if ChannelState::governance_refreshing(&error) =>
+                    {
+                        self.refresh_consent_selection(room, target, asked, cursor)
+                            .await;
+                        return;
+                    }
+                    Err(PrepareFailure::Refreshing(error)) => {
+                        self.finish_owned_consent_cursor(&cursor, Err(error));
+                        return;
+                    }
+                    Err(PrepareFailure::Fault(Fault::RoomChangePending)) => {
+                        self.refresh_consent_selection(room, target, asked, cursor)
+                            .await;
+                        return;
+                    }
+                    Err(PrepareFailure::Fault(fault)) => {
                         let managed = cursor
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .terminal
                             .is_some();
-                        if managed
-                            && matches!(
-                                fault,
-                                Fault::RoomChangePending
-                                    | Fault::ComputerPolicy
-                                    | Fault::NotTrusted
-                            )
-                        {
+                        if managed && matches!(fault, Fault::ComputerPolicy | Fault::NotTrusted) {
                             self.finish_owned_consent_cursor(
                                 &cursor,
                                 Err(Error::Profile(
@@ -442,6 +465,46 @@ impl Node {
         }
     }
 
+    async fn refresh_consent_selection(
+        &mut self,
+        room: Digest32,
+        target: Digest32,
+        asked: bool,
+        cursor: Cursor,
+    ) {
+        let Some(instance) = self.channels.get(&room).cloned() else {
+            self.finish_owned_consent_cursor(&cursor, Err(Error::Profile("consent room changed")));
+            return;
+        };
+        let lifetime = cursor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lifetime
+            .as_ref()
+            .map(Arc::clone);
+        self.governance_work.wake_room(room);
+        let continuation = Continuation {
+            instance,
+            attachment: self.delivery_epoch,
+            lifetime,
+            target,
+            asked,
+            history: self.trust.history(&target),
+            decision: self.trust_decision(&target),
+            plan: None,
+            cursor: Some(cursor),
+            prekey: None,
+            stage: Stage::SelectionGovernance,
+        };
+        self.begin_pending_maintenance(
+            room,
+            Work::Projection(crate::node::channel::session_projection::ProjectionWork::Governance),
+            maintenance_save::Continuation::Consent(continuation),
+            None,
+        )
+        .await;
+    }
+
     async fn prepare_owned_online_consent(
         &mut self,
         room: Digest32,
@@ -449,16 +512,16 @@ impl Node {
         asked: bool,
         lifetime: Option<Arc<Lifetime>>,
         cursor: Cursor,
-    ) -> std::result::Result<bool, Fault> {
+    ) -> std::result::Result<bool, PrepareFailure> {
         if !self.trust.is_trusted(&target) {
-            return Err(Fault::NotTrusted);
+            return Err(Fault::NotTrusted.into());
         }
         if lifetime.is_none() && !self.computer_authority_current() {
-            return Err(Fault::ComputerPolicy);
+            return Err(Fault::ComputerPolicy.into());
         }
         if self.pending_posts.contains_key(&room) {
             self.redeliver_now = true;
-            return Err(Fault::RoomChangePending);
+            return Err(Fault::RoomChangePending.into());
         }
         let instance = self
             .channels
@@ -469,17 +532,23 @@ impl Node {
             let channel = instance.lock().await;
             let profile = self.profile.as_ref().ok_or(Fault::UnknownChannel)?;
             if !channel.is_author(&target) {
-                return Err(Fault::NotAdmitted);
+                return Err(Fault::NotAdmitted.into());
             }
             if !channel.is_settled() {
-                return Err(Fault::RoomNotSynced);
+                return Err(Fault::RoomNotSynced.into());
             }
             if channel.own_history_behind() {
-                return Err(Fault::OwnHistoryBehind);
+                return Err(Fault::OwnHistoryBehind.into());
             }
             channel
                 .require_governance_ready(profile.store(), self.now_ms())
-                .map_err(|error| fault_of(&error))?;
+                .map_err(PrepareFailure::Refreshing)?;
+            if channel
+                .is_member_removed(profile.store(), &target)
+                .map_err(|error| fault_of(&error))?
+            {
+                return Err(Fault::NotAdmitted.into());
+            }
         }
         let conn = self
             .reach_member(&room, target, asked)
@@ -522,6 +591,7 @@ impl Node {
         } else {
             self.frame_owned_consent(room, Box::new(skdm), continuation, &mut None)
                 .await
+                .map_err(PrepareFailure::from)
         }
     }
 
@@ -546,6 +616,35 @@ impl Node {
         channel
             .require_governance_ready(profile.store(), self.now_ms())
             .map_err(|error| fault_of(&error))?;
+        if channel
+            .is_member_removed(profile.store(), &target)
+            .map_err(|error| fault_of(&error))?
+        {
+            return Err(Fault::NotAdmitted);
+        }
+        if channel
+            .room_removal_rotation_needed(profile.store())
+            .map_err(|error| fault_of(&error))?
+        {
+            return Err(fault_of(&Error::StreamRefused(
+                "room authorization keys are rotating",
+            )));
+        }
+        // A creator readmission is a new forward boundary regardless of the
+        // retained global trust history setting or an old pending SKDM.
+        let once_removed = !channel
+            .validated_member_removals(profile.store(), &target, self.now_ms())
+            .map_err(|error| fault_of(&error))?
+            .is_empty();
+        #[cfg(feature = "test-knobs")]
+        let once_removed = once_removed
+            && std::env::var("VOX_TEST_FX62_MUTANT").as_deref() != Ok("readmission-full-plan");
+        if once_removed {
+            return channel
+                .skdm_for_consent(profile)
+                .map(|key| (key, None, true))
+                .map_err(|error| fault_of(&error));
+        }
         let selected = (|| -> crate::error::Result<_> {
             if history == crate::node::trust::HistoryGrant::Full {
                 let (live, plan) = channel.full_consent_release(profile)?;
@@ -845,6 +944,51 @@ impl Node {
         if matches!(&continuation.stage, Stage::RekeyGovernance { .. }) {
             self.finish_rekey_governance(room, saved, lifetime, continuation, reply)
                 .await;
+            return;
+        }
+        if matches!(&continuation.stage, Stage::SelectionGovernance) {
+            match saved {
+                Saved::Projection(
+                    crate::node::channel::session_projection::ProjectionProgress::Governance(
+                        progress,
+                    ),
+                ) if progress.ready => {
+                    if let Some(cursor) = continuation.cursor {
+                        {
+                            let mut owed = cursor
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            owed.room = Some(room);
+                            owed.targets.push_front(continuation.target);
+                        }
+                        self.advance_owned_owed_consents(cursor).await;
+                    }
+                }
+                Saved::Projection(
+                    crate::node::channel::session_projection::ProjectionProgress::Governance(
+                        progress,
+                    ),
+                ) if progress.pending => {
+                    self.begin_pending_maintenance(
+                        room,
+                        Work::Projection(
+                            crate::node::channel::session_projection::ProjectionWork::Governance,
+                        ),
+                        maintenance_save::Continuation::Consent(continuation),
+                        reply,
+                    )
+                    .await;
+                }
+                _ => {
+                    self.fail_owned_consent(
+                        room,
+                        Error::Profile("consent governance projection stopped before readiness"),
+                        continuation,
+                        reply,
+                    )
+                    .await;
+                }
+            }
             return;
         }
         if let Saved::Consent(consent_save::Effect::Held(held)) = saved {
@@ -1245,6 +1389,7 @@ impl Node {
             Work::Consent(consent_save::Work::Delivered {
                 target: continuation.target,
                 generation,
+                removal_generation: None,
                 history,
             }),
             maintenance_save::Continuation::Consent(continuation),

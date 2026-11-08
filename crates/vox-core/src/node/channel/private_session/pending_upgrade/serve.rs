@@ -11,6 +11,7 @@ pub(super) struct Serving {
     charge: BufferCharge,
     incarnation: Option<Digest32>,
     cursors: BTreeMap<Digest32, Cursor>,
+    demands: BTreeMap<Digest32, PullDemand>,
     binding: Digest32,
 }
 
@@ -29,7 +30,7 @@ impl ChannelState {
             || self.needs_session_upgrade()
             || ask.room != self.channel_id
             || ask.epoch != self.epoch
-            || !self.drive_members().contains(&peer)
+            || !self.private_peer_current(store, &peer)?
         {
             return Err(Error::StreamRefused("private Session room unavailable"));
         }
@@ -45,6 +46,7 @@ impl ChannelState {
             } else {
                 BTreeMap::new()
             },
+            demands: self.private_sessions.demands.clone(),
             binding: self.private_pull_binding(),
         };
         self.prepare_private_component(
@@ -66,20 +68,33 @@ impl PendingUpgrade {
             charge,
             incarnation,
             cursors,
+            demands,
             binding,
         } = serving;
+        governance::check_removal_generation(store, sek, &self.room, self.removal_generation)?;
+        if self.removed.contains(&peer) || self.removed.contains(&self.me) {
+            return Err(Error::StreamRefused("private Session room unavailable"));
+        }
         let incarnation = match incarnation {
             Some(incarnation) => incarnation,
             None => {
                 let mut incarnation = [0; 32];
                 getrandom::fill(&mut incarnation).map_err(|_| Error::Rng)?;
-                self.save_cursor(store, sek, &cursors, Some(incarnation), binding, None)?;
+                self.save_cursor(
+                    store,
+                    sek,
+                    &cursors,
+                    &demands,
+                    (Some(incarnation), binding),
+                    (None, None),
+                )?;
                 self.incarnation = Some(incarnation);
                 incarnation
             }
         };
         let mut page = Page {
             revision: 0,
+            removal_generation: Some(self.removal_generation),
             query: ask.query,
             cursor: Cursor {
                 incarnation,

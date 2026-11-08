@@ -2349,3 +2349,124 @@ fn a_sessions_append_waits_for_the_fold_and_a_read_meanwhile_is_provisional() {
         );
     });
 }
+
+#[test]
+#[ignore = "real daemons and private Session history; run in release"]
+fn readmitted_member_keeps_read_private_history_but_cannot_backfill_unseen_history() {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().expect("APPARATUS: temporary directory");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("APPARATUS: runtime");
+    let (_anchor, spec) = anchor(tmp.path());
+    let alice = member(tmp.path(), "alice", &spec);
+    let mut bob = member(tmp.path(), "bob", &spec);
+    let (ok, _, err) = alice.vox(
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "private-removal",
+        ],
+        Some(&format!("{ROOM_PASS}\n")),
+    );
+    assert!(ok, "APPARATUS: room creation failed: {err}");
+    let room = room_id(&alice, "private-removal");
+    let (ok, link, err) = alice.vox(&["room", "link", &room], None);
+    assert!(ok, "APPARATUS: room link failed: {err}");
+    let (ok, out, err) = bob.vox(
+        &["room", "join", "--passphrase-file", "-", link.trim()],
+        Some(&format!("{ROOM_PASS}\n")),
+    );
+    assert!(ok, "APPARATUS: bob join failed: {out}{err}");
+    alice.trust(&bob, true);
+    bob.trust(&alice, false);
+    assert!(
+        posts_until_read(&alice, &bob, &room, "PRIVATE-REMOVAL-READY"),
+        "APPARATUS: reciprocal room access did not settle"
+    );
+    let id = channel_id(&rt, &alice, &room);
+    let (ok, out, err) = alice.vox_with(
+        &["agent", "hook", "--node", "default", "--room", &room],
+        Some(&format!(
+            r#"{{"session_id":"{SESSION}","hook_event_name":"UserPromptSubmit","cwd":"/tmp","transcript_path":"/tmp/t.jsonl","prompt":"go"}}"#
+        )),
+        &[("CLAUDE_CODE_ENTRYPOINT", "cli")],
+    );
+    assert!(ok, "APPARATUS: Session hook failed: {out}{err}");
+    let append = |seq, text| {
+        let result = rt.block_on(alice.socket(&rt).request(&Request::AppendSession {
+            channel_id: id,
+            session_id: SESSION.to_owned(),
+            body: reply(seq, text),
+        }));
+        assert!(
+            matches!(result, Ok(Frame::Appended { .. })),
+            "PRODUCT: Session append failed: {result:?}"
+        );
+    };
+    append(1, "PRIVATE-ALREADY-READ");
+    let owner_session = alice.vox(&["room", "sessions", &room, "--json"], None);
+    let owner_activity = alice.vox(&["room", "session", &room, SESSION, "--json"], None);
+    eprintln!("[staging] owner Session list={owner_session:?}; activity={owner_activity:?}");
+    assert!(
+        until(Duration::from_secs(120), || opened(&bob, &room).iter().any(|s| s == "PRIVATE-ALREADY-READ")),
+        "APPARATUS: bob did not read the original private row; owner list={owner_session:?}; owner activity={owner_activity:?}; bob list={:?}; bob status={:?}; alice status={:?}; alice daemon={}; bob daemon={}",
+        bob.vox(&["room", "sessions", &room, "--json"], None),
+        bob.vox(&["status", "--json"], None),
+        alice.vox(&["status", "--json"], None),
+        std::fs::read_to_string(tmp.path().join("alice.daemon.err")).unwrap_or_default(),
+        std::fs::read_to_string(tmp.path().join("bob.daemon.err")).unwrap_or_default()
+    );
+    drop(bob._daemon.take());
+    append(2, "PRIVATE-UNSEEN-BEFORE-REMOVAL");
+    let (ok, out, err) = alice.vox(&["room", "remove-member", &room, &bob.fp], None);
+    assert!(ok, "APPARATUS: removal did not apply: {out}{err}");
+    append(3, "PRIVATE-REMOVAL-PERIOD");
+    let (ok, out, err) = alice.vox(&["room", "readmit-member", &room, &bob.fp], None);
+    assert!(ok, "APPARATUS: readmission did not apply: {out}{err}");
+    let log =
+        std::fs::File::create(tmp.path().join("bob-restart.err")).expect("APPARATUS: restart log");
+    let child = vox_cmd(&bob.data)
+        .args(["daemon", "--listen", "127.0.0.1:0", "--anchor", &spec])
+        .arg("--passphrase-file")
+        .arg(&bob.pass)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(log))
+        .spawn()
+        .expect("APPARATUS: restart bob");
+    bob._daemon = Some(Proc(child));
+    assert!(
+        until(Duration::from_secs(90), || bob
+            .vox(&["room", "roster", &room], None)
+            .0),
+        "APPARATUS: bob did not reopen the room"
+    );
+    assert!(
+        posts_until_read(&alice, &bob, &room, "PRIVATE-READMISSION-WITNESS"),
+        "APPARATUS: bob did not catch up after readmission"
+    );
+    append(4, "PRIVATE-FORWARD");
+    assert!(
+        until(Duration::from_secs(120), || opened(&bob, &room).iter().any(|s| s == "PRIVATE-FORWARD")),
+        "PRODUCT [FX62 private forward]: readmitted member could not read fresh private activity: {:?}; alice Session={:?}; alice status={:?}; bob status={:?}; alice daemon={}; bob daemon={}",
+        opened(&bob, &room),
+        alice.vox(&["room", "session", &room, SESSION, "--json"], None),
+        alice.vox(&["status", "--json"], None),
+        bob.vox(&["status", "--json"], None),
+        std::fs::read_to_string(tmp.path().join("alice.daemon.err")).unwrap_or_default(),
+        std::fs::read_to_string(tmp.path().join("bob-restart.err")).unwrap_or_default()
+    );
+    let rows = opened(&bob, &room);
+    assert!(
+        rows.iter().any(|s| s == "PRIVATE-ALREADY-READ")
+            && !rows.iter().any(|s| s == "PRIVATE-UNSEEN-BEFORE-REMOVAL")
+            && !rows.iter().any(|s| s == "PRIVATE-REMOVAL-PERIOD"),
+        "PRODUCT [FX62 private history]: readmission lost previously read activity or served unseen old activity: {rows:?}"
+    );
+    eprintln!("[proof] FX62 private history: retained read row, excluded unseen old rows, delivered forward row");
+}

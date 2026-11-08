@@ -62,6 +62,7 @@
 //! `is_last_resort_grade` — the reconciliation ADR-004 requires between the ring's
 //! persistent record and the per-process [`OtpReuseTracker`]: the tracker is seeded
 //! from the ring's verdict, so a restart cannot silently lose the downgrade.
+use std::future::Future;
 
 use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
@@ -107,7 +108,18 @@ const OP_TAKEN: u64 = 10;
 const OP_NOT_AGREED: u64 = 11;
 const OP_ADMISSION_PROPOSED: u64 = 12;
 const OP_ADMISSION_PREPARED: u64 = 13;
-const ADMISSION_PROPOSAL_DOMAIN: &[u8] = b"vox/join-admission-proposal/v1\0";
+const ADMISSION_PROPOSAL_DOMAIN: &[u8] = b"vox/join-admission-proposal/v2\0";
+
+/// Authenticated responder observation of the joiner's prior public history.
+#[derive(Clone, Debug)]
+pub enum OwnHistory {
+    /// No prior authored-log evidence is held by the responder.
+    None,
+    /// An existing author-signed public head, in canonical wire form.
+    Head(Vec<u8>),
+    /// Prior history exists, evidenced by this bounded author-signed entry header.
+    Unavailable(Vec<u8>),
+}
 
 /// An authenticated proposal of the exact fields admission would witness. Its signature has a
 /// distinct domain and cannot pass `JoinWitness::verify`, so a joiner that never prepares rollback
@@ -124,18 +136,69 @@ pub struct AdmissionProposal {
     pub responder_id: Digest32,
     /// The exact timestamp the final witness will carry.
     pub timestamp_ms: u64,
+    /// Current authenticated governance name, or unavailable.
+    pub room_name: Option<String>,
+    /// Responder's authenticated observation of this author's history.
+    pub own_history: OwnHistory,
     signature: CompositeSignature,
 }
 
 impl AdmissionProposal {
+    fn unsigned_fields(witness: &JoinWitness, name: Option<&str>, history: &OwnHistory) -> Vec<u8> {
+        let mut e = Encoder::new();
+        e.array(8)
+            .uint(2)
+            .bytes(&witness.channel_id)
+            .uint(witness.epoch)
+            .bytes(&witness.joiner_id)
+            .bytes(&witness.witness_id)
+            .uint(witness.timestamp_ms);
+        if let Some(name) = name {
+            e.text(name);
+        } else {
+            e.null();
+        }
+        e.array(2);
+        match history {
+            OwnHistory::None => {
+                e.uint(0).null();
+            }
+            OwnHistory::Head(head) => {
+                e.uint(1).bytes(head);
+            }
+            OwnHistory::Unavailable(header) => {
+                e.uint(2).bytes(header);
+            }
+        }
+        e.finish()
+    }
+
     fn unsigned(&self) -> Vec<u8> {
         let mut e = Encoder::new();
-        e.array(5)
+        e.array(8)
+            .uint(2)
             .bytes(&self.channel_id)
             .uint(self.epoch)
             .bytes(&self.joiner_id)
             .bytes(&self.responder_id)
             .uint(self.timestamp_ms);
+        if let Some(name) = &self.room_name {
+            e.text(name);
+        } else {
+            e.null();
+        }
+        e.array(2);
+        match &self.own_history {
+            OwnHistory::None => {
+                e.uint(0).null();
+            }
+            OwnHistory::Head(head) => {
+                e.uint(1).bytes(head);
+            }
+            OwnHistory::Unavailable(header) => {
+                e.uint(2).bytes(header);
+            }
+        }
         e.finish()
     }
 
@@ -143,21 +206,22 @@ impl AdmissionProposal {
         [ADMISSION_PROPOSAL_DOMAIN, self.unsigned().as_slice()].concat()
     }
 
-    fn from_witness(witness: &JoinWitness, signer: &dyn RootSigner) -> Result<Self> {
-        let mut e = Encoder::new();
-        e.array(5)
-            .bytes(&witness.channel_id)
-            .uint(witness.epoch)
-            .bytes(&witness.joiner_id)
-            .bytes(&witness.witness_id)
-            .uint(witness.timestamp_ms);
-        let input = [ADMISSION_PROPOSAL_DOMAIN, e.finish().as_slice()].concat();
+    fn from_witness(
+        witness: &JoinWitness,
+        signer: &dyn RootSigner,
+        room_name: Option<String>,
+        own_history: OwnHistory,
+    ) -> Result<Self> {
+        let body = Self::unsigned_fields(witness, room_name.as_deref(), &own_history);
+        let input = [ADMISSION_PROPOSAL_DOMAIN, body.as_slice()].concat();
         Ok(Self {
             channel_id: witness.channel_id,
             epoch: witness.epoch,
             joiner_id: witness.joiner_id,
             responder_id: witness.witness_id,
             timestamp_ms: witness.timestamp_ms,
+            room_name,
+            own_history,
             signature: signer.sign(&input)?,
         })
     }
@@ -170,20 +234,42 @@ impl AdmissionProposal {
         e.finish()
     }
 
-    fn from_body(bytes: &[u8]) -> Result<Self> {
+    pub(crate) fn from_body(bytes: &[u8]) -> Result<Self> {
         let mut d = Decoder::new(bytes);
         if d.array()? != 2 {
             return Err(Error::MalformedJoin("admission proposal arity"));
         }
         let mut fields = Decoder::new(d.bytes()?);
-        if fields.array()? != 5 {
-            return Err(Error::MalformedJoin("admission proposal fields"));
+        if fields.array()? != 8 || fields.uint()? != 2 {
+            return Err(Error::MalformedJoin(
+                "admission proposal requires software update",
+            ));
         }
         let channel_id = *take_fixed::<32>(&mut fields, "proposal room")?;
         let epoch = fields.uint()?;
         let joiner_id = *take_fixed::<32>(&mut fields, "proposal joiner")?;
         let responder_id = *take_fixed::<32>(&mut fields, "proposal responder")?;
         let timestamp_ms = fields.uint()?;
+        let room_name = if fields.null() {
+            None
+        } else {
+            Some(fields.text()?.to_owned())
+        };
+        if fields.array()? != 2 {
+            return Err(Error::MalformedJoin("own history arity"));
+        }
+        let own_history = match fields.uint()? {
+            0 if fields.null() => OwnHistory::None,
+            1 => OwnHistory::Head(fields.bytes()?.to_vec()),
+            2 => {
+                let header = fields.bytes()?;
+                if header.len() > crate::log::history::MAX_HEADER_BYTES {
+                    return Err(Error::SizeLimitExceeded("own history extent header"));
+                }
+                OwnHistory::Unavailable(header.to_vec())
+            }
+            _ => return Err(Error::MalformedJoin("own history classification")),
+        };
         fields.finish()?;
         let signature = CompositeSignature::from_bytes(&*take_fixed::<COMPOSITE_SIG_LEN>(
             &mut d,
@@ -196,19 +282,21 @@ impl AdmissionProposal {
             joiner_id,
             responder_id,
             timestamp_ms,
+            room_name,
+            own_history,
             signature,
         })
     }
 
-    fn verify(
+    pub(crate) fn verify(
         &self,
         responder: &CompositePublicKey,
         ctx: &JoinContext,
-        joiner: Digest32,
+        joiner: &CompositePublicKey,
     ) -> Result<()> {
         if self.channel_id != ctx.channel_id
             || self.epoch != ctx.epoch
-            || self.joiner_id != joiner
+            || self.joiner_id != joiner.fingerprint()
             || self.responder_id != responder.fingerprint()
             || self.joiner_id == self.responder_id
         {
@@ -216,10 +304,52 @@ impl AdmissionProposal {
                 "admission proposal identity or context",
             ));
         }
-        responder.verify(&self.signing_input(), &self.signature)
+        responder.verify(&self.signing_input(), &self.signature)?;
+        let name = self.room_name.as_deref().ok_or(Error::JoinRefused(
+            "an administrator must name this room before joining",
+        ))?;
+        if crate::governance::name::room_name(name).ok().as_deref() != Some(name) {
+            return Err(Error::MalformedJoin("invalid proposed room name"));
+        }
+        if let OwnHistory::Head(wire) = &self.own_history {
+            use crate::log::history::{HistoryStep, SignedHead, WorkBudget};
+            let head = SignedHead::from_wire(wire)?;
+            if head.binding.room != self.channel_id
+                || head.binding.author != self.joiner_id
+                || head.binding.scope != crate::log::history::LogScope::Public
+            {
+                return Err(Error::MalformedJoin("own history head binding"));
+            }
+            if !matches!(
+                head.verify(joiner, &mut WorkBudget::default())?,
+                HistoryStep::Complete(_)
+            ) {
+                return Err(Error::MalformedJoin("own history verification unavailable"));
+            }
+        }
+        if let OwnHistory::Unavailable(wire) = &self.own_history {
+            if wire.len() > crate::log::history::MAX_HEADER_BYTES {
+                return Err(Error::SizeLimitExceeded("own history extent header"));
+            }
+            let entry = crate::log::entry::Entry::from_wire(wire)?;
+            if entry.payload.is_some()
+                || entry.skeleton.channel_id != self.channel_id
+                || entry.skeleton.author_id != self.joiner_id
+                || entry.skeleton.seq == 0
+                || entry
+                    .skeleton
+                    .v2
+                    .as_ref()
+                    .is_none_or(|v| v.scope != crate::log::history::LogScope::Public)
+            {
+                return Err(Error::MalformedJoin("own history extent binding"));
+            }
+            entry.verify(joiner)?;
+        }
+        Ok(())
     }
 
-    fn covers(&self, witness: &JoinWitness) -> bool {
+    pub(crate) fn covers(&self, witness: &JoinWitness) -> bool {
         self.channel_id == witness.channel_id
             && self.epoch == witness.epoch
             && self.joiner_id == witness.joiner_id
@@ -360,10 +490,6 @@ pub enum JoinFrame {
     Accepted {
         /// `JoinWitness::body_bytes` — the witness, signed by the responder.
         witness: Vec<u8>,
-        /// The room's shared name as the responder holds it (ADR-028 R-1), empty when it holds
-        /// none. Said only after the passphrase is proved, so a link alone does not tell it. The
-        /// joiner uses it until the room's log, which is what decides the name, reaches it.
-        name: String,
     },
     /// The join was refused.
     Rejected(JoinReject),
@@ -465,8 +591,8 @@ impl JoinFrame {
             Self::AdmissionPrepared { proposal_hash } => {
                 e.array(2).uint(OP_ADMISSION_PREPARED).bytes(proposal_hash);
             }
-            Self::Accepted { witness, name } => {
-                e.array(3).uint(OP_ACCEPTED).bytes(witness).text(name);
+            Self::Accepted { witness } => {
+                e.array(2).uint(OP_ACCEPTED).bytes(witness);
             }
             Self::Open { sealed } => {
                 e.array(2).uint(OP_OPEN).bytes(sealed);
@@ -544,9 +670,8 @@ impl JoinFrame {
             (OP_ADMISSION_PREPARED, 2) => Self::AdmissionPrepared {
                 proposal_hash: *take_fixed::<32>(&mut d, "prepared proposal hash")?,
             },
-            (OP_ACCEPTED, 3) => Self::Accepted {
+            (OP_ACCEPTED, 2) => Self::Accepted {
                 witness: d.bytes()?.to_vec(),
-                name: d.text()?.to_owned(),
             },
             (OP_OPEN, 2) => Self::Open {
                 sealed: d.bytes()?.to_vec(),
@@ -726,6 +851,8 @@ pub struct JoinOutcome {
     /// On the **joiner**, the room's shared name as the responder said it (ADR-028 R-1), if it is
     /// a room name at all; `None` on the responder, and when the responder holds none.
     pub room_name: Option<String>,
+    /// Verified authenticated prior-history observation on the joiner.
+    pub own_history: Option<OwnHistory>,
     /// How long **this side** spent solving the proof of work: the joiner's own CPU, on its own
     /// machine, and random in length by design (ADR-005). Zero on the responder. Said apart from
     /// the rest of the exchange, so a slow join shows whether it waited on the responder or on
@@ -750,17 +877,20 @@ impl std::fmt::Debug for JoinOutcome {
 /// `prepare_before_admission` MUST durably retain an exact Member withdrawal covering the
 /// verified proposal's epoch and timestamp before returning `Ok`. It is called before the
 /// responder can commit or publish admission, so a crash or later local failure can retract it.
-pub async fn run_initiator<F, Fut>(
+pub async fn run_initiator<F, Fut, A, AFut>(
     conn: &VoxConnection,
     ctx: JoinContext,
     passphrase: &[u8],
     root: &(dyn RootSigner + Send + Sync),
     ik: &X25519IdentityKey,
     prepare_before_admission: F,
+    retain_accepted: A,
 ) -> Result<JoinOutcome>
 where
     F: FnOnce(AdmissionProposal) -> Fut,
-    Fut: std::future::Future<Output = Result<()>>,
+    Fut: Future<Output = Result<()>>,
+    A: FnOnce(Vec<u8>, Vec<u8>, CompositePublicKey) -> AFut,
+    AFut: Future<Output = Result<()>>,
 {
     let streams = open_typed(conn, StreamKind::Join).await?;
     initiator_exchange(
@@ -772,6 +902,7 @@ where
         ik,
         JoinPurpose::Admission,
         prepare_before_admission,
+        retain_accepted,
     )
     .await?
     .ok_or(Error::MalformedJoin("join stopped before admission"))
@@ -807,6 +938,7 @@ pub async fn run_initiator_validation(
         ik,
         JoinPurpose::PassphraseValidation,
         |_| std::future::ready(Err(Error::MalformedJoin("validation proposed admission"))),
+        |_, _, _| std::future::ready(Err(Error::MalformedJoin("validation accepted admission"))),
     )
     .await?
     {
@@ -822,7 +954,7 @@ enum JoinPurpose {
 }
 
 #[allow(clippy::too_many_arguments)] // authentication inputs, purpose and durable preparation
-async fn initiator_exchange<F, Fut>(
+async fn initiator_exchange<F, Fut, A, AFut>(
     conn: &VoxConnection,
     streams: (SendStream, RecvStream),
     ctx: JoinContext,
@@ -831,10 +963,13 @@ async fn initiator_exchange<F, Fut>(
     ik: &X25519IdentityKey,
     purpose: JoinPurpose,
     prepare_before_admission: F,
+    retain_accepted: A,
 ) -> Result<Option<JoinOutcome>>
 where
     F: FnOnce(AdmissionProposal) -> Fut,
-    Fut: std::future::Future<Output = Result<()>>,
+    Fut: Future<Output = Result<()>>,
+    A: FnOnce(Vec<u8>, Vec<u8>, CompositePublicKey) -> AFut,
+    AFut: Future<Output = Result<()>>,
 {
     let responder_fp = conn.peer_id();
     let (mut send, mut recv) = streams;
@@ -1049,7 +1184,7 @@ where
         _ => return Err(Error::MalformedJoin("expected admission proposal")),
     };
     let proposal = AdmissionProposal::from_body(&proposed)?;
-    proposal.verify(&responder_pub, &ctx, root.fingerprint())?;
+    proposal.verify(&responder_pub, &ctx, &root.public_key())?;
     prepare_before_admission(proposal.clone()).await?;
     send_frame(
         &mut send,
@@ -1060,8 +1195,8 @@ where
     .await?;
 
     // 9. ACCEPTED confirms admission committed, with a valid final witness for the prepared fields.
-    let (witness, room_name) = match recv_frame(&mut recv).await? {
-        JoinFrame::Accepted { witness, name } => {
+    let witness = match recv_frame(&mut recv).await? {
+        JoinFrame::Accepted { witness } => {
             let witness = JoinWitness::from_body(&witness)?;
             witness.verify(
                 &responder_pub,
@@ -1074,11 +1209,7 @@ where
                     "accepted witness differs from prepared proposal",
                 ));
             }
-            // Only a name that is one: anything else is not shown, and the log decides anyway.
-            let name = crate::governance::name::room_name(&name)
-                .ok()
-                .filter(|n| *n == name);
-            (witness, name)
+            witness
         }
         JoinFrame::Rejected(r) => return Err(rejected(r)),
         JoinFrame::Full { members } => return Err(Error::RoomFull { members }),
@@ -1088,6 +1219,7 @@ where
         }
         _ => return Err(Error::MalformedJoin("expected accepted")),
     };
+    retain_accepted(proposed, witness.body_bytes(), responder_pub).await?;
     // 10. OPEN — one ratchet message, empty plaintext, so the responder can send at all.
     //    On this stream rather than a later one, so it is processed before the join
     //    returns (see `JoinFrame::Open`).
@@ -1100,7 +1232,8 @@ where
         peer,
         witness,
         last_resort_grade: false,
-        room_name,
+        room_name: proposal.room_name,
+        own_history: Some(proposal.own_history),
         solved_in,
     }))
 }
@@ -1192,7 +1325,7 @@ pub async fn refuse_join_as(mut send: SendStream, reason: JoinReject) {
 /// here, on the slot's task, which is what keeps the actor free — the property the slot was
 /// introduced for.
 #[allow(clippy::too_many_arguments)] // each argument is a distinct required input
-pub async fn run_responder<F, Fut>(
+pub async fn run_responder<F, Fut, P, PFut>(
     mut send: SendStream,
     mut recv: RecvStream,
     peer_fp: Digest32,
@@ -1200,6 +1333,7 @@ pub async fn run_responder<F, Fut>(
     store: &Store,
     ring: &tokio::sync::Mutex<PrekeyRing>,
     ended: Option<tokio::sync::oneshot::Receiver<()>>,
+    proposal_inputs: P,
     admit_before_accepting: F,
 ) -> Result<JoinOutcome>
 where
@@ -1208,6 +1342,8 @@ where
         crate::nat::record::JoinWitness,
     ) -> Fut,
     Fut: std::future::Future<Output = Result<Option<String>>>,
+    P: FnOnce(CompositePublicKey) -> PFut,
+    PFut: Future<Output = Result<(Option<String>, OwnHistory)>>,
 {
     let exchange = async {
         responder_exchange(
@@ -1239,7 +1375,10 @@ where
             // publishes admission. In particular, a later seal failure/crash cannot leave a
             // witness newer than its durable withdrawal. A missing/mismatched acknowledgement
             // ends the exchange before the admission callback is invoked.
-            let proposed = AdmissionProposal::from_witness(&outcome.witness, cfg.root)?.to_body();
+            let (name, own_history) = proposal_inputs(outcome.peer.identity.clone()).await?;
+            let proposed =
+                AdmissionProposal::from_witness(&outcome.witness, cfg.root, name, own_history)?
+                    .to_body();
             send_frame(
                 &mut send,
                 &JoinFrame::AdmissionProposed {
@@ -1256,13 +1395,10 @@ where
             // is in only if it was: an admission that failed was dropped here, so a joiner the
             // room could not take (it was full) heard `Accepted`, exited 0, and was a member of
             // nothing.
-            let name = match admit_before_accepting(
-                outcome.peer.identity.clone(),
-                outcome.witness.clone(),
-            )
-            .await
+            match admit_before_accepting(outcome.peer.identity.clone(), outcome.witness.clone())
+                .await
             {
-                Ok(name) => name,
+                Ok(_) => {}
                 Err(e) => {
                     let refusal = match e {
                         Error::RoomFull { members } => JoinFrame::Full { members },
@@ -1279,7 +1415,7 @@ where
                     let _ = send.finish();
                     return Err(e);
                 }
-            };
+            }
             // The witness `responder_exchange` minted beside the verification that
             // justifies it. The joiner keeps it: it is what makes that key admissible
             // to anyone else (M17.6).
@@ -1287,7 +1423,6 @@ where
                 &mut send,
                 &JoinFrame::Accepted {
                     witness: outcome.witness.body_bytes(),
-                    name: name.unwrap_or_default(),
                 },
             )
             .await?;
@@ -1559,6 +1694,7 @@ async fn responder_after_work(
         witness,
         last_resort_grade,
         room_name: None,
+        own_history: None,
         solved_in: std::time::Duration::ZERO,
     }))
 }

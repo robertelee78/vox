@@ -830,6 +830,12 @@ fn say_retention_with_prefix(channel_id: &Digest32, node: u64, room: u64, prefix
 /// host that did not answer is the host, an anchor is named only when one was tried, and a board
 /// that answered and then closed is not called unreachable.
 pub(crate) fn join_advice_after(fault: Option<Fault>, said: &str) -> &'static str {
+    if said.contains("admission was accepted and retained") {
+        return "the room accepted this node, but local completion is pending\n       retry the same join with the room passphrase to resume the retained admission";
+    }
+    if said.contains("remote admission may have occurred") {
+        return "remote admission may have occurred, but its acceptance could not be verified and saved\n       this node queued its own withdrawal; retry with a fresh authenticated join";
+    }
     let reached = said.contains(": exchange: ") || said.contains(": exchange (incl. solve) ");
     match fault {
         Some(Fault::Unreachable)

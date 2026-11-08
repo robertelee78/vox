@@ -636,6 +636,427 @@ impl<'a> View<'a> {
         self.facts.revision()
     }
 
+    pub(in crate::node::channel) fn authority_generation(&self) -> u64 {
+        self.facts.authority_generation()
+    }
+
+    /// Issuing a removal never falls back past a certificate carrying an expiry.
+    pub(super) fn require_member_removal_certificate(&self, target: &Digest32) -> Result<()> {
+        if target == &self.root {
+            return Ok(());
+        }
+        let mut before = hash_key(target);
+        before[32..].fill(u8::MAX);
+        let row = self
+            .facts
+            .last(Table::CreatorCerts, Some(before))?
+            .filter(|(key, _)| key[..32] == target[..]);
+        let Some((_, log)) = row else {
+            return Err(Error::Profile("room policy authority required"));
+        };
+        let entry = self.facts.entry(log)?;
+        let GovBody::AdminCert(cert) = GovEntry::body_bound_to(&entry)? else {
+            return Err(invalid("member removal certificate kind"));
+        };
+        if cert.body.issuer_id != self.root
+            || cert.body.delegate_id() != *target
+            || entry.skeleton.author_id != self.root
+        {
+            return Err(invalid("member removal certificate binding"));
+        }
+        if cert.body.expiry_ms != 0 {
+            return Err(Error::Profile(
+                "this admin delegation has an expiry and cannot remove members; ask the room creator",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Whether the current checked fold accepted this exact member fact.
+    pub(in crate::node::channel) fn member_governance_applied(
+        &self,
+        hash: &Digest32,
+    ) -> Result<bool> {
+        Ok(self.facts.get(Table::MemberDecisions, &hash_key(hash))?
+            == Some(self.facts.authority_generation()))
+    }
+
+    /// Validated removal log hashes, in bytewise order.
+    pub(in crate::node::channel) fn validated_member_removals(
+        &self,
+        target: &Digest32,
+    ) -> Result<Vec<Digest32>> {
+        let mut next = self
+            .facts
+            .at_or_after(Table::MemberRemovals, pair(target, &[0; 32]))?;
+        let mut hashes = Vec::new();
+        while let Some((key, log)) = next {
+            if key[..32] != target[..] {
+                break;
+            }
+            next = self.facts.first(Table::MemberRemovals, Some(key))?;
+            let hash: Digest32 = key[32..]
+                .try_into()
+                .map_err(|_| invalid("member removal hash"))?;
+            if self.member_governance_applied(&hash)? {
+                let entry = self.facts.entry(log)?;
+                if entry.entry_hash() != hash {
+                    return Err(invalid("member removal locator"));
+                }
+                hashes.push(hash);
+            }
+        }
+        Ok(hashes)
+    }
+
+    /// Read the observation boundary belonging to an exact validated removal.
+    #[allow(clippy::type_complexity)]
+    pub(in crate::node::channel) fn sender_cut(
+        &self,
+        hash: &Digest32,
+        target: &Digest32,
+        sender: &Digest32,
+    ) -> Result<Option<(u64, Option<(u64, u64)>)>> {
+        if !self.member_governance_applied(hash)? {
+            return Ok(None);
+        }
+        let Some(id) = self.facts.get(Table::SenderRemovalCuts, &hash_key(hash))? else {
+            return Ok(None);
+        };
+        let bytes = self.facts.record(id)?;
+        let mut d = Decoder::new(&bytes);
+        let arity = d.array()?;
+        let version = d.uint()?;
+        if !matches!((version, arity), (1, 5) | (2, 6))
+            || d.bytes()? != target
+            || d.bytes()? != sender
+        {
+            return Err(invalid("sender removal cut binding"));
+        }
+        let chain = d.uint()?;
+        let _iteration = d.uint()?;
+        let entitlement = if version == 2 {
+            match d.array()? {
+                0 => None,
+                2 => Some((d.uint()?, d.uint()?)),
+                _ => return Err(invalid("sender removal entitlement")),
+            }
+        } else {
+            None
+        };
+        d.finish()?;
+        Ok(Some((chain, entitlement)))
+    }
+
+    pub(in crate::node::channel) fn is_member_removed(&self, target: &Digest32) -> Result<bool> {
+        Ok(self.facts.get(Table::CurrentRemoved, &hash_key(target))?
+            == Some(self.facts.authority_generation()))
+    }
+    /// Page one authority-validated source for the named incarnation. The
+    /// caller keeps its cursor and never turns an unvalidated fact into a gate.
+    pub(in crate::node::channel) fn member_fact_after(
+        &self,
+        target: &Digest32,
+        readmission: bool,
+        after: Option<Digest32>,
+    ) -> Result<Option<(Digest32, Option<crate::log::entry::Entry>)>> {
+        let table = if readmission {
+            Table::MemberReadmissions
+        } else {
+            Table::MemberRemovals
+        };
+        let mut key = hash_key(target);
+        let row = if let Some(after) = after {
+            key[32..].copy_from_slice(&after);
+            self.facts.first(table, Some(key))?
+        } else {
+            self.facts.at_or_after(table, key)?
+        };
+        let Some((key, log)) = row.filter(|(key, _)| key[..32] == target[..]) else {
+            return Ok(None);
+        };
+        let hash: Digest32 = key[32..]
+            .try_into()
+            .map_err(|_| invalid("member fact hash"))?;
+        let entry = if self.facts.get(Table::MemberDecisions, &hash_key(&hash))?
+            == Some(self.facts.authority_generation())
+        {
+            Some(self.facts.entry(log)?)
+        } else {
+            None
+        };
+        Ok(Some((hash, entry)))
+    }
+
+    pub(in crate::node::channel) fn causal_contains(
+        &self,
+        scope: &Digest32,
+        ancestor: &crate::log::entry::Entry,
+    ) -> Result<Option<bool>> {
+        self.facts.causal_contains(
+            scope,
+            &crate::log::history::EntryReference {
+                author: ancestor.skeleton.author_id,
+                seq: ancestor.skeleton.seq,
+                hash: ancestor.entry_hash(),
+            },
+        )
+    }
+    pub(in crate::node::channel) fn source(
+        &self,
+        hash: &Digest32,
+    ) -> Result<Option<crate::log::entry::Entry>> {
+        if self.facts.get(Table::Complete, &hash_key(hash))?.is_none()
+            || self
+                .facts
+                .get(Table::Incomplete, &hash_key(hash))?
+                .is_some()
+        {
+            return Ok(None);
+        }
+        if let Some(log) = self.facts.get(Table::SourceHashes, &hash_key(hash))? {
+            return self.facts.entry(log).map(Some);
+        }
+        let Some(id) = self.facts.get(Table::ForkExclusions, &hash_key(hash))? else {
+            return Ok(None);
+        };
+        self.facts.entry(id | super::facts::FORK_LOCATOR).map(Some)
+    }
+
+    /// One exact indexed decision; an unprojected or stale entry is retryable.
+    pub(in crate::node::channel) fn content_eligibility(
+        &self,
+        entry: &crate::log::entry::Entry,
+    ) -> Result<super::channel::ContentEligibility> {
+        use super::channel::ContentEligibility::{Eligible, Ineligible, Refreshing};
+        if entry.skeleton.channel_id != *self.room {
+            return Err(invalid("content eligibility room"));
+        }
+        let hash = hash_key(&entry.entry_hash());
+        if self.facts.get(Table::SourceHashes, &hash)?.is_none()
+            || self.facts.get(Table::Complete, &hash)?.is_none()
+            || self.facts.get(Table::Pending, &hash)?.is_some()
+            || self.facts.get(Table::Incomplete, &hash)?.is_some()
+            || self.facts.get(Table::EligibilityPending, &hash)?.is_some()
+        {
+            return Ok(Refreshing);
+        }
+        let Some(record) = self.facts.get(Table::EligibilityDecisions, &hash)? else {
+            return Ok(Refreshing);
+        };
+        let bytes = self.facts.record(record)?;
+        let mut d = Decoder::new(&bytes);
+        if d.array()? != 3 || d.uint()? != 1 {
+            return Err(invalid("eligibility decision format"));
+        }
+        let generation = d.uint()?;
+        let eligible = match d.uint()? {
+            0 => false,
+            1 => true,
+            _ => return Err(invalid("eligibility decision boolean")),
+        };
+        d.finish()?;
+        if generation != self.facts.authority_generation() {
+            return Ok(Refreshing);
+        }
+        Ok(if eligible { Eligible } else { Ineligible })
+    }
+    /// A floor's recipient has its own causal removal/readmission history. The
+    /// enclosing signed entry, not the folded maximum, binds this decision.
+    pub(in crate::node::channel) fn floor_recipient_eligibility(
+        &self,
+        entry: &crate::log::entry::Entry,
+    ) -> Result<super::channel::ContentEligibility> {
+        use super::channel::ContentEligibility::{Eligible, Ineligible, Refreshing};
+        match self.content_eligibility(entry)? {
+            Eligible => {}
+            other => return Ok(other),
+        }
+        let Some(floor) = entry
+            .payload
+            .as_deref()
+            .and_then(super::super::session_floor::Floor::read)
+            .filter(|floor| {
+                floor.room == *self.room
+                    && floor.author == entry.skeleton.author_id
+                    && floor.epoch == entry.skeleton.epoch
+            })
+        else {
+            return Err(invalid("Session floor source binding"));
+        };
+        let _recipient = floor.recipient;
+        let Some(record) = self.facts.get(
+            Table::FloorRecipientDecisions,
+            &hash_key(&entry.entry_hash()),
+        )?
+        else {
+            return Ok(Refreshing);
+        };
+        let bytes = self.facts.record(record)?;
+        let mut d = Decoder::new(&bytes);
+        if d.array()? != 3 || d.uint()? != 1 {
+            return Err(invalid("floor recipient decision format"));
+        }
+        let generation = d.uint()?;
+        let eligible = match d.uint()? {
+            0 => false,
+            1 => true,
+            _ => return Err(invalid("floor recipient decision boolean")),
+        };
+        d.finish()?;
+        if generation != self.facts.authority_generation() {
+            return Ok(Refreshing);
+        }
+        Ok(if eligible { Eligible } else { Ineligible })
+    }
+
+    /// The once-removed recipient's projected history-body cut (#1171). A target with no
+    /// authenticated removal row needs no room-wide readiness: its ordinary history stays
+    /// whole. Once any removal row exists, only a current-generation projected row decides;
+    /// a missing or stale row is Refreshing, never evidence that the target was not removed.
+    pub(in crate::node::channel) fn recipient_cut(
+        &self,
+        target: &Digest32,
+        now: u64,
+    ) -> Result<RecipientCut> {
+        let removal_row = self
+            .facts
+            .at_or_after(Table::MemberRemovals, hash_key(target))?
+            .is_some_and(|(key, _)| key[..32] == target[..]);
+        if !removal_row {
+            return Ok(RecipientCut::Unrestricted);
+        }
+        if !self.facts.ready(now)? {
+            return Ok(RecipientCut::Refreshing);
+        }
+        let Some(record) = self.facts.get(Table::RecipientCuts, &hash_key(target))? else {
+            return Ok(RecipientCut::Refreshing);
+        };
+        let (generation, state) = read_recipient_cut(&self.facts.record(record)?)?;
+        if generation != self.facts.authority_generation() {
+            return Ok(RecipientCut::Refreshing);
+        }
+        Ok(match state {
+            RecipientCutState::NotRemoved => RecipientCut::Unrestricted,
+            RecipientCutState::Removed => RecipientCut::Removed,
+            RecipientCutState::After(hash) => {
+                let Some(log) = self
+                    .facts
+                    .get(Table::MemberReadmissions, &pair(target, &hash))?
+                else {
+                    return Ok(RecipientCut::Refreshing);
+                };
+                if !self.member_governance_applied(&hash)? {
+                    return Ok(RecipientCut::Refreshing);
+                }
+                let entry = self.facts.entry(log)?;
+                if entry.entry_hash() != hash {
+                    return Err(invalid("recipient cut locator"));
+                }
+                RecipientCut::After(crate::log::history::EntryReference {
+                    author: entry.skeleton.author_id,
+                    seq: entry.skeleton.seq,
+                    hash,
+                })
+            }
+        })
+    }
+
+    /// Whether `recipient` may newly receive or render this body (#1171). Its own entries,
+    /// governance, controls and Session floors are unrestricted; ordinary content and key
+    /// packages need the exact cut readmission in their signed causal past. An entry whose
+    /// causal facts are not yet complete here is Refreshing, never permission.
+    pub(in crate::node::channel) fn body_eligibility_after(
+        &self,
+        cut: &RecipientCut,
+        recipient: &Digest32,
+        entry: &Entry,
+    ) -> Result<super::channel::ContentEligibility> {
+        use super::channel::ContentEligibility::{Eligible, Ineligible, Refreshing};
+        if !body_restricted(entry, recipient) {
+            return Ok(Eligible);
+        }
+        Ok(match cut {
+            RecipientCut::Unrestricted => Eligible,
+            RecipientCut::Removed => Ineligible,
+            RecipientCut::Refreshing => Refreshing,
+            RecipientCut::After(readmission) => match self.contains_cut(entry, readmission)? {
+                Some(true) => Eligible,
+                Some(false) => Ineligible,
+                None => Refreshing,
+            },
+        })
+    }
+
+    /// Strict causal containment of the cut readmission. A body still unindexed here (a fresh
+    /// arrival) is decided only by its own author chain while that chain has no known fork, or
+    /// positively by a signed parent that already contains the cut; otherwise it waits.
+    fn contains_cut(
+        &self,
+        entry: &Entry,
+        cut: &crate::log::history::EntryReference,
+    ) -> Result<Option<bool>> {
+        if let Some(known) = self.facts.causal_contains(&entry.entry_hash(), cut)? {
+            return Ok(Some(known));
+        }
+        let unforked = self
+            .facts
+            .get(Table::ForkBoundary, &hash_key(&cut.author))?
+            .is_none();
+        if unforked && entry.skeleton.author_id == cut.author {
+            return Ok(Some(entry.skeleton.seq > cut.seq));
+        }
+        let Some(v2) = entry.skeleton.v2.as_ref() else {
+            return Ok(None);
+        };
+        for parent in &v2.seen {
+            if parent.hash == cut.hash
+                || (unforked && parent.author == cut.author && parent.seq > cut.seq)
+                || self.facts.causal_contains(&parent.hash, cut)? == Some(true)
+            {
+                return Ok(Some(true));
+            }
+        }
+        Ok(None)
+    }
+
+    pub(in crate::node::channel) fn content_eligible(
+        &self,
+        entry: &crate::log::entry::Entry,
+    ) -> Result<bool> {
+        use super::channel::ContentEligibility::{Eligible, Ineligible, Refreshing};
+        match self.content_eligibility(entry)? {
+            Eligible => Ok(true),
+            Ineligible => Ok(false),
+            Refreshing => Err(Error::Profile(REFRESHING)),
+        }
+    }
+
+    /// Inspect at most one page of current-target slots.
+    pub(in crate::node::channel) fn removed_page(
+        &self,
+        after: Option<Digest32>,
+    ) -> Result<(Vec<Digest32>, Option<Digest32>)> {
+        let mut cursor = after.map(|target| hash_key(&target));
+        let mut last = None;
+        let mut rows = Vec::new();
+        for _ in 0..PAGE_ROWS {
+            let Some((key, generation)) = self.facts.first(Table::CurrentRemoved, cursor)? else {
+                return Ok((rows, None));
+            };
+            if key[32..].iter().any(|byte| *byte != 0) {
+                return Err(invalid("member removal target key"));
+            }
+            let target: Digest32 = key[..32].try_into().map_err(|_| invalid("member target"))?;
+            last = Some(target);
+            cursor = Some(key);
+            if generation == self.facts.authority_generation() {
+                rows.push(target);
+            }
+        }
+        Ok((rows, last))
+    }
+
     pub(in crate::node::channel) fn open(
         store: &Store,
         sek: &'a Sek,
@@ -648,6 +1069,55 @@ impl<'a> View<'a> {
             return Err(Error::Profile(REFRESHING));
         }
         Ok(Self { facts, root, room })
+    }
+
+    pub(in crate::node::channel) fn pinned(
+        snapshot: &'a crate::node::store::Snapshot,
+        sek: &'a Sek,
+        room: &'a Digest32,
+        root: Digest32,
+        now: u64,
+    ) -> Result<Self> {
+        let facts = Read::from_snapshot(snapshot, sek, room)?;
+        if !facts.ready(now)? {
+            return Err(Error::Profile(REFRESHING));
+        }
+        Ok(Self { facts, root, room })
+    }
+
+    pub(in crate::node::channel) fn in_batch(
+        batch: &'a crate::node::store::Batch<'a>,
+        sek: &'a Sek,
+        room: &'a Digest32,
+        root: Digest32,
+        now: u64,
+    ) -> Result<Self> {
+        let facts = Read::from_batch(batch, sek, room)?;
+        if !facts.ready(now)? {
+            return Err(Error::Profile(REFRESHING));
+        }
+        Ok(Self { facts, root, room })
+    }
+
+    /// A recipient-body reader (#1171). It applies no room-wide readiness gate here:
+    /// `recipient_cut` requires current facts only for a target with a removal row. A room
+    /// with no derived index yet has indexed no removal and yields `None`.
+    pub(in crate::node::channel) fn recipient(
+        store: &Store,
+        sek: &'a Sek,
+        room: &'a Digest32,
+        root: Digest32,
+    ) -> Result<Option<Self>> {
+        Ok(Read::open_existing(store, sek, room)?.map(|facts| Self { facts, root, room }))
+    }
+
+    pub(in crate::node::channel) fn recipient_in(
+        batch: &'a crate::node::store::Batch<'a>,
+        sek: &'a Sek,
+        room: &'a Digest32,
+        root: Digest32,
+    ) -> Result<Option<Self>> {
+        Ok(Read::from_batch_existing(batch, sek, room)?.map(|facts| Self { facts, root, room }))
     }
 
     /// Single-writer consent/presence/share facts do not depend on the admin
@@ -1036,6 +1506,250 @@ impl<'a> View<'a> {
             rows,
             next,
             revision: self.facts.revision(),
+        })
+    }
+}
+
+/// A recipient's history-body cut under the current checked fold (#1171).
+pub(in crate::node::channel) enum RecipientCut {
+    /// No authenticated removal of this target: ordinary history stays whole.
+    Unrestricted,
+    /// A validated removal has no covering creator readmission.
+    Removed,
+    /// The exact signed identity of the creator readmission every newly received body must
+    /// causally contain.
+    After(crate::log::history::EntryReference),
+    /// The projection or its fold is not current here.
+    Refreshing,
+}
+
+/// The one room-wide row in `RecipientCuts`: its nonzero tail can never equal a target key.
+pub(super) const ROOM_CUT_KEY: [u8; 64] = {
+    let mut key = [0; 64];
+    key[63] = 1;
+    key
+};
+
+/// One target's projected cut, stamped with the fold generation that wrote it.
+#[derive(PartialEq, Eq)]
+pub(super) enum RecipientCutState {
+    NotRemoved,
+    Removed,
+    After(Digest32),
+}
+
+pub(super) fn write_recipient_cut(generation: u64, state: &RecipientCutState) -> Vec<u8> {
+    let mut e = crate::cbor::Encoder::new();
+    e.array(4).uint(1).uint(generation);
+    match state {
+        RecipientCutState::NotRemoved => {
+            e.uint(0).array(0);
+        }
+        RecipientCutState::Removed => {
+            e.uint(1).array(0);
+        }
+        RecipientCutState::After(hash) => {
+            e.uint(2).array(1).bytes(hash);
+        }
+    }
+    e.finish()
+}
+
+pub(super) fn read_recipient_cut(bytes: &[u8]) -> Result<(u64, RecipientCutState)> {
+    let mut d = Decoder::new(bytes);
+    if d.array()? != 4 || d.uint()? != 1 {
+        return Err(invalid("recipient cut format"));
+    }
+    let generation = d.uint()?;
+    let kind = d.uint()?;
+    let cut = match d.array()? {
+        0 => None,
+        1 => Some(
+            d.bytes()?
+                .try_into()
+                .map_err(|_| invalid("recipient cut hash"))?,
+        ),
+        _ => return Err(invalid("recipient cut option")),
+    };
+    d.finish()?;
+    let state = match (kind, cut) {
+        (0, None) => RecipientCutState::NotRemoved,
+        (1, None) => RecipientCutState::Removed,
+        (2, Some(hash)) => RecipientCutState::After(hash),
+        _ => return Err(invalid("recipient cut state")),
+    };
+    Ok((generation, state))
+}
+
+/// Bodies a once-removed recipient may not newly receive without the cut: ordinary content
+/// and key packages authored by another member. Governance, controls, Session floors and
+/// step policies keep their existing policies; a body-less skeleton carries nothing.
+fn body_restricted(entry: &Entry, recipient: &Digest32) -> bool {
+    use crate::log::history::SignedEntryKind;
+    if entry.skeleton.author_id == *recipient {
+        return false;
+    }
+    match entry.skeleton.v2.as_ref() {
+        Some(v2) => matches!(
+            v2.kind,
+            SignedEntryKind::Content | SignedEntryKind::KeyPackage
+        ),
+        None => entry.payload.as_deref().is_some_and(|payload| {
+            crate::node::keypackage::KeyPackage::is_key_package(payload)
+                || (matches!(
+                    super::super::classify_payload(payload),
+                    Ok(crate::log::entry::EntryKind::Content)
+                ) && !super::super::session_floor::is_session_floor(payload)
+                    && !crate::governance::step_policy::is_step_policy(payload))
+        }),
+    }
+}
+
+impl super::super::ChannelState {
+    /// Whether `recipient` may newly receive (provider) or render (receiver) each body
+    /// (#1171). A never-removed recipient, its own entries and unrestricted kinds need no
+    /// governance read; anything else is decided by the projected cut, Refreshing until current.
+    pub(in crate::node::channel) fn recipient_bodies_eligibility(
+        &self,
+        store: &Store,
+        recipient: &Digest32,
+        entries: &[Entry],
+    ) -> Result<Vec<super::channel::ContentEligibility>> {
+        use super::channel::ContentEligibility::Eligible;
+        if entries
+            .iter()
+            .all(|entry| !body_restricted(entry, recipient))
+        {
+            return Ok(vec![Eligible; entries.len()]);
+        }
+        if self.poisoned {
+            return Err(self.save_failure());
+        }
+        // No validated removal has ever been applied here: nothing to read per body.
+        if super::removal_generation(store, &self.channel_id)? == 0 {
+            return Ok(vec![Eligible; entries.len()]);
+        }
+        let Some(view) = View::recipient(
+            store,
+            &self.sek,
+            &self.channel_id,
+            self.genesis.creator_pubkey().fingerprint(),
+        )?
+        else {
+            return Ok(vec![Eligible; entries.len()]);
+        };
+        let cut = view.recipient_cut(recipient, self.now_hint)?;
+        entries
+            .iter()
+            .map(|entry| view.body_eligibility_after(&cut, recipient, entry))
+            .collect()
+    }
+
+    pub(crate) fn recipient_body_eligibility(
+        &self,
+        store: &Store,
+        recipient: &Digest32,
+        entry: &Entry,
+    ) -> Result<super::channel::ContentEligibility> {
+        if !body_restricted(entry, recipient) {
+            return Ok(super::channel::ContentEligibility::Eligible);
+        }
+        Ok(self.recipient_bodies_eligibility(store, recipient, std::slice::from_ref(entry))?[0])
+    }
+
+    /// Whether this node holds an applied removal incarnation and an indexed removal row for
+    /// `recipient`, without a fold gate. The cheap generation read keeps never-removed rooms
+    /// off the derived index entirely.
+    pub(in crate::node::channel) fn recipient_removal_row_in(
+        &self,
+        batch: &crate::node::store::Batch<'_>,
+        recipient: &Digest32,
+    ) -> Result<bool> {
+        if super::removal_generation_in(batch, &self.channel_id)? == 0 {
+            return Ok(false);
+        }
+        let Some(facts) = Read::from_batch_existing(batch, &self.sek, &self.channel_id)? else {
+            return Ok(false);
+        };
+        Ok(facts
+            .at_or_after(Table::MemberRemovals, hash_key(recipient))?
+            .is_some_and(|(key, _)| key[..32] == recipient[..]))
+    }
+
+    /// The same decision inside the caller's open publication Batch.
+    pub(in crate::node::channel) fn recipient_body_eligibility_in(
+        &self,
+        batch: &crate::node::store::Batch<'_>,
+        recipient: &Digest32,
+        entry: &Entry,
+    ) -> Result<super::channel::ContentEligibility> {
+        if !body_restricted(entry, recipient)
+            || super::removal_generation_in(batch, &self.channel_id)? == 0
+        {
+            return Ok(super::channel::ContentEligibility::Eligible);
+        }
+        let Some(view) = View::recipient_in(
+            batch,
+            &self.sek,
+            &self.channel_id,
+            self.genesis.creator_pubkey().fingerprint(),
+        )?
+        else {
+            return Ok(super::channel::ContentEligibility::Eligible);
+        };
+        let cut = view.recipient_cut(recipient, self.now_hint)?;
+        view.body_eligibility_after(&cut, recipient, entry)
+    }
+}
+
+impl View<'_> {
+    /// The recipient-body decision on an already checked View, adding no store read beyond
+    /// its projected row lookups.
+    pub(in crate::node::channel) fn recipient_body_eligibility(
+        &self,
+        recipient: &Digest32,
+        entry: &Entry,
+        now: u64,
+    ) -> Result<super::channel::ContentEligibility> {
+        if !body_restricted(entry, recipient) {
+            return Ok(super::channel::ContentEligibility::Eligible);
+        }
+        let cut = self.recipient_cut(recipient, now)?;
+        self.body_eligibility_after(&cut, recipient, entry)
+    }
+
+    /// The room's latest readmission cut, which a fresh local Content, KeyPackage or
+    /// ContextUpdate entry must name as a required ancestor (#1171). A room with no applied
+    /// removal, or none indexed, needs nothing. Otherwise only a current-generation row on a
+    /// ready fold answers; anything stale or missing is the existing retryable REFRESHING.
+    pub(in crate::node::channel) fn room_cut(
+        store: &Store,
+        sek: &Sek,
+        room: &Digest32,
+        now: u64,
+    ) -> Result<Option<Digest32>> {
+        if super::removal_generation(store, room)? == 0 {
+            return Ok(None);
+        }
+        let Some(facts) = Read::open_existing(store, sek, room)? else {
+            return Ok(None);
+        };
+        if facts.first(Table::MemberRemovals, None)?.is_none() {
+            return Ok(None);
+        }
+        if !facts.ready(now)? {
+            return Err(Error::Profile(REFRESHING));
+        }
+        let Some(record) = facts.get(Table::RecipientCuts, &ROOM_CUT_KEY)? else {
+            return Err(Error::Profile(REFRESHING));
+        };
+        let (generation, state) = read_recipient_cut(&facts.record(record)?)?;
+        if generation != facts.authority_generation() {
+            return Err(Error::Profile(REFRESHING));
+        }
+        Ok(match state {
+            RecipientCutState::After(hash) => Some(hash),
+            RecipientCutState::NotRemoved | RecipientCutState::Removed => None,
         })
     }
 }

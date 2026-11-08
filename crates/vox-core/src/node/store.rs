@@ -960,6 +960,13 @@ impl Store {
         Ok(epochs)
     }
 
+    /// Serialize one nonblocking irreversible publication step with commit.
+    /// The closure must never await or start another Store write.
+    pub(crate) fn with_publication_fence<T>(&self, step: impl FnOnce() -> Result<T>) -> Result<T> {
+        let _writer = self.writer()?;
+        step()
+    }
+
     fn begin_write(&self) -> Result<(MutexGuard<'_, Epochs>, Cached<redb::WriteTransaction>)> {
         let epochs = self.writer()?;
         match &*self.db.read().unwrap_or_else(PoisonError::into_inner) {
@@ -1886,6 +1893,10 @@ impl Batch<'_> {
             {
                 gone += 1;
             }
+        }
+        #[cfg(feature = "test-knobs")]
+        if crate::node::computer::fx28_mutant("leave-keep-sek-wrap") {
+            return Ok(gone);
         }
         let mut wraps = self
             .txn

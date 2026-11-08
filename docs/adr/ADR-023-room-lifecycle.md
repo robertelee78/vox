@@ -193,6 +193,7 @@ below remain unchanged.
 - **RL-5.2.** `now` MUST release the SKDM at the current iteration. `full` MUST release every
   retained generation at iteration 0, oldest first, the live one last, and the consent grant MUST
   record `FullHistory`.
+  Except as limited for once-removed identities by ADR-007 G-30 (v0.4.20).
 - **RL-5.3.** A grant that arrives after its key MUST make stored messages readable: a sync that
   brings governance MUST retry the backfill for every author the node holds a key for.
 - **RL-5.4.** `--history full` MUST NOT create a gap over `MAX_SKIP` (ADR-006): a generation never
@@ -236,7 +237,7 @@ below remain unchanged.
   member's roster, sync and key delivery. Joining again is an ordinary join: once synced, the node
   moves to a sender generation above any its feed shows and says it is back (`here` = true), which
   starts its consents over.
-  **Proposed v0.4.20 qualification:** a verified, durable admission notice newer than the
+  **v0.4.20 qualification:** a verified, durable admission notice newer than the
   member's departure supplies the recovery standing in RL-8.5 before return Presence. It
   does not supply read/Drive trust or supersede an admin removal. Peers retain and propagate
   that standing through the existing notice machinery, including after restart.
@@ -249,12 +250,17 @@ below remain unchanged.
   only from the creator or an admin on the creator's signed roster (`0x001B`), and MUST answer a
   later join of the room as ended. Lifecycle kind codes 1 and 4 (a leave and a return, before this
   ruling) are reserved and MUST be refused.
+  Lifecycle work MUST get the free actor turn before new read or settlement maintenance
+  takes the writer slot. Already-running writers and the existing lifecycle safety gates
+  still apply; repeatedly starting no-op maintenance MUST NOT starve an idle End.
   An End applied in the room erases its continuity marker. For a node that already left,
   erase the marker only after verifying a creator-signed room-scope board withdrawal against
   the retained public genesis (RL-8.4), with matching room/epoch and the existing skew bound.
   On applying a valid delegated-admin End, the creator's node MUST also publish its own
   room-scope withdrawal through the existing withdrawal journal. This is cleanup evidence,
-  not a new restriction on an admin's End permission. RAM-only board tombstones retain the
+  not a new restriction on an admin's End permission. The creator retries transient endorsement
+  failures on lifecycle ticks, bounded by the 60-second wind-down; persistent failure does not
+  prevent the ended room's deletion. RAM-only board tombstones retain the
   bounded creator public key from the removed genesis, accept a later creator endorsement,
   and prefer that authenticated endorsement over a delegated withdrawal.
   Missing or unverifiable evidence keeps the checkpoint: this includes a creator that was
@@ -263,7 +269,7 @@ below remain unchanged.
 - **RL-8.3.** There MUST NOT be a `vox room forget`: leaving and ending are the only ways a room
   leaves a node.
 
-### v0.4.20 corrective design — proposed, not implemented
+### v0.4.20 corrective design
 
 - **RL-8.4. Durable author continuity.** Before any own signed room entry can become externally
   visible, the append transaction MUST durably retain a room/author-bound continuity marker:
@@ -293,6 +299,17 @@ below remain unchanged.
   key redelivery; persist/propagate the existing notice and restore that recovery standing after
   restart. It grants no independent Read/Drive/service authority; current trust, consent and
   validated room removal still apply. A peer without enough verified evidence remains pending.
+  The returner's retained notice travels through the existing board exchange as well as
+  the admitting member's publication; the admitting member need not stay online for a
+  peer that can verify that witness to learn the recovery standing. A peer removes a
+  departed member's board records at the authenticated departure's timestamp, not
+  when that peer observes it: restarting must not turn an old departure into a
+  tombstone newer than an already accepted readmission.
+  A member's own withdrawal at or after a witnessed admission vetoes that admission, including
+  a returner's cancelled or commit-uncertain readmission (RL-8.7). When other members remain,
+  a normal Leave publishes its withdrawal only after another member acknowledges its signed
+  departure. An older board publication completing while that withdrawal is pending must not
+  send it early; post-publication cleanup remains required once the departure is acknowledged.
   Distinguish recovery standing from a new authored Presence rather than bypassing history safety.
   This explicitly qualifies RL-8.1b and ADR-037 R5; new authors still settle locally.
   Seed markers for currently held valid room histories before further appends. For an
@@ -337,7 +354,7 @@ below remain unchanged.
   without admitting the joiner, preserves the original same-name room, and uses RL-8.6 cleanup.
   If the authoritative name changes after successful preflight/admission, complete the admitted
   join and show colliding rooms by their full IDs, as for a rename clash; explain that outcome.
-  This is a proposed explicit exception to ADR-028 R-3's same-name join refusal, not a new
+  This is an explicit exception to ADR-028 R-3's same-name join refusal, not a new
   responder power to erase a joiner's signed history. Classify the commit boundary precisely:
   (1) before AdmissionPrepared, abort reversible local work; (2) after Prepared but without a
   verified Accepted, commit is uncertain—promote the already journalled own Member withdrawal,
@@ -365,12 +382,15 @@ below remain unchanged.
   explain that an admin must name the room before joining; never invent an empty/default
   name. The responder checks its current authorized name before proposing; a later
   governance rename follows the by-ID rule above.
-  `own_history` is `[kind, head_or_null]`: 0 means no held prior authored-log evidence and
+  `own_history` is `[kind, evidence_or_null]`: 0 means no held prior authored-log evidence and
   requires null; 1 requires a bounded existing own signed Public history head; 2 means known
-  authored history exists but cannot currently be supplied and requires null. The joiner
-  independently verifies a supplied head's author signature and exact public room/author
-  binding. Kind 1 fences writes until recovery reaches the verified supplied head; kind 2,
-  local continuity or contradictory evidence also fences writes for recovery.
+  authored history cannot currently be supplied as a head and requires the highest held
+  author-signed entry's body-absent header, bounded to one header. The joiner independently
+  verifies the evidence's author signature and exact public room/author binding. Kind 1 fences
+  writes until the supplied head is recovered; kind 2 fences until a verified recovered prefix
+  contains the exact evidenced sequence and hash. A conflicting entry is a fork, not permission
+  to choose a branch; unavailable donors leave recovery pending. Local continuity and
+  contradictory evidence also fence writes.
   Kind 0 with no local prior authored history permits the operator-selected automatic empty
   initialization. Prior admission/board-withdraw records are discovery hints, not by themselves
   authored-log sequence evidence; inspect them when trying recovery, never forge a head from

@@ -16,7 +16,7 @@ mod transport;
 
 pub(crate) use client::{EntryPhase, LocalNeed, LocalProof, LocalStep, Receiver, Staging};
 pub(crate) use driver::exchange;
-pub(crate) use hints::HintInbox;
+pub(crate) use hints::{HintInbox, RefusalRetry};
 
 use super::history_budget::{BufferCharge, Job};
 use crate::cbor::{Decoder, Encoder};
@@ -51,9 +51,9 @@ const LOCAL_BYTES_FRAME_FIXED_BYTES: usize = 128;
 const CANCEL_FRAME_MAX_BYTES: usize = 64;
 const ACK_FRAME_MAX_BYTES: usize = 128;
 
-/// Exact local request incarnation. The sealed keyring nonce changes on a durable trust edit,
-/// including removal followed by an otherwise identical regrant; unchanged restart preserves
-/// it. This digest grants no rights. Current room membership and body admission still apply.
+/// Exact local request incarnation. The trust nonce and the room's durable removal
+/// generation invalidate queued work after either kind of authority change. This digest
+/// grants no rights; current membership and body admission still apply.
 pub(crate) fn authorization_generation(
     store: &super::store::Store,
     node: Digest32,
@@ -63,11 +63,14 @@ pub(crate) fn authorization_generation(
 ) -> Result<Digest32> {
     let nonce =
         store.get_meta_prefix::<{ crate::atrest::sek::NONCE_LEN }>(super::trust::TRUST_META_KEY)?;
-    Ok(generation_from_nonce(node, room, instance, epoch, nonce))
+    let removal = super::channel::governance::removal_generation(store, &room)?;
+    Ok(generation_from_nonce(
+        node, room, instance, epoch, nonce, removal,
+    ))
 }
 
-/// Recheck the trust incarnation inside the accepted-entry transaction, so a concurrent trust
-/// edit cannot slip between an earlier read and durable publication/ACK eligibility.
+/// Recheck both authority incarnations inside the accepted-entry transaction, so a concurrent
+/// trust edit or applied room removal cannot slip into durable publication/ACK eligibility.
 pub(crate) fn authorization_generation_in(
     batch: &super::store::Batch<'_>,
     node: Digest32,
@@ -77,7 +80,10 @@ pub(crate) fn authorization_generation_in(
 ) -> Result<Digest32> {
     let nonce =
         batch.get_meta_prefix::<{ crate::atrest::sek::NONCE_LEN }>(super::trust::TRUST_META_KEY)?;
-    Ok(generation_from_nonce(node, room, instance, epoch, nonce))
+    let removal = super::channel::governance::removal_generation_in(batch, &room)?;
+    Ok(generation_from_nonce(
+        node, room, instance, epoch, nonce, removal,
+    ))
 }
 
 fn generation_from_nonce(
@@ -86,6 +92,7 @@ fn generation_from_nonce(
     instance: [u8; 16],
     epoch: u64,
     nonce: Option<[u8; crate::atrest::sek::NONCE_LEN]>,
+    removal: u64,
 ) -> Digest32 {
     let mut bytes = Vec::with_capacity(192);
     bytes.extend_from_slice(b"vox/history-authorization/v1");
@@ -93,6 +100,7 @@ fn generation_from_nonce(
     bytes.extend_from_slice(&room);
     bytes.extend_from_slice(&instance);
     bytes.extend_from_slice(&epoch.to_be_bytes());
+    bytes.extend_from_slice(&removal.to_be_bytes());
     bytes.push(u8::from(nonce.is_some()));
     if let Some(nonce) = nonce {
         bytes.extend_from_slice(&nonce);

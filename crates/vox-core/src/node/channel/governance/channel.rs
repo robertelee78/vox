@@ -10,7 +10,17 @@ use crate::node::store::Store;
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Presence {
     pub last: (u64, bool),
+    pub last_ms: Option<u64>,
     pub back: Option<(u64, u64)>,
+}
+
+/// Checked application-content eligibility at the published governance revision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContentEligibility {
+    Eligible,
+    Ineligible,
+    /// Its authenticated source/frontier or bounded projection is not yet current.
+    Refreshing,
 }
 
 /// A turn may publish current authority while later ordinary causal work remains.
@@ -70,15 +80,152 @@ impl ChannelState {
 
     /// Check one target against current authority at `now`, including the genesis creator.
     /// Pending replay or authority expiry returns refreshing rather than an absence claim.
-    pub fn is_admin(
-        &self,
-        _store: &Store,
-        target: &Digest32,
-        now: crate::time::Ms,
-    ) -> Result<bool> {
+    pub fn is_admin(&self, store: &Store, target: &Digest32, now: crate::time::Ms) -> Result<bool> {
+        if self
+            .checked_governance(store, now.get())?
+            .is_member_removed(target)?
+        {
+            return Ok(false);
+        }
         self.with_semantic_facts(now.get(), |facts| {
             facts.is_admin(target, &self.genesis.creator_pubkey().fingerprint())
         })
+    }
+
+    /// Require non-expiring policy authority and a known, non-root room member.
+    pub fn validate_member_removal(
+        &self,
+        store: &Store,
+        issuer: &Digest32,
+        target: &Digest32,
+        now: crate::time::Ms,
+    ) -> Result<()> {
+        let root = self.genesis.creator_pubkey().fingerprint();
+        if *target == root {
+            return Err(crate::error::Error::Profile(
+                "the room creator cannot be removed",
+            ));
+        }
+        let view = self.checked_governance(store, now.get())?;
+        if !self.is_member(target) || view.is_member_removed(target)? {
+            return Err(crate::error::Error::Profile("room member not found"));
+        }
+        #[cfg(feature = "test-knobs")]
+        if std::env::var("VOX_TEST_FX62_MUTANT").as_deref() == Ok("nonadmin-remove") {
+            return Ok(());
+        }
+        if view.is_member_removed(issuer)?
+            || (*issuer != root && !self.is_member(issuer))
+            || !self.with_semantic_facts(now.get(), |facts| facts.grants_policy(issuer, &root))?
+        {
+            return Err(crate::error::Error::Profile(
+                "room policy authority required",
+            ));
+        }
+        view.require_member_removal_certificate(issuer)
+    }
+
+    /// Return every validated removal of this identity, sorted by log entry hash.
+    pub fn validated_member_removals(
+        &self,
+        store: &Store,
+        target: &Digest32,
+        now: crate::time::Ms,
+    ) -> Result<Vec<Digest32>> {
+        self.checked_governance(store, now.get())?
+            .validated_member_removals(target)
+    }
+
+    /// Whether this exact member governance entry was accepted by the current fold.
+    pub fn member_governance_applied(
+        &self,
+        store: &Store,
+        hash: &Digest32,
+        now: crate::time::Ms,
+    ) -> Result<bool> {
+        self.checked_governance(store, now.get())?
+            .member_governance_applied(hash)
+    }
+
+    /// Whether any validated removal remains unsuperseded by creator readmission.
+    pub fn is_member_removed(&self, store: &Store, target: &Digest32) -> Result<bool> {
+        self.checked_governance(store, self.now_hint)?
+            .is_member_removed(target)
+    }
+
+    pub(crate) fn peer_removal_applied(&self, store: &Store, peer: &Digest32) -> Result<bool> {
+        super::peer_removal_applied(store, &self.sek, &self.channel_id, peer)
+    }
+
+    /// Current public exchange authority, without changing historical author membership.
+    /// This node's own removal does not gate receiving readmission and its ancestry.
+    pub(crate) fn room_peer_current(&self, store: &Store, peer: &Digest32) -> Result<bool> {
+        Ok(self.is_member(peer) && !self.peer_removal_applied(store, peer)?)
+    }
+
+    /// Whether a retained public entry is eligible under the current checked fold.
+    pub fn content_eligible(
+        &self,
+        store: &Store,
+        entry: &crate::log::entry::Entry,
+    ) -> Result<bool> {
+        self.checked_governance(store, self.now_hint)?
+            .content_eligible(entry)
+    }
+
+    /// Nonblocking exact-entry decision from the bounded durable projection.
+    pub(crate) fn content_eligibility(
+        &self,
+        store: &Store,
+        entry: &crate::log::entry::Entry,
+    ) -> Result<ContentEligibility> {
+        match self.checked_governance(store, self.now_hint) {
+            Ok(view) => view.content_eligibility(entry),
+            Err(error) if super::refreshing(&error) => Ok(ContentEligibility::Refreshing),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn is_member_removed_in(
+        &self,
+        read: &super::super::entry_store::Read<'_>,
+        target: &Digest32,
+    ) -> Result<bool> {
+        if read.channel() != &self.channel_id {
+            return Err(crate::error::Error::MalformedAtRest(
+                "member query room binding",
+            ));
+        }
+        View::pinned(
+            read.snapshot(),
+            read.sek(),
+            read.channel(),
+            self.genesis.creator_pubkey().fingerprint(),
+            self.now_hint,
+        )?
+        .is_member_removed(target)
+    }
+
+    /// Page current removed identities under one checked authority generation.
+    pub fn removed_member_page(
+        &self,
+        store: &Store,
+        after: Option<Digest32>,
+        generation: Option<u64>,
+        now: crate::time::Ms,
+    ) -> Result<(Vec<Digest32>, Option<Digest32>, u64)> {
+        let view = self.checked_governance(store, now.get())?;
+        let current = view.authority_generation();
+        if generation.is_some_and(|expected| expected != current) {
+            return Err(crate::error::Error::Profile(super::view::REFRESHING));
+        }
+        let (rows, next) = view.removed_page(after)?;
+        Ok((rows, next, current))
+    }
+
+    /// Durable removal incarnation, for fencing previously prepared work.
+    pub fn removal_generation(&self, store: &Store) -> Result<u64> {
+        super::removal_generation(store, &self.channel_id)
     }
 
     /// Current governance revision, requiring authority to be ready at the room's latest time.
@@ -400,7 +547,7 @@ impl ChannelState {
 
     pub(in crate::node::channel) fn grants_policy(
         &self,
-        _store: &Store,
+        store: &Store,
         who: &Digest32,
         now: u64,
     ) -> Result<bool> {
@@ -411,6 +558,12 @@ impl ChannelState {
         // without synchronously draining the new room's derived index.
         if *who == self.genesis.creator_pubkey().fingerprint() {
             return Ok(true);
+        }
+        if self
+            .checked_governance(store, now)?
+            .is_member_removed(who)?
+        {
+            return Ok(false);
         }
         self.with_semantic_facts(now, |facts| {
             facts.grants_policy(who, &self.genesis.creator_pubkey().fingerprint())
@@ -554,10 +707,12 @@ impl ChannelState {
                                     .entry(entry.skeleton.author_id)
                                     .or_insert(Presence {
                                         last: (entry.skeleton.seq, presence.body.here),
+                                        last_ms: Some(entry.skeleton.claimed_ms),
                                         back: None,
                                     });
                             if entry.skeleton.seq >= held.last.0 {
                                 held.last = (entry.skeleton.seq, presence.body.here);
+                                held.last_ms = Some(entry.skeleton.claimed_ms);
                             }
                             if presence.body.here
                                 && held.back.is_none_or(|(seq, _)| seq < entry.skeleton.seq)
