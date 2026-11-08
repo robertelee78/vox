@@ -3656,11 +3656,43 @@ impl Read<'_> {
         head: &Digest32,
         author: &Digest32,
         seq: u64,
+        local_author: &Digest32,
     ) -> Result<Option<super::super::governance::VerifiedParentPrefix>> {
         let Some(bytes) =
             self.history_object(ObjectKind::ParentReceipt, &receipt_key(head, author, seq))?
         else {
-            return Ok(None);
+            // Native publication retains this node's head and inclusion, but no
+            // parent receipt. Do not ask a peer to prove the author's own tip.
+            // Other authors retain their existing proof-acquisition path.
+            if author != local_author {
+                return Ok(None);
+            }
+            let Some(included) = self.history_inclusion_receipt(head, author, seq)? else {
+                return Ok(None);
+            };
+            if included.binding().scope != LogScope::Public {
+                return Err(invalid("tip parent receipt scope"));
+            }
+            if seq != included.root().leaves {
+                return Ok(None);
+            }
+            let target = self
+                .history_head(head)?
+                .ok_or(invalid("tip parent head missing"))?;
+            if target.binding != included.binding() || target.root != included.root() {
+                return Err(invalid("tip parent head binding"));
+            }
+            if !self.history_head_accepted(head, target.binding)? {
+                return Ok(None);
+            }
+            // Without the root context, keep the proof exchange: its donor also
+            // authorizes the context for an author recovering after Leave.
+            if self.history_context(&included.root().frontier)?.is_none() {
+                return Ok(None);
+            }
+            // A locally complete retained tip is its own consistency prefix.
+            let prefix = ConsistentPrefix::at_tip(&included)?;
+            return super::super::governance::VerifiedParentPrefix::new(included, prefix).map(Some);
         };
         let result =
             super::super::governance::VerifiedParentPrefix::from_authenticated_checkpoint(&bytes)?;

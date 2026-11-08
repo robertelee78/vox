@@ -769,9 +769,12 @@ pub(super) fn start_entry(
             }
             id
         };
-        if let Some(parent) =
-            input.history_parent_receipt(&parent_head, &reference.author, reference.seq)?
-        {
+        if let Some(parent) = input.history_parent_receipt(
+            &parent_head,
+            &reference.author,
+            reference.seq,
+            &room.me(),
+        )? {
             parents.push(parent);
             continue;
         }
@@ -999,8 +1002,12 @@ pub(super) fn preflight(
                 None => return Ok(Preflight::Need(Query::Head(reference.author))),
             },
         };
-        let Some(receipt) =
-            input.history_parent_receipt(&parent_head, &reference.author, reference.seq)?
+        let Some(receipt) = input.history_parent_receipt(
+            &parent_head,
+            &reference.author,
+            reference.seq,
+            &room.me(),
+        )?
         else {
             // Admission starts by acquiring every exact receipt. A changed current head can
             // require a fresh proof; it never permits substituting another parent position.

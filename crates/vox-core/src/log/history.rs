@@ -1432,9 +1432,9 @@ pub struct ConsistentPrefix {
     root: Descriptor,
 }
 impl ConsistentPrefix {
-    /// Construct the only consistency receipt that needs no tree source: a verified
-    /// canonical empty head against its canonical empty prefix. New sparse rooms persist
-    /// this exact author-signed head so another member can acknowledge an empty feed.
+    /// Construct a verified canonical empty head's consistency receipt against its empty
+    /// prefix. New sparse rooms persist this exact author-signed head so another member
+    /// can acknowledge an empty feed.
     pub(crate) fn empty(head: &VerifiedHead) -> Result<Self> {
         let signed = head.head();
         let empty = Descriptor::empty(signed.binding);
@@ -1446,6 +1446,21 @@ impl ConsistentPrefix {
             binding: signed.binding,
             prefix: empty,
             root: empty,
+        })
+    }
+    /// Identity consistency at an already authenticated included tip. This proves only the
+    /// prefix's exact descriptor, not head acceptance, control completion or authority.
+    pub(crate) fn at_tip(included: &IncludedHeader) -> Result<Self> {
+        if included.header().entry().skeleton.seq != included.root().leaves {
+            return Err(Error::MalformedBundle(
+                "parent is not the included head tip",
+            ));
+        }
+        Ok(Self {
+            head_id: included.head_id(),
+            binding: included.binding(),
+            prefix: included.root(),
+            root: included.root(),
         })
     }
     pub(crate) fn local_receipt(&self) -> Result<Vec<u8>> {
