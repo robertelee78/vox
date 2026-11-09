@@ -53,7 +53,15 @@ impl Presence {
             return Ok(state);
         }
         let author = &entry.skeleton.author_id;
-        let facts = facts::Read::from_batch(batch, sek, room)?;
+        // A room with no derived governance header yet holds no positions to place a late
+        // statement against. A late leave with no known return after it is then bounded by the
+        // latest `here` (fail closed); a late `here` never moves the start earlier without them.
+        let Some(facts) = facts::Read::from_batch_existing(batch, sek, room)? else {
+            if !here && state.back.is_none_or(|(back, _)| back < seq) {
+                state.back = Some((prior.0, state.last_ms.unwrap_or(ms)));
+            }
+            return Ok(state);
+        };
         if !here {
             // A leave learned late, with no known return after it: the first statement after
             // it is that return. A later leave there was already folded when it arrived.
