@@ -1,6 +1,6 @@
 # Troubleshooting by symptom
 
-Applies to Vox v0.4.16.
+Applies to Vox v0.4.21.
 
 Find the message or behaviour you see, then follow its steps. Each entry says what the symptom
 means, what to check, how to fix it, and how to confirm the fix.
@@ -109,6 +109,25 @@ terminal interface.
 passphrase. Do not leave and join again.
 
 **Confirm:** `vox room read` works for that room.
+
+## The node is Ready but saved rooms do not reopen
+
+**Symptoms:** a saved room stays unavailable after startup, or the app says `Room not open`.
+The room list and daemon log may give a more specific preparation refusal.
+
+**Meaning:** Ready describes the unlocked identity, not the availability of every saved room.
+In v0.4.20, interrupted key-package preparation could leave a room closed with
+`key-package attempt unacknowledged`, and the app could omit that underlying reason.
+This is not, by itself, evidence that retained messages were deleted.
+
+**Fix:** install v0.4.21 or later and restart Vox with the same profile. Interrupted package
+selection retries from its unchanged durable position; authentication and acknowledgement
+checks still apply. Do not delete the room, leave and rejoin, reset the node or regrant trust
+to bypass this failure. A remaining refusal is shown with its actual cause; keep that reason
+and the daemon log when [getting help](getting-help.md).
+
+**Confirm:** the affected room shows its retained messages and accepts a new post. Other rooms
+remain usable while one room is Preparing or refused.
 
 ## I cannot join a room
 

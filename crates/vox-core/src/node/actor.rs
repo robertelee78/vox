@@ -20558,6 +20558,12 @@ impl Node {
                         self.publish().await;
                         return;
                     }
+                    if prepared.reopening
+                        && !self.channels.contains_key(&id)
+                        && self.profile.as_ref().is_some_and(Profile::is_unlocked)
+                    {
+                        self.reopen_failures.insert(id, error.to_string());
+                    }
                     let _ = self.event_tx.send(NodeEvent::NodeNote {
                         note: format!(
                             "room {} could not finish opening: {error}; it stays closed",

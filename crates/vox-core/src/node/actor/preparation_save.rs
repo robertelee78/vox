@@ -799,7 +799,9 @@ impl Node {
                     Some(Work::Packages(package_save::Work::Select {
                         trust_digest: crate::hash::sha256(&self.trust.to_bytes()),
                         replay: false,
-                        abandon_unopened: false,
+                        // The prior chain finished or was rejected before this turn.
+                        // Retry an interrupted package from its unchanged durable cursor.
+                        abandon_unopened: true,
                     }))
                 }
                 _ => return Err(Error::Profile("unexpected preparation stage")),
