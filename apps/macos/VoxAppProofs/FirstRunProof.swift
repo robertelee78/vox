@@ -5160,6 +5160,8 @@ final class FirstRunProof: XCTestCase {
         type(ui, Key.id("card-alias"), "local-carol", "the explicit local override")
         tap(ui, Key.id("card-trust-confirm"), "Trust Carol as local-carol")
         keyringPassphraseIfAsked(ui) { self.run(vox, ["trust", "list", "--node", "alice"], env: voxEnv).out.contains(carolFp) }
+        // The card stays open on what it did; it is modal, so it is closed before the sidebar.
+        tap(ui, Key.id("card-close"), "Close Carol's card")
         ui.menuBars.menuBarItems["View"].click()
         tap(ui, Key.menuItem("Keyring"), "the keyring after accepting Carol")
         words(ui, Key.id("keyring-capability-local-carol"), timeout: 30,
@@ -9255,25 +9257,31 @@ final class FirstRunProof: XCTestCase {
             guard machine.exists else { return false }
             return machine.frame.contains(f)
         }
-        guard !id.isEmpty, let view = ui.windows.firstMatch.scrollViews.allElementsBoundByIndex.first(where: {
-            $0.frame.minX <= f.midX && f.midX <= $0.frame.maxX
-                && $0.descendants(matching: .any).matching(identifier: id).firstMatch.exists
-        })?.frame else { return true }
+        guard !id.isEmpty, let view = holder(ui, of: e)?.frame else { return true }
         return view.minY <= f.minY && f.maxY <= view.maxY
     }
 
+    /// The window's scroll view that holds `e` on `e`'s own surface. XCTest lists a sheet among
+    /// the descendants of the scroll view it was presented from (Settings' Add Computer), and the
+    /// sheet covers that scroll view: one holding `e` only through a sheet does not hold it.
+    private func holder(_ ui: XCUIApplication, of e: XCUIElement) -> XCUIElement? {
+        let f = e.frame
+        let id = e.identifier
+        return ui.windows.firstMatch.scrollViews.allElementsBoundByIndex.first(where: {
+            $0.frame.minX <= f.midX && f.midX <= $0.frame.maxX
+                && (id.isEmpty || ($0.descendants(matching: .any).matching(identifier: id).firstMatch.exists
+                    && !$0.sheets.containing(.any, identifier: id).firstMatch.exists))
+        })
+    }
+
     private func scrollTo(_ ui: XCUIApplication, _ e: XCUIElement) {
-        let target = e.frame
         let id = e.identifier
         let machine = ui.windows.firstMatch.scrollViews.matching(identifier: "machine-nodes-scroll").firstMatch
         let view: XCUIElement?
         if id.hasPrefix("machine-") {
             view = machine.exists ? machine : nil
         } else {
-            view = ui.windows.firstMatch.scrollViews.allElementsBoundByIndex.first(where: {
-            $0.frame.minX <= target.midX && target.midX <= $0.frame.maxX
-                && (id.isEmpty || $0.descendants(matching: .any).matching(identifier: id).firstMatch.exists)
-            })
+            view = holder(ui, of: e)
         }
         guard let view else { return }
         for _ in 0..<20 where !inView(ui, e) {
