@@ -889,6 +889,8 @@ impl Flow {
         Ok(())
     }
     /// Serve one exact prerequisite without waiting for this retained Public root to end.
+    /// Do not cover a retained body owner: it must reclaim the shared slot before
+    /// another request on this stack can fetch a Control body.
     pub(crate) fn prepend_required(
         &mut self,
         head: Digest32,
@@ -908,6 +910,7 @@ impl Flow {
             || self.authorization_changed
             || self.publication_wait
             || self.byte_pressure.is_some()
+            || self.owners.iter().any(Option::is_some)
             || self.tasks.len() >= MAX_TASKS
             || self.tasks.iter().chain(self.replay.iter()).any(|task| {
                 matches!(
@@ -1330,7 +1333,6 @@ impl Flow {
     pub(crate) fn announcement_can_run(&self) -> bool {
         self.service == OutboundService::Public
             && !self.inventory
-            && self.required_root.is_none()
             && !self.publication_wait
             && self.active_publication_owner().is_none()
     }
@@ -2121,7 +2123,6 @@ impl Flow {
         // announcement prefix. Once no exact publication phase is active, the scalar inventory
         // task gets one response quantum ahead of the ordinary retained stack.
         let announcement_task = if self.service == OutboundService::Public
-            && self.required_root.is_none()
             && self.active_publication_owner().is_none()
         {
             self.announcement
@@ -4033,39 +4034,38 @@ impl Flow {
                 if active.matches(snapshot.state())
                     && snapshot.state().body.is_none()
                     && !snapshot.state().reclaiming()
+                    && (next.is_some() || snapshot.state().remaining == 0)
                 {
-                    if next.is_some() || snapshot.state().remaining == 0 {
-                        // This branch ends More/Complete, so it never needs a subsequent
-                        // pause. Prepay only its work and single reload before the commit.
-                        let work = demand::AdmissionCharge::reserve(&job)?;
-                        let reload = demand::AdmissionCharge::reserve(&job)?;
-                        let state = snapshot.state();
-                        let cursor = next
-                            .filter(|next| *next >= state.bounds.lo && state.remaining > 0)
-                            .map(|next| super::Continuation {
-                                query_kind: 4,
-                                head: state.bounds.head,
-                                lo: state.bounds.lo,
-                                hi: state.bounds.hi,
-                                next_seq: next,
-                                entry: None,
-                                offset: 0,
-                                entries_remaining: state.remaining,
-                            });
-                        demand::checkpoint_precharged(
-                            &staging.context,
-                            &mut active,
-                            if cursor.is_some() {
-                                demand::Progress::More
-                            } else {
-                                demand::Progress::Complete
-                            },
-                            cursor.as_ref(),
-                            &work,
-                        )?;
-                        snapshot = demand::inspect_precharged(&staging.context, reload)?
-                            .ok_or(Error::Profile("archive state missing"))?;
-                    }
+                    // This branch ends More/Complete, so it never needs a subsequent
+                    // pause. Prepay only its work and single reload before the commit.
+                    let work = demand::AdmissionCharge::reserve(&job)?;
+                    let reload = demand::AdmissionCharge::reserve(&job)?;
+                    let state = snapshot.state();
+                    let cursor = next
+                        .filter(|next| *next >= state.bounds.lo && state.remaining > 0)
+                        .map(|next| super::Continuation {
+                            query_kind: 4,
+                            head: state.bounds.head,
+                            lo: state.bounds.lo,
+                            hi: state.bounds.hi,
+                            next_seq: next,
+                            entry: None,
+                            offset: 0,
+                            entries_remaining: state.remaining,
+                        });
+                    demand::checkpoint_precharged(
+                        &staging.context,
+                        &mut active,
+                        if cursor.is_some() {
+                            demand::Progress::More
+                        } else {
+                            demand::Progress::Complete
+                        },
+                        cursor.as_ref(),
+                        &work,
+                    )?;
+                    snapshot = demand::inspect_precharged(&staging.context, reload)?
+                        .ok_or(Error::Profile("archive state missing"))?;
                 }
                 if snapshot.state().progress(Some(&active)) == demand::Progress::Pending {
                     let work = demand::AdmissionCharge::reserve(&job)?;
