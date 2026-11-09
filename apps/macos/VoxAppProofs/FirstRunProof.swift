@@ -3556,8 +3556,10 @@ final class FirstRunProof: XCTestCase {
                     }
                     throw Apparatus("staging not achieved: the replayed OMP \(capture) frames never reached the daemon; the replayed extension says \(state); alice's `vox room session --json` exited \(seen.status) saying \(seen.out.debugDescription)")
                 }
-                tap(ui, Key.id("room-work"), "work, where \(owner.node)'s OMP Session is", premise: inRoom(vox, voxEnv, "work"))
                 let tabKey = Key.id("session-\(session.prefix(8))")
+                if locate(ui, tabKey) == nil {
+                    tap(ui, Key.id("room-work"), "work, where \(owner.node)'s OMP Session is", premise: inRoom(vox, voxEnv, "work"))
+                }
                 let premise = Premise("alice holds the replayed OMP \(capture) Session") {
                     let now = read()
                     return (now.status == 0, now.out)
