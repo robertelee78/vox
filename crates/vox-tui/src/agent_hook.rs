@@ -2669,6 +2669,9 @@ impl Daemon {
                     "node {node}'s work is still stopping"
                 )))
             }
+            DaemonFrame::Refused(vox_core::node::daemonipc::Refusal::Stopping) => {
+                Err(Unregistered::Temporary("Vox daemon is stopping".into()))
+            }
             DaemonFrame::Refused(vox_core::node::daemonipc::Refusal::RegistrationRetryable {
                 reason,
                 ..
