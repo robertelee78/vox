@@ -9550,9 +9550,9 @@ final class FirstRunProof: XCTestCase {
         return out.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// A trust staging step a person retries: the daemon's explicit "made no change" refusal
-    /// while an earlier room change is still applying, retried for at most 60 s; anything else,
-    /// or a refusal that never clears, stays APPARATUS.
+    /// A trust or membership staging step a person retries: an explicit unchanged-Busy refusal,
+    /// or readmission's permissions-refresh refusal before signing or reserving the change.
+    /// Retried for at most 60 s; any other refusal, or one that never clears, stays APPARATUS.
     private func stagedTrustChange(_ vox: String, _ args: [String], env: [String: String]) throws {
         let deadline = Date().addingTimeInterval(60)
         var refusals = 0
@@ -9561,8 +9561,11 @@ final class FirstRunProof: XCTestCase {
                 try staged(vox, args, env: env)
                 return
             } catch let error as Apparatus {
-                guard error.why.contains("a previous change to this room is still being applied; this request made no change")
-                else { throw error }
+                let unchangedBusy = error.why.contains("a previous change to this room is still being applied; this request made no change")
+                let readmissionPending = args.starts(with: ["room", "readmit-member"])
+                    && error.why.contains("this room's permissions are still being read from local storage")
+                    && error.why.contains("try again once the room is ready")
+                guard unchangedBusy || readmissionPending else { throw error }
                 refusals += 1
                 print("[proof] trust staging refusal \(refusals): \(error.why)")
                 guard Date() < deadline else { throw error }
