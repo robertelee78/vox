@@ -544,15 +544,17 @@ impl Node {
             let publication = if crate::node::computer::fx28_mutant("stale-post-authority") {
                 None
             } else {
-                match authority.acquire_publication().await {
-                    Some(publication) => Some(publication),
-                    None => return Err(Fault::ComputerPolicy),
+                match authority.try_acquire_publication() {
+                    Ok(Some(publication)) => Some(publication),
+                    Ok(None) => return Err(Fault::RoomChangePending),
+                    Err(_) => return Err(Fault::ComputerPolicy),
                 }
             };
             #[cfg(not(feature = "test-knobs"))]
-            let publication = match authority.acquire_publication().await {
-                Some(publication) => Some(publication),
-                None => return Err(Fault::ComputerPolicy),
+            let publication = match authority.try_acquire_publication() {
+                Ok(Some(publication)) => Some(publication),
+                Ok(None) => return Err(Fault::RoomChangePending),
+                Err(_) => return Err(Fault::ComputerPolicy),
             };
             let saved =
                 tokio::task::spawn_blocking(move || -> std::result::Result<SavedAppend, Fault> {

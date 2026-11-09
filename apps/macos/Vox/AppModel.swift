@@ -826,18 +826,15 @@ final class AppModel: ObservableObject {
         guard let client else { return }
         let generation = beginNodeRequest()
         if !node.keep {
-            // Refused for a node that has a passphrase, which is then asked for; but a daemon that
-            // no longer answers is said as that, not as a passphrase to type.
-            if (try? await client.keep(node: node.name, passphrase: nil)) == nil {
+            do {
+                try await client.keep(node: node.name, passphrase: nil)
+            } catch VoxError.WrongPassphrase(_) {
                 guard ownsNodeRequest(client, generation) else { return }
-                do {
-                    _ = try await client.nodes()
-                    guard ownsNodeRequest(client, generation) else { return }
-                    phase = .passphrase(node: node.name, said: nil)
-                } catch {
-                    guard ownsNodeRequest(client, generation) else { return }
-                    phase = .unreachable(StartFailure(error))
-                }
+                phase = .passphrase(node: node.name, said: nil)
+                return
+            } catch {
+                guard ownsNodeRequest(client, generation) else { return }
+                phase = .unreachable(StartFailure(error))
                 return
             }
         }
@@ -855,11 +852,13 @@ final class AppModel: ObservableObject {
             guard ownsNodeRequest(client, generation) else { return }
             // Another process holds the node: no passphrase fixes that (P4).
             phase = .unreachable(StartFailure(kind: .busy, said: reason))
+        } catch VoxError.WrongPassphrase(let reason) {
+            guard ownsNodeRequest(client, generation) else { return }
+            phase = .passphrase(node: node.name,
+                                said: node.state == "attached" ? asSentence(reason) : nil)
         } catch {
             guard ownsNodeRequest(client, generation) else { return }
-            // A node not attached that wants its passphrase: asked for, with nothing said yet.
-            phase = .passphrase(node: node.name,
-                                said: node.state == "attached" ? sentence(error) : nil)
+            phase = .unreachable(StartFailure(error))
         }
     }
 

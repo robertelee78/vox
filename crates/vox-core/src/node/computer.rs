@@ -2672,6 +2672,14 @@ impl Computer {
         drop(self.changes.read().await);
     }
 
+    pub(crate) fn publication_writer_pending(&self) -> bool {
+        self.publications.writer_pending()
+    }
+
+    pub(crate) async fn wait_publication_writer(&self) {
+        drop(self.publications.read().await);
+    }
+
     pub(crate) fn try_journal_writer(&self) -> Option<ComputerJournalWriter> {
         Some(ComputerJournalWriter {
             lease: self.changes.try_write()?,
@@ -2720,6 +2728,22 @@ impl Computer {
         let lease = self.publications.read().await;
         self.policy_current(applied, expired, node)
             .then_some(ComputerPublication { _lease: lease })
+    }
+
+    /// A room-slot owner must not wait behind a writer that is draining an older room reader.
+    pub(crate) fn try_acquire_publication(
+        &self,
+        applied: u64,
+        expired: bool,
+        node: Digest32,
+    ) -> crate::error::Result<Option<ComputerPublication>> {
+        let Some(lease) = self.publications.try_read() else {
+            return Ok(None);
+        };
+        if !self.policy_current(applied, expired, node) {
+            return Err(Error::ComputerPolicySuperseded);
+        }
+        Ok(Some(ComputerPublication { _lease: lease }))
     }
 
     /// Exact durable policy projection current at this instant. Callers carry both fields through
