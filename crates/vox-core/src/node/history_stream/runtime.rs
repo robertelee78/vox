@@ -805,10 +805,12 @@ impl Flow {
                     // A resumed archive Entry may have a durably complete body but no room
                     // effect yet. Re-enter its local admission instead of asking the donor
                     // for an empty suffix and parking an unchanged request.
-                    operation: if matches!(&query, Query::Entry { .. }) {
-                        Operation::ResumeWire(query)
-                    } else {
-                        Operation::Wire(query)
+                    operation: match query {
+                        // A resumed durable page can have delivered its last body before
+                        // its terminal checkpoint. Finish locally; no zero-entry wire page.
+                        Query::Page { entries: 0, .. } => Operation::FinishArchive,
+                        query @ Query::Entry { .. } => Operation::ResumeWire(query),
+                        query => Operation::Wire(query),
                     },
                 });
                 tasks
@@ -886,6 +888,60 @@ impl Flow {
         self.tasks.push(task);
         Ok(())
     }
+    /// Serve one exact prerequisite without waiting for this retained Public root to end.
+    pub(crate) fn prepend_required(
+        &mut self,
+        head: Digest32,
+        seq: u64,
+        owner: RequestId,
+    ) -> Result<bool> {
+        if self.service != OutboundService::Public
+            || self.archive
+            || self.automatic_own_recovery
+            || self.own_recovery_cleanup
+            || self.key_body_root.is_some()
+            || self.local_own_root()
+            || self.departure_probe
+            || self.route_origin.is_some()
+            || self.required_root.is_some()
+            || self.required_owner_request.is_some()
+            || self.authorization_changed
+            || self.publication_wait
+            || self.byte_pressure.is_some()
+            || self.tasks.len() >= MAX_TASKS
+            || self.tasks.iter().chain(self.replay.iter()).any(|task| {
+                matches!(
+                    task.operation,
+                    Operation::Local(LocalStep::Entry {
+                        phase: EntryPhase::Prepare(_)
+                            | EntryPhase::Commit(_)
+                            | EntryPhase::Cleanup(_),
+                        ..
+                    })
+                )
+            })
+        {
+            return Ok(false);
+        }
+        let request = request_id()?;
+        self.push(Task {
+            request,
+            purpose: Purpose::Control,
+            operation: Operation::Local(LocalStep::Entry {
+                request,
+                head,
+                seq,
+                body: false,
+                role_header: false,
+                phase: EntryPhase::Start,
+            }),
+        })?;
+        self.required_root = Some((head, seq));
+        self.required_owner_request = Some(owner);
+        self.waiting = false;
+        Ok(true)
+    }
+
     /// Move this Flow's exact durable publication owner to the top of its bounded LIFO stack.
     /// An owner outside the retained task/replay set belongs to another Flow and is untouched.
     fn prioritize_publication_owner(&mut self, owner: RequestId) -> bool {
@@ -1091,7 +1147,9 @@ impl Flow {
                 return Ok(false);
             }
             if let Some(hint) = self.hint.filter(|hint| {
-                self.hint_peer == source.peer && (hint.author != author || hint.head != head)
+                self.required_root.is_none()
+                    && self.hint_peer == source.peer
+                    && (hint.author != author || hint.head != head)
             }) {
                 let Some(hint_scope) = source
                     .transient_scope(job, self.room, hint.author, self.availability_connection)
@@ -1272,6 +1330,7 @@ impl Flow {
     pub(crate) fn announcement_can_run(&self) -> bool {
         self.service == OutboundService::Public
             && !self.inventory
+            && self.required_root.is_none()
             && !self.publication_wait
             && self.active_publication_owner().is_none()
     }
@@ -2062,6 +2121,7 @@ impl Flow {
         // announcement prefix. Once no exact publication phase is active, the scalar inventory
         // task gets one response quantum ahead of the ordinary retained stack.
         let announcement_task = if self.service == OutboundService::Public
+            && self.required_root.is_none()
             && self.active_publication_owner().is_none()
         {
             self.announcement
@@ -3514,7 +3574,11 @@ impl Flow {
                             ..
                         } | LocalStep::Control { .. }
                     );
-                    if !self.archive && result.need.is_some() && rederive {
+                    if !self.archive
+                        && self.required_root.is_none()
+                        && result.need.is_some()
+                        && rederive
+                    {
                         // Keep the oldest exact root in the scalar replay slot. Once that slot is
                         // occupied, retain each nested continuation on the existing bounded task
                         // stack: the dependency pushed below executes first, then the exact entry
@@ -3567,6 +3631,11 @@ impl Flow {
                     self.published = true;
                     self.rendered |= result.rendered;
                     self.governance |= result.governance;
+                    if matches!(step, LocalStep::Entry { head, seq, .. }
+                        if self.required_root == Some((head, seq)))
+                    {
+                        self.required_root = None;
+                    }
                     if self.stage(task.purpose).is_some() {
                         self.push(Task {
                             operation: Operation::Reclaim(task.purpose),
@@ -3965,14 +4034,15 @@ impl Flow {
                     && snapshot.state().body.is_none()
                     && !snapshot.state().reclaiming()
                 {
-                    if let Some(next) = next {
+                    if next.is_some() || snapshot.state().remaining == 0 {
                         // This branch ends More/Complete, so it never needs a subsequent
                         // pause. Prepay only its work and single reload before the commit.
                         let work = demand::AdmissionCharge::reserve(&job)?;
                         let reload = demand::AdmissionCharge::reserve(&job)?;
                         let state = snapshot.state();
-                        let cursor = (next >= state.bounds.lo && state.remaining > 0).then_some(
-                            super::Continuation {
+                        let cursor = next
+                            .filter(|next| *next >= state.bounds.lo && state.remaining > 0)
+                            .map(|next| super::Continuation {
                                 query_kind: 4,
                                 head: state.bounds.head,
                                 lo: state.bounds.lo,
@@ -3981,8 +4051,7 @@ impl Flow {
                                 entry: None,
                                 offset: 0,
                                 entries_remaining: state.remaining,
-                            },
-                        );
+                            });
                         demand::checkpoint_precharged(
                             &staging.context,
                             &mut active,

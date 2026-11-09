@@ -3747,7 +3747,12 @@ impl Node {
                 });
                 flow.rendered = false;
                 flow.governance = false;
-                if let Some(owner) = flow.required_owner_request {
+                let required_owner = if flow.required_root.is_none() {
+                    flow.required_owner_request.take()
+                } else {
+                    flow.required_owner_request
+                };
+                if let Some(owner) = required_owner {
                     self.wake_publication_owner(work.room, owner);
                 }
             }
@@ -4557,6 +4562,52 @@ impl Node {
                 }
             }
         }
+        // A retained Public backlog must not strand an Archive's exact control prerequisite.
+        // Borrow its bounded stack, retaining the ordinary root and its staging unchanged.
+        if service == OutboundService::Public {
+            let required_at = self.bounded_sync.ready[ready_index]
+                .as_ref()
+                .filter(|flow| !self.bounded_sync.record_bytes_blocked(flow))
+                .and_then(|flow| {
+                    self.bounded_sync.required.iter().position(|required| {
+                        required.room == room
+                            && required.peer == peer
+                            && required.instance == flow.instance
+                    })
+                });
+            if let Some(at) = required_at {
+                let required = self.bounded_sync.required[at];
+                if let Some(flow) = self.bounded_sync.ready[ready_index].as_mut() {
+                    let current = flow.room == room
+                        && flow.peer == peer
+                        && flow.epoch == epoch
+                        && Arc::ptr_eq(&flow.shared, &shared)
+                        && shared.try_lock().is_ok_and(|channel| {
+                            channel.epoch() == epoch
+                                && channel
+                                    .history_instance(&store)
+                                    .is_ok_and(|instance| instance == flow.instance)
+                                && flow.initialized_authorization().is_some_and(|captured| {
+                                    stream::authorization_generation(
+                                        &store,
+                                        node,
+                                        room,
+                                        flow.instance,
+                                        epoch,
+                                    )
+                                    .is_ok_and(|generation| generation == captured)
+                                })
+                        });
+                    if current
+                        && flow
+                            .prepend_required(required.head, required.seq, required.request)
+                            .is_ok_and(|attached| attached)
+                    {
+                        let _ = self.bounded_sync.required.remove(at);
+                    }
+                }
+            }
+        }
         // An own append is announced before the next hinted continuation (ADR-037 R7). The
         // inventory exchange is the only exchange that carries this node's heads to the peer,
         // and it runs only on a flow with no hint; a parked hinted flow draining the peer's
@@ -5071,7 +5122,7 @@ impl Node {
                             Ok(value) => Arc::new(value),
                             Err(_) => return false,
                         };
-                        let required_at = (service == OutboundService::Public && !announce_first)
+                        let required_at = (service == OutboundService::Public)
                             .then(|| {
                                 self.bounded_sync.required.iter().position(|required| {
                                     required.room == room && required.peer == peer
