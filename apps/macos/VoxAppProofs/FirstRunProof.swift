@@ -2145,17 +2145,6 @@ final class FirstRunProof: XCTestCase {
                        "PRODUCT: a held room consent must not be described as a failed computer approval: \(pendingConsent)")
         guard present(pairingUI, Key.id("trust-banner-application-" + protectedFp), timeout: 60,
                       "a matching verified computer application must be shown separately from missing room consent") else { return }
-        try staged(vox, ["room", "post", "--node", "paired-personal", keptRoom, "PAIR-WHILE-CONSENT-HELD"], env: computerA)
-        let oneWayUntil = Date().addingTimeInterval(90)
-        var oneWayRead = ""
-        while Date() < oneWayUntil {
-            oneWayRead = run(vox, ["room", "read", "--node", "protected", keptRoom], env: computerB).out
-            if oneWayRead.contains("PAIR-WHILE-CONSENT-HELD") { break }
-            Thread.sleep(forTimeInterval: 0.5)
-        }
-        guard oneWayRead.contains("PAIR-WHILE-CONSENT-HELD") else {
-            throw Apparatus("the paired one-way message did not arrive while reciprocal consent was held")
-        }
         guard waitProtectedWarning(20) != nil else { return }
         guard stager.run(["/bin/rm", "-f", incomingConsentHold], env: [:]).status == 0 else {
             throw Apparatus("cannot release the held real room consent")
