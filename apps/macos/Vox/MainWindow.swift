@@ -2463,7 +2463,8 @@ private struct TrustBanner: View {
                         Text(words([member]) + stale).secondaryText()
                             .accessibilityIdentifier("trust-banner-member-" + member.id)
                     }
-                    if model.computerApplicationConfirmed.contains(member.id) {
+                    if model.daemonReachable, model.ended == nil,
+                       model.computerApplicationConfirmed.contains(member.id) {
                         Text("Computer policy application is confirmed for \(member.name) (\(member.id)); room access is separate.")
                             .secondaryText()
                             .accessibilityIdentifier("trust-banner-application-" + member.id)
