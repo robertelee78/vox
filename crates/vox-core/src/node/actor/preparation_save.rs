@@ -336,7 +336,7 @@ impl Node {
     /// Called only after the unpublished RoomPreparation has been reinserted. This is
     /// asynchronous admission, not physical I/O; the ordinary result cell owns completion.
     pub(super) async fn begin_preparation_turn(&mut self, room: Digest32) -> bool {
-        let allow_fresh = !self.store_save_pending();
+        let allow_fresh = self.fresh_maintenance_allowed();
         let Some(prepared) = self.preparing_rooms.get_mut(&room) else {
             return false;
         };
@@ -435,7 +435,10 @@ impl Node {
         if let Some(result) = prepared.save.result.take() {
             let saved = match result {
                 Ok(saved) => saved,
-                Err(Error::ComputerPolicySuperseded) => {
+                Err(
+                    Error::ComputerPolicySuperseded
+                    | Error::Profile("room publication is busy; retry this operation"),
+                ) => {
                     prepared.wait_on("current computer trust", now.get());
                     prepared.save.lifetime = None;
                     return Ok(false);

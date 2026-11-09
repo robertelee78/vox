@@ -123,6 +123,28 @@ impl ComputerAuthority {
         Some(ComputerPublication { _managed: managed })
     }
 
+    pub(super) fn try_acquire_publication(
+        &self,
+    ) -> crate::error::Result<Option<ComputerPublication>> {
+        let managed = match self {
+            Self::Unmanaged => None,
+            Self::Managed {
+                computer,
+                applied,
+                expired,
+                node,
+            } => {
+                let Some(publication) =
+                    computer.try_acquire_publication(*applied, *expired, *node)?
+                else {
+                    return Ok(None);
+                };
+                Some(publication)
+            }
+        };
+        Ok(Some(ComputerPublication { _managed: managed }))
+    }
+
     /// Only a changed durable target is a supersession. A blocked or failed Computer authority,
     /// or an unsettled application of the same target, is a terminal refusal instead.
     pub(super) fn superseded(&self) -> crate::error::Result<bool> {

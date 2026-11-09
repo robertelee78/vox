@@ -7817,7 +7817,7 @@ impl Node {
                     .deferred_commands
                     .iter()
                     .all(|deferred| deferred._permit.is_some());
-            let allow_fresh_maintenance = !self.store_save_pending();
+            let allow_fresh_maintenance = self.fresh_maintenance_allowed();
             let maintenance_ready = self.room_preparation_work_ready()
                 || (allow_fresh_maintenance
                     && (self.governance_work.pending
@@ -7830,6 +7830,16 @@ impl Node {
                     computer.wait_writer().await;
                 } else {
                     std::future::pending::<()>().await;
+                }
+            };
+            let publication_computer = self.computer.clone();
+            let publication_busy = publication_computer
+                .as_ref()
+                .is_some_and(|computer| computer.publication_writer_pending());
+            let resume_publication = publication_busy || self.metadata_publication_waiting();
+            let publication_ready = async move {
+                if let Some(computer) = publication_computer {
+                    computer.wait_publication_writer().await;
                 }
             };
             let governance_delay = self.governance_work.next_deadline().map(|deadline| {
@@ -7853,6 +7863,11 @@ impl Node {
                     self.parked_construction = None;
                 }
                 () = journal_ready, if journal_busy => {}
+                () = publication_ready, if resume_publication => {
+                    self.resume_metadata_publications().await;
+                    self.publication_pending |= !self.publish_waiters.is_empty();
+                    self.publication_again |= !self.publish_waiters.is_empty();
+                }
                 Some(returned) = self.join_tasks.join_next(), if !self.join_tasks.is_empty() => {
                     self.complete_join_task(returned).await;
                     self.publish().await;
@@ -9658,7 +9673,7 @@ impl Node {
             return;
         }
         use std::ops::Bound::{Excluded, Unbounded};
-        let allow_fresh = !self.store_save_pending();
+        let allow_fresh = self.fresh_maintenance_allowed();
         let next = match self.publication_after {
             Some(after) => self
                 .publish_waiters
@@ -20262,7 +20277,7 @@ impl Node {
     }
 
     fn room_preparation_work_ready(&self) -> bool {
-        let allow_fresh = !self.store_save_pending();
+        let allow_fresh = self.fresh_maintenance_allowed();
         let now = std::time::Instant::now();
         (self.publication_pending
             && ((allow_fresh && self.publish_waiters.is_empty())
@@ -20323,7 +20338,7 @@ impl Node {
         self.advance_room_publication().await;
         use std::ops::Bound::{Excluded, Unbounded};
         let now = std::time::Instant::now();
-        let allow_fresh = !self.store_save_pending();
+        let allow_fresh = self.fresh_maintenance_allowed();
         let id = self
             .preparation_after
             .and_then(|after| {

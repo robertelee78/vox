@@ -46,6 +46,12 @@ reported problem and retry.
 `(remembered)` when Vox has saved how to start it again. A progress mark appears while work is
 starting or stopping; an unreadable saved record reports its reason instead of guessing a state.
 
+Remembered nodes restore independently of room publication. A room waiting for publication
+access must not prevent the other nodes from becoming Ready or daemon control from answering.
+The Mac app asks for a passphrase only after an actual credential refusal. A timed-out daemon
+request instead shows its failure and **Try Again**; its outcome is unknown, not evidence that
+the passphrase was wrong. Do not lock, forget or recreate the node to clear that message.
+
 **Ready** means the node is running and can work. **Locked** means its protected identity needs
 unlocking. `vox node lock` closes a protected node's connections, stops its services, wipes its
 keys from memory and forgets its remembered passphrase. Its rooms and keyring stay on disk.

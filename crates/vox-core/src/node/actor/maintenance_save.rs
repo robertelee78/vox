@@ -633,6 +633,14 @@ impl Node {
                 .any(|waiting| waiting.authority.is_some())
     }
 
+    pub(super) fn fresh_maintenance_allowed(&self) -> bool {
+        !self.store_save_pending()
+            && self
+                .computer
+                .as_ref()
+                .is_none_or(|computer| !computer.publication_writer_pending())
+    }
+
     pub(super) async fn begin_pending_maintenance(
         &mut self,
         room: Digest32,
@@ -782,8 +790,17 @@ impl Node {
             let lifetime = match retained {
                 Some(held) => held,
                 None => {
-                    let Some(publication) = authority.acquire_publication().await else {
-                        return (None, Err(Error::ComputerPolicySuperseded));
+                    let publication = match authority.try_acquire_publication() {
+                        Ok(Some(publication)) => publication,
+                        Ok(None) => {
+                            return (
+                                None,
+                                Err(Error::Profile(
+                                    "room publication is busy; retry this operation",
+                                )),
+                            );
+                        }
+                        Err(error) => return (None, Err(error)),
                     };
                     Arc::new(Lifetime {
                         authority,

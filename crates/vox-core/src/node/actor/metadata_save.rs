@@ -1265,12 +1265,13 @@ type PublicReturned = (
 );
 enum PublicationPending {
     Native(Box<PublicPending>),
+    Waiting(Box<PublicPending>),
     Network(NetworkPending),
 }
 impl PublicationPending {
     async fn retire(self) {
         match self {
-            Self::Native(pending) => pending.retire().await,
+            Self::Native(pending) | Self::Waiting(pending) => pending.retire().await,
             Self::Network(pending) => {
                 let _ = pending.task.await;
             }
@@ -1361,6 +1362,70 @@ impl Node {
         })
     }
 
+    pub(super) fn metadata_publication_waiting(&self) -> bool {
+        self.pending_metadata.as_ref().is_some_and(|pending| {
+            pending
+                .publications
+                .values()
+                .any(|pending| matches!(pending, PublicationPending::Waiting(_)))
+        })
+    }
+
+    /// Retry one original request after reader admission opens, without reserving a native slot.
+    pub(super) async fn resume_metadata_publications(&mut self) {
+        let key = self.pending_metadata.as_ref().and_then(|pending| {
+            pending.publications.iter().find_map(|(key, pending)| {
+                matches!(pending, PublicationPending::Waiting(_)).then_some(*key)
+            })
+        });
+        let Some(key) = key else { return };
+        let Some(PublicationPending::Waiting(pending)) = self
+            .pending_metadata
+            .as_mut()
+            .and_then(|pending| pending.publications.remove(&key))
+        else {
+            return;
+        };
+        let current = pending.epoch == self.delivery_epoch
+            && !*pending.room_cancel.borrow()
+            && self
+                .channels
+                .get(&key.0)
+                .is_some_and(|channel| Arc::ptr_eq(channel, &pending.instance))
+            && self
+                .net
+                .as_ref()
+                .is_some_and(|net| Arc::ptr_eq(net, &pending.net))
+            && pending.instance.lock().await.epoch() == pending.room_epoch;
+        if !current {
+            for target in pending.targets {
+                self.release_metadata_target(key.0, target).await;
+            }
+            if let Some(after) = pending.after {
+                self.reject_metadata_publication(key.0, after, None, Fault::ComputerPolicy)
+                    .await;
+            }
+            if pending.local_again {
+                self.begin_local_publication(key.0, None, None).await;
+            }
+            return;
+        }
+        let local_again = pending.local_again;
+        self.begin_public_bundle(key, pending.local, pending.targets, pending.after, None)
+            .await;
+        if local_again {
+            if let Some(
+                PublicationPending::Native(pending) | PublicationPending::Waiting(pending),
+            ) = self
+                .pending_metadata
+                .as_mut()
+                .and_then(|pending| pending.publications.get_mut(&key))
+            {
+                pending.local_again = true;
+            }
+        }
+    }
+
     pub(super) async fn complete_pending_metadata(&mut self) {
         self.complete_metadata_publication_network().await;
         self.complete_metadata_journals().await;
@@ -1397,7 +1462,7 @@ impl Node {
             };
             let pending = match candidate {
                 PublicationPending::Native(pending) if Arc::ptr_eq(&cell, &pending.result) => {
-                    *pending
+                    pending
                 }
                 other => {
                     self.pending_metadata
@@ -1418,7 +1483,24 @@ impl Node {
                 && self
                     .net
                     .as_ref()
-                    .is_some_and(|net| Arc::ptr_eq(net, &pending.net))
+                    .is_some_and(|net| Arc::ptr_eq(net, &pending.net));
+            if current
+                && lifetime.is_none()
+                && matches!(
+                    result,
+                    Err(Error::Profile(
+                        "room publication is busy; retry this operation"
+                    ))
+                )
+            {
+                self.pending_metadata
+                    .get_or_insert_with(Pending::default)
+                    .publications
+                    .insert(key, PublicationPending::Waiting(pending));
+                continue;
+            }
+            let pending = *pending;
+            let current = current
                 && lifetime
                     .as_ref()
                     .is_some_and(|held| held.publish(|| ()).is_some());
@@ -1573,7 +1655,9 @@ impl Node {
             },
         );
         if after.is_none() {
-            if let Some(PublicationPending::Native(pending)) = self
+            if let Some(
+                PublicationPending::Native(pending) | PublicationPending::Waiting(pending),
+            ) = self
                 .pending_metadata
                 .as_mut()
                 .and_then(|pending| pending.publications.get_mut(&key))
@@ -1754,16 +1838,32 @@ impl Node {
         let task = tokio::spawn(async move {
             let held = match lifetime {
                 Some(held) => Some(held),
-                None => authority.acquire_publication().await.map(|publication| {
-                    Arc::new(maintenance_save::Lifetime {
+                None => {
+                    let publication =
+                        match authority.try_acquire_publication().and_then(|publication| {
+                            publication.ok_or(Error::Profile(
+                                "room publication is busy; retry this operation",
+                            ))
+                        }) {
+                            Ok(publication) => publication,
+                            Err(error) => {
+                                *output
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                    Some((None, Err(error)));
+                                wake.notify_one();
+                                return;
+                            }
+                        };
+                    Some(Arc::new(maintenance_save::Lifetime {
                         authority,
                         publication: Some(publication),
                         exclusive: None,
                         secret,
                         store,
                         signer,
-                    })
-                }),
+                    }))
+                }
             };
             let native_held = held.as_ref().map(Arc::clone);
             let public = tokio::task::spawn_blocking(move || {
