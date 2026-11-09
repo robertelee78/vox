@@ -217,7 +217,11 @@ pub(in crate::node::channel) fn source_replay(
         _ => return Err(bad()),
     };
     d.finish()?;
-    Ok(if version == 1 { (0, false) } else { (after, done) })
+    Ok(if version == 1 {
+        (0, false)
+    } else {
+        (after, done)
+    })
 }
 
 pub(in crate::node::channel) fn save_source_replay(

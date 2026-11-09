@@ -855,9 +855,13 @@ impl PendingSession {
         if self.memberships.is_empty() || self.controls.is_none() {
             return Ok(());
         }
-        let revision =
-            floor_index::author(Transaction::Snapshot(&store.snapshot()?), sek, &self.room, &self.me)?
-                .revision;
+        let revision = floor_index::author(
+            Transaction::Snapshot(&store.snapshot()?),
+            sek,
+            &self.room,
+            &self.me,
+        )?
+        .revision;
         // Only a member that holds this node's Drive, and this node itself, is owed its floors.
         let recipients = || {
             self.holders
@@ -866,24 +870,23 @@ impl PendingSession {
                 .chain(std::iter::once(&self.me))
                 .map(|peer| (*peer, self.memberships.get(peer).copied().unwrap_or(0)))
         };
-        if self.floor_sweep.as_ref().is_some_and(|(at, removals, swept)| {
-            *at == revision
-                && *removals == self.removal_generation
-                && swept.iter().copied().eq(recipients())
-        }) {
+        if self
+            .floor_sweep
+            .as_ref()
+            .is_some_and(|(at, removals, swept)| {
+                *at == revision
+                    && *removals == self.removal_generation
+                    && swept.iter().copied().eq(recipients())
+            })
+        {
             return Ok(());
         }
         let recipients: Vec<(Digest32, u64)> = recipients().collect();
         let live = self.drive.chain.as_ref().map(SenderChain::chain_id);
         let mut decided = true;
         for &(recipient, membership) in &recipients {
-            let floors = floor_index::floors_for(
-                &store.snapshot()?,
-                sek,
-                &self.room,
-                &self.me,
-                &recipient,
-            )?;
+            let floors =
+                floor_index::floors_for(&store.snapshot()?, sek, &self.room, &self.me, &recipient)?;
             if !floors.iter().any(|(_, (old, _, _))| *old > membership) {
                 continue;
             }
@@ -899,14 +902,7 @@ impl PendingSession {
                 }
                 let key = (self.me, recipient, epoch, at);
                 let Some(current) = floor_index::authorized_floor_step(
-                    store,
-                    sek,
-                    &self.room,
-                    self.root,
-                    self.now,
-                    &key,
-                    membership,
-                    restored,
+                    store, sek, &self.room, self.root, self.now, &key, membership, restored,
                 )?
                 else {
                     decided = false;
@@ -916,14 +912,7 @@ impl PendingSession {
                     Some((_, bound, first_seq)) => (bound, first_seq),
                     None if !restored => (after, first),
                     None => match floor_index::authorized_floor_step(
-                        store,
-                        sek,
-                        &self.room,
-                        self.root,
-                        self.now,
-                        &key,
-                        old,
-                        true,
+                        store, sek, &self.room, self.root, self.now, &key, old, true,
                     )? {
                         Some(Some((_, bound, first_seq))) => (bound, first_seq),
                         Some(None) => continue,

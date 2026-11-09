@@ -65,7 +65,10 @@ impl Presence {
         } else if let Some((back, _)) = state.back.filter(|(back, _)| *back > seq) {
             // A return learned late, before the known one and after the same leave.
             if facts.current_ready()?
-                && entries.in_batch(batch, sek, room)?.published_through(author) >= back
+                && entries
+                    .in_batch(batch, sek, room)?
+                    .published_through(author)
+                    >= back
                 && !leave_between(&facts, author, seq, back)?
             {
                 state.back = Some((seq, ms));
