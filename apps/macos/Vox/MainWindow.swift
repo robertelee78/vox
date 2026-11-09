@@ -2455,21 +2455,22 @@ private struct TrustBanner: View {
                             .accessibilityIdentifier("trust-banner-keyring")
                     }
                 }
-                if model.memberObservationError == nil {
-                    ForEach(cut) { member in
-                        if cut.count > 1 {
-                            Text(words([member])).secondaryText()
-                                .accessibilityIdentifier("trust-banner-member-" + member.id)
-                        }
-                        if model.computerApplicationConfirmed.contains(member.id) {
-                            Text("Computer policy application is confirmed for \(member.name) (\(member.id)); room access is separate.")
-                                .secondaryText()
-                                .accessibilityIdentifier("trust-banner-application-" + member.id)
-                        }
-                        if let wait = member.keyWaits {
-                            Text("\(member.name) \(wait)").secondaryText()
-                                .accessibilityIdentifier("trust-banner-key-wait-" + member.id)
-                        }
+                // A retained roster still names what it last showed, marked as such, as the member
+                // rows do: a refreshing governance never hides a member's missing consent.
+                let stale = model.memberObservationError == nil ? "" : " Last observed; may be stale."
+                ForEach(cut) { member in
+                    if cut.count > 1 || !stale.isEmpty {
+                        Text(words([member]) + stale).secondaryText()
+                            .accessibilityIdentifier("trust-banner-member-" + member.id)
+                    }
+                    if model.computerApplicationConfirmed.contains(member.id) {
+                        Text("Computer policy application is confirmed for \(member.name) (\(member.id)); room access is separate.")
+                            .secondaryText()
+                            .accessibilityIdentifier("trust-banner-application-" + member.id)
+                    }
+                    if let wait = member.keyWaits {
+                        Text("\(member.name) \(wait)" + stale).secondaryText()
+                            .accessibilityIdentifier("trust-banner-key-wait-" + member.id)
                     }
                 }
                 if model.daemonReachable, model.ended == nil, let attention = model.computerPairingAttention {
