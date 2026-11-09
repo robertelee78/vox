@@ -178,7 +178,11 @@ fn requested(head: &[u8]) -> Option<Asked> {
         if target.is_empty() || target.len() > 20 || !target.iter().all(u8::is_ascii_digit) {
             return None;
         }
-        return std::str::from_utf8(target).ok()?.parse().ok().map(Asked::Current);
+        return std::str::from_utf8(target)
+            .ok()?
+            .parse()
+            .ok()
+            .map(Asked::Current);
     }
     if target.len() != 64 {
         return None;

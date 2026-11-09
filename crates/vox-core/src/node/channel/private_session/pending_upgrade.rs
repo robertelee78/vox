@@ -2259,8 +2259,8 @@ mod page;
 pub(crate) use page::{LivePageResult, PageFlow, PagePreparation, PageResult};
 mod expiry;
 mod serve;
-pub(crate) use serve::MediaAdmission;
 pub(in crate::node::channel) use expiry::sweep_private;
+pub(crate) use serve::MediaAdmission;
 
 impl ChannelState {
     pub(in crate::node::channel) fn snapshot_private_generations(
