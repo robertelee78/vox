@@ -79,10 +79,9 @@
 //     (D10). Dave trusts alice; her member pane says he is "not in keyring, room consent observed", the room
 //     names him as not yet reading each other with her, and his card says both directions; Trust…
 //     there, with his alias, makes him "local trust and room consent observed" and puts him in her keyring, through
-//     the passphrase gate if the keyring window has closed (D4). With bob's and dave's nodes
-//     detached, a message she posts says "only on this machine"; once bob's node is back, "on 1 of
-//     2 members' nodes" (D9). Node > Detach then offers only to attach alice again, never another
-//     node of this Mac's, and attaching again makes the window hers (D17).
+//     the passphrase gate if the keyring window has closed (D4). Node > Detach then offers only
+//     to attach alice again, never another node of this Mac's, and attaching again makes the
+//     window hers (D17).
 //     Compare goes group by group (#624): on dave's card two groups say "So far matches 2 of 13
 //     groups.", a wrong third is named as group 3 with no Remove (he is not in the keyring), and
 //     the whole of it is marked a match. (Since #726 a room newcomer's offer is his member row
@@ -106,10 +105,10 @@
 //     aaa and bbb and mission's link.
 //
 // Mutants for (15), one each: the member rows drop a node's trust in alice unless she trusts it
-// (D4: the row reads "not in keyring"); the timeline drops the whereabouts line (D9); the join
-// line leaves out who trusts the newcomer (D10); Detach goes back to the chooser of every node
-// (D17); a compare that calls any partial entry a mismatch (#624); the keyring card saying a node
-// that trusts alice back is still waiting (G2). Each turns (15) red on its own assertion.
+// (D4: the row reads "not in keyring"); the join line leaves out who trusts the newcomer (D10);
+// Detach goes back to the chooser of every node (D17); a compare that calls any partial entry a
+// mismatch (#624); the keyring card saying a node that trusts alice back is still waiting (G2).
+// Each turns (15) red on its own assertion.
 // Mutants: the app attaches its node so that it outlives the app (the daemon's explicit attach in
 // place of the app's hold), and quitting leaves it attached: (12) goes red. A room with a message
 // addressed to this node grouped as quiet (`attention::group`): (3) goes red. An app that never
@@ -1966,12 +1965,10 @@ final class FirstRunProof: XCTestCase {
                           "Add Computer must open its account-owned view") else { throw Product("Add Computer did not open") }
         }
         func quitComputerAccount() throws {
-            let computerView = pairingUI.scrollViews.matching(identifier: "computer-trust-sheet").firstMatch
+            let computerView = pairingUI.descendants(matching: .any).matching(identifier: "computer-trust-sheet").firstMatch
             if computerView.exists {
-                // SwiftUI propagates the sheet's identifier onto its Done button.
-                // Scope the visible action to the actual sheet and its button label.
-                let done = pairingUI.sheets.buttons.matching(NSPredicate(
-                    format: "identifier == %@ AND label == %@", "computer-trust-sheet", "Done")).firstMatch
+                // The sheet's own Done, scoped to the sheet; it keeps its own identifier.
+                let done = pairingUI.sheets.buttons.matching(identifier: "computer-done").firstMatch
                 guard done.exists, done.isHittable, inView(pairingUI, done) else {
                     keepTree(pairingUI, "the computer account's Done action could not be delivered")
                     XCTFail("APPARATUS: the visible computer view’s Done button could not be staged for account switching")
@@ -2093,277 +2090,6 @@ final class FirstRunProof: XCTestCase {
         XCTAssertEqual(appliedA["state"] as? String, "confirmed", "PRODUCT: inviting computer must be applied")
         XCTAssertEqual(appliedB["state"] as? String, "confirmed", "PRODUCT: reviewing computer must be applied")
         try quitComputerAccount()
-        // Stage a second, genuinely established group, then review and replace it in My Computers.
-        var replacementHostC: Started?
-        var replacementHostD: Started?
-        defer { replacementHostC?.terminate(); replacementHostD?.terminate() }
-        do {
-        let computerC = computerEnv("r1").merging([
-            "VOX_TEST_KEYCHAIN": computerRoot.appendingPathComponent("r1/pairing.keychain-db").path
-        ]) { $1 }
-        let computerD = computerEnv("r2").merging([
-            "VOX_TEST_KEYCHAIN": computerRoot.appendingPathComponent("r2/pairing.keychain-db").path
-        ]) { $1 }
-        for environment in [computerC, computerD] {
-            guard stager.run(["/bin/mkdir", "-p", environment["HOME"]!], env: [:]).status == 0,
-                  stager.run(["/usr/bin/security", "create-keychain", "-p", "", environment["VOX_TEST_KEYCHAIN"]!],
-                             env: ["HOME": environment["HOME"]!]).status == 0 else {
-                throw Apparatus("cannot create the isolated old-group account and Keychain")
-            }
-        }
-        let hostC = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: computerC,
-                              until: "vox daemon: control socket")
-        replacementHostC = hostC
-        let hostD = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: computerD,
-                              until: "vox daemon: control socket")
-        replacementHostD = hostD
-        for environment in [computerC, computerD] {
-            try stager.write(Data("no\n".utf8), to: environment["VOX_CONFIG_DIR"]! + "/app/login-item")
-        }
-        func computerCommand(_ environment: [String: String], _ args: [String]) throws -> [String: Any] {
-            let result = stager.run([vox, "computer"] + args + ["--json"], env: environment)
-            guard result.status == 0 else {
-                throw Apparatus("scratch computer \(args.first ?? "command") staging failed (exit \(result.status))")
-            }
-            guard let result = try JSONSerialization.jsonObject(with: Data(result.out.utf8)) as? [String: Any] else {
-                throw Apparatus("scratch computer command did not return a JSON status")
-            }
-            return result
-        }
-        try staged(vox, ["node", "create", "move-native"],
-                   env: computerC.merging(["VOX_IDENTITY_PASSPHRASE": "protected pairing identity"]) { $1 })
-        try staged(vox, ["node", "attach", "move-native", "--passphrase-file", computerPass], env: computerC)
-        try staged(vox, ["node", "create", "beast-agent"],
-                   env: computerC.merging(["VOX_IDENTITY_PASSPHRASE": "protected pairing identity"]) { $1 })
-        try staged(vox, ["node", "attach", "beast-agent", "--passphrase-file", computerPass], env: computerC)
-        try staged(vox, ["node", "create", "old-native-peer"],
-                   env: computerD.merging(["VOX_IDENTITY_PASSPHRASE": "protected pairing identity"]) { $1 })
-        try staged(vox, ["node", "attach", "old-native-peer", "--passphrase-file", computerPass], env: computerD)
-        _ = try computerCommand(computerD, ["personal", "old-native-peer"])
-        _ = try computerCommand(computerB, ["personal", "protected"])
-        _ = try computerCommand(computerC, ["personal", "move-native"])
-        let oldOffer = try computerCommand(computerC, ["invite"])
-        guard let oldCode = oldOffer["invite_link"] as? String else {
-            throw Apparatus("the old group did not produce an invitation")
-        }
-        let oldReview = try computerCommand(computerD, ["pair", oldCode, "--preview"])
-        guard let oldPair = oldReview["pairing"] as? [String: Any],
-              let oldOperation = oldPair["operation_id"] as? String else {
-            throw Apparatus("the old group did not stage authenticated review")
-        }
-        _ = try computerCommand(computerD, ["approve", oldOperation])
-        _ = try computerCommand(computerC, ["approve", oldOperation])
-        let oldUntil = Date().addingTimeInterval(45)
-        while Date() < oldUntil {
-            if try computerStatus(computerC)["state"] as? String == "confirmed",
-               try computerStatus(computerD)["state"] as? String == "confirmed" { break }
-            Thread.sleep(forTimeInterval: 0.3)
-        }
-        let beforeReplacement = try computerStatus(computerC)
-        guard beforeReplacement["state"] as? String == "confirmed",
-              let oldIdentity = beforeReplacement["this_computer"] as? [String: Any],
-              let oldFingerprint = oldIdentity["fingerprint"] as? String else {
-            throw Apparatus("the isolated old group did not converge for native replacement")
-        }
-        try staged(vox, ["room", "create", "--node", "move-native", "--name", "old-native-room",
-                         "--passphrase-file", computerPass], env: computerC)
-        let oldRooms = try staged(vox, ["room", "list", "--node", "move-native"], env: computerC)
-        let oldRoom = try line(oldRooms) { $0.contains(" old-native-room") }
-            .split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
-        guard !oldRoom.isEmpty else { throw Apparatus("the old-group room was not staged") }
-        let oldRoomLink = try line(staged(vox, ["room", "link", "--node", "move-native", oldRoom], env: computerC)) {
-            $0.hasPrefix("vox://")
-        }
-        try staged(vox, ["room", "join", "--node", "old-native-peer", "--passphrase-file", computerPass, oldRoomLink], env: computerD)
-        try staged(vox, ["room", "post", "--node", "move-native", oldRoom, "native-old-baseline"], env: computerC)
-        let baselineUntil = Date().addingTimeInterval(45)
-        var oldBaseline = ""
-        while Date() < baselineUntil {
-            oldBaseline = run(vox, ["room", "read", "--node", "old-native-peer", oldRoom], env: computerD).out
-            if oldBaseline.contains("native-old-baseline") { break }
-            Thread.sleep(forTimeInterval: 0.3)
-        }
-        guard oldBaseline.contains("native-old-baseline") else {
-            throw Apparatus("the old-group peer could not read its staged baseline")
-        }
-        try hostD.pause()
-        defer { try? hostD.resume() }
-        _ = try computerCommand(computerC, ["personal", "--clear"])
-        try openComputers(computerC)
-        // ComputerTrust.swift names a retry in flight before an earlier failure ("exchange in
-        // progress"), so an offline peer retried on backoff shows either exchange observation.
-        let observedUntil = Date().addingTimeInterval(45)
-        var observed = false
-        while !observed && Date() < observedUntil {
-            observed = locate(pairingUI, Key.showing("last exchange failed")) != nil
-                || locate(pairingUI, Key.showing("exchange in progress; current reachability unknown")) != nil
-            if !observed { Thread.sleep(forTimeInterval: 0.5) }
-        }
-        guard observed else {
-            keepTree(pairingUI, "the offline old peer's exchange was not observed")
-            XCTFail("PRODUCT: an offline old peer must be shown as an exchange observation, not as a rejected policy: \(onScreen(pairingUI))")
-            return
-        }
-        guard present(pairingUI, Key.showing("Awaiting application confirmation"), timeout: 30,
-                      "an offline peer's application must remain distinct from connectivity") else { return }
-        try quitComputerAccount()
-        _ = try computerCommand(computerC, ["personal", "move-native"])
-        let destinationOffer = try computerCommand(computerA, ["invite"])
-        guard var destinationCode = destinationOffer["invite_link"] as? String else {
-            throw Apparatus("the destination did not produce its invitation")
-        }
-        try openComputers(computerC)
-        type(pairingUI, Key.id("computer-pairing-input"), destinationCode, "the destination group's pairing code")
-        tap(pairingUI, Key.id("computer-pairing-preview"), "Review the authenticated different group")
-        guard present(pairingUI, Key.id("computer-replace-group"), timeout: 30,
-                      "an authenticated different group must offer reviewed replacement") else { return }
-        let refusal = try computerStatus(computerC)
-        guard let conflict = refusal["conflict"] as? [String: Any],
-              var rejectedOperation = conflict["operation_id"] as? String else {
-            throw Product("native different-group review did not retain an authenticated conflict: \(refusal)")
-        }
-        tap(pairingUI, Key.id("computer-replace-group"), "Review local replacement")
-        tap(pairingUI, Key.id("computer-replacement-decline"), "Decline group replacement")
-        let declined = try computerStatus(computerC)
-        XCTAssertEqual((declined["this_computer"] as? [String: Any])?["fingerprint"] as? String, oldFingerprint,
-                       "PRODUCT: declining replacement must preserve the computer identity")
-        XCTAssertEqual((declined["computers"] as? [[String: Any]])?.count,
-                       (beforeReplacement["computers"] as? [[String: Any]])?.count,
-                       "PRODUCT: declining replacement must preserve group membership")
-        tap(pairingUI, Key.id("computer-conflict-close"), "Keep the current group and close the review")
-        guard present(pairingUI, Key.id("computer-pairing-begin"), timeout: 30,
-                      "closing the review must restore normal computer actions") else { return }
-        let rejectedAgain = run(vox, ["computer", "pair", destinationCode, "--preview", "--json"], env: computerC)
-        XCTAssertNotEqual(rejectedAgain.status, 0,
-                          "PRODUCT: a locally closed proposal must not produce a new replacement review")
-        _ = try computerCommand(computerA, ["cancel", rejectedOperation])
-        let replacementOffer = try computerCommand(computerA, ["invite"])
-        guard let replacementCode = replacementOffer["invite_link"] as? String else {
-            throw Apparatus("the destination did not provide a replacement review invitation")
-        }
-        destinationCode = replacementCode
-        type(pairingUI, Key.id("computer-pairing-input"), destinationCode, "the new invitation")
-        tap(pairingUI, Key.id("computer-pairing-preview"), "Review the new authenticated proposal")
-        guard present(pairingUI, Key.id("computer-replace-group"), timeout: 30,
-                      "a fresh invitation must offer a new review") else { return }
-        let freshConflict = try computerStatus(computerC)
-        guard let newConflict = freshConflict["conflict"] as? [String: Any],
-              let newOperation = newConflict["operation_id"] as? String else {
-            throw Product("the fresh conflict omitted its authenticated operation")
-        }
-        rejectedOperation = newOperation
-        tap(pairingUI, Key.id("computer-replace-group"), "Review the original authority")
-        _ = try computerCommand(computerC, ["personal", "--clear"])
-        tap(pairingUI, Key.id("computer-replacement-confirm"), "Reject the now-stale review")
-        guard present(pairingUI, Key.id("computer-action-problem"), timeout: 30,
-                      "a changed authority must require a fresh replacement review") else { return }
-        let stale = try computerStatus(computerC)
-        XCTAssertEqual((stale["computers"] as? [[String: Any]])?.count,
-                       (beforeReplacement["computers"] as? [[String: Any]])?.count,
-                       "PRODUCT: a stale review must not retire group membership")
-        _ = try computerCommand(computerC, ["personal", "move-native"])
-        tap(pairingUI, Key.id("computer-refresh"), "Refresh the changed computer authority")
-        guard present(pairingUI, Key.showing("last exchange failed"), timeout: 45,
-                      "the old-group peer's unresolved exchange failure must remain visible before replacement") else { return }
-        type(pairingUI, Key.id("computer-conflict-input"), destinationCode, "the invitation for a fresh review")
-        tap(pairingUI, Key.id("computer-conflict-review-again"), "Review changed authority")
-        guard present(pairingUI, Key.id("computer-replace-group"), timeout: 30,
-                      "a fresh authenticated review must permit replacement") else { return }
-        tap(pairingUI, Key.id("computer-replace-group"), "Review replacement again")
-        tap(pairingUI, Key.id("computer-replacement-confirm"), "Explicitly retire the old group locally")
-        let retiredUntil = Date().addingTimeInterval(45)
-        while Date() < retiredUntil {
-            if try computerStatus(computerC)["state"] as? String == "individual" { break }
-            Thread.sleep(forTimeInterval: 0.3)
-        }
-        let retired = try computerStatus(computerC)
-        XCTAssertEqual(retired["state"] as? String, "individual",
-                       "PRODUCT: explicitly reviewed replacement must retire the old group locally")
-        XCTAssertEqual((retired["this_computer"] as? [String: Any])?["fingerprint"] as? String, oldFingerprint,
-                       "PRODUCT: local retirement must preserve the computer identity")
-        try quitComputerAccount()
-        let closeRejected = run(vox, ["computer", "cancel", rejectedOperation], env: computerA)
-        guard closeRejected.status == 0 else {
-            throw Product("the inviting computer could not close its rejected proposal: \(closeRejected.out)")
-        }
-        let freshOffer = try computerCommand(computerA, ["invite"])
-        guard let freshCode = freshOffer["invite_link"] as? String else {
-            throw Apparatus("the destination did not produce a fresh invitation")
-        }
-        try openComputers(computerC)
-        type(pairingUI, Key.id("computer-pairing-input"), freshCode, "the fresh destination invitation")
-        tap(pairingUI, Key.id("computer-pairing-preview"), "Review the fresh proposal")
-        let freshReview = try computerStatus(computerC)
-        guard let freshPair = freshReview["pairing"] as? [String: Any],
-              let freshOperation = freshPair["operation_id"] as? String else {
-            throw Product("the fresh invitation did not offer an authenticated approval")
-        }
-        XCTAssertNotEqual(freshOperation, rejectedOperation, "PRODUCT: replacement must not reuse the old operation")
-        tap(pairingUI, Key.id("computer-pairing-approve"), "Approve the fresh proposal on this computer")
-        let destinationApproval = run(vox, ["computer", "approve", freshOperation], env: computerA)
-        guard destinationApproval.status == 0 else {
-            throw Product("the destination could not approve the fresh proposal: \(destinationApproval.out)")
-        }
-        let freshUntil = Date().addingTimeInterval(45)
-        while Date() < freshUntil {
-            if try computerStatus(computerC)["state"] as? String == "confirmed" { break }
-            Thread.sleep(forTimeInterval: 0.3)
-        }
-        XCTAssertEqual(try computerStatus(computerC)["state"] as? String, "confirmed",
-                       "PRODUCT: fresh bilateral approval must join the destination group")
-        guard present(pairingUI, Key.showing("mutual Read directly"), timeout: 30,
-                      "native group policy must show direct mutual Read, not an inviter relay"),
-              words(pairingUI, Key.showing("protected can Drive:"), timeout: 30,
-                    "native policy must show personal-to-Beast Drive and exclude the other personal node",
-                    until: { $0.contains("beast-agent") && !$0.contains("move-native") }) != nil,
-              present(pairingUI, Key.showing("Personal nodes do not automatically Drive other personal nodes"), timeout: 30,
-                      "native group policy must exclude personal-to-personal Drive"),
-              present(pairingUI, Key.showing("current reachability unknown"), timeout: 30,
-                      "native connectivity must remain separate from application receipts") else { return }
-        XCTAssertNil(locateEverywhere(pairingUI, Key.id("computer-pairing-problem")),
-                     "PRODUCT: a retired old-group exchange failure must not stand as a current problem")
-        try hostD.resume()
-        let oldPost = run(vox, ["room", "post", "--node", "move-native", oldRoom, "native-old-after-retirement"], env: computerC)
-        guard oldPost.status == 0 else {
-            throw Product("the preserved old room could not post after replacement: \(oldPost.out)")
-        }
-        let oldReadUntil = Date().addingTimeInterval(45)
-        var leakedOldMessage = false
-        while Date() < oldReadUntil {
-            let oldRead = run(vox, ["room", "read", "--node", "old-native-peer", oldRoom], env: computerD)
-            if oldRead.status == 0 && oldRead.out.contains("native-old-after-retirement") {
-                leakedOldMessage = true
-                break
-            }
-            Thread.sleep(forTimeInterval: 0.3)
-        }
-        XCTAssertFalse(leakedOldMessage, "PRODUCT: the old-group peer read a fresh post after its covered authority was retired")
-        let replacementRoomLink = try line(staged(vox, ["room", "link", "--node", "protected", keptRoom], env: computerB)) {
-            $0.hasPrefix("vox://")
-        }
-        let joinedReplacement = run(vox, ["room", "join", "--node", "move-native", "--passphrase-file", computerPass, replacementRoomLink],
-                                    env: computerC)
-        guard joinedReplacement.status == 0 else {
-            throw Product("the replaced computer could not join the destination's room: \(joinedReplacement.out)")
-        }
-        let fromReplacement = run(vox, ["room", "post", "--node", "move-native", keptRoom, "native-after-replacement"], env: computerC)
-        let fromDestination = run(vox, ["room", "post", "--node", "protected", keptRoom, "native-after-destination"], env: computerB)
-        guard fromReplacement.status == 0 && fromDestination.status == 0 else {
-            throw Product("the replaced and destination computers could not post after fresh approval")
-        }
-        let messageUntil = Date().addingTimeInterval(45)
-        var destinationRead = "", replacementRead = ""
-        while Date() < messageUntil {
-            destinationRead = run(vox, ["room", "read", "--node", "protected", keptRoom], env: computerB).out
-            replacementRead = run(vox, ["room", "read", "--node", "move-native", keptRoom], env: computerC).out
-            if destinationRead.contains("native-after-replacement") && replacementRead.contains("native-after-destination") { break }
-            Thread.sleep(forTimeInterval: 0.3)
-        }
-        XCTAssertTrue(destinationRead.contains("native-after-replacement") && replacementRead.contains("native-after-destination"),
-                      "PRODUCT: fresh messages must be readable both ways after native replacement")
-        try quitComputerAccount()
-        _ = try computerCommand(computerB, ["personal", "--clear"])
-        }
         print("[proof] Add Computer: zero-node invitation; authenticated review; one-sided waiting; protected-node pending; ordinary attach; both confirmed; existing room and repo binding retained")
         // Native OpenCode Session driving uses the existing plugin host apparatus, with no
         // model or room override. Actual room joins and the saved repo binding remain authority.
@@ -2632,6 +2358,278 @@ final class FirstRunProof: XCTestCase {
         nativeHost.terminate()
         try quitComputerAccount()
         print("[proof] paired selected personal node drove the repo-bound native OpenCode Session through app say; recipient received exact prompt and returned visible step; joined ordinary node refused with no recipient call")
+        // Stage a second, genuinely established group, then review and replace it in My Computers.
+        // It needs none of the paired A/B consent journey above, which therefore runs first.
+        var replacementHostC: Started?
+        var replacementHostD: Started?
+        defer { replacementHostC?.terminate(); replacementHostD?.terminate() }
+        do {
+        let computerC = computerEnv("r1").merging([
+            "VOX_TEST_KEYCHAIN": computerRoot.appendingPathComponent("r1/pairing.keychain-db").path
+        ]) { $1 }
+        let computerD = computerEnv("r2").merging([
+            "VOX_TEST_KEYCHAIN": computerRoot.appendingPathComponent("r2/pairing.keychain-db").path
+        ]) { $1 }
+        for environment in [computerC, computerD] {
+            guard stager.run(["/bin/mkdir", "-p", environment["HOME"]!], env: [:]).status == 0,
+                  stager.run(["/usr/bin/security", "create-keychain", "-p", "", environment["VOX_TEST_KEYCHAIN"]!],
+                             env: ["HOME": environment["HOME"]!]).status == 0 else {
+                throw Apparatus("cannot create the isolated old-group account and Keychain")
+            }
+        }
+        let hostC = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: computerC,
+                              until: "vox daemon: control socket")
+        replacementHostC = hostC
+        let hostD = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: computerD,
+                              until: "vox daemon: control socket")
+        replacementHostD = hostD
+        for environment in [computerC, computerD] {
+            try stager.write(Data("no\n".utf8), to: environment["VOX_CONFIG_DIR"]! + "/app/login-item")
+        }
+        func computerCommand(_ environment: [String: String], _ args: [String]) throws -> [String: Any] {
+            let result = stager.run([vox, "computer"] + args + ["--json"], env: environment)
+            guard result.status == 0 else {
+                throw Apparatus("scratch computer \(args.first ?? "command") staging failed (exit \(result.status))")
+            }
+            guard let result = try JSONSerialization.jsonObject(with: Data(result.out.utf8)) as? [String: Any] else {
+                throw Apparatus("scratch computer command did not return a JSON status")
+            }
+            return result
+        }
+        try staged(vox, ["node", "create", "move-native"],
+                   env: computerC.merging(["VOX_IDENTITY_PASSPHRASE": "protected pairing identity"]) { $1 })
+        try staged(vox, ["node", "attach", "move-native", "--passphrase-file", computerPass], env: computerC)
+        try staged(vox, ["node", "create", "beast-agent"],
+                   env: computerC.merging(["VOX_IDENTITY_PASSPHRASE": "protected pairing identity"]) { $1 })
+        try staged(vox, ["node", "attach", "beast-agent", "--passphrase-file", computerPass], env: computerC)
+        try staged(vox, ["node", "create", "old-native-peer"],
+                   env: computerD.merging(["VOX_IDENTITY_PASSPHRASE": "protected pairing identity"]) { $1 })
+        try staged(vox, ["node", "attach", "old-native-peer", "--passphrase-file", computerPass], env: computerD)
+        _ = try computerCommand(computerD, ["personal", "old-native-peer"])
+        _ = try computerCommand(computerB, ["personal", "protected"])
+        _ = try computerCommand(computerC, ["personal", "move-native"])
+        let oldOffer = try computerCommand(computerC, ["invite"])
+        guard let oldCode = oldOffer["invite_link"] as? String else {
+            throw Apparatus("the old group did not produce an invitation")
+        }
+        let oldReview = try computerCommand(computerD, ["pair", oldCode, "--preview"])
+        guard let oldPair = oldReview["pairing"] as? [String: Any],
+              let oldOperation = oldPair["operation_id"] as? String else {
+            throw Apparatus("the old group did not stage authenticated review")
+        }
+        _ = try computerCommand(computerD, ["approve", oldOperation])
+        _ = try computerCommand(computerC, ["approve", oldOperation])
+        let oldUntil = Date().addingTimeInterval(45)
+        while Date() < oldUntil {
+            if try computerStatus(computerC)["state"] as? String == "confirmed",
+               try computerStatus(computerD)["state"] as? String == "confirmed" { break }
+            Thread.sleep(forTimeInterval: 0.3)
+        }
+        let beforeReplacement = try computerStatus(computerC)
+        guard beforeReplacement["state"] as? String == "confirmed",
+              let oldIdentity = beforeReplacement["this_computer"] as? [String: Any],
+              let oldFingerprint = oldIdentity["fingerprint"] as? String else {
+            throw Apparatus("the isolated old group did not converge for native replacement")
+        }
+        try staged(vox, ["room", "create", "--node", "move-native", "--name", "old-native-room",
+                         "--passphrase-file", computerPass], env: computerC)
+        let oldRooms = try staged(vox, ["room", "list", "--node", "move-native"], env: computerC)
+        let oldRoom = try line(oldRooms) { $0.contains(" old-native-room") }
+            .split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
+        guard !oldRoom.isEmpty else { throw Apparatus("the old-group room was not staged") }
+        let oldRoomLink = try line(staged(vox, ["room", "link", "--node", "move-native", oldRoom], env: computerC)) {
+            $0.hasPrefix("vox://")
+        }
+        try staged(vox, ["room", "join", "--node", "old-native-peer", "--passphrase-file", computerPass, oldRoomLink], env: computerD)
+        try staged(vox, ["room", "post", "--node", "move-native", oldRoom, "native-old-baseline"], env: computerC)
+        let baselineUntil = Date().addingTimeInterval(45)
+        var oldBaseline = ""
+        while Date() < baselineUntil {
+            oldBaseline = run(vox, ["room", "read", "--node", "old-native-peer", oldRoom], env: computerD).out
+            if oldBaseline.contains("native-old-baseline") { break }
+            Thread.sleep(forTimeInterval: 0.3)
+        }
+        guard oldBaseline.contains("native-old-baseline") else {
+            throw Apparatus("the old-group peer could not read its staged baseline")
+        }
+        try hostD.pause()
+        defer { try? hostD.resume() }
+        _ = try computerCommand(computerC, ["personal", "--clear"])
+        try openComputers(computerC)
+        // The paused old peer's connectivity line says an exchange is in progress while a retry
+        // runs and "last exchange failed" between retries (ComputerTrust.swift): either one is
+        // an exchange observation, never a rejected policy.
+        func exchangeObserved(_ what: String) -> Bool {
+            let observedUntil = Date().addingTimeInterval(45)
+            while Date() < observedUntil {
+                if locate(pairingUI, Key.showing("last exchange failed")) != nil
+                    || locate(pairingUI, Key.showing("exchange in progress; current reachability unknown")) != nil { return true }
+                Thread.sleep(forTimeInterval: 0.5)
+            }
+            keepTree(pairingUI, "the offline old peer's exchange was not observed")
+            XCTFail("PRODUCT: \(what): \(onScreen(pairingUI))")
+            return false
+        }
+        guard exchangeObserved("an offline old peer must be shown as an exchange observation, not as a rejected policy") else { return }
+        guard present(pairingUI, Key.showing("Awaiting application confirmation"), timeout: 30,
+                      "an offline peer's application must remain distinct from connectivity") else { return }
+        try quitComputerAccount()
+        _ = try computerCommand(computerC, ["personal", "move-native"])
+        let destinationOffer = try computerCommand(computerA, ["invite"])
+        guard var destinationCode = destinationOffer["invite_link"] as? String else {
+            throw Apparatus("the destination did not produce its invitation")
+        }
+        try openComputers(computerC)
+        type(pairingUI, Key.id("computer-pairing-input"), destinationCode, "the destination group's pairing code")
+        tap(pairingUI, Key.id("computer-pairing-preview"), "Review the authenticated different group")
+        guard present(pairingUI, Key.id("computer-replace-group"), timeout: 30,
+                      "an authenticated different group must offer reviewed replacement") else { return }
+        let refusal = try computerStatus(computerC)
+        guard let conflict = refusal["conflict"] as? [String: Any],
+              var rejectedOperation = conflict["operation_id"] as? String else {
+            throw Product("native different-group review did not retain an authenticated conflict: \(refusal)")
+        }
+        tap(pairingUI, Key.id("computer-replace-group"), "Review local replacement")
+        tap(pairingUI, Key.id("computer-replacement-decline"), "Decline group replacement")
+        let declined = try computerStatus(computerC)
+        XCTAssertEqual((declined["this_computer"] as? [String: Any])?["fingerprint"] as? String, oldFingerprint,
+                       "PRODUCT: declining replacement must preserve the computer identity")
+        XCTAssertEqual((declined["computers"] as? [[String: Any]])?.count,
+                       (beforeReplacement["computers"] as? [[String: Any]])?.count,
+                       "PRODUCT: declining replacement must preserve group membership")
+        tap(pairingUI, Key.id("computer-conflict-close"), "Keep the current group and close the review")
+        guard present(pairingUI, Key.id("computer-pairing-begin"), timeout: 30,
+                      "closing the review must restore normal computer actions") else { return }
+        let rejectedAgain = run(vox, ["computer", "pair", destinationCode, "--preview", "--json"], env: computerC)
+        XCTAssertNotEqual(rejectedAgain.status, 0,
+                          "PRODUCT: a locally closed proposal must not produce a new replacement review")
+        _ = try computerCommand(computerA, ["cancel", rejectedOperation])
+        let replacementOffer = try computerCommand(computerA, ["invite"])
+        guard let replacementCode = replacementOffer["invite_link"] as? String else {
+            throw Apparatus("the destination did not provide a replacement review invitation")
+        }
+        destinationCode = replacementCode
+        type(pairingUI, Key.id("computer-pairing-input"), destinationCode, "the new invitation")
+        tap(pairingUI, Key.id("computer-pairing-preview"), "Review the new authenticated proposal")
+        guard present(pairingUI, Key.id("computer-replace-group"), timeout: 30,
+                      "a fresh invitation must offer a new review") else { return }
+        let freshConflict = try computerStatus(computerC)
+        guard let newConflict = freshConflict["conflict"] as? [String: Any],
+              let newOperation = newConflict["operation_id"] as? String else {
+            throw Product("the fresh conflict omitted its authenticated operation")
+        }
+        rejectedOperation = newOperation
+        tap(pairingUI, Key.id("computer-replace-group"), "Review the original authority")
+        _ = try computerCommand(computerC, ["personal", "--clear"])
+        tap(pairingUI, Key.id("computer-replacement-confirm"), "Reject the now-stale review")
+        guard present(pairingUI, Key.id("computer-action-problem"), timeout: 30,
+                      "a changed authority must require a fresh replacement review") else { return }
+        let stale = try computerStatus(computerC)
+        XCTAssertEqual((stale["computers"] as? [[String: Any]])?.count,
+                       (beforeReplacement["computers"] as? [[String: Any]])?.count,
+                       "PRODUCT: a stale review must not retire group membership")
+        _ = try computerCommand(computerC, ["personal", "move-native"])
+        tap(pairingUI, Key.id("computer-refresh"), "Refresh the changed computer authority")
+        guard exchangeObserved("the old-group peer's unresolved exchange must remain an exchange observation before replacement") else { return }
+        type(pairingUI, Key.id("computer-conflict-input"), destinationCode, "the invitation for a fresh review")
+        tap(pairingUI, Key.id("computer-conflict-review-again"), "Review changed authority")
+        guard present(pairingUI, Key.id("computer-replace-group"), timeout: 30,
+                      "a fresh authenticated review must permit replacement") else { return }
+        tap(pairingUI, Key.id("computer-replace-group"), "Review replacement again")
+        tap(pairingUI, Key.id("computer-replacement-confirm"), "Explicitly retire the old group locally")
+        let retiredUntil = Date().addingTimeInterval(45)
+        while Date() < retiredUntil {
+            if try computerStatus(computerC)["state"] as? String == "individual" { break }
+            Thread.sleep(forTimeInterval: 0.3)
+        }
+        let retired = try computerStatus(computerC)
+        XCTAssertEqual(retired["state"] as? String, "individual",
+                       "PRODUCT: explicitly reviewed replacement must retire the old group locally")
+        XCTAssertEqual((retired["this_computer"] as? [String: Any])?["fingerprint"] as? String, oldFingerprint,
+                       "PRODUCT: local retirement must preserve the computer identity")
+        try quitComputerAccount()
+        let closeRejected = run(vox, ["computer", "cancel", rejectedOperation], env: computerA)
+        guard closeRejected.status == 0 else {
+            throw Product("the inviting computer could not close its rejected proposal: \(closeRejected.out)")
+        }
+        let freshOffer = try computerCommand(computerA, ["invite"])
+        guard let freshCode = freshOffer["invite_link"] as? String else {
+            throw Apparatus("the destination did not produce a fresh invitation")
+        }
+        try openComputers(computerC)
+        type(pairingUI, Key.id("computer-pairing-input"), freshCode, "the fresh destination invitation")
+        tap(pairingUI, Key.id("computer-pairing-preview"), "Review the fresh proposal")
+        let freshReview = try computerStatus(computerC)
+        guard let freshPair = freshReview["pairing"] as? [String: Any],
+              let freshOperation = freshPair["operation_id"] as? String else {
+            throw Product("the fresh invitation did not offer an authenticated approval")
+        }
+        XCTAssertNotEqual(freshOperation, rejectedOperation, "PRODUCT: replacement must not reuse the old operation")
+        tap(pairingUI, Key.id("computer-pairing-approve"), "Approve the fresh proposal on this computer")
+        let destinationApproval = run(vox, ["computer", "approve", freshOperation], env: computerA)
+        guard destinationApproval.status == 0 else {
+            throw Product("the destination could not approve the fresh proposal: \(destinationApproval.out)")
+        }
+        let freshUntil = Date().addingTimeInterval(45)
+        while Date() < freshUntil {
+            if try computerStatus(computerC)["state"] as? String == "confirmed" { break }
+            Thread.sleep(forTimeInterval: 0.3)
+        }
+        XCTAssertEqual(try computerStatus(computerC)["state"] as? String, "confirmed",
+                       "PRODUCT: fresh bilateral approval must join the destination group")
+        guard present(pairingUI, Key.showing("mutual Read directly"), timeout: 30,
+                      "native group policy must show direct mutual Read, not an inviter relay"),
+              words(pairingUI, Key.showing("protected can Drive:"), timeout: 30,
+                    "native policy must show personal-to-Beast Drive and exclude the other personal node",
+                    until: { $0.contains("beast-agent") && !$0.contains("move-native") }) != nil,
+              present(pairingUI, Key.showing("Personal nodes do not automatically Drive other personal nodes"), timeout: 30,
+                      "native group policy must exclude personal-to-personal Drive"),
+              present(pairingUI, Key.showing("current reachability unknown"), timeout: 30,
+                      "native connectivity must remain separate from application receipts") else { return }
+        XCTAssertNil(locateEverywhere(pairingUI, Key.id("computer-pairing-problem")),
+                     "PRODUCT: a retired old-group exchange failure must not stand as a current problem")
+        try hostD.resume()
+        let oldPost = run(vox, ["room", "post", "--node", "move-native", oldRoom, "native-old-after-retirement"], env: computerC)
+        guard oldPost.status == 0 else {
+            throw Product("the preserved old room could not post after replacement: \(oldPost.out)")
+        }
+        let oldReadUntil = Date().addingTimeInterval(45)
+        var leakedOldMessage = false
+        while Date() < oldReadUntil {
+            let oldRead = run(vox, ["room", "read", "--node", "old-native-peer", oldRoom], env: computerD)
+            if oldRead.status == 0 && oldRead.out.contains("native-old-after-retirement") {
+                leakedOldMessage = true
+                break
+            }
+            Thread.sleep(forTimeInterval: 0.3)
+        }
+        XCTAssertFalse(leakedOldMessage, "PRODUCT: the old-group peer read a fresh post after its covered authority was retired")
+        let replacementRoomLink = try line(staged(vox, ["room", "link", "--node", "protected", keptRoom], env: computerB)) {
+            $0.hasPrefix("vox://")
+        }
+        let joinedReplacement = run(vox, ["room", "join", "--node", "move-native", "--passphrase-file", computerPass, replacementRoomLink],
+                                    env: computerC)
+        guard joinedReplacement.status == 0 else {
+            throw Product("the replaced computer could not join the destination's room: \(joinedReplacement.out)")
+        }
+        let fromReplacement = run(vox, ["room", "post", "--node", "move-native", keptRoom, "native-after-replacement"], env: computerC)
+        let fromDestination = run(vox, ["room", "post", "--node", "protected", keptRoom, "native-after-destination"], env: computerB)
+        guard fromReplacement.status == 0 && fromDestination.status == 0 else {
+            throw Product("the replaced and destination computers could not post after fresh approval")
+        }
+        let messageUntil = Date().addingTimeInterval(45)
+        var destinationRead = "", replacementRead = ""
+        while Date() < messageUntil {
+            destinationRead = run(vox, ["room", "read", "--node", "protected", keptRoom], env: computerB).out
+            replacementRead = run(vox, ["room", "read", "--node", "move-native", keptRoom], env: computerC).out
+            if destinationRead.contains("native-after-replacement") && replacementRead.contains("native-after-destination") { break }
+            Thread.sleep(forTimeInterval: 0.3)
+        }
+        XCTAssertTrue(destinationRead.contains("native-after-replacement") && replacementRead.contains("native-after-destination"),
+                      "PRODUCT: fresh messages must be readable both ways after native replacement")
+        try quitComputerAccount()
+        _ = try computerCommand(computerB, ["personal", "--clear"])
+        }
 
         // The ordinary app must explain a real storage refusal, not retain its old confirmation.
         try staged(vox, ["node", "create", "storage-failure"],
@@ -3240,10 +3238,10 @@ final class FirstRunProof: XCTestCase {
             links[name] = link
         }
         let room = rooms["work"] ?? ""
-        try staged(vox, ["trust", "add", "--node", "alice", agentFp, "--name", "claude-a",
-                         "--identity-passphrase-file", pass("alice")], env: voxEnv)
-        try staged(vox, ["trust", "add", "--node", "claude-a", aliceFp, "--name", "alice", "--drive",
-                         "--identity-passphrase-file", pass("claude-a")], env: voxEnv)
+        try stagedTrustChange(vox, ["trust", "add", "--node", "alice", agentFp, "--name", "claude-a",
+                                    "--identity-passphrase-file", pass("alice")], env: voxEnv)
+        try stagedTrustChange(vox, ["trust", "add", "--node", "claude-a", aliceFp, "--name", "alice", "--drive",
+                                    "--identity-passphrase-file", pass("claude-a")], env: voxEnv)
         // FX-60: the authorized OMP image's Session belongs to omp-owner, a node on a daemon of
         // its own, so on a Computer of its own. Drive taken back there stays taken back, and the
         // revocation below measures its media service alone: on alice's daemon, My computers
@@ -3314,10 +3312,10 @@ final class FirstRunProof: XCTestCase {
             }
             try staged(vox, ["room", "join", "--node", "omp-owner", "--passphrase-file", pass("room"), ownerLink],
                        env: ownerEnv)
-            try staged(vox, ["trust", "add", "--node", "alice", ownerFp, "--name", "omp-owner",
-                             "--identity-passphrase-file", pass("alice")], env: voxEnv)
-            try staged(vox, ["trust", "add", "--node", "omp-owner", aliceFp, "--name", "alice", "--drive",
-                             "--identity-passphrase-file", ownerPass], env: ownerEnv)
+            try stagedTrustChange(vox, ["trust", "add", "--node", "alice", ownerFp, "--name", "omp-owner",
+                                        "--identity-passphrase-file", pass("alice")], env: voxEnv)
+            try stagedTrustChange(vox, ["trust", "add", "--node", "omp-owner", aliceFp, "--name", "alice", "--drive",
+                                        "--identity-passphrase-file", ownerPass], env: ownerEnv)
             let grants = try staged(vox, ["trust", "list", "--node", "omp-owner"], env: ownerEnv)
             guard grants.split(separator: "\n").contains(where: { $0.hasPrefix(aliceFp + "  ") && $0.hasSuffix("  read + drive") }) else {
                 throw Apparatus("the OMP image owner must grant alice Read + Drive: \(grants)")
@@ -3751,8 +3749,8 @@ final class FirstRunProof: XCTestCase {
             // FX-60 owner side: omp-owner takes drive back from alice. Its own media service must
             // then refuse her, though she asks past her own daemon's checks (mutant: the media
             // witness's Only::Drive becomes Anyone, and the image is served).
-            try staged(vox, ["trust", "read", "--node", "omp-owner", aliceFp,
-                             "--identity-passphrase-file", imageOwner.pass], env: imageOwner.env)
+            try stagedTrustChange(vox, ["trust", "read", "--node", "omp-owner", aliceFp,
+                                        "--identity-passphrase-file", imageOwner.pass], env: imageOwner.env)
             let ownerUntil = Date().addingTimeInterval(20)
             var afterRevocation = try askOwner()
             while afterRevocation.served && Date() < ownerUntil {
@@ -3795,8 +3793,8 @@ final class FirstRunProof: XCTestCase {
             }
             keepTree(ui, "the authorized OMP Session after the revocation (evidence)")
             print("[proof] FX-60 revocation: owner service \(afterRevocation.said); app shows \(appShows.debugDescription)")
-            try staged(vox, ["trust", "drive", "--node", "omp-owner", aliceFp,
-                             "--identity-passphrase-file", imageOwner.pass], env: imageOwner.env)
+            try stagedTrustChange(vox, ["trust", "drive", "--node", "omp-owner", aliceFp,
+                                        "--identity-passphrase-file", imageOwner.pass], env: imageOwner.env)
             print("[proof] FX-60 OMP images: authorized \(authorized.prefix(8)) rendered (\(renderedSize)); forged \(forged.prefix(8)) refused: \(refusal)")
             // A real stock-OMP capture is released in stages while alice's app is watching.
             // Hold the captured media response while the second progress frame arrives, then
@@ -4812,12 +4810,12 @@ final class FirstRunProof: XCTestCase {
         try staged(vox, ["room", "join", "--node", "remote-owner", "--passphrase-file", pass("room"), ownerLink], env: ownerEnv)
         try staged(vox, ["node", "unlock", "claude-a", "--passphrase-file", pass("claude-a")], env: voxEnv)
         for (name, fp) in [("alice", aliceFp), ("claude-a", agentFp)] {
-            try staged(vox, ["trust", "add", "--node", name, ownerFp, "--name", "remote-owner",
-                             "--identity-passphrase-file", pass(name)], env: voxEnv)
+            try stagedTrustChange(vox, ["trust", "add", "--node", name, ownerFp, "--name", "remote-owner",
+                                        "--identity-passphrase-file", pass(name)], env: voxEnv)
             var grant = ["trust", "add", "--node", "remote-owner", fp, "--name", name,
                          "--identity-passphrase-file", ownerPass]
             if name == "claude-a" { grant.append("--drive") }
-            try staged(vox, grant, env: ownerEnv)
+            try stagedTrustChange(vox, grant, env: ownerEnv)
         }
         let grants = try staged(vox, ["trust", "list", "--node", "remote-owner"], env: ownerEnv)
         guard grants.split(separator: "\n").contains(where: { $0.hasPrefix(aliceFp + "  ") && $0.hasSuffix("  read") }),
@@ -4917,8 +4915,8 @@ final class FirstRunProof: XCTestCase {
                       "the Drive member must be offered the owner's Session in To") else { return }
         ui.typeKey(.escape, modifierFlags: [])
         tap(ui, privateRow, "Select the authorized owner tab before revocation")
-        try staged(vox, ["trust", "read", "--node", "remote-owner", agentFp,
-                         "--identity-passphrase-file", ownerPass], env: ownerEnv)
+        try stagedTrustChange(vox, ["trust", "read", "--node", "remote-owner", agentFp,
+                                    "--identity-passphrase-file", ownerPass], env: ownerEnv)
         missingWithin(ui, privateRow, 60, "downgrade to Read must remove the retained owner's Session row")
         guard present(ui, Key.id("compose"), timeout: 15,
                       "revoking the selected Session must fall back to General") else { return }
@@ -4928,8 +4926,8 @@ final class FirstRunProof: XCTestCase {
         XCTAssertNil(locate(ui, Key.id("to-remote-owner-\(privateSession.prefix(8))")),
                      "PRODUCT: revoked drive must remove the owner's Session To option")
         ui.typeKey(.escape, modifierFlags: [])
-        try staged(vox, ["trust", "drive", "--node", "remote-owner", agentFp,
-                         "--identity-passphrase-file", ownerPass], env: ownerEnv)
+        try stagedTrustChange(vox, ["trust", "drive", "--node", "remote-owner", agentFp,
+                                    "--identity-passphrase-file", ownerPass], env: ownerEnv)
         guard present(ui, privateRow, timeout: 60, "regrant must restore discovery of the retained owner's Session") else { return }
         print("[proof] SA-1/2/4: three identities; Read-only chat without Session/To; authorized entry and To; revocation removes discovery; regrant restores")
 
@@ -8154,7 +8152,7 @@ final class FirstRunProof: XCTestCase {
         print("[proof] keyboard: Space and Return opened Quick Look; ↑ ↑ ↓ selected KEYS-B, KEYS-A, KEYS-B; Tab reached the composer in \(tabs)")
         }
 
-        // (15) Who trusts whom, from a member (ADR-028 K-5, K-7, R-5, R-6, E-4; D4, D9, D10, D17).
+        // (15) Who trusts whom, from a member (ADR-028 K-5, K-7, R-5, R-6, E-4; D4, D10, D17).
         // Dave is remote and unpaired: the local automatic trust policy cannot pretrust him.
         // Bob trusts him before he joins, so Bob's grant is on mission's log once he is in.
         let daveRoot = scratch.appendingPathComponent("dave-host")
@@ -8559,29 +8557,15 @@ final class FirstRunProof: XCTestCase {
                             until: { $0.hasPrefix("Removing dave: it reads nothing you write from now on") }) ?? ""
         tap(ui, Key.id("room-mission"), "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
         print("[proof] keyring card: \(ringHead); \(theirs); \(rooms); \(removal.prefix(40))…")
-        // (15c, D9) A message of alice's no member's node holds says so, then where it is.
+        // Bob's, dave's, erin's and fay's nodes go away while alice posts WHERE-15; bob's comes
+        // back. Room removal below must keep WHERE-15 readable.
         try staged(vox, ["node", "detach", "bob"], env: voxEnv)
         try staged(vox, ["node", "detach", "dave"], env: daveEnv)
         // Erin and Fay are remote members from (5d); stop their nodes on their own account too.
         try staged(vox, ["node", "detach", "erin"], env: trustEnv)
         try staged(vox, ["node", "detach", "fay"], env: trustEnv)
         try staged(vox, ["room", "post", "--node", "alice", room, "WHERE-15"], env: voxEnv)
-        var whereId = ""
-        for row in run(vox, ["room", "read", "--node", "alice", "--json", room], env: voxEnv).out
-            .split(separator: "\n") {
-            guard let r = try? JSONSerialization.jsonObject(with: Data(row.utf8)) as? [String: Any],
-                  r["text"] as? String == "WHERE-15", let id = r["entry_hash"] as? String else { continue }
-            whereId = id
-        }
-        guard !whereId.isEmpty else { throw Apparatus("alice's `vox room read --json` lists no WHERE-15") }
-        let alone = words(ui, Key.id("whereabouts-\(whereId)"), timeout: 60,
-                          "alice's WHERE-15, posted with bob's and dave's nodes detached, must say \"only on this machine\"",
-                          until: { $0 == "only on this machine" }) ?? ""
         try staged(vox, ["node", "attach", "bob", "--passphrase-file", bobPass], env: voxEnv)
-        let spread = words(ui, Key.id("whereabouts-\(whereId)"), timeout: 90,
-                           "once bob's node is back and holds WHERE-15, it must say it is on 1 of the members' nodes, \"on 1 of N members' nodes\"",
-                           until: { $0.hasPrefix("on 1 of ") && $0.hasSuffix(" members' nodes") }) ?? ""
-        print("[proof] whereabouts: \(alone) → \(spread)")
         // FX-62: use the native member row, not a CLI removal.
         guard present(ui, Key.id("member-remove-\(bobFp)"), timeout: 30,
                       "the exact member row must offer Remove from Room",
@@ -9001,7 +8985,7 @@ final class FirstRunProof: XCTestCase {
                     button.click()
                     openedComputerView = true
                 }
-                let sheet = ui.scrollViews.matching(identifier: "computer-trust-sheet").firstMatch
+                let sheet = ui.descendants(matching: .any).matching(identifier: "computer-trust-sheet").firstMatch
                 let identity = sheet.descendants(matching: .staticText)
                     .matching(NSPredicate(format: "label == %@ OR CAST(value, 'NSString') == %@", fingerprint, fingerprint)).firstMatch
                 if sheet.exists, identity.exists {

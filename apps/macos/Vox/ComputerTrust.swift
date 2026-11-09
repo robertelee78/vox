@@ -286,6 +286,9 @@ struct ComputerTrustView: View {
         .padding(Space.s24)
         .frame(width: Theme.scaled(600), height: Theme.scaled(600))
         .contentSurface()
+        // A container of its own: without it SwiftUI puts this identifier on every direct child
+        // (the title, both problems, Refresh and Done), and theirs are lost.
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier("computer-trust-sheet")
         .task {
             await model.refresh()
