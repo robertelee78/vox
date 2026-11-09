@@ -837,8 +837,16 @@ impl<'a> View<'a> {
             || self.facts.get(Table::Complete, &hash)?.is_none()
             || self.facts.get(Table::Pending, &hash)?.is_some()
             || self.facts.get(Table::Incomplete, &hash)?.is_some()
-            || self.facts.get(Table::EligibilityPending, &hash)?.is_some()
         {
+            return Ok(Refreshing);
+        }
+        // An author with no accepted removal has the same strict-past decision, `true`, at
+        // every authority generation (`PastMembership::advance`): an unrelated removal's
+        // eligibility replay is not awaited for it, once current facts say it has none.
+        if self.never_removed(&entry.skeleton.author_id)? {
+            return Ok(Eligible);
+        }
+        if self.facts.get(Table::EligibilityPending, &hash)?.is_some() {
             return Ok(Refreshing);
         }
         let Some(record) = self.facts.get(Table::EligibilityDecisions, &hash)? else {
@@ -884,7 +892,11 @@ impl<'a> View<'a> {
         else {
             return Err(invalid("Session floor source binding"));
         };
-        let _recipient = floor.recipient;
+        // Likewise a recipient with no accepted removal: only a once-removed recipient's
+        // floor waits for its current-generation decision.
+        if self.never_removed(&floor.recipient)? {
+            return Ok(Eligible);
+        }
         let Some(record) = self.facts.get(
             Table::FloorRecipientDecisions,
             &hash_key(&entry.entry_hash()),
@@ -910,6 +922,22 @@ impl<'a> View<'a> {
         Ok(if eligible { Eligible } else { Ineligible })
     }
 
+    /// Whether any authenticated removal of `target` has been accepted here (#1171).
+    fn removal_row(&self, target: &Digest32) -> Result<bool> {
+        Ok(self
+            .facts
+            .at_or_after(Table::MemberRemovals, hash_key(target))?
+            .is_some_and(|(key, _)| key[..32] == target[..]))
+    }
+
+    /// `target` has no accepted removal, decided only on current folded facts: every received
+    /// source row is observed (so a received removal already has its row) and the canonical
+    /// membership fold is settled at the current authority generation. Otherwise `false`, and
+    /// the caller keeps its generation-stamped path.
+    fn never_removed(&self, target: &Digest32) -> Result<bool> {
+        Ok(self.facts.current_ready()? && self.facts.settled() && !self.removal_row(target)?)
+    }
+
     /// The once-removed recipient's projected history-body cut (#1171). A target with no
     /// authenticated removal row needs no room-wide readiness: its ordinary history stays
     /// whole. Once any removal row exists, only a current-generation projected row decides;
@@ -919,11 +947,7 @@ impl<'a> View<'a> {
         target: &Digest32,
         now: u64,
     ) -> Result<RecipientCut> {
-        let removal_row = self
-            .facts
-            .at_or_after(Table::MemberRemovals, hash_key(target))?
-            .is_some_and(|(key, _)| key[..32] == target[..]);
-        if !removal_row {
+        if !self.removal_row(target)? {
             return Ok(RecipientCut::Unrestricted);
         }
         if !self.facts.ready(now)? {

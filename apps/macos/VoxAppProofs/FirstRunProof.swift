@@ -75,17 +75,17 @@
 //     Thread (⌘R) then says; Space and Return on a row whose file alice pulled open it in Quick
 //     Look; Tab from the timeline reaches the composer.
 // 15. Who trusts whom (ADR-028 K-5, K-7, R-5, R-6, E-4). Dave, whom bob trusts, joins mission
-//     while it is on screen: its timeline says "<dave> (not in keyring) joined. bob trusts it."
-//     (D10). Dave trusts alice; her member pane says he is "not in keyring, trusts you", the room
+//     while it is on screen: its timeline says "Observed in this room: <dave> (not in keyring) joined. bob trusts it."
+//     (D10). Dave trusts alice; her member pane says he is "not in keyring, room consent observed", the room
 //     names him as not yet reading each other with her, and his card says both directions; Trust…
-//     there, with his alias, makes him "trusted both ways" and puts him in her keyring, through
-//     the passphrase gate if the keyring window has closed (D4). With bob's and dave's nodes
-//     detached, a message she posts says "only on this machine"; once bob's node is back, "on 1 of
-//     2 members' nodes" (D9). Node > Detach then offers only to attach alice again, never another
-//     node of this Mac's, and attaching again makes the window hers (D17).
-//     Compare goes group by group (#624): four groups of dave's fingerprint on his offer say "So
-//     far matches 4 of 13 groups."; on his card two say 2 of 13, a wrong third is named as group 3
-//     with no Remove (he is not in the keyring), and the whole of it is marked a match.
+//     there, with his alias, makes him "local trust and room consent observed" and puts him in her keyring, through
+//     the passphrase gate if the keyring window has closed (D4). Node > Detach then offers only
+//     to attach alice again, never another node of this Mac's, and attaching again makes the
+//     window hers (D17).
+//     Compare goes group by group (#624): on dave's card two groups say "So far matches 2 of 13
+//     groups.", a wrong third is named as group 3 with no Remove (he is not in the keyring), and
+//     the whole of it is marked a match. (Since #726 a room newcomer's offer is his member row
+//     and card, never a General banner.)
 //     The keyring's card for dave (G2) heads "dave ⇄ you", says he trusts alice too, names
 //     mission as a shared room, and its disclosure says what removing him would change.
 // 16. What an operation comes to (#608, #611, #615), run after step 5, or alone with
@@ -100,12 +100,15 @@
 //     the room header's tag filter set to task:#636 shows it and not the untagged one, and "All
 //     messages" brings the untagged one back. Mutant: the app's `.tag` thread showing the whole
 //     room (timelineItems) turns it red at "must not show the untagged".
+// 15 alone: VOX_PROOF_FROM=15 stages steps 1-5 by `vox`, runs 5b-5d, then skips steps 6 to 14
+//     (their own proofs, NOT RUN), staging only what step 15 reads from them: the quiet rooms
+//     aaa and bbb and mission's link.
 //
 // Mutants for (15), one each: the member rows drop a node's trust in alice unless she trusts it
-// (D4: the row reads "not in keyring"); the timeline drops the whereabouts line (D9); the join
-// line leaves out who trusts the newcomer (D10); Detach goes back to the chooser of every node
-// (D17); a compare that calls any partial entry a mismatch (#624); the keyring card saying a node
-// that trusts alice back is still waiting (G2). Each turns (15) red on its own assertion.
+// (D4: the row reads "not in keyring"); the join line leaves out who trusts the newcomer (D10);
+// Detach goes back to the chooser of every node (D17); a compare that calls any partial entry a
+// mismatch (#624); the keyring card saying a node that trusts alice back is still waiting (G2).
+// Each turns (15) red on its own assertion.
 // Mutants: the app attaches its node so that it outlives the app (the daemon's explicit attach in
 // place of the app's hold), and quitting leaves it attached: (12) goes red. A room with a message
 // addressed to this node grouped as quiet (`attention::group`): (3) goes red. An app that never
@@ -301,6 +304,7 @@ final class FirstRunProof: XCTestCase {
     /// When another app took the foreground from a running Vox, and which: a display change or a
     /// person at the Mac, never the walkthrough (it quits Vox, and Vox's own panels are its own).
     private var lostForeground: [(at: Date, to: String)] = []
+    private var expectedHTTPActivation: (bundleID: String, until: Date)?
     private var watchingForeground: NSObjectProtocol?
     private var watchingVox: NSObjectProtocol?
     /// Set while the proof itself has hidden or quit Vox (⌘H, ⌘Q), until Vox is active again:
@@ -339,6 +343,11 @@ final class FirstRunProof: XCTestCase {
                   // Vox's own file panel and previews run in system services of its own.
                   !(app.bundleIdentifier ?? "").hasPrefix("com.apple.appkit.xpc."),
                   !(app.bundleIdentifier ?? "").hasPrefix("com.apple.quicklook.") else { return }
+            if let expected = self?.expectedHTTPActivation, app.bundleIdentifier == expected.bundleID,
+               Date() <= expected.until {
+                self?.expectedHTTPActivation = nil
+                return
+            }
             let at = Date()
             let to = app.localizedName ?? app.bundleIdentifier ?? "pid \(app.processIdentifier)"
             // Taken from a Vox that is still running a second later: not Vox quitting.
@@ -1874,8 +1883,10 @@ final class FirstRunProof: XCTestCase {
              "VOX_PROXY": "127.0.0.1:0",
              "HOME": computerRoot.appendingPathComponent(name + "/home").path]
         }
+        let incomingConsentHold = computerRoot.appendingPathComponent("incoming-consent.hold").path
         let computerA = computerEnv("a").merging([
-            "VOX_TEST_KEYCHAIN": computerRoot.appendingPathComponent("a/pairing.keychain-db").path
+            "VOX_TEST_KEYCHAIN": computerRoot.appendingPathComponent("a/pairing.keychain-db").path,
+            "VOX_TEST_HOLD_INCOMING_CONSENT_FILE": incomingConsentHold
         ]) { $1 }
         let computerB = computerEnv("b").merging([
             "VOX_TEST_KEYCHAIN": computerRoot.appendingPathComponent("b/pairing.keychain-db").path
@@ -1954,12 +1965,10 @@ final class FirstRunProof: XCTestCase {
                           "Add Computer must open its account-owned view") else { throw Product("Add Computer did not open") }
         }
         func quitComputerAccount() throws {
-            let computerView = pairingUI.scrollViews.matching(identifier: "computer-trust-sheet").firstMatch
+            let computerView = pairingUI.descendants(matching: .any).matching(identifier: "computer-trust-sheet").firstMatch
             if computerView.exists {
-                // SwiftUI propagates the sheet's identifier onto its Done button.
-                // Scope the visible action to the actual sheet and its button label.
-                let done = pairingUI.sheets.buttons.matching(NSPredicate(
-                    format: "identifier == %@ AND label == %@", "computer-trust-sheet", "Done")).firstMatch
+                // The sheet's own Done, scoped to the sheet; it keeps its own identifier.
+                let done = pairingUI.sheets.buttons.matching(identifier: "computer-done").firstMatch
                 guard done.exists, done.isHittable, inView(pairingUI, done) else {
                     keepTree(pairingUI, "the computer account's Done action could not be delivered")
                     XCTFail("APPARATUS: the visible computer view’s Done button could not be staged for account switching")
@@ -2036,8 +2045,20 @@ final class FirstRunProof: XCTestCase {
         try quitComputerAccount()
         try openComputers(computerA)
         tap(pairingUI, Key.id("computer-pairing-approve"), "Explicit approval on the inviting computer")
-        guard present(pairingUI, Key.id("computer-trust-applying"), timeout: 30,
-                      "the second signed approval must be recorded before leaving this computer") else { return }
+        // Node-free A has no pending node of its own: "applying" lasts only until B's application
+        // is confirmed (pairing.rs status), and may never be drawn. Either state records it.
+        let recordedUntil = Date().addingTimeInterval(30)
+        var recorded = false
+        while !recorded && Date() < recordedUntil {
+            recorded = locate(pairingUI, Key.id("computer-trust-applying")) != nil
+                || locate(pairingUI, Key.id("computer-trust-confirmed")) != nil
+            if !recorded { Thread.sleep(forTimeInterval: 0.5) }
+        }
+        guard recorded else {
+            keepTree(pairingUI, "the second signed approval was not recorded")
+            XCTFail("PRODUCT: the second signed approval must be recorded (applying or confirmed) before leaving this computer: \(onScreen(pairingUI))")
+            return
+        }
         try quitComputerAccount()
         try openComputers(computerB)
         guard words(pairingUI, Key.id("computer-pending-nodes"), timeout: 30,
@@ -2069,7 +2090,263 @@ final class FirstRunProof: XCTestCase {
         XCTAssertEqual(appliedA["state"] as? String, "confirmed", "PRODUCT: inviting computer must be applied")
         XCTAssertEqual(appliedB["state"] as? String, "confirmed", "PRODUCT: reviewing computer must be applied")
         try quitComputerAccount()
+        print("[proof] Add Computer: zero-node invitation; authenticated review; one-sided waiting; protected-node pending; ordinary attach; both confirmed; existing room and repo binding retained")
+        // Native OpenCode Session driving uses the existing plugin host apparatus, with no
+        // model or room override. Actual room joins and the saved repo binding remain authority.
+        guard let nativeNode = env["VOX_PROOF_NATIVE_NODE"],
+              let nativeHostSource = env["VOX_PROOF_OPENCODE_HOST"],
+              stager.run(["/bin/test", "-x", nativeNode], env: [:]).status == 0,
+              stager.run(["/bin/test", "-r", nativeHostSource], env: [:]).status == 0 else {
+            throw Apparatus("the existing native OpenCode host and Node executable must be staged before this journey")
+        }
+        for name in ["paired-personal", "paired-ordinary"] {
+            try staged(vox, ["node", "create", name],
+                       env: computerA.merging(["VOX_IDENTITY_PASSPHRASE": "protected pairing identity"]) { $1 })
+            try staged(vox, ["node", "attach", name, "--passphrase-file", computerPass], env: computerA)
+        }
+        let keptLink = try line(staged(vox, ["room", "link", "--node", "protected", keptRoom], env: computerB)) {
+            $0.hasPrefix("vox://")
+        }
+        let personalFp = try line(staged(vox, ["id", "--node", "paired-personal"], env: computerA)) { $0.count == 52 }
+        let protectedFp = try line(staged(vox, ["id", "--node", "protected"], env: computerB)) { $0.count == 52 }
+        let fullKeptRoom = String(keptLink.dropFirst("vox://".count).prefix { $0 != "?" && $0 != "/" })
+        guard fullKeptRoom.count == 52 else { throw Apparatus("pairing room link lacks its full identity") }
+        try stager.write(Data("\(fullKeptRoom) \(protectedFp) \(personalFp)".utf8), to: incomingConsentHold)
+        defer { _ = stager.run(["/bin/rm", "-f", incomingConsentHold], env: [:]) }
+        try staged(vox, ["room", "join", "--node", "paired-personal", "--passphrase-file", computerPass, keptLink], env: computerA)
+        pairingUI.launchEnvironment = computerA
+        try launchVox(pairingUI, appPath, env: computerA, scratch: scratchPath,
+                      nodeFingerprint: (name: "paired-personal", fingerprint: personalFp))
+        tap(pairingUI, Key.id("node-paired-personal"), "Choose paired-personal as the personal node")
+        guard present(pairingUI, Key.id("room-pairing-kept"), timeout: 30,
+                      "the selected personal node must show its joined retained room") else { return }
+        tap(pairingUI, Key.id("room-pairing-kept"), "Open the joined retained room")
+        let enteredConsent = URL(fileURLWithPath: incomingConsentHold).deletingPathExtension().appendingPathExtension("entered").path
+        let heldUntil = Date().addingTimeInterval(90)
+        while Date() < heldUntil && stager.run(["/bin/test", "-e", enteredConsent], env: [:]).status != 0 {
+            Thread.sleep(forTimeInterval: 0.2)
+        }
+        guard stager.run(["/bin/test", "-e", enteredConsent], env: [:]).status == 0 else {
+            throw Apparatus("the real protected-to-personal consent was not held before admission")
+        }
+        func waitProtectedWarning(_ timeout: TimeInterval) -> String? {
+            let until = Date().addingTimeInterval(timeout)
+            while Date() < until {
+                let value = (locate(pairingUI, Key.id("trust-banner-member-" + protectedFp))
+                    ?? locate(pairingUI, Key.id("trust-banner"))).map(shown) ?? ""
+                if value.contains("room consent") && value.contains("not been observed") { return value }
+                Thread.sleep(forTimeInterval: 0.2)
+            }
+            XCTFail("PRODUCT: paired member's missing room consent was not reported: \(onScreen(pairingUI))")
+            return nil
+        }
+        guard let pendingConsent = waitProtectedWarning(90) else { return }
+        XCTAssertFalse(pendingConsent.lowercased().contains("declined") || pendingConsent.contains("trust you back"),
+                       "PRODUCT: a held room consent must not be described as a failed computer approval: \(pendingConsent)")
+        guard present(pairingUI, Key.id("trust-banner-application-" + protectedFp), timeout: 60,
+                      "a matching verified computer application must be shown separately from missing room consent") else { return }
+        guard waitProtectedWarning(20) != nil else { return }
+        guard stager.run(["/bin/rm", "-f", incomingConsentHold], env: [:]).status == 0 else {
+            throw Apparatus("cannot release the held real room consent")
+        }
+        try staged(vox, ["room", "join", "--node", "paired-ordinary", "--passphrase-file", computerPass, keptLink], env: computerA)
+        let joined = try staged(vox, ["room", "list", "--node", "paired-ordinary"], env: computerA)
+        guard joined.contains(keptRoom) else { throw Apparatus("native drive's ordinary node did not join: \(joined)") }
+        try staged(vox, ["room", "post", "--node", "protected", keptRoom, "PAIR-CONSENT-PROTECTED"], env: computerB)
+        try staged(vox, ["room", "post", "--node", "paired-personal", keptRoom, "PAIR-CONSENT-PERSONAL"], env: computerA)
+        let pairReadUntil = Date().addingTimeInterval(90)
+        var protectedRead = "", personalRead = ""
+        while Date() < pairReadUntil {
+            protectedRead = run(vox, ["room", "read", "--node", "protected", keptRoom], env: computerB).out
+            personalRead = run(vox, ["room", "read", "--node", "paired-personal", keptRoom], env: computerA).out
+            if protectedRead.contains("PAIR-CONSENT-PERSONAL") && personalRead.contains("PAIR-CONSENT-PROTECTED") { break }
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+        XCTAssertTrue(protectedRead.contains("PAIR-CONSENT-PERSONAL") && personalRead.contains("PAIR-CONSENT-PROTECTED"),
+                      "PRODUCT: releasing real room consent must allow fresh paired messages both ways")
+        guard words(pairingUI, Key.id("member-trust-directions-" + protectedFp), timeout: 90,
+                    "the paired member must eventually show its observed reciprocal room consent",
+                    until: { $0.contains("Reciprocal room consent is observed") && !$0.contains("stale") }) != nil else { return }
+        let clearedUntil = Date().addingTimeInterval(90)
+        var remainingWarning = ""
+        while Date() < clearedUntil {
+            remainingWarning = locate(pairingUI, Key.id("trust-banner")).map(shown) ?? ""
+            if !remainingWarning.contains("protected") { break }
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+        XCTAssertFalse(remainingWarning.contains("protected"),
+                       "PRODUCT: the protected member's warning must clear after reciprocal delivery: \(remainingWarning)")
+        let ordinaryFp = try line(staged(vox, ["id", "--node", "paired-ordinary"], env: computerA)) { $0.count == 52 }
+        let rosterUntil = Date().addingTimeInterval(30)
+        var nativeRoster = ""
+        while Date() < rosterUntil {
+            nativeRoster = try staged(vox, ["room", "roster", "--node", "protected", keptRoom], env: computerB)
+            if nativeRoster.contains(personalFp) && nativeRoster.contains(ordinaryFp) { break }
+            Thread.sleep(forTimeInterval: 0.3)
+        }
+        guard nativeRoster.contains(personalFp) && nativeRoster.contains(ordinaryFp) else {
+            throw Apparatus("native drive's exact personal and ordinary identities are not both room members: \(nativeRoster)")
+        }
+        // A short, uniquely owned scratch temp directory lets the real plugin's Unix sockets fit.
+        let nativeTempResult = stager.run(["/usr/bin/mktemp", "-d", "/tmp/vox-799-native.XXXXXXXX"], env: [:])
+        let nativeTemp = nativeTempResult.out.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard nativeTempResult.status == 0, nativeTemp.hasPrefix("/tmp/vox-799-native."), !nativeTemp.contains("\n") else {
+            throw Apparatus("cannot stage the native plugin's private temporary directory: \(nativeTempResult.out)")
+        }
+        defer { _ = stager.run(["/bin/rm", "-rf", nativeTemp], env: [:]) }
+        let nativeSession = "ses_799_pair_drive_0001"
+        let nativePlugin = computerRoot.appendingPathComponent("native-plugin.mjs").path
+        // This command ships JavaScript on stdout and installation advice on stderr.
+        // Install it exactly as a person redirects the command, without mixing the streams.
+        let pluginAdvice = computerRoot.appendingPathComponent("native-plugin-advice.txt").path
+        let installedPlugin = stager.run(["/bin/sh", "-c",
+            "exec \"$1\" agent plugin opencode --node protected > \"$2\" 2> \"$3\"",
+            "install-plugin", vox, nativePlugin, pluginAdvice], env: computerB)
+        guard installedPlugin.status == 0 else {
+            throw Apparatus("the native OpenCode plugin could not be installed from command stdout: \(installedPlugin.out)")
+        }
+        let nativeEnv = computerB.merging(["PATH": "/usr/bin:/bin", "TMPDIR": nativeTemp,
+                                          "VOX_BIN": vox, "VOX_IDENTITY_PASSPHRASE": "protected pairing identity"]) { $1 }
+        let nativeHost = try stager.jsonHost([nativeNode, nativeHostSource, nativePlugin, nativeSession],
+                                            env: nativeEnv, cwd: repo,
+                                            stderr: computerRoot.appendingPathComponent("native-host.stderr").path)
+        defer { nativeHost.terminate() }
+        _ = try nativeHost.command("title Pairing native OpenCode")
+        func nativeEvent(_ object: [String: Any]) throws {
+            let json = try JSONSerialization.data(withJSONObject: object)
+            _ = try nativeHost.command("event " + String(decoding: json, as: UTF8.self))
+        }
+        // OpenCode 2.x's bus shape (`{type, data}`), the only one the shipped plugin mirrors
+        // (opencode-plugin.js MIRRORED; opencode_mirror.rs): the operator's prompt is a
+        // delivered inbox item. The 1.x message.updated/message.part.updated shape is never read.
+        let initialUser: [String: Any] = ["type": "session.inbox.delivered", "data": [
+            "sessionID": nativeSession, "inboxID": "msg_799_user",
+            "item": ["type": "user", "payload": ["text": "NATIVE-799-INITIAL"], "delivery": "queue"]]]
+        let nativeOpenUntil = Date().addingTimeInterval(20)
+        var nativeOwner = (status: Int32(-1), out: "")
+        var nativeTurnAnswers: [[String: Any]] = []
+        repeat {
+            // A bounded first turn can truthfully say that this freshly attached node is still
+            // preparing and to try again next turn. Model only that documented next turn. Events
+            // cannot establish the Session before the plugin hook has opened it, so replaying only
+            // the bus events (the old apparatus) could wait forever for a Session that did not exist.
+            let answer = try nativeHost.command("turn NATIVE-799-INITIAL")
+            nativeTurnAnswers.append(answer)
+            let observeUntil = min(nativeOpenUntil, Date().addingTimeInterval(1))
+            repeat {
+                nativeOwner = run(vox, ["room", "session", "--node", "protected", "--json", keptRoom, nativeSession], env: computerB)
+                if nativeOwner.status == 0 { break }
+                Thread.sleep(forTimeInterval: 0.1)
+            } while Date() < observeUntil
+            if nativeOwner.status == 0 { break }
+            let text = answer["text"] as? String ?? ""
+            guard text.contains("try again next turn") || text.contains("is preparing node") else { break }
+        } while Date() < nativeOpenUntil
+        guard nativeOwner.status == 0 else {
+            throw Apparatus("the native OpenCode hook did not establish its repo-bound Session on protected; native turns said \(nativeTurnAnswers); owner's `vox room session --json` exited \(nativeOwner.status) saying \(nativeOwner.out)")
+        }
+        let nativeInitialUntil = Date().addingTimeInterval(60)
+        var nativeInitial = ""
+        while Date() < nativeInitialUntil {
+            try nativeEvent(initialUser)
+            nativeInitial = run(vox, ["room", "session", "--node", "paired-personal", keptRoom, nativeSession], env: computerA).out
+            if nativeInitial.contains("NATIVE-799-INITIAL") { break }
+            Thread.sleep(forTimeInterval: 0.3)
+        }
+        guard nativeInitial.contains("NATIVE-799-INITIAL") else {
+            // Premise: the owner's own Session holds the replayed turn; delivery is the claim.
+            let ownerRead = run(vox, ["room", "session", "--node", "protected", keptRoom, nativeSession], env: computerB)
+            guard ownerRead.status == 0, ownerRead.out.contains("NATIVE-799-INITIAL") else {
+                throw Apparatus("the replayed OpenCode turn never reached protected's own Session, so delivery was not exercised; owner said \(ownerRead.status): \(ownerRead.out)")
+            }
+            throw Product("the computer-trusted personal node did not receive the protected node's established native Session within 60 seconds; owner holds it (\(ownerRead.out)); personal said \(nativeInitial)")
+        }
+        tap(pairingUI, Key.id("session-\(nativeSession.prefix(8))"), "The native OpenCode Session in the joined room")
+        guard present(pairingUI, Key.id("session-compose"), timeout: 30,
+                      "the selected personal node must be able to drive a covered ordinary node's native Session") else { return }
+        words(pairingUI, Key.id("session-compose-as"), timeout: 10,
+              "native Session input must be sent as the selected personal node", until: { $0.contains("paired-personal") })
+        type(pairingUI, Key.id("session-compose"), "NATIVE-799-APP-SAY\r", "Say into the native OpenCode Session")
+        // Accepted is what the person sees: an answer under the composer, and the sent draft
+        // cleared (SessionDrive.swift clears it only when the native node took the input).
+        guard present(pairingUI, Key.id("session-said"), timeout: 30,
+                      "the native Session must answer the app input"),
+              words(pairingUI, Key.id("session-compose"), timeout: 10,
+                    "the native Session must take the app input, clearing its sent draft",
+                    until: { $0.isEmpty }, field: true) != nil else { return }
+        try nativeEvent(["type": "session.step.started", "data": ["sessionID": nativeSession,
+            "assistantMessageID": "msg_799_reply", "agent": "build", "model": "opencode/apparatus", "started": 0]])
+        try nativeEvent(["type": "session.text.ended", "data": ["sessionID": nativeSession,
+            "assistantMessageID": "msg_799_reply", "ordinal": 0, "text": "NATIVE-799-REPLY"]])
+        try nativeEvent(["type": "session.idle", "data": ["sessionID": nativeSession]])
+        let nativeTimeline = pairingUI.scrollViews.matching(identifier: "timeline").firstMatch
+        guard nativeTimeline.waitForExistence(timeout: 10) else {
+            throw Apparatus("the selected native Session has no public timeline for reading its returned step")
+        }
+        let nativeReplyLines = nativeTimeline.descendants(matching: .any).matching(NSPredicate(
+            format: "identifier BEGINSWITH %@ AND (label CONTAINS %@ OR CAST(value, 'NSString') CONTAINS %@)",
+            "entry-line-", "NATIVE-799-REPLY", "NATIVE-799-REPLY"))
+        func nativeReplyVisible(_ line: XCUIElement) -> Bool {
+            let body = line.frame, clip = nativeTimeline.frame, window = pairingUI.windows.firstMatch.frame
+            return [body.minX, body.minY, body.width, body.height,
+                    clip.minX, clip.minY, clip.width, clip.height,
+                    window.minX, window.minY, window.width, window.height].allSatisfy { $0.isFinite }
+                && body.width > 0 && body.height > 0 && clip.width > 0 && clip.height > 0
+                && clip.contains(body) && window.contains(body)
+        }
+        let nativeReplyUntil = Date().addingTimeInterval(30)
+        while Date() < nativeReplyUntil {
+            let line = nativeReplyLines.firstMatch
+            if line.exists && nativeReplyVisible(line) { break }
+            let clip = nativeTimeline.frame
+            guard clip.width > 0, clip.height > 0, clip.height.isFinite else {
+                throw Apparatus("the native Session's timeline has no finite positive viewport: \(clip)")
+            }
+            if line.exists, !line.frame.isEmpty {
+                nativeTimeline.scroll(byDeltaX: 0, deltaY: max(-200, min(200, clip.midY - line.frame.midY)))
+            } else {
+                // Realize the newest native entry through normal public scrolling.
+                nativeTimeline.scroll(byDeltaX: 0, deltaY: -min(200, clip.height * 0.75))
+            }
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        let nativeReplyLine = nativeReplyLines.firstMatch
+        guard nativeReplyLine.exists else {
+            keepTree(pairingUI, "native reply absent from the selected Session entry lines")
+            throw Product("the native Session's returned NATIVE-799-REPLY step must appear as its own timeline entry, not a sidebar preview")
+        }
+        guard nativeReplyVisible(nativeReplyLine) else {
+            keepTree(pairingUI, "native returned step could not be brought inside its timeline")
+            throw Apparatus("cannot stage the native returned step visibly: entry \(nativeReplyLine.frame), timeline \(nativeTimeline.frame), window \(pairingUI.windows.firstMatch.frame)")
+        }
+        let ordinaryGrantUntil = Date().addingTimeInterval(30)
+        var ordinaryGrant = ""
+        while Date() < ordinaryGrantUntil {
+            let grants = try staged(vox, ["trust", "list", "--node", "protected"], env: computerB)
+            ordinaryGrant = grants.split(whereSeparator: \.isNewline).map(String.init)
+                .first { $0.split(whereSeparator: \.isWhitespace).first.map(String.init) == ordinaryFp } ?? ""
+            if ordinaryGrant.split(whereSeparator: \.isWhitespace).last == "read", !ordinaryGrant.contains("drive") { break }
+            Thread.sleep(forTimeInterval: 0.3)
+        }
+        guard ordinaryGrant.split(whereSeparator: \.isWhitespace).last == "read", !ordinaryGrant.contains("drive") else {
+            throw Apparatus("the exact covered ordinary member's Read without drive grant was not established: \(ordinaryGrant)")
+        }
+        let ordinarySessions = try staged(vox, ["room", "sessions", "--node", "paired-ordinary", keptRoom], env: computerA)
+        checkNonUI {
+            XCTAssertFalse(ordinarySessions.contains(nativeSession.prefix(8)) || ordinarySessions.contains("Pairing native OpenCode"),
+                           "PRODUCT: Read without drive must not discover the native Session; \(ordinarySessions)")
+        }
+        let ordinarySay = run(vox, ["room", "session", "--node", "paired-ordinary", keptRoom, nativeSession,
+                                   "--say", "NATIVE-799-ORDINARY-MUST-NOT-ARRIVE"], env: computerA)
+        checkNonUI {
+            XCTAssertTrue(ordinarySay.status != 0 && !ordinarySay.out.contains("Pairing native OpenCode"),
+                          "PRODUCT: a Read-only member must be refused without disclosing the native Session; \(ordinarySay.out)")
+        }
+        nativeHost.terminate()
+        try quitComputerAccount()
+        print("[proof] paired selected personal node's app say was taken by the repo-bound native OpenCode Session; its returned native step is visible; joined ordinary node refused without disclosure")
         // Stage a second, genuinely established group, then review and replace it in My Computers.
+        // It needs none of the paired A/B consent journey above, which therefore runs first.
         var replacementHostC: Started?
         var replacementHostD: Started?
         defer { replacementHostC?.terminate(); replacementHostD?.terminate() }
@@ -2166,8 +2443,21 @@ final class FirstRunProof: XCTestCase {
         defer { try? hostD.resume() }
         _ = try computerCommand(computerC, ["personal", "--clear"])
         try openComputers(computerC)
-        guard present(pairingUI, Key.showing("last exchange failed"), timeout: 45,
-                      "an offline old peer must be shown as an exchange observation, not as a rejected policy") else { return }
+        // The paused old peer's connectivity line says an exchange is in progress while a retry
+        // runs and "last exchange failed" between retries (ComputerTrust.swift): either one is
+        // an exchange observation, never a rejected policy.
+        func exchangeObserved(_ what: String) -> Bool {
+            let observedUntil = Date().addingTimeInterval(45)
+            while Date() < observedUntil {
+                if locate(pairingUI, Key.showing("last exchange failed")) != nil
+                    || locate(pairingUI, Key.showing("exchange in progress; current reachability unknown")) != nil { return true }
+                Thread.sleep(forTimeInterval: 0.5)
+            }
+            keepTree(pairingUI, "the offline old peer's exchange was not observed")
+            XCTFail("PRODUCT: \(what): \(onScreen(pairingUI))")
+            return false
+        }
+        guard exchangeObserved("an offline old peer must be shown as an exchange observation, not as a rejected policy") else { return }
         guard present(pairingUI, Key.showing("Awaiting application confirmation"), timeout: 30,
                       "an offline peer's application must remain distinct from connectivity") else { return }
         try quitComputerAccount()
@@ -2227,8 +2517,7 @@ final class FirstRunProof: XCTestCase {
                        "PRODUCT: a stale review must not retire group membership")
         _ = try computerCommand(computerC, ["personal", "move-native"])
         tap(pairingUI, Key.id("computer-refresh"), "Refresh the changed computer authority")
-        guard present(pairingUI, Key.showing("last exchange failed"), timeout: 45,
-                      "the old-group peer's unresolved exchange failure must remain visible before replacement") else { return }
+        guard exchangeObserved("the old-group peer's unresolved exchange must remain an exchange observation before replacement") else { return }
         type(pairingUI, Key.id("computer-conflict-input"), destinationCode, "the invitation for a fresh review")
         tap(pairingUI, Key.id("computer-conflict-review-again"), "Review changed authority")
         guard present(pairingUI, Key.id("computer-replace-group"), timeout: 30,
@@ -2328,207 +2617,6 @@ final class FirstRunProof: XCTestCase {
         try quitComputerAccount()
         _ = try computerCommand(computerB, ["personal", "--clear"])
         }
-        print("[proof] Add Computer: zero-node invitation; authenticated review; one-sided waiting; protected-node pending; ordinary attach; both confirmed; existing room and repo binding retained")
-        // Native OpenCode Session driving uses the existing plugin host apparatus, with no
-        // model or room override. Actual room joins and the saved repo binding remain authority.
-        guard let nativeNode = env["VOX_PROOF_NATIVE_NODE"],
-              let nativeHostSource = env["VOX_PROOF_OPENCODE_HOST"],
-              stager.run(["/bin/test", "-x", nativeNode], env: [:]).status == 0,
-              stager.run(["/bin/test", "-r", nativeHostSource], env: [:]).status == 0 else {
-            throw Apparatus("the existing native OpenCode host and Node executable must be staged before this journey")
-        }
-        for name in ["paired-personal", "paired-ordinary"] {
-            try staged(vox, ["node", "create", name],
-                       env: computerA.merging(["VOX_IDENTITY_PASSPHRASE": "protected pairing identity"]) { $1 })
-            try staged(vox, ["node", "attach", name, "--passphrase-file", computerPass], env: computerA)
-        }
-        let keptLink = try line(staged(vox, ["room", "link", "--node", "protected", keptRoom], env: computerB)) {
-            $0.hasPrefix("vox://")
-        }
-        for name in ["paired-personal", "paired-ordinary"] {
-            try staged(vox, ["room", "join", "--node", name, "--passphrase-file", computerPass, keptLink], env: computerA)
-            let joined = try staged(vox, ["room", "list", "--node", name], env: computerA)
-            guard joined.contains(keptRoom) else { throw Apparatus("native drive node \(name) did not join the retained room: \(joined)") }
-        }
-        let personalFp = try line(staged(vox, ["id", "--node", "paired-personal"], env: computerA)) { $0.count == 52 }
-        pairingUI.launchEnvironment = computerA
-        try launchVox(pairingUI, appPath, env: computerA, scratch: scratchPath,
-                      nodeFingerprint: (name: "paired-personal", fingerprint: personalFp))
-        tap(pairingUI, Key.id("node-paired-personal"), "Choose paired-personal as the personal node")
-        guard present(pairingUI, Key.id("room-pairing-kept"), timeout: 30,
-                      "the selected personal node must show its joined retained room") else { return }
-        tap(pairingUI, Key.id("room-pairing-kept"), "Open the joined retained room")
-        let ordinaryFp = try line(staged(vox, ["id", "--node", "paired-ordinary"], env: computerA)) { $0.count == 52 }
-        let rosterUntil = Date().addingTimeInterval(30)
-        var nativeRoster = ""
-        while Date() < rosterUntil {
-            nativeRoster = try staged(vox, ["room", "roster", "--node", "protected", keptRoom], env: computerB)
-            if nativeRoster.contains(personalFp) && nativeRoster.contains(ordinaryFp) { break }
-            Thread.sleep(forTimeInterval: 0.3)
-        }
-        guard nativeRoster.contains(personalFp) && nativeRoster.contains(ordinaryFp) else {
-            throw Apparatus("native drive's exact personal and ordinary identities are not both room members: \(nativeRoster)")
-        }
-        // A short, uniquely owned scratch temp directory lets the real plugin's Unix sockets fit.
-        let nativeTempResult = stager.run(["/usr/bin/mktemp", "-d", "/tmp/vox-799-native.XXXXXXXX"], env: [:])
-        let nativeTemp = nativeTempResult.out.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard nativeTempResult.status == 0, nativeTemp.hasPrefix("/tmp/vox-799-native."), !nativeTemp.contains("\n") else {
-            throw Apparatus("cannot stage the native plugin's private temporary directory: \(nativeTempResult.out)")
-        }
-        defer { _ = stager.run(["/bin/rm", "-rf", nativeTemp], env: [:]) }
-        let nativeSession = "ses_799_pair_drive_0001"
-        let nativePlugin = computerRoot.appendingPathComponent("native-plugin.mjs").path
-        // This command ships JavaScript on stdout and installation advice on stderr.
-        // Install it exactly as a person redirects the command, without mixing the streams.
-        let pluginAdvice = computerRoot.appendingPathComponent("native-plugin-advice.txt").path
-        let installedPlugin = stager.run(["/bin/sh", "-c",
-            "exec \"$1\" agent plugin opencode --node protected > \"$2\" 2> \"$3\"",
-            "install-plugin", vox, nativePlugin, pluginAdvice], env: computerB)
-        guard installedPlugin.status == 0 else {
-            throw Apparatus("the native OpenCode plugin could not be installed from command stdout: \(installedPlugin.out)")
-        }
-        let nativeEnv = computerB.merging(["PATH": "/usr/bin:/bin", "TMPDIR": nativeTemp,
-                                          "VOX_BIN": vox, "VOX_IDENTITY_PASSPHRASE": "protected pairing identity"]) { $1 }
-        let nativeHost = try stager.jsonHost([nativeNode, nativeHostSource, nativePlugin, nativeSession],
-                                            env: nativeEnv, cwd: repo,
-                                            stderr: computerRoot.appendingPathComponent("native-host.stderr").path)
-        defer { nativeHost.terminate() }
-        _ = try nativeHost.command("title Pairing native OpenCode")
-        func nativeEvent(_ object: [String: Any]) throws {
-            let json = try JSONSerialization.data(withJSONObject: object)
-            _ = try nativeHost.command("event " + String(decoding: json, as: UTF8.self))
-        }
-        let initialUser: [String: Any] = ["type": "message.updated", "properties": ["info":
-            ["id": "msg_799_user", "sessionID": nativeSession, "role": "user"]]]
-        let initialText: [String: Any] = ["type": "message.part.updated", "properties": ["part":
-            ["id": "part_799_user", "messageID": "msg_799_user", "sessionID": nativeSession,
-             "type": "text", "text": "NATIVE-799-INITIAL"]]]
-        let nativeOpenUntil = Date().addingTimeInterval(20)
-        var nativeOwner = (status: Int32(-1), out: "")
-        var nativeTurnAnswers: [[String: Any]] = []
-        repeat {
-            // A bounded first turn can truthfully say that this freshly attached node is still
-            // preparing and to try again next turn. Model only that documented next turn. Events
-            // cannot establish the Session before the plugin hook has opened it, so replaying only
-            // the bus events (the old apparatus) could wait forever for a Session that did not exist.
-            let answer = try nativeHost.command("turn NATIVE-799-INITIAL")
-            nativeTurnAnswers.append(answer)
-            let observeUntil = min(nativeOpenUntil, Date().addingTimeInterval(1))
-            repeat {
-                nativeOwner = run(vox, ["room", "session", "--node", "protected", "--json", keptRoom, nativeSession], env: computerB)
-                if nativeOwner.status == 0 { break }
-                Thread.sleep(forTimeInterval: 0.1)
-            } while Date() < observeUntil
-            if nativeOwner.status == 0 { break }
-            let text = answer["text"] as? String ?? ""
-            guard text.contains("try again next turn") || text.contains("is preparing node") else { break }
-        } while Date() < nativeOpenUntil
-        guard nativeOwner.status == 0 else {
-            throw Apparatus("the native OpenCode hook did not establish its repo-bound Session on protected; native turns said \(nativeTurnAnswers); owner's `vox room session --json` exited \(nativeOwner.status) saying \(nativeOwner.out)")
-        }
-        let nativeInitialUntil = Date().addingTimeInterval(60)
-        var nativeInitial = ""
-        while Date() < nativeInitialUntil {
-            try nativeEvent(initialUser); try nativeEvent(initialText)
-            nativeInitial = run(vox, ["room", "session", "--node", "paired-personal", keptRoom, nativeSession], env: computerA).out
-            if nativeInitial.contains("NATIVE-799-INITIAL") { break }
-            Thread.sleep(forTimeInterval: 0.3)
-        }
-        guard nativeInitial.contains("NATIVE-799-INITIAL") else {
-            throw Product("the computer-trusted personal node did not receive the protected node's established native Session within 60 seconds; it said \(nativeInitial)")
-        }
-        tap(pairingUI, Key.id("session-\(nativeSession.prefix(8))"), "The native OpenCode Session in the joined room")
-        guard present(pairingUI, Key.id("session-compose"), timeout: 30,
-                      "the selected personal node must be able to drive a covered ordinary node's native Session") else { return }
-        words(pairingUI, Key.id("session-compose-as"), timeout: 10,
-              "native Session input must be sent as the selected personal node", until: { $0.contains("paired-personal") })
-        type(pairingUI, Key.id("session-compose"), "NATIVE-799-APP-SAY\r", "Say into the native OpenCode Session")
-        guard words(pairingUI, Key.id("session-said"), timeout: 30,
-                    "the native Session must report accepted app input", until: { $0.hasSuffix(": typed") }) != nil else { return }
-        let nativeCalls = try nativeHost.command("calls 30 1", within: 40)
-        let acceptedCalls = nativeCalls["calls"] as? [[String: Any]] ?? []
-        XCTAssertTrue(acceptedCalls.contains { call in
-            let parts = (call["body"] as? [String: Any])?["parts"] as? [[String: Any]]
-            return call["method"] as? String == "POST" && call["url"] as? String == "/session/\(nativeSession)/prompt_async"
-                && parts?.first?["text"] as? String == "NATIVE-799-APP-SAY"
-        }, "PRODUCT: app say must reach exactly the native recipient Session as prompt_async; host read \(nativeCalls)")
-        try nativeEvent(["type": "message.updated", "properties": ["info":
-            ["id": "msg_799_reply", "sessionID": nativeSession, "role": "assistant", "providerID": "opencode", "modelID": "apparatus"]]])
-        try nativeEvent(["type": "message.part.updated", "properties": ["part":
-            ["id": "part_799_reply", "messageID": "msg_799_reply", "sessionID": nativeSession,
-             "type": "text", "text": "NATIVE-799-REPLY"]]])
-        try nativeEvent(["type": "session.idle", "properties": ["sessionID": nativeSession]])
-        let nativeTimeline = pairingUI.scrollViews.matching(identifier: "timeline").firstMatch
-        guard nativeTimeline.waitForExistence(timeout: 10) else {
-            throw Apparatus("the selected native Session has no public timeline for reading its returned step")
-        }
-        let nativeReplyLines = nativeTimeline.descendants(matching: .any).matching(NSPredicate(
-            format: "identifier BEGINSWITH %@ AND (label CONTAINS %@ OR CAST(value, 'NSString') CONTAINS %@)",
-            "entry-line-", "NATIVE-799-REPLY", "NATIVE-799-REPLY"))
-        func nativeReplyVisible(_ line: XCUIElement) -> Bool {
-            let body = line.frame, clip = nativeTimeline.frame, window = pairingUI.windows.firstMatch.frame
-            return [body.minX, body.minY, body.width, body.height,
-                    clip.minX, clip.minY, clip.width, clip.height,
-                    window.minX, window.minY, window.width, window.height].allSatisfy { $0.isFinite }
-                && body.width > 0 && body.height > 0 && clip.width > 0 && clip.height > 0
-                && clip.contains(body) && window.contains(body)
-        }
-        let nativeReplyUntil = Date().addingTimeInterval(30)
-        while Date() < nativeReplyUntil {
-            let line = nativeReplyLines.firstMatch
-            if line.exists && nativeReplyVisible(line) { break }
-            let clip = nativeTimeline.frame
-            guard clip.width > 0, clip.height > 0, clip.height.isFinite else {
-                throw Apparatus("the native Session's timeline has no finite positive viewport: \(clip)")
-            }
-            if line.exists, !line.frame.isEmpty {
-                nativeTimeline.scroll(byDeltaX: 0, deltaY: max(-200, min(200, clip.midY - line.frame.midY)))
-            } else {
-                // Realize the newest native entry through normal public scrolling.
-                nativeTimeline.scroll(byDeltaX: 0, deltaY: -min(200, clip.height * 0.75))
-            }
-            Thread.sleep(forTimeInterval: 0.25)
-        }
-        let nativeReplyLine = nativeReplyLines.firstMatch
-        guard nativeReplyLine.exists else {
-            keepTree(pairingUI, "native reply absent from the selected Session entry lines")
-            throw Product("the native Session's returned NATIVE-799-REPLY step must appear as its own timeline entry, not a sidebar preview")
-        }
-        guard nativeReplyVisible(nativeReplyLine) else {
-            keepTree(pairingUI, "native returned step could not be brought inside its timeline")
-            throw Apparatus("cannot stage the native returned step visibly: entry \(nativeReplyLine.frame), timeline \(nativeTimeline.frame), window \(pairingUI.windows.firstMatch.frame)")
-        }
-        let ordinaryGrantUntil = Date().addingTimeInterval(30)
-        var ordinaryGrant = ""
-        while Date() < ordinaryGrantUntil {
-            let grants = try staged(vox, ["trust", "list", "--node", "protected"], env: computerB)
-            ordinaryGrant = grants.split(whereSeparator: \.isNewline).map(String.init)
-                .first { $0.split(whereSeparator: \.isWhitespace).first.map(String.init) == ordinaryFp } ?? ""
-            if ordinaryGrant.split(whereSeparator: \.isWhitespace).last == "read", !ordinaryGrant.contains("drive") { break }
-            Thread.sleep(forTimeInterval: 0.3)
-        }
-        guard ordinaryGrant.split(whereSeparator: \.isWhitespace).last == "read", !ordinaryGrant.contains("drive") else {
-            throw Apparatus("the exact covered ordinary member's Read without drive grant was not established: \(ordinaryGrant)")
-        }
-        let ordinarySessions = try staged(vox, ["room", "sessions", "--node", "paired-ordinary", keptRoom], env: computerA)
-        checkNonUI {
-            XCTAssertFalse(ordinarySessions.contains(nativeSession.prefix(8)) || ordinarySessions.contains("Pairing native OpenCode"),
-                           "PRODUCT: Read without drive must not discover the native Session; \(ordinarySessions)")
-        }
-        let ordinarySay = run(vox, ["room", "session", "--node", "paired-ordinary", keptRoom, nativeSession,
-                                   "--say", "NATIVE-799-ORDINARY-MUST-NOT-ARRIVE"], env: computerA)
-        checkNonUI {
-            XCTAssertTrue(ordinarySay.status != 0 && ordinarySay.out.contains("no Session in this room is named " + nativeSession),
-                          "PRODUCT: a Read-only member must be refused without disclosing the native Session; \(ordinarySay.out)")
-        }
-        let callsAfterRefusal = try nativeHost.command("calls 2 2", within: 5)
-        checkNonUI {
-            XCTAssertEqual((callsAfterRefusal["calls"] as? [[String: Any]])?.count, acceptedCalls.count,
-                           "PRODUCT: refused ordinary-node input must not reach the native recipient; \(callsAfterRefusal)")
-        }
-        nativeHost.terminate()
-        try quitComputerAccount()
-        print("[proof] paired selected personal node drove the repo-bound native OpenCode Session through app say; recipient received exact prompt and returned visible step; joined ordinary node refused with no recipient call")
 
         // The ordinary app must explain a real storage refusal, not retain its old confirmation.
         try staged(vox, ["node", "create", "storage-failure"],
@@ -3038,10 +3126,35 @@ final class FirstRunProof: XCTestCase {
     ///   passphrase leaves the map unchanged; Choose binds both waiting sessions. Create uses
     ///   alice with her keyring window closed, no identity prompt, and both next turns follow.
     ///   Not This Repo silences both paths. Mutant: write the map before checking the passphrase.
+    /// - FX-60 (#1169, step `omp-image`): OMP Sessions of omp-owner (its own daemon) and claude-a
+    ///   are replayed to the real daemons over the bridge protocol (omp_bridge_replay.py). Five
+    ///   are what stock OMP 18.18.0's Vox extension sent a real host daemon
+    ///   (tests/support/omp-image-capture: authorized, streaming, async-error, unicode, cancel);
+    ///   forged.jsonl is crafted test-side attacker input, not a stock capture: its offer announces
+    ///   an all-zero SHA-256 for bytes identical to the authorized image. Alice's app loads the
+    ///   authorized image and shows it; the forged image shows a visible refusal and is never
+    ///   drawn (mutant: Descriptor::verify without the hash comparison renders it). The replayed
+    ///   extension's VOX_ROOM is a strict prefix of the room id, and `vox room session --json` must
+    ///   show each Session's activity first (mutant: the follower not restarted from the stored
+    ///   registration once the prefix is resolved). The authorized Session's tool card shows its
+    ///   multi-line body as written (mutant: card bodies parsed as full Markdown). omp-owner's
+    ///   media service is also asked directly, past the requester's own daemon
+    ///   (media_forward_probe.py), naming the Session activity record that announced the image:
+    ///   after omp-owner takes drive back from alice it refuses her (mutant: the media witness's
+    ///   Only::Drive becomes Anyone and the record admission's drive-holder check is dropped;
+    ///   either alone still refuses), and her app does not draw the image again. Its admission is
+    ///   the unchanged per-recipient private Session permission (#1171): never-removed alice is
+    ///   still served after alice removes media-returner (mutant: the admission refuses every image
+    ///   offered before the room's latest removal generation), and readmitted
+    ///   media-returner is refused the record offered before its removal (mutant: the admission's
+    ///   floor step taken with `restored` false) and served one offered after its readmission
+    ///   (mutant: any recipient with a validated removal refused).
     func testSessionsAreDrivenWhereTheyAreShown() throws {
         let env = ProcessInfo.processInfo.environment
         let selectedStep = env["VOX_PROOF_STEP"] ?? ""
-        guard selectedStep.isEmpty || selectedStep == "room-ask" else { throw Apparatus("unsupported Sessions journey step: \(selectedStep)") }
+        guard selectedStep.isEmpty || selectedStep == "room-ask" || selectedStep == "omp-image" else {
+            throw Apparatus("unsupported Sessions journey step: \(selectedStep)")
+        }
         if !selectedStep.isEmpty { print("SELECTED PROOF STEP: \(selectedStep)") }
         guard let appPath = env["VOX_PROOF_APP"], let scratchPath = env["VOX_PROOF_SCRATCH"] else {
             throw Apparatus("VOX_PROOF_APP and VOX_PROOF_SCRATCH are set by scripts/app-proofs.sh")
@@ -3096,6 +3209,7 @@ final class FirstRunProof: XCTestCase {
         let aliceFp = try line(staged(vox, ["id", "--node", "alice"], env: voxEnv)) { $0.count == 52 }
         let agentFp = try line(staged(vox, ["id", "--node", "claude-a"], env: voxEnv)) { $0.count == 52 }
         var rooms: [String: String] = [:]
+        var links: [String: String] = [:]
         for name in ["work", "other"] {
             try staged(vox, ["room", "create", "--node", "alice", "--passphrase-file", pass("room"),
                              "--name", name], env: voxEnv)
@@ -3108,12 +3222,133 @@ final class FirstRunProof: XCTestCase {
             try staged(vox, ["room", "join", "--node", "claude-a", "--passphrase-file", pass("room"), link],
                        env: voxEnv)
             rooms[name] = id
+            links[name] = link
         }
         let room = rooms["work"] ?? ""
-        try staged(vox, ["trust", "add", "--node", "alice", agentFp, "--name", "claude-a",
-                         "--identity-passphrase-file", pass("alice")], env: voxEnv)
-        try staged(vox, ["trust", "add", "--node", "claude-a", aliceFp, "--name", "alice", "--drive",
-                         "--identity-passphrase-file", pass("claude-a")], env: voxEnv)
+        try stagedTrustChange(vox, ["trust", "add", "--node", "alice", agentFp, "--name", "claude-a",
+                                    "--identity-passphrase-file", pass("alice")], env: voxEnv)
+        try stagedTrustChange(vox, ["trust", "add", "--node", "claude-a", aliceFp, "--name", "alice", "--drive",
+                                    "--identity-passphrase-file", pass("claude-a")], env: voxEnv)
+        // FX-60: the authorized OMP image's Session belongs to omp-owner, a node on a daemon of
+        // its own, so on a Computer of its own. Drive taken back there stays taken back, and the
+        // revocation below measures its media service alone: on alice's daemon, My computers
+        // gives the personal node alice drive over claude-a again whatever claude-a's keyring said.
+        var ompOwner: (daemon: Started, env: [String: String], fp: String, pass: String)?
+        defer { ompOwner?.daemon.terminate() }
+        // FX-60 removal floor: media-returner, on a daemon of its own, is a work member holding
+        // drive from omp-owner before omp-owner offers the authorized image. Alice removes and
+        // readmits it below; omp-owner's media service admits by its per-recipient floor.
+        var mediaReturner: (daemon: Started, env: [String: String], fp: String)?
+        defer { mediaReturner?.daemon.terminate() }
+        /// `node`'s own `vox room roster` of work, once `holds` says its members are what is
+        /// awaited. Members are the bare fingerprint lines; `vox:` notes (an owed key, a name) can
+        /// name a removed node and are not membership.
+        func roster(of node: String, env: [String: String], within seconds: TimeInterval,
+                    _ holds: (Set<String>) -> Bool) -> (holds: Bool, said: String) {
+            let until = Date().addingTimeInterval(seconds)
+            var said = ""
+            repeat {
+                let r = run(vox, ["room", "roster", "--node", node, room], env: env)
+                said = "status \(r.status): \(r.out)"
+                let members = Set(r.out.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
+                    .filter { $0.count == 52 && $0.allSatisfy { ("a"..."z").contains($0) || ("2"..."7").contains($0) } })
+                if r.status == 0 && holds(members) { return (true, said) }
+                Thread.sleep(forTimeInterval: 0.5)
+            } while Date() < until
+            return (false, said)
+        }
+        /// One durable `marker` posted to work by `from`, read back by `to` within 90 s: `to` is
+        /// reached by `from`'s room traffic from here on.
+        func reachedBy(_ marker: String, from: (node: String, env: [String: String]),
+                       to: (node: String, env: [String: String])) -> (reached: Bool, said: String) {
+            let posted = run(vox, ["room", "post", "--node", from.node, room, marker], env: from.env)
+            guard posted.status == 0 else {
+                return (false, "\(from.node)'s post exited \(posted.status): \(posted.out.debugDescription)")
+            }
+            let until = Date().addingTimeInterval(90)
+            var read = run(vox, ["room", "read", "--node", to.node, room], env: to.env)
+            while !read.out.contains(marker) && Date() < until {
+                Thread.sleep(forTimeInterval: 0.5)
+                read = run(vox, ["room", "read", "--node", to.node, room], env: to.env)
+            }
+            return (read.out.contains(marker), "\(to.node)'s read exited \(read.status): \(read.out.debugDescription)")
+        }
+        if selectedStep.isEmpty || selectedStep == "omp-image" {
+            let ownerRoot = root.appendingPathComponent("omp-owner")
+            let ownerHome = ownerRoot.appendingPathComponent("home").path
+            let ownerKeychain = ownerRoot.appendingPathComponent("identity.keychain-db").path
+            let ownerEnv = ["VOX_DATA_DIR": ownerRoot.appendingPathComponent("data").path,
+                            "VOX_CONFIG_DIR": ownerRoot.appendingPathComponent("config").path,
+                            "HOME": ownerHome, "VOX_PROXY": "127.0.0.1:0", "VOX_TEST_KEYCHAIN": ownerKeychain]
+            guard stager.run(["/bin/mkdir", "-p", ownerHome], env: [:]).status == 0,
+                  stager.run(["/usr/bin/security", "create-keychain", "-p", "", ownerKeychain],
+                             env: ["HOME": ownerHome]).status == 0 else {
+                throw Apparatus("cannot stage the OMP image owner's private HOME and Keychain")
+            }
+            let ownerDaemon = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: ownerEnv,
+                                        until: "vox daemon: control socket")
+            let ownerPass = ownerRoot.appendingPathComponent("owner.pass").path
+            ompOwner = (ownerDaemon, ownerEnv, "", ownerPass)
+            try stager.write(Data("omp owner identity\n".utf8), to: ownerPass)
+            try staged(vox, ["node", "create", "omp-owner", "--passphrase-file", ownerPass], env: ownerEnv)
+            try staged(vox, ["node", "unlock", "omp-owner", "--passphrase-file", ownerPass], env: ownerEnv)
+            let ownerFp = try line(staged(vox, ["id", "--node", "omp-owner"], env: ownerEnv)) { $0.count == 52 }
+            ompOwner?.fp = ownerFp
+            let ownerLink = try line(staged(vox, ["room", "link", "--node", "alice", room], env: voxEnv)) {
+                $0.hasPrefix("vox://")
+            }
+            try staged(vox, ["room", "join", "--node", "omp-owner", "--passphrase-file", pass("room"), ownerLink],
+                       env: ownerEnv)
+            try stagedTrustChange(vox, ["trust", "add", "--node", "alice", ownerFp, "--name", "omp-owner",
+                                        "--identity-passphrase-file", pass("alice")], env: voxEnv)
+            try stagedTrustChange(vox, ["trust", "add", "--node", "omp-owner", aliceFp, "--name", "alice", "--drive",
+                                        "--identity-passphrase-file", ownerPass], env: ownerEnv)
+            let grants = try staged(vox, ["trust", "list", "--node", "omp-owner"], env: ownerEnv)
+            guard grants.split(separator: "\n").contains(where: { $0.hasPrefix(aliceFp + "  ") && $0.hasSuffix("  read + drive") }) else {
+                throw Apparatus("the OMP image owner must grant alice Read + Drive: \(grants)")
+            }
+            let returnerRoot = root.appendingPathComponent("media-returner")
+            let returnerHome = returnerRoot.appendingPathComponent("home").path
+            let returnerKeychain = returnerRoot.appendingPathComponent("identity.keychain-db").path
+            let returnerEnv = ["VOX_DATA_DIR": returnerRoot.appendingPathComponent("data").path,
+                               "VOX_CONFIG_DIR": returnerRoot.appendingPathComponent("config").path,
+                               "HOME": returnerHome, "VOX_PROXY": "127.0.0.1:0", "VOX_TEST_KEYCHAIN": returnerKeychain]
+            guard stager.run(["/bin/mkdir", "-p", returnerHome], env: [:]).status == 0,
+                  stager.run(["/usr/bin/security", "create-keychain", "-p", "", returnerKeychain],
+                             env: ["HOME": returnerHome]).status == 0 else {
+                throw Apparatus("cannot stage the media returner's private HOME and Keychain")
+            }
+            let returnerDaemon = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: returnerEnv,
+                                           until: "vox daemon: control socket")
+            let returnerPass = returnerRoot.appendingPathComponent("returner.pass").path
+            mediaReturner = (returnerDaemon, returnerEnv, "")
+            try stager.write(Data("media returner identity\n".utf8), to: returnerPass)
+            try staged(vox, ["node", "create", "media-returner", "--passphrase-file", returnerPass], env: returnerEnv)
+            try staged(vox, ["node", "unlock", "media-returner", "--passphrase-file", returnerPass], env: returnerEnv)
+            let returnerFp = try line(staged(vox, ["id", "--node", "media-returner"], env: returnerEnv)) { $0.count == 52 }
+            mediaReturner?.fp = returnerFp
+            let returnerLink = try line(staged(vox, ["room", "link", "--node", "alice", room], env: voxEnv)) {
+                $0.hasPrefix("vox://")
+            }
+            try staged(vox, ["room", "join", "--node", "media-returner", "--passphrase-file", pass("room"), returnerLink],
+                       env: returnerEnv)
+            try stagedTrustChange(vox, ["trust", "add", "--node", "media-returner", ownerFp, "--name", "omp-owner",
+                                        "--identity-passphrase-file", returnerPass], env: returnerEnv)
+            try stagedTrustChange(vox, ["trust", "add", "--node", "omp-owner", returnerFp, "--name", "media-returner", "--drive",
+                                        "--identity-passphrase-file", ownerPass], env: ownerEnv)
+            let returnerGrants = try staged(vox, ["trust", "list", "--node", "omp-owner"], env: ownerEnv)
+            guard returnerGrants.split(separator: "\n").contains(where: { $0.hasPrefix(returnerFp + "  ") && $0.hasSuffix("  read + drive") }) else {
+                throw Apparatus("the OMP image owner must grant media-returner Read + Drive: \(returnerGrants)")
+            }
+            let ownerSeesReturner = roster(of: "omp-owner", env: ownerEnv, within: 60) { $0.contains(returnerFp) }
+            guard ownerSeesReturner.holds else {
+                throw Apparatus("omp-owner does not list media-returner as a work member within 60 s: \(ownerSeesReturner.said)")
+            }
+            let returnerReady = reachedBy("MEDIA-RETURNER-READY", from: ("omp-owner", ownerEnv), to: ("media-returner", returnerEnv))
+            guard returnerReady.reached else {
+                throw Apparatus("media-returner did not read omp-owner's post within 90 s before the authorized image: \(returnerReady.said)")
+            }
+        }
         // Room work must not borrow the authorization window opened by trust above (KP-1).
         try staged(vox, ["node", "lock", "alice"], env: voxEnv)
         try staged(vox, ["node", "unlock", "alice", "--passphrase-file", pass("alice")], env: voxEnv)
@@ -3227,6 +3462,785 @@ final class FirstRunProof: XCTestCase {
         try launchVox(ui, appPath, env: ui.launchEnvironment, scratch: scratchPath)
         defer { ui.terminate() }
         present(ui, Key.id("attached"), timeout: 60, "the app must open attached as alice")
+
+        // FX-60: OMP images. The replayed extensions stay connected for the rest of the journey.
+        var ompHosts: [StagedJSONHost] = []
+        var ompTemp = ""
+        defer {
+            ompHosts.forEach { $0.terminate() }
+            if !ompTemp.isEmpty { _ = stager.run(["/bin/rm", "-rf", ompTemp], env: [:]) }
+        }
+        if selectedStep.isEmpty || selectedStep == "omp-image" {
+            guard let replayer = env["VOX_PROOF_OMP_REPLAY"],
+                  stager.run(["/bin/test", "-r", replayer], env: [:]).status == 0 else {
+                throw Apparatus("VOX_PROOF_OMP_REPLAY must name the OMP bridge replayer (scripts/app-proofs.sh)")
+            }
+            let captures = URL(fileURLWithPath: replayer).deletingLastPathComponent()
+                .appendingPathComponent("omp-image-capture").path
+            // A short, uniquely owned directory lets the replayed bridge's Unix socket fit.
+            let ompTempResult = stager.run(["/usr/bin/mktemp", "-d", "/tmp/vox-1169-omp.XXXXXXXX"], env: [:])
+            ompTemp = ompTempResult.out.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard ompTempResult.status == 0, ompTemp.hasPrefix("/tmp/vox-1169-omp."), !ompTemp.contains("\n") else {
+                throw Apparatus("cannot stage the replayed bridge's private temporary directory: \(ompTempResult.out)")
+            }
+            // The extension's VOX_ROOM is the room id as `vox room list` shows it: a prefix of the
+            // whole id, which the daemon resolves when the Session registers. The OMP follower
+            // must then admit activity for the registration as resolved (host.rs `registered`);
+            // mutant: no restart from the stored registration, and every entry is refused.
+            let wholeRoom = String((links["work"] ?? "").trimmingCharacters(in: .whitespaces)
+                .dropFirst("vox://".count).prefix { $0 != "?" })
+            guard wholeRoom.count == 52, room.count < wholeRoom.count, wholeRoom.hasPrefix(room) else {
+                throw Apparatus("the omp-image step gives VOX_ROOM as a strict prefix of the room id; `vox room list` gave \(room.debugDescription) and the room's link names \(wholeRoom.debugDescription)")
+            }
+            guard let imageOwner = ompOwner else {
+                throw Apparatus("the OMP image owner's own daemon was not staged")
+            }
+            let claudeA = (node: "claude-a", env: voxEnv)
+            let omp = (node: "omp-owner", env: imageOwner.env)
+            // The captured proof_image tool returned a multi-line text part with the image: its card
+            // keeps every line, the blank one and the -, + and # markers as written. Mutant: the
+            // body parsed as full Markdown runs the lines together and drops the markers. It is read
+            // before the image loads, while the card is still in the timeline's view.
+            func checkToolCard() throws {
+                // The assistant's reply quotes the same lines in a code block: only the tool card's
+                // own body starts with the tool's first line. A selectable Text carries its text as
+                // its value.
+                let toolBody = "PROOF_IMAGE\n- kept as typed\n+ added line\n# not a heading\n\nsecond paragraph"
+                let toolCards = ui.descendants(matching: .staticText)
+                    .matching(NSPredicate(format: "identifier BEGINSWITH %@", "entry-content-"))
+                    .allElementsBoundByIndex.map { ($0.value as? String) ?? $0.label }
+                    .filter { $0.hasPrefix("PROOF_IMAGE") }
+                keepTree(ui, "the authorized OMP Session before its image loads (evidence)")
+                guard !toolCards.isEmpty else {
+                    throw Apparatus("the authorized OMP Session's proof_image tool card is not in the timeline's view, so its body cannot be read")
+                }
+                if !toolCards.contains(where: { $0.trimmingCharacters(in: .newlines) == toolBody }) {
+                    XCTFail("PRODUCT: the OMP tool card must show its multi-line body as written, \(toolBody.debugDescription); the app shows \(toolCards.debugDescription)")
+                }
+            }
+            /// Replay one captured OMP Session as `owner`'s, open it in alice's app, and load its image.
+            func replayed(_ capture: String, by owner: (node: String, env: [String: String]),
+                          linkURL: String? = nil, httpURL: String? = nil,
+                          beforeLoad: () throws -> Void = {}) throws -> (StagedJSONHost, String) {
+                var replayEnv = owner.env.merging(["VOX_BIN": vox, "VOX_NODE": owner.node, "VOX_ROOM": room,
+                                                   "PATH": "/usr/bin:/bin", "TMPDIR": ompTemp]) { $1 }
+                if let linkURL { replayEnv["VOX_PROOF_LINK_URL"] = linkURL }
+                if let httpURL { replayEnv["VOX_PROOF_HTTP_URL"] = httpURL }
+                let args = ["/usr/bin/python3", replayer, captures + "/\(capture).jsonl"]
+                    + (capture == "streaming" ? ["--stream-activity"]
+                       : capture == "async-error" ? ["--stream-async"]
+                       : capture == "unicode" ? ["--stream-unicode"]
+                       : capture == "cancel" ? ["--stream-cancel"] : [])
+                let host = try stager.jsonHost(args, env: replayEnv, cwd: work,
+                                               stderr: root.appendingPathComponent("omp-\(capture).stderr").path)
+                ompHosts.append(host)
+                guard let session = try host.command("register", within: 110)["session"] as? String else {
+                    throw Apparatus("the OMP replayer registered no Session from its \(capture) capture")
+                }
+                let read = { self.run(vox, ["room", "session", "--node", "alice", "--json", room, session], env: voxEnv) }
+                let expected = capture == "async-error" ? "Running async sleep command"
+                    : capture == "unicode" ? "Calling proof_unicode"
+                    : capture == "cancel" ? "CANCEL_RUNNING" : "Image available (image/png)"
+                let until = Date().addingTimeInterval(60)
+                var seen = read()
+                while Date() < until && !seen.out.contains(expected) {
+                    Thread.sleep(forTimeInterval: 0.5)
+                    seen = read()
+                }
+                guard seen.out.contains(expected) else {
+                    // Every captured frame reached the daemon: what it did with them is the product's.
+                    let state = try host.command("served 0 1", within: 10)
+                    let said = run(vox, ["room", "session", "--node", owner.node, "--json", room, session], env: owner.env)
+                    if (state["replayed"] as? Int ?? 0) > 0 {
+                        throw Product("with VOX_ROOM prefix \(room.debugDescription), the daemon received OMP \(capture) but alice's Session did not show \(expected.debugDescription); replay \(state); alice \(seen.out.debugDescription); owner \(said.out.debugDescription)")
+                    }
+                    throw Apparatus("staging not achieved: the replayed OMP \(capture) frames never reached the daemon; the replayed extension says \(state); alice's `vox room session --json` exited \(seen.status) saying \(seen.out.debugDescription)")
+                }
+                let tabKey = Key.id("session-\(session.prefix(8))")
+                if locate(ui, tabKey) == nil {
+                    tap(ui, Key.id("room-work"), "work, where \(owner.node)'s OMP Session is", premise: inRoom(vox, voxEnv, "work"))
+                }
+                let premise = Premise("alice holds the replayed OMP \(capture) Session") {
+                    let now = read()
+                    return (now.status == 0, now.out)
+                }
+                // Two Session tabs overflow the tab strip, where XCTest calls a fully visible tab
+                // not hittable: it is clicked where it is drawn, as a person clicks it.
+                let tabUntil = Date().addingTimeInterval(10)
+                var clicked = false
+                while !clicked && Date() < tabUntil {
+                    if let tab = locate(ui, tabKey), let strip = locate(ui, Key.id("room-session-tabs")),
+                       strip.frame.contains(tab.frame), ui.windows.firstMatch.frame.contains(tab.frame) {
+                        tab.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).click()
+                        clicked = true
+                    } else {
+                        Thread.sleep(forTimeInterval: 0.25)
+                    }
+                }
+                if !clicked { tap(ui, tabKey, "\(owner.node)'s replayed OMP \(capture) Session", premise: premise) }
+                let selectedUntil = Date().addingTimeInterval(10)
+                while Date() < selectedUntil && locate(ui, tabKey)?.isSelected != true {
+                    Thread.sleep(forTimeInterval: 0.25)
+                }
+                guard locate(ui, tabKey)?.isSelected == true else {
+                    keepTree(ui, "the replayed OMP \(capture) Session was not selected")
+                    throw Apparatus("the click on \(owner.node)'s replayed OMP \(capture) Session tab did not select it")
+                }
+                if ["async-error", "unicode", "cancel"].contains(capture) {
+                    try beforeLoad()
+                    return (host, session)
+                }
+                guard present(ui, Key.idPrefix("session-media-load-"), timeout: 30,
+                              "an available OMP image must offer to load in its Session view") else {
+                    throw Product("\(owner.node)'s replayed OMP \(capture) Session shows no Load image control")
+                }
+                try beforeLoad()
+                tap(ui, Key.idPrefix("session-media-load-"), "Load image in \(owner.node)'s replayed OMP \(capture) Session")
+                return (host, session)
+            }
+            /// Whether a replayed extension answered the image request it was asked: read only when
+            /// the app shows no outcome. Asked and unable to answer from its capture is the
+            /// replay's (APPARATUS); never asked, or answered with nothing shown, is the app's.
+            func answered(_ host: StagedJSONHost, _ capture: String) -> Premise {
+                Premise("the replayed OMP \(capture) extension answered the image request it was asked") {
+                    guard let state = try? host.command("served 1 5", within: 15) else {
+                        return (false, "the replayed extension did not say what it was asked")
+                    }
+                    let asked = (state["requested"] as? [String]) ?? []
+                    let answered = (state["answered"] as? [String]) ?? []
+                    return (asked.isEmpty || !answered.isEmpty, "\(state)")
+                }
+            }
+            /// What alice's app shows after Load image, by the identifier `prefix` (the image, or
+            /// the refusal in its place), once `present` finds it within 60 s.
+            func media(_ prefix: String, _ host: StagedJSONHost, _ capture: String, _ product: String) -> XCUIElement? {
+                guard present(ui, Key.idPrefix(prefix), timeout: 60, product, premise: answered(host, capture)) else {
+                    return nil
+                }
+                return locate(ui, Key.idPrefix(prefix))
+            }
+            let (authorizedHost, authorized) = try replayed("authorized", by: omp, beforeLoad: checkToolCard)
+            guard let shownImage = media("session-media-image-", authorizedHost, "authorized",
+                                         "the authorized OMP image must render in alice's Session view") else { return }
+            guard let timelineFrame = locate(ui, Key.id("timeline"))?.frame else {
+                throw Apparatus("the authorized OMP Session's timeline cannot be found to place its image")
+            }
+            let renderedSize = shownImage.frame.size
+            if !(renderedSize.width > 0 && renderedSize.height > 0 && timelineFrame.intersects(shownImage.frame)) {
+                XCTFail("PRODUCT: the authorized OMP image must be drawn in alice's Session timeline; it is at \(shownImage.frame), the timeline at \(timelineFrame)")
+            }
+            XCTAssertEqual(shownImage.label, "Session image", "PRODUCT: the rendered OMP image must be named for VoiceOver")
+            keepTree(ui, "the authorized OMP image rendered (evidence)")
+            /// An image's service tag and the Session activity record that announced it, as
+            /// alice's own raw read of `session` carries them. The owner admits a media request
+            /// only for that record, so the direct probe names it as alice's read shows it.
+            func mediaRecord(_ session: String) throws -> (tag: String, entry: String) {
+                let raw = run(vox, ["room", "session", "--node", "alice", "--raw", "--json", room, session], env: voxEnv)
+                guard let tagRange = raw.out.range(of: "media-[0-9a-f]{32}", options: .regularExpression) else {
+                    throw Apparatus("alice's raw read of OMP Session \(session.prefix(8)) names no media service: \(raw.out.debugDescription)")
+                }
+                let tag = String(raw.out[tagRange])
+                guard let line = raw.out.split(separator: "\n").first(where: { $0.contains(tag) }),
+                      let row = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                      let entry = row["entry"] as? String else {
+                    throw Apparatus("alice's raw read names no activity entry for \(tag): \(raw.out.debugDescription)")
+                }
+                return (tag, entry)
+            }
+            let (mediaTag, mediaEntry) = try mediaRecord(authorized)
+            let probe = URL(fileURLWithPath: replayer).deletingLastPathComponent()
+                .appendingPathComponent("media_forward_probe.py").path
+            /// omp-owner's media service asked directly as `node` for the image `tag` that record
+            /// `entry` announced, past every check `node`'s own daemon makes first
+            /// (media_forward_probe.py): what it serves is the owner's decision.
+            func ask(_ node: String, _ nodeEnv: [String: String], _ tag: String, _ entry: String) throws -> (served: Bool, said: String) {
+                let asked = stager.run(["/usr/bin/python3", probe, node, wholeRoom, imageOwner.fp, tag, entry], env: nodeEnv)
+                guard let answer = try? JSONSerialization.jsonObject(with: Data(asked.out.utf8)) as? [String: Any],
+                      answer["kind"] as? String == "answer" else {
+                    throw Apparatus("the direct media probe could not ask omp-owner's service as \(node): \(asked.out.debugDescription)")
+                }
+                let status = answer["status"] as? String ?? ""
+                let body = answer["body"] as? Int ?? 0
+                guard status.isEmpty || status.contains(" 200 ") else {
+                    throw Apparatus("the direct media probe received an unexpected HTTP response: \(asked.out.debugDescription)")
+                }
+                let served = !status.isEmpty || body > 0
+                return (served, asked.out.trimmingCharacters(in: .whitespacesAndNewlines))
+            }
+            func askOwner() throws -> (served: Bool, said: String) {
+                try ask("alice", voxEnv, mediaTag, mediaEntry)
+            }
+            let beforeRevocation = try askOwner()
+            guard beforeRevocation.served else {
+                throw Apparatus("premise unmet: omp-owner's media service, asked directly while alice holds drive, served nothing: \(beforeRevocation.said)")
+            }
+            // FX-60 removal floor (#1171): admission is the owner's unchanged per-recipient private
+            // Session permission for the record a request names. Alice removes media-returner: an
+            // unrelated cut for never-removed alice, who stays served. Readmitted media-returner is
+            // asked below, once served omp-owner's next image, for this record offered before its removal.
+            guard let returner = mediaReturner else {
+                throw Apparatus("the media returner's own daemon was not staged")
+            }
+            let returnerBefore = try ask("media-returner", returner.env, mediaTag, mediaEntry)
+            guard returnerBefore.served else {
+                throw Apparatus("premise unmet: omp-owner's media service, asked directly by media-returner before its removal, did not serve the record offered while it held drive: \(returnerBefore.said)")
+            }
+            try stagedTrustChange(vox, ["room", "remove-member", "--node", "alice", room, returner.fp], env: voxEnv)
+            let ownerRemoved = roster(of: "omp-owner", env: imageOwner.env, within: 60) {
+                !$0.contains(returner.fp) && $0.contains(aliceFp)
+            }
+            guard ownerRemoved.holds else {
+                throw Apparatus("omp-owner did not apply media-returner's removal within 60 s, so alice's check would not follow the cut: \(ownerRemoved.said)")
+            }
+            // The roster's notes speak only for current members: none may still name the removed one.
+            XCTAssertFalse(ownerRemoved.said.contains(String(returner.fp.prefix(12))),
+                           "PRODUCT: omp-owner's roster still names removed media-returner after applying its removal: \(ownerRemoved.said)")
+            let cutUntil = Date().addingTimeInterval(30)
+            var afterCut = try askOwner()
+            while !afterCut.served && Date() < cutUntil {
+                Thread.sleep(forTimeInterval: 1)
+                afterCut = try askOwner()
+            }
+            if !afterCut.served {
+                XCTFail("PRODUCT: after alice removed media-returner, omp-owner's media service refused never-removed alice the authorized image's record for 30 s: \(afterCut.said)")
+            }
+            try stagedTrustChange(vox, ["room", "readmit-member", "--node", "alice", room, returner.fp], env: voxEnv)
+            let ownerReadmitted = roster(of: "omp-owner", env: imageOwner.env, within: 60) { $0.contains(returner.fp) }
+            guard ownerReadmitted.holds else {
+                throw Apparatus("omp-owner did not apply media-returner's readmission within 60 s: \(ownerReadmitted.said)")
+            }
+            // Causal barrier: media-returner reads omp-owner's post made after the readmission, so
+            // omp-owner's next image is offered once the readmitted member is reached again.
+            let witness = reachedBy("MEDIA-READMISSION-WITNESS", from: ("omp-owner", imageOwner.env),
+                                    to: ("media-returner", returner.env))
+            guard witness.reached else {
+                throw Apparatus("causal barrier not reached: readmitted media-returner did not read omp-owner's post within 90 s, so its new-record check would be timing-only: \(witness.said)")
+            }
+            // Never-removed alice is not cut by media-returner's readmission either.
+            let afterReadmission = try askOwner()
+            if !afterReadmission.served {
+                XCTFail("PRODUCT: after alice readmitted media-returner, omp-owner's media service refused never-removed alice the authorized image's record: \(afterReadmission.said)")
+            }
+            print("[proof] FX-60 removal floor: never-removed alice after the cut \(afterCut.said), after the readmission \(afterReadmission.said)")
+            let (forgedHost, forged) = try replayed("forged", by: claudeA)
+            guard let refusalShown = media("session-media-error-", forgedHost, "forged",
+                                           "the OMP image whose SHA-256 does not verify must show a visible refusal") else { return }
+            if locate(ui, Key.idPrefix("session-media-image-")) != nil {
+                keepTree(ui, "the unverified OMP image rendered")
+                XCTFail("PRODUCT: an OMP image whose announced SHA-256 does not match its bytes rendered in alice's Session view (\(forged.prefix(8))); it must be refused")
+            }
+            let refusal = (refusalShown.value as? String) ?? refusalShown.label
+            XCTAssertTrue(refusal.hasPrefix("Image unavailable:")
+                          && (refusal.contains("failed verification") || refusal.contains("SHA-256")),
+                          "PRODUCT: the refusal must say the image failed verification; it says \(refusal.debugDescription)")
+            keepTree(ui, "the forged OMP image was refused (evidence)")
+            // A real stock-OMP capture is released in stages while alice's app is watching.
+            // Hold the captured media response while the second progress frame arrives, then
+            // send it and release the captured final only after the image has rendered.
+            func progressVisible(_ text: String, within seconds: TimeInterval) -> Bool {
+                let until = Date().addingTimeInterval(seconds)
+                repeat {
+                    let values = ui.descendants(matching: .staticText)
+                        .matching(NSPredicate(format: "identifier BEGINSWITH %@", "entry-content-"))
+                        .allElementsBoundByIndex.map { ($0.value as? String) ?? $0.label }
+                    if values.contains(where: { $0.contains(text) }) { return true }
+                    Thread.sleep(forTimeInterval: 0.25)
+                } while Date() < until
+                return false
+            }
+            // A guest-only URL handler makes opening a peer's forbidden custom-scheme link
+            // observable. First prove that Launch Services can open it outside Vox.
+            let suffix = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+            let httpMarker = root.appendingPathComponent("link-http-\(UUID().uuidString)").path
+            let http = try stager.start(["/usr/bin/python3", "-u", "-c", """
+                import http.server, pathlib
+                marker = pathlib.Path("\(httpMarker)")
+                class Handler(http.server.BaseHTTPRequestHandler):
+                    def do_GET(self):
+                        if self.path == "/vox-proof": marker.write_text(self.path)
+                        self.send_response(200)
+                        self.end_headers()
+                        self.wfile.write(b"Vox proof link")
+                    def log_message(self, *args): pass
+                server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+                print("PORT " + str(server.server_port), flush=True)
+                server.serve_forever()
+                """], env: [:], until: "PORT ", within: 15)
+            defer { stager.stop(http.id) }
+            guard let port = http.line?.split(separator: " ").last, UInt16(port) != nil else {
+                throw Apparatus("the guest HTTP link handler did not announce its port: \(http.out)")
+            }
+            let httpURL = "http://127.0.0.1:\(port)/vox-proof"
+            let scheme = "voxproof" + suffix
+            let linkURL = "\(scheme)://attacker"
+            let handlerID = "us.vox.proof.link." + suffix
+            // Launch Services ignores URL handlers registered below the transient /var/folders
+            // proof root. Keep this uniquely named, disposable bundle in the guest user's home.
+            let handler = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("vox-link-handler-\(suffix).app").path
+            let marker = root.appendingPathComponent("link-opened-\(suffix)").path
+            let register = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+            defer {
+                for app in NSRunningApplication.runningApplications(withBundleIdentifier: handlerID) {
+                    app.terminate()
+                }
+                _ = stager.run(["/usr/bin/python3", "-c", """
+                    import shutil, subprocess
+                    subprocess.run(["\(register)", "-u", "\(handler)"], capture_output=True)
+                    shutil.rmtree("\(handler)", ignore_errors=True)
+                    """], env: [:])
+            }
+            let linkSetup = stager.run(["/usr/bin/python3", "-c", """
+                import ctypes, json, os, pathlib, plistlib, subprocess, time
+                handler, marker = "\(handler)", pathlib.Path("\(marker)")
+                script = ('on open location incoming\\n'
+                          'set f to open for access POSIX file ' + json.dumps(str(marker)) + ' with write permission\\n'
+                          'set eof f to 0\\nwrite incoming to f\\nclose access f\\nend open location')
+                subprocess.run(["/usr/bin/osacompile", "-o", handler, "-e", script], check=True)
+                plist = pathlib.Path(handler) / "Contents/Info.plist"
+                with plist.open("rb") as f: data = plistlib.load(f)
+                data["CFBundleIdentifier"] = "\(handlerID)"
+                data["CFBundleURLTypes"] = [{"CFBundleURLName": "Vox proof", "CFBundleURLSchemes": ["\(scheme)"]}]
+                with plist.open("wb") as f: plistlib.dump(data, f)
+                subprocess.run(["/usr/bin/codesign", "--force", "--deep", "--sign", "-", handler], check=True)
+                subprocess.run(["\(register)", "-f", handler], check=True)
+                cf = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+                ls = ctypes.CDLL("/System/Library/Frameworks/CoreServices.framework/CoreServices")
+                cf.CFStringCreateWithCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]
+                cf.CFStringCreateWithCString.restype = ctypes.c_void_p
+                ls.LSSetDefaultHandlerForURLScheme.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+                ls.LSSetDefaultHandlerForURLScheme.restype = ctypes.c_int32
+                scheme = cf.CFStringCreateWithCString(None, b"\(scheme)", 0x08000100)
+                bundle = cf.CFStringCreateWithCString(None, b"\(handlerID)", 0x08000100)
+                status = ls.LSSetDefaultHandlerForURLScheme(scheme, bundle)
+                if status != 0: raise RuntimeError("could not set guest handler: " + str(status))
+                subprocess.run(["/usr/bin/open", "\(linkURL)"], check=True)
+                until = time.monotonic() + 20
+                while not marker.exists() and time.monotonic() < until: time.sleep(0.2)
+                if not marker.exists(): raise RuntimeError("the guest URL handler did not receive its premise")
+                marker.unlink()
+                print("ready")
+                """], env: [:])
+            guard linkSetup.status == 0, linkSetup.out.contains("ready") else {
+                throw Apparatus("the guest-only URL handler could not be staged: \(linkSetup.out.debugDescription)")
+            }
+            ui.activate()
+            let (streamHost, streamed) = try replayed("streaming", by: omp, linkURL: linkURL, httpURL: httpURL) {
+                guard progressVisible("IMAGE_PROGRESS_FIRST", within: 20) else {
+                    throw Apparatus("the stock streaming capture's first progress was not visible before Load")
+                }
+            }
+            let requested = try streamHost.command("requested 1 20", within: 25)
+            guard (requested["requested"] as? [String])?.isEmpty == false else {
+                throw Apparatus("the held image request was not staged: \(requested)")
+            }
+            func stage(_ step: String) throws {
+                let result = try streamHost.command(step, within: 35)
+                guard result["step"] as? String == step else {
+                    throw Apparatus("the streaming \(step) frame was not staged: \(result)")
+                }
+            }
+            try stage("advance")
+            guard progressVisible("IMAGE_PROGRESS_SECOND", within: 20) else {
+                throw Product("the app did not show the streamed second progress while its image was loading")
+            }
+            try stage("release")
+            guard media("session-media-image-", streamHost, "streaming",
+                        "a streamed progress update must not make the authorized in-flight image disappear") != nil else { return }
+            try stage("finish")
+            guard progressVisible("IMAGE_PROGRESS_FINAL", within: 20) else {
+                throw Product("the app did not show the streamed final tool outcome")
+            }
+            guard present(ui, Key.idPrefix("session-media-image-"), timeout: 20,
+                          "the loaded image must survive the streamed final") else {
+                throw Product("the app erased the authorized loaded image when new Session activity arrived")
+            }
+            print("[proof] FX-60 streamed activity: second progress while image in flight; final and loaded image both visible")
+            try stage("link")
+            // SwiftUI exposes inline links beneath the selectable text inside the row button.
+            // XCTest's `ui.links` query omits these descendants on macOS, even though the
+            // system AX tree exposes them. Find the named AXLink in the timeline and click
+            // its actual on-screen frame; do not activate the URL directly.
+            @discardableResult func clickTimelineTarget(_ title: String) throws -> CGRect {
+                guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: proofAppID)
+                    .first(where: { !$0.isTerminated }) else {
+                    throw Product("Vox exited before the peer link could be clicked")
+                }
+                let result = stager.run(["/usr/bin/python3", "-c", """
+                    import ctypes, json, time
+                    ax = ctypes.CDLL("/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices")
+                    cf = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+                    cf.CFStringCreateWithCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]
+                    cf.CFStringCreateWithCString.restype = ctypes.c_void_p
+                    cf.CFArrayGetCount.argtypes = [ctypes.c_void_p]
+                    cf.CFArrayGetCount.restype = ctypes.c_long
+                    cf.CFArrayGetValueAtIndex.argtypes = [ctypes.c_void_p, ctypes.c_long]
+                    cf.CFArrayGetValueAtIndex.restype = ctypes.c_void_p
+                    cf.CFGetTypeID.argtypes = [ctypes.c_void_p]
+                    cf.CFGetTypeID.restype = ctypes.c_ulong
+                    cf.CFStringGetTypeID.restype = ctypes.c_ulong
+                    cf.CFStringGetCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32]
+                    cf.CFStringGetCString.restype = ctypes.c_bool
+                    ax.AXUIElementCreateApplication.argtypes = [ctypes.c_int]
+                    ax.AXUIElementCreateApplication.restype = ctypes.c_void_p
+                    ax.AXUIElementSetMessagingTimeout.argtypes = [ctypes.c_void_p, ctypes.c_float]
+                    ax.AXUIElementCopyAttributeValue.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+                    ax.AXValueGetValue.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+                    ax.AXValueGetValue.restype = ctypes.c_bool
+                    class Point(ctypes.Structure):
+                        _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
+                    ax.CGEventCreateMouseEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint32, Point, ctypes.c_uint32]
+                    ax.CGEventCreateMouseEvent.restype = ctypes.c_void_p
+                    ax.CGEventCreateScrollWheelEvent2.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_int32, ctypes.c_int32, ctypes.c_int32]
+                    ax.CGEventCreateScrollWheelEvent2.restype = ctypes.c_void_p
+                    ax.CGEventSetLocation.argtypes = [ctypes.c_void_p, Point]
+                    ax.CGEventPost.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
+                    def name(s):
+                        return cf.CFStringCreateWithCString(None, s.encode(), 0x08000100)
+                    def get(element, attr):
+                        ax.AXUIElementSetMessagingTimeout(element, 2.0)
+                        value = ctypes.c_void_p()
+                        error = ax.AXUIElementCopyAttributeValue(element, name(attr), ctypes.byref(value))
+                        if error in (-25202, -25205, -25212): return None
+                        if error: raise RuntimeError("AX " + str(error))
+                        return value.value
+                    def text(value):
+                        if not value or cf.CFGetTypeID(value) != cf.CFStringGetTypeID(): return ""
+                        buf = ctypes.create_string_buffer(4096)
+                        return buf.value.decode() if cf.CFStringGetCString(value, buf, len(buf), 0x08000100) else ""
+                    def frame(element):
+                        p, s = Point(), Point()
+                        pos, size = get(element, "AXPosition"), get(element, "AXSize")
+                        if not pos or not size or not ax.AXValueGetValue(pos, 1, ctypes.byref(p)) or not ax.AXValueGetValue(size, 2, ctypes.byref(s)):
+                            return None
+                        return (p.x, p.y, s.x, s.y)
+                    def walk(element, limit):
+                        pending, found = [element], []
+                        while pending and len(found) < limit:
+                            item = pending.pop()
+                            found.append(item)
+                            children = get(item, "AXChildren")
+                            if children:
+                                pending.extend(cf.CFArrayGetValueAtIndex(children, i) for i in range(cf.CFArrayGetCount(children)))
+                        if pending: raise RuntimeError("AX traversal bound")
+                        return found
+                    try:
+                        app = ax.AXUIElementCreateApplication(\(app.processIdentifier))
+                        deadline = time.monotonic() + 30
+                        while time.monotonic() < deadline:
+                            nodes = walk(app, 4000)
+                            timeline = next((e for e in nodes if text(get(e, "AXIdentifier")) == "timeline"), None)
+                            if timeline:
+                                bounds = frame(timeline)
+                                links = [e for e in walk(timeline, 4000)
+                                         if text(get(e, "AXRole")) == "AXLink" and text(get(e, "AXTitle")) == "\(title)"]
+                                if len(links) > 1: raise RuntimeError("ambiguous timeline target")
+                                target = frame(links[0]) if links else None
+                                if bounds and target and target[2] > 0 and target[3] > 0:
+                                    x, y = target[0] + target[2] / 2, target[1] + target[3] / 2
+                                    bx, by, bw, bh = bounds
+                                    if bx <= x <= bx + bw and by <= y <= by + bh:
+                                        at = Point(x, y)
+                                        for kind in (1, 2):
+                                            ax.CGEventPost(0, ax.CGEventCreateMouseEvent(None, kind, at, 0))
+                                        print("clicked " + json.dumps(bounds))
+                                        break
+                                    direction = -200 if y > by + bh else 200
+                                    event = ax.CGEventCreateScrollWheelEvent2(None, 0, 1, direction, 0, 0)
+                                    ax.CGEventSetLocation(event, Point(bx + bw / 2, by + bh / 2))
+                                    ax.CGEventPost(0, event)
+                            time.sleep(0.5)
+                        else:
+                            print("missing")
+                    except RuntimeError as error:
+                        print(str(error))
+                    """], env: [:])
+                guard result.status == 0 else {
+                    throw Apparatus("the external peer-link click failed: \(result.out.debugDescription)")
+                }
+                guard let range = result.out.range(of: "clicked "),
+                      let data = String(result.out[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines).data(using: .utf8),
+                      let bounds = try? JSONSerialization.jsonObject(with: data) as? [Double], bounds.count == 4 else {
+                    throw Apparatus("the timeline target \(title) could not be located and clicked: \(result.out.debugDescription)")
+                }
+                return CGRect(x: bounds[0], y: bounds[1], width: bounds[2], height: bounds[3])
+            }
+            guard let controlURL = URL(string: httpURL),
+                  let browser = NSWorkspace.shared.urlForApplication(toOpen: controlURL),
+                  let browserID = Bundle(url: browser)?.bundleIdentifier else {
+                throw Apparatus("the HTTP control has no identifiable default browser")
+            }
+            expectedHTTPActivation = (browserID, Date().addingTimeInterval(15))
+            try clickTimelineTarget("safe-link")
+            let web = stager.run(["/usr/bin/python3", "-c", """
+                import pathlib, time
+                marker = pathlib.Path("\(httpMarker)")
+                until = time.monotonic() + 15
+                while not marker.exists() and time.monotonic() < until: time.sleep(0.2)
+                print(marker.read_text() if marker.exists() else "missing")
+                """], env: [:])
+            guard web.status == 0 else {
+                throw Apparatus("the guest HTTP handler result could not be read: \(web.out.debugDescription)")
+            }
+            guard web.out.contains("/vox-proof") else {
+                throw Product("the app did not open the peer's http link: \(web.out.debugDescription)")
+            }
+            guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == browserID else {
+                throw Apparatus("the HTTP control did not bring its expected browser to the foreground")
+            }
+            ui.activate()
+            guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == proofAppID else {
+                throw Apparatus("Vox did not regain the foreground after the HTTP control")
+            }
+            try clickTimelineTarget("unsafe-link")
+            let opened = stager.run(["/usr/bin/python3", "-c", """
+                import pathlib, time
+                marker = pathlib.Path("\(marker)")
+                until = time.monotonic() + 5
+                while not marker.exists() and time.monotonic() < until: time.sleep(0.2)
+                print("opened" if marker.exists() else "blocked")
+                """], env: [:])
+            guard opened.status == 0 else {
+                throw Apparatus("the guest URL handler result could not be read: \(opened.out.debugDescription)")
+            }
+            if opened.out.contains("opened") {
+                throw Product("the app opened a peer's non-http(s) link: \(opened.out.debugDescription)")
+            }
+            guard opened.out.contains("blocked") else {
+                throw Apparatus("the guest URL handler returned an unexpected result: \(opened.out.debugDescription)")
+            }
+            print("[proof] FX-60 peer custom-scheme link blocked after the guest handler premise succeeded")
+            // FX-60 removal floor, readmitted side: the streamed image was offered after
+            // media-returner's readmission reached it.
+            let (freshTag, freshEntry) = try mediaRecord(streamed)
+            let freshUntil = Date().addingTimeInterval(60)
+            var returnerFresh = try ask("media-returner", returner.env, freshTag, freshEntry)
+            while !returnerFresh.served && Date() < freshUntil {
+                Thread.sleep(forTimeInterval: 1)
+                returnerFresh = try ask("media-returner", returner.env, freshTag, freshEntry)
+            }
+            if returnerFresh.served {
+                // The same forward from media-returner has just been served, and never-removed
+                // alice is served the record offered before its removal right now: the old
+                // image's service is alive, so refusing media-returner that record is the owner's
+                // admission.
+                let aliceOld = try askOwner()
+                guard aliceOld.served else {
+                    throw Apparatus("positive control unmet: omp-owner's media service did not serve never-removed alice the record offered before media-returner's removal, so refusing media-returner that record cannot be attributed: \(aliceOld.said)")
+                }
+                let returnerStale = try ask("media-returner", returner.env, mediaTag, mediaEntry)
+                if returnerStale.served {
+                    XCTFail("PRODUCT: omp-owner's media service served readmitted media-returner the image record offered before its removal: \(returnerStale.said)")
+                }
+                print("[proof] FX-60 removal floor: readmitted media-returner, record offered after its readmission \(returnerFresh.said); never-removed alice, record offered before the removal \(aliceOld.said); readmitted media-returner, that record \(returnerStale.said)")
+            } else {
+                XCTFail("PRODUCT: omp-owner's media service refused readmitted media-returner, holding drive, the image record offered after its readmission for 60 s: \(returnerFresh.said)")
+            }
+            // Keep alice's old-record positive control above this cut: a later Drive regrant
+            // is forward-only and cannot serve as evidence that her old generation is live.
+            let authorizedTab = Key.id("session-\(authorized.prefix(8))")
+            // FX-60 owner side: omp-owner takes drive back from alice. Its own media service must
+            // then refuse her, though she asks past her own daemon's checks (mutant: the media
+            // witness's Only::Drive becomes Anyone, and the image is served).
+            try stagedTrustChange(vox, ["trust", "read", "--node", "omp-owner", aliceFp,
+                                        "--identity-passphrase-file", imageOwner.pass], env: imageOwner.env)
+            let ownerUntil = Date().addingTimeInterval(20)
+            var afterRevocation = try askOwner()
+            while afterRevocation.served && Date() < ownerUntil {
+                Thread.sleep(forTimeInterval: 1)
+                afterRevocation = try askOwner()
+            }
+            if afterRevocation.served {
+                XCTFail("PRODUCT: 20 s after omp-owner took drive back from alice, its own media service still served her the authorized OMP image when she asked it directly: \(afterRevocation.said)")
+            }
+            // The revocation as alice's app shows it: the authorized Session's image is not drawn
+            // again, whether Load image is still offered or the Session is gone. Its tab is clicked
+            // where it is drawn, as in `replayed`.
+            if let tab = locate(ui, authorizedTab), ui.windows.firstMatch.frame.contains(tab.frame) {
+                tab.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).click()
+            }
+            var appShows = "the Session is gone"
+            if locate(ui, authorizedTab) != nil {
+                let loadUntil = Date().addingTimeInterval(10)
+                while locate(ui, Key.idPrefix("session-media-load-")) == nil && Date() < loadUntil {
+                    Thread.sleep(forTimeInterval: 0.25)
+                }
+                if locate(ui, Key.idPrefix("session-media-load-")) != nil {
+                    tap(ui, Key.idPrefix("session-media-load-"), "Load image after omp-owner took drive back")
+                }
+                // Within 60 s the app shows its refusal or nothing; never the image.
+                let shownUntil = Date().addingTimeInterval(60)
+                while locate(ui, Key.idPrefix("session-media-image-")) == nil
+                        && locate(ui, Key.idPrefix("session-media-error-")) == nil && Date() < shownUntil {
+                    Thread.sleep(forTimeInterval: 0.25)
+                }
+                if let shown = locate(ui, Key.idPrefix("session-media-error-")) {
+                    appShows = (shown.value as? String) ?? shown.label
+                } else {
+                    appShows = "no image and no refusal"
+                }
+                if locate(ui, Key.idPrefix("session-media-image-")) != nil {
+                    keepTree(ui, "the OMP image rendered after drive was taken back")
+                    XCTFail("PRODUCT: after omp-owner took drive back from alice, her app drew the authorized OMP image again (\(authorized.prefix(8))); it shows \(appShows.debugDescription)")
+                }
+            }
+            keepTree(ui, "the authorized OMP Session after the revocation (evidence)")
+            print("[proof] FX-60 revocation: owner service \(afterRevocation.said); app shows \(appShows.debugDescription)")
+            try stagedTrustChange(vox, ["trust", "drive", "--node", "omp-owner", aliceFp,
+                                        "--identity-passphrase-file", imageOwner.pass], env: imageOwner.env)
+            print("[proof] FX-60 OMP images: authorized \(authorized.prefix(8)) rendered (\(renderedSize)); forged \(forged.prefix(8)) refused: \(refusal)")
+            // These are stock OMP records captured while an actual background bash job ran,
+            // completed, and then a separate command failed. Release each only after the app
+            // has observed the prior state, rather than opening a preloaded completed capture.
+            ui.activate()
+            let (asyncHost, _) = try replayed("async-error", by: omp)
+            func rowShows(_ pieces: [String], within seconds: TimeInterval) -> Bool {
+                let until = Date().addingTimeInterval(seconds)
+                repeat {
+                    let rows = ui.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", "entry-row-"))
+                        .allElementsBoundByIndex
+                    for row in rows {
+                        let texts = row.descendants(matching: .staticText).allElementsBoundByIndex
+                            .map { ($0.value as? String) ?? $0.label }
+                        if pieces.allSatisfy({ piece in texts.contains(where: { $0.contains(piece) }) }) {
+                            return true
+                        }
+                    }
+                    Thread.sleep(forTimeInterval: 0.25)
+                } while Date() < until
+                return false
+            }
+            func asyncStage(_ name: String) throws {
+                let sent = try asyncHost.command(name, within: 35)
+                guard sent["step"] as? String == name else {
+                    throw Apparatus("the captured async \(name) stage was not sent: \(sent)")
+                }
+            }
+            guard rowShows(["Running async sleep command", "running"], within: 20) else {
+                throw Product("the app did not show the captured tool's initial running state")
+            }
+            try asyncStage("job")
+            guard rowShows(["bg_1", "running"], within: 20) else {
+                throw Product("the app did not show the streamed background job running")
+            }
+            try asyncStage("complete")
+            guard rowShows(["bg_1", "completed"], within: 20),
+                  rowShows(["Running async sleep command", "completed", "ASYNC_FINAL_PROOF"], within: 20) else {
+                throw Product("the app did not show the streamed background job and tool completion")
+            }
+            try asyncStage("error")
+            guard rowShows(["Running command that exits with an error", "error", "PROOF_ERROR_FAILURE"], within: 20) else {
+                throw Product("the app did not show the streamed tool failure as an error")
+            }
+            print("[proof] FX-60 streamed stock async running, completion and error visible in app")
+            let (unicodeHost, _) = try replayed("unicode", by: omp)
+            guard rowShows(["Calling proof_unicode", "running"], within: 20) else {
+                throw Product("the app did not show the Unicode tool before its result")
+            }
+            let unicodeSent = try unicodeHost.command("unicode", within: 35)
+            guard unicodeSent["step"] as? String == "unicode" else {
+                throw Apparatus("the captured Unicode result was not sent: \(unicodeSent)")
+            }
+            let fullUnicode = "UNICODE_BEGIN|" + String(repeating: "é漢🙂", count: 4000) + "|UNICODE_END"
+            let page1 = String(fullUnicode.prefix(4096))
+            let page2 = String(fullUnicode.dropFirst(4096).prefix(4096))
+            let page3 = String(fullUnicode.dropFirst(8192))
+            let untilUnicode = Date().addingTimeInterval(30)
+            var unicodeRow: XCUIElement?
+            repeat {
+                let rows = ui.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", "entry-row-"))
+                    .allElementsBoundByIndex
+                unicodeRow = rows.first { row in
+                    row.descendants(matching: .staticText).allElementsBoundByIndex
+                        .contains { (($0.value as? String) ?? $0.label) == page1 }
+                }
+                if unicodeRow == nil { Thread.sleep(forTimeInterval: 0.25) }
+            } while unicodeRow == nil && Date() < untilUnicode
+            guard let unicodeRow else { throw Product("the first Unicode page was not shown intact") }
+            for expectedPage in [page2, page3] {
+                let next = unicodeRow.buttons.matching(identifier: "Next").firstMatch
+                guard next.exists else { throw Product("the long Unicode result has no next page") }
+                if !inView(ui, next) { scrollTo(ui, next) }
+                guard inView(ui, next) else { throw Apparatus("the Unicode next-page control is outside the timeline") }
+                next.click()
+                let texts = unicodeRow.descendants(matching: .staticText).allElementsBoundByIndex
+                    .map { ($0.value as? String) ?? $0.label }
+                guard texts.contains(expectedPage) else {
+                    throw Product("a Unicode result page was clipped, altered, or out of order")
+                }
+            }
+            let disclosureUntil = Date().addingTimeInterval(20)
+            var disclosure: XCUIElement?
+            repeat {
+                disclosure = ui.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", "entry-row-"))
+                    .allElementsBoundByIndex.first { row in
+                        row.descendants(matching: .staticText).allElementsBoundByIndex
+                            .contains { (($0.value as? String) ?? $0.label) == "Tool details" }
+                    }
+                if disclosure == nil { Thread.sleep(forTimeInterval: 0.25) }
+            } while disclosure == nil && Date() < disclosureUntil
+            guard let disclosure else { throw Product("the Unicode tool's details disclosure is missing") }
+            let detailsButton = disclosure.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", "entry-details-")).firstMatch
+            guard detailsButton.exists else { throw Product("the Unicode tool's details cannot be opened") }
+            if !inView(ui, detailsButton) { scrollTo(ui, detailsButton) }
+            guard inView(ui, detailsButton) else { throw Apparatus("Unicode details control is outside the timeline") }
+            detailsButton.click()
+            let fullDetails = "    details:\n      {\"text\":\"" + fullUnicode + "\"}\n"
+            let detailPages = stride(from: 0, to: fullDetails.count, by: 4096).map { offset in
+                String(fullDetails.dropFirst(offset).prefix(4096))
+            }
+            for (index, expectedPage) in detailPages.enumerated() {
+                let text = disclosure.descendants(matching: .staticText)
+                    .matching(NSPredicate(format: "identifier BEGINSWITH %@", "entry-details-text-")).firstMatch
+                guard text.waitForExistence(timeout: 10), ((text.value as? String) ?? text.label) == expectedPage else {
+                    throw Product("Unicode details page \(index + 1) was clipped, altered, or out of order")
+                }
+                if index + 1 < detailPages.count {
+                    let next = disclosure.buttons.matching(identifier: "Next").firstMatch
+                    guard next.exists else { throw Product("the long Unicode details have no next page") }
+                    if !inView(ui, next) { scrollTo(ui, next) }
+                    guard inView(ui, next) else { throw Apparatus("Unicode details next-page control is outside the timeline") }
+                    next.click()
+                }
+            }
+            print("[proof] FX-60 stock Unicode details shown intact across app pages")
+            print("[proof] FX-60 stock Unicode result shown intact across three app pages")
+            let partialSent = try unicodeHost.command("partial", within: 35)
+            guard partialSent["step"] as? String == "partial" else {
+                throw Apparatus("the captured assistant partial was not sent: \(partialSent)")
+            }
+            guard rowShows(["proof_unicode_response"], within: 20) else {
+                throw Product("the app did not show the captured assistant partial before its empty final")
+            }
+            let emptySent = try unicodeHost.command("empty-final", within: 35)
+            guard emptySent["step"] as? String == "empty-final" else {
+                throw Apparatus("the captured empty assistant final was not sent: \(emptySent)")
+            }
+            let emptyUntil = Date().addingTimeInterval(20)
+            while rowShows(["proof_unicode_response"], within: 0) && Date() < emptyUntil {
+                Thread.sleep(forTimeInterval: 0.25)
+            }
+            guard !rowShows(["proof_unicode_response"], within: 0) else {
+                throw Product("the app retained the assistant partial after its captured empty final")
+            }
+            print("[proof] FX-60 captured empty final cleared the observed assistant partial")
+            let (cancelHost, _) = try replayed("cancel", by: omp)
+            guard rowShows(["Calling proof_cancel", "running", "CANCEL_RUNNING"], within: 20) else {
+                throw Product("the app did not show the cancellable tool's running progress")
+            }
+            let cancelSent = try cancelHost.command("cancel", within: 35)
+            guard cancelSent["step"] as? String == "cancel" else {
+                throw Apparatus("the captured cancellation was not sent: \(cancelSent)")
+            }
+            guard rowShows(["Calling proof_cancel", "cancelled", "CANCELLED_BY_OPERATOR"], within: 20) else {
+                throw Product("the app did not show the streamed tool cancellation")
+            }
+            print("[proof] FX-60 stock tool cancellation visible after running progress")
+            if selectedStep == "omp-image" {
+                print("[proof] selected omp-image step complete; other Sessions flows NOT RUN")
+                return
+            }
+        }
 
         if selectedStep.isEmpty {
             let s1Read = { self.run(vox, ["room", "session", "--node", "alice", "--json", room, s1], env: voxEnv).out }
@@ -3787,12 +4801,12 @@ final class FirstRunProof: XCTestCase {
         try staged(vox, ["room", "join", "--node", "remote-owner", "--passphrase-file", pass("room"), ownerLink], env: ownerEnv)
         try staged(vox, ["node", "unlock", "claude-a", "--passphrase-file", pass("claude-a")], env: voxEnv)
         for (name, fp) in [("alice", aliceFp), ("claude-a", agentFp)] {
-            try staged(vox, ["trust", "add", "--node", name, ownerFp, "--name", "remote-owner",
-                             "--identity-passphrase-file", pass(name)], env: voxEnv)
+            try stagedTrustChange(vox, ["trust", "add", "--node", name, ownerFp, "--name", "remote-owner",
+                                        "--identity-passphrase-file", pass(name)], env: voxEnv)
             var grant = ["trust", "add", "--node", "remote-owner", fp, "--name", name,
                          "--identity-passphrase-file", ownerPass]
             if name == "claude-a" { grant.append("--drive") }
-            try staged(vox, grant, env: ownerEnv)
+            try stagedTrustChange(vox, grant, env: ownerEnv)
         }
         let grants = try staged(vox, ["trust", "list", "--node", "remote-owner"], env: ownerEnv)
         guard grants.split(separator: "\n").contains(where: { $0.hasPrefix(aliceFp + "  ") && $0.hasSuffix("  read") }),
@@ -3892,8 +4906,8 @@ final class FirstRunProof: XCTestCase {
                       "the Drive member must be offered the owner's Session in To") else { return }
         ui.typeKey(.escape, modifierFlags: [])
         tap(ui, privateRow, "Select the authorized owner tab before revocation")
-        try staged(vox, ["trust", "read", "--node", "remote-owner", agentFp,
-                         "--identity-passphrase-file", ownerPass], env: ownerEnv)
+        try stagedTrustChange(vox, ["trust", "read", "--node", "remote-owner", agentFp,
+                                    "--identity-passphrase-file", ownerPass], env: ownerEnv)
         missingWithin(ui, privateRow, 60, "downgrade to Read must remove the retained owner's Session row")
         guard present(ui, Key.id("compose"), timeout: 15,
                       "revoking the selected Session must fall back to General") else { return }
@@ -3903,8 +4917,8 @@ final class FirstRunProof: XCTestCase {
         XCTAssertNil(locate(ui, Key.id("to-remote-owner-\(privateSession.prefix(8))")),
                      "PRODUCT: revoked drive must remove the owner's Session To option")
         ui.typeKey(.escape, modifierFlags: [])
-        try staged(vox, ["trust", "drive", "--node", "remote-owner", agentFp,
-                         "--identity-passphrase-file", ownerPass], env: ownerEnv)
+        try stagedTrustChange(vox, ["trust", "drive", "--node", "remote-owner", agentFp,
+                                    "--identity-passphrase-file", ownerPass], env: ownerEnv)
         guard present(ui, privateRow, timeout: 60, "regrant must restore discovery of the retained owner's Session") else { return }
         print("[proof] SA-1/2/4: three identities; Read-only chat without Session/To; authorized entry and To; revocation removes discovery; regrant restores")
 
@@ -4160,13 +5174,15 @@ final class FirstRunProof: XCTestCase {
         words(ui, Key.id("card-presented-name"), timeout: 30,
               "Carol's authenticated name stays visible beside her full fingerprint", until: { $0 == "Name it presents: carol" })
         words(ui, Key.id("card-directions"), timeout: 10,
-              "a presented name must not conceal that Carol is outside the keyring", until: { $0.contains("not in your keyring") })
+              "a presented name must not conceal that Carol is outside the keyring", until: { $0.contains("haven't granted local node trust") })
         tap(ui, Key.id("card-alias"), "Carol's editable default")
         el(ui, Key.id("card-alias")).typeKey("a", modifierFlags: .command)
         el(ui, Key.id("card-alias")).typeKey(XCUIKeyboardKey.delete.rawValue, modifierFlags: [])
         type(ui, Key.id("card-alias"), "local-carol", "the explicit local override")
         tap(ui, Key.id("card-trust-confirm"), "Trust Carol as local-carol")
         keyringPassphraseIfAsked(ui) { self.run(vox, ["trust", "list", "--node", "alice"], env: voxEnv).out.contains(carolFp) }
+        // The card stays open on what it did; it is modal, so it is closed before the sidebar.
+        tap(ui, Key.id("card-close"), "Close Carol's card")
         ui.menuBars.menuBarItems["View"].click()
         tap(ui, Key.menuItem("Keyring"), "the keyring after accepting Carol")
         words(ui, Key.id("keyring-capability-local-carol"), timeout: 30,
@@ -4444,7 +5460,11 @@ final class FirstRunProof: XCTestCase {
             XCTAssertFalse(during.contains("NATIVE-TWIN-DURING"), "PRODUCT: removed Bob received the twin's removal-period activity: \(during)")
         }
         print("[proof] before=\(before) removed=\(during) other=\(controlAfter) trust=\(trust) twin=\(twinDuring) twinRoster=\(propagated.said) twinReadmit=\(twinReadmit.status): \(twinReadmit.out) bobRosterWhileRemoved=\(bobRosterRemoved.status): \(bobRosterRemoved.out)")
-        guard tap(ui, Key.id("member-manage-membership"), "readmission management"),
+        // The inspector's button opened removal above. After that sheet, XCTest finds no hit point
+        // on it while it is drawn unobstructed and enabled (UI tree and screen at this step), so
+        // readmission opens the same sheet from Room › Remove or Readmit Member…, a person's path.
+        ui.menuBars.menuBarItems["Room"].click()
+        guard tap(ui, Key.menuItem("Remove or Readmit Member…"), "Room › Remove or Readmit Member…"),
               tap(ui, Key.id("room-readmit-fingerprint"), "full readmission fingerprint") else { return }
         el(ui, Key.id("room-readmit-fingerprint")).typeText(bobFp)
         guard tap(ui, Key.showing("Review Readmission"), "review exact readmission"),
@@ -4542,7 +5562,9 @@ final class FirstRunProof: XCTestCase {
              "VOX_PROXY": "127.0.0.1:0",
              "VOX_TEST_KEYCHAIN": root.appendingPathComponent("\(name).keychain-db").path]
         }
-        let alice = nodeEnv("alice"), bob = nodeEnv("bob")
+        let firstFailure = root.appendingPathComponent("member-observation.fail").path
+        let alice = nodeEnv("alice").merging(["VOX_TEST_MEMBER_OBSERVATION_FAIL_FILE": firstFailure]) { $1 }
+        let bob = nodeEnv("bob")
         let pass = root.appendingPathComponent("pass").path
         try stager.write(Data("recovery pass\n".utf8), to: pass)
         // Only these owned apparatus daemons target private Keychains through real Security APIs.
@@ -4572,9 +5594,15 @@ final class FirstRunProof: XCTestCase {
         try stager.write(Data("no\n".utf8), to: alice["VOX_CONFIG_DIR"]! + "/app/login-item")
         try staged(vox, ["computer", "personal", "alice"], env: alice)
         try staged(vox, ["room", "post", "--node", "bob", room, "RECOVERY-OLD"], env: bob)
+        let firstGate = root.appendingPathComponent("first-roster-gate").path
+        guard stager.run(["/bin/mkdir", "-p", firstGate], env: [:]).status == 0 else {
+            throw Apparatus("cannot create the first-roster scheduling directory")
+        }
+        try stager.write(Data(), to: firstGate + "/hold-before-initial")
+        try stager.write(Data(), to: firstGate + "/hold-before-watch")
         let ui = voxApp(appPath)
-        ui.launchEnvironment = alice
-        try launchVox(ui, appPath, env: alice, scratch: scratchPath)
+        ui.launchEnvironment = alice.merging(["VOX_PROOF_ROSTER_GATE": firstGate]) { $1 }
+        try launchVox(ui, appPath, env: ui.launchEnvironment, scratch: scratchPath)
         defer { ui.terminate() }
         func timelineBody(_ text: String, timeout: TimeInterval, _ outcome: String) -> Bool {
             guard windowReadable(ui) else { return false }
@@ -4605,7 +5633,61 @@ final class FirstRunProof: XCTestCase {
             XCTFail("PRODUCT: \(outcome); no exact \(text.debugDescription) body is visible inside the timeline. The app shows: \(onScreen(ui))")
             return false
         }
+        // Refuse one actual MemberObservation RPC while Alice remains Ready. Both app
+        // roster writers are held before the request so no successful baseline can win.
+        guard words(ui, Key.id("machine-alice"), timeout: 60, "Alice must be Ready before the fault",
+                    until: { $0 == "alice Ready" }) != nil else { return }
         tap(ui, Key.id("room-recovery"), "the remote recovery room")
+        func waitFirstMarker(_ name: String) throws {
+            let until = Date().addingTimeInterval(90)
+            while Date() < until {
+                if stager.run(["/bin/test", "-e", firstGate + "/" + name], env: [:]).status == 0 { return }
+                Thread.sleep(forTimeInterval: 0.2)
+            }
+            if name.hasPrefix("published-rejected") {
+                // Staging was reached (its held marker was observed); the app then failed to
+                // reject the stale completion it was handed.
+                XCTFail("PRODUCT: the stale first-roster completion was not rejected (no \(name) within 90 s)")
+                return
+            }
+            throw Apparatus("first-roster scheduling did not reach \(name)")
+        }
+        try waitFirstMarker("held-before-initial")
+        let fullRecovery = String(link.dropFirst("vox://".count).prefix { $0 != "?" && $0 != "/" })
+        guard fullRecovery.count == 52 else { throw Apparatus("recovery link has no full room identity") }
+        try stager.write(Data(fullRecovery.utf8), to: firstFailure)
+        guard stager.run(["/bin/rm", "-f", firstGate + "/hold-before-initial"], env: [:]).status == 0 else {
+            throw Apparatus("cannot release the initial roster request")
+        }
+        let consumed = URL(fileURLWithPath: firstFailure).deletingPathExtension().appendingPathExtension("consumed").path
+        let consumedUntil = Date().addingTimeInterval(60)
+        while Date() < consumedUntil && stager.run(["/bin/test", "-e", consumed], env: [:]).status != 0 {
+            Thread.sleep(forTimeInterval: 0.2)
+        }
+        guard stager.run(["/bin/test", "-e", consumed], env: [:]).status == 0 else {
+            throw Apparatus("the real first membership RPC was not refused")
+        }
+        guard words(ui, Key.id("member-observation-unavailable"), timeout: 30,
+                    "the real first-read refusal must be visible",
+                    until: { $0.contains("membership observation was refused") }) != nil,
+              words(ui, Key.id("machine-alice"), timeout: 10, "the node must stay Ready through the refusal",
+                    until: { $0 == "alice Ready" }) != nil else { return }
+        XCTAssertNil(locate(ui, Key.id("node-stopped")),
+                     "PRODUCT: a roster RPC refusal must not stop the ready node or its observer")
+        guard stager.run(["/bin/rm", "-f", firstGate + "/hold-before-watch"], env: [:]).status == 0 else {
+            throw Apparatus("cannot release the fresh watcher request")
+        }
+        guard words(ui, Key.id("room-tab-members"), timeout: 90,
+                    "the first successful populated roster must recover in the same selection",
+                    until: { $0 == "2 members" }) != nil else { return }
+        XCTAssertNil(locate(ui, Key.id("node-stopped")),
+                     "PRODUCT: the same selected room must recover without an observer restart")
+        for _ in 0..<2 {
+            _ = stager.run(["/bin/rm", "-f", firstGate + "/published-watch"], env: [:])
+            try waitFirstMarker("published-watch")
+            XCTAssertNil(locate(ui, Key.id("join-\(bobFp)")),
+                         "PRODUCT: a failed first roster read must not seed an empty baseline")
+        }
         guard timelineBody("RECOVERY-OLD", timeout: 60,
                            "the old remote message body must be visible before pruning") else { return }
         guard present(ui, Key.id("member-bob"), timeout: 30,
@@ -4651,6 +5733,9 @@ final class FirstRunProof: XCTestCase {
         print("[proof] timeline: displayed OLD; shipped CLI confirmed OLD pruned and KEPT complete; resumed same app without another post; KEPT and bob visible")
         // Interrupt only the daemon this journey started, keeping the same app and room open.
         guard let local = daemon else { throw Apparatus("the started Alice daemon handle is absent") }
+        _ = stager.run(["/bin/rm", "-f", firstGate + "/held-watch", firstGate + "/published-rejected-watch"], env: [:])
+        try stager.write(Data(), to: firstGate + "/hold-watch")
+        try waitFirstMarker("held-watch")
         try local.pause()
         defer { try? local.resume() }
         // A suspended daemon answers only when its 60-second IPC deadline expires.
@@ -4659,6 +5744,10 @@ final class FirstRunProof: XCTestCase {
                     until: { $0.contains("members unavailable") }) != nil else { return }
         guard timelineBody("RECOVERY-KEPT", timeout: 10,
                            "a transport interruption must preserve the displayed retained timeline") else { return }
+        guard stager.run(["/bin/rm", "-f", firstGate + "/hold-watch"], env: [:]).status == 0 else {
+            throw Apparatus("cannot release the old-epoch roster response")
+        }
+        try waitFirstMarker("published-rejected-watch")
         // A changed remote roster makes recovery distinguishable from the retained old view.
         try staged(vox, ["node", "create", "charlie"],
                    env: bob.merging(["VOX_IDENTITY_PASSPHRASE": "recovery pass"]) { $1 })
@@ -4715,6 +5804,10 @@ final class FirstRunProof: XCTestCase {
         guard words(ui, Key.id("timeline-title"), timeout: 15,
                     "the room watcher must refresh retention to one hour",
                     until: { $0.contains("1 hour") }) != nil else { return }
+        XCTAssertNil(locate(ui, Key.id("join-\(bobFp)")),
+                     "PRODUCT: recovering the existing room must not report Bob as newly joined")
+        XCTAssertNil(locate(ui, Key.id("join-\(charlieFp)")),
+                     "PRODUCT: an admission during the observation outage cannot be asserted as a live join")
         print("[proof] transport: unavailable retained timeline; same room recovered roster; later remote retention reached header")
     }
 
@@ -4814,8 +5907,37 @@ final class FirstRunProof: XCTestCase {
             print("[proof] started at step \(from): steps 1–5 NOT RUN; what they leave was staged by vox")
         }
 
+        // Scheduling markers only: roster values still come from the real daemon.
+        let rosterGate = scratch.appendingPathComponent("roster-gate").path
+        guard stager.run(["/bin/mkdir", "-p", rosterGate], env: [:]).status == 0 else {
+            throw Apparatus("cannot create the isolated roster scheduling directory")
+        }
+        func rosterMarker(_ name: String, present: Bool) throws {
+            let path = rosterGate + "/" + name
+            if present {
+                try stager.write(Data(), to: path)
+            } else {
+                guard stager.run(["/bin/rm", "-f", path], env: [:]).status == 0 else {
+                    throw Apparatus("cannot remove roster scheduling marker \(name)")
+                }
+            }
+        }
+        func waitRosterMarker(_ name: String) throws {
+            let until = Date().addingTimeInterval(90)
+            while Date() < until {
+                if stager.run(["/bin/test", "-e", rosterGate + "/" + name], env: [:]).status == 0 { return }
+                Thread.sleep(forTimeInterval: 0.2)
+            }
+            if name.hasPrefix("published-rejected") {
+                XCTFail("PRODUCT: the stale roster completion was not rejected (no \(name) within 90 s)")
+                return
+            }
+            throw Apparatus("real roster observation did not reach scheduling marker \(name)")
+        }
+
         let ui = voxApp(appPath)
         ui.launchEnvironment = voxEnv
+        ui.launchEnvironment["VOX_PROOF_ROSTER_GATE"] = rosterGate
         try launchVox(ui, appPath, env: ui.launchEnvironment, scratch: scratchPath)
 
         if from > 5 {
@@ -4897,8 +6019,16 @@ final class FirstRunProof: XCTestCase {
             throw Product("the app's New Room made no room alice's `vox room list` lists: \(rooms)")
         }
         room = made
-        guard present(ui, Key.id("attached"), timeout: 60,
-                      "the native node must recover observation after room creation before room commands are exercised") else { return }
+        // Do not exercise ⌘L against a transitional observer: the real room page and its
+        // successfully observed single-member roster must be visible with the node Ready.
+        guard words(ui, Key.id("machine-alice"), timeout: 90, "the node must automatically reach Ready",
+                    until: { $0 == "alice Ready" }) != nil,
+              words(ui, Key.id("room-tab-members"), timeout: 90,
+                    "the newly created room must publish its actual roster",
+                    until: { $0 == "1 member" }) != nil,
+              present(ui, Key.id("timeline"), timeout: 30, "the created room's page must be visible") else { return }
+        XCTAssertNil(locate(ui, Key.id("node-stopped")),
+                     "PRODUCT: the created room must automatically recover observation before its actions are used")
         NSPasteboard.general.clearContents()
         ui.typeKey("l", modifierFlags: .command)
         var link = ""
@@ -4935,10 +6065,18 @@ final class FirstRunProof: XCTestCase {
         // trusted meanwhile, is listed in its inspector without the room being opened again.
         words(ui, Key.id("member-bob"), timeout: 30,
               "bob joined and was trusted while the room was on screen: its inspector must list him in alice's keyring",
-              until: { $0.hasPrefix("bob, trusted both ways") || $0.hasPrefix("bob, waiting for the other side") })
+              until: { $0.hasPrefix("bob, local trust and room consent observed") || $0.hasPrefix("bob, local trust, room consent not observed") })
         // Off the room, so a message to alice is unread: a room on screen is read.
         ui.menuBars.menuBarItems["View"].click()
         tap(ui, Key.menuItem("Keyring"), "View > Keyring")
+        // Bob's addressed post comes from an agent Session. Open it through the same first-turn
+        // hook a real Claude Code session runs; a VOX_SESSION marker alone is not registration.
+        let bobOpened = run(vox, ["agent", "hook", "--node", "bob", "--room", room, "--format", "text"],
+                            env: voxEnv.merging(["CLAUDE_CODE_ENTRYPOINT": "cli"]) { $1 },
+                            input: "{\"session_id\":\"bob-proof\",\"hook_event_name\":\"UserPromptSubmit\",\"cwd\":\"/tmp\",\"transcript_path\":\"/tmp/t.jsonl\",\"prompt\":\"notify alice\"}")
+        guard bobOpened.status == 0 else {
+            throw Apparatus("bob's Claude Code hook, to open the notification sender Session, exited \(bobOpened.status): \(bobOpened.out)")
+        }
         try staged(vox, ["room", "post", "--node", "bob", "--to", aliceFp, room, "NEEDS-YOU"],
                    env: bobSession)
         // One list of rooms, no headings (the decider, v0.4.3): mission's row says it needs
@@ -4956,7 +6094,7 @@ final class FirstRunProof: XCTestCase {
         tap(ui, row, "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
         let bob = Key.id("member-bob")
         let bobWords = words(ui, bob, timeout: 30, "the inspector must list bob in alice's keyring",
-                             until: { $0.hasPrefix("bob, trusted both ways") || $0.hasPrefix("bob, waiting for the other side") }) ?? ""
+                             until: { $0.hasPrefix("bob, local trust and room consent observed") || $0.hasPrefix("bob, local trust, room consent not observed") }) ?? ""
         let bar = words(ui, Key.id("status"), timeout: 10,
                         "the status bar must say the node, its peers and the keyring window",
                         until: { $0.contains("node alice") && $0.contains("peer") && $0.contains("keyring") }) ?? ""
@@ -5937,7 +7075,7 @@ final class FirstRunProof: XCTestCase {
         let erinOffer = trustGap([("erin", erinFp, true)])
         words(ui, banner, timeout: 60,
               "remote erin trusts alice now: the room must name erin's incoming trust and explain that alice must trust her too",
-              until: { $0.contains(erinShort) && $0.contains("trusts you") && $0.contains("too") },
+              until: { $0.contains(erinShort) && $0.contains("Room consent") && $0.contains("too") },
               premise: erinOffer)
         let offerPremise = Premise("erin's untrusted offer is available to alice") {
             let (gap, said) = erinOffer.read()
@@ -5959,8 +7097,116 @@ final class FirstRunProof: XCTestCase {
         let fayShort = String(fayFp.prefix(12))
         words(ui, banner, timeout: 60,
               "remote erin and fay cannot read alice: the room must name both members and explain that reading needs both sides' trust",
-              until: { $0.contains(erinShort) && $0.contains(fayShort) && $0.contains("reading needs both sides") },
+              until: { $0.contains(erinShort) && $0.contains(fayShort) && $0.contains("room consent") },
               premise: trustGap([("erin", erinFp, true), ("fay", fayFp, false)]))
+        // Real one-way grant: Fay has not granted Alice trust. Absence of room consent
+        // must not be presented as Fay rejecting computer or node trust.
+        try staged(vox, ["trust", "add", "--node", "alice", erinFp, "--name", "erin",
+                         "--identity-passphrase-file", alicePass], env: voxEnv)
+        try staged(vox, ["trust", "add", "--node", "alice", fayFp, "--name", "fay",
+                         "--identity-passphrase-file", alicePass], env: voxEnv)
+        let oneWayUntil = Date().addingTimeInterval(90)
+        var oneWay = ""
+        while Date() < oneWayUntil {
+            oneWay = (locate(ui, Key.id("trust-banner-member-" + fayFp)) ?? locate(ui, banner)).map(shown) ?? ""
+            if oneWay.contains("fay") && oneWay.contains("room consent") && oneWay.contains("not been observed") { break }
+            Thread.sleep(forTimeInterval: 0.2)
+        }
+        guard oneWay.contains("fay") && oneWay.contains("room consent") && oneWay.contains("not been observed") else {
+            XCTFail("PRODUCT: Fay's local grant must name unobserved room consent: \(oneWay)")
+            return
+        }
+        XCTAssertFalse(oneWay.lowercased().contains("declined") || oneWay.contains("trust you back"),
+                       "PRODUCT: missing room consent must not claim Fay refused trust: \(oneWay)")
+        tap(ui, Key.id("member-fay"), "Fay's member card")
+        guard let fayDirections = words(ui, Key.id("card-directions"), timeout: 15,
+                                        "Fay's card must distinguish local grant from missing room evidence",
+                                        until: { $0.contains("reciprocal room consent") && $0.contains("not been observed") }) else { return }
+        XCTAssertFalse(fayDirections.lowercased().contains("declined"),
+                       "PRODUCT: no refusal may be invented from absent consent: \(fayDirections)")
+        tap(ui, Key.id("card-close"), "close Fay's card")
+        // A replacement identity with the same presented name stays distinct by fingerprint.
+        let replacementRoot = scratch.appendingPathComponent("fay-replacement-host")
+        let replacementHome = replacementRoot.appendingPathComponent("home").path
+        let replacementKeychain = replacementRoot.appendingPathComponent("identity.keychain-db").path
+        guard stager.run(["/bin/mkdir", "-p", replacementHome], env: [:]).status == 0,
+              stager.run(["/usr/bin/security", "create-keychain", "-p", "", replacementKeychain],
+                         env: ["HOME": replacementHome]).status == 0 else {
+            throw Apparatus("cannot stage the replacement Fay's private HOME and Keychain")
+        }
+        let replacementEnv = ["VOX_DATA_DIR": replacementRoot.appendingPathComponent("data").path,
+                              "VOX_CONFIG_DIR": replacementRoot.appendingPathComponent("config").path,
+                              "VOX_PROXY": "127.0.0.1:0", "HOME": replacementHome,
+                              "VOX_TEST_KEYCHAIN": replacementKeychain]
+        let replacementDaemon = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: replacementEnv,
+                                          until: "vox daemon: control socket")
+        defer { replacementDaemon.terminate() }
+        let replacementPass = scratch.appendingPathComponent("fay-replacement.pass").path
+        try stager.write(Data("replacement identity\n".utf8), to: replacementPass)
+        try staged(vox, ["node", "create", "fay"],
+                   env: replacementEnv.merging(["VOX_IDENTITY_PASSPHRASE": "replacement identity"]) { $1 })
+        try staged(vox, ["node", "attach", "fay", "--passphrase-file", replacementPass], env: replacementEnv)
+        let replacementFp = try line(staged(vox, ["id", "--node", "fay"], env: replacementEnv)) { $0.count == 52 }
+        guard replacementFp != fayFp else { throw Apparatus("replacement Fay did not get a distinct identity") }
+        try staged(vox, ["room", "join", "--node", "fay", "--passphrase-file", roomPass, erinLink], env: replacementEnv)
+        let oldFay = Key.id("member-fay#\(fayFp.prefix(6))")
+        let replacementFay = Key.id("member-fay#\(replacementFp.prefix(6)) · \(replacementFp.prefix(12))")
+        guard present(ui, oldFay, timeout: 90, "the original Fay must remain separately named"),
+              present(ui, replacementFay, timeout: 90, "the replacement Fay must have its own fingerprint-qualified row") else { return }
+        for (row, fingerprint) in [(oldFay, fayFp), (replacementFay, replacementFp)] {
+            tap(ui, row, "inspect Fay's exact identity")
+            tap(ui, Key.id("card-copy"), "copy Fay's full fingerprint")
+            XCTAssertEqual(NSPasteboard.general.string(forType: .string), fingerprint,
+                           "PRODUCT: same-name identities must retain their own full fingerprints")
+            tap(ui, Key.id("card-close"), "close Fay's identity card")
+        }
+        // The synthetic replacement signs its own real board withdrawal while remaining
+        // connected. Alice still has a real member, but no usable bundle for its key.
+        guard let waitHelper = env["VOX_PROOF_KEY_WAIT_HELPER"], !waitHelper.isEmpty else {
+            throw Apparatus("the signed key-wait apparatus was not built")
+        }
+        replacementDaemon.terminate()
+        let aliceStatus = run(vox, ["status", "--node", "alice", "--json"], env: voxEnv)
+        guard aliceStatus.status == 0 else { throw Apparatus("cannot read Alice's actual listener: \(aliceStatus.out)") }
+        let statusFile = scratch.appendingPathComponent("key-wait-status.json").path
+        let waitHold = scratch.appendingPathComponent("key-wait-hold").path
+        try stager.write(Data(aliceStatus.out.utf8), to: statusFile)
+        try stager.write(Data(), to: waitHold)
+        defer { _ = stager.run(["/bin/rm", "-f", waitHold], env: [:]) }
+        let roomIdentity = String(erinLink.dropFirst("vox://".count).prefix { $0 != "?" && $0 != "/" })
+        guard roomIdentity.count == 52 else { throw Apparatus("the key-wait room link has no full identity") }
+        let waiter = try start(waitHelper, [scratch.path, replacementEnv["VOX_DATA_DIR"]!,
+                                           replacementEnv["VOX_CONFIG_DIR"]!, replacementPass,
+                                           roomIdentity, aliceFp, statusFile, waitHold],
+                               env: [:], until: "withdraw-ready")
+        defer { waiter.terminate() }
+        try staged(vox, ["trust", "add", "--node", "alice", replacementFp, "--name", "fay-replacement",
+                         "--identity-passphrase-file", alicePass], env: voxEnv)
+        let waitUntil = Date().addingTimeInterval(90)
+        var rosterWithWait = ""
+        while Date() < waitUntil {
+            rosterWithWait = run(vox, ["room", "roster", "--node", "alice", room], env: voxEnv).out
+            if rosterWithWait.split(separator: "\n").contains(where: { $0.contains(replacementFp) && $0.contains("waits") }) { break }
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+        guard rosterWithWait.split(separator: "\n").contains(where: { $0.contains(replacementFp) && $0.contains("waits") }) else {
+            throw Apparatus("the real withdrawn prekey did not produce a key wait: \(rosterWithWait)")
+        }
+        guard words(ui, Key.id("member-key-waits-fay-replacement"), timeout: 60,
+                    "the member inspector must show the actual key wait",
+                    until: { $0.contains("waits") }) != nil,
+              present(ui, Key.id("trust-banner-key-wait-" + replacementFp), timeout: 30,
+                      "the room banner must expose the same actual key wait") else { return }
+        guard stager.run(["/bin/rm", "-f", waitHold], env: [:]).status == 0 else {
+            throw Apparatus("cannot release the synthetic key-wait peer")
+        }
+        waiter.terminate()
+        // Fay's node now exists, so the restarted daemon opens it with its passphrase.
+        let replacementAgain = try start(knobs, ["daemon", "--listen", "127.0.0.1:0",
+                                                 "--passphrase-file", replacementPass],
+                                         env: replacementEnv, until: "vox daemon: control socket")
+        defer { replacementAgain.terminate() }
+        try staged(vox, ["node", "attach", "fay", "--passphrase-file", replacementPass], env: replacementEnv)
 
         // The Dock badge (P17) is not checked here: macOS exposes no Dock badge to lsappinfo or to
         // XCUITest (the Dock's item has an empty label and value with a badge set, 2026-10-09), so
@@ -6132,10 +7378,10 @@ final class FirstRunProof: XCTestCase {
         }
         try staged(knobs, ["room", "join", "--node", "dora", "--passphrase-file", roomPass, doraLink],
                    env: doraEnv)
-        try staged(vox, ["trust", "add", "--node", "alice", doraFp, "--name", "dora",
-                         "--identity-passphrase-file", alicePass], env: voxEnv)
-        try staged(knobs, ["trust", "add", "--node", "dora", aliceFp, "--name", "alice",
-                           "--identity-passphrase-file", doraPass], env: doraEnv)
+        try stagedTrustChange(vox, ["trust", "add", "--node", "alice", doraFp, "--name", "dora",
+                                    "--identity-passphrase-file", alicePass], env: voxEnv)
+        try stagedTrustChange(knobs, ["trust", "add", "--node", "dora", aliceFp, "--name", "alice",
+                                      "--identity-passphrase-file", doraPass], env: doraEnv)
         var old: (id: String, millis: UInt64)?
         let oldUntil = Date().addingTimeInterval(120)
         var d = 0
@@ -6190,6 +7436,18 @@ final class FirstRunProof: XCTestCase {
         if from <= 5 {
             try tagThread(ui, vox: vox, voxEnv: voxEnv, room: room)
         }
+        let missionLink = try line(staged(vox, ["room", "link", "--node", "alice", room], env: voxEnv)) {
+            $0.hasPrefix("vox://")
+        }
+        if from == 15 {
+            for name in ["aaa", "bbb"] {
+                try staged(vox, ["room", "create", "--node", "alice", "--passphrase-file", roomPass,
+                                 "--name", name], env: voxEnv)
+            }
+            present(ui, Key.id("room-aaa"), timeout: 30, "room aaa must show in the sidebar",
+                    premise: inRoom(vox, voxEnv, "aaa"))
+            print("[proof] VOX_PROOF_FROM=15: steps 6 to 14 NOT RUN")
+        } else {
 
         // (6) Attach a file to the room, To: bob, with a note.
         tap(ui, Key.id("room-mission"), "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
@@ -6720,9 +7978,6 @@ final class FirstRunProof: XCTestCase {
         try stager.write(Data("carol identity\n".utf8), to: carolPass)
         try stager.write(Data("not the room passphrase\n".utf8), to: wrongPass)
         try staged(vox, ["node", "attach", "carol", "--passphrase-file", carolPass], env: voxEnv)
-        let missionLink = try line(staged(vox, ["room", "link", "--node", "alice", room], env: voxEnv)) {
-            $0.hasPrefix("vox://")
-        }
         let refusedJoin = run(vox, ["room", "join", "--node", "carol", "--passphrase-file", wrongPass,
                                     missionLink], env: voxEnv)
         guard refusedJoin.status != 0 else {
@@ -6886,8 +8141,9 @@ final class FirstRunProof: XCTestCase {
         XCTAssertTrue(el(ui, compose).value(forKey: "hasKeyboardFocus") as? Bool == true,
                       "PRODUCT: Tab from the timeline must reach the composer; after \(tabs) Tabs it has no keyboard focus")
         print("[proof] keyboard: Space and Return opened Quick Look; ↑ ↑ ↓ selected KEYS-B, KEYS-A, KEYS-B; Tab reached the composer in \(tabs)")
+        }
 
-        // (15) Who trusts whom, from a member (ADR-028 K-5, K-7, R-5, R-6, E-4; D4, D9, D10, D17).
+        // (15) Who trusts whom, from a member (ADR-028 K-5, K-7, R-5, R-6, E-4; D4, D10, D17).
         // Dave is remote and unpaired: the local automatic trust policy cannot pretrust him.
         // Bob trusts him before he joins, so Bob's grant is on mission's log once he is in.
         let daveRoot = scratch.appendingPathComponent("dave-host")
@@ -6911,9 +8167,268 @@ final class FirstRunProof: XCTestCase {
                    env: daveEnv.merging(["VOX_IDENTITY_PASSPHRASE": "dave identity"]) { $1 })
         try staged(vox, ["node", "attach", "dave", "--passphrase-file", davePass], env: daveEnv)
         let daveFp = try line(staged(vox, ["id", "--node", "dave"], env: daveEnv)) { $0.count == 52 }
-        try staged(vox, ["trust", "add", "--node", "bob", daveFp, "--name", "dave",
-                         "--identity-passphrase-file", bobPass], env: voxEnv)
-        tap(ui, Key.id("room-mission"), "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
+        try stagedTrustChange(vox, ["trust", "add", "--node", "bob", daveFp, "--name", "dave",
+                                    "--identity-passphrase-file", bobPass], env: voxEnv)
+        // A known-empty remote roster must still report its first real admission.
+        tap(ui, Key.id("room-aaa"), "open the room with no remote peers")
+        guard words(ui, Key.id("room-tab-members"), timeout: 60,
+                    "aaa must publish a known one-member roster", until: { $0 == "1 member" }) != nil else { return }
+        try rosterMarker("published-watch", present: false)
+        try waitRosterMarker("published-watch")
+        let listedRooms = try staged(vox, ["room", "list", "--node", "alice"], env: voxEnv)
+        guard let emptyRoom = listedRooms.split(separator: "\n").first(where: { $0.contains(" aaa") })?
+            .split(whereSeparator: \.isWhitespace).first.map(String.init) else {
+            throw Apparatus("the empty-peer room aaa is missing: \(listedRooms)")
+        }
+        let emptyRoster = try staged(vox, ["room", "roster", "--node", "alice", emptyRoom], env: voxEnv)
+        guard !emptyRoster.contains(daveFp) else { throw Apparatus("Dave was already in aaa: \(emptyRoster)") }
+        let emptyLink = try line(staged(vox, ["room", "link", "--node", "alice", emptyRoom], env: voxEnv)) {
+            $0.hasPrefix("vox://")
+        }
+        try staged(vox, ["room", "join", "--node", "dave", "--passphrase-file", roomPass, emptyLink], env: daveEnv)
+        guard present(ui, Key.id("join-\(daveFp)"), timeout: 90,
+                      "the first peer admitted after a known-empty roster must have a join line") else { return }
+        try rosterMarker("published-watch", present: false)
+        try waitRosterMarker("published-watch")
+        XCTAssertEqual(ui.descendants(matching: .any).matching(identifier: "join-\(daveFp)").count, 1,
+                       "PRODUCT: the first genuine admission must remain exactly one line after refresh")
+
+        let rosterBeforeDave = try staged(vox, ["room", "roster", "--node", "alice", room], env: voxEnv)
+        guard [bobFp, erinFp, fayFp, replacementFp].allSatisfy({ rosterBeforeDave.contains($0) }) else {
+            throw Apparatus("the preexisting mission roster must contain all four remote identities: \(rosterBeforeDave)")
+        }
+        func noPreexistingJoins() {
+            for fingerprint in [bobFp, erinFp, fayFp, replacementFp] {
+                XCTAssertNil(locate(ui, Key.id("join-\(fingerprint)")),
+                             "PRODUCT: a preexisting member must not acquire a join line on room open: \(fingerprint)")
+            }
+        }
+        // Force the watcher to commit a real populated roster before the held initial read.
+        try rosterMarker("published-watch", present: false)
+        try rosterMarker("published-initial", present: false)
+        try rosterMarker("held-initial", present: false)
+        try rosterMarker("released-initial", present: false)
+        try rosterMarker("hold-initial", present: true)
+        tap(ui, Key.id("room-mission"), "open populated mission with its initial roster held")
+        try waitRosterMarker("held-initial")
+        try waitRosterMarker("published-watch")
+        guard words(ui, Key.id("room-tab-members"), timeout: 30,
+                    "the watcher must publish the populated roster",
+                    until: { $0.hasSuffix(" members") && !$0.contains("loading") }) != nil else { return }
+        noPreexistingJoins()
+        try rosterMarker("hold-initial", present: false)
+        // The held initial read may complete or be discarded as stale; either way the person
+        // must see the room page with its roster and no fabricated joins.
+        try waitRosterMarker("released-initial")
+        guard present(ui, Key.id("timeline"), timeout: 30, "mission's page must be visible after the held read"),
+              words(ui, Key.id("room-tab-members"), timeout: 30,
+                    "mission's roster must remain published after the held initial read",
+                    until: { $0.hasSuffix(" members") && !$0.contains("loading") }) != nil else { return }
+        noPreexistingJoins()
+        for _ in 0..<2 {
+            try rosterMarker("published-watch", present: false)
+            try waitRosterMarker("published-watch")
+            noPreexistingJoins()
+        }
+        // Opposite order: initial roster first, followed by the held watcher.
+        tap(ui, Key.id("room-aaa"), "leave mission before the opposite read order")
+        try rosterMarker("published-initial", present: false)
+        try rosterMarker("held-watch", present: false)
+        try rosterMarker("hold-watch", present: true)
+        tap(ui, Key.id("room-mission"), "open mission with the watcher held")
+        try waitRosterMarker("published-initial")
+        try waitRosterMarker("held-watch")
+        noPreexistingJoins()
+        try rosterMarker("hold-watch", present: false)
+        try rosterMarker("published-watch", present: false)
+        try waitRosterMarker("published-watch")
+        noPreexistingJoins()
+        // A held old-room response may not populate the next selected room.
+        try rosterMarker("held-watch", present: false)
+        try rosterMarker("published-rejected-watch", present: false)
+        try rosterMarker("hold-watch", present: true)
+        try waitRosterMarker("held-watch")
+        tap(ui, Key.id("room-aaa"), "switch rooms while mission's roster is held")
+        guard words(ui, Key.id("room-tab-members"), timeout: 60,
+                    "aaa must display its own two-member roster", until: { $0 == "2 members" }) != nil else { return }
+        try rosterMarker("hold-watch", present: false)
+        try waitRosterMarker("published-rejected-watch")
+        // The released mission roster must not have replaced aaa's on screen.
+        guard words(ui, Key.id("room-tab-members"), timeout: 10,
+                    "after the held mission roster is released, aaa must still show its own two members",
+                    until: { $0 == "2 members" }) != nil else { return }
+        try rosterMarker("published-watch", present: false)
+        try waitRosterMarker("published-watch")
+        noPreexistingJoins()
+        // Replace Alice's saved instance of the same Bob-owned room while an old roster is held.
+        try staged(vox, ["room", "create", "--node", "bob", "--passphrase-file", roomPass,
+                         "--name", "instance-case"], env: voxEnv)
+        let bobRooms = try staged(vox, ["room", "list", "--node", "bob"], env: voxEnv)
+        guard let instanceRoom = bobRooms.split(separator: "\n").first(where: { $0.contains(" instance-case") })?
+            .split(whereSeparator: \.isWhitespace).first.map(String.init) else {
+            throw Apparatus("Bob's instance-case room was not created: \(bobRooms)")
+        }
+        let instanceLink = try line(staged(vox, ["room", "link", "--node", "bob", instanceRoom], env: voxEnv)) {
+            $0.hasPrefix("vox://")
+        }
+        try staged(vox, ["room", "join", "--node", "alice", "--passphrase-file", roomPass, instanceLink], env: voxEnv)
+        guard present(ui, Key.id("room-instance-case"), timeout: 90,
+                      "Alice's newly joined instance-case room must appear") else { return }
+        tap(ui, Key.id("room-instance-case"), "open Alice's first saved instance")
+        guard words(ui, Key.id("room-tab-members"), timeout: 60, "the original instance must have both members",
+                    until: { $0 == "2 members" }) != nil else { return }
+        func savedInstance() throws -> String {
+            let json = try staged(vox, ["room", "read", "--node", "alice", instanceRoom,
+                                        "--history", "status", "--json"], env: voxEnv)
+            guard let data = json.data(using: .utf8),
+                  let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let value = object["instance"] as? String, !value.isEmpty else {
+                throw Apparatus("the real room history status did not name a saved instance: \(json)")
+            }
+            return value
+        }
+        let oldInstance = try savedInstance()
+        try rosterMarker("held-watch", present: false)
+        try rosterMarker("published-rejected-watch", present: false)
+        try rosterMarker("hold-watch", present: true)
+        try waitRosterMarker("held-watch")
+        try staged(vox, ["room", "leave", "--node", "alice", instanceRoom], env: voxEnv)
+        try staged(vox, ["room", "join", "--node", "alice", "--passphrase-file", roomPass, instanceLink], env: voxEnv)
+        let replacementInstance = try savedInstance()
+        guard oldInstance != replacementInstance else {
+            throw Apparatus("leave and rejoin did not replace Alice's saved room instance")
+        }
+        guard present(ui, Key.id("room-instance-case"), timeout: 90,
+                      "the rejoined same-ID room must return to the sidebar") else { return }
+        tap(ui, Key.id("room-instance-case"), "open the replacement saved instance")
+        try rosterMarker("hold-watch", present: false)
+        try waitRosterMarker("published-rejected-watch")
+        guard words(ui, Key.id("room-tab-members"), timeout: 60, "the replacement instance must show its roster",
+                    until: { $0 == "2 members" }) != nil else { return }
+        XCTAssertNil(locate(ui, Key.id("join-\(bobFp)")),
+                     "PRODUCT: a held response from the prior saved instance must not fabricate a join")
+        // An actual admission after the replacement baseline remains observable once.
+        try staged(vox, ["room", "join", "--node", "dave", "--passphrase-file", roomPass, instanceLink], env: daveEnv)
+        guard present(ui, Key.id("join-\(daveFp)"), timeout: 90,
+                      "an admission after saved-instance replacement must have a join line") else { return }
+        for _ in 0..<2 {
+            try rosterMarker("published-watch", present: false)
+            try waitRosterMarker("published-watch")
+            XCTAssertEqual(ui.descendants(matching: .any).matching(identifier: "join-\(daveFp)").count, 1,
+                           "PRODUCT: the replacement instance's later admission must appear once")
+        }
+        // Caption authority is independent of leave/rejoin recovery (FX-54). Use a fresh
+        // room Alice has never left; the saved-instance replacement assertions stay above.
+        try staged(vox, ["room", "create", "--node", "bob", "--passphrase-file", roomPass,
+                         "--name", "drive-caption-case"], env: voxEnv)
+        let captionRooms = try staged(vox, ["room", "list", "--node", "bob"], env: voxEnv)
+        guard let captionRoom = captionRooms.split(separator: "\n").first(where: { $0.contains(" drive-caption-case") })?
+            .split(whereSeparator: \.isWhitespace).first.map(String.init) else {
+            throw Apparatus("Bob's drive-caption-case room was not created: \(captionRooms)")
+        }
+        let captionLink = try line(staged(vox, ["room", "link", "--node", "bob", captionRoom], env: voxEnv)) {
+            $0.hasPrefix("vox://")
+        }
+        try staged(vox, ["room", "join", "--node", "alice", "--passphrase-file", roomPass, captionLink], env: voxEnv)
+        guard present(ui, Key.id("room-drive-caption-case"), timeout: 90,
+                      "the fresh Drive-caption room must appear") else { return }
+        tap(ui, Key.id("room-drive-caption-case"), "open the fresh room before Dave's admission")
+        guard words(ui, Key.id("room-tab-members"), timeout: 60,
+                    "the fresh room must establish its two-member baseline",
+                    until: { $0 == "2 members" }) != nil else { return }
+        try staged(vox, ["room", "join", "--node", "dave", "--passphrase-file", roomPass, captionLink], env: daveEnv)
+        let privateCwd = scratch.appendingPathComponent("dave-private-caption-cwd").path
+        guard stager.run(["/bin/mkdir", "-p", privateCwd], env: [:]).status == 0 else {
+            throw Apparatus("cannot create the private Session cwd")
+        }
+        let privateSession = "11661166-aaaa-4bbb-8ccc-000000001166"
+        let privateInput: [String: Any] = ["session_id": privateSession, "hook_event_name": "UserPromptSubmit",
+                                           "cwd": privateCwd, "transcript_path": privateCwd + "/transcript.jsonl",
+                                           "prompt": "private caption"]
+        let hookInput = String(decoding: try JSONSerialization.data(withJSONObject: privateInput), as: UTF8.self)
+        let hookResult = run(vox, ["agent", "hook", "--node", "dave", "--room", captionRoom, "--format", "text"],
+                             env: daveEnv.merging(["CLAUDE_CODE_ENTRYPOINT": "cli"]) { $1 }, input: hookInput)
+        guard hookResult.status == 0 else { throw Apparatus("Dave's real private Session could not open: \(hookResult.out)") }
+        let privateOwn = try staged(vox, ["room", "sessions", "--node", "dave", captionRoom, "--json"], env: daveEnv)
+        guard privateOwn.contains(privateSession) else { throw Apparatus("Dave's private Session is not present: \(privateOwn)") }
+        guard present(ui, Key.id("join-\(daveFp)"), timeout: 90,
+                      "Dave's admission to the fresh room must have a join caption") else { return }
+        for _ in 0..<2 {
+            try rosterMarker("published-watch", present: false)
+            try waitRosterMarker("published-watch")
+            XCTAssertFalse(onScreen(ui).contains(privateCwd),
+                           "PRODUCT: a join caption must not reveal a Session cwd without Drive")
+        }
+        let privateList = try staged(vox, ["room", "sessions", "--node", "alice", captionRoom, "--json"], env: voxEnv)
+        XCTAssertFalse(privateList.contains(privateSession),
+                       "PRODUCT: Alice must not discover Dave's private Session without Drive")
+        let deniedDrive = run(vox, ["room", "session", "--node", "alice", captionRoom, privateSession,
+                                   "--say", "MUST-NOT-REACH-DAVE"], env: voxEnv)
+        XCTAssertNotEqual(deniedDrive.status, 0, "PRODUCT: Alice must not drive Dave's private Session")
+        // The positive control is the same real Session after both grants and Drive; the
+        // working directory is current Session state, not evidence of admission-time cwd.
+        try stagedTrustChange(vox, ["trust", "add", "--node", "alice", daveFp, "--name", "temp-dave",
+                                    "--identity-passphrase-file", alicePass], env: voxEnv)
+        try stagedTrustChange(vox, ["trust", "add", "--node", "dave", aliceFp, "--name", "alice",
+                                    "--identity-passphrase-file", davePass], env: daveEnv)
+        try stagedTrustChange(vox, ["trust", "drive", "--node", "dave", aliceFp,
+                                    "--identity-passphrase-file", davePass], env: daveEnv)
+        let visibilityDeadline = Date().addingTimeInterval(180)
+        var visibleSession = false
+        while Date() < visibilityDeadline {
+            let result = run(vox, ["room", "sessions", "--node", "alice", captionRoom, "--json"], env: voxEnv)
+            if result.status == 0 {
+                visibleSession = result.out.split(separator: "\n").contains { line in
+                    guard let data = String(line).data(using: .utf8),
+                          let row = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return false }
+                    return row["id"] as? String == privateSession && row["node"] as? String == daveFp
+                        && row["open"] as? Bool == true && row["can_drive"] as? Bool == true
+                }
+            }
+            if visibleSession { break }
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+        guard visibleSession else {
+            throw Apparatus("Alice never observed Dave's driveable Session in the fresh caption room within 180s")
+        }
+        guard words(ui, Key.id("join-\(daveFp)"), timeout: 90,
+                    "current Drive may disclose the currently active Session cwd",
+                    until: { $0.hasPrefix("Observed in this room:") && $0.contains("is working in") && $0.contains(privateCwd) }) != nil else { return }
+        try rosterMarker("held-caption", present: false)
+        try rosterMarker("published-rejected-caption", present: false)
+        try rosterMarker("hold-caption", present: true)
+        try waitRosterMarker("held-caption")
+        try stagedTrustChange(vox, ["trust", "remove", "--node", "dave", aliceFp,
+                                    "--identity-passphrase-file", davePass], env: daveEnv)
+        try stagedTrustChange(vox, ["trust", "remove", "--node", "alice", daveFp,
+                                    "--identity-passphrase-file", alicePass], env: voxEnv)
+        // A Session stays listed once its node takes drive back, saying `can_drive: false`
+        // (session_projection query, ADR-029 CL-3): withdrawn is no row still driveable.
+        func driveCurrent(_ out: String) -> Bool {
+            out.split(separator: "\n").contains { line in
+                guard let data = String(line).data(using: .utf8),
+                      let row = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return false }
+                return row["id"] as? String == privateSession && row["can_drive"] as? Bool != false
+            }
+        }
+        let withdrawnUntil = Date().addingTimeInterval(90)
+        var afterWithdrawal = "", withdrawalStatus: Int32 = -1
+        while Date() < withdrawnUntil {
+            let result = run(vox, ["room", "sessions", "--node", "alice", captionRoom, "--json"], env: voxEnv)
+            afterWithdrawal = result.out
+            withdrawalStatus = result.status
+            if withdrawalStatus == 0 && !driveCurrent(afterWithdrawal) { break }
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+        guard withdrawalStatus == 0 && !driveCurrent(afterWithdrawal) else {
+            throw Apparatus("Dave's withdrawn Drive still appears current to Alice: \(afterWithdrawal)")
+        }
+        tap(ui, Key.id("room-mission"), "switch while the old private caption is held")
+        try rosterMarker("hold-caption", present: false)
+        try waitRosterMarker("published-rejected-caption")
+        XCTAssertFalse(onScreen(ui).contains(privateCwd),
+                       "PRODUCT: an old-room caption must not reveal the private Session cwd after switching")
+        tap(ui, Key.id("room-mission"), "return to mission before admitting Dave")
         try staged(vox, ["room", "join", "--node", "dave", "--passphrase-file", roomPass, missionLink],
                    env: daveEnv)
         let davePremiseUntil = Date().addingTimeInterval(30)
@@ -6934,32 +8449,29 @@ final class FirstRunProof: XCTestCase {
         let daveNamed = "\(daveFp.prefix(26)) (not in keyring)"
         let joinSaid = words(ui, Key.id("join-\(daveFp)"), timeout: 90,
                              "dave joined mission while it was on screen; its timeline must say so, and that bob (whom alice trusts) trusts him: \"\(daveNamed) joined. bob trusts it.\"",
-                             until: { $0 == "\(daveNamed) joined. bob trusts it." }) ?? ""
+                             until: { $0 == "Observed in this room: \(daveNamed) joined. bob trusts it." }) ?? ""
         print("[proof] join: \(joinSaid)")
+        for _ in 0..<2 {
+            try rosterMarker("published-watch", present: false)
+            try waitRosterMarker("published-watch")
+            XCTAssertEqual(ui.descendants(matching: .any).matching(identifier: "join-\(daveFp)").count, 1,
+                           "PRODUCT: a later admission must appear exactly once after refresh")
+            noPreexistingJoins()
+        }
         // (15b, D4) Dave trusts alice; she has not trusted him. His row says so, and his card says
         // each direction and trusts him from there; the room's banner naming who does not read
         // her yet is P2's TrustBanner, proved at 5d.
-        try staged(vox, ["trust", "add", "--node", "dave", aliceFp, "--name", "alice",
-                         "--identity-passphrase-file", davePass], env: daveEnv)
+        try stagedTrustChange(vox, ["trust", "add", "--node", "dave", aliceFp, "--name", "alice",
+                                    "--identity-passphrase-file", davePass], env: daveEnv)
         let daveRow = Key.id("member-dave · \(daveFp.prefix(12))")
         let rowSaid = words(ui, daveRow, timeout: 60,
-                            "dave trusts alice and she has not trusted him: her member pane must say \"not in keyring, trusts you\"",
-                            until: { $0.hasSuffix("not in keyring, trusts you") }) ?? ""
-        // (15e, #624) Compare, group by group: on dave's offer, collapsed until asked for, a
-        // partial entry says how far it matches.
-        tap(ui, Key.id("room-mission"), "mission in the sidebar")
-        tap(ui, Key.id("session-general"), "mission's General")
-        tap(ui, Key.id("offer-\(daveFp.prefix(12))"), "dave's offer at the top of mission's General")
-        tap(ui, Key.id("offer-compare-open"), "Compare… on dave's offer")
-        type(ui, Key.id("offer-compare"), String(daveFp.prefix(16)), "the offer's compare field")
-        let offerSoFar = words(ui, Key.id("offer-compare-said"), timeout: 10,
-                               "four groups of dave's own fingerprint typed on his offer must say \"So far matches 4 of 13 groups.\"",
-                               until: { $0 == "So far matches 4 of 13 groups." }) ?? ""
+                            "dave trusts alice and she has not trusted him: her member pane must say \"not in keyring, room consent observed\"",
+                            until: { $0.hasSuffix("not in keyring, room consent observed") }) ?? ""
         tap(ui, Key.id("room-mission"), "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
         tap(ui, daveRow, "dave in the member pane")
         let directions = words(ui, Key.id("card-directions"), timeout: 10,
                                "dave's card must say both directions: he trusts alice, she has not trusted him",
-                               until: { $0.contains("trusts you; you haven't trusted") }) ?? ""
+                               until: { $0.contains("Room consent") && $0.contains("haven't granted local node trust") }) ?? ""
         // The card's Copy puts the fingerprint on the pasteboard whole, as `vox trust add` takes
         // it, not the grouped form shown for reading (#662).
         tap(ui, Key.id("card-copy"), "Copy on dave's card")
@@ -6986,7 +8498,7 @@ final class FirstRunProof: XCTestCase {
         let whole = words(ui, Key.id("card-compare-said"), timeout: 10,
                           "dave's whole fingerprint typed must be marked as a match of all 13 groups",
                           until: { $0.hasSuffix("all 13 groups.") && $0.hasPrefix("Matches ") }) ?? ""
-        print("[proof] compare: offer \(offerSoFar); card \(soFar) → \(wrong) → \(whole)")
+        print("[proof] compare: card \(soFar) → \(wrong) → \(whole)")
         tap(ui, Key.id("card-trust-open"), "Trust… on dave's card")
         words(ui, Key.id("card-presented-name"), timeout: 90,
               "Dave's card must present his authenticated name beside his fingerprint before trust", until: { $0 == "Name it presents: dave" })
@@ -7004,12 +8516,17 @@ final class FirstRunProof: XCTestCase {
             self.run(vox, ["trust", "list", "--node", "alice"], env: voxEnv).out.contains(daveFp)
         }
         let cardSaid = words(ui, Key.id("card-trust"), timeout: 60,
-                             "trusted from his card, dave, who trusts alice, must read \"dave, trusted both ways\"",
-                             until: { $0 == "dave, trusted both ways" }) ?? ""
+                             "trusted from his card, dave, who trusts alice, must read \"dave, local trust and room consent observed\"",
+                             until: { $0 == "dave, local trust and room consent observed" }) ?? ""
         let ring = run(vox, ["trust", "list", "--node", "alice"], env: voxEnv).out
         XCTAssertTrue(ring.contains(daveFp),
                       "PRODUCT: trusted from his card, dave must be in alice's keyring; `vox trust list` said: \(ring)")
-        tap(ui, Key.id("card-close"), "Close on dave's card")
+        // Close is the card's cancel action (NodeCard.swift: .keyboardShortcut(.cancelAction)).
+        // With this step's unreachable-peer notifications up, XCTest finds no hit point on the
+        // drawn, enabled Close; Escape, a person's Close, needs none.
+        ui.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
+        XCTAssertTrue(el(ui, Key.id("node-card")).waitForNonExistence(timeout: 10),
+                      "PRODUCT: Escape, Close's keyboard shortcut, must close dave's card")
         print("[proof] dave's row: \(rowSaid); card: \(directions) → \(cardSaid)")
         // (15f, G2) The keyring's card for dave: each direction, the room it covers, and what
         // removing him would change, behind a disclosure.
@@ -7018,10 +8535,10 @@ final class FirstRunProof: XCTestCase {
         tap(ui, Key.id("keyring-row-dave"), "dave's keyring entry", premise: trusted(vox, voxEnv, daveFp, "dave"))
         let ringHead = words(ui, Key.id("keyring-card-heading"), timeout: 15,
                              "dave's keyring card must head \"dave ⇄ you\": he trusts alice too",
-                             until: { $0 == "dave, trusted both ways" }) ?? ""
+                             until: { $0 == "dave, room consent observed" }) ?? ""
         let theirs = words(ui, Key.id("keyring-card-theirs"), timeout: 5,
                            "dave's direction must say he trusts alice too",
-                           until: { $0.hasPrefix("dave trusts you too.") }) ?? ""
+                           until: { $0.hasPrefix("Reciprocal room consent from dave is observed.") }) ?? ""
         let rooms = words(ui, Key.id("keyring-card-rooms"), timeout: 15,
                           "dave's card must name the room alice shares with him, mission",
                           until: { $0.hasPrefix("Shared rooms: ") && $0.contains("mission") }) ?? ""
@@ -7031,29 +8548,15 @@ final class FirstRunProof: XCTestCase {
                             until: { $0.hasPrefix("Removing dave: it reads nothing you write from now on") }) ?? ""
         tap(ui, Key.id("room-mission"), "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
         print("[proof] keyring card: \(ringHead); \(theirs); \(rooms); \(removal.prefix(40))…")
-        // (15c, D9) A message of alice's no member's node holds says so, then where it is.
+        // Bob's, dave's, erin's and fay's nodes go away while alice posts WHERE-15; bob's comes
+        // back. Room removal below must keep WHERE-15 readable.
         try staged(vox, ["node", "detach", "bob"], env: voxEnv)
         try staged(vox, ["node", "detach", "dave"], env: daveEnv)
         // Erin and Fay are remote members from (5d); stop their nodes on their own account too.
         try staged(vox, ["node", "detach", "erin"], env: trustEnv)
         try staged(vox, ["node", "detach", "fay"], env: trustEnv)
         try staged(vox, ["room", "post", "--node", "alice", room, "WHERE-15"], env: voxEnv)
-        var whereId = ""
-        for row in run(vox, ["room", "read", "--node", "alice", "--json", room], env: voxEnv).out
-            .split(separator: "\n") {
-            guard let r = try? JSONSerialization.jsonObject(with: Data(row.utf8)) as? [String: Any],
-                  r["text"] as? String == "WHERE-15", let id = r["entry_hash"] as? String else { continue }
-            whereId = id
-        }
-        guard !whereId.isEmpty else { throw Apparatus("alice's `vox room read --json` lists no WHERE-15") }
-        let alone = words(ui, Key.id("whereabouts-\(whereId)"), timeout: 60,
-                          "alice's WHERE-15, posted with bob's and dave's nodes detached, must say \"only on this machine\"",
-                          until: { $0 == "only on this machine" }) ?? ""
         try staged(vox, ["node", "attach", "bob", "--passphrase-file", bobPass], env: voxEnv)
-        let spread = words(ui, Key.id("whereabouts-\(whereId)"), timeout: 90,
-                           "once bob's node is back and holds WHERE-15, it must say it is on 1 of the members' nodes, \"on 1 of N members' nodes\"",
-                           until: { $0.hasPrefix("on 1 of ") && $0.hasSuffix(" members' nodes") }) ?? ""
-        print("[proof] whereabouts: \(alone) → \(spread)")
         // FX-62: use the native member row, not a CLI removal.
         guard present(ui, Key.id("member-remove-\(bobFp)"), timeout: 30,
                       "the exact member row must offer Remove from Room",
@@ -7473,7 +8976,7 @@ final class FirstRunProof: XCTestCase {
                     button.click()
                     openedComputerView = true
                 }
-                let sheet = ui.scrollViews.matching(identifier: "computer-trust-sheet").firstMatch
+                let sheet = ui.descendants(matching: .any).matching(identifier: "computer-trust-sheet").firstMatch
                 let identity = sheet.descendants(matching: .staticText)
                     .matching(NSPredicate(format: "label == %@ OR CAST(value, 'NSString') == %@", fingerprint, fingerprint)).firstMatch
                 if sheet.exists, identity.exists {
@@ -7722,6 +9225,21 @@ final class FirstRunProof: XCTestCase {
                 let reached: () -> Bool
                 if case .menuItem = key { reached = { e.isHittable } } else { reached = { self.inView(ui, e) } }
                 if !reached() { scrollTo(ui, e) }
+                if !reached() {
+                    // Notification Center's container while a banner shows can take XCTest's hit
+                    // point from a target already in view: waited out as below, never clicked through.
+                    let at = CGPoint(x: e.frame.midX, y: e.frame.midY)
+                    let clearBy = Date().addingTimeInterval(20)
+                    while !reached(), systemOverlayOver(at, targetHittable: e.isHittable) != nil, Date() < clearBy {
+                        Thread.sleep(forTimeInterval: 0.5)
+                    }
+                    if !reached(), let held = systemOverlayOver(at, targetHittable: e.isHittable) {
+                        keepTree(ui, "a system window covered \(what)")
+                        XCTFail("APPARATUS: \(held) covered \(what) (\(key)) for 20 s; not Vox's, and left alone",
+                                file: file, line: line)
+                        return false
+                    }
+                }
                 if reached() {
                     // A notification banner, or the screenshot overlay (the person may be taking
                     // a screenshot), over the click's point would take the click: waited out, as
@@ -7769,25 +9287,32 @@ final class FirstRunProof: XCTestCase {
             guard machine.exists else { return false }
             return machine.frame.contains(f)
         }
-        guard !id.isEmpty, let view = ui.windows.firstMatch.scrollViews.allElementsBoundByIndex.first(where: {
-            $0.frame.minX <= f.midX && f.midX <= $0.frame.maxX
-                && $0.descendants(matching: .any).matching(identifier: id).firstMatch.exists
-        })?.frame else { return true }
+        guard !id.isEmpty, let view = holder(ui, of: e)?.frame else { return true }
         return view.minY <= f.minY && f.maxY <= view.maxY
     }
 
+    /// The window's scroll view that holds `e` on `e`'s own surface. XCTest lists Settings' Add
+    /// Computer sheet among the descendants of the Settings scroll view it was presented from
+    /// (no Sheet element between them), and the sheet covers that scroll view wholly: XCTest
+    /// finds no hit point in it. One with no hit point is not where `e` is seen or scrolled.
+    private func holder(_ ui: XCUIApplication, of e: XCUIElement) -> XCUIElement? {
+        let f = e.frame
+        let id = e.identifier
+        return ui.windows.firstMatch.scrollViews.allElementsBoundByIndex.first(where: {
+            $0.frame.minX <= f.midX && f.midX <= $0.frame.maxX
+                && (id.isEmpty || $0.descendants(matching: .any).matching(identifier: id).firstMatch.exists)
+                && $0.isHittable
+        })
+    }
+
     private func scrollTo(_ ui: XCUIApplication, _ e: XCUIElement) {
-        let target = e.frame
         let id = e.identifier
         let machine = ui.windows.firstMatch.scrollViews.matching(identifier: "machine-nodes-scroll").firstMatch
         let view: XCUIElement?
         if id.hasPrefix("machine-") {
             view = machine.exists ? machine : nil
         } else {
-            view = ui.windows.firstMatch.scrollViews.allElementsBoundByIndex.first(where: {
-            $0.frame.minX <= target.midX && target.midX <= $0.frame.maxX
-                && (id.isEmpty || $0.descendants(matching: .any).matching(identifier: id).firstMatch.exists)
-            })
+            view = holder(ui, of: e)
         }
         guard let view else { return }
         for _ in 0..<20 where !inView(ui, e) {
@@ -8027,6 +9552,30 @@ final class FirstRunProof: XCTestCase {
             throw Apparatus("`vox \(args.joined(separator: " "))` exited \(status): \(out)")
         }
         return out.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// A trust or membership staging step a person retries: an explicit unchanged-Busy refusal,
+    /// or readmission's permissions-refresh refusal before signing or reserving the change.
+    /// Retried for at most 60 s; any other refusal, or one that never clears, stays APPARATUS.
+    private func stagedTrustChange(_ vox: String, _ args: [String], env: [String: String]) throws {
+        let deadline = Date().addingTimeInterval(60)
+        var refusals = 0
+        while true {
+            do {
+                try staged(vox, args, env: env)
+                return
+            } catch let error as Apparatus {
+                let unchangedBusy = error.why.contains("a previous change to this room is still being applied; this request made no change")
+                let readmissionPending = args.starts(with: ["room", "readmit-member"])
+                    && error.why.contains("this room's permissions are still being read from local storage")
+                    && error.why.contains("try again once the room is ready")
+                guard unchangedBusy || readmissionPending else { throw error }
+                refusals += 1
+                print("[proof] trust staging refusal \(refusals): \(error.why)")
+                guard Date() < deadline else { throw error }
+                Thread.sleep(forTimeInterval: 0.5)
+            }
+        }
     }
 
     /// The line of `out` that `is` picks: `vox` prints its answer on a line of its own.

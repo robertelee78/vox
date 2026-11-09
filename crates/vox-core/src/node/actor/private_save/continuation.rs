@@ -158,6 +158,10 @@ enum After {
         job: Job,
         charge: BufferCharge,
     },
+    Admission {
+        answer: oneshot::Sender<bool>,
+        guard: history_demand::CurrentPrivateGuard,
+    },
 }
 
 pub(in crate::node::actor) struct Continuation {
@@ -180,7 +184,9 @@ impl Continuation {
         &self,
     ) -> Option<Arc<tokio::sync::OwnedRwLockReadGuard<()>>> {
         match &self.after {
-            After::Serving { guard, .. } | After::Live { guard, .. } => Some(guard.secret()),
+            After::Serving { guard, .. }
+            | After::Live { guard, .. }
+            | After::Admission { guard, .. } => Some(guard.secret()),
             After::Archive { guard, .. } => Some(guard.secret()),
             After::Drive { .. } | After::SupportDiscovery(_) => None,
         }
@@ -1461,6 +1467,34 @@ impl Node {
         .await
     }
 
+    /// Decide one image request through the private serving rule; any refusal answers `false`.
+    pub(in crate::node::actor) async fn begin_owned_private_admission(
+        &mut self,
+        room: Digest32,
+        instance: SharedChannel,
+        admission: pending_upgrade::MediaAdmission,
+        guard: history_demand::CurrentPrivateGuard,
+        answer: oneshot::Sender<bool>,
+    ) -> bool {
+        let work = Work::Admit {
+            admission,
+            guard: guard.clone(),
+        };
+        let continuation = Continuation {
+            instance,
+            attachment: self.delivery_epoch,
+            lifetime: None,
+            after: After::Admission { answer, guard },
+        };
+        self.begin_pending_maintenance(
+            room,
+            maintenance_save::Work::Private(work),
+            maintenance_save::Continuation::Private(continuation),
+            None,
+        )
+        .await
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(in crate::node::actor) async fn begin_owned_private_live(
         &mut self,
@@ -1558,6 +1592,9 @@ impl Node {
             }
             After::Archive { answer, .. } => {
                 let _ = answer.send(Err(error.to_string()));
+            }
+            After::Admission { answer, .. } => {
+                let _ = answer.send(false);
             }
             After::Drive { .. } | After::SupportDiscovery(_) => {}
         }
@@ -1680,6 +1717,13 @@ impl Node {
                     charge,
                 }));
                 drop((guard, job));
+            }
+            (
+                After::Admission { answer, guard },
+                maintenance_save::Saved::Private(Saved::Admitted(admitted)),
+            ) => {
+                drop((lifetime, guard));
+                let _ = answer.send(admitted);
             }
             (after, _) => {
                 let continuation = Continuation {

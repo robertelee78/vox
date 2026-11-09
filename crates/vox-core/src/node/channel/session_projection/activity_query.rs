@@ -149,8 +149,63 @@ fn outcome_kind(origin: Kind) -> Option<Kind> {
         Kind::Other => Some(Kind::ToolDone),
         Kind::Approval | Kind::Question => Some(Kind::Resolved),
         Kind::Drive => Some(Kind::DriveResult),
-        Kind::Resolved | Kind::ToolDone | Kind::DriveResult => None,
+        Kind::OmpMessage => Some(Kind::OmpMessageUpdate),
+        Kind::Resolved
+        | Kind::ToolDone
+        | Kind::DriveResult
+        | Kind::OmpMessageUpdate
+        | Kind::OmpReset
+        | Kind::OmpMedia
+        | Kind::OmpDisclosure => None,
     }
+}
+
+fn active_omp_snapshot(read: &Read<'_>, f: &Fact) -> Result<bool> {
+    let Some(branch) = f.omp_branch else {
+        return Ok(true);
+    };
+    let key = super::activity_fold::omp_current_key(&f.group());
+    let Some(reset) = read.activity_find(T::Driven, &hash_key(&key))? else {
+        return Ok(false);
+    };
+    let reset = fact(read, reset)?;
+    Ok(reset.kind == Kind::OmpReset && reset.omp_branch == Some(branch))
+}
+
+fn omp_visible_group(
+    read: &Read<'_>,
+    session: &str,
+    author: &Digest32,
+) -> Result<Option<Digest32>> {
+    let group = group(session, author);
+    let key = super::activity_fold::omp_current_key(&group);
+    let Some(arrival) = read.activity_find(T::Driven, &hash_key(&key))? else {
+        return Ok(None);
+    };
+    let reset = fact(read, arrival)?;
+    if reset.kind != Kind::OmpReset || reset.omp_branch.is_none() {
+        return Err(bad());
+    }
+    Ok(Some(super::activity_index::visible_group(&reset)))
+}
+
+fn visible_session_exists(read: &Read<'_>, session: &str, author: &Digest32) -> Result<bool> {
+    let base = group(session, author);
+    if read
+        .activity_find(T::VisibleCount, &hash_key(&base))?
+        .unwrap_or(0)
+        != 0
+    {
+        return Ok(true);
+    }
+    Ok(match omp_visible_group(read, session, author)? {
+        Some(branch) => {
+            read.activity_find(T::VisibleCount, &hash_key(&branch))?
+                .unwrap_or(0)
+                != 0
+        }
+        None => false,
+    })
 }
 /// Each applicable author contributes one indexed predecessor, not its whole
 /// transcript. The greatest arrival is the room's next raw/visible origin.
@@ -554,17 +609,15 @@ impl ChannelState {
                         None => current.clone(),
                     };
                     if after.is_none() {
-                        let tree = if visible {
-                            T::VisibleCount
-                        } else {
-                            T::RawCount
-                        };
                         for author in &authors {
-                            if read
-                                .activity_find(tree, &hash_key(&group(&typed, author)))?
-                                .unwrap_or(0)
-                                != 0
-                            {
+                            let exists = if visible {
+                                visible_session_exists(&read, &typed, author)?
+                            } else {
+                                read.activity_find(T::RawCount, &hash_key(&group(&typed, author)))?
+                                    .unwrap_or(0)
+                                    != 0
+                            };
+                            if exists {
                                 return Ok(Reply::Resolved {
                                     candidate: Some(typed),
                                     next: None,
@@ -598,12 +651,7 @@ impl ChannelState {
                         if !authors.contains(&f.author) || !f.session.starts_with(typed.trim()) {
                             continue;
                         }
-                        if visible
-                            && read
-                                .activity_find(T::VisibleCount, &hash_key(&f.group()))?
-                                .unwrap_or(0)
-                                == 0
-                        {
+                        if visible && !visible_session_exists(&read, &f.session, &f.author)? {
                             continue;
                         }
                         if candidate.as_ref().is_some_and(|old| old != &f.session) {
@@ -707,9 +755,15 @@ impl ChannelState {
                                 return Err(Error::StreamRefused(REFRESHING));
                             }
                             if read
-                                .activity_find(T::Visible, &member_key(&f.group(), arrival))?
+                                .activity_find(
+                                    T::Visible,
+                                    &member_key(&super::activity_index::visible_group(&f), arrival),
+                                )?
                                 .is_none()
                             {
+                                continue;
+                            }
+                            if !active_omp_snapshot(&read, &f)? {
                                 continue;
                             }
                             if origins.contains(&arrival) {
@@ -760,7 +814,14 @@ impl ChannelState {
                         ))?,
                         None => revision.boundary.checked_add(1).ok_or_else(bad)?,
                     };
-                    let (tree, groups, visible) = selection(&which, &authors)?;
+                    let (tree, mut groups, visible) = selection(&which, &authors)?;
+                    if let SessionFilter::Session(id) = &which {
+                        for author in &authors {
+                            if let Some(branch) = omp_visible_group(&read, id, author)? {
+                                groups.push(branch);
+                            }
+                        }
+                    }
                     if before.is_some() {
                         let mut member = false;
                         for g in &groups {
@@ -775,6 +836,9 @@ impl ChannelState {
                         if !authors.contains(&f.author) {
                             return Err(Error::StreamRefused(CHANGED));
                         }
+                        if visible && !active_omp_snapshot(&read, &f)? {
+                            return Err(Error::StreamRefused(CHANGED));
+                        }
                     }
                     let end = if matches!(&which, SessionFilter::Pending(_)) {
                         super::activity_pending::prefix(&read, &groups, bound)?
@@ -785,11 +849,20 @@ impl ChannelState {
                     let mut cursor = bound;
                     let mut bytes = 0u64;
                     let mut rows = 0u64;
+                    let mut scanned = 0u64;
                     while origins.len() < max_rows.clamp(1, crate::node::ipc::SESSION_PAGE_ROWS) {
                         let Some((arrival, _)) = previous(&read, tree, &groups, cursor)? else {
                             break;
                         };
                         let f = fact(&read, arrival)?;
+                        if visible && !active_omp_snapshot(&read, &f)? {
+                            cursor = arrival;
+                            scanned += 1;
+                            if scanned >= 4096 {
+                                return Err(Error::StreamRefused("OMP historical branch scan exceeds its bound; refresh the Session"));
+                            }
+                            continue;
+                        }
                         let cost = cost(&read, &f, &authors, visible, revision.boundary)?;
                         if !origins.is_empty() && bytes.saturating_add(cost) > max_bytes as u64 {
                             break;
@@ -800,9 +873,10 @@ impl ChannelState {
                             .ok_or(Error::StreamRefused(crate::node::ipc::SESSION_READ_LIMIT))?;
                         bound_selection(rows, bytes)?;
                         origins.push(arrival);
+                        scanned += 1;
                         cursor = arrival;
                     }
-                    let older = end.checked_sub(origins.len() as u64).ok_or_else(bad)?;
+                    let older = end.checked_sub(scanned).ok_or_else(bad)?;
                     origins.reverse();
                     Ok(Reply::Selected(Plan {
                         origins,

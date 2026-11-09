@@ -77,6 +77,7 @@ pub(crate) struct PendingSession {
     members: BTreeSet<Digest32>,
     holders: BTreeSet<Digest32>,
     memberships: BTreeMap<Digest32, u64>,
+    floor_sweep: Option<FloorSweep>,
     entries: entry_store::EntryIndex,
     next: u64,
     refresh: Option<RefreshWork>,
@@ -110,6 +111,7 @@ pub(crate) struct CompletedSession {
     next: u64,
     refresh: Option<RefreshWork>,
     refresh_changed: bool,
+    floor_sweep: Option<FloorSweep>,
     committed_rows: u64,
     news: Vec<String>,
     failure: Option<String>,
@@ -420,6 +422,7 @@ impl ChannelState {
                 holders.clone()
             },
             memberships,
+            floor_sweep: self.private_sessions.floor_sweep.take(),
             entries: entry_store::EntryIndex::default(),
             next: self.private_sessions.next,
             refresh,
@@ -458,6 +461,7 @@ impl ChannelState {
             next,
             refresh,
             refresh_changed,
+            floor_sweep,
             committed_rows,
             news,
             change_unsaid,
@@ -488,6 +492,7 @@ impl ChannelState {
         }
         self.drive.news.extend(news);
         self.private_sessions.next = self.private_sessions.next.max(next);
+        self.private_sessions.floor_sweep = floor_sweep;
         if refresh_changed {
             self.private_sessions.refresh = refresh;
         }
@@ -569,6 +574,11 @@ impl PendingSession {
             next: self.next,
             refresh: self.refresh,
             refresh_changed: self.refresh_changed,
+            floor_sweep: if result.is_ok() {
+                self.floor_sweep
+            } else {
+                None
+            },
             change_unsaid: if result.is_ok() {
                 self.drive.change_unsaid
             } else {
@@ -834,7 +844,125 @@ impl PendingSession {
         Ok(())
     }
 
+    /// Supersede every retained floor of this node that still carries a membership start it had
+    /// placed too late (a sender-key rotation read as a return), once per basis: this node's
+    /// floor revision, the removal generation and its Drive holders' current starts. Each keeps its
+    /// exact signed bound: the earliest floor currently authorized at the current membership,
+    /// else the retained floor itself, which a once-removed recipient must hold under the
+    /// current removal and readmission rules. Otherwise that generation stays refused. A live
+    /// mark returns to that bound. A sweep with an undecided authorization is not recorded.
+    fn correct_floors(&mut self, store: &Store, sek: &Sek, signer: &dyn RootSigner) -> Result<()> {
+        if self.memberships.is_empty() || self.controls.is_none() {
+            return Ok(());
+        }
+        let revision = floor_index::author(
+            Transaction::Snapshot(&store.snapshot()?),
+            sek,
+            &self.room,
+            &self.me,
+        )?
+        .revision;
+        // Only a member that holds this node's Drive, and this node itself, is owed its floors.
+        let recipients = || {
+            self.holders
+                .iter()
+                .filter(|peer| self.members.contains(*peer))
+                .chain(std::iter::once(&self.me))
+                .map(|peer| (*peer, self.memberships.get(peer).copied().unwrap_or(0)))
+        };
+        if self
+            .floor_sweep
+            .as_ref()
+            .is_some_and(|(at, removals, swept)| {
+                *at == revision
+                    && *removals == self.removal_generation
+                    && swept.iter().copied().eq(recipients())
+            })
+        {
+            return Ok(());
+        }
+        let recipients: Vec<(Digest32, u64)> = recipients().collect();
+        let live = self.drive.chain.as_ref().map(SenderChain::chain_id);
+        let mut decided = true;
+        for &(recipient, membership) in &recipients {
+            let floors =
+                floor_index::floors_for(&store.snapshot()?, sek, &self.room, &self.me, &recipient)?;
+            if !floors.iter().any(|(_, (old, _, _))| *old > membership) {
+                continue;
+            }
+            let restored = {
+                let snapshot = store.snapshot()?;
+                let view =
+                    governance::View::pinned(&snapshot, sek, &self.room, self.root, self.now)?;
+                !view.validated_member_removals(&recipient)?.is_empty()
+            };
+            for ((epoch, at), (old, after, first)) in floors {
+                if old <= membership {
+                    continue;
+                }
+                let key = (self.me, recipient, epoch, at);
+                let Some(current) = floor_index::authorized_floor_step(
+                    store, sek, &self.room, self.root, self.now, &key, membership, restored,
+                )?
+                else {
+                    decided = false;
+                    continue;
+                };
+                let (bound, first_seq) = match current {
+                    Some((_, bound, first_seq)) => (bound, first_seq),
+                    None if !restored => (after, first),
+                    None => match floor_index::authorized_floor_step(
+                        store, sek, &self.room, self.root, self.now, &key, old, true,
+                    )? {
+                        Some(Some((_, bound, first_seq))) => (bound, first_seq),
+                        Some(None) => continue,
+                        None => {
+                            decided = false;
+                            continue;
+                        }
+                    },
+                };
+                if epoch == self.epoch
+                    && live == Some(at)
+                    && self
+                        .drive
+                        .floor_mark(&recipient)
+                        .is_some_and(|(marked, from)| marked == at && bound < from)
+                {
+                    self.drive.restore_mark(&recipient, at, bound);
+                    self.persist_drive(store, sek)?;
+                }
+                let floor = super::super::session_floor::Floor {
+                    room: self.room,
+                    author: self.me,
+                    recipient,
+                    epoch,
+                    generation: at,
+                    iteration: bound,
+                    first_seq,
+                    membership,
+                };
+                self.controls
+                    .as_mut()
+                    .ok_or(Error::Profile("Session floor owner missing"))?
+                    .append_control_owned(
+                        store,
+                        signer,
+                        floor.wire(),
+                        EntryKind::Content,
+                        SignedEntryKind::SessionFloor,
+                        crate::time::Ms(self.now),
+                    )?;
+            }
+        }
+        if decided {
+            self.floor_sweep = Some((revision, self.removal_generation, recipients));
+        }
+        Ok(())
+    }
+
     fn ensure_floors(&mut self, store: &Store, sek: &Sek, signer: &dyn RootSigner) -> Result<()> {
+        self.correct_floors(store, sek, signer)?;
         let Some(generation) = self.drive.chain.as_ref().map(SenderChain::chain_id) else {
             return Ok(());
         };
@@ -844,14 +972,21 @@ impl PendingSession {
             .iter()
             .filter(|peer| self.members.contains(*peer))
         {
+            // A later membership start is a return: the key from before it is not the peer's.
+            // An earlier one corrects a start this node had placed too late (a sender-key
+            // rotation read as a return); the peer held the key throughout, so its floor is
+            // republished below from the generation's original mark, without a new release.
             if floor_index::floor(
                 Transaction::Snapshot(&snapshot),
                 sek,
                 &self.room,
                 &(self.me, *peer, self.epoch, generation),
             )?
-            .is_some_and(|(membership, _, _)| Some(&membership) != self.memberships.get(peer))
-            {
+            .is_some_and(|(membership, _, _)| {
+                self.memberships
+                    .get(peer)
+                    .is_none_or(|current| membership < *current)
+            }) {
                 self.drive.forget(&[*peer]);
             }
         }
@@ -874,14 +1009,17 @@ impl PendingSession {
         marks.push((self.me, generation, 0));
         for (recipient, generation, iteration) in marks {
             let membership = self.memberships.get(&recipient).copied().unwrap_or(0);
-            if floor_index::floor(
+            let floor = floor_index::floor(
                 Transaction::Snapshot(&store.snapshot()?),
                 sek,
                 &self.room,
                 &(self.me, recipient, self.epoch, generation),
-            )?
-            .is_some_and(|(old, after, _)| old == membership && after >= iteration)
-            {
+            )?;
+            // A live floor still at a later start awaits its exact correction above; it is never
+            // re-cut from the current position.
+            if floor.is_some_and(|(old, after, _)| {
+                old > membership || (old == membership && after >= iteration)
+            }) {
                 continue;
             }
             let controls = self

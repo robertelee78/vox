@@ -25,6 +25,10 @@ pub(super) enum Work {
         charge: crate::node::history_budget::BufferCharge,
         guard: history_demand::CurrentPrivateGuard,
     },
+    Admit {
+        admission: pending_upgrade::MediaAdmission,
+        guard: history_demand::CurrentPrivateGuard,
+    },
     Live {
         peer: Digest32,
         revision: u64,
@@ -60,12 +64,14 @@ pub(super) enum Saved {
     Page(Page),
     Flow(Box<pending_upgrade::PageFlow>),
     PageFinished(pending_upgrade::PageResult),
+    Admitted(bool),
 }
 
 pub(super) enum NativeKind {
     Upgrade,
     Migration,
     Serve,
+    Admission,
     AutoFailure,
     Flow(Box<pending_upgrade::PageFlow>),
 }
@@ -245,6 +251,15 @@ impl Work {
                 pending: channel
                     .prepare_pending_private_page(store, owner, ask, peer, &holders, charge)?,
                 kind: NativeKind::Serve,
+                boundary: Some(Boundary::Current {
+                    guard,
+                    before: true,
+                    after: true,
+                }),
+            }),
+            Self::Admit { admission, guard } => Some(Prepared::Native {
+                pending: channel.prepare_pending_private_admission(store, owner, admission)?,
+                kind: NativeKind::Admission,
                 boundary: Some(Boundary::Current {
                     guard,
                     before: true,
@@ -452,6 +467,10 @@ fn native_saved(mut saved: Native, kind: NativeKind) -> Result<Saved> {
             .take()
             .map(Saved::Page)
             .ok_or(Error::Profile("native private page receipt missing")),
+        NativeKind::Admission => saved
+            .admitted
+            .map(Saved::Admitted)
+            .ok_or(Error::Profile("native private admission receipt missing")),
         NativeKind::AutoFailure => {
             if !saved.cursor_committed {
                 return Err(Error::Profile("private refetch failure receipt missing"));

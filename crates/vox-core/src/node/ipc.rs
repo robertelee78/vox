@@ -56,6 +56,9 @@ use crate::hash::Digest32;
 use crate::node::actor::{EventStream, EventStreamItem, NodeHandle};
 use crate::node::api::{MessageRow, NodeEvent};
 
+#[path = "ipc_omp_media.rs"]
+mod ipc_omp_media;
+
 /// The protocol this build speaks. Bumped when a frame's shape changes in a way
 /// an older client would misread; a client that sees a version it does not know
 /// MUST disconnect rather than guess.
@@ -244,6 +247,9 @@ const T_FILTERED_ROWS: u64 = 87201;
 const T_MEMBERS: u64 = 6;
 /// [`Frame::MemberConsents`] (V030-17).
 const T_CONSENTS: u64 = 3271;
+/// Atomic room membership observation and its request.
+const T_MEMBER_OBSERVATION: u64 = 11650002;
+const T_MEMBER_OBSERVATION_REQ: u64 = 11650001;
 const T_ROOMS: u64 = 7;
 
 const T_BOUND: u64 = 8;
@@ -402,6 +408,9 @@ const T_SESSION_ROWS: u64 = 5432;
 const T_SESSION_PAGE_REQ: u64 = 5435;
 /// `[5436, [row, …], older, instance]` — [`Frame::SessionPage`].
 const T_SESSION_PAGE: u64 = 5436;
+/// One authorized OMP media page and its reply.
+const T_OMP_MEDIA_REQ: u64 = 89911;
+const T_OMP_MEDIA: u64 = 89912;
 /// `[5437, channel_id, after]` — [`Request::SessionsPage`]; an empty `after` is the start
 /// (ADR-034 FR-1).
 const T_SESSIONS_PAGE_REQ: u64 = 5437;
@@ -516,6 +525,23 @@ const T_OFFERS: u64 = 4952;
 /// is accident prevention on top of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
+    /// Fetch bytes only for one exact readable OMP media activity.
+    OmpMedia {
+        /// Room containing the activity.
+        channel_id: Digest32,
+        /// Session owner's node.
+        node: Digest32,
+        /// Native session identifier.
+        session_id: String,
+        /// Session opening identifier.
+        opening: Digest32,
+        /// Activity entry identifying the attachment.
+        entry: Digest32,
+        /// Room instance.
+        instance: [u8; 16],
+        /// Continuation for a previously authorized transfer.
+        cursor: Option<String>,
+    },
     /// Explicit peer-history demand. All ordinary room pages remain cache-only.
     HistoryDemand {
         /// Selected room.
@@ -718,6 +744,11 @@ pub enum Request {
     },
     /// The members of a room.
     Roster {
+        /// The room.
+        channel_id: Digest32,
+    },
+    /// One saved-room instance's membership and consent projection.
+    MemberObservation {
         /// The room.
         channel_id: Digest32,
     },
@@ -1650,6 +1681,9 @@ impl Request {
             Request::Roster { channel_id } => {
                 e.array(2).uint(T_ROSTER).bytes(channel_id);
             }
+            Request::MemberObservation { channel_id } => {
+                e.array(2).uint(T_MEMBER_OBSERVATION_REQ).bytes(channel_id);
+            }
             Request::KeyWaits { channel_id } => {
                 e.array(2).uint(T_KEY_WAITS_REQ).bytes(channel_id);
             }
@@ -1769,6 +1803,25 @@ impl Request {
             }
             Request::ShareList { channel_id } => {
                 e.array(2).uint(T_SHARE_LIST).bytes(channel_id);
+            }
+            Request::OmpMedia {
+                channel_id,
+                node,
+                session_id,
+                opening,
+                entry,
+                instance,
+                cursor,
+            } => {
+                e.array(8)
+                    .uint(T_OMP_MEDIA_REQ)
+                    .bytes(channel_id)
+                    .bytes(node)
+                    .text(session_id)
+                    .bytes(opening)
+                    .bytes(entry)
+                    .bytes(instance)
+                    .text(cursor.as_deref().unwrap_or(""));
             }
             Request::AppendSession {
                 channel_id,
@@ -2373,6 +2426,12 @@ impl Request {
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Roster { channel_id })
             }
+            (T_MEMBER_OBSERVATION_REQ, 2) => {
+                let channel_id = digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::MemberObservation { channel_id })
+            }
             (T_KEY_WAITS_REQ, 2) => {
                 let channel_id = digest(&mut d)?;
                 d.finish()
@@ -2792,6 +2851,29 @@ impl Request {
                     to,
                 })
             }
+            (T_OMP_MEDIA_REQ, 8) => {
+                let channel_id = digest(&mut d)?;
+                let node = digest(&mut d)?;
+                let session_id = text(&mut d, "media Session")?;
+                let opening = digest(&mut d)?;
+                let entry = digest(&mut d)?;
+                let instance = d
+                    .bytes()?
+                    .try_into()
+                    .map_err(|_| Error::MalformedIpc("media room instance"))?;
+                let cursor = text(&mut d, "media cursor")?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::OmpMedia {
+                    channel_id,
+                    node,
+                    session_id,
+                    opening,
+                    entry,
+                    instance,
+                    cursor: (!cursor.is_empty()).then_some(cursor),
+                })
+            }
             (T_SESSION_ENTRIES, 2) => {
                 let channel_id = digest(&mut d)?;
                 d.finish()
@@ -3187,6 +3269,13 @@ pub type RoomRow = (
 /// how a `Lagged` report comes to be silently swallowed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
+    /// A bounded image page. A cursor is scoped to this connection.
+    OmpMedia {
+        /// Image bytes in this page.
+        bytes: Vec<u8>,
+        /// Continuation for the next page, if any.
+        cursor: Option<String>,
+    },
     /// Durable progress of the explicitly selected bounded history operation.
     HistoryDemand {
         /// Current redaction-safe progress for the bounded operation.
@@ -3353,6 +3442,19 @@ pub enum Frame {
     Members {
         /// Member fingerprints, in the order the node holds them.
         members: Vec<Digest32>,
+    },
+    /// One saved-room instance's membership and consent, including retained-projection failure.
+    MemberObservation {
+        /// Saved room instance.
+        instance: [u8; 16],
+        /// Current or retained room members.
+        members: Vec<Digest32>,
+        /// Members whose room consent for this identity has been observed.
+        inbound: Vec<Digest32>,
+        /// Key delivery status for this room.
+        waits: Vec<(Digest32, String)>,
+        /// Actual reason the retained projection is not current, or empty when current.
+        failure: String,
     },
     /// The answer to a [`Request::KeyWaits`]: `(member, said)`, what is said after its name, in
     /// member order.
@@ -3775,6 +3877,30 @@ impl Frame {
                     e.bytes(m);
                 }
             }
+            Frame::MemberObservation {
+                instance,
+                members,
+                inbound,
+                waits,
+                failure,
+            } => {
+                e.array(6)
+                    .uint(T_MEMBER_OBSERVATION)
+                    .bytes(instance)
+                    .array(members.len());
+                for member in members {
+                    e.bytes(member);
+                }
+                e.array(inbound.len());
+                for member in inbound {
+                    e.bytes(member);
+                }
+                e.array(waits.len());
+                for (member, why) in waits {
+                    e.array(2).bytes(member).text(why);
+                }
+                e.text(failure);
+            }
             Frame::KeyWaits { waits } => {
                 e.array(2).uint(T_KEY_WAITS).array(waits.len());
                 for (m, why) in waits {
@@ -3872,6 +3998,12 @@ impl Frame {
                         .uint(r.fetched)
                         .uint(r.files);
                 }
+            }
+            Frame::OmpMedia { bytes, cursor } => {
+                e.array(3)
+                    .uint(T_OMP_MEDIA)
+                    .bytes(bytes)
+                    .text(cursor.as_deref().unwrap_or(""));
             }
             Frame::Appended { entry } => {
                 e.array(2).uint(T_APPENDED).bytes(entry);
@@ -4846,6 +4978,47 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             }
             return Ok(Frame::Members { members });
         }
+        (T_MEMBER_OBSERVATION, 6) => {
+            let instance = d
+                .bytes()?
+                .try_into()
+                .map_err(|_| Error::MalformedIpc("ipc member observation instance"))?;
+            let count = d
+                .array()
+                .map_err(|_| Error::MalformedIpc("ipc observation members"))?;
+            let mut members = Vec::with_capacity(count.min(1024));
+            for _ in 0..count {
+                members.push(digest(d)?);
+            }
+            let count = d
+                .array()
+                .map_err(|_| Error::MalformedIpc("ipc observation consents"))?;
+            let mut inbound = Vec::with_capacity(count.min(1024));
+            for _ in 0..count {
+                inbound.push(digest(d)?);
+            }
+            let count = d
+                .array()
+                .map_err(|_| Error::MalformedIpc("ipc observation key waits"))?;
+            let mut waits = Vec::with_capacity(count.min(1024));
+            for _ in 0..count {
+                if d.array()
+                    .map_err(|_| Error::MalformedIpc("ipc observation key wait"))?
+                    != 2
+                {
+                    return Err(Error::MalformedIpc("ipc observation key wait"));
+                }
+                waits.push((digest(d)?, text(d, "ipc observation key wait reason")?));
+            }
+            let failure = text(d, "ipc observation failure")?;
+            return Ok(Frame::MemberObservation {
+                instance,
+                members,
+                inbound,
+                waits,
+                failure,
+            });
+        }
         (T_KEY_WAITS, 2) => {
             let n = d
                 .array()
@@ -5039,6 +5212,17 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 });
             }
             return Ok(Frame::Shares { shares });
+        }
+        (T_OMP_MEDIA, 3) => {
+            let bytes = d.bytes()?.to_vec();
+            if bytes.len() > 64 * 1024 {
+                return Err(Error::MalformedIpc("media page exceeds its bound"));
+            }
+            let cursor = text(d, "media cursor")?;
+            return Ok(Frame::OmpMedia {
+                bytes,
+                cursor: (!cursor.is_empty()).then_some(cursor),
+            });
         }
         (T_APPENDED, 2) => {
             let entry = digest(d)?;
@@ -6713,6 +6897,7 @@ async fn serve_requests(
         node.clone()
             .map(|node| Frame::NodeDetached { node }.to_bytes())
     };
+    let mut media = ipc_omp_media::Cache::default();
     // Serve requests until the client hangs up, or until it subscribes — which is
     // terminal, because from then on the connection is a one-way stream.
     loop {
@@ -6816,6 +7001,17 @@ async fn serve_requests(
                 return Ok(());
             }
         };
+        if matches!(request, Request::OmpMedia { .. }) {
+            let reply = tokio::select! {
+                reply = media.page(handle, &request) => reply.unwrap_or_else(|reason| Frame::Error { reason }),
+                () = node_detached(&mut watch) => {
+                    if let Some(body) = gone(&node) { let _ = write_frame(&mut stream, &body).await; }
+                    return Ok(());
+                },
+            };
+            write_frame(&mut stream, &reply.to_bytes()).await?;
+            continue;
+        }
         if matches!(request, Request::Subscribe) {
             // Subscribe BEFORE acknowledging, so nothing emitted between the
             // request and the first read is missed.
@@ -7004,6 +7200,7 @@ async fn serve_requests(
                 | Frame::WorkBoard { .. }
                 | Frame::Order { .. }
                 | Frame::Members { .. }
+                | Frame::MemberObservation { .. }
                 | Frame::KeyWaits { .. }
                 | Frame::MemberConsents { .. }
                 | Frame::Trusted { .. }
@@ -7597,6 +7794,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         | Request::Read { channel_id, .. }
         | Request::Order { channel_id, .. }
         | Request::Roster { channel_id, .. }
+        | Request::MemberObservation { channel_id, .. }
         | Request::KeyWaits { channel_id, .. }
         | Request::MemberConsents { channel_id, .. }
         | Request::AddService { channel_id, .. }
@@ -7606,6 +7804,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         | Request::ShareList { channel_id, .. }
         | Request::AppendSession { channel_id, .. }
         | Request::SessionShare { channel_id, .. }
+        | Request::OmpMedia { channel_id, .. }
         | Request::SessionEntries { channel_id, .. }
         | Request::SessionPage { channel_id, .. }
         | Request::Sessions { channel_id, .. }
@@ -8675,9 +8874,11 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             Ok(states) => Frame::PullStates { states },
             Err(reason) => Frame::Error { reason },
         },
-        Request::SessionEntries { .. } | Request::SessionPage { .. } => Frame::Error {
-            reason: "Session activity requires the streaming IPC handler".into(),
-        },
+        Request::SessionEntries { .. } | Request::SessionPage { .. } | Request::OmpMedia { .. } => {
+            Frame::Error {
+                reason: "Session activity requires the streaming IPC handler".into(),
+            }
+        }
         // Newest first. The reply envelope carries every event across pages, without a byte cap.
         Request::Decisions { limit } => Frame::Decisions {
             events: handle.decisions().recent(
@@ -8838,6 +9039,45 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             {
                 Some(detail) => Frame::Members {
                     members: detail.members.clone(),
+                },
+                None => Frame::Error {
+                    reason: "room not open".into(),
+                },
+            }
+        }
+        Request::MemberObservation { channel_id } => {
+            // Proofs can fail one real authenticated RPC without replacing its data.
+            #[cfg(feature = "test-knobs")]
+            if let Some(path) = std::env::var_os("VOX_TEST_MEMBER_OBSERVATION_FAIL_FILE")
+                .filter(|path| !path.is_empty())
+                .map(std::path::PathBuf::from)
+            {
+                let room = crate::node::link::b32_encode(&channel_id);
+                if std::fs::read_to_string(&path).ok().as_deref() == Some(room.as_str())
+                    && std::fs::rename(&path, path.with_extension("consumed")).is_ok()
+                {
+                    return Frame::Error {
+                        reason: "the room membership observation was refused by the node".into(),
+                    };
+                }
+            }
+            let view = handle.view();
+            match view
+                .open_channels
+                .iter()
+                .find(|detail| detail.channel_id == channel_id)
+            {
+                Some(detail) => Frame::MemberObservation {
+                    instance: detail.history_instance,
+                    members: detail.members.clone(),
+                    inbound: detail.consenting.clone(),
+                    waits: view
+                        .key_waits
+                        .iter()
+                        .filter(|(room, _, _)| *room == channel_id)
+                        .map(|(_, member, why)| (*member, why.clone()))
+                        .collect(),
+                    failure: detail.projection_failure.clone().unwrap_or_default(),
                 },
                 None => Frame::Error {
                     reason: "room not open".into(),

@@ -106,7 +106,8 @@ struct NodeCard: View {
 
     var body: some View {
         let card = fingerprintCard(fingerprint: node.fingerprint)
-        let trust = model.trust(of: node.fingerprint)
+        let member = model.members.first { $0.id == node.fingerprint && model.roomOnScreen != nil }
+        let trust = member?.trust ?? model.trust(of: node.fingerprint)
         let entry = model.trusted.first { $0.fingerprint == node.fingerprint }
         // Its alias once the keyring holds it, else as the room named it.
         let name = entry?.name ?? node.name
@@ -140,6 +141,9 @@ struct NodeCard: View {
                     .accessibilityIdentifier("card-trust")
                 Text(trust.sentence(name))
                     .accessibilityIdentifier("card-directions")
+                if let error = (member != nil ? model.memberObservationError : (model.trustsBackError ?? model.keyringObservationError)) {
+                    Text(error).secondaryText().accessibilityIdentifier("card-observation-unavailable")
+                }
                 if let entry {
                     Text("Your keyring grants \(entry.name) \(Capability.words(entry.drive)).")
                         .secondaryText()

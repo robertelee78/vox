@@ -148,6 +148,13 @@ struct Inner {
     opencode: Arc<crate::opencode_mirror::OpenCodeMirror>,
     /// OMP sessions' activity and controls through their native extension.
     omp: Arc<crate::omp_mirror::OmpMirror>,
+    /// Ephemeral image services belonging to a live OMP branch.
+    omp_media: tokio::sync::Mutex<BTreeMap<(NodeName, String, u64, String), OmpMediaLease>>,
+}
+
+struct OmpMediaLease {
+    descriptor: vox_core::node::shares::media::Descriptor,
+    lease: vox_core::node::shares::media::MediaLease,
 }
 
 struct OmpEnding {
@@ -519,6 +526,152 @@ impl Router {
             })
     }
 
+    /// Offer an image only for the exact live attachment, room and OMP branch.
+    async fn offer_omp_media(
+        &self,
+        node: NodeName,
+        registration: crate::wake::Session,
+        branch: u64,
+        descriptor: vox_core::node::shares::media::Descriptor,
+    ) -> Result<String, String> {
+        descriptor.validate()?;
+        let room = registration
+            .room
+            .as_deref()
+            .ok_or("the OMP Session has no room")?;
+        let room = vox_core::node::link::b32_decode(room, "the Session room")
+            .map_err(|e| e.to_string())?;
+        let (handle, attachment) = {
+            let slots = lock(&self.inner.slots);
+            match slots.get(&node) {
+                Some(Slot::Attached(a)) if !*a.detached.borrow() => {
+                    (a.handle.clone(), a.generation)
+                }
+                _ => return Err("the Session node is not attached".into()),
+            }
+        };
+        let view = handle.view();
+        let owner = view
+            .identity
+            .as_ref()
+            .map(|identity| identity.fingerprint)
+            .ok_or("the Session node is locked")?;
+        let instance = view
+            .open_channels
+            .iter()
+            .find(|channel| channel.channel_id == room && channel.members.contains(&owner))
+            .map(|channel| channel.history_instance)
+            .ok_or("the Session room is not open")?;
+        let weak = Arc::downgrade(&self.inner);
+        let (check_node, check_registration, check_handle, check_id) = (
+            node.clone(),
+            registration.clone(),
+            handle.clone(),
+            descriptor.id.clone(),
+        );
+        let current: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
+            let Some(inner) = weak.upgrade() else {
+                return false;
+            };
+            let same = matches!(lock(&inner.slots).get(&check_node),
+                Some(Slot::Attached(a)) if a.generation == attachment && !*a.detached.borrow()
+                    && Arc::ptr_eq(a.handle.app(), check_handle.app()));
+            let view = check_handle.view();
+            same && !view.locked
+                && !view.locking
+                && view.identity.as_ref().map(|identity| identity.fingerprint) == Some(owner)
+                && view.open_channels.iter().any(|channel| {
+                    channel.channel_id == room
+                        && channel.history_instance == instance
+                        && channel.members.contains(&owner)
+                })
+                && (Router {
+                    inner: Arc::clone(&inner),
+                })
+                .current_omp_registration(&check_node, &check_registration)
+                && inner
+                    .omp
+                    .media_current(&check_node, &check_registration, branch, &check_id)
+        });
+        if !current() {
+            return Err("the OMP image is no longer current".into());
+        }
+        let peer_current = Arc::clone(&current);
+        let peer_handle = handle.clone();
+        let guard: vox_core::node::shares::media::Guard = Arc::new(move |peer| {
+            peer_current()
+                && peer_handle.view().open_channels.iter().any(|channel| {
+                    channel.channel_id == room
+                        && channel.history_instance == instance
+                        && channel.members.contains(&peer)
+                })
+        });
+        let (mirror, source_node, source_registration, source_id) = (
+            Arc::clone(&self.inner.omp),
+            node.clone(),
+            registration.clone(),
+            descriptor.id.clone(),
+        );
+        let materialize: vox_core::node::shares::media::Materialize = Arc::new(move || {
+            let (mirror, node, registration, id) = (
+                Arc::clone(&mirror),
+                source_node.clone(),
+                source_registration.clone(),
+                source_id.clone(),
+            );
+            Box::pin(async move { mirror.media(&node, &registration, branch, id).await })
+        });
+        let binding = vox_core::node::shares::media::Binding {
+            session: registration.session.clone(),
+            generation: branch,
+            descriptor: descriptor.clone(),
+        };
+        let key = (node, registration.session, branch, descriptor.id.clone());
+        let mut leases = self.inner.omp_media.lock().await;
+        if let Some(existing) = leases.get(&key) {
+            return if existing.descriptor == descriptor && current() {
+                Ok(existing.lease.tag().to_owned())
+            } else {
+                Err("the native image descriptor changed".into())
+            };
+        }
+        let lease = vox_core::node::shares::media::MediaLease::start(
+            &handle,
+            room,
+            binding,
+            guard,
+            materialize,
+        )
+        .await?;
+        if !current() {
+            return Err("the OMP image is no longer current".into());
+        }
+        let tag = lease.tag().to_owned();
+        leases.insert(key.clone(), OmpMediaLease { descriptor, lease });
+        drop(leases);
+        let weak = Arc::downgrade(&self.inner);
+        let expected_tag = tag.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if current() {
+                    continue;
+                }
+                if let Some(inner) = weak.upgrade() {
+                    let mut leases = inner.omp_media.lock().await;
+                    if leases
+                        .get(&key)
+                        .is_some_and(|lease| lease.lease.tag() == expected_tag)
+                    {
+                        leases.remove(&key);
+                    }
+                }
+                break;
+            }
+        });
+        Ok(tag)
+    }
+
     /// A router for `account`'s nodes, on `rt`.
     #[must_use]
     pub fn new(account: Account, rt: Handle, defaults: Defaults) -> Self {
@@ -536,7 +689,9 @@ impl Router {
                     weak_omp_end,
                     weak_omp_activity,
                     weak_omp_rename,
+                    weak_omp_media,
                 ) = (
+                    weak.clone(),
                     weak.clone(),
                     weak.clone(),
                     weak.clone(),
@@ -635,19 +790,32 @@ impl Router {
                         let weak = weak_omp_activity.clone();
                         Box::pin(async move {
                             let Some(inner) = weak.upgrade() else {
-                                return;
+                                return vox_core::node::daemonipc::SessionAdmission::Refused(
+                                    "the daemon stopped".into(),
+                                );
                             };
                             let router = Router { inner };
                             let lifecycle = router.session_lifecycle(&node, &registration.session);
                             let guard = lifecycle.lock_owned().await;
                             if !router.current_omp_registration(&node, &registration) {
-                                return;
+                                return vox_core::node::daemonipc::SessionAdmission::Refused(
+                                    "the OMP Session route changed".into(),
+                                );
                             }
                             router
                                 .inner
                                 .sink
                                 .omp_activity(&node, Arc::new(registration), bodies, guard)
-                                .await;
+                                .await
+                        })
+                    }),
+                    Arc::new(move |node, registration, generation, descriptor| {
+                        let weak = weak_omp_media.clone();
+                        Box::pin(async move {
+                            let inner = weak.upgrade().ok_or("the daemon stopped")?;
+                            Router { inner }
+                                .offer_omp_media(node, registration, generation, descriptor)
+                                .await
                         })
                     }),
                 );
@@ -656,6 +824,7 @@ impl Router {
                     codex,
                     opencode,
                     omp,
+                    omp_media: tokio::sync::Mutex::new(BTreeMap::new()),
                     account,
                     rt,
                     manual_anchors: tokio::sync::Mutex::new(MachineAnchors {
@@ -1832,7 +2001,15 @@ impl Router {
                         .as_ref()
                         .map(|session| self.registration_fence(node, session, g.info.fingerprint))
                         .transpose()?;
-                    crate::wake::store_room(&paths, &id, one);
+                    if crate::wake::store_room(&paths, &id, one).is_some() {
+                        // The OMP follower admits activity only for the registration as stored;
+                        // the one `want` started holds the prefix and would refuse every entry.
+                        if let Some(reg) = crate::wake::registration(&paths, &id)
+                            .filter(|reg| reg.harness == "omp")
+                        {
+                            self.watch_harness(node, &reg);
+                        }
+                    }
                 }
             }
         }

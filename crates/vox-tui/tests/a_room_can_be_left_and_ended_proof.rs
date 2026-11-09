@@ -674,10 +674,12 @@ fn an_admin_removes_one_member_and_the_creator_readmits_it_forward_only() {
         back,
         "APPARATUS: full-history control rejoin did not reach its sender: {roster:?}"
     );
+    // Own-history recovery is the #1163 prerequisite, not roster propagation; use the
+    // same patience as its existing recovery consumers rather than WITHIN's leave window.
     let (writable, post) = poll(
         dave,
         &["room", "post", id, "FX62-REJOIN-CONTROL"],
-        WITHIN,
+        support::TIMEOUT,
         |o| o.ok,
     );
     if !writable

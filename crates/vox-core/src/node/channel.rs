@@ -2497,7 +2497,7 @@ impl ChannelState {
             }
         }
         let mut dag = Dag::restore_published(&restart.feeds)?;
-        let presence = restart.presence.clone();
+        let mut presence = restart.presence.clone();
         let retained_step_body = restart.retained_step_body;
         let set_aside = restart.set_aside.clone();
         // Cache and log ids share one allocator. Resume past both through metadata, without
@@ -2835,6 +2835,9 @@ impl ChannelState {
             entries.read(store, &sek, channel_id)?.key_package_tip()?,
         )?;
         governance::prepare(store, &sek, channel_id)?;
+        governance::Presence::repair(store, &entries, &sek, channel_id, &mut presence, |author| {
+            dag.authored_feed(author).map_or(0, |feed| feed.seq)
+        })?;
         if forks_kept != 0 {
             let mut batch = store.batch()?;
             for proof in dag.fork_proofs() {

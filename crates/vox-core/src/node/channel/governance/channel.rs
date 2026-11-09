@@ -1,7 +1,8 @@
 //! Channel-facing checked queries and one-turn governance maintenance.
 
 use super::super::{ChannelState, RoomNotice, Share};
-use super::View;
+use super::{facts, View};
+use crate::atrest::sek::Sek;
 use crate::error::Result;
 use crate::governance::entry::{GovBody, GovEntry};
 use crate::hash::Digest32;
@@ -12,6 +13,188 @@ pub(crate) struct Presence {
     pub last: (u64, bool),
     pub last_ms: Option<u64>,
     pub back: Option<(u64, u64)>,
+}
+
+impl Presence {
+    /// Fold one authenticated presence statement, already indexed in `batch`. A membership
+    /// starts at the earliest `here` after the member's latest stated leave; a sender-key
+    /// rotation's `here` statement is not a return. A statement learned out of order is placed
+    /// against the author's held authenticated governance positions. A later start is always
+    /// taken; an earlier one only when the author's feed is held without a gap across the
+    /// positions it passes over, and otherwise the later start stands (fail closed).
+    pub(in crate::node::channel) fn fold(
+        old: Option<Self>,
+        batch: &crate::node::store::Batch<'_>,
+        entries: &super::EntryIndex,
+        sek: &Sek,
+        room: &Digest32,
+        entry: &crate::log::entry::Entry,
+        here: bool,
+    ) -> Result<Self> {
+        let (seq, ms) = (entry.skeleton.seq, entry.skeleton.claimed_ms);
+        let Some(mut state) = old else {
+            return Ok(Self {
+                last: (seq, here),
+                last_ms: Some(ms),
+                back: None,
+            });
+        };
+        let prior = state.last;
+        if seq > prior.0 {
+            state.last = (seq, here);
+            state.last_ms = Some(ms);
+            if here && !prior.1 {
+                state.back = Some((seq, ms));
+            }
+            return Ok(state);
+        }
+        // Out of order: only the start of a membership that still stands can move.
+        if seq == prior.0 || !prior.1 {
+            return Ok(state);
+        }
+        let author = &entry.skeleton.author_id;
+        let facts = facts::Read::from_batch(batch, sek, room)?;
+        if !here {
+            // A leave learned late, with no known return after it: the first statement after
+            // it is that return. A later leave there was already folded when it arrived.
+            if state.back.is_none_or(|(back, _)| back < seq) {
+                if let Some((next, next_ms, true)) = next_presence(&facts, author, seq)? {
+                    state.back = Some((next, next_ms));
+                }
+            }
+        } else if let Some((back, _)) = state.back.filter(|(back, _)| *back > seq) {
+            // A return learned late, before the known one and after the same leave.
+            if facts.current_ready()?
+                && entries
+                    .in_batch(batch, sek, room)?
+                    .published_through(author)
+                    >= back
+                && !leave_between(&facts, author, seq, back)?
+            {
+                state.back = Some((seq, ms));
+            }
+        }
+        Ok(state)
+    }
+
+    /// Derived repair of each stored membership start a sender-key rotation's `here` statement
+    /// moved (v0.4.19 and earlier), from the room's held authenticated governance positions. The
+    /// start of a member who is here now is recomputed as the earliest `here` after its latest
+    /// stated leave. A later start is always taken; an earlier one only when the governance facts
+    /// hold every source row and the author's feed is held without a gap through its latest
+    /// statement. Otherwise the stored, later start stands (fail closed).
+    pub(in crate::node::channel) fn repair(
+        store: &Store,
+        entries: &super::EntryIndex,
+        sek: &Sek,
+        room: &Digest32,
+        presence: &mut std::collections::BTreeMap<Digest32, Self>,
+        published_through: impl Fn(&Digest32) -> u64,
+    ) -> Result<()> {
+        let Some(facts) = facts::Read::open_existing(store, sek, room)? else {
+            return Ok(());
+        };
+        let complete = facts.current_ready()?;
+        let mut repaired = Vec::new();
+        for (author, state) in presence.iter() {
+            let Some((back, _)) = state.back.filter(|_| state.last.1) else {
+                continue;
+            };
+            let derived = held_return(&facts, author)?;
+            if derived == state.back {
+                continue;
+            }
+            let later = derived.is_some_and(|(seq, _)| seq > back);
+            if later || (complete && published_through(author) >= state.last.0) {
+                repaired.push((
+                    *author,
+                    Self {
+                        back: derived,
+                        ..*state
+                    },
+                ));
+            }
+        }
+        drop(facts);
+        if repaired.is_empty() {
+            return Ok(());
+        }
+        let mut batch = store.batch()?;
+        let mut index = entries.write(&mut batch, sek, room)?;
+        for (author, state) in &repaired {
+            index.note_presence(*author, *state)?;
+        }
+        index.seal()?;
+        batch.commit()?;
+        presence.extend(repaired);
+        Ok(())
+    }
+}
+
+/// The author's held presence statement, as (seq, claimed time, here), behind one position row.
+fn presence_at(facts: &facts::Read<'_>, log: u64) -> Result<Option<(u64, u64, bool)>> {
+    let entry = facts.entry(log)?;
+    Ok(match GovEntry::body_bound_to(&entry) {
+        Ok(GovBody::Presence(presence)) => Some((
+            entry.skeleton.seq,
+            entry.skeleton.claimed_ms,
+            presence.body.here,
+        )),
+        _ => None,
+    })
+}
+
+/// The author's first held presence statement after `seq`.
+fn next_presence(
+    facts: &facts::Read<'_>,
+    author: &Digest32,
+    seq: u64,
+) -> Result<Option<(u64, u64, bool)>> {
+    let mut after = facts::position(author, seq);
+    while let Some((key, log)) = facts
+        .first(facts::Table::Positions, Some(after))?
+        .filter(|(key, _)| key[..32] == author[..])
+    {
+        if let Some(presence) = presence_at(facts, log)? {
+            return Ok(Some(presence));
+        }
+        after = key;
+    }
+    Ok(None)
+}
+
+/// Whether the author stated a leave strictly between `low` and `high`.
+fn leave_between(facts: &facts::Read<'_>, author: &Digest32, low: u64, high: u64) -> Result<bool> {
+    let low = facts::position(author, low);
+    let mut before = facts::position(author, high);
+    while let Some((key, log)) = facts
+        .last(facts::Table::Positions, Some(before))?
+        .filter(|(key, _)| *key > low)
+    {
+        if presence_at(facts, log)?.is_some_and(|(_, _, here)| !here) {
+            return Ok(true);
+        }
+        before = key;
+    }
+    Ok(false)
+}
+
+/// The earliest held `here` after the author's latest held leave; `None` without a leave.
+fn held_return(facts: &facts::Read<'_>, author: &Digest32) -> Result<Option<(u64, u64)>> {
+    let mut before = facts::position(author, u64::MAX);
+    let mut back = None;
+    while let Some((key, log)) = facts
+        .last(facts::Table::Positions, Some(before))?
+        .filter(|(key, _)| key[..32] == author[..])
+    {
+        match presence_at(facts, log)? {
+            Some((_, _, false)) => return Ok(back),
+            Some((seq, ms, true)) => back = Some((seq, ms)),
+            None => {}
+        }
+        before = key;
+    }
+    Ok(None)
 }
 
 /// Checked application-content eligibility at the published governance revision.
@@ -702,24 +885,16 @@ impl ChannelState {
                 if let Some(key) = self.authors.get(&entry.skeleton.author_id) {
                     if body.verify(key).is_ok() {
                         if let GovBody::Presence(presence) = &body {
-                            let held =
-                                self.presence
-                                    .entry(entry.skeleton.author_id)
-                                    .or_insert(Presence {
-                                        last: (entry.skeleton.seq, presence.body.here),
-                                        last_ms: Some(entry.skeleton.claimed_ms),
-                                        back: None,
-                                    });
-                            if entry.skeleton.seq >= held.last.0 {
-                                held.last = (entry.skeleton.seq, presence.body.here);
-                                held.last_ms = Some(entry.skeleton.claimed_ms);
-                            }
-                            if presence.body.here
-                                && held.back.is_none_or(|(seq, _)| seq < entry.skeleton.seq)
-                            {
-                                held.back = Some((entry.skeleton.seq, entry.skeleton.claimed_ms));
-                            }
-                            let state = *held;
+                            let state = Presence::fold(
+                                self.presence.get(&entry.skeleton.author_id).copied(),
+                                batch,
+                                &self.entries,
+                                &self.sek,
+                                &self.channel_id,
+                                entry,
+                                presence.body.here,
+                            )?;
+                            self.presence.insert(entry.skeleton.author_id, state);
                             let mut index =
                                 self.entries.write(batch, &self.sek, &self.channel_id)?;
                             index.note_presence(entry.skeleton.author_id, state)?;

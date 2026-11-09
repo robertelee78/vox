@@ -44,6 +44,7 @@ enum Work {
         at: u64,
     },
     Serve(serve::Serving),
+    Admit(serve::MediaAdmission),
     PullCursor {
         peer: Digest32,
         cursor: Cursor,
@@ -162,6 +163,7 @@ pub(crate) struct Saved {
     pub(crate) cached: Option<bool>,
     pub(crate) cursor_committed: bool,
     pub(crate) page: Option<Page>,
+    pub(crate) admitted: Option<bool>,
 }
 
 pub(crate) struct CompletedUpgrade {
@@ -310,6 +312,7 @@ impl ChannelState {
             Work::Receive { .. }
                 | Work::Check { .. }
                 | Work::Serve(_)
+                | Work::Admit(_)
                 | Work::Legacy
                 | Work::Replay
                 | Work::PullCursor { .. }
@@ -384,6 +387,7 @@ impl ChannelState {
                         replay: Ok(false) | Err(_)
                     }
                     | Work::Serve(_)
+                    | Work::Admit(_)
                     | Work::PullCursor { .. }
             ) {
                 None
@@ -582,6 +586,7 @@ impl PendingUpgrade {
                 let mut checked_invalid = false;
                 let mut checked_unknown = false;
                 let mut page = None;
+                let mut admitted = None;
                 let (advance, received) = match work {
                     Work::Restore => (self.restore(store, sek)?, None),
                     Work::Controls => (self.controls(store, sek)?, None),
@@ -718,6 +723,10 @@ impl PendingUpgrade {
                         page = Some(self.serve(store, sek, serving)?);
                         (SessionAdvance::Waiting, None)
                     }
+                    Work::Admit(admission) => {
+                        admitted = Some(self.admit(store, sek, &admission)?);
+                        (SessionAdvance::Waiting, None)
+                    }
                     Work::PullCursor {
                         peer,
                         cursor,
@@ -758,6 +767,7 @@ impl PendingUpgrade {
                     cached,
                     cursor_committed,
                     page,
+                    admitted,
                     session_rendered: self.news.len(),
                 })
             })
@@ -2250,6 +2260,7 @@ pub(crate) use page::{LivePageResult, PageFlow, PagePreparation, PageResult};
 mod expiry;
 mod serve;
 pub(in crate::node::channel) use expiry::sweep_private;
+pub(crate) use serve::MediaAdmission;
 
 impl ChannelState {
     pub(in crate::node::channel) fn snapshot_private_generations(

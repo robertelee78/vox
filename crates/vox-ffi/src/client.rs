@@ -815,6 +815,19 @@ pub struct Member {
     pub key_waits: Option<String>,
 }
 
+/// One saved-room membership projection, with its actual freshness.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct RoomMemberObservation {
+    /// Saved-room instance that owns this projection.
+    pub instance: Vec<u8>,
+    /// Members and their locally known names and key status.
+    pub members: Vec<Member>,
+    /// Members whose consent for this node is observed in this room.
+    pub inbound: Vec<String>,
+    /// Actual projection failure, or empty when current.
+    pub failure: String,
+}
+
 /// Current daemon-derived eligibility for individual Trust controls. Refresh when policy
 /// changes; the daemon separately rechecks authorization when the person performs the action.
 #[derive(Debug, Clone, uniffi::Record)]
@@ -1251,6 +1264,49 @@ pub struct FfiSessionEntry {
     pub request: Option<FfiRequest>,
     /// Scoped OMP Drive evidence, if this is a Drive operation.
     pub drive: Option<FfiDriveEvidence>,
+    /// Native OMP semantic tool or job body.
+    pub presentation: Option<FfiPresentation>,
+    /// Session-scoped on-demand image.
+    pub media: Option<FfiSessionMedia>,
+}
+
+/// Renderable OMP tool or job content.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiPresentation {
+    /// Native intent or tool name.
+    pub heading: String,
+    /// Native operation status.
+    pub status: String,
+    /// Readable body, retaining Markdown/code/diff text.
+    pub body: String,
+    /// Async job identity and timing, if this is a job.
+    pub job: Option<FfiPresentationJob>,
+}
+
+/// Native async-job identity and timing.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiPresentationJob {
+    /// Native job id.
+    pub id: String,
+    /// Native job type.
+    pub kind: String,
+    /// Start timestamp.
+    pub started: Option<u64>,
+    /// End timestamp, if known.
+    pub ended: Option<u64>,
+}
+
+/// An image reachable only through its exact Session activity entry.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiSessionMedia {
+    /// Activity entry identity, used as the access-checked handle.
+    pub entry: String,
+    /// Declared image MIME.
+    pub mime: String,
+    /// Declared image size.
+    pub size: u64,
+    /// Whether the native image service is available.
+    pub available: bool,
 }
 
 /// Evidence for one attributed OMP Drive operation.
@@ -1282,12 +1338,20 @@ fn session_entry(
     pulled: &HashMap<String, String>,
 ) -> FfiSessionEntry {
     use vox_core::node::session_view::details_text;
+    let details = if l.presentation.is_some() {
+        l.details
+            .iter()
+            .find(|(label, _)| label == "arguments")
+            .map_or_else(String::new, |(_, body)| body.clone())
+    } else {
+        details_text(l)
+    };
     FfiSessionEntry {
         id: b32_encode(&l.id),
         at_ms: l.at_millis,
         kind: l.kind.clone(),
         line: l.text.clone(),
-        details: details_text(l),
+        details,
         drive: l.drive.as_ref().map(|d| FfiDriveEvidence {
             operation: d.operation.clone(),
             by: d.by.clone(),
@@ -1297,6 +1361,23 @@ fn session_entry(
                 "refused" => FfiDrivePhase::Refused,
                 _ => FfiDrivePhase::Unconfirmed,
             },
+        }),
+        presentation: l.presentation.as_ref().map(|p| FfiPresentation {
+            heading: p.heading.clone(),
+            status: p.status.clone(),
+            body: p.body.clone(),
+            job: p.job.as_ref().map(|job| FfiPresentationJob {
+                id: job.id.clone(),
+                kind: job.kind.clone(),
+                started: job.started,
+                ended: job.ended,
+            }),
+        }),
+        media: l.media.as_ref().map(|m| FfiSessionMedia {
+            entry: b32_encode(&l.id),
+            mime: m.mime.clone(),
+            size: m.size,
+            available: m.available,
         }),
         file: l.file.as_ref().map(|f| FfiSessionFile {
             name: shown_name(&f.name),
@@ -3916,6 +3997,52 @@ impl VoxClient {
         })
     }
 
+    /// Read roster, reciprocal room consent and key status from one room publication.
+    ///
+    /// # Errors
+    /// A malformed room id or an unavailable node projection.
+    pub async fn room_member_observation(
+        &self,
+        room: String,
+    ) -> Result<RoomMemberObservation, VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        on_held!(self, |c| {
+            let names = names(c).await?;
+            let presented: HashMap<_, _> = c
+                .presented_names()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            let (instance, members, inbound, waits, failure) =
+                match ask(c, &Request::MemberObservation { channel_id }).await? {
+                    Frame::MemberObservation {
+                        instance,
+                        members,
+                        inbound,
+                        waits,
+                        failure,
+                    } => (instance, members, inbound, waits, failure),
+                    other => return Err(unexpected(&other)),
+                };
+            let waits: HashMap<_, _> = waits.into_iter().collect();
+            Ok(RoomMemberObservation {
+                instance: instance.to_vec(),
+                members: members
+                    .into_iter()
+                    .map(|m| Member {
+                        presented_name: presented.get(&m).cloned().unwrap_or_default(),
+                        fingerprint: b32_encode(&m),
+                        name: names.get(&m).cloned().unwrap_or_default(),
+                        key_waits: waits.get(&m).cloned(),
+                    })
+                    .collect(),
+                inbound: inbound.iter().map(b32_encode).collect(),
+                failure,
+            })
+        })
+    }
+
     /// Read one current-member metadata page independently of the message window. A changed
     /// revision replaces the caller's claims; an unchanged completed scan returns no bodies.
     /// The owned request never holds Slot over IPC, and explicit cancellation stops its work.
@@ -6117,6 +6244,129 @@ impl VoxClient {
         let before = digest(&before, "entry")?;
         self.session_page_read(room, node, session_id, Some(before))
             .await
+    }
+
+    /// Fetch one exact Session image after per-page authorization and verification.
+    ///
+    /// # Errors
+    /// The Session, room, branch, media authority or image changed, or the bounded transfer failed.
+    pub async fn session_media(
+        &self,
+        room: String,
+        node: String,
+        session_id: String,
+        opening: String,
+        entry: String,
+        instance: Vec<u8>,
+    ) -> Result<Vec<u8>, VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        let node = input_fingerprint(&node)?;
+        let opening = digest(&opening, "Session opening")?;
+        let entry = digest(&entry, "Session entry")?;
+        let instance: [u8; 16] = instance
+            .try_into()
+            .map_err(|_| failed("invalid saved room instance"))?;
+        let held = Arc::clone(&self.held);
+        self.on_rt(async move {
+            // Image materialization can wait on the remote Session. Do not hold the shared
+            // app connection across that wait: Session activity and revocation must still be
+            // observed while the image is in flight.
+            let (at, attachment, actor) = {
+                let mut slot = held.lock().await;
+                let h = slot.as_mut().ok_or_else(not_attached)?;
+                h.mend().await?;
+                let actor = h
+                    .client
+                    .me()
+                    .ok_or_else(|| failed("The acting node is unknown."))?;
+                (h.at.clone(), Arc::clone(&h.attachment), actor)
+            };
+            let mut client = IpcClient::open_at(&at)
+                .await
+                .map_err(|e| listing_failed("Session media", e))?
+                .with_answer_bound(REQUEST_WITHIN);
+            if client.me() != Some(actor) {
+                return Err(failed(
+                    "The acting node changed while loading the Session image.",
+                ));
+            }
+            let mut output = Vec::new();
+            let mut cursor = None;
+            let mut complete = false;
+            for _ in 0..256 {
+                let frame = client
+                    .request(&vox_core::node::ipc::Request::OmpMedia {
+                        channel_id,
+                        node,
+                        session_id: session_id.clone(),
+                        opening,
+                        entry,
+                        instance,
+                        cursor: cursor.clone(),
+                    })
+                    .await
+                    .map_err(|e| listing_failed("Session media", e))?;
+                let (bytes, next) = match frame {
+                    Frame::OmpMedia { bytes, cursor } => (bytes, cursor),
+                    other => return Err(unexpected(&answered(other)?)),
+                };
+                if bytes.len() > 64 * 1024 || output.len().saturating_add(bytes.len()) > 512 * 1024
+                {
+                    return Err(failed("the Session image exceeds its transfer bound"));
+                }
+                if bytes.is_empty() && next.is_some() {
+                    return Err(failed("the Session image page made no progress"));
+                }
+                output.extend_from_slice(&bytes);
+                match next {
+                    None => {
+                        complete = true;
+                        break;
+                    }
+                    Some(next) if Some(&next) != cursor.as_ref() => cursor = Some(next),
+                    Some(_) => return Err(failed("the Session image cursor did not advance")),
+                }
+            }
+            if !complete {
+                return Err(failed("the Session image has too many pages"));
+            }
+            let (sessions, _) = exact_session(&mut client, channel_id, node, &session_id).await?;
+            if !sessions
+                .iter()
+                .any(|s| s.opening == opening && s.open && (s.can_drive || node == actor))
+            {
+                return Err(failed(
+                    "The selected Session changed while loading its image.",
+                ));
+            }
+            let which = vox_core::node::drive::SessionFilter::Entries {
+                node,
+                session_id,
+                entries: vec![entry],
+                instance,
+            };
+            match client
+                .session_page(channel_id, which, None)
+                .await
+                .map_err(|e| listing_failed("Session media", e))?
+            {
+                Frame::SessionPage {
+                    rows,
+                    instance: actual,
+                    older: 0,
+                } if actual == instance && rows.iter().any(|row| row.entry_hash == entry) => {}
+                _ => return Err(failed("The Session image is no longer available.")),
+            }
+            let slot = held.lock().await;
+            let h = slot.as_ref().ok_or_else(not_attached)?;
+            if !Arc::ptr_eq(&attachment, &h.attachment) || h.client.me() != Some(actor) {
+                return Err(failed(
+                    "The acting node attachment changed while loading the Session image.",
+                ));
+            }
+            Ok(output)
+        })
+        .await
     }
 
     /// Re-read at most 128 logical activities already held in this Session window, including

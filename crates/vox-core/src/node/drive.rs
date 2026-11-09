@@ -176,6 +176,16 @@ impl DriveState {
         self.marks.get(member).copied()
     }
 
+    /// Return `member`'s mark on `generation` to the earlier `iteration` it was first owed from:
+    /// a membership start placed too late had re-marked it from a later position. Never marks.
+    pub(crate) fn restore_mark(&mut self, member: &Digest32, generation: u64, iteration: u64) {
+        if let Some(mark) = self.marks.get_mut(member) {
+            if mark.0 == generation && iteration < mark.1 {
+                mark.1 = iteration;
+            }
+        }
+    }
+
     /// Make `chain` this node's live drive generation, marking every member of `holders` owed it
     /// from its first entry.
     pub fn begin(&mut self, chain: SenderChain, holders: impl IntoIterator<Item = Digest32>) {

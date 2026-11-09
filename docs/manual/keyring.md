@@ -174,6 +174,12 @@ Trust grants already saved by the daemon wait for current room permissions befor
 keys. A room still reading its permissions does not undo that grant or turn it into a trust
 withdrawal.
 
+In Vox.app, treat consent and key-wait facts marked **Last observed; may be stale** as
+retained observations, not current room access. A membership refresh error does not mean
+the other computer refused trust. Computer-policy application is a separate fact; its
+confirmation does not establish room consent, key delivery or reachability. Verify fresh
+messages in both directions before treating access as ready.
+
 To remove one exact node from just one room, use **Remove from Room…** beside its member row,
 or **Room > Remove or Readmit Member…**. Review the full fingerprint and room before confirming.
 Only the creator or an authorized admin can remove a non-creator; only the creator can readmit.

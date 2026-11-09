@@ -197,6 +197,18 @@ still paged. `--json` prints one object per line, and continuation guidance rema
 An empty current page or a retained page is not the whole history. A removed or expired cursor
 requires a fresh newest read; do not silently treat it as a complete empty Session.
 
+OMP activity shows native tool intent, progress, outcomes and background work rather than a
+protocol envelope. In Vox.app, **Load image** fetches an available Session image on demand;
+it is not an arbitrary remote URL fetch. Images are checked before display, and an unavailable
+or unverifiable image is reported rather than shown as verified. New activity can arrive while
+an image loads; changing the Session or losing Drive withdraws its private image.
+
+Images remain bound to the Session record and membership under which they were offered.
+Removing someone else or rotating sender keys does not make a never-removed member newly
+admitted. Readmission does not authorize fetching private images offered before that member's
+removal. An image can also become unavailable when its owner stops the Session or restarts;
+retaining its announcement does not retain a live image service.
+
 ## Drive a session
 
 Each input reaches exactly the session named, or is refused with the reason. The harness's own

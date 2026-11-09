@@ -19,6 +19,12 @@ const WAKE_TYPE = "vox-neutral-wake"
 const WAKE_PREFIX = "vox-wake:"
 const CONTEXT_STAGED = "vox-context-staged"
 const CONTEXT_ACCEPTED = "vox-context-accepted"
+const SEMANTIC_RECORD = 1 << 20
+const SEMANTIC_CHUNK = 24 << 10
+const SEMANTIC_SNAPSHOT = 2 << 20
+const MEDIA_LIMIT = 512 << 10
+const MEDIA_TOTAL = 8 << 20
+
 
 
 export default function vox(pi) {
@@ -50,6 +56,13 @@ export default function vox(pi) {
     cleanup.unref()
   } catch {}
   const sockets = new Set(), followers = new Set(), children = new Set(), tools = new Map()
+  const semanticFollowers = new Map(), media = new Map()
+  let semanticGeneration = 0, semanticReset = null, mediaBytes = 0, activeMessage = null
+  let jobState = new Map()
+  let liveMessage = null, semanticTimer = null, semanticPendingBytes = 0
+  // Live assistant messages a follower was shown in part: only these need an empty final.
+  const semanticPending = new Map(), partialMessages = new Set()
+
   // OMP provides PI_SESSION_ID in its tool environment. Node identity is shared by this
   // installed extension, not inferred from a parent harness's environment.
   process.env.VOX_NODE = VOX_NODE
@@ -80,9 +93,11 @@ export default function vox(pi) {
   }
   function branchMatches(manager, stamp) {
     const branch = manager.getBranch()
+    return resetBoundary(branch) === stamp.reset && ancestryMatches(branch, stamp)
+  }
+  function ancestryMatches(branch, stamp) {
     const anchor = stamp.leaf === null ? -1 : branch.findIndex(entry => entry.id === stamp.leaf)
-    return resetBoundary(branch) === stamp.reset
-      && (stamp.leaf === null || anchor !== -1)
+    return (stamp.leaf === null || anchor !== -1)
       && !branch.slice(anchor + 1).some(entry => stamp.existing.has(entry.id))
   }
   function resetBoundary(branch) {
@@ -512,7 +527,257 @@ export default function vox(pi) {
     registration = attempt
     return attempt
   }
-  function retire() {
+  function semanticBoundary() {
+    // A same-session reset seen by activity before the periodic tick: the fresh snapshot owns it.
+    if (reconcileReset()) return false
+    if (!current()) return false
+    const boundary = resetBoundary(ctx.sessionManager.getBranch())
+    if (boundary !== semanticReset) {
+      semanticReset = boundary
+      semanticGeneration++
+      media.clear(); mediaBytes = 0; activeMessage = null; jobState.clear(); partialMessages.clear()
+      semanticPending.clear(); semanticPendingBytes = 0; clearTimeout(semanticTimer); semanticTimer = null
+      liveMessage = null
+      tools.clear()
+      for (const follower of followers) follower.destroy()
+      followers.clear(); semanticFollowers.clear()
+    }
+    return true
+  }
+  function semanticTo(sock, record) {
+    const state = semanticFollowers.get(sock)
+    if (!state || sock.destroyed) return 0
+    let data
+    try { data = Buffer.from(JSON.stringify(record), "utf8") } catch { data = Buffer.alloc(SEMANTIC_RECORD + 1) }
+    if (data.length > SEMANTIC_RECORD) {
+      state.incomplete = true
+      data = Buffer.from(JSON.stringify({ kind: "incomplete", reason: "record exceeds transport bound" }))
+    }
+    const parts = Math.max(1, Math.ceil(data.length / SEMANTIC_CHUNK))
+    const cursor = ++state.cursor
+    let written = 0
+    for (let part = 0; part < parts; part++) {
+      const frame = { type: "event", event: { type: "semantic", generation: semanticGeneration, cursor,
+        part, parts, data: data.subarray(part * SEMANTIC_CHUNK, (part + 1) * SEMANTIC_CHUNK).toString("base64") } }
+      const line = JSON.stringify(frame) + "\n"
+      const size = Buffer.byteLength(line)
+      if (sock.writableLength + size > MAX_OUTPUT) { sock.destroy(); return written }
+      sock.write(line); written += size
+    }
+    return written
+  }
+  function semantic(record) {
+    if (!semanticBoundary()) return
+    for (const follower of followers) semanticTo(follower, record)
+    if (record.kind === "message" && !record.complete && followers.size) partialMessages.add(record.id)
+  }
+  function queueSemantic(key, record) {
+    if (!followers.size) return
+    let bytes
+    try { bytes = Buffer.byteLength(JSON.stringify(record)) } catch { bytes = SEMANTIC_RECORD + 1 }
+    const previous = semanticPending.get(key)?.bytes ?? 0
+    if (bytes > SEMANTIC_RECORD || semanticPendingBytes - previous + bytes > MAX_OUTPUT
+      || (!semanticPending.has(key) && semanticPending.size >= 256)) {
+      semantic({ kind: "incomplete", reason: "semantic update queue exceeded its bound" })
+      return
+    }
+    semanticPendingBytes += bytes - previous
+    semanticPending.set(key, { record, bytes })
+    if (!semanticTimer) {
+      semanticTimer = setTimeout(() => {
+        semanticTimer = null
+        const pending = [...semanticPending.values()]
+        semanticPending.clear(); semanticPendingBytes = 0
+        for (const item of pending) semantic(item.record)
+      }, 200)
+      semanticTimer.unref?.()
+    }
+  }
+  function discardSemantic(key) {
+    const item = semanticPending.get(key)
+    if (item) semanticPendingBytes -= item.bytes
+    semanticPending.delete(key)
+  }
+  function jsonDisclosure(value) {
+    if (value === undefined || value === null) return null
+    let nodes = 0, bytes = 0
+    const seen = new WeakSet()
+    function clean(item, depth, key = "") {
+      if (++nodes > 16384 || depth > 24) throw new Error("structural bound")
+      if (/^(thinking|reasoning|reasoningcontent|analysis|signature|redacted_thinking)$/i.test(key))
+        return "[private content omitted]"
+      if (typeof item === "string") {
+        bytes += Buffer.byteLength(item)
+        if (bytes > SEMANTIC_RECORD / 2) throw new Error("text bound")
+        return item
+      }
+      if (item === null || typeof item === "boolean" || typeof item === "number") return item
+      if (typeof item !== "object") return "[unsupported]"
+      if (seen.has(item)) throw new Error("repeated object")
+      seen.add(item)
+      const properties = Object.getOwnPropertyDescriptors(item)
+      const type = properties.type?.value
+      if (typeof type === "string" && /^(thinking|redacted_thinking|reasoning)$/i.test(type))
+        return "[private content omitted]"
+      if (Array.isArray(item)) {
+        const length = properties.length?.value
+        if (!Number.isSafeInteger(length) || length > 16384 - nodes) throw new Error("array bound")
+        const output = []
+        for (let index = 0; index < length; index++) {
+          const descriptor = properties[index]
+          output.push(descriptor && "value" in descriptor ? clean(descriptor.value, depth + 1) : "[unsupported]")
+        }
+        return output
+      }
+      const output = Object.create(null)
+      for (const [name, descriptor] of Object.entries(properties)) {
+        if (!descriptor.enumerable) continue
+        bytes += Buffer.byteLength(name)
+        if (bytes > SEMANTIC_RECORD / 2) throw new Error("text bound")
+        output[name] = "value" in descriptor ? clean(descriptor.value, depth + 1, name) : "[unsupported]"
+      }
+      return output
+    }
+    try {
+      const text = JSON.stringify(clean(value, 0))
+      return typeof text === "string" && Buffer.byteLength(text) <= SEMANTIC_RECORD / 2
+        ? text : "[Disclosure unavailable: exceeds transport bound]"
+    } catch { return "[Disclosure unavailable: unsupported or exceeds bounds]" }
+  }
+  function imageDescriptor(part) {
+    const mime = part?.mimeType
+    if (!["image/png", "image/jpeg", "image/gif", "image/webp"].includes(mime)
+      || typeof part.data !== "string" || part.data.length > Math.ceil(MEDIA_LIMIT / 3) * 4
+      || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(part.data)) return null
+    const bytes = Buffer.from(part.data, "base64")
+    const valid = mime === "image/png" ? bytes.subarray(0, 8).equals(Buffer.from("89504e470d0a1a0a", "hex"))
+      : mime === "image/jpeg" ? bytes.subarray(0, 3).equals(Buffer.from("ffd8ff", "hex"))
+      : mime === "image/gif" ? ["GIF87a", "GIF89a"].includes(bytes.subarray(0, 6).toString("ascii"))
+      : bytes.subarray(0, 4).toString("ascii") === "RIFF" && bytes.subarray(8, 12).toString("ascii") === "WEBP"
+    if (!valid || !bytes.length || bytes.length > MEDIA_LIMIT) return null
+    const sha256 = createHash("sha256").update(bytes).digest("hex")
+    let id = null
+    for (const [key, item] of media) if (item.sha256 === sha256 && item.mime === mime) { id = key; break }
+    if (!id) {
+      if (mediaBytes + bytes.length > MEDIA_TOTAL) return null
+      id = randomBytes(16).toString("hex")
+      media.set(id, { bytes, mime, sha256 }); mediaBytes += bytes.length
+    }
+    return { type: "image", id, mime, size: bytes.length, sha256 }
+  }
+  function resultContent(result) {
+    const content = []
+    if (!Array.isArray(result?.content)) return content
+    for (const part of result.content) {
+      if (part?.type === "text" && typeof part.text === "string") content.push({ type: "text", text: part.text })
+      else if (part?.type === "image") {
+        const descriptor = imageDescriptor(part)
+        if (descriptor) content.push(descriptor)
+        else content.push({ type: "text", text: "[Image unavailable: unsupported or exceeds media bounds]" })
+      }
+    }
+    return content
+  }
+  function toolRecord(id, tool, status, result) {
+    return { kind: "tool", id, name: tool.name, intent: tool.intent ?? null, status,
+      args: tool.args ?? null, content: resultContent(result), details: jsonDisclosure(result?.details) }
+  }
+  function toolStatus(result, isError) {
+    if (result?.details?.async?.state === "cancelled"
+      || result?.details?.source === "assistant_stop_aborted"
+      || result?.details?.__interrupted === true) return "cancelled"
+    return isError ? "error" : "completed"
+  }
+  function messageText(message) {
+    return Array.isArray(message?.content)
+      ? message.content.filter(part => part?.type === "text" && typeof part.text === "string").map(part => part.text).join("")
+      : typeof message?.content === "string" ? message.content : ""
+  }
+  function messageId(message) {
+    if (!liveMessage || liveMessage.role !== message.role || liveMessage.timestamp !== message.timestamp)
+      liveMessage = { role: message.role, timestamp: message.timestamp, id: randomBytes(16).toString("hex") }
+    return "live:" + liveMessage.id
+  }
+  function jobRecords() {
+    const snapshot = ctx?.getAsyncJobSnapshot()
+    if (!snapshot) return []
+    return [...(snapshot.running || []), ...(snapshot.recent || [])].map(job => ({
+      kind: "job", id: job.id, jobType: job.type, status: job.status, label: job.label,
+      intent: job.intent ?? null, command: job.command ?? null, caption: job.caption ?? null,
+      startTime: job.startTime, endTime: job.endTime ?? null, agentId: job.agentId ?? null, ownerId: job.ownerId ?? null
+    }))
+  }
+  function publishJobs() {
+    if (!semanticBoundary() || !followers.size) return
+    const next = new Map()
+    for (const job of jobRecords()) {
+      const value = JSON.stringify(job)
+      next.set(job.id, value)
+      if (jobState.get(job.id) !== value) semantic(job)
+    }
+    for (const id of jobState.keys()) if (!next.has(id)) semantic({ kind: "job-remove", id })
+    jobState = next
+  }
+  function semanticSnapshot(sock) {
+    semanticFollowers.get(sock).incomplete = false
+    const branch = ctx.sessionManager.getBranch()
+    const reset = branch.findLastIndex(entry => entry.type === "reset_boundary")
+    const entries = branch.slice(reset + 1).filter(entry => entry.type === "message")
+    let complete = entries.length <= 128, bytes = 0
+    semanticTo(sock, { kind: "snapshot-begin", complete: true })
+    const calls = new Map()
+    for (const entry of entries.slice(-128)) {
+      const m = entry.message
+      if (m?.role === "assistant" && Array.isArray(m.content)) {
+        for (const part of m.content) if (part?.type === "toolCall")
+          calls.set(part.id, { name: part.name, intent: part.intent ?? null, args: jsonDisclosure(part.arguments) })
+      }
+      let record = null
+      if (m?.role === "user" || m?.role === "assistant") {
+        const text = messageText(m)
+        if (text) record = { kind: "message", id: "entry:" + entry.id, role: m.role, text, complete: true }
+      } else if (m?.role === "toolResult") {
+        const tool = calls.get(m.toolCallId) || { name: m.toolName, intent: null, args: null }
+        if (!tools.has(m.toolCallId)) {
+          let status = toolStatus(m, m.isError)
+          if (!m.isError && m.details?.async?.state === "running") {
+            const job = jobRecords().find(item => item.id === m.details.async.jobId)
+            status = job?.status ?? "unknown"
+          }
+          record = toolRecord(m.toolCallId, tool, status, m)
+        }
+        calls.delete(m.toolCallId)
+      }
+      if (record) {
+        if (bytes + Buffer.byteLength(JSON.stringify(record)) > SEMANTIC_SNAPSHOT) { complete = false; break }
+        bytes += semanticTo(sock, record)
+      }
+    }
+    for (const id of calls.keys()) if (!tools.has(id)) complete = false
+    for (const [id, tool] of tools) {
+      if (bytes >= SEMANTIC_SNAPSHOT) { complete = false; break }
+      bytes += semanticTo(sock, toolRecord(id, tool, "running", tool.result))
+    }
+    if (activeMessage && bytes < SEMANTIC_SNAPSHOT) {
+      bytes += semanticTo(sock, activeMessage)
+      partialMessages.add(activeMessage.id)
+    }
+    for (const job of jobRecords()) {
+      if (bytes >= SEMANTIC_SNAPSHOT) { complete = false; break }
+      bytes += semanticTo(sock, job)
+    }
+    if (semanticFollowers.get(sock)?.incomplete) complete = false
+    semanticTo(sock, { kind: "snapshot-end", complete })
+  }
+  const jobsTimer = setInterval(() => { reconcileReset(); publishJobs() }, 1000)
+  jobsTimer.unref?.()
+
+  function retire(intentional = false) {
+    // Observers are told this epoch ended by plan only for a deliberate transition with no
+    // Vox delivery outcome open; failures and open outcomes keep the bare close, which
+    // reports observation stopped and outcomes unknown.
+    const planned = intentional && !operation && ![...notices.values()].some(record => record.source === "drive"
+      && (record.state === "preparing" || record.state === "dispatched" || record.state === "unknown"))
     for (const record of notices.values()) {
       if (record.source === "drive" && (record.state === "queued" || (record.state === "preparing" && !operation?.injected))) {
         record.state = "cancelled"
@@ -521,13 +786,21 @@ export default function vox(pi) {
     }
     generation++
     installed = false
+    semanticGeneration++
+    semanticFollowers.clear(); media.clear(); mediaBytes = 0; activeMessage = null; jobState.clear(); partialMessages.clear()
+    semanticPending.clear(); semanticPendingBytes = 0; clearTimeout(semanticTimer); semanticTimer = null
+    liveMessage = null
     route = randomBytes(32).toString("hex")
     generationRef = null; installPending = null; revokePending = null; confirmed = false; refusal = null; retryStep = 0; unavailableNotice = false; cancelRetry()
     if (operation) finish(operation, operation.injected ? null : "cancel")
     notices.clear()
     lastName = null
     tools.clear()
-    for (const follower of followers) follower.destroy()
+    const transition = JSON.stringify({ type: "event", event: { type: "transition" } }) + "\n"
+    for (const follower of followers) {
+      if (planned && follower.writableLength + Buffer.byteLength(transition) <= MAX_OUTPUT) follower.end(transition)
+      else follower.destroy()
+    }
     followers.clear()
     for (const child of children) child.kill()
   }
@@ -567,9 +840,10 @@ export default function vox(pi) {
     const id = manager.getSessionId(), leaf = manager.getLeafId(), branch = manager.getBranch()
     const snapshot = id ? { leaf, reset: resetBoundary(branch), existing: new Set(manager.getEntries().map(entry => entry.id)) } : null
     const serial = ++reconcileSerial
-    retire()
+    retire(true)
     session = id
     transitionFence = snapshot
+    semanticReset = snapshot?.reset ?? null
     installed = !!id
     const stamp = generation, nextRoute = route
     const work = (async () => {
@@ -581,6 +855,19 @@ export default function vox(pi) {
     })().catch(() => { if (serial === reconcileSerial) { generationRef = null; report("Vox Session ownership unavailable") } })
     ownership = work
     return work
+  }
+  // OMP's in-place context reset (/clear) appends a reset boundary to the same session
+  // without any session event. Only that change is reconciled here: other transitions
+  // move ancestry and are owned by their native events and fences.
+  function reconcileReset() {
+    if (stopped || !installed || !session || !transitionFence || operation
+      || !ctx || ctx.mode !== "tui" || ctx.agent.kind !== "main") return false
+    const manager = ctx.sessionManager
+    if (manager.getSessionId() !== session) return false
+    const branch = manager.getBranch()
+    if (resetBoundary(branch) === transitionFence.reset || !ancestryMatches(branch, transitionFence)) return false
+    void reconcileManager()
+    return true
   }
   function activate(next) {
     ctx = next
@@ -614,6 +901,7 @@ export default function vox(pi) {
     sock.on("error", () => {})
     sock.on("close", () => {
       clearTimeout(timer); sockets.delete(sock); followers.delete(sock)
+      semanticFollowers.delete(sock)
       for (const [id, pending] of materializations) {
         if (pending.socket === sock) {
           materializations.delete(id)
@@ -637,6 +925,14 @@ export default function vox(pi) {
           continue
         }
         if (subscribed) {
+          if (msg?.type === "media") {
+            if (!semanticBoundary() || !semanticFollowers.has(sock) || typeof msg.id !== "string") return sock.destroy()
+            const item = media.get(msg.id)
+            if (!item) semanticTo(sock, { kind: "media-unavailable", id: msg.id })
+            else semanticTo(sock, { kind: "media", id: msg.id, mime: item.mime,
+              size: item.bytes.length, sha256: item.sha256, data: item.bytes.toString("base64") })
+            continue
+          }
           if (msg?.type === "materialized") {
             const pending = materializations.get(msg.id)
             if (!pending || pending.socket !== sock) return sock.destroy()
@@ -696,10 +992,11 @@ export default function vox(pi) {
           const id = session, stamp = generation, reference = generationRef
           const admit = () => {
             if (sock.destroyed || !current() || session !== id || generation !== stamp
-              || generationRef !== reference || !readyNode || !confirmed || isPoisoned()) return sock.destroy()
-            subscribed = true; clearTimeout(timer); followers.add(sock)
+              || generationRef !== reference || !readyNode || !confirmed || isPoisoned() || !semanticBoundary()) return sock.destroy()
+            subscribed = true; clearTimeout(timer); followers.add(sock); semanticFollowers.set(sock, { cursor: 0 })
             reply({ type: "subscribed", session })
             reply({ type: "event", event: { type: "state", busy: !ctx.isIdle() } })
+            semanticSnapshot(sock)
             // Enroll before the snapshot so later live events follow recoverable receipts.
             const accepted = [...acceptedHistory(ctx.sessionManager.getBranch()).values()].slice(-MAX_NOTICES / 4)
             for (const state of accepted) {
@@ -746,7 +1043,7 @@ export default function vox(pi) {
       return { cancel: true }
     }
     const serial = ++reconcileSerial
-    retire()
+    retire(true)
     const owner = watcher
     if (owner) {
       let running = false
@@ -773,6 +1070,7 @@ export default function vox(pi) {
   pi.on("session_branch", (_event, context) => activate(context))
   pi.on("session_tree", (_event, context) => activate(context))
   pi.on("session_shutdown", async () => {
+    clearInterval(jobsTimer)
     const pendingWrites = []
     if (current()) {
       const frame = JSON.stringify({ type: "event", event: { type: "session-end" } }) + "\n"
@@ -949,6 +1247,11 @@ export default function vox(pi) {
     if (count === 1 && !op.matched) op.matched = true
     else op.ambiguous = true
   })
+  pi.on("message_start", event => {
+    const m = event.message
+    if (current() && (m?.role === "user" || m?.role === "assistant"))
+      liveMessage = { role: m.role, timestamp: m.timestamp, id: randomBytes(16).toString("hex") }
+  })
   pi.on("message_end", event => {
     const op = operation
     const m = event.message
@@ -975,20 +1278,64 @@ export default function vox(pi) {
       }
       providerActive = 0
     }
-    if (m?.role !== "user" && m?.role !== "assistant") return
-    const text = Array.isArray(m.content) ? m.content.filter(part => part.type === "text").map(part => part.text).join("") : typeof m.content === "string" ? m.content : ""
-    if (text) publish({ type: m.role === "user" ? "user" : "reply", text })
+    if (!current() || (m?.role !== "user" && m?.role !== "assistant")) return
+    const text = messageText(m)
+    if (m.role === "assistant") activeMessage = null
+    const id = messageId(m)
+    discardSemantic("message:" + id)
+    const partial = partialMessages.delete(id)
+    if (text || (m.role === "assistant" && partial)) semantic({ kind: "message", id, role: m.role, text, complete: true })
+    liveMessage = null
+  })
+  pi.on("message_update", event => {
+    if (!current() || event.message?.role !== "assistant"
+      || !liveMessage || liveMessage.role !== "assistant" || liveMessage.timestamp !== event.message.timestamp
+      || !["text_start", "text_delta", "text_end"].includes(event.assistantMessageEvent?.type)) return
+    const text = messageText(event.message)
+    activeMessage = { kind: "message", id: messageId(event.message), role: "assistant", text, complete: false }
+    queueSemantic("message:" + activeMessage.id, activeMessage)
   })
   pi.on("tool_execution_start", event => {
-    if (!current()) return
-    tools.set(event.toolCallId, generation)
-    publish({ type: "tool", id: event.toolCallId, name: event.toolName, input: JSON.stringify(event.args) ?? "" })
+    if (!semanticBoundary()) return
+    const tool = { generation, name: event.toolName, intent: event.intent ?? null,
+      args: jsonDisclosure(event.args), result: null }
+    tools.set(event.toolCallId, tool)
+    semantic(toolRecord(event.toolCallId, tool, "running", null))
+  })
+  pi.on("tool_execution_update", event => {
+    if (!semanticBoundary()) return
+    const tool = tools.get(event.toolCallId)
+    if (!tool || tool.generation !== generation) return
+    tool.result = event.partialResult
+    const state = event.partialResult?.details?.async?.state
+    if (["completed", "failed", "cancelled"].includes(state)) {
+      if (tool.parked) {
+        tools.delete(event.toolCallId)
+        discardSemantic("tool:" + event.toolCallId)
+        semantic(toolRecord(event.toolCallId, tool, state, event.partialResult))
+        return
+      }
+      tool.settled = event.partialResult
+    }
+    queueSemantic("tool:" + event.toolCallId, toolRecord(event.toolCallId, tool, "running", event.partialResult))
   })
   pi.on("tool_execution_end", event => {
-    const stamp = tools.get(event.toolCallId)
+    if (!semanticBoundary()) return
+    const tool = tools.get(event.toolCallId)
+    if (!tool || tool.generation !== generation) return
+    discardSemantic("tool:" + event.toolCallId)
+    const parks = !event.isError && ["task", "bash", "eval"].includes(tool.name)
+      && event.result?.details?.async?.state === "running"
+    if (parks && !tool.settled) {
+      tool.parked = true
+      tool.result = event.result
+      semantic(toolRecord(event.toolCallId, tool, "running", event.result))
+      return
+    }
     tools.delete(event.toolCallId)
-    if (stamp !== generation || !current()) return
-    publish({ type: "tool-done", id: event.toolCallId, name: event.toolName, output: JSON.stringify(event.result) ?? "", isError: !!event.isError })
+    const result = parks ? tool.settled : event.result
+    const state = parks ? result?.details?.async?.state : null
+    semantic(toolRecord(event.toolCallId, tool, state || toolStatus(result, event.isError), result))
   })
   pi.on("agent_start", () => publish({ type: "turn-start" }))
   pi.on("agent_end", event => {

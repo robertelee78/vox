@@ -45,17 +45,29 @@ fn floor_key(key: &SessionFloorKey) -> Key {
     generation_key(&pair(&key.0, &key.1), (key.2, key.3))
 }
 fn boundary(bytes: &[u8]) -> Result<SessionFloorBoundary> {
+    Ok(stored(bytes)?.0)
+}
+/// A retained floor and the author sequence that signed it. A record written before the
+/// sequence was kept has none; the source replay restarted for it rewrites every such record.
+fn stored(bytes: &[u8]) -> Result<(SessionFloorBoundary, Option<u64>)> {
     let mut d = Decoder::new(bytes);
-    if d.array()? != 4 || d.uint()? != 1 {
+    let arity = d.array()?;
+    if !matches!(arity, 4 | 5) || d.uint()? != 1 {
         return Err(bad());
     }
     let value = (d.uint()?, d.uint()?, d.uint()?);
+    let signed = if arity == 5 { Some(d.uint()?) } else { None };
     d.finish()?;
-    Ok(value)
+    Ok((value, signed))
 }
-fn boundary_bytes(value: SessionFloorBoundary) -> Vec<u8> {
+fn boundary_bytes(value: SessionFloorBoundary, signed: u64) -> Vec<u8> {
     let mut e = Encoder::new();
-    e.array(4).uint(1).uint(value.0).uint(value.1).uint(value.2);
+    e.array(5)
+        .uint(1)
+        .uint(value.0)
+        .uint(value.1)
+        .uint(value.2)
+        .uint(signed);
     e.finish()
 }
 fn descriptor(
@@ -88,6 +100,29 @@ pub(in crate::node::channel) fn floor(
     descriptor(transaction, sek, room, Tree::Floors, &floor_key(key))?
         .map(|bytes| boundary(&bytes))
         .transpose()
+}
+/// Every retained floor `author` published for `recipient`, by (epoch, generation).
+pub(in crate::node::channel) fn floors_for(
+    snapshot: &crate::node::store::Snapshot,
+    sek: &Sek,
+    room: &Digest32,
+    author: &Digest32,
+    recipient: &Digest32,
+) -> Result<Vec<(Generation, SessionFloorBoundary)>> {
+    let Some(read) = Read::existing(snapshot, sek, room)? else {
+        return Ok(Vec::new());
+    };
+    let start = author_key(&pair(author, recipient));
+    let mut floors = Vec::new();
+    let mut row = read.find(Tree::Floors, &start)?.map(|id| (start, id));
+    if row.is_none() {
+        row = read.next(Tree::Floors, Some(start))?;
+    }
+    while let Some((key, id)) = row.filter(|(key, _)| key[..32] == start[..32]) {
+        floors.push((generation(&key), boundary(&read.descriptor(id)?)?));
+        row = read.next(Tree::Floors, Some(key))?;
+    }
+    Ok(floors)
 }
 
 #[derive(Default, Clone, Copy)]
@@ -157,6 +192,8 @@ fn replace(index: &mut Write<'_, '_>, tree: Tree, key: Key, bytes: &[u8]) -> Res
 }
 /// Reconstruction is independent of folded maxima: each source is recovered from
 /// the already authenticated public log and its cursor commits with its locator.
+/// A cursor of the first form folded floors without their signing sequence: the replay
+/// starts again, so each retained floor is decided by its later-signed source.
 pub(in crate::node::channel) fn source_replay(
     transaction: Transaction<'_, '_>,
     sek: &Sek,
@@ -166,7 +203,11 @@ pub(in crate::node::channel) fn source_replay(
         return Ok((0, false));
     };
     let mut d = Decoder::new(&bytes);
-    if d.array()? != 3 || d.uint()? != 1 {
+    if d.array()? != 3 {
+        return Err(bad());
+    }
+    let version = d.uint()?;
+    if !matches!(version, 1 | 2) {
         return Err(bad());
     }
     let after = d.uint()?;
@@ -176,7 +217,11 @@ pub(in crate::node::channel) fn source_replay(
         _ => return Err(bad()),
     };
     d.finish()?;
-    Ok((after, done))
+    Ok(if version == 1 {
+        (0, false)
+    } else {
+        (after, done)
+    })
 }
 
 pub(in crate::node::channel) fn save_source_replay(
@@ -187,7 +232,7 @@ pub(in crate::node::channel) fn save_source_replay(
     done: bool,
 ) -> Result<()> {
     let mut e = Encoder::new();
-    e.array(3).uint(1).uint(after).uint(u64::from(done));
+    e.array(3).uint(2).uint(after).uint(u64::from(done));
     let mut index = Write::open(batch, sek, room)?;
     replace(&mut index, Tree::FloorReplay, [0; 64], &e.finish())?;
     index.seal()
@@ -263,13 +308,25 @@ pub(super) fn observe(
             changed = true;
         }
         let value = (f.membership, f.iteration, f.first_seq);
+        let signed = entry.skeleton.seq;
         let exact = floor_key(&(author, f.recipient, f.epoch, f.generation));
         let old = index
             .find(Tree::Floors, &exact)?
-            .map(|id| index.descriptor(id).and_then(|b| boundary(&b)))
+            .map(|id| index.descriptor(id).and_then(|b| stored(&b)))
             .transpose()?;
-        if old.is_none_or(|old| value > old) {
-            let id = replace(index, Tree::Floors, exact, &boundary_bytes(value))?;
+        // The later-signed floor decides the recipient's membership on this key, whatever
+        // order its sources arrive or replay in; within one membership the largest boundary
+        // stands. A record without its signing sequence is rewritten by the source replay.
+        let next = match old {
+            None | Some((_, None)) => Some((value, signed)),
+            Some((old, Some(at))) if old.0 == value.0 => {
+                let next = (old.max(value), at.max(signed));
+                (next != (old, at)).then_some(next)
+            }
+            Some((_, Some(at))) => (signed > at).then_some((value, signed)),
+        };
+        if let Some((value, signed)) = next {
+            let id = replace(index, Tree::Floors, exact, &boundary_bytes(value, signed))?;
             if author == f.recipient {
                 index.set(
                     Tree::FloorSelf,
@@ -610,6 +667,9 @@ pub(in crate::node::channel) fn authorized_floor_step(
     let generation = view.authority_generation();
     let revision = author(Transaction::Snapshot(&snapshot), sek, room, &key.0)?.revision;
     let mut tree_key = floor_key(key);
+    // One bounded selection per queried membership: a corrected start's two lookups on one
+    // key (at the current and at the retained membership) never restart each other's scan.
+    tree_key[48..56].copy_from_slice(&membership.to_be_bytes());
     tree_key[63] = u8::from(recipient_current);
     let mut state = descriptor(
         Transaction::Snapshot(&snapshot),

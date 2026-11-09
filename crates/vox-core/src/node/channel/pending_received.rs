@@ -742,20 +742,15 @@ impl PendingReceived {
                         governance_changed = accepted.work_changed;
                         if let Ok(GovBody::Presence(body)) = GovEntry::body_bound_to(entry) {
                             let old = self.presence;
-                            let mut state = old.unwrap_or(governance::Presence {
-                                last: (entry.skeleton.seq, body.body.here),
-                                last_ms: Some(entry.skeleton.claimed_ms),
-                                back: None,
-                            });
-                            if entry.skeleton.seq >= state.last.0 {
-                                state.last = (entry.skeleton.seq, body.body.here);
-                                state.last_ms = Some(entry.skeleton.claimed_ms);
-                            }
-                            if body.body.here
-                                && state.back.is_none_or(|(seq, _)| seq < entry.skeleton.seq)
-                            {
-                                state.back = Some((entry.skeleton.seq, entry.skeleton.claimed_ms));
-                            }
+                            let state = governance::Presence::fold(
+                                old,
+                                &batch,
+                                &self.index,
+                                sek,
+                                &self.room,
+                                entry,
+                                body.body.here,
+                            )?;
                             if old.is_none_or(|old| {
                                 old.last != state.last
                                     || old.last_ms != state.last_ms

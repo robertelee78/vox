@@ -1151,6 +1151,98 @@ private struct RoomTimelineView: View {
     @State private var inspectorWidth = Columns.width(.inspector)
     @State private var roomActivityShown = false
 
+    @ViewBuilder private func timelineRows() -> some View {
+        let items = model.timelineItems
+        let days = TimelineTime.dividers(items)
+        if model.showingSession && model.sessionReloadNeeded {
+            Button("Reload newest activity") {
+                Task { await model.readNewestTimeline() }
+            }
+            .accessibilityIdentifier("session-reload-newest")
+        }
+        if !model.showingSession && model.roomReloadNeeded {
+            Button("Reload newest messages") {
+                Task { await model.readNewestTimeline() }
+            }
+            .accessibilityIdentifier("room-reload-newest")
+        }
+        ForEach(items) { item in
+            // A new day starts above the first line that falls on it.
+            if let day = days[item.id] {
+                DayDivider(key: day, words: TimelineTime.dayWords(item.millis))
+            }
+            // What was unread as the room came on screen starts here.
+            if let id = item.message?.id, id == model.unreadFrom {
+                UnreadDivider(count: model.unreadCount)
+            }
+            if let message = item.message {
+                MessageRow(model: model, message: message, me: model.me,
+                           quote: model.quote(of: message),
+                           jump: { model.jumpTo = $0 },
+                           readBy: model.readBy[message.id] ?? [],
+                           whereabouts: model.whereabouts[message.id],
+                           pulledBy: model.pulledBy[message.id] ?? [],
+                           pulled: model.pulled[message.id]) { looking = $0 }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .voxPadding(Space.s4)
+                    .selectable(model.selectedMessages.contains(message.id),
+                                focused: timelineFocused
+                                    && model.selectedMessage == message.id) {
+                        clicked(message.id)
+                    }
+                    .reportsFrame(of: message.id)
+                    .id(message.id)
+            } else if let notice = item.notice {
+                // What was done to the room: a line among the
+                // messages, not one of them (ADR-028 R-1, R-7).
+                VStack(alignment: .leading, spacing: Space.s4) {
+                    Text(notice).secondaryText().italic()
+                        .accessibilityIdentifier(item.id)
+                    if let command = item.command {
+                        HStack(spacing: Space.s8) {
+                            Text(command).font(.system(.body, design: .monospaced))
+                                .textSelection(.enabled)
+                                .accessibilityIdentifier("\(item.id)-command")
+                            Button("Copy") {
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(command, forType: .string)
+                            }
+                            .accessibilityLabel("Copy the command")
+                            .accessibilityIdentifier("\(item.id)-copy")
+                        }
+                    }
+                    if item.loadsOlder {
+                        if model.readingOlderTimeline {
+                            ProgressView("Loading earlier entries…").controlSize(.small)
+                        }
+                        Button("Show older entries") {
+                            Task { await model.readOlderTimeline() }
+                        }
+                        .disabled(model.readingOlderTimeline)
+                        .accessibilityIdentifier("\(item.id)-load")
+                    }
+                }
+                .voxPadding(.horizontal, Space.s4)
+                .reportsFrame(of: item.id)
+                .id(item.id)
+            } else if let entry = item.entry, let session = model.shownSession,
+                      let room = model.roomOnScreen {
+                SessionEntryRow(model: model, room: room, session: session,
+                                entry: entry) { looking = $0 }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    // Selected like a message: ↑/↓ reach it (P14).
+                    .selectable(model.selectedMessages.contains(item.id),
+                                focused: timelineFocused
+                                    && model.selectedMessage == item.id) {
+                        clicked(item.id)
+                    }
+                    .accessibilityIdentifier("entry-row-\(entry.id)")
+                    .reportsFrame(of: item.id)
+                    .id(item.id)
+            }
+        }
+    }
+
     var body: some View {
         // The timeline and the inspector, with a divider the person drags; the inspector's width is
         // remembered (Columns), and it can be hidden (View > Hide Inspector). Its width is the one
@@ -1299,95 +1391,13 @@ private struct RoomTimelineView: View {
                             // do not measure in this coordinate space, so what is in view could not be
                             // told.
                             ScrollView {
-                                let items = model.timelineItems
-                                let days = TimelineTime.dividers(items)
-                                LazyVStack(alignment: .leading, spacing: Space.s12 * scale) {
-                                    if model.showingSession && model.sessionReloadNeeded {
-                                        Button("Reload newest activity") {
-                                            Task { await model.readNewestTimeline() }
-                                        }
-                                        .accessibilityIdentifier("session-reload-newest")
-                                    }
-                                    if !model.showingSession && model.roomReloadNeeded {
-                                        Button("Reload newest messages") {
-                                            Task { await model.readNewestTimeline() }
-                                        }
-                                        .accessibilityIdentifier("room-reload-newest")
-                                    }
-                                    ForEach(items) { item in
-                                        // A new day starts above the first line that falls on it.
-                                        if let day = days[item.id] {
-                                            DayDivider(key: day, words: TimelineTime.dayWords(item.millis))
-                                        }
-                                        // What was unread as the room came on screen starts here.
-                                        if let id = item.message?.id, id == model.unreadFrom {
-                                            UnreadDivider(count: model.unreadCount)
-                                        }
-                                        if let message = item.message {
-                                            MessageRow(model: model, message: message, me: model.me,
-                                                       quote: model.quote(of: message),
-                                                       jump: { model.jumpTo = $0 },
-                                                       readBy: model.readBy[message.id] ?? [],
-                                                       whereabouts: model.whereabouts[message.id],
-                                                       pulledBy: model.pulledBy[message.id] ?? [],
-                                                       pulled: model.pulled[message.id]) { looking = $0 }
-                                                .frame(maxWidth: .infinity, alignment: .leading)
-                                                .voxPadding(Space.s4)
-                                                .selectable(model.selectedMessages.contains(message.id),
-                                                            focused: timelineFocused
-                                                                && model.selectedMessage == message.id) {
-                                                    clicked(message.id)
-                                                }
-                                                .reportsFrame(of: message.id)
-                                                .id(message.id)
-                                        } else if let notice = item.notice {
-                                            // What was done to the room: a line among the
-                                            // messages, not one of them (ADR-028 R-1, R-7).
-                                            VStack(alignment: .leading, spacing: Space.s4) {
-                                                Text(notice).secondaryText().italic()
-                                                    .accessibilityIdentifier(item.id)
-                                                if let command = item.command {
-                                                    HStack(spacing: Space.s8) {
-                                                        Text(command).font(.system(.body, design: .monospaced))
-                                                            .textSelection(.enabled)
-                                                            .accessibilityIdentifier("\(item.id)-command")
-                                                        Button("Copy") {
-                                                            NSPasteboard.general.clearContents()
-                                                            NSPasteboard.general.setString(command, forType: .string)
-                                                        }
-                                                        .accessibilityLabel("Copy the command")
-                                                        .accessibilityIdentifier("\(item.id)-copy")
-                                                    }
-                                                }
-                                                if item.loadsOlder {
-                                                    if model.readingOlderTimeline {
-                                                        ProgressView("Loading earlier entries…").controlSize(.small)
-                                                    }
-                                                    Button("Show older entries") {
-                                                        Task { await model.readOlderTimeline() }
-                                                    }
-                                                    .disabled(model.readingOlderTimeline)
-                                                    .accessibilityIdentifier("\(item.id)-load")
-                                                }
-                                            }
-                                            .voxPadding(.horizontal, Space.s4)
-                                            .reportsFrame(of: item.id)
-                                            .id(item.id)
-                                        } else if let entry = item.entry, let session = model.shownSession,
-                                                  let room = model.roomOnScreen {
-                                            SessionEntryRow(model: model, room: room, session: session,
-                                                            entry: entry) { looking = $0 }
-                                                .frame(maxWidth: .infinity, alignment: .leading)
-                                                // Selected like a message: ↑/↓ reach it (P14).
-                                                .selectable(model.selectedMessages.contains(item.id),
-                                                            focused: timelineFocused
-                                                                && model.selectedMessage == item.id) {
-                                                    clicked(item.id)
-                                                }
-                                                .accessibilityIdentifier("entry-row-\(entry.id)")
-                                                .reportsFrame(of: item.id)
-                                                .id(item.id)
-                                        }
+                                // Session windows are bounded. Lay them out eagerly so selectable
+                                // text does not participate in lazy prefetch.
+                                Group {
+                                    if model.showingSession {
+                                        VStack(alignment: .leading, spacing: Space.s12 * scale) { timelineRows() }
+                                    } else {
+                                        LazyVStack(alignment: .leading, spacing: Space.s12 * scale) { timelineRows() }
                                     }
                                 }
                                 .voxPadding(Space.s12)
@@ -2429,11 +2439,11 @@ private struct TrustBanner: View {
     @State private var showingComputers = false
 
     var body: some View {
-        let cut = model.members.filter { $0.trust != .mutual }
-        if !cut.isEmpty {
+        let cut = model.members.filter { $0.trust != .mutual || $0.keyWaits != nil }
+        if !cut.isEmpty || model.memberObservationError != nil {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 8) {
-                    StateMark(kind: .attention, words: words(cut))
+                    StateMark(kind: .attention, words: model.memberObservationError ?? words(cut))
                         .accessibilityIdentifier("trust-banner")
                     Spacer()
                     if cut.count == 1, let member = cut.first, !member.trust.inKeyring,
@@ -2443,6 +2453,25 @@ private struct TrustBanner: View {
                     } else if cut.contains(where: { !$0.trust.inKeyring }) {
                         Button("Show Keyring") { Task { await model.show(.keyring) } }
                             .accessibilityIdentifier("trust-banner-keyring")
+                    }
+                }
+                // A retained roster still names what it last showed, marked as such, as the member
+                // rows do: a refreshing governance never hides a member's missing consent.
+                let stale = model.memberObservationError == nil ? "" : " Last observed; may be stale."
+                ForEach(cut) { member in
+                    if cut.count > 1 || !stale.isEmpty {
+                        Text(words([member]) + stale).secondaryText()
+                            .accessibilityIdentifier("trust-banner-member-" + member.id)
+                    }
+                    if model.daemonReachable, model.ended == nil,
+                       model.computerApplicationConfirmed.contains(member.id) {
+                        Text("Computer policy application is confirmed for \(member.name) (\(member.id)); room access is separate.")
+                            .secondaryText()
+                            .accessibilityIdentifier("trust-banner-application-" + member.id)
+                    }
+                    if let wait = member.keyWaits {
+                        Text("\(member.name) \(wait)" + stale).secondaryText()
+                            .accessibilityIdentifier("trust-banner-key-wait-" + member.id)
                     }
                 }
                 if model.daemonReachable, model.ended == nil, let attention = model.computerPairingAttention {
@@ -2468,17 +2497,22 @@ private struct TrustBanner: View {
             // Every one named (D4), as the room names them: the alias, else the fingerprint's start.
             let names = cut.map(\.name)
             let listed = names.dropLast().joined(separator: ", ") + " and " + (names.last ?? "")
-            return "\(listed) aren't reading each other with you yet: reading needs both sides to "
-                + "trust each other."
+            return "Room access needs review for \(listed): room consent, key status and node trust are separate."
         }
         switch (m.trust, m.trustsYou) {
         case (.oneWay, _):
-            return "You trust \(m.name). Waiting for \(m.name) to trust you back before you can read each other."
+            #if VOX_PROOF_STUB_SERVICES && VOX_PROOF_MUTANT_REFUSAL
+            return "You trust \(m.name). Reciprocal room consent from \(m.name) has not been observed; \(m.name) declined to trust you."
+            #else
+            return "You trust \(m.name). Reciprocal room consent from \(m.name) has not been observed; room access is unresolved."
+            #endif
         // Not in the keyring and trusting this node: D4's theyOnly, or none with its trust seen.
         case (.theyOnly, _), (.none, true):
-            return "\(m.name) trusts you. Trust \(m.name) too, and you can read each other."
+            return "Room consent from \(m.name) has been observed. Trust \(m.name) too to grant local node trust."
+        case (.mutual, _):
+            return "Local node trust and reciprocal room consent are observed for \(m.name); its room key status needs attention."
         default:
-            return "You and \(m.name) can't read each other yet: each of you has to trust the other."
+            return "You and \(m.name) can't read each other yet: local node trust and reciprocal room consent have not both been observed."
         }
     }
 }
@@ -2795,13 +2829,17 @@ private struct Inspector: View {
                         Text("Platform information is still being read.").caption().secondaryText()
                             .accessibilityIdentifier("member-platform-pending")
                     }
+                    if let problem = model.memberObservationError {
+                        Text(problem).secondaryText().fixedSize(horizontal: false, vertical: true)
+                            .accessibilityIdentifier("member-observation-unavailable")
+                    }
                     ForEach(model.members) { member in
                         TrustMark(name: member.name, trust: member.trust)
                             .nodeCard(model, member.id, name: member.name)
                             .accessibilityIdentifier("member-\(member.name)")
                         role(member.id)
                         work(member.id)
-                        Text(member.trust.sentence(member.name)).caption().secondaryText()
+                        Text(memberTrustWords(member)).caption().secondaryText()
                             .fixedSize(horizontal: false, vertical: true)
                             .accessibilityIdentifier("member-trust-directions-" + member.id)
                         MemberTrustActions(model: model, fingerprint: member.id, name: member.name, room: room)
@@ -2862,6 +2900,13 @@ private struct Inspector: View {
                 catch { return }
             }
         }
+    }
+
+    private func memberTrustWords(_ member: NodeModel.MemberRow) -> String {
+        let local = member.trust.inKeyring ? "Local node trust is granted." : "This node has not granted local node trust."
+        let consent = member.trustsYou ? "Reciprocal room consent is observed." : "Reciprocal room consent has not been observed."
+        let freshness = model.memberObservationError == nil ? "" : " Last observed; may be stale."
+        return "\(local) \(consent)\(freshness)"
     }
 
     @ViewBuilder private func work(_ fingerprint: String) -> some View {

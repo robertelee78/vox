@@ -540,6 +540,7 @@ fn detail_of(
         }
     }
     Ok(ChannelDetail {
+        projection_failure: None,
         history_read: ch.history_read_resource(),
         history_read_revision: ch
             .history_read_resource()
@@ -800,6 +801,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::BoundedRoomAdvanced { .. } => "publishing accepted current room work",
         NetEvent::BoundedSyncDone { .. } => "filing a bounded history response",
         NetEvent::PrivateSessionAsk { .. } => "authorizing private Session records",
+        NetEvent::SessionMediaAdmission { .. } => "authorizing a Session image request",
         NetEvent::PrivateSessionBytesReady { .. } => {
             "retrying private Session work after its bytes were released"
         }
@@ -1357,6 +1359,15 @@ enum NetEvent {
         reply: oneshot::Sender<
             std::result::Result<crate::node::channel::session_projection::ActivityReply, String>,
         >,
+    },
+    /// Admit one image request against its named own private Session record.
+    SessionMediaAdmission {
+        channel_id: Digest32,
+        peer: Digest32,
+        entry: Digest32,
+        tag: String,
+        media: crate::node::shares::media::Binding,
+        reply: oneshot::Sender<bool>,
     },
     SessionProjection {
         channel_id: Digest32,
@@ -5484,6 +5495,37 @@ impl NodeHandle {
             .map_err(|_| "the node stopped before answering".to_owned())?
     }
 
+    /// Whether `peer` may receive this node's own Session image `tag`, asked through its
+    /// sealed activity record `entry`. The record is checked in this node's store against
+    /// `media`, then the existing private Session serving permission decides (#1171).
+    /// Any refusal, transient refresh or stopped node is `false`.
+    pub(crate) async fn session_media_admits(
+        &self,
+        channel_id: Digest32,
+        peer: Digest32,
+        entry: Digest32,
+        tag: String,
+        media: crate::node::shares::media::Binding,
+    ) -> bool {
+        let (reply, rx) = oneshot::channel();
+        if self
+            .net_tx
+            .send(NetEvent::SessionMediaAdmission {
+                channel_id,
+                peer,
+                entry,
+                tag,
+                media,
+                reply,
+            })
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        rx.await.unwrap_or(false)
+    }
+
     pub(crate) async fn session_projection(
         &self,
         channel_id: Digest32,
@@ -8429,7 +8471,14 @@ impl Node {
                     } else {
                         false
                     };
-                    if ran || tended || sessions_changed || self.paths_moved() {
+                    // A retained projection is refreshed by the next publication's locked read.
+                    let retained = self
+                        .view_tx
+                        .borrow()
+                        .open_channels
+                        .iter()
+                        .any(|detail| detail.projection_failure.is_some());
+                    if ran || tended || sessions_changed || retained || self.paths_moved() {
                         self.publish().await;
                     }
                     // Retention on every tick: the index is ordered by age, so a pass that
@@ -11053,6 +11102,8 @@ impl Node {
             });
         }
         for peer in removed {
+            self.key_waiting.remove(&(room, *peer));
+            self.key_waits_said.remove(&(room, *peer));
             if self.ports.contains_key(&(room, *peer)) {
                 self.drop_port(&room, peer);
             }
@@ -12940,6 +12991,35 @@ impl Node {
                     guard,
                 )
                 .await;
+            }
+            NetEvent::SessionMediaAdmission {
+                channel_id,
+                peer,
+                entry,
+                tag,
+                media,
+                reply,
+            } => {
+                let Some(shared) = self.channels.get(&channel_id).map(Arc::clone) else {
+                    let _ = reply.send(false);
+                    return;
+                };
+                // The same secret-work lease and trust nonce a private page serve holds; no page
+                // bytes are produced, so no history budget job is taken.
+                let Some((store, guard)) = self.current_private_context() else {
+                    let _ = reply.send(false);
+                    return;
+                };
+                drop(store);
+                let admission = crate::node::channel::pending_upgrade::MediaAdmission {
+                    peer,
+                    hash: entry,
+                    holder: self.drive_holders().contains(&peer),
+                    tag,
+                    media,
+                };
+                self.begin_owned_private_admission(channel_id, shared, admission, guard, reply)
+                    .await;
             }
             NetEvent::PrivateSessionPageReady {
                 channel_id,
@@ -24463,16 +24543,20 @@ impl Node {
                 // The summary and detail taken under this room's lock by this node's own latest write,
                 // if any, are newer than the ones last published (see `fresh_details`): a person reads
                 // their own post (read-your-writes), and the room's entry count agrees with it.
-                match self.fresh_details.get(id) {
+                let kept = match self.fresh_details.get(id) {
                     Some((summary, detail)) => {
                         summaries.insert(*id, summary.clone());
-                        open_channels.push(detail.clone());
+                        Some(detail)
                     }
-                    None => {
-                        if let Some(d) = prev.open_channels.iter().find(|d| d.channel_id == *id) {
-                            open_channels.push(d.clone());
-                        }
-                    }
+                    None => prev.open_channels.iter().find(|d| d.channel_id == *id),
+                };
+                // Not read under the lock in this publication: its membership is last-known.
+                if let Some(detail) = kept {
+                    let mut detail = detail.clone();
+                    detail.projection_failure.get_or_insert_with(|| {
+                        "the room was busy; membership is the last observed view".into()
+                    });
+                    open_channels.push(detail);
                 }
                 mlock_active &= prev.mlock_active;
                 continue;
@@ -24559,6 +24643,7 @@ impl Node {
                     summaries.insert(*id, summary_of(&ch, rows));
                     if let Some(detail) = kept {
                         let mut detail = detail.clone();
+                        detail.projection_failure = Some(error.to_string());
                         detail.history_read = ch.history_read_resource();
                         detail.history_read_revision = detail
                             .history_read
