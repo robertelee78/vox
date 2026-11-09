@@ -439,6 +439,7 @@ TEST_RUNNER_VOX_PROOF_APP="$APP" TEST_RUNNER_VOX_PROOF_SCRATCH="$SCRATCH" \
     TEST_RUNNER_VOX_PROOF_KEY_WAIT_HELPER="$ROOT/target/proof-knobs/release/examples/native_key_wait" \
     TEST_RUNNER_VOX_PROOF_NATIVE_NODE="$NATIVE_NODE" \
     TEST_RUNNER_VOX_PROOF_OPENCODE_HOST="$ROOT/crates/vox-tui/tests/support/opencode_plugin_host.mjs" \
+    TEST_RUNNER_VOX_PROOF_OMP_REPLAY="$ROOT/crates/vox-tui/tests/support/omp_bridge_replay.py" \
     TEST_RUNNER_VOX_PROOF_CONTINUE="${VOX_PROOF_CONTINUE:-}" \
     xcodebuild -project apps/macos/Vox.xcodeproj -scheme Vox -configuration Release \
     -derivedDataPath "$DERIVED" -resultBundlePath "$RESULTS/AppProofs.xcresult" \

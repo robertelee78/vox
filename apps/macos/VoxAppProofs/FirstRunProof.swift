@@ -304,6 +304,7 @@ final class FirstRunProof: XCTestCase {
     /// When another app took the foreground from a running Vox, and which: a display change or a
     /// person at the Mac, never the walkthrough (it quits Vox, and Vox's own panels are its own).
     private var lostForeground: [(at: Date, to: String)] = []
+    private var expectedHTTPActivation: (bundleID: String, until: Date)?
     private var watchingForeground: NSObjectProtocol?
     private var watchingVox: NSObjectProtocol?
     /// Set while the proof itself has hidden or quit Vox (⌘H, ⌘Q), until Vox is active again:
@@ -342,6 +343,11 @@ final class FirstRunProof: XCTestCase {
                   // Vox's own file panel and previews run in system services of its own.
                   !(app.bundleIdentifier ?? "").hasPrefix("com.apple.appkit.xpc."),
                   !(app.bundleIdentifier ?? "").hasPrefix("com.apple.quicklook.") else { return }
+            if let expected = self?.expectedHTTPActivation, app.bundleIdentifier == expected.bundleID,
+               Date() <= expected.until {
+                self?.expectedHTTPActivation = nil
+                return
+            }
             let at = Date()
             let to = app.localizedName ?? app.bundleIdentifier ?? "pid \(app.processIdentifier)"
             // Taken from a Vox that is still running a second later: not Vox quitting.
@@ -3110,10 +3116,35 @@ final class FirstRunProof: XCTestCase {
     ///   passphrase leaves the map unchanged; Choose binds both waiting sessions. Create uses
     ///   alice with her keyring window closed, no identity prompt, and both next turns follow.
     ///   Not This Repo silences both paths. Mutant: write the map before checking the passphrase.
+    /// - FX-60 (#1169, step `omp-image`): OMP Sessions of omp-owner (its own daemon) and claude-a
+    ///   are replayed to the real daemons over the bridge protocol (omp_bridge_replay.py). Five
+    ///   are what stock OMP 18.18.0's Vox extension sent a real host daemon
+    ///   (tests/support/omp-image-capture: authorized, streaming, async-error, unicode, cancel);
+    ///   forged.jsonl is crafted test-side attacker input, not a stock capture: its offer announces
+    ///   an all-zero SHA-256 for bytes identical to the authorized image. Alice's app loads the
+    ///   authorized image and shows it; the forged image shows a visible refusal and is never
+    ///   drawn (mutant: Descriptor::verify without the hash comparison renders it). The replayed
+    ///   extension's VOX_ROOM is a strict prefix of the room id, and `vox room session --json` must
+    ///   show each Session's activity first (mutant: the follower not restarted from the stored
+    ///   registration once the prefix is resolved). The authorized Session's tool card shows its
+    ///   multi-line body as written (mutant: card bodies parsed as full Markdown). omp-owner's
+    ///   media service is also asked directly, past the requester's own daemon
+    ///   (media_forward_probe.py), naming the Session activity record that announced the image:
+    ///   after omp-owner takes drive back from alice it refuses her (mutant: the media witness's
+    ///   Only::Drive becomes Anyone and the record admission's drive-holder check is dropped;
+    ///   either alone still refuses), and her app does not draw the image again. Its admission is
+    ///   the unchanged per-recipient private Session permission (#1171): never-removed alice is
+    ///   still served after alice removes media-returner (mutant: the admission refuses every image
+    ///   offered before the room's latest removal generation), and readmitted
+    ///   media-returner is refused the record offered before its removal (mutant: the admission's
+    ///   floor step taken with `restored` false) and served one offered after its readmission
+    ///   (mutant: any recipient with a validated removal refused).
     func testSessionsAreDrivenWhereTheyAreShown() throws {
         let env = ProcessInfo.processInfo.environment
         let selectedStep = env["VOX_PROOF_STEP"] ?? ""
-        guard selectedStep.isEmpty || selectedStep == "room-ask" else { throw Apparatus("unsupported Sessions journey step: \(selectedStep)") }
+        guard selectedStep.isEmpty || selectedStep == "room-ask" || selectedStep == "omp-image" else {
+            throw Apparatus("unsupported Sessions journey step: \(selectedStep)")
+        }
         if !selectedStep.isEmpty { print("SELECTED PROOF STEP: \(selectedStep)") }
         guard let appPath = env["VOX_PROOF_APP"], let scratchPath = env["VOX_PROOF_SCRATCH"] else {
             throw Apparatus("VOX_PROOF_APP and VOX_PROOF_SCRATCH are set by scripts/app-proofs.sh")
@@ -3168,6 +3199,7 @@ final class FirstRunProof: XCTestCase {
         let aliceFp = try line(staged(vox, ["id", "--node", "alice"], env: voxEnv)) { $0.count == 52 }
         let agentFp = try line(staged(vox, ["id", "--node", "claude-a"], env: voxEnv)) { $0.count == 52 }
         var rooms: [String: String] = [:]
+        var links: [String: String] = [:]
         for name in ["work", "other"] {
             try staged(vox, ["room", "create", "--node", "alice", "--passphrase-file", pass("room"),
                              "--name", name], env: voxEnv)
@@ -3180,12 +3212,129 @@ final class FirstRunProof: XCTestCase {
             try staged(vox, ["room", "join", "--node", "claude-a", "--passphrase-file", pass("room"), link],
                        env: voxEnv)
             rooms[name] = id
+            links[name] = link
         }
         let room = rooms["work"] ?? ""
         try staged(vox, ["trust", "add", "--node", "alice", agentFp, "--name", "claude-a",
                          "--identity-passphrase-file", pass("alice")], env: voxEnv)
         try staged(vox, ["trust", "add", "--node", "claude-a", aliceFp, "--name", "alice", "--drive",
                          "--identity-passphrase-file", pass("claude-a")], env: voxEnv)
+        // FX-60: the authorized OMP image's Session belongs to omp-owner, a node on a daemon of
+        // its own, so on a Computer of its own. Drive taken back there stays taken back, and the
+        // revocation below measures its media service alone: on alice's daemon, My computers
+        // gives the personal node alice drive over claude-a again whatever claude-a's keyring said.
+        var ompOwner: (daemon: Started, env: [String: String], fp: String, pass: String)?
+        defer { ompOwner?.daemon.terminate() }
+        // FX-60 removal floor: media-returner, on a daemon of its own, is a work member holding
+        // drive from omp-owner before omp-owner offers the authorized image. Alice removes and
+        // readmits it below; omp-owner's media service admits by its per-recipient floor.
+        var mediaReturner: (daemon: Started, env: [String: String], fp: String)?
+        defer { mediaReturner?.daemon.terminate() }
+        /// `node`'s own `vox room roster` of work, once `holds` says it shows what is awaited.
+        func roster(of node: String, env: [String: String], within seconds: TimeInterval,
+                    _ holds: (String) -> Bool) -> (holds: Bool, said: String) {
+            let until = Date().addingTimeInterval(seconds)
+            var said = ""
+            repeat {
+                let r = run(vox, ["room", "roster", "--node", node, room], env: env)
+                said = "status \(r.status): \(r.out)"
+                if r.status == 0 && holds(r.out) { return (true, said) }
+                Thread.sleep(forTimeInterval: 0.5)
+            } while Date() < until
+            return (false, said)
+        }
+        /// One durable `marker` posted to work by `from`, read back by `to` within 90 s: `to` is
+        /// reached by `from`'s room traffic from here on.
+        func reachedBy(_ marker: String, from: (node: String, env: [String: String]),
+                       to: (node: String, env: [String: String])) -> (reached: Bool, said: String) {
+            let posted = run(vox, ["room", "post", "--node", from.node, room, marker], env: from.env)
+            guard posted.status == 0 else {
+                return (false, "\(from.node)'s post exited \(posted.status): \(posted.out.debugDescription)")
+            }
+            let until = Date().addingTimeInterval(90)
+            var read = run(vox, ["room", "read", "--node", to.node, room], env: to.env)
+            while !read.out.contains(marker) && Date() < until {
+                Thread.sleep(forTimeInterval: 0.5)
+                read = run(vox, ["room", "read", "--node", to.node, room], env: to.env)
+            }
+            return (read.out.contains(marker), "\(to.node)'s read exited \(read.status): \(read.out.debugDescription)")
+        }
+        if selectedStep.isEmpty || selectedStep == "omp-image" {
+            let ownerRoot = root.appendingPathComponent("omp-owner")
+            let ownerHome = ownerRoot.appendingPathComponent("home").path
+            let ownerKeychain = ownerRoot.appendingPathComponent("identity.keychain-db").path
+            let ownerEnv = ["VOX_DATA_DIR": ownerRoot.appendingPathComponent("data").path,
+                            "VOX_CONFIG_DIR": ownerRoot.appendingPathComponent("config").path,
+                            "HOME": ownerHome, "VOX_PROXY": "127.0.0.1:0", "VOX_TEST_KEYCHAIN": ownerKeychain]
+            guard stager.run(["/bin/mkdir", "-p", ownerHome], env: [:]).status == 0,
+                  stager.run(["/usr/bin/security", "create-keychain", "-p", "", ownerKeychain],
+                             env: ["HOME": ownerHome]).status == 0 else {
+                throw Apparatus("cannot stage the OMP image owner's private HOME and Keychain")
+            }
+            let ownerDaemon = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: ownerEnv,
+                                        until: "vox daemon: control socket")
+            let ownerPass = ownerRoot.appendingPathComponent("owner.pass").path
+            ompOwner = (ownerDaemon, ownerEnv, "", ownerPass)
+            try stager.write(Data("omp owner identity\n".utf8), to: ownerPass)
+            try staged(vox, ["node", "create", "omp-owner", "--passphrase-file", ownerPass], env: ownerEnv)
+            try staged(vox, ["node", "unlock", "omp-owner", "--passphrase-file", ownerPass], env: ownerEnv)
+            let ownerFp = try line(staged(vox, ["id", "--node", "omp-owner"], env: ownerEnv)) { $0.count == 52 }
+            ompOwner?.fp = ownerFp
+            let ownerLink = try line(staged(vox, ["room", "link", "--node", "alice", room], env: voxEnv)) {
+                $0.hasPrefix("vox://")
+            }
+            try staged(vox, ["room", "join", "--node", "omp-owner", "--passphrase-file", pass("room"), ownerLink],
+                       env: ownerEnv)
+            try staged(vox, ["trust", "add", "--node", "alice", ownerFp, "--name", "omp-owner",
+                             "--identity-passphrase-file", pass("alice")], env: voxEnv)
+            try staged(vox, ["trust", "add", "--node", "omp-owner", aliceFp, "--name", "alice", "--drive",
+                             "--identity-passphrase-file", ownerPass], env: ownerEnv)
+            let grants = try staged(vox, ["trust", "list", "--node", "omp-owner"], env: ownerEnv)
+            guard grants.split(separator: "\n").contains(where: { $0.hasPrefix(aliceFp + "  ") && $0.hasSuffix("  read + drive") }) else {
+                throw Apparatus("the OMP image owner must grant alice Read + Drive: \(grants)")
+            }
+            let returnerRoot = root.appendingPathComponent("media-returner")
+            let returnerHome = returnerRoot.appendingPathComponent("home").path
+            let returnerKeychain = returnerRoot.appendingPathComponent("identity.keychain-db").path
+            let returnerEnv = ["VOX_DATA_DIR": returnerRoot.appendingPathComponent("data").path,
+                               "VOX_CONFIG_DIR": returnerRoot.appendingPathComponent("config").path,
+                               "HOME": returnerHome, "VOX_PROXY": "127.0.0.1:0", "VOX_TEST_KEYCHAIN": returnerKeychain]
+            guard stager.run(["/bin/mkdir", "-p", returnerHome], env: [:]).status == 0,
+                  stager.run(["/usr/bin/security", "create-keychain", "-p", "", returnerKeychain],
+                             env: ["HOME": returnerHome]).status == 0 else {
+                throw Apparatus("cannot stage the media returner's private HOME and Keychain")
+            }
+            let returnerDaemon = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: returnerEnv,
+                                           until: "vox daemon: control socket")
+            let returnerPass = returnerRoot.appendingPathComponent("returner.pass").path
+            mediaReturner = (returnerDaemon, returnerEnv, "")
+            try stager.write(Data("media returner identity\n".utf8), to: returnerPass)
+            try staged(vox, ["node", "create", "media-returner", "--passphrase-file", returnerPass], env: returnerEnv)
+            try staged(vox, ["node", "unlock", "media-returner", "--passphrase-file", returnerPass], env: returnerEnv)
+            let returnerFp = try line(staged(vox, ["id", "--node", "media-returner"], env: returnerEnv)) { $0.count == 52 }
+            mediaReturner?.fp = returnerFp
+            let returnerLink = try line(staged(vox, ["room", "link", "--node", "alice", room], env: voxEnv)) {
+                $0.hasPrefix("vox://")
+            }
+            try staged(vox, ["room", "join", "--node", "media-returner", "--passphrase-file", pass("room"), returnerLink],
+                       env: returnerEnv)
+            try staged(vox, ["trust", "add", "--node", "media-returner", ownerFp, "--name", "omp-owner",
+                             "--identity-passphrase-file", returnerPass], env: returnerEnv)
+            try staged(vox, ["trust", "add", "--node", "omp-owner", returnerFp, "--name", "media-returner", "--drive",
+                             "--identity-passphrase-file", ownerPass], env: ownerEnv)
+            let returnerGrants = try staged(vox, ["trust", "list", "--node", "omp-owner"], env: ownerEnv)
+            guard returnerGrants.split(separator: "\n").contains(where: { $0.hasPrefix(returnerFp + "  ") && $0.hasSuffix("  read + drive") }) else {
+                throw Apparatus("the OMP image owner must grant media-returner Read + Drive: \(returnerGrants)")
+            }
+            let ownerSeesReturner = roster(of: "omp-owner", env: ownerEnv, within: 60) { $0.contains(returnerFp) }
+            guard ownerSeesReturner.holds else {
+                throw Apparatus("omp-owner does not list media-returner as a work member within 60 s: \(ownerSeesReturner.said)")
+            }
+            let returnerReady = reachedBy("MEDIA-RETURNER-READY", from: ("omp-owner", ownerEnv), to: ("media-returner", returnerEnv))
+            guard returnerReady.reached else {
+                throw Apparatus("media-returner did not read omp-owner's post within 90 s before the authorized image: \(returnerReady.said)")
+            }
+        }
         // Room work must not borrow the authorization window opened by trust above (KP-1).
         try staged(vox, ["node", "lock", "alice"], env: voxEnv)
         try staged(vox, ["node", "unlock", "alice", "--passphrase-file", pass("alice")], env: voxEnv)
@@ -3299,6 +3448,778 @@ final class FirstRunProof: XCTestCase {
         try launchVox(ui, appPath, env: ui.launchEnvironment, scratch: scratchPath)
         defer { ui.terminate() }
         present(ui, Key.id("attached"), timeout: 60, "the app must open attached as alice")
+
+        // FX-60: OMP images. The replayed extensions stay connected for the rest of the journey.
+        var ompHosts: [StagedJSONHost] = []
+        var ompTemp = ""
+        defer {
+            ompHosts.forEach { $0.terminate() }
+            if !ompTemp.isEmpty { _ = stager.run(["/bin/rm", "-rf", ompTemp], env: [:]) }
+        }
+        if selectedStep.isEmpty || selectedStep == "omp-image" {
+            guard let replayer = env["VOX_PROOF_OMP_REPLAY"],
+                  stager.run(["/bin/test", "-r", replayer], env: [:]).status == 0 else {
+                throw Apparatus("VOX_PROOF_OMP_REPLAY must name the OMP bridge replayer (scripts/app-proofs.sh)")
+            }
+            let captures = URL(fileURLWithPath: replayer).deletingLastPathComponent()
+                .appendingPathComponent("omp-image-capture").path
+            // A short, uniquely owned directory lets the replayed bridge's Unix socket fit.
+            let ompTempResult = stager.run(["/usr/bin/mktemp", "-d", "/tmp/vox-1169-omp.XXXXXXXX"], env: [:])
+            ompTemp = ompTempResult.out.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard ompTempResult.status == 0, ompTemp.hasPrefix("/tmp/vox-1169-omp."), !ompTemp.contains("\n") else {
+                throw Apparatus("cannot stage the replayed bridge's private temporary directory: \(ompTempResult.out)")
+            }
+            // The extension's VOX_ROOM is the room id as `vox room list` shows it: a prefix of the
+            // whole id, which the daemon resolves when the Session registers. The OMP follower
+            // must then admit activity for the registration as resolved (host.rs `registered`);
+            // mutant: no restart from the stored registration, and every entry is refused.
+            let wholeRoom = String((links["work"] ?? "").trimmingCharacters(in: .whitespaces)
+                .dropFirst("vox://".count).prefix { $0 != "?" })
+            guard wholeRoom.count == 52, room.count < wholeRoom.count, wholeRoom.hasPrefix(room) else {
+                throw Apparatus("the omp-image step gives VOX_ROOM as a strict prefix of the room id; `vox room list` gave \(room.debugDescription) and the room's link names \(wholeRoom.debugDescription)")
+            }
+            guard let imageOwner = ompOwner else {
+                throw Apparatus("the OMP image owner's own daemon was not staged")
+            }
+            let claudeA = (node: "claude-a", env: voxEnv)
+            let omp = (node: "omp-owner", env: imageOwner.env)
+            // The captured proof_image tool returned a multi-line text part with the image: its card
+            // keeps every line, the blank one and the -, + and # markers as written. Mutant: the
+            // body parsed as full Markdown runs the lines together and drops the markers. It is read
+            // before the image loads, while the card is still in the timeline's view.
+            func checkToolCard() throws {
+                // The assistant's reply quotes the same lines in a code block: only the tool card's
+                // own body starts with the tool's first line. A selectable Text carries its text as
+                // its value.
+                let toolBody = "PROOF_IMAGE\n- kept as typed\n+ added line\n# not a heading\n\nsecond paragraph"
+                let toolCards = ui.descendants(matching: .staticText)
+                    .matching(NSPredicate(format: "identifier BEGINSWITH %@", "entry-content-"))
+                    .allElementsBoundByIndex.map { ($0.value as? String) ?? $0.label }
+                    .filter { $0.hasPrefix("PROOF_IMAGE") }
+                keepTree(ui, "the authorized OMP Session before its image loads (evidence)")
+                guard !toolCards.isEmpty else {
+                    throw Apparatus("the authorized OMP Session's proof_image tool card is not in the timeline's view, so its body cannot be read")
+                }
+                if !toolCards.contains(where: { $0.trimmingCharacters(in: .newlines) == toolBody }) {
+                    XCTFail("PRODUCT: the OMP tool card must show its multi-line body as written, \(toolBody.debugDescription); the app shows \(toolCards.debugDescription)")
+                }
+            }
+            /// Replay one captured OMP Session as `owner`'s, open it in alice's app, and load its image.
+            func replayed(_ capture: String, by owner: (node: String, env: [String: String]),
+                          linkURL: String? = nil, httpURL: String? = nil,
+                          beforeLoad: () throws -> Void = {}) throws -> (StagedJSONHost, String) {
+                var replayEnv = owner.env.merging(["VOX_BIN": vox, "VOX_NODE": owner.node, "VOX_ROOM": room,
+                                                   "PATH": "/usr/bin:/bin", "TMPDIR": ompTemp]) { $1 }
+                if let linkURL { replayEnv["VOX_PROOF_LINK_URL"] = linkURL }
+                if let httpURL { replayEnv["VOX_PROOF_HTTP_URL"] = httpURL }
+                let args = ["/usr/bin/python3", replayer, captures + "/\(capture).jsonl"]
+                    + (capture == "streaming" ? ["--stream-activity"]
+                       : capture == "async-error" ? ["--stream-async"]
+                       : capture == "unicode" ? ["--stream-unicode"]
+                       : capture == "cancel" ? ["--stream-cancel"] : [])
+                let host = try stager.jsonHost(args, env: replayEnv, cwd: work,
+                                               stderr: root.appendingPathComponent("omp-\(capture).stderr").path)
+                ompHosts.append(host)
+                guard let session = try host.command("register", within: 110)["session"] as? String else {
+                    throw Apparatus("the OMP replayer registered no Session from its \(capture) capture")
+                }
+                let read = { self.run(vox, ["room", "session", "--node", "alice", "--json", room, session], env: voxEnv) }
+                let expected = capture == "async-error" ? "Running async sleep command"
+                    : capture == "unicode" ? "Calling proof_unicode"
+                    : capture == "cancel" ? "CANCEL_RUNNING" : "Image available (image/png)"
+                let until = Date().addingTimeInterval(60)
+                var seen = read()
+                while Date() < until && !seen.out.contains(expected) {
+                    Thread.sleep(forTimeInterval: 0.5)
+                    seen = read()
+                }
+                guard seen.out.contains(expected) else {
+                    // Every captured frame reached the daemon: what it did with them is the product's.
+                    let state = try host.command("served 0 1", within: 10)
+                    let said = run(vox, ["room", "session", "--node", owner.node, "--json", room, session], env: owner.env)
+                    if (state["replayed"] as? Int ?? 0) > 0 {
+                        throw Product("with VOX_ROOM prefix \(room.debugDescription), the daemon received OMP \(capture) but alice's Session did not show \(expected.debugDescription); replay \(state); alice \(seen.out.debugDescription); owner \(said.out.debugDescription)")
+                    }
+                    throw Apparatus("staging not achieved: the replayed OMP \(capture) frames never reached the daemon; the replayed extension says \(state); alice's `vox room session --json` exited \(seen.status) saying \(seen.out.debugDescription)")
+                }
+                tap(ui, Key.id("room-work"), "work, where \(owner.node)'s OMP Session is", premise: inRoom(vox, voxEnv, "work"))
+                let tabKey = Key.id("session-\(session.prefix(8))")
+                let premise = Premise("alice holds the replayed OMP \(capture) Session") {
+                    let now = read()
+                    return (now.status == 0, now.out)
+                }
+                // Two Session tabs overflow the tab strip, where XCTest calls a fully visible tab
+                // not hittable: it is clicked where it is drawn, as a person clicks it.
+                let tabUntil = Date().addingTimeInterval(10)
+                var clicked = false
+                while !clicked && Date() < tabUntil {
+                    if let tab = locate(ui, tabKey), let strip = locate(ui, Key.id("room-session-tabs")),
+                       strip.frame.contains(tab.frame), ui.windows.firstMatch.frame.contains(tab.frame) {
+                        tab.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).click()
+                        clicked = true
+                    } else {
+                        Thread.sleep(forTimeInterval: 0.25)
+                    }
+                }
+                if !clicked { tap(ui, tabKey, "\(owner.node)'s replayed OMP \(capture) Session", premise: premise) }
+                let selectedUntil = Date().addingTimeInterval(10)
+                while Date() < selectedUntil && locate(ui, tabKey)?.isSelected != true {
+                    Thread.sleep(forTimeInterval: 0.25)
+                }
+                guard locate(ui, tabKey)?.isSelected == true else {
+                    keepTree(ui, "the replayed OMP \(capture) Session was not selected")
+                    throw Apparatus("the click on \(owner.node)'s replayed OMP \(capture) Session tab did not select it")
+                }
+                if ["async-error", "unicode", "cancel"].contains(capture) {
+                    try beforeLoad()
+                    return (host, session)
+                }
+                guard present(ui, Key.idPrefix("session-media-load-"), timeout: 30,
+                              "an available OMP image must offer to load in its Session view") else {
+                    throw Product("\(owner.node)'s replayed OMP \(capture) Session shows no Load image control")
+                }
+                try beforeLoad()
+                tap(ui, Key.idPrefix("session-media-load-"), "Load image in \(owner.node)'s replayed OMP \(capture) Session")
+                return (host, session)
+            }
+            /// Whether a replayed extension answered the image request it was asked: read only when
+            /// the app shows no outcome. Asked and unable to answer from its capture is the
+            /// replay's (APPARATUS); never asked, or answered with nothing shown, is the app's.
+            func answered(_ host: StagedJSONHost, _ capture: String) -> Premise {
+                Premise("the replayed OMP \(capture) extension answered the image request it was asked") {
+                    guard let state = try? host.command("served 1 5", within: 15) else {
+                        return (false, "the replayed extension did not say what it was asked")
+                    }
+                    let asked = (state["requested"] as? [String]) ?? []
+                    let answered = (state["answered"] as? [String]) ?? []
+                    return (asked.isEmpty || !answered.isEmpty, "\(state)")
+                }
+            }
+            /// What alice's app shows after Load image, by the identifier `prefix` (the image, or
+            /// the refusal in its place), once `present` finds it within 60 s.
+            func media(_ prefix: String, _ host: StagedJSONHost, _ capture: String, _ product: String) -> XCUIElement? {
+                guard present(ui, Key.idPrefix(prefix), timeout: 60, product, premise: answered(host, capture)) else {
+                    return nil
+                }
+                return locate(ui, Key.idPrefix(prefix))
+            }
+            let (authorizedHost, authorized) = try replayed("authorized", by: omp, beforeLoad: checkToolCard)
+            guard let shownImage = media("session-media-image-", authorizedHost, "authorized",
+                                         "the authorized OMP image must render in alice's Session view") else { return }
+            guard let timelineFrame = locate(ui, Key.id("timeline"))?.frame else {
+                throw Apparatus("the authorized OMP Session's timeline cannot be found to place its image")
+            }
+            let renderedSize = shownImage.frame.size
+            if !(renderedSize.width > 0 && renderedSize.height > 0 && timelineFrame.intersects(shownImage.frame)) {
+                XCTFail("PRODUCT: the authorized OMP image must be drawn in alice's Session timeline; it is at \(shownImage.frame), the timeline at \(timelineFrame)")
+            }
+            XCTAssertEqual(shownImage.label, "Session image", "PRODUCT: the rendered OMP image must be named for VoiceOver")
+            keepTree(ui, "the authorized OMP image rendered (evidence)")
+            /// An image's service tag and the Session activity record that announced it, as
+            /// alice's own raw read of `session` carries them. The owner admits a media request
+            /// only for that record, so the direct probe names it as alice's read shows it.
+            func mediaRecord(_ session: String) throws -> (tag: String, entry: String) {
+                let raw = run(vox, ["room", "session", "--node", "alice", "--raw", "--json", room, session], env: voxEnv)
+                guard let tagRange = raw.out.range(of: "media-[0-9a-f]{32}", options: .regularExpression) else {
+                    throw Apparatus("alice's raw read of OMP Session \(session.prefix(8)) names no media service: \(raw.out.debugDescription)")
+                }
+                let tag = String(raw.out[tagRange])
+                guard let line = raw.out.split(separator: "\n").first(where: { $0.contains(tag) }),
+                      let row = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                      let entry = row["entry"] as? String else {
+                    throw Apparatus("alice's raw read names no activity entry for \(tag): \(raw.out.debugDescription)")
+                }
+                return (tag, entry)
+            }
+            let (mediaTag, mediaEntry) = try mediaRecord(authorized)
+            let probe = URL(fileURLWithPath: replayer).deletingLastPathComponent()
+                .appendingPathComponent("media_forward_probe.py").path
+            /// omp-owner's media service asked directly as `node` for the image `tag` that record
+            /// `entry` announced, past every check `node`'s own daemon makes first
+            /// (media_forward_probe.py): what it serves is the owner's decision.
+            func ask(_ node: String, _ nodeEnv: [String: String], _ tag: String, _ entry: String) throws -> (served: Bool, said: String) {
+                let asked = stager.run(["/usr/bin/python3", probe, node, wholeRoom, imageOwner.fp, tag, entry], env: nodeEnv)
+                guard let answer = try? JSONSerialization.jsonObject(with: Data(asked.out.utf8)) as? [String: Any],
+                      answer["kind"] as? String == "answer" else {
+                    throw Apparatus("the direct media probe could not ask omp-owner's service as \(node): \(asked.out.debugDescription)")
+                }
+                let status = answer["status"] as? String ?? ""
+                let body = answer["body"] as? Int ?? 0
+                guard status.isEmpty || status.contains(" 200 ") else {
+                    throw Apparatus("the direct media probe received an unexpected HTTP response: \(asked.out.debugDescription)")
+                }
+                let served = !status.isEmpty || body > 0
+                return (served, asked.out.trimmingCharacters(in: .whitespacesAndNewlines))
+            }
+            func askOwner() throws -> (served: Bool, said: String) {
+                try ask("alice", voxEnv, mediaTag, mediaEntry)
+            }
+            let beforeRevocation = try askOwner()
+            guard beforeRevocation.served else {
+                throw Apparatus("premise unmet: omp-owner's media service, asked directly while alice holds drive, served nothing: \(beforeRevocation.said)")
+            }
+            // FX-60 removal floor (#1171): admission is the owner's unchanged per-recipient private
+            // Session permission for the record a request names. Alice removes media-returner: an
+            // unrelated cut for never-removed alice, who stays served. Readmitted media-returner is
+            // asked below, once served omp-owner's next image, for this record offered before its removal.
+            guard let returner = mediaReturner else {
+                throw Apparatus("the media returner's own daemon was not staged")
+            }
+            let returnerBefore = try ask("media-returner", returner.env, mediaTag, mediaEntry)
+            guard returnerBefore.served else {
+                throw Apparatus("premise unmet: omp-owner's media service, asked directly by media-returner before its removal, did not serve the record offered while it held drive: \(returnerBefore.said)")
+            }
+            try stagedTrustChange(vox, ["room", "remove-member", "--node", "alice", room, returner.fp], env: voxEnv)
+            let ownerRemoved = roster(of: "omp-owner", env: imageOwner.env, within: 60) {
+                !$0.contains(returner.fp) && $0.contains(aliceFp)
+            }
+            guard ownerRemoved.holds else {
+                throw Apparatus("omp-owner did not apply media-returner's removal within 60 s, so alice's check would not follow the cut: \(ownerRemoved.said)")
+            }
+            let cutUntil = Date().addingTimeInterval(30)
+            var afterCut = try askOwner()
+            while !afterCut.served && Date() < cutUntil {
+                Thread.sleep(forTimeInterval: 1)
+                afterCut = try askOwner()
+            }
+            if !afterCut.served {
+                XCTFail("PRODUCT: after alice removed media-returner, omp-owner's media service refused never-removed alice the authorized image's record for 30 s: \(afterCut.said)")
+            }
+            try stagedTrustChange(vox, ["room", "readmit-member", "--node", "alice", room, returner.fp], env: voxEnv)
+            let ownerReadmitted = roster(of: "omp-owner", env: imageOwner.env, within: 60) { $0.contains(returner.fp) }
+            guard ownerReadmitted.holds else {
+                throw Apparatus("omp-owner did not apply media-returner's readmission within 60 s: \(ownerReadmitted.said)")
+            }
+            // Causal barrier: media-returner reads omp-owner's post made after the readmission, so
+            // omp-owner's next image is offered once the readmitted member is reached again.
+            let witness = reachedBy("MEDIA-READMISSION-WITNESS", from: ("omp-owner", imageOwner.env),
+                                    to: ("media-returner", returner.env))
+            guard witness.reached else {
+                throw Apparatus("causal barrier not reached: readmitted media-returner did not read omp-owner's post within 90 s, so its new-record check would be timing-only: \(witness.said)")
+            }
+            // Never-removed alice is not cut by media-returner's readmission either.
+            let afterReadmission = try askOwner()
+            if !afterReadmission.served {
+                XCTFail("PRODUCT: after alice readmitted media-returner, omp-owner's media service refused never-removed alice the authorized image's record: \(afterReadmission.said)")
+            }
+            print("[proof] FX-60 removal floor: never-removed alice after the cut \(afterCut.said), after the readmission \(afterReadmission.said)")
+            let (forgedHost, forged) = try replayed("forged", by: claudeA)
+            guard let refusalShown = media("session-media-error-", forgedHost, "forged",
+                                           "the OMP image whose SHA-256 does not verify must show a visible refusal") else { return }
+            if locate(ui, Key.idPrefix("session-media-image-")) != nil {
+                keepTree(ui, "the unverified OMP image rendered")
+                XCTFail("PRODUCT: an OMP image whose announced SHA-256 does not match its bytes rendered in alice's Session view (\(forged.prefix(8))); it must be refused")
+            }
+            let refusal = (refusalShown.value as? String) ?? refusalShown.label
+            XCTAssertTrue(refusal.hasPrefix("Image unavailable:")
+                          && (refusal.contains("failed verification") || refusal.contains("SHA-256")),
+                          "PRODUCT: the refusal must say the image failed verification; it says \(refusal.debugDescription)")
+            keepTree(ui, "the forged OMP image was refused (evidence)")
+            let authorizedTab = Key.id("session-\(authorized.prefix(8))")
+            // FX-60 owner side: omp-owner takes drive back from alice. Its own media service must
+            // then refuse her, though she asks past her own daemon's checks (mutant: the media
+            // witness's Only::Drive becomes Anyone, and the image is served).
+            try staged(vox, ["trust", "read", "--node", "omp-owner", aliceFp,
+                             "--identity-passphrase-file", imageOwner.pass], env: imageOwner.env)
+            let ownerUntil = Date().addingTimeInterval(20)
+            var afterRevocation = try askOwner()
+            while afterRevocation.served && Date() < ownerUntil {
+                Thread.sleep(forTimeInterval: 1)
+                afterRevocation = try askOwner()
+            }
+            if afterRevocation.served {
+                XCTFail("PRODUCT: 20 s after omp-owner took drive back from alice, its own media service still served her the authorized OMP image when she asked it directly: \(afterRevocation.said)")
+            }
+            // The revocation as alice's app shows it: the authorized Session's image is not drawn
+            // again, whether Load image is still offered or the Session is gone. Its tab is clicked
+            // where it is drawn, as in `replayed`.
+            if let tab = locate(ui, authorizedTab), ui.windows.firstMatch.frame.contains(tab.frame) {
+                tab.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).click()
+            }
+            var appShows = "the Session is gone"
+            if locate(ui, authorizedTab) != nil {
+                let loadUntil = Date().addingTimeInterval(10)
+                while locate(ui, Key.idPrefix("session-media-load-")) == nil && Date() < loadUntil {
+                    Thread.sleep(forTimeInterval: 0.25)
+                }
+                if locate(ui, Key.idPrefix("session-media-load-")) != nil {
+                    tap(ui, Key.idPrefix("session-media-load-"), "Load image after omp-owner took drive back")
+                }
+                // Within 60 s the app shows its refusal or nothing; never the image.
+                let shownUntil = Date().addingTimeInterval(60)
+                while locate(ui, Key.idPrefix("session-media-image-")) == nil
+                        && locate(ui, Key.idPrefix("session-media-error-")) == nil && Date() < shownUntil {
+                    Thread.sleep(forTimeInterval: 0.25)
+                }
+                if let shown = locate(ui, Key.idPrefix("session-media-error-")) {
+                    appShows = (shown.value as? String) ?? shown.label
+                } else {
+                    appShows = "no image and no refusal"
+                }
+                if locate(ui, Key.idPrefix("session-media-image-")) != nil {
+                    keepTree(ui, "the OMP image rendered after drive was taken back")
+                    XCTFail("PRODUCT: after omp-owner took drive back from alice, her app drew the authorized OMP image again (\(authorized.prefix(8))); it shows \(appShows.debugDescription)")
+                }
+            }
+            keepTree(ui, "the authorized OMP Session after the revocation (evidence)")
+            print("[proof] FX-60 revocation: owner service \(afterRevocation.said); app shows \(appShows.debugDescription)")
+            try staged(vox, ["trust", "drive", "--node", "omp-owner", aliceFp,
+                             "--identity-passphrase-file", imageOwner.pass], env: imageOwner.env)
+            print("[proof] FX-60 OMP images: authorized \(authorized.prefix(8)) rendered (\(renderedSize)); forged \(forged.prefix(8)) refused: \(refusal)")
+            // A real stock-OMP capture is released in stages while alice's app is watching.
+            // Hold the captured media response while the second progress frame arrives, then
+            // send it and release the captured final only after the image has rendered.
+            func progressVisible(_ text: String, within seconds: TimeInterval) -> Bool {
+                let until = Date().addingTimeInterval(seconds)
+                repeat {
+                    let values = ui.descendants(matching: .staticText)
+                        .matching(NSPredicate(format: "identifier BEGINSWITH %@", "entry-content-"))
+                        .allElementsBoundByIndex.map { ($0.value as? String) ?? $0.label }
+                    if values.contains(where: { $0.contains(text) }) { return true }
+                    Thread.sleep(forTimeInterval: 0.25)
+                } while Date() < until
+                return false
+            }
+            // A guest-only URL handler makes opening a peer's forbidden custom-scheme link
+            // observable. First prove that Launch Services can open it outside Vox.
+            let suffix = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+            let httpMarker = root.appendingPathComponent("link-http-\(UUID().uuidString)").path
+            let http = try stager.start(["/usr/bin/python3", "-u", "-c", """
+                import http.server, pathlib
+                marker = pathlib.Path("\(httpMarker)")
+                class Handler(http.server.BaseHTTPRequestHandler):
+                    def do_GET(self):
+                        if self.path == "/vox-proof": marker.write_text(self.path)
+                        self.send_response(200)
+                        self.end_headers()
+                        self.wfile.write(b"Vox proof link")
+                    def log_message(self, *args): pass
+                server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+                print("PORT " + str(server.server_port), flush=True)
+                server.serve_forever()
+                """], env: [:], until: "PORT ", within: 15)
+            defer { stager.stop(http.id) }
+            guard let port = http.line?.split(separator: " ").last, UInt16(port) != nil else {
+                throw Apparatus("the guest HTTP link handler did not announce its port: \(http.out)")
+            }
+            let httpURL = "http://127.0.0.1:\(port)/vox-proof"
+            let scheme = "voxproof" + suffix
+            let linkURL = "\(scheme)://attacker"
+            let handlerID = "us.vox.proof.link." + suffix
+            // Launch Services ignores URL handlers registered below the transient /var/folders
+            // proof root. Keep this uniquely named, disposable bundle in the guest user's home.
+            let handler = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("vox-link-handler-\(suffix).app").path
+            let marker = root.appendingPathComponent("link-opened-\(suffix)").path
+            let register = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+            defer {
+                for app in NSRunningApplication.runningApplications(withBundleIdentifier: handlerID) {
+                    app.terminate()
+                }
+                _ = stager.run(["/usr/bin/python3", "-c", """
+                    import shutil, subprocess
+                    subprocess.run(["\(register)", "-u", "\(handler)"], capture_output=True)
+                    shutil.rmtree("\(handler)", ignore_errors=True)
+                    """], env: [:])
+            }
+            let linkSetup = stager.run(["/usr/bin/python3", "-c", """
+                import ctypes, json, os, pathlib, plistlib, subprocess, time
+                handler, marker = "\(handler)", pathlib.Path("\(marker)")
+                script = ('on open location incoming\\n'
+                          'set f to open for access POSIX file ' + json.dumps(str(marker)) + ' with write permission\\n'
+                          'set eof f to 0\\nwrite incoming to f\\nclose access f\\nend open location')
+                subprocess.run(["/usr/bin/osacompile", "-o", handler, "-e", script], check=True)
+                plist = pathlib.Path(handler) / "Contents/Info.plist"
+                with plist.open("rb") as f: data = plistlib.load(f)
+                data["CFBundleIdentifier"] = "\(handlerID)"
+                data["CFBundleURLTypes"] = [{"CFBundleURLName": "Vox proof", "CFBundleURLSchemes": ["\(scheme)"]}]
+                with plist.open("wb") as f: plistlib.dump(data, f)
+                subprocess.run(["/usr/bin/codesign", "--force", "--deep", "--sign", "-", handler], check=True)
+                subprocess.run(["\(register)", "-f", handler], check=True)
+                cf = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+                ls = ctypes.CDLL("/System/Library/Frameworks/CoreServices.framework/CoreServices")
+                cf.CFStringCreateWithCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]
+                cf.CFStringCreateWithCString.restype = ctypes.c_void_p
+                ls.LSSetDefaultHandlerForURLScheme.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+                ls.LSSetDefaultHandlerForURLScheme.restype = ctypes.c_int32
+                scheme = cf.CFStringCreateWithCString(None, b"\(scheme)", 0x08000100)
+                bundle = cf.CFStringCreateWithCString(None, b"\(handlerID)", 0x08000100)
+                status = ls.LSSetDefaultHandlerForURLScheme(scheme, bundle)
+                if status != 0: raise RuntimeError("could not set guest handler: " + str(status))
+                subprocess.run(["/usr/bin/open", "\(linkURL)"], check=True)
+                until = time.monotonic() + 20
+                while not marker.exists() and time.monotonic() < until: time.sleep(0.2)
+                if not marker.exists(): raise RuntimeError("the guest URL handler did not receive its premise")
+                marker.unlink()
+                print("ready")
+                """], env: [:])
+            guard linkSetup.status == 0, linkSetup.out.contains("ready") else {
+                throw Apparatus("the guest-only URL handler could not be staged: \(linkSetup.out.debugDescription)")
+            }
+            ui.activate()
+            let (streamHost, streamed) = try replayed("streaming", by: omp, linkURL: linkURL, httpURL: httpURL) {
+                guard progressVisible("IMAGE_PROGRESS_FIRST", within: 20) else {
+                    throw Apparatus("the stock streaming capture's first progress was not visible before Load")
+                }
+            }
+            let requested = try streamHost.command("requested 1 20", within: 25)
+            guard (requested["requested"] as? [String])?.isEmpty == false else {
+                throw Apparatus("the held image request was not staged: \(requested)")
+            }
+            func stage(_ step: String) throws {
+                let result = try streamHost.command(step, within: 35)
+                guard result["step"] as? String == step else {
+                    throw Apparatus("the streaming \(step) frame was not staged: \(result)")
+                }
+            }
+            try stage("advance")
+            guard progressVisible("IMAGE_PROGRESS_SECOND", within: 20) else {
+                throw Product("the app did not show the streamed second progress while its image was loading")
+            }
+            try stage("release")
+            guard media("session-media-image-", streamHost, "streaming",
+                        "a streamed progress update must not make the authorized in-flight image disappear") != nil else { return }
+            try stage("finish")
+            guard progressVisible("IMAGE_PROGRESS_FINAL", within: 20) else {
+                throw Product("the app did not show the streamed final tool outcome")
+            }
+            guard present(ui, Key.idPrefix("session-media-image-"), timeout: 20,
+                          "the loaded image must survive the streamed final") else {
+                throw Product("the app erased the authorized loaded image when new Session activity arrived")
+            }
+            print("[proof] FX-60 streamed activity: second progress while image in flight; final and loaded image both visible")
+            try stage("link")
+            // SwiftUI exposes inline links beneath the selectable text inside the row button.
+            // XCTest's `ui.links` query omits these descendants on macOS, even though the
+            // system AX tree exposes them. Find the named AXLink in the timeline and click
+            // its actual on-screen frame; do not activate the URL directly.
+            @discardableResult func clickTimelineTarget(_ title: String) throws -> CGRect {
+                guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: proofAppID)
+                    .first(where: { !$0.isTerminated }) else {
+                    throw Product("Vox exited before the peer link could be clicked")
+                }
+                let result = stager.run(["/usr/bin/python3", "-c", """
+                    import ctypes, json, time
+                    ax = ctypes.CDLL("/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices")
+                    cf = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+                    cf.CFStringCreateWithCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]
+                    cf.CFStringCreateWithCString.restype = ctypes.c_void_p
+                    cf.CFArrayGetCount.argtypes = [ctypes.c_void_p]
+                    cf.CFArrayGetCount.restype = ctypes.c_long
+                    cf.CFArrayGetValueAtIndex.argtypes = [ctypes.c_void_p, ctypes.c_long]
+                    cf.CFArrayGetValueAtIndex.restype = ctypes.c_void_p
+                    cf.CFGetTypeID.argtypes = [ctypes.c_void_p]
+                    cf.CFGetTypeID.restype = ctypes.c_ulong
+                    cf.CFStringGetTypeID.restype = ctypes.c_ulong
+                    cf.CFStringGetCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32]
+                    cf.CFStringGetCString.restype = ctypes.c_bool
+                    ax.AXUIElementCreateApplication.argtypes = [ctypes.c_int]
+                    ax.AXUIElementCreateApplication.restype = ctypes.c_void_p
+                    ax.AXUIElementSetMessagingTimeout.argtypes = [ctypes.c_void_p, ctypes.c_float]
+                    ax.AXUIElementCopyAttributeValue.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+                    ax.AXValueGetValue.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+                    ax.AXValueGetValue.restype = ctypes.c_bool
+                    class Point(ctypes.Structure):
+                        _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
+                    ax.CGEventCreateMouseEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint32, Point, ctypes.c_uint32]
+                    ax.CGEventCreateMouseEvent.restype = ctypes.c_void_p
+                    ax.CGEventCreateScrollWheelEvent2.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_int32, ctypes.c_int32, ctypes.c_int32]
+                    ax.CGEventCreateScrollWheelEvent2.restype = ctypes.c_void_p
+                    ax.CGEventSetLocation.argtypes = [ctypes.c_void_p, Point]
+                    ax.CGEventPost.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
+                    def name(s):
+                        return cf.CFStringCreateWithCString(None, s.encode(), 0x08000100)
+                    def get(element, attr):
+                        ax.AXUIElementSetMessagingTimeout(element, 2.0)
+                        value = ctypes.c_void_p()
+                        error = ax.AXUIElementCopyAttributeValue(element, name(attr), ctypes.byref(value))
+                        if error in (-25202, -25205, -25212): return None
+                        if error: raise RuntimeError("AX " + str(error))
+                        return value.value
+                    def text(value):
+                        if not value or cf.CFGetTypeID(value) != cf.CFStringGetTypeID(): return ""
+                        buf = ctypes.create_string_buffer(4096)
+                        return buf.value.decode() if cf.CFStringGetCString(value, buf, len(buf), 0x08000100) else ""
+                    def frame(element):
+                        p, s = Point(), Point()
+                        pos, size = get(element, "AXPosition"), get(element, "AXSize")
+                        if not pos or not size or not ax.AXValueGetValue(pos, 1, ctypes.byref(p)) or not ax.AXValueGetValue(size, 2, ctypes.byref(s)):
+                            return None
+                        return (p.x, p.y, s.x, s.y)
+                    def walk(element, limit):
+                        pending, found = [element], []
+                        while pending and len(found) < limit:
+                            item = pending.pop()
+                            found.append(item)
+                            children = get(item, "AXChildren")
+                            if children:
+                                pending.extend(cf.CFArrayGetValueAtIndex(children, i) for i in range(cf.CFArrayGetCount(children)))
+                        if pending: raise RuntimeError("AX traversal bound")
+                        return found
+                    try:
+                        app = ax.AXUIElementCreateApplication(\(app.processIdentifier))
+                        deadline = time.monotonic() + 30
+                        while time.monotonic() < deadline:
+                            nodes = walk(app, 4000)
+                            timeline = next((e for e in nodes if text(get(e, "AXIdentifier")) == "timeline"), None)
+                            if timeline:
+                                bounds = frame(timeline)
+                                links = [e for e in walk(timeline, 4000)
+                                         if text(get(e, "AXRole")) == "AXLink" and text(get(e, "AXTitle")) == "\(title)"]
+                                if len(links) > 1: raise RuntimeError("ambiguous timeline target")
+                                target = frame(links[0]) if links else None
+                                if bounds and target and target[2] > 0 and target[3] > 0:
+                                    x, y = target[0] + target[2] / 2, target[1] + target[3] / 2
+                                    bx, by, bw, bh = bounds
+                                    if bx <= x <= bx + bw and by <= y <= by + bh:
+                                        at = Point(x, y)
+                                        for kind in (1, 2):
+                                            ax.CGEventPost(0, ax.CGEventCreateMouseEvent(None, kind, at, 0))
+                                        print("clicked " + json.dumps(bounds))
+                                        break
+                                    direction = -200 if y > by + bh else 200
+                                    event = ax.CGEventCreateScrollWheelEvent2(None, 0, 1, direction, 0, 0)
+                                    ax.CGEventSetLocation(event, Point(bx + bw / 2, by + bh / 2))
+                                    ax.CGEventPost(0, event)
+                            time.sleep(0.5)
+                        else:
+                            print("missing")
+                    except RuntimeError as error:
+                        print(str(error))
+                    """], env: [:])
+                guard result.status == 0 else {
+                    throw Apparatus("the external peer-link click failed: \(result.out.debugDescription)")
+                }
+                guard let range = result.out.range(of: "clicked "),
+                      let data = String(result.out[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines).data(using: .utf8),
+                      let bounds = try? JSONSerialization.jsonObject(with: data) as? [Double], bounds.count == 4 else {
+                    throw Apparatus("the timeline target \(title) could not be located and clicked: \(result.out.debugDescription)")
+                }
+                return CGRect(x: bounds[0], y: bounds[1], width: bounds[2], height: bounds[3])
+            }
+            guard let controlURL = URL(string: httpURL),
+                  let browser = NSWorkspace.shared.urlForApplication(toOpen: controlURL),
+                  let browserID = Bundle(url: browser)?.bundleIdentifier else {
+                throw Apparatus("the HTTP control has no identifiable default browser")
+            }
+            expectedHTTPActivation = (browserID, Date().addingTimeInterval(15))
+            try clickTimelineTarget("safe-link")
+            let web = stager.run(["/usr/bin/python3", "-c", """
+                import pathlib, time
+                marker = pathlib.Path("\(httpMarker)")
+                until = time.monotonic() + 15
+                while not marker.exists() and time.monotonic() < until: time.sleep(0.2)
+                print(marker.read_text() if marker.exists() else "missing")
+                """], env: [:])
+            guard web.status == 0 else {
+                throw Apparatus("the guest HTTP handler result could not be read: \(web.out.debugDescription)")
+            }
+            guard web.out.contains("/vox-proof") else {
+                throw Product("the app did not open the peer's http link: \(web.out.debugDescription)")
+            }
+            guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == browserID else {
+                throw Apparatus("the HTTP control did not bring its expected browser to the foreground")
+            }
+            ui.activate()
+            guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == proofAppID else {
+                throw Apparatus("Vox did not regain the foreground after the HTTP control")
+            }
+            try clickTimelineTarget("unsafe-link")
+            let opened = stager.run(["/usr/bin/python3", "-c", """
+                import pathlib, time
+                marker = pathlib.Path("\(marker)")
+                until = time.monotonic() + 5
+                while not marker.exists() and time.monotonic() < until: time.sleep(0.2)
+                print("opened" if marker.exists() else "blocked")
+                """], env: [:])
+            guard opened.status == 0 else {
+                throw Apparatus("the guest URL handler result could not be read: \(opened.out.debugDescription)")
+            }
+            if opened.out.contains("opened") {
+                throw Product("the app opened a peer's non-http(s) link: \(opened.out.debugDescription)")
+            }
+            guard opened.out.contains("blocked") else {
+                throw Apparatus("the guest URL handler returned an unexpected result: \(opened.out.debugDescription)")
+            }
+            print("[proof] FX-60 peer custom-scheme link blocked after the guest handler premise succeeded")
+            // FX-60 removal floor, readmitted side: the streamed image was offered after
+            // media-returner's readmission reached it.
+            let (freshTag, freshEntry) = try mediaRecord(streamed)
+            let freshUntil = Date().addingTimeInterval(60)
+            var returnerFresh = try ask("media-returner", returner.env, freshTag, freshEntry)
+            while !returnerFresh.served && Date() < freshUntil {
+                Thread.sleep(forTimeInterval: 1)
+                returnerFresh = try ask("media-returner", returner.env, freshTag, freshEntry)
+            }
+            if returnerFresh.served {
+                // The same forward from media-returner has just been served, and never-removed
+                // alice is served the record offered before its removal right now: the old
+                // image's service is alive, so refusing media-returner that record is the owner's
+                // admission.
+                let aliceOld = try askOwner()
+                guard aliceOld.served else {
+                    throw Apparatus("positive control unmet: omp-owner's media service did not serve never-removed alice the record offered before media-returner's removal, so refusing media-returner that record cannot be attributed: \(aliceOld.said)")
+                }
+                let returnerStale = try ask("media-returner", returner.env, mediaTag, mediaEntry)
+                if returnerStale.served {
+                    XCTFail("PRODUCT: omp-owner's media service served readmitted media-returner the image record offered before its removal: \(returnerStale.said)")
+                }
+                print("[proof] FX-60 removal floor: readmitted media-returner, record offered after its readmission \(returnerFresh.said); never-removed alice, record offered before the removal \(aliceOld.said); readmitted media-returner, that record \(returnerStale.said)")
+            } else {
+                XCTFail("PRODUCT: omp-owner's media service refused readmitted media-returner, holding drive, the image record offered after its readmission for 60 s: \(returnerFresh.said)")
+            }
+            // These are stock OMP records captured while an actual background bash job ran,
+            // completed, and then a separate command failed. Release each only after the app
+            // has observed the prior state, rather than opening a preloaded completed capture.
+            ui.activate()
+            let (asyncHost, _) = try replayed("async-error", by: omp)
+            func rowShows(_ pieces: [String], within seconds: TimeInterval) -> Bool {
+                let until = Date().addingTimeInterval(seconds)
+                repeat {
+                    let rows = ui.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", "entry-row-"))
+                        .allElementsBoundByIndex
+                    for row in rows {
+                        let texts = row.descendants(matching: .staticText).allElementsBoundByIndex
+                            .map { ($0.value as? String) ?? $0.label }
+                        if pieces.allSatisfy({ piece in texts.contains(where: { $0.contains(piece) }) }) {
+                            return true
+                        }
+                    }
+                    Thread.sleep(forTimeInterval: 0.25)
+                } while Date() < until
+                return false
+            }
+            func asyncStage(_ name: String) throws {
+                let sent = try asyncHost.command(name, within: 35)
+                guard sent["step"] as? String == name else {
+                    throw Apparatus("the captured async \(name) stage was not sent: \(sent)")
+                }
+            }
+            guard rowShows(["Running async sleep command", "running"], within: 20) else {
+                throw Product("the app did not show the captured tool's initial running state")
+            }
+            try asyncStage("job")
+            guard rowShows(["bg_1", "running"], within: 20) else {
+                throw Product("the app did not show the streamed background job running")
+            }
+            try asyncStage("complete")
+            guard rowShows(["bg_1", "completed"], within: 20),
+                  rowShows(["Running async sleep command", "completed", "ASYNC_FINAL_PROOF"], within: 20) else {
+                throw Product("the app did not show the streamed background job and tool completion")
+            }
+            try asyncStage("error")
+            guard rowShows(["Running command that exits with an error", "error", "PROOF_ERROR_FAILURE"], within: 20) else {
+                throw Product("the app did not show the streamed tool failure as an error")
+            }
+            print("[proof] FX-60 streamed stock async running, completion and error visible in app")
+            let (unicodeHost, _) = try replayed("unicode", by: omp)
+            guard rowShows(["Calling proof_unicode", "running"], within: 20) else {
+                throw Product("the app did not show the Unicode tool before its result")
+            }
+            let unicodeSent = try unicodeHost.command("unicode", within: 35)
+            guard unicodeSent["step"] as? String == "unicode" else {
+                throw Apparatus("the captured Unicode result was not sent: \(unicodeSent)")
+            }
+            let fullUnicode = "UNICODE_BEGIN|" + String(repeating: "é漢🙂", count: 4000) + "|UNICODE_END"
+            let page1 = String(fullUnicode.prefix(4096))
+            let page2 = String(fullUnicode.dropFirst(4096).prefix(4096))
+            let page3 = String(fullUnicode.dropFirst(8192))
+            let untilUnicode = Date().addingTimeInterval(30)
+            var unicodeRow: XCUIElement?
+            repeat {
+                let rows = ui.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", "entry-row-"))
+                    .allElementsBoundByIndex
+                unicodeRow = rows.first { row in
+                    row.descendants(matching: .staticText).allElementsBoundByIndex
+                        .contains { (($0.value as? String) ?? $0.label) == page1 }
+                }
+                if unicodeRow == nil { Thread.sleep(forTimeInterval: 0.25) }
+            } while unicodeRow == nil && Date() < untilUnicode
+            guard let unicodeRow else { throw Product("the first Unicode page was not shown intact") }
+            for expectedPage in [page2, page3] {
+                let next = unicodeRow.buttons.matching(identifier: "Next").firstMatch
+                guard next.exists else { throw Product("the long Unicode result has no next page") }
+                if !inView(ui, next) { scrollTo(ui, next) }
+                guard inView(ui, next) else { throw Apparatus("the Unicode next-page control is outside the timeline") }
+                next.click()
+                let texts = unicodeRow.descendants(matching: .staticText).allElementsBoundByIndex
+                    .map { ($0.value as? String) ?? $0.label }
+                guard texts.contains(expectedPage) else {
+                    throw Product("a Unicode result page was clipped, altered, or out of order")
+                }
+            }
+            let disclosureUntil = Date().addingTimeInterval(20)
+            var disclosure: XCUIElement?
+            repeat {
+                disclosure = ui.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", "entry-row-"))
+                    .allElementsBoundByIndex.first { row in
+                        row.descendants(matching: .staticText).allElementsBoundByIndex
+                            .contains { (($0.value as? String) ?? $0.label) == "Tool details" }
+                    }
+                if disclosure == nil { Thread.sleep(forTimeInterval: 0.25) }
+            } while disclosure == nil && Date() < disclosureUntil
+            guard let disclosure else { throw Product("the Unicode tool's details disclosure is missing") }
+            let detailsButton = disclosure.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", "entry-details-")).firstMatch
+            guard detailsButton.exists else { throw Product("the Unicode tool's details cannot be opened") }
+            if !inView(ui, detailsButton) { scrollTo(ui, detailsButton) }
+            guard inView(ui, detailsButton) else { throw Apparatus("Unicode details control is outside the timeline") }
+            detailsButton.click()
+            let fullDetails = "    details:\n      {\"text\":\"" + fullUnicode + "\"}\n"
+            let detailPages = stride(from: 0, to: fullDetails.count, by: 4096).map { offset in
+                String(fullDetails.dropFirst(offset).prefix(4096))
+            }
+            for (index, expectedPage) in detailPages.enumerated() {
+                let text = disclosure.descendants(matching: .staticText)
+                    .matching(NSPredicate(format: "identifier BEGINSWITH %@", "entry-details-text-")).firstMatch
+                guard text.waitForExistence(timeout: 10), ((text.value as? String) ?? text.label) == expectedPage else {
+                    throw Product("Unicode details page \(index + 1) was clipped, altered, or out of order")
+                }
+                if index + 1 < detailPages.count {
+                    let next = disclosure.buttons.matching(identifier: "Next").firstMatch
+                    guard next.exists else { throw Product("the long Unicode details have no next page") }
+                    if !inView(ui, next) { scrollTo(ui, next) }
+                    guard inView(ui, next) else { throw Apparatus("Unicode details next-page control is outside the timeline") }
+                    next.click()
+                }
+            }
+            print("[proof] FX-60 stock Unicode details shown intact across app pages")
+            print("[proof] FX-60 stock Unicode result shown intact across three app pages")
+            let partialSent = try unicodeHost.command("partial", within: 35)
+            guard partialSent["step"] as? String == "partial" else {
+                throw Apparatus("the captured assistant partial was not sent: \(partialSent)")
+            }
+            guard rowShows(["proof_unicode_response"], within: 20) else {
+                throw Product("the app did not show the captured assistant partial before its empty final")
+            }
+            let emptySent = try unicodeHost.command("empty-final", within: 35)
+            guard emptySent["step"] as? String == "empty-final" else {
+                throw Apparatus("the captured empty assistant final was not sent: \(emptySent)")
+            }
+            let emptyUntil = Date().addingTimeInterval(20)
+            while rowShows(["proof_unicode_response"], within: 0) && Date() < emptyUntil {
+                Thread.sleep(forTimeInterval: 0.25)
+            }
+            guard !rowShows(["proof_unicode_response"], within: 0) else {
+                throw Product("the app retained the assistant partial after its captured empty final")
+            }
+            print("[proof] FX-60 captured empty final cleared the observed assistant partial")
+            let (cancelHost, _) = try replayed("cancel", by: omp)
+            guard rowShows(["Calling proof_cancel", "running", "CANCEL_RUNNING"], within: 20) else {
+                throw Product("the app did not show the cancellable tool's running progress")
+            }
+            let cancelSent = try cancelHost.command("cancel", within: 35)
+            guard cancelSent["step"] as? String == "cancel" else {
+                throw Apparatus("the captured cancellation was not sent: \(cancelSent)")
+            }
+            guard rowShows(["Calling proof_cancel", "cancelled", "CANCELLED_BY_OPERATOR"], within: 20) else {
+                throw Product("the app did not show the streamed tool cancellation")
+            }
+            print("[proof] FX-60 stock tool cancellation visible after running progress")
+            if selectedStep == "omp-image" {
+                print("[proof] selected omp-image step complete; other Sessions flows NOT RUN")
+                return
+            }
+        }
 
         if selectedStep.isEmpty {
             let s1Read = { self.run(vox, ["room", "session", "--node", "alice", "--json", room, s1], env: voxEnv).out }
