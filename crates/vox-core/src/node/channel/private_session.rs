@@ -606,6 +606,9 @@ pub(super) struct PrivateSessions {
     legacy_work: Option<LegacyWork>,
     restoring: bool,
     floor_replay_done: bool,
+    // The basis of the last complete correction sweep of this node's retained Session floors:
+    // its floor revision, the removal generation and each swept recipient's membership start.
+    floor_sweep: Option<(u64, u64, Vec<(Digest32, u64)>)>,
     restore_after: Option<u64>,
     pending_active: bool,
     pending_after: Option<u64>,
