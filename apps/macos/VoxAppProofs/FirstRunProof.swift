@@ -8377,16 +8377,25 @@ final class FirstRunProof: XCTestCase {
                                     "--identity-passphrase-file", davePass], env: daveEnv)
         try stagedTrustChange(vox, ["trust", "remove", "--node", "alice", daveFp,
                                     "--identity-passphrase-file", alicePass], env: voxEnv)
+        // A Session stays listed once its node takes drive back, saying `can_drive: false`
+        // (session_projection query, ADR-029 CL-3): withdrawn is no row still driveable.
+        func driveCurrent(_ out: String) -> Bool {
+            out.split(separator: "\n").contains { line in
+                guard let data = String(line).data(using: .utf8),
+                      let row = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return false }
+                return row["id"] as? String == privateSession && row["can_drive"] as? Bool != false
+            }
+        }
         let withdrawnUntil = Date().addingTimeInterval(90)
         var afterWithdrawal = "", withdrawalStatus: Int32 = -1
         while Date() < withdrawnUntil {
             let result = run(vox, ["room", "sessions", "--node", "alice", captionRoom, "--json"], env: voxEnv)
             afterWithdrawal = result.out
             withdrawalStatus = result.status
-            if withdrawalStatus == 0 && !afterWithdrawal.contains(privateSession) { break }
+            if withdrawalStatus == 0 && !driveCurrent(afterWithdrawal) { break }
             Thread.sleep(forTimeInterval: 0.5)
         }
-        guard withdrawalStatus == 0 && !afterWithdrawal.contains(privateSession) else {
+        guard withdrawalStatus == 0 && !driveCurrent(afterWithdrawal) else {
             throw Apparatus("Dave's withdrawn Drive still appears current to Alice: \(afterWithdrawal)")
         }
         tap(ui, Key.id("room-mission"), "switch while the old private caption is held")
@@ -9210,6 +9219,21 @@ final class FirstRunProof: XCTestCase {
                 let reached: () -> Bool
                 if case .menuItem = key { reached = { e.isHittable } } else { reached = { self.inView(ui, e) } }
                 if !reached() { scrollTo(ui, e) }
+                if !reached() {
+                    // Notification Center's container while a banner shows can take XCTest's hit
+                    // point from a target already in view: waited out as below, never clicked through.
+                    let at = CGPoint(x: e.frame.midX, y: e.frame.midY)
+                    let clearBy = Date().addingTimeInterval(20)
+                    while !reached(), systemOverlayOver(at, targetHittable: e.isHittable) != nil, Date() < clearBy {
+                        Thread.sleep(forTimeInterval: 0.5)
+                    }
+                    if !reached(), let held = systemOverlayOver(at, targetHittable: e.isHittable) {
+                        keepTree(ui, "a system window covered \(what)")
+                        XCTFail("APPARATUS: \(held) covered \(what) (\(key)) for 20 s; not Vox's, and left alone",
+                                file: file, line: line)
+                        return false
+                    }
+                }
                 if reached() {
                     // A notification banner, or the screenshot overlay (the person may be taking
                     // a screenshot), over the click's point would take the click: waited out, as
@@ -9261,16 +9285,17 @@ final class FirstRunProof: XCTestCase {
         return view.minY <= f.minY && f.maxY <= view.maxY
     }
 
-    /// The window's scroll view that holds `e` on `e`'s own surface. XCTest lists a sheet among
-    /// the descendants of the scroll view it was presented from (Settings' Add Computer), and the
-    /// sheet covers that scroll view: one holding `e` only through a sheet does not hold it.
+    /// The window's scroll view that holds `e` on `e`'s own surface. XCTest lists Settings' Add
+    /// Computer sheet among the descendants of the Settings scroll view it was presented from
+    /// (no Sheet element between them), and the sheet covers that scroll view wholly: XCTest
+    /// finds no hit point in it. One with no hit point is not where `e` is seen or scrolled.
     private func holder(_ ui: XCUIApplication, of e: XCUIElement) -> XCUIElement? {
         let f = e.frame
         let id = e.identifier
         return ui.windows.firstMatch.scrollViews.allElementsBoundByIndex.first(where: {
             $0.frame.minX <= f.midX && f.midX <= $0.frame.maxX
-                && (id.isEmpty || ($0.descendants(matching: .any).matching(identifier: id).firstMatch.exists
-                    && !$0.sheets.containing(.any, identifier: id).firstMatch.exists))
+                && (id.isEmpty || $0.descendants(matching: .any).matching(identifier: id).firstMatch.exists)
+                && $0.isHittable
         })
     }
 

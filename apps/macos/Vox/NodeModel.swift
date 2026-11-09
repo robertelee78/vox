@@ -1065,8 +1065,12 @@ final class NodeModel: ObservableObject {
         individualTrustFacts[fingerprint] = IndividualTrustFact(allowed: nil, reason: "Checking whether individual trust can be changed…")
         do {
             let fact = try await client.individualTrustEligibility(fingerprint: fingerprint)
-            guard individualTrustReads[fingerprint] == request, generation == roomReadGeneration, epoch == nodeObservationEpoch, ended == nil, !Task.isCancelled else { return false }
-            individualTrustFacts[fingerprint] = IndividualTrustFact(allowed: fact.canManageIndividualTrust, reason: fact.reason)
+            guard generation == roomReadGeneration, epoch == nodeObservationEpoch, ended == nil, !Task.isCancelled else { return false }
+            // The background refresh may read the same node meanwhile: only the newest read
+            // publishes, but this answer is as current and decides the person's own action.
+            if individualTrustReads[fingerprint] == request {
+                individualTrustFacts[fingerprint] = IndividualTrustFact(allowed: fact.canManageIndividualTrust, reason: fact.reason)
+            }
             guard fact.canManageIndividualTrust else {
                 let refused = Outcome(operation: operation, kind: .refused, words: fact.reason)
                 outcomes[operation] = refused
@@ -1075,8 +1079,10 @@ final class NodeModel: ObservableObject {
             }
             return true
         } catch {
-            guard individualTrustReads[fingerprint] == request, generation == roomReadGeneration, epoch == nodeObservationEpoch, ended == nil, !Task.isCancelled else { return false }
-            individualTrustFacts[fingerprint] = IndividualTrustFact(allowed: nil, reason: sentence(error))
+            guard generation == roomReadGeneration, epoch == nodeObservationEpoch, ended == nil, !Task.isCancelled else { return false }
+            if individualTrustReads[fingerprint] == request {
+                individualTrustFacts[fingerprint] = IndividualTrustFact(allowed: nil, reason: sentence(error))
+            }
             report(error, operation: operation)
             return false
         }
