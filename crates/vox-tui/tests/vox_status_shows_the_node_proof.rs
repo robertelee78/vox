@@ -415,6 +415,90 @@ fn ready_and_locked_are_the_states_a_person_sees() {
     eprintln!("[proof] Ready/Locked in CLI status/list, TUI and hook; no-passphrase Lock/Forget stayed Ready");
 }
 
+/// An unrelated unavailable machine inventory cannot erase a selected node's status (#960).
+#[test]
+#[ignore = "real binaries and production Argon2id; run in release"]
+fn status_survives_another_nodes_unavailable_anchor_inventory() {
+    watchdog::arm();
+    let scratch = StatusNodes(tempfile::tempdir().expect("APPARATUS: status scratch root"));
+    let dir = scratch.0.path();
+    std::fs::create_dir_all(dir.join("home")).expect("APPARATUS: scratch HOME");
+    let run = |args: &[&str], input: &str| {
+        let (ok, out, err) = node_command(dir, args, input);
+        assert!(ok, "PRODUCT: vox {args:?} failed: {out}{err}");
+        out
+    };
+    for name in ["private", "broken-status-witness"] {
+        run(
+            &["node", "create", name, "--passphrase-file", "-"],
+            "private passphrase\n",
+        );
+    }
+    run(
+        &[
+            "node",
+            "create",
+            "free",
+            "--passphrase-file",
+            "-",
+            "--listen",
+            "127.0.0.1:0",
+        ],
+        "\n",
+    );
+    // Test-side apparatus: a detached node's unsupported display cache elicits the same
+    // machine-inventory refusal as an attached room without its observation. No authority
+    // state is changed, and every verdict below comes from the real vox command.
+    let cache = dir.join("nodes/broken-status-witness/anchor-inventory.cbor");
+    std::fs::write(&cache, [0x82, 0x00, 0x80])
+        .expect("APPARATUS: stage unsupported scratch inventory");
+    let (ok, out, err) = node_command(dir, &["anchor", "list"], "");
+    assert!(
+        !ok && format!("{out}{err}").contains("broken-status-witness"),
+        "APPARATUS: unavailable inventory staging was not observable: {out}{err}"
+    );
+    for (node, want) in [("free", "Ready"), ("private", "Locked")] {
+        let out = run(&["status", "--node", node, "--json"], "");
+        let report: Value = serde_json::from_str(&out).expect("PRODUCT: status was not JSON");
+        assert_eq!(
+            report["status"], want,
+            "PRODUCT: inventory refusal erased {node}'s status: {report}"
+        );
+        assert!(
+            report.get("anchors") == Some(&Value::Null)
+                && report["anchor_inventory_error"]
+                    .as_str()
+                    .is_some_and(|e| e.contains("broken-status-witness")),
+            "PRODUCT: unavailable inventory looked complete or lost its cause: {report}"
+        );
+        let text = run(&["status", "--node", node], "");
+        assert!(
+            text.contains(want)
+                && text.contains("broken-status-witness")
+                && !text.contains("healthy: nothing needs attention"),
+            "PRODUCT: status hid its inventory refusal or claimed unqualified health: {text}"
+        );
+    }
+    let (ok, out, err) = node_command(dir, &["anchor", "list"], "");
+    assert!(
+        !ok && format!("{out}{err}").contains("broken-status-witness"),
+        "PRODUCT: anchor list silently accepted incomplete inventory: {out}{err}"
+    );
+    // Repair only the disposable display cache, without restarting or unlocking anything.
+    std::fs::write(&cache, [0x82, 0x01, 0x80]).expect("APPARATUS: repair scratch inventory");
+    run(&["anchor", "list"], "");
+    for (node, want) in [("free", "Ready"), ("private", "Locked")] {
+        let out = run(&["status", "--node", node, "--json"], "");
+        let report: Value = serde_json::from_str(&out).expect("PRODUCT: status was not JSON");
+        assert!(
+            report["status"] == want
+                && report["anchors"].is_array()
+                && report.get("anchor_inventory_error").is_none(),
+            "PRODUCT: repaired inventory did not recover without restart: {report}"
+        );
+    }
+}
+
 #[test]
 #[ignore = "real binaries, production Argon2id and a PoW; run in release"]
 fn vox_status_shows_rooms_peers_tunnels_udp_flows_and_what_is_unhealthy() {

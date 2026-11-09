@@ -2158,19 +2158,44 @@ pub async fn serve(stream: &mut UnixStream, handle: &NodeHandle) -> Result<()> {
 /// # Errors
 /// If the node cannot be reached, does not answer in time, or answers something else.
 pub async fn request(at: &crate::node::ipc::NodeSocket) -> Result<String> {
-    tokio::time::timeout(crate::node::ipc::ANSWER_WITHIN, async {
-        let report = ask(at).await?;
-        let mut value: serde_json::Value =
-            serde_json::from_str(&report).map_err(|_| Error::MalformedIpc("ipc status JSON"))?;
-        let anchors = request_anchors(at).await?;
-        // Retain the selected node's dial scope as diagnostics; the primary list is
-        // this daemon's complete manual and saved-room inventory (ADR-032 AN-12).
-        value["node_anchors"] = value["anchors"].take();
-        value["anchors"] = serde_json::Value::Array(anchors.iter().map(|a| a.to_json()).collect());
-        Ok(value.to_string())
-    })
-    .await
-    .map_err(|_| crate::node::ipc::silent())?
+    let deadline = tokio::time::Instant::now() + crate::node::ipc::ANSWER_WITHIN;
+    let report = tokio::time::timeout_at(deadline, ask(at))
+        .await
+        .map_err(|_| crate::node::ipc::silent())??;
+    let mut value: serde_json::Value =
+        serde_json::from_str(&report).map_err(|_| Error::MalformedIpc("ipc status JSON"))?;
+    // Retain the selected node's dial scope as diagnostics; the primary list is
+    // this daemon's complete manual and saved-room inventory (ADR-032 AN-12).
+    value["node_anchors"] = value["anchors"].take();
+    let anchors = tokio::time::timeout_at(deadline, request_anchors(at))
+        .await
+        .unwrap_or_else(|_| Err(anchor_inventory_timeout()));
+    set_anchor_inventory(&mut value, anchors);
+    Ok(value.to_string())
+}
+
+/// Add machine inventory or its actual refusal without discarding a node's status.
+pub fn set_anchor_inventory(
+    report: &mut serde_json::Value,
+    anchors: Result<Vec<crate::node::daemonipc::AnchorInfo>>,
+) {
+    match anchors {
+        Ok(anchors) => {
+            report["anchors"] =
+                serde_json::Value::Array(anchors.iter().map(|a| a.to_json()).collect());
+        }
+        Err(error) => {
+            report["anchors"] = serde_json::Value::Null;
+            report["anchor_inventory_error"] = error.to_string().into();
+        }
+    }
+}
+
+fn anchor_inventory_timeout() -> Error {
+    Error::Path {
+        op: "read machine anchors",
+        detail: "the daemon's anchor inventory did not answer in time".to_owned(),
+    }
 }
 
 /// Read the daemon's anchor inventory without selecting or unlocking a node.
@@ -2198,7 +2223,7 @@ pub async fn request_anchors(
         }
     })
     .await
-    .map_err(|_| crate::node::ipc::silent())?
+    .map_err(|_| anchor_inventory_timeout())?
 }
 
 async fn ask(at: &crate::node::ipc::NodeSocket) -> Result<String> {

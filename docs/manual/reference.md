@@ -1,6 +1,6 @@
 # Commands and local state
 
-Applies to Vox v0.4.5.
+Applies to Vox v0.4.22.
 
 This page lists the terms this manual uses, Vox's commands, how a command picks its node, the files Vox keeps, how
 passphrases are given, and the terminal interface's keys. `vox --help`, and `--help` on any
@@ -40,7 +40,7 @@ command, give the exact arguments of the `vox` you run. `vox man` prints the sam
 | Run the daemon in a terminal | `vox daemon` | nothing: unlocking a node starts one |
 | Run an anchor | `vox node`, with no subcommand | a headless node |
 | Rooms and messages | `vox room list`, `create`, `link`, `join`, `roster`, `post`, `read`, `tail`, `rename`, `retention`, `admin`, `leave`, `end` | a Ready node |
-| What the node is doing | `vox status`, `vox status --json` | a Ready node |
+| What the node is doing | `vox status`, `vox status --json` | a saved node; Locked nodes report their state without unlocking |
 | Your fingerprint | `vox id` | |
 | Trust | `vox trust add`, `list`, `offers`, `dismiss`, `rename`, `remove`, `drive`, `read` | a compared fingerprint; the passphrase, typed at a terminal, for a change |
 | Share a service | `vox serve`, `vox service add`, `list`, `remove` | a running local service |
@@ -261,6 +261,13 @@ gateway
 `asked …: none answered` means no router granted a mapping. The daemon renews a mapping before it
 lapses and deletes each one when it stops. `vox status --json` carries the same, and the last
 network change under `network_changed`.
+
+Status remains available when another node's saved anchor inventory cannot be read. Its JSON
+`anchors` is the complete machine inventory; `node_anchors` retains a Ready node's own dial
+scope. If the machine inventory is unavailable, `anchors` is `null` and
+`anchor_inventory_error` gives the actual cause. Human status shows that cause rather than an
+unqualified healthy verdict. An unavailable inventory is neither an empty complete list nor
+evidence that the daemon did not answer. `vox anchor list` still refuses an incomplete inventory.
 
 The top-level JSON field `full_flushes` counts successful store-backend `sync_data` calls across
 the daemon process, including all its nodes, database opening/recovery and temporary rewrite

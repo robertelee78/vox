@@ -1,6 +1,6 @@
 # Troubleshooting by symptom
 
-Applies to Vox v0.4.21.
+Applies to Vox v0.4.22.
 
 Find the message or behaviour you see, then follow its steps. Each entry says what the symptom
 means, what to check, how to fix it, and how to confirm the fix.
@@ -120,7 +120,7 @@ In v0.4.20, interrupted key-package preparation could leave a room closed with
 `key-package attempt unacknowledged`, and the app could omit that underlying reason.
 This is not, by itself, evidence that retained messages were deleted.
 
-**Fix:** install v0.4.21 or later and restart Vox with the same profile. Interrupted package
+**Fix:** install v0.4.22 or later and restart Vox with the same profile. Interrupted package
 selection retries from its unchanged durable position; authentication and acknowledgement
 checks still apply. Do not delete the room, leave and rejoin, reset the node or regrant trust
 to bypass this failure. A remaining refusal is shown with its actual cause; keep that reason
@@ -128,6 +128,24 @@ and the daemon log when [getting help](getting-help.md).
 
 **Confirm:** the affected room shows its retained messages and accepts a new post. Other rooms
 remain usable while one room is Preparing or refused.
+
+## Status reports an unavailable anchor inventory
+
+**Symptoms:** `vox status --node <name>` reports the selected node's state alongside an anchor
+inventory error. Before v0.4.22, another node's incomplete inventory could instead make this
+command fail with misleading daemon-nonresponse wording.
+
+**Meaning:** the selected node answered, but the daemon cannot provide a complete machine-wide
+anchor list. This does not make the selected identity Locked or prove that the machine has no
+anchors.
+
+**Fix:** use v0.4.22 or later to retain the node's status and the actual inventory refusal.
+Keep that refusal and the daemon log when [getting help](getting-help.md). Do not reset an
+identity or delete a room merely to make status run.
+
+**Confirm:** human status and `--json` retain the selected node's Ready or Locked state. An
+unavailable JSON inventory is `anchors: null` with `anchor_inventory_error`, not an empty array.
+`vox anchor list` still refuses until the underlying inventory problem is resolved.
 
 ## I cannot join a room
 

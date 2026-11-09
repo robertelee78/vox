@@ -29,14 +29,14 @@ pub async fn status(paths: &Paths, json: bool) -> Result<(), AppError> {
         .iter()
         .find(|n| n.name == name && n.status != Some(NodeStatus::Ready))
     {
-        let anchors = vox_core::node::status::request_anchors(&at)
-            .await
-            .map_err(|e| crate::client::said(&at, e))?;
-        let value = serde_json::json!({
+        let mut value = serde_json::json!({
             "node": name.as_str(), "status": info.status.map(|s| s.as_str()),
             "identity": info.fingerprint.map(|f| vox_core::node::link::b32_encode(&f)),
-            "anchors": anchors.iter().map(|a| a.to_json()).collect::<Vec<_>>(),
         });
+        vox_core::node::status::set_anchor_inventory(
+            &mut value,
+            vox_core::node::status::request_anchors(&at).await,
+        );
         if json {
             println!("{value}");
         } else {
@@ -134,6 +134,9 @@ fn ago(now_ms: u64, v: &Value) -> String {
 fn render_anchors(v: &Value) -> String {
     use std::fmt::Write as _;
     let mut o = String::new();
+    if let Some(error) = v["anchor_inventory_error"].as_str() {
+        let _ = writeln!(o, "anchor inventory unavailable: {error}");
+    }
     for a in v["anchors"].as_array().into_iter().flatten() {
         let sources = a["sources"]
             .as_array()
@@ -225,7 +228,9 @@ fn render(v: &Value) -> Result<String, AppError> {
     );
     let unhealthy = arr("unhealthy");
     if unhealthy.is_empty() {
-        let _ = writeln!(o, "healthy: nothing needs attention");
+        if v["anchor_inventory_error"].as_str().is_none() {
+            let _ = writeln!(o, "healthy: nothing needs attention");
+        }
     } else {
         let _ = writeln!(o, "UNHEALTHY:");
         for u in unhealthy {
