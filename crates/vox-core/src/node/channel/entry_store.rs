@@ -3286,6 +3286,14 @@ impl View<'_, '_> {
     pub(crate) fn sparse_enabled(&self) -> bool {
         self.directory.active.sparse.enabled
     }
+    /// The author's published contiguous prefix: every sequence through it is held.
+    pub(crate) fn published_through(&self, author: &Digest32) -> u64 {
+        self.directory
+            .restart
+            .as_ref()
+            .and_then(|restart| restart.feeds.get(author))
+            .map_or(0, |feed| feed.seq)
+    }
     pub(crate) fn log_id(&self, hash: &Digest32) -> Result<Option<u64>> {
         Ok(self
             .transaction

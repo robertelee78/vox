@@ -1223,9 +1223,12 @@ impl PendingText {
                         last_ms: Some(entry.skeleton.claimed_ms),
                         back: None,
                     });
+                    let prior = state.last;
                     state.last = (entry.skeleton.seq, presence.body.here);
                     state.last_ms = Some(entry.skeleton.claimed_ms);
-                    if presence.body.here {
+                    // Own admission moves only on a return after a stated leave, as every member
+                    // reads it; a sender-key rotation's `here` statement is not a return.
+                    if presence.body.here && !prior.1 && prior.0 < entry.skeleton.seq {
                         state.back = Some((entry.skeleton.seq, entry.skeleton.claimed_ms));
                     }
                     let mut index = self.entries.write(&mut batch, sek, &self.room)?;
@@ -1341,9 +1344,10 @@ impl PendingText {
                 last_ms: Some(entry.skeleton.claimed_ms),
                 back: None,
             });
+            let prior = state.last;
             state.last = (seq, presence.body.here);
             state.last_ms = Some(entry.skeleton.claimed_ms);
-            if presence.body.here {
+            if presence.body.here && !prior.1 && prior.0 < seq {
                 state.back = Some((seq, self.now_millis));
             }
             self.presence = Some(state);
