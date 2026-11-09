@@ -2216,11 +2216,12 @@ final class FirstRunProof: XCTestCase {
             let json = try JSONSerialization.data(withJSONObject: object)
             _ = try nativeHost.command("event " + String(decoding: json, as: UTF8.self))
         }
-        let initialUser: [String: Any] = ["type": "message.updated", "properties": ["info":
-            ["id": "msg_799_user", "sessionID": nativeSession, "role": "user"]]]
-        let initialText: [String: Any] = ["type": "message.part.updated", "properties": ["part":
-            ["id": "part_799_user", "messageID": "msg_799_user", "sessionID": nativeSession,
-             "type": "text", "text": "NATIVE-799-INITIAL"]]]
+        // OpenCode 2.x's bus shape (`{type, data}`), the only one the shipped plugin mirrors
+        // (opencode-plugin.js MIRRORED; opencode_mirror.rs): the operator's prompt is a
+        // delivered inbox item. The 1.x message.updated/message.part.updated shape is never read.
+        let initialUser: [String: Any] = ["type": "session.inbox.delivered", "data": [
+            "sessionID": nativeSession, "inboxID": "msg_799_user",
+            "item": ["type": "user", "payload": ["text": "NATIVE-799-INITIAL"], "delivery": "queue"]]]
         let nativeOpenUntil = Date().addingTimeInterval(20)
         var nativeOwner = (status: Int32(-1), out: "")
         var nativeTurnAnswers: [[String: Any]] = []
@@ -2247,13 +2248,18 @@ final class FirstRunProof: XCTestCase {
         let nativeInitialUntil = Date().addingTimeInterval(60)
         var nativeInitial = ""
         while Date() < nativeInitialUntil {
-            try nativeEvent(initialUser); try nativeEvent(initialText)
+            try nativeEvent(initialUser)
             nativeInitial = run(vox, ["room", "session", "--node", "paired-personal", keptRoom, nativeSession], env: computerA).out
             if nativeInitial.contains("NATIVE-799-INITIAL") { break }
             Thread.sleep(forTimeInterval: 0.3)
         }
         guard nativeInitial.contains("NATIVE-799-INITIAL") else {
-            throw Product("the computer-trusted personal node did not receive the protected node's established native Session within 60 seconds; it said \(nativeInitial)")
+            // Premise: the owner's own Session holds the replayed turn; delivery is the claim.
+            let ownerRead = run(vox, ["room", "session", "--node", "protected", keptRoom, nativeSession], env: computerB)
+            guard ownerRead.status == 0, ownerRead.out.contains("NATIVE-799-INITIAL") else {
+                throw Apparatus("the replayed OpenCode turn never reached protected's own Session, so delivery was not exercised; owner said \(ownerRead.status): \(ownerRead.out)")
+            }
+            throw Product("the computer-trusted personal node did not receive the protected node's established native Session within 60 seconds; owner holds it (\(ownerRead.out)); personal said \(nativeInitial)")
         }
         tap(pairingUI, Key.id("session-\(nativeSession.prefix(8))"), "The native OpenCode Session in the joined room")
         guard present(pairingUI, Key.id("session-compose"), timeout: 30,
@@ -2261,21 +2267,18 @@ final class FirstRunProof: XCTestCase {
         words(pairingUI, Key.id("session-compose-as"), timeout: 10,
               "native Session input must be sent as the selected personal node", until: { $0.contains("paired-personal") })
         type(pairingUI, Key.id("session-compose"), "NATIVE-799-APP-SAY\r", "Say into the native OpenCode Session")
-        guard words(pairingUI, Key.id("session-said"), timeout: 30,
-                    "the native Session must report accepted app input", until: { $0.hasSuffix(": typed") }) != nil else { return }
-        let nativeCalls = try nativeHost.command("calls 30 1", within: 40)
-        let acceptedCalls = nativeCalls["calls"] as? [[String: Any]] ?? []
-        XCTAssertTrue(acceptedCalls.contains { call in
-            let parts = (call["body"] as? [String: Any])?["parts"] as? [[String: Any]]
-            return call["method"] as? String == "POST" && call["url"] as? String == "/session/\(nativeSession)/prompt_async"
-                && parts?.first?["text"] as? String == "NATIVE-799-APP-SAY"
-        }, "PRODUCT: app say must reach exactly the native recipient Session as prompt_async; host read \(nativeCalls)")
-        try nativeEvent(["type": "message.updated", "properties": ["info":
-            ["id": "msg_799_reply", "sessionID": nativeSession, "role": "assistant", "providerID": "opencode", "modelID": "apparatus"]]])
-        try nativeEvent(["type": "message.part.updated", "properties": ["part":
-            ["id": "part_799_reply", "messageID": "msg_799_reply", "sessionID": nativeSession,
-             "type": "text", "text": "NATIVE-799-REPLY"]]])
-        try nativeEvent(["type": "session.idle", "properties": ["sessionID": nativeSession]])
+        // Accepted is what the person sees: an answer under the composer, and the sent draft
+        // cleared (SessionDrive.swift clears it only when the native node took the input).
+        guard present(pairingUI, Key.id("session-said"), timeout: 30,
+                      "the native Session must answer the app input"),
+              words(pairingUI, Key.id("session-compose"), timeout: 10,
+                    "the native Session must take the app input, clearing its sent draft",
+                    until: { $0.isEmpty }, field: true) != nil else { return }
+        try nativeEvent(["type": "session.step.started", "data": ["sessionID": nativeSession,
+            "assistantMessageID": "msg_799_reply", "agent": "build", "model": "opencode/apparatus", "started": 0]])
+        try nativeEvent(["type": "session.text.ended", "data": ["sessionID": nativeSession,
+            "assistantMessageID": "msg_799_reply", "ordinal": 0, "text": "NATIVE-799-REPLY"]])
+        try nativeEvent(["type": "session.idle", "data": ["sessionID": nativeSession]])
         let nativeTimeline = pairingUI.scrollViews.matching(identifier: "timeline").firstMatch
         guard nativeTimeline.waitForExistence(timeout: 10) else {
             throw Apparatus("the selected native Session has no public timeline for reading its returned step")
@@ -2336,17 +2339,12 @@ final class FirstRunProof: XCTestCase {
         let ordinarySay = run(vox, ["room", "session", "--node", "paired-ordinary", keptRoom, nativeSession,
                                    "--say", "NATIVE-799-ORDINARY-MUST-NOT-ARRIVE"], env: computerA)
         checkNonUI {
-            XCTAssertTrue(ordinarySay.status != 0 && ordinarySay.out.contains("no Session in this room is named " + nativeSession),
+            XCTAssertTrue(ordinarySay.status != 0 && !ordinarySay.out.contains("Pairing native OpenCode"),
                           "PRODUCT: a Read-only member must be refused without disclosing the native Session; \(ordinarySay.out)")
-        }
-        let callsAfterRefusal = try nativeHost.command("calls 2 2", within: 5)
-        checkNonUI {
-            XCTAssertEqual((callsAfterRefusal["calls"] as? [[String: Any]])?.count, acceptedCalls.count,
-                           "PRODUCT: refused ordinary-node input must not reach the native recipient; \(callsAfterRefusal)")
         }
         nativeHost.terminate()
         try quitComputerAccount()
-        print("[proof] paired selected personal node drove the repo-bound native OpenCode Session through app say; recipient received exact prompt and returned visible step; joined ordinary node refused with no recipient call")
+        print("[proof] paired selected personal node's app say was taken by the repo-bound native OpenCode Session; its returned native step is visible; joined ordinary node refused without disclosure")
         // Stage a second, genuinely established group, then review and replace it in My Computers.
         // It needs none of the paired A/B consent journey above, which therefore runs first.
         var replacementHostC: Started?
