@@ -805,10 +805,12 @@ impl Flow {
                     // A resumed archive Entry may have a durably complete body but no room
                     // effect yet. Re-enter its local admission instead of asking the donor
                     // for an empty suffix and parking an unchanged request.
-                    operation: if matches!(&query, Query::Entry { .. }) {
-                        Operation::ResumeWire(query)
-                    } else {
-                        Operation::Wire(query)
+                    operation: match query {
+                        // A resumed durable page can have delivered its last body before
+                        // its terminal checkpoint. Finish locally; no zero-entry wire page.
+                        Query::Page { entries: 0, .. } => Operation::FinishArchive,
+                        query @ Query::Entry { .. } => Operation::ResumeWire(query),
+                        query => Operation::Wire(query),
                     },
                 });
                 tasks
@@ -886,6 +888,63 @@ impl Flow {
         self.tasks.push(task);
         Ok(())
     }
+    /// Serve one exact prerequisite without waiting for this retained Public root to end.
+    /// Do not cover a retained body owner: it must reclaim the shared slot before
+    /// another request on this stack can fetch a Control body.
+    pub(crate) fn prepend_required(
+        &mut self,
+        head: Digest32,
+        seq: u64,
+        owner: RequestId,
+    ) -> Result<bool> {
+        if self.service != OutboundService::Public
+            || self.archive
+            || self.automatic_own_recovery
+            || self.own_recovery_cleanup
+            || self.key_body_root.is_some()
+            || self.local_own_root()
+            || self.departure_probe
+            || self.route_origin.is_some()
+            || self.required_root.is_some()
+            || self.required_owner_request.is_some()
+            || self.authorization_changed
+            || self.publication_wait
+            || self.byte_pressure.is_some()
+            || self.owners.iter().any(Option::is_some)
+            || self.tasks.len() >= MAX_TASKS
+            || self.tasks.iter().chain(self.replay.iter()).any(|task| {
+                matches!(
+                    task.operation,
+                    Operation::Local(LocalStep::Entry {
+                        phase: EntryPhase::Prepare(_)
+                            | EntryPhase::Commit(_)
+                            | EntryPhase::Cleanup(_),
+                        ..
+                    })
+                )
+            })
+        {
+            return Ok(false);
+        }
+        let request = request_id()?;
+        self.push(Task {
+            request,
+            purpose: Purpose::Control,
+            operation: Operation::Local(LocalStep::Entry {
+                request,
+                head,
+                seq,
+                body: false,
+                role_header: false,
+                phase: EntryPhase::Start,
+            }),
+        })?;
+        self.required_root = Some((head, seq));
+        self.required_owner_request = Some(owner);
+        self.waiting = false;
+        Ok(true)
+    }
+
     /// Move this Flow's exact durable publication owner to the top of its bounded LIFO stack.
     /// An owner outside the retained task/replay set belongs to another Flow and is untouched.
     fn prioritize_publication_owner(&mut self, owner: RequestId) -> bool {
@@ -1091,7 +1150,9 @@ impl Flow {
                 return Ok(false);
             }
             if let Some(hint) = self.hint.filter(|hint| {
-                self.hint_peer == source.peer && (hint.author != author || hint.head != head)
+                self.required_root.is_none()
+                    && self.hint_peer == source.peer
+                    && (hint.author != author || hint.head != head)
             }) {
                 let Some(hint_scope) = source
                     .transient_scope(job, self.room, hint.author, self.availability_connection)
@@ -3455,7 +3516,28 @@ impl Flow {
                     })?,
                     LocalProof::Busy => {
                         self.push(task)?;
+                        *retry_task = None;
+                        // A local proof can meet a publication owned by another flow.
+                        // Retain its causal wake just as for a local wire admission.
+                        let readiness = source.publication_readiness(job).await?;
                         self.waiting = true;
+                        self.publication_owner_wait = None;
+                        if let Lookup::Found(readiness) = readiness {
+                            let readiness = readiness.value;
+                            if !readiness.busy {
+                                self.waiting = false;
+                            } else if readiness
+                                .owner
+                                .is_some_and(|owner| self.prioritize_publication_owner(owner))
+                            {
+                                self.publication_wait = false;
+                                self.waiting = false;
+                            } else {
+                                self.publication_wait = readiness.owner.is_some();
+                                self.publication_owner_wait = readiness.owner;
+                                self.slot_wait = Some(readiness.wake);
+                            }
+                        }
                     }
                 }
             }
@@ -3493,7 +3575,11 @@ impl Flow {
                             ..
                         } | LocalStep::Control { .. }
                     );
-                    if !self.archive && result.need.is_some() && rederive {
+                    if !self.archive
+                        && self.required_root.is_none()
+                        && result.need.is_some()
+                        && rederive
+                    {
                         // Keep the oldest exact root in the scalar replay slot. Once that slot is
                         // occupied, retain each nested continuation on the existing bounded task
                         // stack: the dependency pushed below executes first, then the exact entry
@@ -3546,6 +3632,11 @@ impl Flow {
                     self.published = true;
                     self.rendered |= result.rendered;
                     self.governance |= result.governance;
+                    if matches!(step, LocalStep::Entry { head, seq, .. }
+                        if self.required_root == Some((head, seq)))
+                    {
+                        self.required_root = None;
+                    }
                     if self.stage(task.purpose).is_some() {
                         self.push(Task {
                             operation: Operation::Reclaim(task.purpose),
@@ -3943,39 +4034,38 @@ impl Flow {
                 if active.matches(snapshot.state())
                     && snapshot.state().body.is_none()
                     && !snapshot.state().reclaiming()
+                    && (next.is_some() || snapshot.state().remaining == 0)
                 {
-                    if let Some(next) = next {
-                        // This branch ends More/Complete, so it never needs a subsequent
-                        // pause. Prepay only its work and single reload before the commit.
-                        let work = demand::AdmissionCharge::reserve(&job)?;
-                        let reload = demand::AdmissionCharge::reserve(&job)?;
-                        let state = snapshot.state();
-                        let cursor = (next >= state.bounds.lo && state.remaining > 0).then_some(
-                            super::Continuation {
-                                query_kind: 4,
-                                head: state.bounds.head,
-                                lo: state.bounds.lo,
-                                hi: state.bounds.hi,
-                                next_seq: next,
-                                entry: None,
-                                offset: 0,
-                                entries_remaining: state.remaining,
-                            },
-                        );
-                        demand::checkpoint_precharged(
-                            &staging.context,
-                            &mut active,
-                            if cursor.is_some() {
-                                demand::Progress::More
-                            } else {
-                                demand::Progress::Complete
-                            },
-                            cursor.as_ref(),
-                            &work,
-                        )?;
-                        snapshot = demand::inspect_precharged(&staging.context, reload)?
-                            .ok_or(Error::Profile("archive state missing"))?;
-                    }
+                    // This branch ends More/Complete, so it never needs a subsequent
+                    // pause. Prepay only its work and single reload before the commit.
+                    let work = demand::AdmissionCharge::reserve(&job)?;
+                    let reload = demand::AdmissionCharge::reserve(&job)?;
+                    let state = snapshot.state();
+                    let cursor = next
+                        .filter(|next| *next >= state.bounds.lo && state.remaining > 0)
+                        .map(|next| super::Continuation {
+                            query_kind: 4,
+                            head: state.bounds.head,
+                            lo: state.bounds.lo,
+                            hi: state.bounds.hi,
+                            next_seq: next,
+                            entry: None,
+                            offset: 0,
+                            entries_remaining: state.remaining,
+                        });
+                    demand::checkpoint_precharged(
+                        &staging.context,
+                        &mut active,
+                        if cursor.is_some() {
+                            demand::Progress::More
+                        } else {
+                            demand::Progress::Complete
+                        },
+                        cursor.as_ref(),
+                        &work,
+                    )?;
+                    snapshot = demand::inspect_precharged(&staging.context, reload)?
+                        .ok_or(Error::Profile("archive state missing"))?;
                 }
                 if snapshot.state().progress(Some(&active)) == demand::Progress::Pending {
                     let work = demand::AdmissionCharge::reserve(&job)?;
