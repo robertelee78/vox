@@ -15,6 +15,17 @@ pub(super) struct Serving {
     binding: Digest32,
 }
 
+/// One image request naming this node's own sealed Session record: admitted only for the
+/// exact `omp-media` record of `tag` and `media`, and only if the private serving rule below
+/// would give `peer` that record now (#1171). Produces no page bytes.
+pub(crate) struct MediaAdmission {
+    pub(crate) peer: Digest32,
+    pub(crate) hash: Digest32,
+    pub(crate) holder: bool,
+    pub(crate) tag: String,
+    pub(crate) media: crate::node::shares::media::Binding,
+}
+
 impl ChannelState {
     pub(crate) fn prepare_pending_private_page(
         &mut self,
@@ -57,9 +68,68 @@ impl ChannelState {
             Work::Serve(serving),
         )
     }
+
+    /// The same room/peer preconditions as [`Self::prepare_pending_private_page`].
+    pub(crate) fn prepare_pending_private_admission(
+        &mut self,
+        store: &Arc<Store>,
+        owner: Arc<()>,
+        admission: MediaAdmission,
+    ) -> Result<Box<PendingUpgrade>> {
+        self.require_governance_ready(store, crate::time::Ms(self.now_hint))?;
+        if self.poisoned
+            || self.needs_session_upgrade()
+            || !self.private_peer_current(store, &admission.peer)?
+        {
+            return Err(Error::StreamRefused("private Session room unavailable"));
+        }
+        self.index_session_floors(store)?;
+        self.prepare_private_component(
+            store,
+            owner,
+            crate::time::Ms(self.now_hint),
+            false,
+            Work::Admit(admission),
+        )
+    }
 }
 
 impl PendingUpgrade {
+    /// Serve's `permitted` conjunction for one exact own record (removal generation, removed
+    /// members, unexpired, drive holder, unchanged per-recipient `permitted_to`), plus the
+    /// record's binding to the image. OMP media is only ever sealed as a private-proof record
+    /// (`PendingSession` via `Record::new`); a legacy public entry is never this image's.
+    pub(super) fn admit(
+        &self,
+        store: &Store,
+        sek: &Sek,
+        admission: &MediaAdmission,
+    ) -> Result<bool> {
+        governance::check_removal_generation(store, sek, &self.room, self.removal_generation)?;
+        if !admission.holder
+            || self.removed.contains(&admission.peer)
+            || self.removed.contains(&self.me)
+        {
+            return Ok(false);
+        }
+        let Some(id) = private_index::find(&store.snapshot()?, sek, &self.room, &admission.hash)?
+        else {
+            return Ok(false);
+        };
+        let Some(saved) = self.at(store, sek, id)? else {
+            return Ok(false);
+        };
+        let bound = saved.record.hash() == admission.hash
+            && saved.record.legacy_entry().is_none()
+            && saved.record.message.header.author_id == self.me
+            && !expired(&saved, self.now, self.retention)
+            && saved.row.as_ref().is_some_and(|row| {
+                row.entry_hash == admission.hash
+                    && admission.media.names(row, &self.me, &admission.tag)
+            });
+        Ok(bound && self.permitted_to(store, sek, &saved.record, &admission.peer)?)
+    }
+
     pub(super) fn serve(&mut self, store: &Store, sek: &Sek, serving: Serving) -> Result<Page> {
         let Serving {
             ask,

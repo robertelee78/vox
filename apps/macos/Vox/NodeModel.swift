@@ -639,6 +639,33 @@ final class NodeModel: ObservableObject {
     var hasNewerTimeline: Bool { showingSession ? sessionPages.hasNewer : roomHasNewer }
     @Published private var sessionPages = SessionPages()
     var sessionEntries: [FfiSessionEntry] { sessionPages.entries }
+    @Published private var sessionMediaRevision = UUID()
+    @Published private(set) var sessionMediaChecking = false
+    private var sessionMediaCheck = UUID()
+    private var sessionMediaRead = UUID()
+    /// Images belong to the selected room view, its authority and the saved room instance.
+    var sessionMediaScope: String {
+        "\(me)/\(roomOnScreen ?? "")/\(roomReadGeneration)/\(nodeObservationEpoch)/\(roomViewGeneration)/\(shownSession?.nodeFingerprint ?? "")/\(shownSession?.sessionId ?? "")/\(shownSession?.opening ?? "")/\(shownSession?.canDrive == true)/\(shownSession?.open == true)/\(sessionMediaRevision)/\(sessionPages.instance?.base64EncodedString() ?? "")"
+    }
+
+    func sessionMedia(room: String, session: FfiSession, entry: String) async throws -> Data {
+        let scope = sessionMediaScope
+        guard roomOnScreen == room, let shown = shownSession, shown.canDrive, shown.open,
+              shown.nodeFingerprint == session.nodeFingerprint, shown.sessionId == session.sessionId,
+              shown.opening == session.opening, let instance = sessionPages.instance,
+              sessionEntries.contains(where: { $0.id == entry && $0.media?.available == true }) else {
+            throw VoxError.Failed(reason: "The Session image is no longer available.")
+        }
+        let bytes = try await client.sessionMedia(room: room, node: session.nodeFingerprint,
+            sessionId: session.sessionId, opening: session.opening, entry: entry, instance: instance)
+        guard sessionMediaScope == scope, roomOnScreen == room, shownSession?.canDrive == true,
+              shownSession?.opening == session.opening,
+              sessionEntries.contains(where: { $0.id == entry && $0.media?.available == true }),
+              !Task.isCancelled else {
+            throw VoxError.Failed(reason: "The Session or image changed while loading.")
+        }
+        return bytes
+    }
     /// A notification may point to a request before the newest page. It is shown separately,
     /// without reading every transcript entry between it and the newest page.
     @Published private(set) var selectedEarlierRequest: FfiSessionEntry?
@@ -4471,6 +4498,7 @@ extension NodeModel {
                 sessionPages = pages
                 sessionWindowRevision = UUID()
             }
+            sessionMediaRead = UUID()
             if heldActivityMissing {
                 // The exact read authorized only the survivors. Its result cannot repair
                 // the old paging cursor or silently move a pinned reader to newest.
@@ -4730,12 +4758,22 @@ extension NodeModel {
 
     /// A Session in `room` opened, ended or was renamed, or what waits on this node changed.
     fileprivate func sessionsChanged(in room: String) async {
-        // A drive revocation uses this same change signal. Drop private wording before
-        // any suspension; bounded reads may restore it afterward.
+        // The same signal covers ordinary activity and authority changes. Hide media while
+        // revalidating, but retain it across an ordinary update; failed revalidation discards it.
+        let check = UUID(), view = roomViewGeneration
+        var validated = false
         if roomOnScreen == room {
+            sessionMediaCheck = check
+            sessionMediaChecking = true
             invalidateSessionPause()
             invalidateSessionAttention()
             clearPrivateJoinCaptions()
+        }
+        defer {
+            if sessionMediaCheck == check {
+                if !validated && roomViewGeneration == view { sessionMediaRevision = UUID() }
+                sessionMediaChecking = false
+            }
         }
         let epoch = nodeObservationEpoch
         let count = try? await client.sessionsWaiting(room: room)
@@ -4751,7 +4789,11 @@ extension NodeModel {
         guard epoch == nodeObservationEpoch, !Task.isCancelled, roomOnScreen == room else { return }
         await readSelectedSessionMetadata()
         guard epoch == nodeObservationEpoch, !Task.isCancelled, roomOnScreen == room else { return }
+        let before = sessionMediaRead
         await readSession()
+        validated = roomOnScreen == room && roomViewGeneration == view && selectedSessionMetadataKnown
+            && shownSession?.canDrive == true && shownSession?.open == true
+            && sessionPages.instance != nil && sessionMediaRead != before
     }
 
     /// Drive a Session (ADR-029 DR-1), for the Session view's controls (SessionDrive.swift).

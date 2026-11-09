@@ -100,6 +100,13 @@ struct SessionPages: Equatable {
         if let drive = entry.drive {
             size += drive.operation.utf8.count + drive.by.utf8.count
         }
+        if let presentation = entry.presentation {
+            size += presentation.heading.utf8.count + presentation.status.utf8.count + presentation.body.utf8.count
+            if let job = presentation.job { size += job.id.utf8.count + job.kind.utf8.count }
+        }
+        if let media = entry.media {
+            size += media.entry.utf8.count + media.mime.utf8.count
+        }
         if let file = entry.file {
             size += file.name.utf8.count + file.sha256.utf8.count + file.entry.utf8.count
             size += file.pulledPath?.utf8.count ?? 0

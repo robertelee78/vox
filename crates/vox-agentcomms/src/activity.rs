@@ -149,20 +149,33 @@ impl<A> Entry<A> {
     }
 }
 
+fn mark_incomplete<A>(entry: &mut Entry<A>) {
+    let field = big_field(entry.kind());
+    if let Some(Value::String(text)) = entry.fields.get_mut(field) {
+        text.push_str("\n[Incomplete activity: one or more parts are unavailable]");
+    }
+    entry.fields.insert("incomplete".into(), json!(true));
+    entry.fields.insert("complete".into(), json!(false));
+    if entry.fields.contains_key("status") {
+        entry.fields.insert("status".into(), json!("incomplete"));
+    }
+}
+
 /// `rows` (author, body), one Session's entries in order, as entries: the parts of a split entry
 /// joined by (author, kind, ref, occurrence). A body that is not a JSON object is skipped.
 #[must_use]
 pub fn join<'a, A: Ord + Clone + 'a>(
     rows: impl IntoIterator<Item = (A, &'a str)>,
 ) -> Vec<Entry<A>> {
+    type OpenParts<A> = BTreeMap<(A, String, String, String), (usize, u64, u64, bool)>;
     let mut out: Vec<Entry<A>> = Vec::new();
     // An occurrence keeps later observations of a reused request ref separate.
-    let mut open: BTreeMap<(A, String, String, String), usize> = BTreeMap::new();
+    let mut open: OpenParts<A> = BTreeMap::new();
     for (author, body) in rows {
         let Ok(Value::Object(fields)) = serde_json::from_str::<Value>(body) else {
             continue;
         };
-        let e = Entry { author, fields };
+        let mut e = Entry { author, fields };
         let Some((i, n)) = e.part() else {
             out.push(e);
             continue;
@@ -174,22 +187,44 @@ pub fn join<'a, A: Ord + Clone + 'a>(
             e.str("occurrence").to_owned(),
         );
         let field = big_field(e.kind());
-        match open.get(&key) {
-            Some(&at) if i > 1 => {
+        let strict = e.fields.get("omp").and_then(Value::as_bool) == Some(true);
+        match open.get(&key).copied() {
+            Some((at, next, total, true)) if i > 1 && (!strict || i != next || n != total) => {
+                mark_incomplete(&mut out[at]);
+                open.remove(&key);
+                mark_incomplete(&mut e);
+                out.push(e);
+            }
+            Some((at, _, _, is_strict)) if i > 1 => {
                 let more = e.str(field).to_owned();
                 if let Some(Value::String(s)) = out[at].fields.get_mut(field) {
                     s.push_str(&more);
                 }
                 if i >= n {
                     open.remove(&key);
+                } else if let Some(state) = open.get_mut(&key) {
+                    state.1 = i.saturating_add(1);
+                }
+                if is_strict && i > n {
+                    mark_incomplete(&mut out[at]);
                 }
             }
             _ => {
-                if n > 1 {
-                    open.insert(key, out.len());
+                if let Some((at, _, _, true)) = open.remove(&key) {
+                    mark_incomplete(&mut out[at]);
+                }
+                if strict && (i != 1 || n == 0 || i > n) {
+                    mark_incomplete(&mut e);
+                } else if n > 1 {
+                    open.insert(key, (out.len(), 2, n, strict));
                 }
                 out.push(e);
             }
+        }
+    }
+    for (_, (at, _, _, strict)) in open {
+        if strict {
+            mark_incomplete(&mut out[at]);
         }
     }
     out

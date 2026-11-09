@@ -36,6 +36,9 @@ use crate::node::paths::Paths;
 /// The envelope type a share is announced with.
 pub const FILE: &str = "file";
 
+/// Bounded, on-demand Session image transfer.
+pub mod media;
+
 /// How long a post into a room just joined waits for its first sync (V210-164), as
 /// `vox room post` does.
 const POST_PATIENCE: Duration = Duration::from_secs(30);

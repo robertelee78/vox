@@ -43,6 +43,47 @@ pub struct Line {
     pub request: Option<RequestLine>,
     /// Correlated OMP Drive delivery, when this is an attributed Drive operation.
     pub drive: Option<DriveLine>,
+    /// Structured OMP tool or job presentation, distinct from raw disclosure.
+    pub presentation: Option<PresentationLine>,
+    /// An OMP image offer, fetched only through the Session's authorized service.
+    pub media: Option<MediaLine>,
+}
+
+/// Readable semantic content for a native tool or job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PresentationLine {
+    /// Intent or tool name.
+    pub heading: String,
+    /// Native operation status.
+    pub status: String,
+    /// Text content; Markdown, code and diffs remain text, not protocol JSON.
+    pub body: String,
+    /// Typed async-job metadata, when this card represents a job.
+    pub job: Option<JobLine>,
+}
+
+/// Native async-job identity and timing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobLine {
+    /// Native job id.
+    pub id: String,
+    /// Native job type.
+    pub kind: String,
+    /// Native start timestamp.
+    pub started: Option<u64>,
+    /// Native end timestamp, if known.
+    pub ended: Option<u64>,
+}
+
+/// A bounded image offer; the entry identity is its access-checked handle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaLine {
+    /// Declared image MIME.
+    pub mime: String,
+    /// Declared byte count.
+    pub size: u64,
+    /// Whether a Session-scoped service was offered.
+    pub available: bool,
 }
 
 /// Delivery evidence for one scoped OMP Drive operation.
@@ -377,7 +418,7 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
             asked.insert(b.reference().to_owned());
         }
         match b.kind() {
-            "tool-done" => {
+            "tool-done" | "omp-message-update" => {
                 done.insert(b.reference().to_owned(), i);
             }
             "drive" if !b.str("id").is_empty() => {
@@ -403,14 +444,90 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
         let mut file = None;
         let mut request = None;
         let mut drive = None;
+        let mut presentation = None;
+        let mut media = None;
         let mut waiting = None;
         let text = match b.kind() {
             "user" => {
-                details.push(("typed".into(), b.str("text").to_owned()));
-                format!("typed at the terminal: {}", one_line(b.str("text")))
+                let text = if b.fields.get("omp").and_then(Value::as_bool) == Some(true) {
+                    done.get(b.reference())
+                        .map_or(b.str("text"), |&i| bodies[i].str("text"))
+                } else {
+                    b.str("text")
+                };
+                if b.fields.get("omp").and_then(Value::as_bool) == Some(true) {
+                    let current = done.get(b.reference()).map_or(b, |&i| &bodies[i]);
+                    presentation = Some(PresentationLine {
+                        heading: "User".into(),
+                        status: (if current.fields.get("incomplete").and_then(Value::as_bool)
+                            == Some(true)
+                            || b.fields.get("incomplete").and_then(Value::as_bool) == Some(true)
+                        {
+                            "incomplete"
+                        } else if current.fields.get("complete").and_then(Value::as_bool)
+                            == Some(true)
+                        {
+                            "complete"
+                        } else {
+                            "streaming"
+                        })
+                        .into(),
+                        body: text.to_owned(),
+                        job: None,
+                    });
+                }
+                if presentation.is_none() {
+                    details.push(("typed".into(), text.to_owned()));
+                }
+                format!("typed at the terminal: {}", one_line(text))
             }
             "tool" if asked.contains(b.reference()) && !done.contains_key(b.reference()) => {
                 continue
+            }
+            "tool" if b.fields.get("omp").and_then(Value::as_bool) == Some(true) => {
+                let head = b.str("summary");
+                if !b.str("input").is_empty() {
+                    details.push(("arguments".into(), b.str("input").to_owned()));
+                }
+                let outcome = done.get(b.reference()).map(|&i| &bodies[i]);
+                let incomplete = b.fields.get("incomplete").and_then(Value::as_bool) == Some(true)
+                    || outcome.is_some_and(|d| {
+                        d.fields.get("incomplete").and_then(Value::as_bool) == Some(true)
+                    });
+                let status = if incomplete {
+                    "incomplete"
+                } else {
+                    outcome.map_or_else(
+                        || {
+                            if b.str("status").is_empty() {
+                                "running"
+                            } else {
+                                b.str("status")
+                            }
+                        },
+                        |d| d.str("status"),
+                    )
+                };
+                let body = outcome.map_or("", |d| d.str("output"));
+                presentation = Some(PresentationLine {
+                    heading: head.to_owned(),
+                    status: status.to_owned(),
+                    body: body.to_owned(),
+                    job: (!b.str("job_id").is_empty()).then(|| JobLine {
+                        id: b.str("job_id").to_owned(),
+                        kind: b.str("job_type").to_owned(),
+                        started: b.fields.get("started").and_then(Value::as_u64),
+                        ended: outcome
+                            .and_then(|d| d.fields.get("ended").and_then(Value::as_u64))
+                            .or_else(|| b.fields.get("ended").and_then(Value::as_u64)),
+                    }),
+                });
+                let suffix = if body.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — {}", one_line(body))
+                };
+                format!("{head} [{status}]{suffix}")
             }
             "tool" => {
                 details.push(("input".into(), b.str("input").to_owned()));
@@ -433,10 +550,39 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
                 }
             }
             // Drawn on its call's line.
-            "tool-done" | "resolved" => continue,
+            "tool-done" | "omp-message-update" | "resolved" => continue,
             "reply" => {
-                details.push(("reply".into(), b.str("text").to_owned()));
-                format!("reply: {}", one_line(b.str("text")))
+                let text = if b.fields.get("omp").and_then(Value::as_bool) == Some(true) {
+                    done.get(b.reference())
+                        .map_or(b.str("text"), |&i| bodies[i].str("text"))
+                } else {
+                    b.str("text")
+                };
+                if b.fields.get("omp").and_then(Value::as_bool) == Some(true) {
+                    let current = done.get(b.reference()).map_or(b, |&i| &bodies[i]);
+                    presentation = Some(PresentationLine {
+                        heading: "Assistant".into(),
+                        status: (if current.fields.get("incomplete").and_then(Value::as_bool)
+                            == Some(true)
+                            || b.fields.get("incomplete").and_then(Value::as_bool) == Some(true)
+                        {
+                            "incomplete"
+                        } else if current.fields.get("complete").and_then(Value::as_bool)
+                            == Some(true)
+                        {
+                            "complete"
+                        } else {
+                            "streaming"
+                        })
+                        .into(),
+                        body: text.to_owned(),
+                        job: None,
+                    });
+                }
+                if presentation.is_none() {
+                    details.push(("reply".into(), text.to_owned()));
+                }
+                format!("reply: {}", one_line(text))
             }
             "turn-end" => "— turn ended —".to_owned(),
             "approval" => {
@@ -654,6 +800,28 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
                 }
                 format!("not delivered to {label}: {}", b.str("why"))
             }
+            "omp-reset" => b.str("text").to_owned(),
+            "omp-disclosure" => {
+                details.push(("details".into(), b.str("text").to_owned()));
+                if b.fields.get("incomplete").and_then(Value::as_bool) == Some(true) {
+                    "Tool details (incomplete)".to_owned()
+                } else {
+                    "Tool details".to_owned()
+                }
+            }
+            "omp-media" => {
+                let available = !b.str("tag").is_empty();
+                media = Some(MediaLine {
+                    mime: b.str("mime").to_owned(),
+                    size: b.fields.get("size").and_then(Value::as_u64).unwrap_or(0),
+                    available,
+                });
+                if available {
+                    format!("Image available ({})", b.str("mime"))
+                } else {
+                    format!("Image unavailable: {}", b.str("unavailable"))
+                }
+            }
             _ => "(unknown activity)".to_owned(),
         };
         out.push(Line {
@@ -664,6 +832,8 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
             text: format!("{prefix}{text}"),
             details,
             drive,
+            presentation,
+            media,
             reference: b.reference().to_owned(),
             waiting,
             file,
@@ -680,6 +850,19 @@ pub fn details_text(line: &Line) -> String {
     let mut s = String::new();
     for (label, body) in &line.details {
         s.push_str(&format!("    {label}:\n"));
+        for l in body.lines() {
+            s.push_str("      ");
+            s.push_str(l);
+            s.push('\n');
+        }
+    }
+    if let Some(body) = line
+        .presentation
+        .as_ref()
+        .map(|p| p.body.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        s.push_str("    content:\n");
         for l in body.lines() {
             s.push_str("      ");
             s.push_str(l);

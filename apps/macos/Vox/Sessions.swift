@@ -2,6 +2,7 @@
 // General is the room conversation; ended Sessions are reached from the row's menu.
 
 import AppKit
+import ImageIO
 import SwiftUI
 
 /// What the room's timeline shows: its conversation, a selected tag, or one Session by node and id.
@@ -263,7 +264,21 @@ struct SessionEntryRow: View {
             // the row is selected like a message (P14), the request as the one ⌥⌘Y and ⌥⌘N act
             // on (P1), and neither takes the other's place.
             VStack(alignment: .leading, spacing: Space.s4 * scale) {
-                if entry.kind == "tool" {
+                if let presentation = entry.presentation {
+                    HStack(alignment: .firstTextBaseline, spacing: Space.s8 * scale) {
+                        Text(presentation.heading).fontWeight(.semibold).textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        Text(presentation.status).secondaryText()
+                        if !fullContent && !entry.details.isEmpty { detailsButton }
+                    }
+                    if let job = presentation.job {
+                        Text("\(job.kind) · \(job.id)").secondaryText().textSelection(.enabled)
+                    }
+                    if !presentation.body.isEmpty {
+                        PagedSemanticText(text: presentation.body, markdown: entry.kind != "tool")
+                            .accessibilityIdentifier("entry-content-\(entry.id)")
+                    }
+                } else if entry.kind == "tool" {
                     HStack(alignment: .firstTextBaseline, spacing: Space.s8 * scale) {
                         summary.lineLimit(1)
                             .frame(maxWidth: .infinity, alignment: .leading)
@@ -272,7 +287,7 @@ struct SessionEntryRow: View {
                 } else {
                     summary
                 }
-                if fullContent && !entry.details.isEmpty {
+                if fullContent && entry.presentation == nil && !entry.details.isEmpty {
                     // Approval Details are the tool's input; replies and questions are prose.
                     Text(entry.details).voxFont(entry.kind == "approval"
                         ? VoxTokens.Fonts.appMono : VoxTokens.Fonts.appText)
@@ -297,12 +312,20 @@ struct SessionEntryRow: View {
                     }
                 }
             }
+            if let media = entry.media {
+                SessionMediaView(model: model, room: room, session: session, media: media)
+            }
             if !fullContent && !entry.details.isEmpty {
-                if entry.kind != "tool" { detailsButton }
+                if entry.presentation == nil && entry.kind != "tool" { detailsButton }
                 if details {
-                    Text(entry.details).voxFont(VoxTokens.Fonts.appMono).secondaryText().textSelection(.enabled)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .accessibilityIdentifier("entry-details-text-\(entry.id)")
+                    if entry.presentation != nil || entry.kind == "omp-disclosure" {
+                        PagedSemanticText(text: entry.details, markdown: false)
+                            .accessibilityIdentifier("entry-details-text-\(entry.id)")
+                    } else {
+                        Text(entry.details).voxFont(VoxTokens.Fonts.appMono).secondaryText().textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .accessibilityIdentifier("entry-details-text-\(entry.id)")
+                    }
                 }
             }
         }
@@ -319,6 +342,116 @@ struct SessionEntryRow: View {
         Button(details ? "Hide details" : "Details") { details.toggle() }
             .buttonStyle(.borderless).fixedSize()
             .accessibilityIdentifier("entry-details-\(entry.id)")
+    }
+}
+
+/// Bounded, Unicode-safe pages preserve all native text without rendering code. Markdown is
+/// inline only, its line breaks kept; a link opens only if it is http or https.
+private struct PagedSemanticText: View {
+    let text: String
+    let markdown: Bool
+    @State private var page = 0
+    private let pageCharacters = 4096
+    private var pages: Int { max(1, (text.count + pageCharacters - 1) / pageCharacters) }
+    private var segment: String {
+        let start = text.index(text.startIndex, offsetBy: min(page * pageCharacters, text.count))
+        let end = text.index(start, offsetBy: pageCharacters, limitedBy: text.endIndex) ?? text.endIndex
+        return String(text[start..<end])
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if markdown, let rendered = try? AttributedString(
+                markdown: segment,
+                options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+            ) {
+                Text(rendered).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                    .environment(\.openURL, OpenURLAction { url in
+                        ["http", "https"].contains(url.scheme?.lowercased() ?? "") ? .systemAction : .discarded
+                    })
+            } else {
+                Text(segment).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+            }
+            if pages > 1 {
+                HStack {
+                    Button("Previous") { page = max(0, page - 1) }.disabled(page == 0)
+                    Text("Page \(page + 1) of \(pages)").secondaryText()
+                    Button("Next") { page = min(pages - 1, page + 1) }.disabled(page + 1 >= pages)
+                }
+            }
+        }
+        .onChange(of: text) { _ in page = min(page, pages - 1) }
+    }
+}
+
+/// Images are fetched only on demand through the Session-authorized media service.
+private struct SessionMediaView: View {
+    @ObservedObject var model: NodeModel
+    let room: String
+    let session: FfiSession
+    let media: FfiSessionMedia
+    @State private var image: NSImage?
+    @State private var loading = false
+    @State private var error: String?
+
+    var body: some View {
+        VStack(alignment: .leading) {
+            if model.sessionMediaChecking {
+                ProgressView("Checking image access…")
+            } else if let image {
+                Image(nsImage: image).resizable().scaledToFit()
+                    .frame(maxWidth: 640, maxHeight: 480)
+                    .accessibilityLabel("Session image")
+                    .accessibilityIdentifier("session-media-image-\(media.entry)")
+            } else if media.available {
+                Button(loading ? "Loading image…" : "Load image") { load() }.disabled(loading)
+                    .accessibilityIdentifier("session-media-load-\(media.entry)")
+            } else {
+                Text("Image unavailable").secondaryText()
+                    .accessibilityIdentifier("session-media-unavailable-\(media.entry)")
+            }
+            if let error, !model.sessionMediaChecking {
+                Text(error).secondaryText().textSelection(.enabled)
+                    .accessibilityIdentifier("session-media-error-\(media.entry)")
+            }
+        }
+        .onChange(of: model.sessionMediaScope) { _ in image = nil; error = nil }
+        .onChange(of: media.available) { available in
+            if !available { image = nil; error = nil }
+        }
+        .onDisappear { image = nil }
+    }
+
+    private func load() {
+        guard !loading else { return }
+        loading = true
+        error = nil
+        let scope = model.sessionMediaScope
+        Task {
+            defer { loading = false }
+            do {
+                let bytes = try await model.sessionMedia(room: room, session: session, entry: media.entry)
+                guard scope == model.sessionMediaScope else { return }
+                guard let source = CGImageSourceCreateWithData(bytes as CFData, nil),
+                      let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+                      let width = properties[kCGImagePropertyPixelWidth] as? Int,
+                      let height = properties[kCGImagePropertyPixelHeight] as? Int,
+                      width > 0, height > 0, width <= 4096, height <= 4096,
+                      width * height <= 16_000_000,
+                      let decoded = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                        kCGImageSourceCreateThumbnailFromImageAlways: true,
+                        kCGImageSourceThumbnailMaxPixelSize: 2048,
+                        kCGImageSourceShouldCacheImmediately: true
+                      ] as CFDictionary), scope == model.sessionMediaScope else {
+                    error = "Image is unsupported or exceeds display bounds."
+                    return
+                }
+                image = NSImage(cgImage: decoded, size: .zero)
+            } catch {
+                guard scope == model.sessionMediaScope else { return }
+                self.error = "Image unavailable: \(sentence(error))"
+            }
+        }
     }
 }
 

@@ -18,6 +18,11 @@ pub(super) enum Kind {
     ToolDone,
     Drive,
     DriveResult,
+    OmpMessage,
+    OmpMessageUpdate,
+    OmpReset,
+    OmpMedia,
+    OmpDisclosure,
 }
 
 #[derive(Clone)]
@@ -41,6 +46,17 @@ pub(super) struct Fact {
     pub succeeded: bool,
     pub bytes: u64,
     pub file_out: bool,
+    /// OMP progress/results replace previous observations for this call.
+    pub latest_only: bool,
+    /// Authenticated native snapshot epoch, when this is an OMP semantic row.
+    pub omp_branch: Option<Digest32>,
+}
+
+pub(super) fn visible_group(f: &Fact) -> Digest32 {
+    let group = f.group();
+    f.omp_branch.map_or(group, |branch| {
+        sha256_concat(&[b"vox/omp-visible-snapshot/v1", &group, &branch])
+    })
 }
 
 pub(super) fn group(session: &str, author: &Digest32) -> Digest32 {
@@ -183,6 +199,18 @@ impl Fact {
                 "resolved" => Kind::Resolved,
                 "tool-done" => Kind::ToolDone,
                 "drive" => Kind::Drive,
+                "user" | "reply"
+                    if object
+                        .and_then(|b| b.get("omp"))
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true) =>
+                {
+                    Kind::OmpMessage
+                }
+                "omp-message-update" => Kind::OmpMessageUpdate,
+                "omp-reset" => Kind::OmpReset,
+                "omp-media" => Kind::OmpMedia,
+                "omp-disclosure" => Kind::OmpDisclosure,
                 "drive-result" => Kind::DriveResult,
                 _ => Kind::Other,
             },
@@ -200,6 +228,25 @@ impl Fact {
             ),
             bytes: (row.body.len() as u64).saturating_add(row.session_id.len() as u64),
             file_out: kind == "file" && text("dir") == "out",
+            latest_only: kind == "omp-message-update"
+                || (kind == "tool-done"
+                    && object
+                        .and_then(|b| b.get("omp"))
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)),
+            omp_branch: (object
+                .and_then(|b| b.get("omp"))
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+                && !text("branch").is_empty())
+            .then(|| {
+                sha256_concat(&[
+                    b"vox/omp-branch/v1",
+                    &row.author,
+                    row.session_id.as_bytes(),
+                    text("branch").as_bytes(),
+                ])
+            }),
             succeeded: object
                 .and_then(|b| b.get("ok"))
                 .and_then(serde_json::Value::as_bool)
@@ -221,8 +268,8 @@ impl Fact {
     }
     fn bytes(&self) -> Vec<u8> {
         let mut e = Encoder::new();
-        e.array(17)
-            .uint(3)
+        e.array(19)
+            .uint(5)
             .uint(self.arrival)
             .bytes(&self.hash)
             .bytes(&self.author)
@@ -241,14 +288,16 @@ impl Fact {
             .uint(u64::from(self.succeeded))
             .uint(self.bytes)
             .uint(u64::from(self.file_out))
-            .bytes(self.association.as_ref().map_or(&[][..], |h| h.as_slice()));
+            .bytes(self.association.as_ref().map_or(&[][..], |h| h.as_slice()))
+            .uint(u64::from(self.latest_only))
+            .bytes(self.omp_branch.as_ref().map_or(&[][..], |h| h.as_slice()));
         e.finish()
     }
     pub fn read(bytes: &[u8]) -> Result<Self> {
         let mut d = Decoder::new(bytes);
         let arity = d.array()?;
         let version = d.uint()?;
-        if !matches!((arity, version), (16, 2) | (17, 3)) {
+        if !matches!((arity, version), (16, 2) | (17, 3) | (18, 4) | (19, 5)) {
             return Err(Error::MalformedAtRest("Session activity fact format"));
         }
         let arrival = d.uint()?;
@@ -274,6 +323,11 @@ impl Fact {
             4 => Kind::ToolDone,
             5 => Kind::Drive,
             6 => Kind::DriveResult,
+            7 => Kind::OmpMessage,
+            8 => Kind::OmpMessageUpdate,
+            9 => Kind::OmpReset,
+            10 => Kind::OmpMedia,
+            11 => Kind::OmpDisclosure,
             _ => return Err(Error::MalformedAtRest("Session activity kind")),
         };
         let optional = |d: &mut Decoder<'_>| -> Result<Option<Digest32>> {
@@ -308,7 +362,17 @@ impl Fact {
         let succeeded = boolean(&mut d)?;
         let bytes = d.uint()?;
         let file_out = boolean(&mut d)?;
-        let association = if version == 3 {
+        let association = if version >= 3 {
+            optional(&mut d)?
+        } else {
+            None
+        };
+        let latest_only = if version >= 4 {
+            boolean(&mut d)?
+        } else {
+            false
+        };
+        let omp_branch = if version >= 5 {
             optional(&mut d)?
         } else {
             None
@@ -334,6 +398,8 @@ impl Fact {
             succeeded,
             bytes,
             file_out,
+            latest_only,
+            omp_branch,
         })
     }
 }

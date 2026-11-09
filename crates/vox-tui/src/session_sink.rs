@@ -385,6 +385,7 @@ impl Sink {
         let Some(room) = (self.room_of)(node, session) else {
             return SessionAdmission::Skipped.into();
         };
+        let strict_omp = expected.is_some();
         let mut batch = Vec::new();
         let mut bytes = 0usize;
         let mut result = SessionAdmission::Skipped;
@@ -404,7 +405,16 @@ impl Sink {
                 )
                 .await;
                 fresh |= next.fresh;
-                result = combine(result, next.admission);
+                let admission = if strict_omp
+                    && matches!(&next.admission, SessionAdmission::Skipped)
+                {
+                    SessionAdmission::Refused(
+                        "the OMP route changed before the complete activity was committed".into(),
+                    )
+                } else {
+                    next.admission
+                };
+                result = combine(result, admission);
                 if !result.taken() {
                     return Posted {
                         admission: reported(node, session, result),
@@ -428,7 +438,14 @@ impl Sink {
             )
             .await;
             fresh |= next.fresh;
-            result = combine(result, next.admission);
+            let admission = if strict_omp && matches!(&next.admission, SessionAdmission::Skipped) {
+                SessionAdmission::Refused(
+                    "the OMP route changed before the complete activity was committed".into(),
+                )
+            } else {
+                next.admission
+            };
+            result = combine(result, admission);
         }
         Posted {
             admission: reported(node, session, result),

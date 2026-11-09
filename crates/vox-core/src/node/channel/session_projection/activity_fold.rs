@@ -38,6 +38,10 @@ pub(super) fn authored_reference(fact: &Fact, reference: &Digest32) -> Digest32 
     ])
 }
 
+pub(super) fn omp_current_key(group: &Digest32) -> Digest32 {
+    sha256_concat(&[b"vox/omp-current-snapshot/v1", group])
+}
+
 pub(super) fn visible(index: &mut Write<'_, '_>, f: &Fact) -> Result<()> {
     let group = f.group();
     let rank = plus(index, T::RawCount, hash_key(&group), 1)?;
@@ -48,21 +52,50 @@ pub(super) fn visible(index: &mut Write<'_, '_>, f: &Fact) -> Result<()> {
         let rank = plus(index, T::FileCount, hash_key(&f.author), 1)?;
         index.activity_set(T::FileRank, member_key(&f.author, f.arrival), Some(rank))?;
     }
+    if f.kind == Kind::OmpReset && f.omp_branch.is_some() {
+        index.activity_set(
+            T::Driven,
+            hash_key(&omp_current_key(&group)),
+            Some(f.arrival),
+        )?;
+    }
     super::activity_pending::observe(index, f)?;
     let Some(part_group) = f.part_group else {
         return Ok(());
     };
     if let Some(reference) = f.outcome_reference() {
-        if matches!(f.kind, Kind::ToolDone | Kind::Resolved | Kind::DriveResult) {
-            index.activity_set(
-                T::Outcomes,
-                member_key(&authored_reference(f, &reference), f.arrival),
-                Some(f.arrival),
-            )?;
+        if matches!(
+            f.kind,
+            Kind::ToolDone | Kind::Resolved | Kind::DriveResult | Kind::OmpMessageUpdate
+        ) {
+            let authored = authored_reference(f, &reference);
             let mut key = hash_key(&reference);
             key[32..].copy_from_slice(&f.author);
+            if f.latest_only && f.part.is_none_or(|(part, _)| part == 1) {
+                // OMP progress is a replacement, not an ever-growing collection of
+                // terminal outcomes. The sealed history remains untouched.
+                let mut removed = 0usize;
+                while let Some((old, _)) =
+                    index.activity_next(T::Outcomes, Some(hash_key(&authored)))?
+                {
+                    if old[..32] != authored {
+                        break;
+                    }
+                    index.activity_set(T::Outcomes, old, None)?;
+                    removed += 1;
+                    if removed > 512 {
+                        return Err(bad());
+                    }
+                }
+                index.activity_set(T::OutcomeCount, key, None)?;
+                index.activity_set(T::OutcomeBytes, hash_key(&authored), None)?;
+            }
+            index.activity_set(
+                T::Outcomes,
+                member_key(&authored, f.arrival),
+                Some(f.arrival),
+            )?;
             plus(index, T::OutcomeCount, key, 1)?;
-            let authored = authored_reference(f, &reference);
             let bytes = plus(index, T::OutcomeBytes, hash_key(&authored), f.bytes)?;
             index.activity_set(
                 T::OutcomeBytes,
@@ -94,8 +127,10 @@ pub(super) fn visible(index: &mut Write<'_, '_>, f: &Fact) -> Result<()> {
         .transpose()?
         .flatten()
         .is_some();
-    if matches!(f.kind, Kind::ToolDone | Kind::Resolved)
-        || (f.kind == Kind::Drive && !f.direct_action)
+    if matches!(
+        f.kind,
+        Kind::ToolDone | Kind::Resolved | Kind::OmpMessageUpdate
+    ) || (f.kind == Kind::Drive && !f.direct_action)
         || (f.kind == Kind::DriveResult && (f.succeeded || driven))
     {
         return Ok(());
@@ -126,8 +161,13 @@ pub(super) fn visible(index: &mut Write<'_, '_>, f: &Fact) -> Result<()> {
             index.activity_set(T::OpenParts, hash_key(&part_group), Some(f.arrival))?;
         }
     }
-    let rank = plus(index, T::VisibleCount, hash_key(&group), 1)?;
-    index.activity_set(T::Visible, member_key(&group, f.arrival), Some(rank))
+    let visible_group = super::activity_index::visible_group(f);
+    let rank = plus(index, T::VisibleCount, hash_key(&visible_group), 1)?;
+    index.activity_set(
+        T::Visible,
+        member_key(&visible_group, f.arrival),
+        Some(rank),
+    )
 }
 
 /// Pending joins follow the same created-time/seq order as of_session, distinct
