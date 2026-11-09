@@ -77,7 +77,7 @@ pub(crate) struct PendingSession {
     members: BTreeSet<Digest32>,
     holders: BTreeSet<Digest32>,
     memberships: BTreeMap<Digest32, u64>,
-    floor_sweep: Option<(u64, u64, Vec<(Digest32, u64)>)>,
+    floor_sweep: Option<FloorSweep>,
     entries: entry_store::EntryIndex,
     next: u64,
     refresh: Option<RefreshWork>,
@@ -111,7 +111,7 @@ pub(crate) struct CompletedSession {
     next: u64,
     refresh: Option<RefreshWork>,
     refresh_changed: bool,
-    floor_sweep: Option<(u64, u64, Vec<(Digest32, u64)>)>,
+    floor_sweep: Option<FloorSweep>,
     committed_rows: u64,
     news: Vec<String>,
     failure: Option<String>,
@@ -922,15 +922,15 @@ impl PendingSession {
                         }
                     },
                 };
-                if epoch == self.epoch && live == Some(at) {
-                    if self
+                if epoch == self.epoch
+                    && live == Some(at)
+                    && self
                         .drive
                         .floor_mark(&recipient)
                         .is_some_and(|(marked, from)| marked == at && bound < from)
-                    {
-                        self.drive.restore_mark(&recipient, at, bound);
-                        self.persist_drive(store, sek)?;
-                    }
+                {
+                    self.drive.restore_mark(&recipient, at, bound);
+                    self.persist_drive(store, sek)?;
                 }
                 let floor = super::super::session_floor::Floor {
                     room: self.room,

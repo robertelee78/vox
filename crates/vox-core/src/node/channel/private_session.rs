@@ -600,6 +600,8 @@ pub(super) struct Stored {
     attention_after: Option<AttentionOpening>,
 }
 
+pub(super) type FloorSweep = (u64, u64, Vec<(Digest32, u64)>);
+
 #[derive(Default)]
 pub(super) struct PrivateSessions {
     pub(super) legacy_pending: LegacyPending,
@@ -608,7 +610,7 @@ pub(super) struct PrivateSessions {
     floor_replay_done: bool,
     // The basis of the last complete correction sweep of this node's retained Session floors:
     // its floor revision, the removal generation and each swept recipient's membership start.
-    floor_sweep: Option<(u64, u64, Vec<(Digest32, u64)>)>,
+    floor_sweep: Option<FloorSweep>,
     restore_after: Option<u64>,
     pending_active: bool,
     pending_after: Option<u64>,

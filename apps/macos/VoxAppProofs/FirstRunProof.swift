@@ -3732,57 +3732,6 @@ final class FirstRunProof: XCTestCase {
                           && (refusal.contains("failed verification") || refusal.contains("SHA-256")),
                           "PRODUCT: the refusal must say the image failed verification; it says \(refusal.debugDescription)")
             keepTree(ui, "the forged OMP image was refused (evidence)")
-            let authorizedTab = Key.id("session-\(authorized.prefix(8))")
-            // FX-60 owner side: omp-owner takes drive back from alice. Its own media service must
-            // then refuse her, though she asks past her own daemon's checks (mutant: the media
-            // witness's Only::Drive becomes Anyone, and the image is served).
-            try stagedTrustChange(vox, ["trust", "read", "--node", "omp-owner", aliceFp,
-                                        "--identity-passphrase-file", imageOwner.pass], env: imageOwner.env)
-            let ownerUntil = Date().addingTimeInterval(20)
-            var afterRevocation = try askOwner()
-            while afterRevocation.served && Date() < ownerUntil {
-                Thread.sleep(forTimeInterval: 1)
-                afterRevocation = try askOwner()
-            }
-            if afterRevocation.served {
-                XCTFail("PRODUCT: 20 s after omp-owner took drive back from alice, its own media service still served her the authorized OMP image when she asked it directly: \(afterRevocation.said)")
-            }
-            // The revocation as alice's app shows it: the authorized Session's image is not drawn
-            // again, whether Load image is still offered or the Session is gone. Its tab is clicked
-            // where it is drawn, as in `replayed`.
-            if let tab = locate(ui, authorizedTab), ui.windows.firstMatch.frame.contains(tab.frame) {
-                tab.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).click()
-            }
-            var appShows = "the Session is gone"
-            if locate(ui, authorizedTab) != nil {
-                let loadUntil = Date().addingTimeInterval(10)
-                while locate(ui, Key.idPrefix("session-media-load-")) == nil && Date() < loadUntil {
-                    Thread.sleep(forTimeInterval: 0.25)
-                }
-                if locate(ui, Key.idPrefix("session-media-load-")) != nil {
-                    tap(ui, Key.idPrefix("session-media-load-"), "Load image after omp-owner took drive back")
-                }
-                // Within 60 s the app shows its refusal or nothing; never the image.
-                let shownUntil = Date().addingTimeInterval(60)
-                while locate(ui, Key.idPrefix("session-media-image-")) == nil
-                        && locate(ui, Key.idPrefix("session-media-error-")) == nil && Date() < shownUntil {
-                    Thread.sleep(forTimeInterval: 0.25)
-                }
-                if let shown = locate(ui, Key.idPrefix("session-media-error-")) {
-                    appShows = (shown.value as? String) ?? shown.label
-                } else {
-                    appShows = "no image and no refusal"
-                }
-                if locate(ui, Key.idPrefix("session-media-image-")) != nil {
-                    keepTree(ui, "the OMP image rendered after drive was taken back")
-                    XCTFail("PRODUCT: after omp-owner took drive back from alice, her app drew the authorized OMP image again (\(authorized.prefix(8))); it shows \(appShows.debugDescription)")
-                }
-            }
-            keepTree(ui, "the authorized OMP Session after the revocation (evidence)")
-            print("[proof] FX-60 revocation: owner service \(afterRevocation.said); app shows \(appShows.debugDescription)")
-            try stagedTrustChange(vox, ["trust", "drive", "--node", "omp-owner", aliceFp,
-                                        "--identity-passphrase-file", imageOwner.pass], env: imageOwner.env)
-            print("[proof] FX-60 OMP images: authorized \(authorized.prefix(8)) rendered (\(renderedSize)); forged \(forged.prefix(8)) refused: \(refusal)")
             // A real stock-OMP capture is released in stages while alice's app is watching.
             // Hold the captured media response while the second progress frame arrives, then
             // send it and release the captured final only after the image has rendered.
@@ -4085,6 +4034,59 @@ final class FirstRunProof: XCTestCase {
             } else {
                 XCTFail("PRODUCT: omp-owner's media service refused readmitted media-returner, holding drive, the image record offered after its readmission for 60 s: \(returnerFresh.said)")
             }
+            // Keep alice's old-record positive control above this cut: a later Drive regrant
+            // is forward-only and cannot serve as evidence that her old generation is live.
+            let authorizedTab = Key.id("session-\(authorized.prefix(8))")
+            // FX-60 owner side: omp-owner takes drive back from alice. Its own media service must
+            // then refuse her, though she asks past her own daemon's checks (mutant: the media
+            // witness's Only::Drive becomes Anyone, and the image is served).
+            try stagedTrustChange(vox, ["trust", "read", "--node", "omp-owner", aliceFp,
+                                        "--identity-passphrase-file", imageOwner.pass], env: imageOwner.env)
+            let ownerUntil = Date().addingTimeInterval(20)
+            var afterRevocation = try askOwner()
+            while afterRevocation.served && Date() < ownerUntil {
+                Thread.sleep(forTimeInterval: 1)
+                afterRevocation = try askOwner()
+            }
+            if afterRevocation.served {
+                XCTFail("PRODUCT: 20 s after omp-owner took drive back from alice, its own media service still served her the authorized OMP image when she asked it directly: \(afterRevocation.said)")
+            }
+            // The revocation as alice's app shows it: the authorized Session's image is not drawn
+            // again, whether Load image is still offered or the Session is gone. Its tab is clicked
+            // where it is drawn, as in `replayed`.
+            if let tab = locate(ui, authorizedTab), ui.windows.firstMatch.frame.contains(tab.frame) {
+                tab.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).click()
+            }
+            var appShows = "the Session is gone"
+            if locate(ui, authorizedTab) != nil {
+                let loadUntil = Date().addingTimeInterval(10)
+                while locate(ui, Key.idPrefix("session-media-load-")) == nil && Date() < loadUntil {
+                    Thread.sleep(forTimeInterval: 0.25)
+                }
+                if locate(ui, Key.idPrefix("session-media-load-")) != nil {
+                    tap(ui, Key.idPrefix("session-media-load-"), "Load image after omp-owner took drive back")
+                }
+                // Within 60 s the app shows its refusal or nothing; never the image.
+                let shownUntil = Date().addingTimeInterval(60)
+                while locate(ui, Key.idPrefix("session-media-image-")) == nil
+                        && locate(ui, Key.idPrefix("session-media-error-")) == nil && Date() < shownUntil {
+                    Thread.sleep(forTimeInterval: 0.25)
+                }
+                if let shown = locate(ui, Key.idPrefix("session-media-error-")) {
+                    appShows = (shown.value as? String) ?? shown.label
+                } else {
+                    appShows = "no image and no refusal"
+                }
+                if locate(ui, Key.idPrefix("session-media-image-")) != nil {
+                    keepTree(ui, "the OMP image rendered after drive was taken back")
+                    XCTFail("PRODUCT: after omp-owner took drive back from alice, her app drew the authorized OMP image again (\(authorized.prefix(8))); it shows \(appShows.debugDescription)")
+                }
+            }
+            keepTree(ui, "the authorized OMP Session after the revocation (evidence)")
+            print("[proof] FX-60 revocation: owner service \(afterRevocation.said); app shows \(appShows.debugDescription)")
+            try stagedTrustChange(vox, ["trust", "drive", "--node", "omp-owner", aliceFp,
+                                        "--identity-passphrase-file", imageOwner.pass], env: imageOwner.env)
+            print("[proof] FX-60 OMP images: authorized \(authorized.prefix(8)) rendered (\(renderedSize)); forged \(forged.prefix(8)) refused: \(refusal)")
             // These are stock OMP records captured while an actual background bash job ran,
             // completed, and then a separate command failed. Release each only after the app
             // has observed the prior state, rather than opening a preloaded completed capture.
