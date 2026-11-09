@@ -1041,8 +1041,13 @@ impl Source {
         to: u64,
     ) -> Result<Lookup<Proof>> {
         self.current()?;
-        let Some(charge) = job.reserve(1024 * 1024) else {
-            return Ok(Lookup::Busy);
+        let charge = match job.reserve_or_pressure(1024 * 1024) {
+            Ok(charge) => charge,
+            // Serving retains wire Busy; a client retains the exact byte-release wait.
+            Err(Error::HistoryCapacity(_)) if self.authorization.is_none() => {
+                return Ok(Lookup::Busy);
+            }
+            Err(error) => return Err(error),
         };
         if to > head.root.leaves {
             return Err(Error::MalformedBundle("proof exceeds requested head"));

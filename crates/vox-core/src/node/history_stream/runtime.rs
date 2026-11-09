@@ -3455,7 +3455,28 @@ impl Flow {
                     })?,
                     LocalProof::Busy => {
                         self.push(task)?;
+                        *retry_task = None;
+                        // A local proof can meet a publication owned by another flow.
+                        // Retain its causal wake just as for a local wire admission.
+                        let readiness = source.publication_readiness(job).await?;
                         self.waiting = true;
+                        self.publication_owner_wait = None;
+                        if let Lookup::Found(readiness) = readiness {
+                            let readiness = readiness.value;
+                            if !readiness.busy {
+                                self.waiting = false;
+                            } else if readiness
+                                .owner
+                                .is_some_and(|owner| self.prioritize_publication_owner(owner))
+                            {
+                                self.publication_wait = false;
+                                self.waiting = false;
+                            } else {
+                                self.publication_wait = readiness.owner.is_some();
+                                self.publication_owner_wait = readiness.owner;
+                                self.slot_wait = Some(readiness.wake);
+                            }
+                        }
                     }
                 }
             }
