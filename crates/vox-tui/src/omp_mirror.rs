@@ -1641,13 +1641,28 @@ impl Follow {
             "turn-end" => {
                 crate::wake::record_omp_state(&self.paths, &self.registration, false);
                 if !self.ended {
-                    self.post(self.envelope("turn-end", None), "").await;
+                    // A turn end belongs to the snapshot epoch that observed it, so a later
+                    // rewind or reset hides it with the rest of that branch's activity.
+                    let mut entry = self.envelope("turn-end", None);
+                    entry.insert("omp".into(), json!(true));
+                    entry.insert("branch".into(), json!(self.semantic.epoch));
+                    self.post(entry, "").await;
                     self.ended = true;
                 }
             }
             "session-end" => {
                 (self.session_end)(self.node.clone(), self.registration.clone()).await;
                 self.failed = true;
+            }
+            "transition" => {
+                // The extension retired this epoch by plan. Without an open control it is
+                // an expected close; an open one stays explicitly unknown.
+                if self.calls.is_empty() && self.deferred.is_empty() {
+                    self.failed = true;
+                } else {
+                    self.fail("the OMP conversation changed; pending control outcomes are unknown")
+                        .await;
+                }
             }
             "name" => {
                 if let Some(name) = event.get("name").and_then(Value::as_str) {

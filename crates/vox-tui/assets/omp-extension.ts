@@ -93,9 +93,11 @@ export default function vox(pi) {
   }
   function branchMatches(manager, stamp) {
     const branch = manager.getBranch()
+    return resetBoundary(branch) === stamp.reset && ancestryMatches(branch, stamp)
+  }
+  function ancestryMatches(branch, stamp) {
     const anchor = stamp.leaf === null ? -1 : branch.findIndex(entry => entry.id === stamp.leaf)
-    return resetBoundary(branch) === stamp.reset
-      && (stamp.leaf === null || anchor !== -1)
+    return (stamp.leaf === null || anchor !== -1)
       && !branch.slice(anchor + 1).some(entry => stamp.existing.has(entry.id))
   }
   function resetBoundary(branch) {
@@ -526,6 +528,8 @@ export default function vox(pi) {
     return attempt
   }
   function semanticBoundary() {
+    // A same-session reset seen by activity before the periodic tick: the fresh snapshot owns it.
+    if (reconcileReset()) return false
     if (!current()) return false
     const boundary = resetBoundary(ctx.sessionManager.getBranch())
     if (boundary !== semanticReset) {
@@ -765,10 +769,15 @@ export default function vox(pi) {
     if (semanticFollowers.get(sock)?.incomplete) complete = false
     semanticTo(sock, { kind: "snapshot-end", complete })
   }
-  const jobsTimer = setInterval(publishJobs, 1000)
+  const jobsTimer = setInterval(() => { reconcileReset(); publishJobs() }, 1000)
   jobsTimer.unref?.()
 
-  function retire() {
+  function retire(intentional = false) {
+    // Observers are told this epoch ended by plan only for a deliberate transition with no
+    // Vox delivery outcome open; failures and open outcomes keep the bare close, which
+    // reports observation stopped and outcomes unknown.
+    const planned = intentional && !operation && ![...notices.values()].some(record => record.source === "drive"
+      && (record.state === "preparing" || record.state === "dispatched" || record.state === "unknown"))
     for (const record of notices.values()) {
       if (record.source === "drive" && (record.state === "queued" || (record.state === "preparing" && !operation?.injected))) {
         record.state = "cancelled"
@@ -787,7 +796,11 @@ export default function vox(pi) {
     notices.clear()
     lastName = null
     tools.clear()
-    for (const follower of followers) follower.destroy()
+    const transition = JSON.stringify({ type: "event", event: { type: "transition" } }) + "\n"
+    for (const follower of followers) {
+      if (planned && follower.writableLength + Buffer.byteLength(transition) <= MAX_OUTPUT) follower.end(transition)
+      else follower.destroy()
+    }
     followers.clear()
     for (const child of children) child.kill()
   }
@@ -827,9 +840,10 @@ export default function vox(pi) {
     const id = manager.getSessionId(), leaf = manager.getLeafId(), branch = manager.getBranch()
     const snapshot = id ? { leaf, reset: resetBoundary(branch), existing: new Set(manager.getEntries().map(entry => entry.id)) } : null
     const serial = ++reconcileSerial
-    retire()
+    retire(true)
     session = id
     transitionFence = snapshot
+    semanticReset = snapshot?.reset ?? null
     installed = !!id
     const stamp = generation, nextRoute = route
     const work = (async () => {
@@ -841,6 +855,19 @@ export default function vox(pi) {
     })().catch(() => { if (serial === reconcileSerial) { generationRef = null; report("Vox Session ownership unavailable") } })
     ownership = work
     return work
+  }
+  // OMP's in-place context reset (/clear) appends a reset boundary to the same session
+  // without any session event. Only that change is reconciled here: other transitions
+  // move ancestry and are owned by their native events and fences.
+  function reconcileReset() {
+    if (stopped || !installed || !session || !transitionFence || operation
+      || !ctx || ctx.mode !== "tui" || ctx.agent.kind !== "main") return false
+    const manager = ctx.sessionManager
+    if (manager.getSessionId() !== session) return false
+    const branch = manager.getBranch()
+    if (resetBoundary(branch) === transitionFence.reset || !ancestryMatches(branch, transitionFence)) return false
+    void reconcileManager()
+    return true
   }
   function activate(next) {
     ctx = next
@@ -1016,7 +1043,7 @@ export default function vox(pi) {
       return { cancel: true }
     }
     const serial = ++reconcileSerial
-    retire()
+    retire(true)
     const owner = watcher
     if (owner) {
       let running = false
