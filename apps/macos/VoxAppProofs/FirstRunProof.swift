@@ -83,9 +83,10 @@
 //     detached, a message she posts says "only on this machine"; once bob's node is back, "on 1 of
 //     2 members' nodes" (D9). Node > Detach then offers only to attach alice again, never another
 //     node of this Mac's, and attaching again makes the window hers (D17).
-//     Compare goes group by group (#624): four groups of dave's fingerprint on his offer say "So
-//     far matches 4 of 13 groups."; on his card two say 2 of 13, a wrong third is named as group 3
-//     with no Remove (he is not in the keyring), and the whole of it is marked a match.
+//     Compare goes group by group (#624): on dave's card two groups say "So far matches 2 of 13
+//     groups.", a wrong third is named as group 3 with no Remove (he is not in the keyring), and
+//     the whole of it is marked a match. (Since #726 a room newcomer's offer is his member row
+//     and card, never a General banner.)
 //     The keyring's card for dave (G2) heads "dave ⇄ you", says he trusts alice too, names
 //     mission as a shared room, and its disclosure says what removing him would change.
 // 16. What an operation comes to (#608, #611, #615), run after step 5, or alone with
@@ -2047,8 +2048,20 @@ final class FirstRunProof: XCTestCase {
         try quitComputerAccount()
         try openComputers(computerA)
         tap(pairingUI, Key.id("computer-pairing-approve"), "Explicit approval on the inviting computer")
-        guard present(pairingUI, Key.id("computer-trust-applying"), timeout: 30,
-                      "the second signed approval must be recorded before leaving this computer") else { return }
+        // Node-free A has no pending node of its own: "applying" lasts only until B's application
+        // is confirmed (pairing.rs status), and may never be drawn. Either state records it.
+        let recordedUntil = Date().addingTimeInterval(30)
+        var recorded = false
+        while !recorded && Date() < recordedUntil {
+            recorded = locate(pairingUI, Key.id("computer-trust-applying")) != nil
+                || locate(pairingUI, Key.id("computer-trust-confirmed")) != nil
+            if !recorded { Thread.sleep(forTimeInterval: 0.5) }
+        }
+        guard recorded else {
+            keepTree(pairingUI, "the second signed approval was not recorded")
+            XCTFail("PRODUCT: the second signed approval must be recorded (applying or confirmed) before leaving this computer: \(onScreen(pairingUI))")
+            return
+        }
         try quitComputerAccount()
         try openComputers(computerB)
         guard words(pairingUI, Key.id("computer-pending-nodes"), timeout: 30,
@@ -3318,10 +3331,10 @@ final class FirstRunProof: XCTestCase {
             }
             try staged(vox, ["room", "join", "--node", "media-returner", "--passphrase-file", pass("room"), returnerLink],
                        env: returnerEnv)
-            try staged(vox, ["trust", "add", "--node", "media-returner", ownerFp, "--name", "omp-owner",
-                             "--identity-passphrase-file", returnerPass], env: returnerEnv)
-            try staged(vox, ["trust", "add", "--node", "omp-owner", returnerFp, "--name", "media-returner", "--drive",
-                             "--identity-passphrase-file", ownerPass], env: ownerEnv)
+            try stagedTrustChange(vox, ["trust", "add", "--node", "media-returner", ownerFp, "--name", "omp-owner",
+                                        "--identity-passphrase-file", returnerPass], env: returnerEnv)
+            try stagedTrustChange(vox, ["trust", "add", "--node", "omp-owner", returnerFp, "--name", "media-returner", "--drive",
+                                        "--identity-passphrase-file", ownerPass], env: ownerEnv)
             let returnerGrants = try staged(vox, ["trust", "list", "--node", "omp-owner"], env: ownerEnv)
             guard returnerGrants.split(separator: "\n").contains(where: { $0.hasPrefix(returnerFp + "  ") && $0.hasSuffix("  read + drive") }) else {
                 throw Apparatus("the OMP image owner must grant media-returner Read + Drive: \(returnerGrants)")
@@ -5439,7 +5452,11 @@ final class FirstRunProof: XCTestCase {
             XCTAssertFalse(during.contains("NATIVE-TWIN-DURING"), "PRODUCT: removed Bob received the twin's removal-period activity: \(during)")
         }
         print("[proof] before=\(before) removed=\(during) other=\(controlAfter) trust=\(trust) twin=\(twinDuring) twinRoster=\(propagated.said) twinReadmit=\(twinReadmit.status): \(twinReadmit.out) bobRosterWhileRemoved=\(bobRosterRemoved.status): \(bobRosterRemoved.out)")
-        guard tap(ui, Key.id("member-manage-membership"), "readmission management"),
+        // The inspector's button opened removal above. After that sheet, XCTest finds no hit point
+        // on it while it is drawn unobstructed and enabled (UI tree and screen at this step), so
+        // readmission opens the same sheet from Room › Remove or Readmit Member…, a person's path.
+        ui.menuBars.menuBarItems["Room"].click()
+        guard tap(ui, Key.menuItem("Remove or Readmit Member…"), "Room › Remove or Readmit Member…"),
               tap(ui, Key.id("room-readmit-fingerprint"), "full readmission fingerprint") else { return }
         el(ui, Key.id("room-readmit-fingerprint")).typeText(bobFp)
         guard tap(ui, Key.showing("Review Readmission"), "review exact readmission"),
@@ -8442,16 +8459,6 @@ final class FirstRunProof: XCTestCase {
         let rowSaid = words(ui, daveRow, timeout: 60,
                             "dave trusts alice and she has not trusted him: her member pane must say \"not in keyring, room consent observed\"",
                             until: { $0.hasSuffix("not in keyring, room consent observed") }) ?? ""
-        // (15e, #624) Compare, group by group: on dave's offer, collapsed until asked for, a
-        // partial entry says how far it matches.
-        tap(ui, Key.id("room-mission"), "mission in the sidebar")
-        tap(ui, Key.id("session-general"), "mission's General")
-        tap(ui, Key.id("offer-\(daveFp.prefix(12))"), "dave's offer at the top of mission's General")
-        tap(ui, Key.id("offer-compare-open"), "Compare… on dave's offer")
-        type(ui, Key.id("offer-compare"), String(daveFp.prefix(16)), "the offer's compare field")
-        let offerSoFar = words(ui, Key.id("offer-compare-said"), timeout: 10,
-                               "four groups of dave's own fingerprint typed on his offer must say \"So far matches 4 of 13 groups.\"",
-                               until: { $0 == "So far matches 4 of 13 groups." }) ?? ""
         tap(ui, Key.id("room-mission"), "mission in the sidebar", premise: inRoom(vox, voxEnv, "mission"))
         tap(ui, daveRow, "dave in the member pane")
         let directions = words(ui, Key.id("card-directions"), timeout: 10,
@@ -8483,7 +8490,7 @@ final class FirstRunProof: XCTestCase {
         let whole = words(ui, Key.id("card-compare-said"), timeout: 10,
                           "dave's whole fingerprint typed must be marked as a match of all 13 groups",
                           until: { $0.hasSuffix("all 13 groups.") && $0.hasPrefix("Matches ") }) ?? ""
-        print("[proof] compare: offer \(offerSoFar); card \(soFar) → \(wrong) → \(whole)")
+        print("[proof] compare: card \(soFar) → \(wrong) → \(whole)")
         tap(ui, Key.id("card-trust-open"), "Trust… on dave's card")
         words(ui, Key.id("card-presented-name"), timeout: 90,
               "Dave's card must present his authenticated name beside his fingerprint before trust", until: { $0 == "Name it presents: dave" })
