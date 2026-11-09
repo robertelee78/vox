@@ -2190,8 +2190,20 @@ final class FirstRunProof: XCTestCase {
         defer { try? hostD.resume() }
         _ = try computerCommand(computerC, ["personal", "--clear"])
         try openComputers(computerC)
-        guard present(pairingUI, Key.showing("last exchange failed"), timeout: 45,
-                      "an offline old peer must be shown as an exchange observation, not as a rejected policy") else { return }
+        // ComputerTrust.swift names a retry in flight before an earlier failure ("exchange in
+        // progress"), so an offline peer retried on backoff shows either exchange observation.
+        let observedUntil = Date().addingTimeInterval(45)
+        var observed = false
+        while !observed && Date() < observedUntil {
+            observed = locate(pairingUI, Key.showing("last exchange failed")) != nil
+                || locate(pairingUI, Key.showing("exchange in progress; current reachability unknown")) != nil
+            if !observed { Thread.sleep(forTimeInterval: 0.5) }
+        }
+        guard observed else {
+            keepTree(pairingUI, "the offline old peer's exchange was not observed")
+            XCTFail("PRODUCT: an offline old peer must be shown as an exchange observation, not as a rejected policy: \(onScreen(pairingUI))")
+            return
+        }
         guard present(pairingUI, Key.showing("Awaiting application confirmation"), timeout: 30,
                       "an offline peer's application must remain distinct from connectivity") else { return }
         try quitComputerAccount()
@@ -3243,15 +3255,19 @@ final class FirstRunProof: XCTestCase {
         // readmits it below; omp-owner's media service admits by its per-recipient floor.
         var mediaReturner: (daemon: Started, env: [String: String], fp: String)?
         defer { mediaReturner?.daemon.terminate() }
-        /// `node`'s own `vox room roster` of work, once `holds` says it shows what is awaited.
+        /// `node`'s own `vox room roster` of work, once `holds` says its members are what is
+        /// awaited. Members are the bare fingerprint lines; `vox:` notes (an owed key, a name) can
+        /// name a removed node and are not membership.
         func roster(of node: String, env: [String: String], within seconds: TimeInterval,
-                    _ holds: (String) -> Bool) -> (holds: Bool, said: String) {
+                    _ holds: (Set<String>) -> Bool) -> (holds: Bool, said: String) {
             let until = Date().addingTimeInterval(seconds)
             var said = ""
             repeat {
                 let r = run(vox, ["room", "roster", "--node", node, room], env: env)
                 said = "status \(r.status): \(r.out)"
-                if r.status == 0 && holds(r.out) { return (true, said) }
+                let members = Set(r.out.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
+                    .filter { $0.count == 52 && $0.allSatisfy { ("a"..."z").contains($0) || ("2"..."7").contains($0) } })
+                if r.status == 0 && holds(members) { return (true, said) }
                 Thread.sleep(forTimeInterval: 0.5)
             } while Date() < until
             return (false, said)
@@ -3689,6 +3705,9 @@ final class FirstRunProof: XCTestCase {
             guard ownerRemoved.holds else {
                 throw Apparatus("omp-owner did not apply media-returner's removal within 60 s, so alice's check would not follow the cut: \(ownerRemoved.said)")
             }
+            // The roster's notes speak only for current members: none may still name the removed one.
+            XCTAssertFalse(ownerRemoved.said.contains(String(returner.fp.prefix(12))),
+                           "PRODUCT: omp-owner's roster still names removed media-returner after applying its removal: \(ownerRemoved.said)")
             let cutUntil = Date().addingTimeInterval(30)
             var afterCut = try askOwner()
             while !afterCut.served && Date() < cutUntil {
@@ -8513,7 +8532,12 @@ final class FirstRunProof: XCTestCase {
         let ring = run(vox, ["trust", "list", "--node", "alice"], env: voxEnv).out
         XCTAssertTrue(ring.contains(daveFp),
                       "PRODUCT: trusted from his card, dave must be in alice's keyring; `vox trust list` said: \(ring)")
-        tap(ui, Key.id("card-close"), "Close on dave's card")
+        // Close is the card's cancel action (NodeCard.swift: .keyboardShortcut(.cancelAction)).
+        // With this step's unreachable-peer notifications up, XCTest finds no hit point on the
+        // drawn, enabled Close; Escape, a person's Close, needs none.
+        ui.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
+        XCTAssertTrue(el(ui, Key.id("node-card")).waitForNonExistence(timeout: 10),
+                      "PRODUCT: Escape, Close's keyboard shortcut, must close dave's card")
         print("[proof] dave's row: \(rowSaid); card: \(directions) → \(cardSaid)")
         // (15f, G2) The keyring's card for dave: each direction, the room it covers, and what
         // removing him would change, behind a disclosure.

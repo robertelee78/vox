@@ -11102,6 +11102,8 @@ impl Node {
             });
         }
         for peer in removed {
+            self.key_waiting.remove(&(room, *peer));
+            self.key_waits_said.remove(&(room, *peer));
             if self.ports.contains_key(&(room, *peer)) {
                 self.drop_port(&room, peer);
             }

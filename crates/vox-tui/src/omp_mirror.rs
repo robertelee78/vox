@@ -464,6 +464,8 @@ impl OmpMirror {
     }
 }
 
+type MediaWaiter = oneshot::Sender<Result<Vec<u8>, String>>;
+
 struct Follow {
     node: NodeName,
     session: String,
@@ -479,7 +481,7 @@ struct Follow {
     receipts: Arc<Mutex<BTreeMap<String, (String, crate::host::OmpDriveGuard)>>>,
     semantic: SemanticState,
     /// One native request in flight per media id; every waiter for it receives that answer.
-    media: BTreeMap<String, Vec<oneshot::Sender<Result<Vec<u8>, String>>>>,
+    media: BTreeMap<String, Vec<MediaWaiter>>,
     next_id: u64,
     failed: bool,
     stop_reported: Arc<std::sync::atomic::AtomicBool>,
