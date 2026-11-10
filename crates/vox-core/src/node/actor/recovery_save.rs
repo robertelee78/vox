@@ -265,7 +265,11 @@ impl Node {
             }
             if ChannelState::receiver_release_cleanup_waiting(&error)
                 || ChannelState::governance_refreshing(&error)
-                || matches!(error, Error::OwnHistoryBehind)
+                || matches!(
+                    error,
+                    Error::OwnHistoryBehind
+                        | Error::Profile("room publication is busy; retry this operation")
+                )
             {
                 self.governance_work.wake_room(room);
             }
@@ -275,7 +279,10 @@ impl Node {
             After::Producer => {
                 if let Some(reply) = reply {
                     let _ = reply.send(Outcome::Failed(fault_of(&error)));
-                } else {
+                } else if !matches!(
+                    error,
+                    Error::Profile("room publication is busy; retry this operation")
+                ) {
                     let _ = self.event_tx.send(NodeEvent::JoinFailed {
                         reason: format!(
                             "room {} recovery could not complete its retained save: {error}",

@@ -57,6 +57,23 @@ node is a new identity, with no rooms and no trust.
 
 **Confirm:** `vox room list --node robertgpt` shows this node's rooms, or `no rooms`.
 
+## Opening a node times out or remembered nodes stay Attaching
+
+**Symptoms:** the app remains on `Unlocking node …`, then reports that the request did not
+finish within 60 seconds and its outcome is unknown. Other remembered nodes may remain
+`Attaching` while some are Ready.
+
+**Meaning:** the daemon has not confirmed the operation. This is not evidence of an incorrect
+passphrase. Room publication and Computer-policy work can share an ordering dependency;
+`Attaching` alone does not identify which operation is holding it.
+
+**Fix:** keep the full error and daemon log. `Try Again` reconnects to reconcile the existing
+operation; it is not a request to enter the passphrase again or recreate the identity. A genuine
+credential refusal is shown separately. Do not erase the profile or change trust to bypass a stall.
+
+**Confirm:** the same node becomes Ready, the app opens it without another credential prompt,
+and an authorized peer reads a fresh post. A successful reconnect alone does not prove room delivery.
+
 ## A keyring change asks for the passphrase, or is refused
 
 **Symptoms:**

@@ -107,7 +107,10 @@ enum Opening {
     },
 }
 enum After {
-    Logged,
+    Logged {
+        replay: bool,
+        abandon_unopened: bool,
+    },
     Preparation(Box<preparation_save::Continuation>),
     Inbound(Box<Inbound>),
     Reoffer {
@@ -239,7 +242,10 @@ impl Node {
             instance,
             attachment: self.delivery_epoch,
             lifetime,
-            after: After::Logged,
+            after: After::Logged {
+                replay,
+                abandon_unopened,
+            },
             stage: Stage::Select,
             attempt: None,
         };
@@ -311,7 +317,23 @@ impl Node {
                     let _ = reply.send(Outcome::Failed(fault_of(&error)));
                 }
             }
-            After::Logged => {
+            After::Logged {
+                replay,
+                abandon_unopened,
+            } => {
+                let publication_busy = matches!(
+                    error,
+                    Error::Profile("room publication is busy; retry this operation")
+                );
+                if attached && matches!(continuation.stage, Stage::Select) && publication_busy {
+                    self.key_package_rooms
+                        .entry(room)
+                        .and_modify(|pending| *pending |= replay)
+                        .or_insert(replay);
+                    if abandon_unopened {
+                        self.key_package_unopened.insert(room);
+                    }
+                }
                 if attached
                     && matches!(continuation.stage, Stage::Open | Stage::Install)
                     && matches!(fault_of(&error), Fault::GovernanceRefreshing)
@@ -320,7 +342,7 @@ impl Node {
                     self.key_package_unopened.insert(room);
                     self.governance_work.wake_room(room);
                 }
-                if attached {
+                if attached && !publication_busy {
                     let _ = self.event_tx.send(NodeEvent::NodeNote {
                         note: format!(
                             "room {} could not read its saved key deliveries: {error}",
@@ -538,7 +560,7 @@ impl Node {
                         ))
                         .await;
                     }
-                    After::Logged => {
+                    After::Logged { .. } => {
                         if attempt.floor_wait.is_some() {
                             // A later governance fold can change floor authority even
                             // without another package publication.
@@ -912,7 +934,7 @@ impl Node {
                 return;
             }
         };
-        if matches!(continuation.after, After::Logged)
+        if matches!(continuation.after, After::Logged { .. })
             && reply.is_none()
             && self.policy_save_pending()
         {
