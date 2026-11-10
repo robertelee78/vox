@@ -819,13 +819,12 @@ final class AppModel: ObservableObject {
         client = nil
     }
 
-    /// Attach the node: one already attached, or one that needs no passphrase, at once; else ask
-    /// for its passphrase. With Keep Running chosen, a node that needs no passphrase is kept as it
-    /// attaches (M-6).
+    /// Use a live or pending attachment without replacing its restart credentials. Only a cold
+    /// open probes for a passphrase and remembers the node; other failures remain distinct.
     private func use(_ node: NodeSummary) async {
         guard let client else { return }
         let generation = beginNodeRequest()
-        if !node.keep {
+        if !node.keep && node.state != "attached" && node.state != "attaching" {
             do {
                 try await client.keep(node: node.name, passphrase: nil)
             } catch VoxError.WrongPassphrase(_) {

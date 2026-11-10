@@ -74,6 +74,17 @@ credential refusal is shown separately. Do not erase the profile or change trust
 **Confirm:** the same node becomes Ready, the app opens it without another credential prompt,
 and an authorized peer reads a fresh post. A successful reconnect alone does not prove room delivery.
 
+## A Ready node is not remembered
+
+Ready describes the currently unlocked identity, not saved restart credentials. Opening a Ready
+node, or waiting for its in-flight unlock, uses that attachment without storing a new passphrase.
+A node that was not remembered stays unremembered and may need Unlock again after a daemon restart.
+
+On a Mac, a CLI unlock can leave a node Ready but not remembered when the login Keychain is
+unavailable. The app can open that Ready node. Unlocking a Locked protected node in the app still
+requires a usable login Keychain to remember its credentials; preserve the exact storage error
+rather than resetting the identity or changing trust.
+
 ## A keyring change asks for the passphrase, or is refused
 
 **Symptoms:**
