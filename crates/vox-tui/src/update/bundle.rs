@@ -258,7 +258,11 @@ impl Transition {
             && self.app_complete
             && !self.daemon_complete
             && !self.handoff_complete
-            && self.deferred_daemon.is_some()
+            && self.deferred_daemon.is_none()
+            && matches!(
+                self.handoff_daemon(),
+                super::restart::DaemonIntent::Running { .. }
+            )
     }
 
     fn identities(&self) -> [Option<&BundleIdentity>; 10] {
@@ -617,8 +621,9 @@ fn prepare_candidate_journal(apps: &Path) -> Result<Transition, AppError> {
     }
     let retained = path_exists(&apps.join(PUBLISHING))?;
     let mut transition = if retained {
+        use std::os::unix::ffi::OsStringExt as _;
         let bytes = fs::read(apps.join(PUBLISHING).join(TRANSITION)).map_err(AppError::Io)?;
-        let pending: Transition = serde_json::from_slice(&bytes)
+        let mut pending: Transition = serde_json::from_slice(&bytes)
             .map_err(|e| usage(format!("invalid pending handoff journal: {e}")))?;
         pending.validate_identities(false)?;
         if !pending.pending_refresh()
@@ -629,6 +634,18 @@ fn prepare_candidate_journal(apps: &Path) -> Result<Transition, AppError> {
                 "pending handoff authority changed; all state retained",
             ));
         }
+        let account = vox_core::node::paths::Account {
+            data_root: PathBuf::from(std::ffi::OsString::from_vec(
+                pending.daemon_data_root.clone(),
+            )),
+            config_dir: PathBuf::from(std::ffi::OsString::from_vec(
+                pending.daemon_config_dir.clone(),
+            )),
+        };
+        let (observed, process) =
+            super::restart::capture_daemon_state(&account, &active.join(HELPER))?;
+        pending.deferred_daemon = Some(std::mem::replace(&mut pending.daemon, observed));
+        pending.daemon_process = process;
         pending
     } else {
         let running = inspect_app(&active)?;
@@ -1780,9 +1797,11 @@ fn recover_candidate_preparation(apps: &Path, transition: &mut Transition) -> Re
             ))
         })?;
     }
-    if transition.deferred_daemon.is_some() {
+    if let Some(original) = transition.deferred_daemon.take() {
         remove_journal_file(apps, SOURCE_ARCHIVE)?;
         remove_journal_file(apps, "source.json")?;
+        transition.daemon = original;
+        transition.daemon_process = None;
         transition.candidate_preparation = None;
         write_transition(apps, transition)
     } else {
@@ -1805,27 +1824,11 @@ fn normalize_pending_refresh(
     transition: &mut Transition,
     version: &str,
 ) -> Result<(), AppError> {
-    use std::os::unix::ffi::OsStringExt as _;
-    let active = apps.join(BUNDLE);
-    let identity = bundle_identity(&active)?;
-    let account = vox_core::node::paths::Account {
-        data_root: PathBuf::from(std::ffi::OsString::from_vec(
-            transition.daemon_data_root.clone(),
-        )),
-        config_dir: PathBuf::from(std::ffi::OsString::from_vec(
-            transition.daemon_config_dir.clone(),
-        )),
-    };
-    let (observed, process) = super::restart::capture_daemon_state(&account, &active.join(HELPER))?;
-    let original = transition.deferred_daemon.take().unwrap_or_else(|| {
-        std::mem::replace(&mut transition.daemon, super::restart::DaemonIntent::Absent)
-    });
-    transition.deferred_daemon = match original {
-        super::restart::DaemonIntent::Running { .. } => Some(original),
-        super::restart::DaemonIntent::Absent => None,
-    };
-    transition.daemon = observed;
-    transition.daemon_process = process;
+    let identity = bundle_identity(&apps.join(BUNDLE))?;
+    if let Some(original) = transition.deferred_daemon.take() {
+        transition.daemon = original;
+    }
+    transition.daemon_process = None;
     transition.kind = TransitionKind::Refresh;
     transition.version = version.to_owned();
     transition.source = identity.clone();
@@ -2246,8 +2249,9 @@ fn recover_transition(
         }
     }
     if transition.candidate_preparation.is_some() {
+        let adopted = transition.deferred_daemon.is_some();
         recover_candidate_preparation(apps, &mut transition)?;
-        if transition.deferred_daemon.is_none() {
+        if !adopted {
             return Ok(Recovery {
                 interrupted_publish: true,
                 handoff_done: true,
