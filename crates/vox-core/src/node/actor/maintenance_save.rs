@@ -1252,7 +1252,7 @@ impl Node {
         match continuation {
             Continuation::Session(next) => self.reject_owned_session(room, error, next, reply),
             Continuation::Trust(next) => self.reject_owned_trust(room, error, next, reply),
-            Continuation::Private(next) => self.reject_owned_private(error, next, reply),
+            Continuation::Private(next) => self.reject_owned_private(room, error, next, reply),
             Continuation::Governance(next) => {
                 self.reject_owned_governance(room, error, next, reply)
             }

@@ -957,7 +957,7 @@ impl Node {
     fn park_private_drive(
         &mut self,
         room: Digest32,
-        lifetime: Arc<maintenance_save::Lifetime>,
+        authority: computer::ComputerAuthority,
         continuation: Continuation,
         reply: ActorReply,
         prerequisite: DriveWait,
@@ -965,6 +965,7 @@ impl Node {
         let After::Drive { stage, guard } = continuation.after else {
             return;
         };
+        let busy_owner = self.pending_posts.get(&room).map(post_save::Pending::owner);
         if let Some(parked) = self.parked_private_drives.get_mut(&room) {
             if parked.attachment == continuation.attachment
                 && parked
@@ -985,10 +986,11 @@ impl Node {
                 }
                 parked.stage = stage;
                 parked.guard = guard;
-                parked.authority = lifetime.authority.clone();
+                parked.authority = authority;
                 parked.prerequisite = prerequisite;
                 parked.reply = reply;
                 parked.drive_active = true;
+                parked.busy_owner = busy_owner;
             } else if let Some(reply) = reply {
                 let _ = reply.send(Outcome::Failed(Fault::ChannelNotOpen));
             }
@@ -1003,15 +1005,54 @@ impl Node {
                 releases: [Vec::new(), Vec::new()],
                 upgrades: Vec::new(),
                 drive_active: true,
-                busy_owner: None,
+                busy_owner,
                 room_wait: None,
                 prerequisite,
                 guard,
-                authority: lifetime.authority.clone(),
+                authority,
                 reply,
             },
         );
     }
+
+    fn private_publication_wait(
+        &self,
+        instance: &SharedChannel,
+    ) -> Option<(
+        DriveWait,
+        std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + Sync>>,
+    )> {
+        match instance.try_lock() {
+            Ok(channel) => {
+                let profile = self.profile.as_ref()?;
+                if channel
+                    .history_publication_busy(&profile.store_handle())
+                    .ok()?
+                {
+                    return Some((DriveWait::Publication, channel.history_publication_wake()));
+                }
+            }
+            Err(_) => {
+                let weak = Arc::downgrade(instance);
+                return Some((
+                    DriveWait::Native,
+                    Box::pin(async move {
+                        if let Some(instance) = weak.upgrade() {
+                            drop(instance.lock().await);
+                        }
+                    }),
+                ));
+            }
+        }
+        if let Some(computer) = self.computer.as_ref().map(Arc::clone) {
+            return Some((
+                DriveWait::Native,
+                Box::pin(async move { computer.wait_publication_writer().await }),
+            ));
+        }
+        Some((DriveWait::Native, Box::pin(std::future::ready(()))))
+    }
+
     pub(in crate::node::actor) fn checked_support_discovery(
         &mut self,
         room: Digest32,
@@ -1578,10 +1619,86 @@ impl Node {
 
     pub(in crate::node::actor) fn reject_owned_private(
         &mut self,
+        room: Digest32,
         error: Error,
         continuation: Continuation,
         reply: ActorReply,
     ) {
+        if continuation.attached(self, &room)
+            && matches!(
+                error,
+                Error::Profile("room publication is busy; retry this operation")
+            )
+        {
+            match &continuation.after {
+                After::Drive { .. } => {
+                    let authority = continuation
+                        .lifetime
+                        .as_ref()
+                        .map(|held| held.authority.clone())
+                        .or_else(|| self.computer_authority());
+                    if let Some(authority) = authority {
+                        let waiting = self
+                            .parked_private_drives
+                            .get(&room)
+                            .filter(|parked| !parked.drive_active && parked.room_wait.is_some())
+                            .map(|_| (DriveWait::Native, None))
+                            .or_else(|| {
+                                self.private_publication_wait(&continuation.instance)
+                                    .map(|(prerequisite, released)| (prerequisite, Some(released)))
+                            });
+                        if let Some((prerequisite, waiting)) = waiting {
+                            self.park_private_drive(
+                                room,
+                                authority,
+                                continuation,
+                                reply,
+                                prerequisite,
+                            );
+                            if let Some(released) = waiting {
+                                let token = self.next_token;
+                                self.next_token += 1;
+                                let tx = self.net_tx.clone();
+                                let task = self.spawn_join_housekeeping(async move {
+                                    released.await;
+                                    let _ = tx
+                                        .send(NetEvent::PrivateDriveRoomReady { room, token })
+                                        .await;
+                                });
+                                if let Some(parked) = self.parked_private_drives.get_mut(&room) {
+                                    parked.room_wait = Some(RoomWake { token, task });
+                                } else {
+                                    task.abort();
+                                }
+                            }
+                            return;
+                        }
+                    }
+                }
+                After::SupportDiscovery(SupportStage::Refresh) => {
+                    if let Some((node, (_, released))) = self
+                        .profile
+                        .as_ref()
+                        .map(Profile::fingerprint)
+                        .zip(self.private_publication_wait(&continuation.instance))
+                    {
+                        self.bounded_sync.wait_for_support_discovery_publication(
+                            &self.net_tx,
+                            &mut self.next_token,
+                            node,
+                            room,
+                            Arc::clone(&continuation.instance),
+                            released,
+                        );
+                        if let Some(reply) = reply {
+                            let _ = reply.send(Outcome::Failed(Fault::RoomChangePending));
+                        }
+                        return;
+                    }
+                }
+                _ => {}
+            }
+        }
         let fault = fault_of(&error);
         match continuation.after {
             After::Serving {
@@ -1614,12 +1731,13 @@ impl Node {
         let result = match result {
             Ok(saved) => saved,
             Err(error) => {
-                self.reject_owned_private(error, continuation, reply);
+                self.reject_owned_private(room, error, continuation, reply);
                 return;
             }
         };
         if !continuation.attached(self, &room) {
             self.reject_owned_private(
+                room,
                 Error::StreamRefused("private room attachment changed"),
                 continuation,
                 reply,
@@ -1630,6 +1748,7 @@ impl Node {
         if let maintenance_save::Saved::Private(Saved::Flow(flow)) = result {
             let Some(guard) = continuation.flow_guard() else {
                 self.reject_owned_private(
+                    room,
                     Error::Profile("private flow continuation changed"),
                     continuation,
                     reply,
@@ -1656,7 +1775,7 @@ impl Node {
             if let Err(error) =
                 self.owned_private_drive_guard(guard.as_ref(), Some(lifetime.as_ref()))
             {
-                self.reject_owned_private(error, continuation, reply);
+                self.reject_owned_private(room, error, continuation, reply);
                 return;
             }
             let stage = *stage;
@@ -1731,6 +1850,7 @@ impl Node {
                     ..continuation
                 };
                 self.reject_owned_private(
+                    room,
                     Error::Profile("private completion does not match its continuation"),
                     continuation,
                     reply,
@@ -1788,6 +1908,7 @@ impl Node {
                 if saved.advance == SessionAdvance::Waiting {
                     let Some(reason) = saved.wait else {
                         self.reject_owned_private(
+                            room,
                             Error::Profile("private upgrade wait reason missing"),
                             continuation,
                             reply,
@@ -1834,7 +1955,7 @@ impl Node {
                         Ok(false) => None,
                         Err(error) => {
                             drop(channel);
-                            self.reject_owned_private(error, continuation, reply);
+                            self.reject_owned_private(room, error, continuation, reply);
                             return;
                         }
                     }
@@ -1844,7 +1965,14 @@ impl Node {
                 } else {
                     DriveWait::Upgrade(pending_upgrade::UpgradeWait::Governance)
                 };
-                self.park_private_drive(room, lifetime, continuation, reply, reason);
+                self.park_private_drive(
+                    room,
+                    lifetime.authority.clone(),
+                    continuation,
+                    reply,
+                    reason,
+                );
+                drop(lifetime);
                 let token = self.next_token;
                 self.next_token += 1;
                 let tx = self.net_tx.clone();
@@ -1898,7 +2026,7 @@ impl Node {
                 let (ready, missing_port) = match checked {
                     Ok(checked) => checked,
                     Err(error) => {
-                        self.reject_owned_private(error, continuation, reply);
+                        self.reject_owned_private(room, error, continuation, reply);
                         return;
                     }
                 };
@@ -1963,6 +2091,7 @@ impl Node {
             (_, maintenance_save::Saved::Unavailable) => None,
             _ => {
                 self.reject_owned_private(
+                    room,
                     Error::Profile("private drive prerequisite receipt changed"),
                     continuation,
                     reply,
@@ -1977,7 +2106,14 @@ impl Node {
             continuation.lifetime = Some(lifetime);
             self.continue_private(room, work, continuation, reply).await;
         } else {
-            self.park_private_drive(room, lifetime, continuation, reply, prerequisite);
+            self.park_private_drive(
+                room,
+                lifetime.authority.clone(),
+                continuation,
+                reply,
+                prerequisite,
+            );
+            drop(lifetime);
         }
     }
 
@@ -2005,11 +2141,19 @@ impl Node {
                 if let After::Drive { stage, .. } = &mut continuation.after {
                     *stage = DriveStage::Query;
                 }
-                self.park_private_drive(room, lifetime, continuation, reply, DriveWait::Projection);
+                self.park_private_drive(
+                    room,
+                    lifetime.authority.clone(),
+                    continuation,
+                    reply,
+                    DriveWait::Projection,
+                );
+                drop(lifetime);
                 return;
             }
             Ok(_) => {
                 self.reject_owned_private(
+                    room,
                     Error::Profile("private Session query returned an unexpected reply"),
                     continuation,
                     reply,
@@ -2085,6 +2229,7 @@ impl Node {
                 }
             }
             _ => self.reject_owned_private(
+                room,
                 Error::Profile("private support receipt does not match its retained stage"),
                 continuation,
                 reply,
