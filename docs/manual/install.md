@@ -1,6 +1,6 @@
 # Install and update
 
-Applies to Vox v0.4.13.
+Applies to Vox v0.4.24.
 
 Vox runs on Linux on x86_64, and on Macs with Apple Silicon and macOS 13 or later. On a Mac it
 comes as `Vox.app`, with `vox` inside it.
@@ -89,8 +89,13 @@ An update can install the new app before a later cleanup operation is refused. V
 what is installed, which handoff failed, and the affected operation and path; it retains the
 unfinished transition for local repair. After resolving that specific obstruction, run
 `vox update` to finish the retained work. If a newer updater is available, it owns both repair
-and the upgrade in that invocation. Repairable local work can still finish when the newer
-updater's download fails, but the unavailable upgrade is reported as a failure, not success.
+and the upgrade in that invocation. Starting with v0.4.24, an authenticated, completed app
+installation with an unfinished daemon handoff does not require the old daemon to become Ready
+before a strictly newer release can be installed. The newer installation must still make the
+originally required remembered nodes Ready before reporting success; the pending handoff is not
+discarded. Same-version repair and explicit rollback retain their completion checks.
+Repairable local work can still finish when the newer updater's download fails, but the
+unavailable upgrade is reported as a failure, not success.
 Do not repeat `vox update --rollback` to repair an already-installed rollback: doing so could
 reverse it. Do not delete retained bundles or the transition journal to dismiss an error.
 

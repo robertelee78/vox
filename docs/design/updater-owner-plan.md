@@ -112,7 +112,7 @@ Temporary removal must not be relabeled optional when it leaves another launchab
 
 ### Newer upgrade with an unfinished daemon handoff (#1201)
 
-Proposed correction; independent exact-revision Opus design approval is required before implementation.
+Design approved at `c0127f6b6a98ba05de77c1bd1b65af2ff0d74ba0` by independent Opus review.
 The selected newer updater must not require the broken installed daemon to become Ready before it can
 install the release that corrects that daemon. Same-version/offline repair and explicit rollback keep
 their current completion checks. Published releases remain immutable.
@@ -138,22 +138,27 @@ The committed journal may contain only `transition.json` and matching `prior.zip
 Only those authenticated obsolete `prior.*` payloads are removed while the original record still
 names them, before writing the Refresh. Other shapes retain existing recovery, not a relaxed match.
 
-Use one optional, bounded `deferred_daemon` intent in the existing transition, not a recursive transaction
-tree, second writable journal or second updater. It retains the original required handoff authority.
-The ordinary `daemon` plus process identity records the freshly observed daemon for the existing fenced
-stop operation, including a positively captured absent daemon. Handoff uses the deferred intent when
-present; stopping does not. Keep the saved profile roots, and refuse a conflicting current app/profile.
-Do not weaken the existing refusal for an unfenced process or infer startup intent from failed IPC.
-`deferred_daemon` may contain only an original valid `Running` intent, checked on parse; never `Absent`.
-Without a deferred intent the fresh observation governs both stop and handoff.
+Keep the original required `Running` intent in `daemon` in the normalized pending Refresh, with no
+process identity or `deferred_daemon` field. Ordinary download and preparation failures must leave this
+record readable by the still-installed helper, which can retry its existing required handoff.
+
+During candidate preparation, use one optional, bounded `deferred_daemon` intent in the existing
+transition, not a recursive transaction tree, second writable journal or second updater. Move the
+original required intent into that field while capturing the freshly observed `daemon` and process
+identity for the existing fenced stop operation, including a positively captured absent daemon. Write
+both together with candidate preparation. Handoff uses the deferred intent when present; stopping does
+not. Keep the saved profile roots, and refuse a conflicting current app/profile. Do not weaken the
+existing refusal for an unfenced process or infer startup intent from failed IPC. `deferred_daemon`
+may contain only an original valid `Running` intent, checked on parse; never `Absent`.
 
 Reuse candidate preparation in that same Refresh journal. Preparation failure or crash removes only
-its recorded candidate objects and clears preparation while retaining pending handoff, rather than
-finishing the journal. Carry the deferred intent into the new Update record and every restoration and
-handoff path. After the newer filesystem commit, its installed helper must make the original required
-nodes Ready before success and journal retirement. If newer publication fails, existing verified source
-restoration remains mandatory; a later newer attempt must be able to resume from restored filesystem
-state without again requiring the broken older daemon to become Ready first.
+its recorded candidate objects, restores the original intent to `daemon`, clears the deferred field and
+process identity, and clears preparation while retaining pending handoff rather than finishing the
+journal. Carry the deferred intent into the new Update record and every restoration and handoff path.
+After the newer filesystem commit, its installed helper must make the original required nodes Ready
+before success and journal retirement. If newer publication fails, existing verified source restoration
+remains mandatory; a later newer attempt must be able to resume from restored filesystem state without
+again requiring the broken older daemon to become Ready first.
 
 After verified source filesystem restoration of an Update, remove only `source.zip` and `source.json`
 while the Update record still authorizes them, then atomically normalize to pending Refresh before
@@ -166,8 +171,9 @@ handoff independently and persist its receipt before deferring the daemon; do no
 daemon to become Ready merely to complete that app portion.
 
 Older helpers reject the new optional field rather than silently discarding it. After an interrupted
-superseding run, offline old-code repair may therefore refuse; preserve the record and let the verified
-newer engine resume it when available. Do not add a format downgrade or silently ignore future fields.
+superseding preparation or Update, offline old-code repair may therefore refuse; preserve the record and
+let the verified newer engine resume it when available. Normalization after verified source restoration
+returns the original intent to the field-free pending Refresh. Do not silently ignore future fields.
 
 Validation is a focused actual-binary scratch journey, not a new gate or harness. The existing UDP-port
 blocker produces a genuine unedited committed journal. On the subsequent upgrade, keep the port blocked
