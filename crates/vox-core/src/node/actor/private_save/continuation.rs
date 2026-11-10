@@ -32,6 +32,11 @@ enum DriveWait {
     Native,
 }
 
+type PublicationWait = (
+    DriveWait,
+    std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + Sync>>,
+);
+
 struct ReleaseWait {
     instance: std::sync::Weak<tokio::sync::Mutex<ChannelState>>,
     attachment: u64,
@@ -1015,13 +1020,7 @@ impl Node {
         );
     }
 
-    fn private_publication_wait(
-        &self,
-        instance: &SharedChannel,
-    ) -> Option<(
-        DriveWait,
-        std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + Sync>>,
-    )> {
+    fn private_publication_wait(&self, instance: &SharedChannel) -> Option<PublicationWait> {
         match instance.try_lock() {
             Ok(channel) => {
                 let profile = self.profile.as_ref()?;
