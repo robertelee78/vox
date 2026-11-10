@@ -112,7 +112,9 @@ Temporary removal must not be relabeled optional when it leaves another launchab
 
 ### Newer upgrade with an unfinished daemon handoff (#1201)
 
-Design approved at `c0127f6b6a98ba05de77c1bd1b65af2ff0d74ba0` by independent Opus review.
+Design approved at `c0127f6b6a98ba05de77c1bd1b65af2ff0d74ba0` by independent Opus review; the
+field-free pending Refresh refinement below was approved in source review of
+`354caacd61726bff98cb188a6e7618801d421c86`.
 The selected newer updater must not require the broken installed daemon to become Ready before it can
 install the release that corrects that daemon. Same-version/offline repair and explicit rollback keep
 their current completion checks. Published releases remain immutable.
