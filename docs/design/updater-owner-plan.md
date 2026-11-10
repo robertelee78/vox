@@ -110,6 +110,50 @@ owned publishing directory until promotion/restoration is durably resolved.
 
 Temporary removal must not be relabeled optional when it leaves another launchable/selectable application. A failed restoration remains a failure with retained recovery authority; no design can promise a successful write on an unavailable or permanently read-only filesystem. The user must not be told to do ordinary retirement/repair manually to turn a failed update into success.
 
+### Newer upgrade with an unfinished daemon handoff (#1201)
+
+Proposed correction; independent exact-revision Opus design approval is required before implementation.
+The selected newer updater must not require the broken installed daemon to become Ready before it can
+install the release that corrects that daemon. Same-version/offline repair and explicit rollback keep
+their current completion checks. Published releases remain immutable.
+
+For an explicitly selected, authenticated, strictly newer release, first resolve and authenticate the
+old transaction's filesystem state under the existing installation lock. Preserve all current identity,
+archive, signing, ownership and ambiguity refusals. Precommit state must finish verified source
+restoration before it can be considered; a committed target must never be downgraded. This continuation
+is eligible only once the old app handoff is complete; an unfinished app intent must be completed or
+retained and reported, never silently replaced with a fresh absent-app observation.
+
+The old completed filesystem transaction can become an existing Refresh record for the authenticated
+current bundle, with its original account and pending daemon startup/remembered-node intent retained.
+Canonical rollback authority remains unchanged. Retire only authenticated obsolete journal-owned
+payloads, preserving the original record until that cleanup is complete; atomically persist the
+replacement Refresh record without deleting the journal or marking the old daemon handoff complete.
+Crash recovery must still find either the original transaction or equivalent durable pending work.
+
+Use one optional, bounded `deferred_daemon` intent in the existing transition, not a recursive transaction
+tree, second writable journal or second updater. It retains the original required handoff authority.
+The ordinary `daemon` plus process identity records the freshly observed daemon for the existing fenced
+stop operation, including a positively captured absent daemon. Handoff uses the deferred intent when
+present; stopping does not. Keep the saved profile roots, and refuse a conflicting current app/profile.
+Do not weaken the existing refusal for an unfenced process or infer startup intent from failed IPC.
+
+Reuse candidate preparation in that same Refresh journal. Preparation failure or crash removes only
+its recorded candidate objects and clears preparation while retaining pending handoff, rather than
+finishing the journal. Carry the deferred intent into the new Update record and every restoration and
+handoff path. After the newer filesystem commit, its installed helper must make the original required
+nodes Ready before success and journal retirement. If newer publication fails, existing verified source
+restoration remains mandatory; a later newer attempt must be able to resume from restored filesystem
+state without again requiring the broken older daemon to become Ready first.
+
+Validation is a focused actual-binary scratch journey, not a new gate or harness. The existing UDP-port
+blocker produces a genuine unedited committed journal. On the subsequent upgrade, keep the port blocked
+until the installed bundle reports the pinned newer version, then release it. This is an apparatus
+trigger, not a commit assertion; source review establishes startup-after-commit. Consumer assertions are
+the installed version, required Ready node, unchanged fingerprint/room/message and a fresh post/read.
+The inverse must fail those same assertions by attempting the old handoff before publication.
+Observe blocker ownership/release; an unreleased-port race is APPARATUS, not a product verdict.
+
 ## 5. The existing incomplete installation
 
 The operator's v0.4.13 installation already ran and may have written current-version data. Recovery must not automatically roll it back to v0.4.12 merely because its older retirement step is incomplete.
