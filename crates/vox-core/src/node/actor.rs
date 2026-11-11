@@ -8001,6 +8001,11 @@ impl Node {
                     }
                 } => {
                     let Some(ReadRequest { command, reply }) = received else { break };
+                    // A handler decides on a current view (status answers from it), and the reply
+                    // follows a publication that holds the command's own writes.
+                    if self.view_owed.is_some() {
+                        self.publish().await;
+                    }
                     if let NodeCommand::Status { reply: status_reply } = command {
                         self.answer_status(status_reply, flow_release_rx);
                         if let Some(reply) = reply { let _ = reply.send(Outcome::Done); }
@@ -8009,11 +8014,6 @@ impl Node {
                         continue;
                     }
                     let Some(reply) = reply else { continue };
-                    // A handler decides on a current view, and the reply follows a publication
-                    // that holds the command's own writes.
-                    if self.view_owed.is_some() {
-                        self.publish().await;
-                    }
                     let shutdown = matches!(command, NodeCommand::Shutdown);
                     // Computer policy is applied by its causal `ComputerPolicy` event (and by
                     // startup before Ready), never by minting a fresh wall-clock deadline for an
@@ -13866,9 +13866,16 @@ impl Node {
                 }
             }
             NetEvent::Names(reply) => {
+                // Names come from the published view: pay an owed publication first.
+                if self.view_owed.is_some() {
+                    self.publish().await;
+                }
                 let _ = reply.send(self.resolver_snapshot().await);
             }
             NetEvent::Resolve { name, reply } => {
+                if self.view_owed.is_some() {
+                    self.publish().await;
+                }
                 let mut names = self.resolver_snapshot().await;
                 let result = async {
                     let target = names.lookup(&name)?;
