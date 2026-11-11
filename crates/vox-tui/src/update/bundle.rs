@@ -109,6 +109,12 @@ struct Transition {
     daemon_data_root: Vec<u8>,
     daemon_config_dir: Vec<u8>,
     daemon: super::restart::DaemonIntent,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_deferred_daemon",
+        skip_serializing_if = "Option::is_none"
+    )]
+    deferred_daemon: Option<super::restart::DaemonIntent>,
     #[serde(default)]
     daemon_process: Option<super::restart::DaemonProcess>,
     #[serde(default)]
@@ -187,6 +193,21 @@ where
     Ok(format)
 }
 
+fn deserialize_deferred_daemon<'de, D>(
+    deserializer: D,
+) -> Result<Option<super::restart::DaemonIntent>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let intent = <super::restart::DaemonIntent as serde::Deserialize>::deserialize(deserializer)?;
+    if !matches!(intent, super::restart::DaemonIntent::Running { .. }) || !intent.is_valid() {
+        return Err(serde::de::Error::custom(
+            "deferred daemon handoff requires a valid running intent",
+        ));
+    }
+    Ok(Some(intent))
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct IdentityHistory {
@@ -220,6 +241,30 @@ fn saved_matches(saved: Option<&BundleIdentity>, current: &BundleIdentity) -> bo
 }
 
 impl Transition {
+    fn handoff_daemon(&self) -> &super::restart::DaemonIntent {
+        self.deferred_daemon.as_ref().unwrap_or(&self.daemon)
+    }
+
+    fn pending_refresh(&self) -> bool {
+        self.identity_format == IdentityFormat::Durable
+            && self.identity_history.is_none()
+            && self.readoption_target.is_none()
+            && matches!(self.kind, TransitionKind::Refresh)
+            && self.source == self.target
+            && self.archive.is_none()
+            && self.candidate_preparation.is_none()
+            && self.legacy_preparation.is_none()
+            && !self.legacy_no_handoff
+            && self.app_complete
+            && !self.daemon_complete
+            && !self.handoff_complete
+            && self.deferred_daemon.is_none()
+            && matches!(
+                self.handoff_daemon(),
+                super::restart::DaemonIntent::Running { .. }
+            )
+    }
+
     fn identities(&self) -> [Option<&BundleIdentity>; 10] {
         [
             Some(&self.source),
@@ -466,18 +511,52 @@ fn transition_record(
     kind: TransitionKind,
     version: &str,
     app: &Option<StoppedApp>,
+    pending: Option<Transition>,
 ) -> Result<Transition, AppError> {
-    use std::os::unix::ffi::OsStrExt as _;
-    let account = match app.as_ref() {
-        Some(app) => vox_core::node::paths::Account {
-            data_root: app.account.data_root.clone(),
-            config_dir: app.account.config_dir.clone(),
-        },
-        None => vox_core::node::paths::Account::of(None, None)
-            .map_err(|e| usage(format!("cannot resolve daemon account: {e}")))?,
+    use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+    let source = bundle_identity(source)?;
+    let target = bundle_identity(target)?;
+    let (account, deferred_daemon) = match pending {
+        Some(pending) => {
+            if !pending.source.matches(&source)
+                || !saved_matches(
+                    pending
+                        .candidate_preparation
+                        .as_ref()
+                        .and_then(|preparation| preparation.staged.as_ref()),
+                    &target,
+                )
+            {
+                return Err(usage(
+                    "candidate or source identity changed during preparation",
+                ));
+            }
+            let account = vox_core::node::paths::Account {
+                data_root: PathBuf::from(std::ffi::OsString::from_vec(pending.daemon_data_root)),
+                config_dir: PathBuf::from(std::ffi::OsString::from_vec(pending.daemon_config_dir)),
+            };
+            if app.as_ref().is_some_and(|app| {
+                app.account.data_root != account.data_root
+                    || app.account.config_dir != account.config_dir
+            }) {
+                return Err(usage(
+                    "the running app uses a different profile than the pending handoff; all state retained",
+                ));
+            }
+            (account, pending.deferred_daemon)
+        }
+        None => (
+            match app.as_ref() {
+                Some(app) => vox_core::node::paths::Account {
+                    data_root: app.account.data_root.clone(),
+                    config_dir: app.account.config_dir.clone(),
+                },
+                None => vox_core::node::paths::Account::of(None, None)
+                    .map_err(|e| usage(format!("cannot resolve daemon account: {e}")))?,
+            },
+            None,
+        ),
     };
-    let daemon_data_root = account.data_root.as_os_str().as_bytes().to_vec();
-    let daemon_config_dir = account.config_dir.as_os_str().as_bytes().to_vec();
     let app = app.as_ref().map(|app| AppIntent {
         pid: app.identity.pid,
         started: app.identity.started,
@@ -495,12 +574,13 @@ fn transition_record(
         readoption_target: None,
         kind,
         version: version.to_owned(),
-        source: bundle_identity(source)?,
-        target: bundle_identity(target)?,
-        daemon_data_root,
-        daemon_config_dir,
+        source,
+        target,
+        daemon_data_root: account.data_root.into_os_string().into_vec(),
+        daemon_config_dir: account.config_dir.into_os_string().into_vec(),
         daemon,
         daemon_process,
+        deferred_daemon,
         archive: None,
         candidate_preparation: None,
         legacy_preparation: None,
@@ -534,25 +614,53 @@ fn prepare_candidate_journal(apps: &Path) -> Result<Transition, AppError> {
     use std::os::unix::fs::DirBuilderExt as _;
     let active = apps.join(BUNDLE);
     let unpacked = apps.join(UNPACK_PARTIAL);
-    if path_exists(&unpacked)?
-        || path_exists(&apps.join(PARTIAL))?
-        || path_exists(&apps.join(PUBLISHING))?
-    {
+    if path_exists(&unpacked)? || path_exists(&apps.join(PARTIAL))? {
         return Err(usage(
-            "unexpected candidate staging or journal exists; all files retained",
+            "unexpected candidate staging exists; all files retained",
         ));
     }
-    let running = inspect_app(&active)?;
-    let version =
-        app_version(&active).ok_or_else(|| usage("active Vox.app version is unavailable"))?;
-    let mut transition = transition_record(
-        &active,
-        &active,
-        &active,
-        TransitionKind::Refresh,
-        &version,
-        &running,
-    )?;
+    let retained = path_exists(&apps.join(PUBLISHING))?;
+    let mut transition = if retained {
+        use std::os::unix::ffi::OsStringExt as _;
+        let bytes = fs::read(apps.join(PUBLISHING).join(TRANSITION)).map_err(AppError::Io)?;
+        let mut pending: Transition = serde_json::from_slice(&bytes)
+            .map_err(|e| usage(format!("invalid pending handoff journal: {e}")))?;
+        pending.validate_identities(false)?;
+        if !pending.pending_refresh()
+            || !pending.source.matches(&bundle_identity(&active)?)
+            || app_version(&active).as_deref() != Some(&pending.version)
+        {
+            return Err(usage(
+                "pending handoff authority changed; all state retained",
+            ));
+        }
+        let account = vox_core::node::paths::Account {
+            data_root: PathBuf::from(std::ffi::OsString::from_vec(
+                pending.daemon_data_root.clone(),
+            )),
+            config_dir: PathBuf::from(std::ffi::OsString::from_vec(
+                pending.daemon_config_dir.clone(),
+            )),
+        };
+        let (observed, process) =
+            super::restart::capture_daemon_state(&account, &active.join(HELPER))?;
+        pending.deferred_daemon = Some(std::mem::replace(&mut pending.daemon, observed));
+        pending.daemon_process = process;
+        pending
+    } else {
+        let running = inspect_app(&active)?;
+        let version =
+            app_version(&active).ok_or_else(|| usage("active Vox.app version is unavailable"))?;
+        transition_record(
+            &active,
+            &active,
+            &active,
+            TransitionKind::Refresh,
+            &version,
+            &running,
+            None,
+        )?
+    };
     fs::DirBuilder::new()
         .mode(0o700)
         .create(&unpacked)
@@ -563,7 +671,12 @@ fn prepare_candidate_journal(apps: &Path) -> Result<Transition, AppError> {
         verification_directory: None,
         verification_path: None,
     });
-    if let Err(error) = publish_new_journal(apps, &transition) {
+    let publication = if retained {
+        write_transition(apps, &transition)
+    } else {
+        publish_new_journal(apps, &transition)
+    };
+    if let Err(error) = publication {
         return match fs::remove_dir(&unpacked) {
             Ok(()) => Err(error),
             Err(cleanup) => Err(usage(format!(
@@ -616,8 +729,8 @@ fn prepare_transition(
 ) -> Result<Transition, AppError> {
     use std::os::unix::ffi::OsStrExt as _;
     let active = apps.join(BUNDLE);
-    let mut transition = transition_record(&active, &active, candidate, kind, version, app)?;
     if matches!(kind, TransitionKind::Refresh) {
+        let transition = transition_record(&active, &active, candidate, kind, version, app, None)?;
         publish_new_journal(apps, &transition)?;
         return Ok(transition);
     }
@@ -629,8 +742,8 @@ fn prepare_transition(
         .candidate_preparation
         .as_ref()
         .ok_or_else(|| usage("missing candidate preparation authority"))?;
-    if !preparing.source.matches(&transition.source)
-        || !saved_matches(preparation.staged.as_ref(), &transition.target)
+    if !preparing.source.matches(&bundle_identity(&active)?)
+        || !saved_matches(preparation.staged.as_ref(), &bundle_identity(candidate)?)
         || candidate != apps.join(PARTIAL)
     {
         return Err(usage(
@@ -663,6 +776,15 @@ fn prepare_transition(
         (Err(e), _) | (_, Err(e)) => return Err(e),
         _ => {}
     }
+    let mut transition = transition_record(
+        &active,
+        &active,
+        candidate,
+        kind,
+        version,
+        app,
+        Some(preparing),
+    )?;
     transition.archive = Some(ArchiveTransition {
         phase: FilesystemPhase::Prepared,
         legacy: false,
@@ -708,7 +830,7 @@ pub(super) fn update(
         return Ok(());
     }
     let _lock = InstallLock::acquire(apps)?;
-    if repair_locked(apps, exe)? {
+    if repair_locked(apps, exe, None)? {
         return Ok(());
     }
     refresh(apps, exe)
@@ -717,11 +839,21 @@ pub(super) fn update(
 /// Repair retained local work after a release lookup fails, without requiring network access.
 pub(super) fn repair(apps: &Path, exe: &Path) -> Result<bool, AppError> {
     let _lock = InstallLock::acquire(apps)?;
-    repair_locked(apps, exe)
+    repair_locked(apps, exe, None)
 }
 
-fn repair_locked(apps: &Path, exe: &Path) -> Result<bool, AppError> {
-    let repaired = recover(apps)?;
+fn repair_locked(
+    apps: &Path,
+    exe: &Path,
+    upgrade: Option<&semver::Version>,
+) -> Result<bool, AppError> {
+    let repaired = recover(
+        apps,
+        upgrade.map_or(RecoveryMode::Repair, RecoveryMode::Upgrade),
+    )?;
+    if repaired.handoff_deferred {
+        return Ok(false);
+    }
     if repaired.is_empty() {
         return Ok(false);
     }
@@ -788,7 +920,7 @@ pub(super) fn apply(
             ))
         }
     }
-    let repaired = repair_locked(apps, exe)?;
+    let repaired = repair_locked(apps, exe, Some(&vox.version))?;
     let current = installed_version(apps)?;
     if vox.version <= current {
         return if repaired { Ok(()) } else { refresh(apps, exe) };
@@ -905,7 +1037,7 @@ pub(super) fn apply(
 pub(super) fn rollback(apps: &Path, exe: &Path) -> Result<(), AppError> {
     let active = apps.join(BUNDLE);
     let _lock = InstallLock::acquire(apps)?;
-    let repaired = recover(apps)?;
+    let repaired = recover(apps, RecoveryMode::Repair)?;
     if !repaired.is_empty() && !repaired.legacy_migrated {
         if !repaired.handoff_done {
             let now = app_version(&active)
@@ -1309,7 +1441,7 @@ fn sweep(apps: &Path, repaired: &mut Recovery) -> Result<(), AppError> {
 }
 
 /// Recover the exact recorded transaction under the install lock; preserve ambiguous authority.
-fn recover(apps: &Path) -> Result<Recovery, AppError> {
+fn recover(apps: &Path, mode: RecoveryMode<'_>) -> Result<Recovery, AppError> {
     let mut repaired = Recovery::default();
     let journal = apps.join(PUBLISHING);
     let journal_present = match fs::symlink_metadata(&journal) {
@@ -1370,6 +1502,7 @@ fn recover(apps: &Path) -> Result<Recovery, AppError> {
                 TransitionKind::Update,
                 &version,
                 &running,
+                None,
             )?;
             transition.legacy_no_handoff = true;
             let preparing = tempfile::Builder::new()
@@ -1384,13 +1517,13 @@ fn recover(apps: &Path) -> Result<Recovery, AppError> {
                 ))
             })?;
             sync_dir(apps)?;
-            return recover_transition(apps, &journal.join(TRANSITION));
+            return recover_transition(apps, &journal.join(TRANSITION), mode);
         }
         return Ok(repaired);
     }
     let transition_path = journal.join(TRANSITION);
     match fs::symlink_metadata(&transition_path) {
-        Ok(_) => return recover_transition(apps, &transition_path),
+        Ok(_) => return recover_transition(apps, &transition_path, mode),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => {
             return Err(usage(format!(
@@ -1487,9 +1620,10 @@ fn recover(apps: &Path) -> Result<Recovery, AppError> {
         TransitionKind::Update,
         published.trim(),
         &running,
+        None,
     )?;
     write_transition(apps, &transition)?;
-    recover_transition(apps, &transition_path)
+    recover_transition(apps, &transition_path, mode)
 }
 
 fn stopped_from_transition(transition: &Transition) -> Option<StoppedApp> {
@@ -1563,7 +1697,7 @@ fn reconcile_app_handoff(
 
 fn preparation_failed(apps: &Path, error: AppError) -> AppError {
     let path = apps.join(PUBLISHING).join(TRANSITION);
-    match recover_transition(apps, &path) {
+    match recover_transition(apps, &path, RecoveryMode::PreparationFailed) {
         Ok(_) => error,
         Err(cleanup) => usage(format!(
             "{error}; candidate preparation cleanup failed: {cleanup}; journal retained"
@@ -1571,7 +1705,7 @@ fn preparation_failed(apps: &Path, error: AppError) -> AppError {
     }
 }
 
-fn recover_candidate_preparation(apps: &Path, transition: &Transition) -> Result<(), AppError> {
+fn recover_candidate_preparation(apps: &Path, transition: &mut Transition) -> Result<(), AppError> {
     use std::os::unix::ffi::OsStringExt as _;
     let preparation = transition
         .candidate_preparation
@@ -1663,7 +1797,136 @@ fn recover_candidate_preparation(apps: &Path, transition: &Transition) -> Result
             ))
         })?;
     }
-    finish_journal(apps)
+    if let Some(original) = transition.deferred_daemon.take() {
+        remove_journal_file(apps, SOURCE_ARCHIVE)?;
+        remove_journal_file(apps, "source.json")?;
+        transition.daemon = original;
+        transition.daemon_process = None;
+        transition.candidate_preparation = None;
+        write_transition(apps, transition)
+    } else {
+        finish_journal(apps)
+    }
+}
+
+fn remove_journal_file(apps: &Path, name: &str) -> Result<(), AppError> {
+    let path = apps.join(PUBLISHING).join(name);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(usage(format!("cannot remove {}: {error}", path.display()))),
+    }
+}
+
+/// Replace completed filesystem authority with equivalent pending startup work, never success.
+fn normalize_pending_refresh(
+    apps: &Path,
+    transition: &mut Transition,
+    version: &str,
+) -> Result<(), AppError> {
+    let identity = bundle_identity(&apps.join(BUNDLE))?;
+    if let Some(original) = transition.deferred_daemon.take() {
+        transition.daemon = original;
+    }
+    transition.daemon_process = None;
+    transition.kind = TransitionKind::Refresh;
+    transition.version = version.to_owned();
+    transition.source = identity.clone();
+    transition.target = identity;
+    transition.archive = None;
+    transition.daemon_complete = false;
+    transition.handoff_complete = false;
+    write_transition(apps, transition)
+}
+
+/// A newer selected release may discharge an authenticated old daemon debt after publication.
+fn defer_daemon_handoff(
+    apps: &Path,
+    transition: &mut Transition,
+    version: &str,
+    mode: RecoveryMode<'_>,
+) -> Result<bool, AppError> {
+    let RecoveryMode::Upgrade(target) = mode else {
+        return Ok(false);
+    };
+    let installed = semver::Version::parse(version)
+        .map_err(|_| usage("the installed handoff version is not SemVer"))?;
+    if *target <= installed
+        || transition.identity_format != IdentityFormat::Durable
+        || transition.identity_history.is_some()
+        || transition.readoption_target.is_some()
+        || transition.candidate_preparation.is_some()
+        || transition.legacy_preparation.is_some()
+        || transition.legacy_no_handoff
+        || transition.daemon_complete
+        || transition.handoff_complete
+        || !matches!(
+            transition.handoff_daemon(),
+            super::restart::DaemonIntent::Running { .. }
+        )
+    {
+        return Ok(false);
+    }
+    let prior = match (&transition.kind, &transition.archive) {
+        (TransitionKind::Update, Some(archive))
+            if !archive.legacy
+                && archive.legacy_path.is_none()
+                && archive.legacy_superseded.is_none()
+                && archive.legacy_superseded_identity.is_none()
+                && archive.restoration.is_none()
+                && archive.restoration_directory.is_none()
+                && archive.restoration_path.is_none()
+                && matches!(
+                    archive.phase,
+                    FilesystemPhase::FilesystemCommitted | FilesystemPhase::HandingOff
+                ) =>
+        {
+            archive.previous_archive.as_ref()
+        }
+        (TransitionKind::Refresh, None) if transition.source == transition.target => None,
+        _ => return Ok(false),
+    };
+    let journal = apps.join(PUBLISHING);
+    for entry in fs::read_dir(&journal).map_err(AppError::Io)? {
+        let entry = entry.map_err(AppError::Io)?;
+        if entry.file_name() != TRANSITION
+            && entry.file_name() != PRIOR_ARCHIVE
+            && entry.file_name() != PRIOR_AUTHORITY
+        {
+            return Ok(false);
+        }
+    }
+    let prior_zip = journal.join(PRIOR_ARCHIVE);
+    if path_exists(&prior_zip)?
+        && !match prior {
+            Some(authority) => archive_matches(&prior_zip, authority)?,
+            None => false,
+        }
+    {
+        return Ok(false);
+    }
+    let prior_record = journal.join(PRIOR_AUTHORITY);
+    if path_exists(&prior_record)? && prior != Some(&read_archive_record(&prior_record)?) {
+        return Ok(false);
+    }
+    if !transition.app_complete {
+        let stopped = stopped_from_transition(transition);
+        reconcile_app_handoff(
+            &apps.join(BUNDLE),
+            &stopped,
+            matches!(transition.kind, TransitionKind::Update),
+        )?;
+        transition.app_complete = true;
+        write_transition(apps, transition)?;
+    }
+    if matches!(transition.kind, TransitionKind::Update) {
+        remove_journal_file(apps, PRIOR_ARCHIVE)?;
+        remove_journal_file(apps, PRIOR_AUTHORITY)?;
+    }
+    if !transition.pending_refresh() {
+        normalize_pending_refresh(apps, transition, version)?;
+    }
+    Ok(true)
 }
 
 fn code_directory_hash(path: &Path) -> Result<String, AppError> {
@@ -1916,7 +2179,11 @@ fn authenticate_readoption(apps: &Path, transition: &mut Transition) -> Result<(
 }
 
 /// Recover using the bundle identities and owned handoff captured before the app was stopped.
-fn recover_transition(apps: &Path, path: &Path) -> Result<Recovery, AppError> {
+fn recover_transition(
+    apps: &Path,
+    path: &Path,
+    mode: RecoveryMode<'_>,
+) -> Result<Recovery, AppError> {
     use std::os::unix::ffi::OsStringExt as _;
     let bytes =
         fs::read(path).map_err(|e| usage(format!("cannot read {}: {e}", path.display())))?;
@@ -1982,13 +2249,23 @@ fn recover_transition(apps: &Path, path: &Path) -> Result<Recovery, AppError> {
         }
     }
     if transition.candidate_preparation.is_some() {
-        recover_candidate_preparation(apps, &transition)?;
-        return Ok(Recovery {
-            interrupted_publish: true,
-            handoff_done: true,
-            legacy_migrated: true,
-            ..Recovery::default()
-        });
+        let adopted = transition.deferred_daemon.is_some();
+        recover_candidate_preparation(apps, &mut transition)?;
+        if !adopted {
+            return Ok(Recovery {
+                interrupted_publish: true,
+                handoff_done: true,
+                legacy_migrated: true,
+                ..Recovery::default()
+            });
+        }
+        if matches!(mode, RecoveryMode::PreparationFailed) {
+            return Ok(Recovery {
+                interrupted_publish: true,
+                handoff_deferred: true,
+                ..Recovery::default()
+            });
+        }
     }
     if transition.archive.is_none()
         && !matches!(transition.kind, TransitionKind::Refresh)
@@ -2074,12 +2351,7 @@ fn recover_transition(apps: &Path, path: &Path) -> Result<Recovery, AppError> {
             FilesystemPhase::FilesystemCommitted | FilesystemPhase::HandingOff
         ) {
             let stopped = stopped_from_transition(&transition);
-            restore_source_and_handoff(apps, &stopped, &mut transition)?;
-            return Ok(Recovery {
-                interrupted_publish: true,
-                handoff_done: true,
-                ..Recovery::default()
-            });
+            return restore_source_and_handoff(apps, &stopped, &mut transition, mode);
         }
         if !transition
             .target
@@ -2153,6 +2425,13 @@ fn recover_transition(apps: &Path, path: &Path) -> Result<Recovery, AppError> {
             path.display()
         )));
     }
+    if defer_daemon_handoff(apps, &mut transition, &now, mode)? {
+        return Ok(Recovery {
+            interrupted_publish: true,
+            handoff_deferred: true,
+            ..Recovery::default()
+        });
+    }
     let mut errors = Vec::new();
     if let Err(e) = sync_dir(apps) {
         errors.push(format!("cannot sync directory {}: {e}", apps.display()));
@@ -2172,7 +2451,7 @@ fn recover_transition(apps: &Path, path: &Path) -> Result<Recovery, AppError> {
                 &account,
                 &active.join(HELPER),
                 &now,
-                Some(&transition.daemon),
+                Some(transition.handoff_daemon()),
             ) {
                 Ok(_detached) => {
                     transition.daemon_complete = true;
@@ -2222,11 +2501,18 @@ fn recover_transition(apps: &Path, path: &Path) -> Result<Recovery, AppError> {
         interrupted_publish: true,
         handoff_done: true,
         daemon_was_running: Some(matches!(
-            &transition.daemon,
+            transition.handoff_daemon(),
             super::restart::DaemonIntent::Running { .. }
         )),
         ..Recovery::default()
     })
+}
+
+#[derive(Clone, Copy)]
+enum RecoveryMode<'a> {
+    Repair,
+    Upgrade(&'a semver::Version),
+    PreparationFailed,
 }
 
 /// Work left by an earlier transition, reported after the active daemon has been restarted.
@@ -2234,6 +2520,7 @@ fn recover_transition(apps: &Path, path: &Path) -> Result<Recovery, AppError> {
 struct Recovery {
     interrupted_publish: bool,
     handoff_done: bool,
+    handoff_deferred: bool,
     legacy_migrated: bool,
     retired_removed: usize,
     daemon_was_running: Option<bool>,
@@ -3890,7 +4177,7 @@ fn transition_handoff(
 ) -> Result<(), AppError> {
     let mut failures = Vec::new();
     if !transition.daemon_complete {
-        match restart_for_handoff(active, version, stopped, Some(&transition.daemon)) {
+        match restart_for_handoff(active, version, stopped, Some(transition.handoff_daemon())) {
             Ok(()) => {
                 transition.daemon_complete = true;
                 if let Err(e) = write_transition(apps, transition) {
@@ -3928,7 +4215,8 @@ fn restore_source_and_handoff(
     apps: &Path,
     stopped: &Option<StoppedApp>,
     transition: &mut Transition,
-) -> Result<(), AppError> {
+    mode: RecoveryMode<'_>,
+) -> Result<Recovery, AppError> {
     use std::os::unix::ffi::OsStringExt as _;
     let filesystem = restore_source_filesystem(apps, transition);
     let active = apps.join(BUNDLE);
@@ -3950,6 +4238,37 @@ fn restore_source_and_handoff(
     verify_local_bundle(&active, &archive.source_archive)?;
     launch_services(true, &active).map_err(usage)?;
     let version = archive.source_archive.version.clone();
+    if filesystem.is_ok()
+        && transition.identity_format == IdentityFormat::Durable
+        && matches!(transition.kind, TransitionKind::Update)
+        && !archive.legacy
+        && !transition.daemon_complete
+    {
+        let source_zip = apps.join(PUBLISHING).join(SOURCE_ARCHIVE);
+        if path_exists(&source_zip)? && !archive_matches(&source_zip, &archive.source_archive)? {
+            return Err(usage(
+                "restoration snapshot changed; recovery authority retained",
+            ));
+        }
+        let source_record = apps.join(PUBLISHING).join("source.json");
+        if path_exists(&source_record)?
+            && read_archive_record(&source_record)? != archive.source_archive
+        {
+            return Err(usage(
+                "restoration snapshot record changed; recovery authority retained",
+            ));
+        }
+        remove_journal_file(apps, SOURCE_ARCHIVE)?;
+        remove_journal_file(apps, "source.json")?;
+        normalize_pending_refresh(apps, transition, &version)?;
+        if defer_daemon_handoff(apps, transition, &version, mode)? {
+            return Ok(Recovery {
+                interrupted_publish: true,
+                handoff_deferred: true,
+                ..Recovery::default()
+            });
+        }
+    }
     let account = vox_core::node::paths::Account {
         data_root: PathBuf::from(std::ffi::OsString::from_vec(
             transition.daemon_data_root.clone(),
@@ -3963,7 +4282,7 @@ fn restore_source_and_handoff(
             &account,
             &active.join(HELPER),
             &version,
-            Some(&transition.daemon),
+            Some(transition.handoff_daemon()),
         )?;
         transition.daemon_complete = true;
         write_transition(apps, transition)?;
@@ -3975,7 +4294,16 @@ fn restore_source_and_handoff(
     }
     transition_handoff(apps, &active, &version, stopped, transition)?;
     filesystem?;
-    finish_journal(apps)
+    finish_journal(apps)?;
+    Ok(Recovery {
+        interrupted_publish: true,
+        handoff_done: true,
+        daemon_was_running: Some(matches!(
+            transition.handoff_daemon(),
+            super::restart::DaemonIntent::Running { .. }
+        )),
+        ..Recovery::default()
+    })
 }
 
 /// Report the original failure, restoring only before the filesystem commit boundary.
@@ -3993,8 +4321,8 @@ fn transition_failed_journal(
     }) {
         return usage(format!("{error}; filesystem commit may have completed; retained journal for handoff, no automatic downgrade"));
     }
-    match restore_source_and_handoff(apps, stopped, transition) {
-        Ok(()) => usage(format!("{error}; previous installation and startup intent restored")),
+    match restore_source_and_handoff(apps, stopped, transition, RecoveryMode::Repair) {
+        Ok(_) => usage(format!("{error}; previous installation and startup intent restored")),
         Err(restoration) => usage(format!("{error}; automatic source restoration incomplete: {restoration}; recovery authority retained")),
     }
 }

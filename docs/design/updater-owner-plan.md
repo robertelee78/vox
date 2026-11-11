@@ -110,6 +110,83 @@ owned publishing directory until promotion/restoration is durably resolved.
 
 Temporary removal must not be relabeled optional when it leaves another launchable/selectable application. A failed restoration remains a failure with retained recovery authority; no design can promise a successful write on an unavailable or permanently read-only filesystem. The user must not be told to do ordinary retirement/repair manually to turn a failed update into success.
 
+### Newer upgrade with an unfinished daemon handoff (#1201)
+
+Design approved at `c0127f6b6a98ba05de77c1bd1b65af2ff0d74ba0` by independent Opus review; the
+field-free pending Refresh refinement below was approved in source review of
+`354caacd61726bff98cb188a6e7618801d421c86`.
+The selected newer updater must not require the broken installed daemon to become Ready before it can
+install the release that corrects that daemon. Same-version/offline repair and explicit rollback keep
+their current completion checks. Published releases remain immutable.
+
+For an explicitly selected, authenticated, strictly newer release, first resolve and authenticate the
+old transaction's filesystem state under the existing installation lock. Preserve all current identity,
+archive, signing, ownership and ambiguity refusals. Precommit state must finish verified source
+restoration before it can be considered; a committed target must never be downgraded. This continuation
+is eligible only once the old app handoff is complete; an unfinished app intent must be completed or
+retained and reported, never silently replaced with a fresh absent-app observation.
+
+The old completed filesystem transaction can become an existing Refresh record for the authenticated
+current bundle, with its original account and pending daemon startup/remembered-node intent retained.
+Canonical rollback authority remains unchanged. Retire only authenticated obsolete journal-owned
+payloads, preserving the original record until that cleanup is complete; atomically persist the
+replacement Refresh record without deleting the journal or marking the old daemon handoff complete.
+Crash recovery must still find either the original transaction or equivalent durable pending work.
+
+Eligible adoption is limited to `durable-v1`, with no readoption target, legacy, restoration or
+preparation fields: a non-legacy Update whose filesystem is committed, app handoff complete and
+daemon handoff incomplete, or an already normalized pending Refresh with no archive or preparation.
+The committed journal may contain only `transition.json` and matching `prior.zip`/`prior.json`.
+Only those authenticated obsolete `prior.*` payloads are removed while the original record still
+names them, before writing the Refresh. Other shapes retain existing recovery, not a relaxed match.
+
+Keep the original required `Running` intent in `daemon` in the normalized pending Refresh, with no
+process identity or `deferred_daemon` field. Ordinary download and preparation failures must leave this
+record readable by the still-installed helper, which can retry its existing required handoff.
+
+During candidate preparation, use one optional, bounded `deferred_daemon` intent in the existing
+transition, not a recursive transaction tree, second writable journal or second updater. Move the
+original required intent into that field while capturing the freshly observed `daemon` and process
+identity for the existing fenced stop operation, including a positively captured absent daemon. Write
+both together with candidate preparation. Handoff uses the deferred intent when present; stopping does
+not. Keep the saved profile roots, and refuse a conflicting current app/profile. Do not weaken the
+existing refusal for an unfenced process or infer startup intent from failed IPC. `deferred_daemon`
+may contain only an original valid `Running` intent, checked on parse; never `Absent`.
+
+Reuse candidate preparation in that same Refresh journal. Preparation failure or crash removes only
+its recorded candidate objects, restores the original intent to `daemon`, clears the deferred field and
+process identity, and clears preparation while retaining pending handoff rather than finishing the
+journal. Carry the deferred intent into the new Update record and every restoration and handoff path.
+After the newer filesystem commit, its installed helper must make the original required nodes Ready
+before success and journal retirement. If newer publication fails, existing verified source restoration
+remains mandatory; a later newer attempt must be able to resume from restored filesystem state without
+again requiring the broken older daemon to become Ready first.
+
+After verified source filesystem restoration of an Update, remove only `source.zip` and `source.json`
+while the Update record still authorizes them, then atomically normalize to pending Refresh before
+trying the old daemon handoff. Its source and target are the authenticated restored bundle's actual
+identity, its version is the restored version, and its original-or-deferred startup intent, account,
+app intent and completion flags remain intact with daemon handoff incomplete. A crash before this
+write can resume from the authenticated restored identity without needing the removed source archive.
+If old handoff fails, retain the pending Refresh. For a newer apply, reconcile any unfinished app
+handoff independently and persist its receipt before deferring the daemon; do not require the broken
+daemon to become Ready merely to complete that app portion.
+
+Older helpers reject the new optional field rather than silently discarding it. After an interrupted
+superseding preparation or Update, offline old-code repair may therefore refuse; preserve the record and
+let the verified newer engine resume it when available. Normalization after verified source restoration
+returns the original intent to the field-free pending Refresh. Do not silently ignore future fields.
+
+Validation is a focused actual-binary scratch journey, not a new gate or harness. The existing UDP-port
+blocker produces a genuine unedited committed journal. On the subsequent upgrade, keep the port blocked
+until the installed bundle reports the pinned newer version, then release it. This is an apparatus
+trigger, not a commit assertion; source review establishes startup-after-commit. Consumer assertions are
+the installed version, required Ready node, unchanged fingerprint/room/message and a fresh post/read.
+The inverse must fail those same assertions by attempting the old handoff before publication.
+Observe blocker ownership/release; an unreleased-port race is APPARATUS, not a product verdict.
+A disposable preparation-refusal case must leave pending Refresh intact; a subsequent good apply
+must install the new release and preserve actual use. This covers no-stranding beyond source review.
+
 ## 5. The existing incomplete installation
 
 The operator's v0.4.13 installation already ran and may have written current-version data. Recovery must not automatically roll it back to v0.4.12 merely because its older retirement step is incomplete.

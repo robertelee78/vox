@@ -107,7 +107,8 @@ jobs:
   # packages both. One job, so neither artifact can exist without the other.
   build-darwin-arm64:
     if: ${{ github.event_name != 'workflow_dispatch' || !inputs.candidate_only }}
-    runs-on: macos-latest
+    # Pin the Apple Silicon image used by CI instead of the moving latest alias.
+    runs-on: macos-26
     timeout-minutes: 120  # two notary submissions, each waited on
     # Holds the Apple credentials. A fork or a pull request cannot reach them, so it cannot
     # produce a release artifact — which is the point: there is no unsigned fallback.
@@ -198,7 +199,8 @@ jobs:
   # checkout must both be the exact explicitly selected source before apple-release is reached.
   candidate-preflight:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_only }}
-    runs-on: macos-latest
+    # This source/owner check needs only Bash and Git, not a macOS runner.
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
@@ -227,7 +229,7 @@ jobs:
   candidate-darwin-arm64:
     needs: [candidate-preflight]
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_only }}
-    runs-on: macos-latest
+    runs-on: macos-26
     timeout-minutes: 360
     environment: apple-release
     permissions:
