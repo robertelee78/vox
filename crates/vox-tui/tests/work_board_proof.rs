@@ -306,56 +306,81 @@ fn busy_room_reads_whole_board(alice: &Worker, bob: &Worker, room: &str) {
         |o| o.ok && held(o) == BUSY_ITEMS,
     );
     let stop = AtomicBool::new(false);
-    // When each of bob-2's posts was on bob's node: a local post returns once it is saved and
-    // rendered there, so its completion is an arrival on the node bob reads from.
-    let landed: std::sync::Mutex<Vec<std::time::Instant>> = std::sync::Mutex::new(Vec::new());
+    // bob-2's posts, each as its entry hash and when `vox room post --json` returned: the post
+    // was saved on bob's node, the node bob reads from, no later than that.
+    let posted: std::sync::Mutex<Vec<(String, std::time::Instant)>> =
+        std::sync::Mutex::new(Vec::new());
     std::thread::scope(|s| {
-        let (stop, landed) = (&stop, &landed);
+        let (stop, posted) = (&stop, &posted);
         for (w, session) in [(alice, "alice"), (bob, "bob-2")] {
             s.spawn(move || {
                 let mut n = 0u32;
                 while !stop.load(Ordering::Relaxed) {
                     n += 1;
                     let body = format!("busy chatter {session} {n}");
-                    let o = as_session(w, session, &["room", "post", room, &body]);
+                    let o = as_session(w, session, &["room", "post", room, &body, "--json"]);
                     if o.ok && session == "bob-2" {
-                        landed.lock().unwrap().push(std::time::Instant::now());
+                        if let Some(hash) = o.json()["entry_hash"].as_str() {
+                            posted
+                                .lock()
+                                .unwrap()
+                                .push((hash.to_owned(), std::time::Instant::now()));
+                        }
                     }
                     std::thread::sleep(std::time::Duration::from_millis(250));
                 }
             });
         }
-        // Busy is measured inside one read: at least one of bob-2's posts must have landed
-        // while a `vox room board` was between its first page and its last (strictly inside
-        // the read, MARGIN clear of its start and end), else nothing about reading across
-        // arrivals was tested. Reads continue until that is seen, or the deadline names it.
-        // The posters are stopped before any red, or the scope would wait on them forever.
+        // Busy is measured inside one read, from what the product records. A board's
+        // `position.last` is the newest row its first page pinned; `vox room read --since` that
+        // row lists what arrived after it, so a bob-2 post among those rows landed after page 1.
+        // That it landed before the last page: its `vox room post` had returned, the row saved,
+        // MARGIN before the reader process exited, and the reader exits right after its last
+        // page. Reads continue until one such read is seen, or the deadline names it. The
+        // posters are stopped before any red, or the scope would wait on them forever.
         const MARGIN: std::time::Duration = std::time::Duration::from_millis(40);
-        let deadline = std::time::Instant::now() + support::TIMEOUT;
-        let mut reads: Vec<(std::time::Instant, std::time::Instant, u64)> = Vec::new();
-        let crossed = |reads: &[(std::time::Instant, std::time::Instant, u64)]| {
-            let landed = landed.lock().unwrap();
-            reads.iter().position(|(start, end, _)| {
-                landed
+        struct Read {
+            end: std::time::Instant,
+            last: String,
+            entries: u64,
+        }
+        let crossed = |reads: &[Read]| -> Option<usize> {
+            let posted = posted.lock().unwrap().clone();
+            reads.iter().position(|r| {
+                let saved: Vec<&str> = posted
                     .iter()
-                    .any(|t| *t >= *start + MARGIN && *t + MARGIN <= *end)
+                    .filter(|(_, t)| *t + MARGIN <= r.end)
+                    .map(|(h, _)| h.as_str())
+                    .collect();
+                if saved.is_empty() {
+                    return false;
+                }
+                let after = bob.vox(None, &["room", "read", room, "--since", &r.last, "--json"]);
+                after.ok
+                    && after
+                        .ndjson()
+                        .iter()
+                        .filter_map(|row| row["entry_hash"].as_str())
+                        .any(|h| saved.contains(&h))
             })
         };
+        let deadline = std::time::Instant::now() + support::TIMEOUT;
+        let mut reads: Vec<Read> = Vec::new();
         let verdict = loop {
             if reads.len() >= READS && crossed(&reads).is_some() {
                 break Ok(());
             }
             if std::time::Instant::now() >= deadline {
                 break Err(format!(
-                    "APPARATUS, CANNOT MEASURE: in {}s none of bob-2's {} posts landed inside \
-                     one of bob's {} board reads; reading across arrivals was not exercised",
+                    "APPARATUS, CANNOT MEASURE: in {}s none of bob-2's {} posts arrived after \
+                     the pinned head and before the end of one of bob's {} board reads; reading \
+                     across arrivals was not exercised",
                     support::TIMEOUT.as_secs(),
-                    landed.lock().unwrap().len(),
+                    posted.lock().unwrap().len(),
                     reads.len()
                 ));
             }
             let i = reads.len();
-            let start = std::time::Instant::now();
             let o = as_session(bob, "bob", &["room", "board", room, "--json"]);
             let end = std::time::Instant::now();
             if !o.ok {
@@ -373,11 +398,17 @@ fn busy_room_reads_whole_board(alice: &Worker, bob: &Worker, room: &str) {
                      of alice's {BUSY_ITEMS} held resources: {o:?}"
                 ));
             }
-            reads.push((
-                start,
+            let json = o.json();
+            let Some(last) = json["position"]["last"].as_str() else {
+                break Err(format!(
+                    "PRODUCT: read {i} of the board names no position.last: {o:?}"
+                ));
+            };
+            reads.push(Read {
                 end,
-                o.json()["position"]["entries"].as_u64().unwrap_or(0),
-            ));
+                last: last.to_owned(),
+                entries: json["position"]["entries"].as_u64().unwrap_or(0),
+            });
         };
         stop.store(true, Ordering::Relaxed);
         if let Err(red) = verdict {
@@ -386,11 +417,11 @@ fn busy_room_reads_whole_board(alice: &Worker, bob: &Worker, room: &str) {
         let inside = crossed(&reads).unwrap_or(0);
         println!(
             "[proof] {} whole {BUSY_ITEMS}-claim boards read while the room posted; read {inside} \
-             ({:?}) had a post land between its pages; entries {} -> {}",
+             (position.last {}) had a bob-2 post arrive between its pages; entries {} -> {}",
             reads.len(),
-            reads[inside].1 - reads[inside].0,
-            reads[0].2,
-            reads[reads.len() - 1].2
+            reads[inside].last,
+            reads[0].entries,
+            reads[reads.len() - 1].entries
         );
     });
 }

@@ -105,8 +105,9 @@ pub(crate) enum Query {
     Count {
         since: Option<Digest32>,
     },
-    /// The room's readable position as it stood at a pinned arrival: how many rows had
-    /// arrived by `through`, and the newest of them. Answered as [`Reply::Count`].
+    /// The room's position as it stood at a pinned arrival: how many rendered rows had
+    /// arrived by `through` (an owed placeholder has no body and no arrival, and is not one),
+    /// and the newest of them. Answered as [`Reply::Count`].
     Position {
         through: HistoryCursor,
     },
@@ -1688,7 +1689,8 @@ impl View<'_> {
                     .step(None, false, Some((through.arrival, [u8::MAX; 32])), true)?
                     .map(|((_, hash), _)| hash);
                 let n = self
-                    .count_before(None)?
+                    .rendered
+                    .count()?
                     .saturating_sub(self.rendered.after_arrival(through.arrival)?);
                 Ok(Reply::Count { n, last })
             }

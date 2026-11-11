@@ -163,7 +163,8 @@ pub struct Page {
     pub version: String,
     /// Whether the canonical version table refuses coordination.
     pub refused: bool,
-    /// Whole-room readable entry count at the pinned arrival head this board folds.
+    /// Rendered rows at or below the pinned arrival head this board folds: the prefix folded
+    /// (ADR-021 §7.4). A message still owed has no body and no arrival, and is not counted.
     pub entries: u64,
     /// Newest arrival at the pinned head, not greatest send timestamp.
     pub last: Option<Digest32>,
