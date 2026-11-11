@@ -3843,7 +3843,7 @@ impl Management {
                 // stage neither subtracts a private budget nor starts a new one.
                 let outcome = if deadline <= std::time::Instant::now() {
                     if causal {
-                        let _recording = lock(&me.recording);
+                        let _recording = hold(&me.recording);
                         if lock(&me.inflight)
                             .get(&peer)
                             .is_some_and(|flight| flight.serial == serial && flight.superseded)
