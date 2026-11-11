@@ -230,14 +230,24 @@ fn previous(
     Ok(found)
 }
 
+/// How many members of `groups` arrived before `before`: the predecessor's rank less the
+/// members that have since left the group, which all arrived before it (`activity_fold`).
 fn prefix(read: &Read<'_>, tree: T, groups: &[Digest32], before: u64) -> Result<u64> {
     let mut count = 0u64;
+    let counts = super::activity_fold::count_of(tree)?;
     for group in groups {
-        let rank = read
+        let Some((_, rank)) = read
             .activity_previous(tree, Some(member_key(group, before)))?
             .filter(|(key, _)| key[..32] == group[..])
-            .map_or(0, |(_, rank)| rank);
-        count = count.checked_add(rank).ok_or_else(bad)?;
+        else {
+            continue;
+        };
+        let removed = read
+            .activity_find(counts, &super::activity_fold::removed_key(group))?
+            .unwrap_or(0);
+        count = count
+            .checked_add(rank.checked_sub(removed).ok_or_else(bad)?)
+            .ok_or_else(bad)?;
     }
     Ok(count)
 }

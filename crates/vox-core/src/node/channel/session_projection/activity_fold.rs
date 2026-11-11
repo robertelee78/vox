@@ -30,6 +30,39 @@ fn plus(index: &mut Write<'_, '_>, tree: T, key: [u8; 64], n: u64) -> Result<u64
     index.activity_set(tree, key, Some(value))?;
     Ok(value)
 }
+fn id_of(key: &[u8; 64]) -> u64 {
+    u64::from_be_bytes(key[32..40].try_into().unwrap_or([0; 8]))
+}
+/// Under a rank's count tree, how many members already left this group (`removed`).
+pub(super) fn removed_key(group: &Digest32) -> [u8; 64] {
+    hash_key(&sha256_concat(&[b"vox/session-activity/removed/v1", group]))
+}
+/// The live-count tree that pairs with a rank tree.
+pub(super) fn count_of(rank: T) -> Result<T> {
+    Ok(match rank {
+        T::RawRank => T::RawCount,
+        T::AllRank => T::AllCount,
+        T::FileRank => T::FileCount,
+        T::RequestRank => T::RequestCount,
+        T::Visible => T::VisibleCount,
+        _ => return Err(bad()),
+    })
+}
+/// A rank is the member's prefix count at its arrival: members are folded in arrival
+/// order, so it is one more than every earlier member's, counting those that have since
+/// left the group (`removed`). `prefix` subtracts the removed count again.
+fn rank_plus(index: &mut Write<'_, '_>, count: T, group: &Digest32) -> Result<u64> {
+    let live = plus(index, count, hash_key(group), 1)?;
+    let removed = index
+        .activity_find(count, &removed_key(group))?
+        .unwrap_or(0);
+    live.checked_add(removed).ok_or_else(bad)
+}
+fn lowest(index: &Write<'_, '_>, tree: T, group: &Digest32, arrival: u64) -> Result<bool> {
+    Ok(index
+        .activity_next(tree, Some(hash_key(group)))?
+        .is_some_and(|(key, _)| key[..32] == group[..] && id_of(&key) == arrival))
+}
 pub(super) fn authored_reference(fact: &Fact, reference: &Digest32) -> Digest32 {
     sha256_concat(&[
         b"vox/session-activity/authored-ref/v1",
@@ -44,12 +77,12 @@ pub(super) fn omp_current_key(group: &Digest32) -> Digest32 {
 
 pub(super) fn visible(index: &mut Write<'_, '_>, f: &Fact) -> Result<()> {
     let group = f.group();
-    let rank = plus(index, T::RawCount, hash_key(&group), 1)?;
+    let rank = rank_plus(index, T::RawCount, &group)?;
     index.activity_set(T::RawRank, member_key(&group, f.arrival), Some(rank))?;
-    let rank = plus(index, T::AllCount, hash_key(&f.author), 1)?;
+    let rank = rank_plus(index, T::AllCount, &f.author)?;
     index.activity_set(T::AllRank, member_key(&f.author, f.arrival), Some(rank))?;
     if f.file_out {
-        let rank = plus(index, T::FileCount, hash_key(&f.author), 1)?;
+        let rank = rank_plus(index, T::FileCount, &f.author)?;
         index.activity_set(T::FileRank, member_key(&f.author, f.arrival), Some(rank))?;
     }
     if f.kind == Kind::OmpReset && f.omp_branch.is_some() {
@@ -114,7 +147,7 @@ pub(super) fn visible(index: &mut Write<'_, '_>, f: &Fact) -> Result<()> {
     if let Some(reference) = f.reference {
         if matches!(f.kind, Kind::Approval | Kind::Question | Kind::Resolved) {
             let authored = authored_reference(f, &reference);
-            let rank = plus(index, T::RequestCount, hash_key(&authored), 1)?;
+            let rank = rank_plus(index, T::RequestCount, &authored)?;
             index.activity_set(T::RequestRank, member_key(&authored, f.arrival), Some(rank))?;
         }
         if f.kind == Kind::Drive {
@@ -162,7 +195,7 @@ pub(super) fn visible(index: &mut Write<'_, '_>, f: &Fact) -> Result<()> {
         }
     }
     let visible_group = super::activity_index::visible_group(f);
-    let rank = plus(index, T::VisibleCount, hash_key(&visible_group), 1)?;
+    let rank = rank_plus(index, T::VisibleCount, &visible_group)?;
     index.activity_set(
         T::Visible,
         member_key(&visible_group, f.arrival),
@@ -263,6 +296,126 @@ pub(super) fn appended(index: &mut Write<'_, '_>, f: &Fact) -> Result<()> {
     Ok(())
 }
 
+/// Folds one removed fact out of the index exactly, or returns false: the index must be
+/// rebuilt. Ranks are prefix counts written in arrival order, so a member leaves its rank
+/// groups exactly only while it is the lowest arrival in each; the group's removed count
+/// then carries the shift for every remaining rank. Expiry removes the oldest rows, so
+/// this is the common shape. A request, a drive, an OMP reset or replacement and a
+/// multipart body reach other derived trees and rebuild, as before.
+pub(super) fn removed(index: &mut Write<'_, '_>, f: &Fact) -> Result<bool> {
+    let activity = &index.header.activity;
+    if !activity.ready {
+        // A rebuild still walking retained facts below this arrival never sees it.
+        return Ok(activity.work.as_ref().is_some_and(|work| {
+            work.phase == 1
+                && work
+                    .cursor
+                    .as_ref()
+                    .is_none_or(|cursor| super::activity_index::arrival_of(cursor) < f.arrival)
+        }));
+    }
+    if f.arrival > activity.applied {
+        return Ok(true);
+    }
+    if f.latest_only
+        || f.part.is_some_and(|(_, n)| n > 1)
+        || !matches!(
+            f.kind,
+            Kind::Other
+                | Kind::ToolDone
+                | Kind::DriveResult
+                | Kind::OmpMessage
+                | Kind::OmpMessageUpdate
+                | Kind::OmpMedia
+                | Kind::OmpDisclosure
+        )
+    {
+        return Ok(false);
+    }
+    let group = f.group();
+    let visible_group = super::activity_index::visible_group(f);
+    let mut ranks = vec![(T::RawRank, group), (T::AllRank, f.author)];
+    if f.file_out {
+        ranks.push((T::FileRank, f.author));
+    }
+    if index
+        .activity_find(T::Visible, &member_key(&visible_group, f.arrival))?
+        .is_some()
+    {
+        ranks.push((T::Visible, visible_group));
+    }
+    for (rank, group) in &ranks {
+        if !lowest(index, *rank, group, f.arrival)? {
+            return Ok(false);
+        }
+    }
+    // An outcome's bytes are cumulative per authored reference; later members shift.
+    let mut outcome = None;
+    if let Some(reference) = f.part_group.and(f.outcome_reference()).filter(|_| {
+        matches!(
+            f.kind,
+            Kind::ToolDone | Kind::DriveResult | Kind::OmpMessageUpdate
+        )
+    }) {
+        let authored = authored_reference(f, &reference);
+        if index
+            .activity_find(T::Outcomes, &member_key(&authored, f.arrival))?
+            .is_some()
+        {
+            let mut later = Vec::new();
+            let mut cursor = member_key(&authored, f.arrival);
+            while let Some((key, bytes)) = index.activity_next(T::OutcomeBytes, Some(cursor))? {
+                if key[..32] != authored {
+                    break;
+                }
+                later.push((key, bytes.checked_sub(f.bytes).ok_or_else(bad)?));
+                if later.len() > 512 {
+                    return Ok(false);
+                }
+                cursor = key;
+            }
+            outcome = Some((authored, later));
+        }
+    }
+    for (rank, group) in ranks {
+        let count = count_of(rank)?;
+        index.activity_set(rank, member_key(&group, f.arrival), None)?;
+        let live = index
+            .activity_find(count, &hash_key(&group))?
+            .unwrap_or(0)
+            .checked_sub(1)
+            .ok_or_else(bad)?;
+        index.activity_set(count, hash_key(&group), (live != 0).then_some(live))?;
+        plus(index, count, removed_key(&group), 1)?;
+    }
+    if let Some((authored, later)) = outcome {
+        let mut key = hash_key(&authored);
+        key[32..].copy_from_slice(&f.author);
+        index.activity_set(T::Outcomes, member_key(&authored, f.arrival), None)?;
+        let count = index
+            .activity_find(T::OutcomeCount, &key)?
+            .unwrap_or(0)
+            .checked_sub(1)
+            .ok_or_else(bad)?;
+        index.activity_set(T::OutcomeCount, key, (count != 0).then_some(count))?;
+        let total = index
+            .activity_find(T::OutcomeBytes, &hash_key(&authored))?
+            .unwrap_or(0)
+            .checked_sub(f.bytes)
+            .ok_or_else(bad)?;
+        index.activity_set(
+            T::OutcomeBytes,
+            hash_key(&authored),
+            (total != 0).then_some(total),
+        )?;
+        index.activity_set(T::OutcomeBytes, member_key(&authored, f.arrival), None)?;
+        for (key, bytes) in later {
+            index.activity_set(T::OutcomeBytes, key, Some(bytes))?;
+        }
+    }
+    Ok(true)
+}
+
 pub(super) fn advance_owned(
     store: &Store,
     sek: &crate::atrest::sek::Sek,
@@ -291,7 +444,6 @@ pub(super) fn advance_owned(
         if work.phase != 5 && work.invalidated != index.header.activity.invalidated {
             work.phase = 5;
             work.cursor = None;
-            work.cleanup = 0;
         }
     } else {
         let boundary = read
@@ -310,7 +462,6 @@ pub(super) fn advance_owned(
             invalidated: index.header.activity.invalidated,
             phase: 1,
             cursor: None,
-            cleanup: 0,
         });
     }
     let state = index.header.activity.work.clone().ok_or_else(bad)?;
@@ -384,7 +535,7 @@ pub(super) fn advance_owned(
                 index.publish_activity()?;
             }
         }
-        5 => index.cleanup_activity(32)?,
+        5 => index.cleanup_activity()?,
         _ => return Err(bad()),
     }
     if let Some(work) = &mut index.header.activity.work {
@@ -400,6 +551,5 @@ fn phase(index: &mut Write<'_, '_>, phase: u8) -> Result<()> {
     let work = index.header.activity.work.as_mut().ok_or_else(bad)?;
     work.phase = phase;
     work.cursor = None;
-    work.cleanup = 0;
     Ok(())
 }

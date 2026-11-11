@@ -146,6 +146,19 @@ attention/delivery path MUST NOT wait on the saved-Sessions refresh.
 This requirement is security-neutral: every answer it unblocks is locally held plaintext the
 node already decrypted under the checks that admitted it.
 
+**v0.4.26 correction (#1203): an expired row leaves the activity index without a rebuild.**
+The activity index's ranks are prefix counts written in arrival order. Removing a row used to
+discard the whole per-room index and rebuild it from phase 1, 32 facts a turn, then delete the
+retired trees one key at a time; with Session steps expiring at the pace they arrived a week
+earlier, a busy room rebuilt continuously (1.5–2.5 cores for 30–40 s, every 2–10 minutes). Now
+a removed fact that is the lowest arrival in each of its rank groups (the shape expiry
+produces) is folded out exactly: its member and live count go, the group's `removed` count
+rises, a later rank is one more than every earlier member's counting the removed ones, and a
+prefix count is the predecessor's rank less the removed count. Requests, drives, OMP resets and
+replacements and multipart bodies reach other derived trees and still rebuild. A retired
+generation is freed page by page in one turn, never key by key. The answer a page gives is
+unchanged: exact counts over the rows the node holds and has not expired.
+
 ### R5. Own-authored state is the author's durable fact
 
 A node's own sequence and own drive generation in a room MUST come from its local store. A

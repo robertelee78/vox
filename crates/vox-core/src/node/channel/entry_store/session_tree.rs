@@ -112,6 +112,10 @@ impl<'a, 's> Write<'a, 's> {
     pub(crate) fn set(&mut self, root: u64, key: Key, value: Option<u64>) -> Result<u64> {
         self.inner.change_value(root, key, value.map(Value::Number))
     }
+    /// Frees a whole retired tree; see `entry_store::Write::drop_tree`.
+    pub(crate) fn drop(&mut self, root: u64) -> Result<()> {
+        self.inner.drop_tree(root, 0)
+    }
     pub(crate) fn next_page(&self) -> u64 {
         self.inner.directory.next_page
     }

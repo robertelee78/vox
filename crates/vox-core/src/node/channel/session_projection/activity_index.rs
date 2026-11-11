@@ -72,6 +72,9 @@ pub(super) fn arrival_key(id: u64) -> Key {
     key[..8].copy_from_slice(&id.to_be_bytes());
     key
 }
+pub(super) fn arrival_of(key: &Key) -> u64 {
+    u64::from_be_bytes(key[..8].try_into().unwrap_or([0; 8]))
+}
 pub(super) fn member_key(group: &Digest32, id: u64) -> Key {
     let mut key = hash_key(group);
     key[32..40].copy_from_slice(&id.to_be_bytes());
@@ -454,6 +457,8 @@ pub(super) fn put(index: &mut Write<'_, '_>, id: u64, row: &SessionRow) -> Resul
     super::activity_fold::appended(index, &fact)
 }
 
+/// Removes one fact; the derived trees leave it exactly when they can (expiry removes
+/// the oldest rows) and are rebuilt otherwise.
 pub(super) fn remove(index: &mut Write<'_, '_>, id: u64) -> Result<()> {
     let key = arrival_key(id);
     let Some(descriptor) = index.find(Tree::ActivityFacts, &key)? else {
@@ -480,5 +485,9 @@ pub(super) fn remove(index: &mut Write<'_, '_>, id: u64) -> Result<()> {
         .filter(|(key, _)| key[..32] == group)
         .map(|(_, id)| id);
     index.set(Tree::ActivitySessions, hash_key(&group), next)?;
-    index.header.activity.invalidate()
+    if super::activity_fold::removed(index, &fact)? {
+        Ok(())
+    } else {
+        index.header.activity.invalidate()
+    }
 }

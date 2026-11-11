@@ -40,39 +40,6 @@ pub(super) enum ActivityTree {
     RawRetire,
 }
 pub(super) const ACTIVITY_TREES: usize = 31;
-pub(super) const ALL: [ActivityTree; ACTIVITY_TREES] = [
-    ActivityTree::Visible,
-    ActivityTree::VisibleCount,
-    ActivityTree::RawRank,
-    ActivityTree::Parts,
-    ActivityTree::PartCount,
-    ActivityTree::OpenParts,
-    ActivityTree::Outcomes,
-    ActivityTree::OutcomeCount,
-    ActivityTree::Requests,
-    ActivityTree::Resolved,
-    ActivityTree::Driven,
-    ActivityTree::Pending,
-    ActivityTree::PendingCount,
-    ActivityTree::PendingRefs,
-    ActivityTree::WaitingOpen,
-    ActivityTree::PendingLast,
-    ActivityTree::RoomPending,
-    ActivityTree::RawCount,
-    ActivityTree::WaitingParts,
-    ActivityTree::PartBytes,
-    ActivityTree::OutcomeBytes,
-    ActivityTree::AllRank,
-    ActivityTree::AllCount,
-    ActivityTree::FileRank,
-    ActivityTree::FileCount,
-    ActivityTree::RequestRank,
-    ActivityTree::RequestCount,
-    ActivityTree::RawPending,
-    ActivityTree::RawPendingPrefix,
-    ActivityTree::RawResolved,
-    ActivityTree::RawRetire,
-];
 impl ActivityTree {
     pub fn index(self) -> usize {
         self as usize
@@ -95,7 +62,6 @@ pub(super) struct ActivityWork {
     pub invalidated: u64,
     pub phase: u8,
     pub cursor: Option<Key>,
-    pub cleanup: usize,
 }
 impl Default for ActivityState {
     fn default() -> Self {
@@ -139,7 +105,9 @@ impl ActivityState {
                 .uint(work.invalidated)
                 .uint(u64::from(work.phase))
                 .bytes(work.cursor.as_ref().map_or(&[][..], |key| &key[..]))
-                .uint(work.cleanup as u64);
+                // The retired key-by-key cleanup cursor's slot; a whole generation is
+                // freed in one turn now.
+                .uint(0);
         }
         self.waiting.put(e);
     }
@@ -186,8 +154,7 @@ impl ActivityState {
                     [] => None,
                     bytes => Some(bytes.try_into().map_err(|_| invalid())?),
                 };
-                let cleanup = usize::try_from(d.uint()?).map_err(|_| invalid())?;
-                if cleanup > ACTIVITY_TREES {
+                if d.uint()? > ACTIVITY_TREES as u64 {
                     return Err(invalid());
                 }
                 Some(ActivityWork {
@@ -196,7 +163,6 @@ impl ActivityState {
                     invalidated,
                     phase,
                     cursor,
-                    cleanup,
                 })
             }
             _ => return Err(invalid()),

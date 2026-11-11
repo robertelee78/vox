@@ -682,35 +682,27 @@ impl<'a, 's> Write<'a, 's> {
         self.header.activity.ready = true;
         work.phase = 5;
         work.cursor = None;
-        work.cleanup = 0;
         Ok(())
     }
-    pub fn cleanup_activity(&mut self, limit: usize) -> Result<()> {
-        self.activity_working = true;
-        for _ in 0..limit {
-            let at = self
-                .header
-                .activity
-                .work
-                .as_ref()
-                .ok_or_else(|| invalid("Session activity work absent"))?
-                .cleanup;
-            let Some(tree) = super::activity_state::ALL.get(at).copied() else {
-                self.header.activity.work = None;
-                self.activity_working = false;
-                break;
-            };
-            if let Some((key, _)) = self.activity_next(tree, None)? {
-                self.activity_set(tree, key, None)?;
-            } else {
-                self.header
-                    .activity
-                    .work
-                    .as_mut()
-                    .ok_or_else(|| invalid("Session activity work absent"))?
-                    .cleanup += 1;
-            }
+    /// Frees the retired generation held in `work.roots` (the superseded published trees
+    /// after a publication, or a discarded partial rebuild) and ends the work. Pages are
+    /// deleted whole; no key is rewritten.
+    pub fn cleanup_activity(&mut self) -> Result<()> {
+        let roots = self
+            .header
+            .activity
+            .work
+            .as_ref()
+            .ok_or_else(|| invalid("Session activity work absent"))?
+            .roots;
+        let mut pages =
+            session_tree::Write::new(self.batch, self.sek, self.room, KIND, self.header.next)?;
+        for root in roots {
+            pages.drop(root)?;
         }
+        self.header.next = pages.next_page();
+        self.header.activity.work = None;
+        self.activity_working = false;
         Ok(())
     }
     pub fn open(batch: &'a mut Batch<'s>, sek: &'a Sek, room: &'a Digest32) -> Result<Self> {
