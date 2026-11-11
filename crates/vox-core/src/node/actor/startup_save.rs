@@ -146,6 +146,21 @@ fn prepare(profile: &Profile, decisions: &DecisionLog, now: u64) -> crate::error
     })
 }
 
+/// The fault for `error`, saying the error itself on the node's log when the fault would
+/// otherwise be the bare "internal error" (which promises that the log has the detail).
+fn fault_noting(events: &broadcast::Sender<NodeEvent>, at: &str, error: &Error) -> Fault {
+    let fault = match error {
+        Error::AtRestUnlockFailed => Fault::SealedUnreadable,
+        error => fault_of(error),
+    };
+    if matches!(fault, Fault::Internal) {
+        let _ = events.send(NodeEvent::NodeNote {
+            note: format!("could not {at}: {error}"),
+        });
+    }
+    fault
+}
+
 fn run(
     work: Work,
     paths: Paths,
@@ -165,7 +180,12 @@ fn run(
                     decisions.start_fresh(now);
                     (profile, None)
                 }
-                Err(error) => return (None, Err(fault_of(&error))),
+                Err(error) => {
+                    return (
+                        None,
+                        Err(fault_noting(events, "create the identity", &error)),
+                    )
+                }
             }
         }
         Work::Unlock {
@@ -180,20 +200,23 @@ fn run(
                 .unwrap_or_else(|| Profile::open_noting(paths, &waiting))
             {
                 Ok(profile) => profile,
-                Err(error) => return (None, Err(fault_of(&error))),
+                Err(error) => {
+                    return (None, Err(fault_noting(events, "open the identity", &error)))
+                }
             };
             (profile, Some(passphrase))
         }
     };
     if let Some(passphrase) = unlock {
         if let Err(error) = profile.unlock(&passphrase) {
-            return (Some(profile), Err(fault_of(&error)));
+            return (
+                Some(profile),
+                Err(fault_noting(events, "unlock the identity", &error)),
+            );
         }
     }
-    let loaded = prepare(&profile, decisions, now).map_err(|error| match error {
-        Error::AtRestUnlockFailed => Fault::SealedUnreadable,
-        error => fault_of(&error),
-    });
+    let loaded = prepare(&profile, decisions, now)
+        .map_err(|error| fault_noting(events, "load the identity's saved state", &error));
     if loaded.is_err() {
         profile.lock();
         decisions.lock();
@@ -201,7 +224,7 @@ fn run(
     (Some(profile), loaded)
 }
 impl Returned {
-    fn settle_policy(&mut self, decisions: &DecisionLog) {
+    fn settle_policy(&mut self, decisions: &DecisionLog, events: &broadcast::Sender<NodeEvent>) {
         if self.loaded.is_err() {
             return;
         }
@@ -234,10 +257,7 @@ impl Returned {
                 self.policy = Some(applied);
             }
             Err(error) => {
-                self.loaded = Err(match error {
-                    Error::AtRestUnlockFailed => Fault::SealedUnreadable,
-                    error => fault_of(&error),
-                });
+                self.loaded = Err(fault_noting(events, "settle computer policy", &error));
                 if let Some(profile) = self.profile.as_mut() {
                     profile.lock();
                 }
@@ -394,6 +414,7 @@ impl Node {
         let decisions = self.decisions.clone();
         let worker_decisions = decisions.clone();
         let events = self.event_tx.clone();
+        let joined_events = events.clone();
         let computer = self.computer.clone();
         let result = Arc::new(std::sync::Mutex::new(None));
         let output = Arc::clone(&result);
@@ -417,11 +438,19 @@ impl Node {
                     boundary: None,
                     policy: None,
                 };
-                returned.settle_policy(&worker_decisions);
+                returned.settle_policy(&worker_decisions, &events);
                 returned
             })
             .await;
-            let returned = returned.ok();
+            let returned = match returned {
+                Ok(returned) => Some(returned),
+                Err(join) => {
+                    let _ = joined_events.send(NodeEvent::NodeNote {
+                        note: format!("identity startup did not finish: {join}"),
+                    });
+                    None
+                }
+            };
             *output
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = returned;
@@ -524,9 +553,10 @@ impl Node {
             let output = Arc::clone(&pending.result);
             let wake = Arc::clone(&self.post_save_wake);
             let decisions = pending.decisions.clone();
+            let events = self.event_tx.clone();
             pending.task = tokio::spawn(async move {
                 let returned = tokio::task::spawn_blocking(move || {
-                    returned.settle_policy(&decisions);
+                    returned.settle_policy(&decisions, &events);
                     returned
                 })
                 .await
