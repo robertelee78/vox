@@ -357,10 +357,22 @@ pub(super) fn removed(index: &mut Write<'_, '_>, f: &Fact) -> Result<bool> {
     {
         ranks.push((T::Visible, visible_group));
     }
+    // Every count the exact path needs is read before anything is written: an index that
+    // disagrees with the fact (older at-rest state, a shape not foreseen) is rebuilt from its
+    // retained facts, never refused.
+    let mut counts = Vec::with_capacity(ranks.len());
     for (rank, group) in &ranks {
         if !lowest(index, *rank, group, f.arrival)? {
             return Ok(false);
         }
+        let count = count_of(*rank)?;
+        let Some(live) = index
+            .activity_find(count, &hash_key(group))?
+            .and_then(|live| live.checked_sub(1))
+        else {
+            return Ok(false);
+        };
+        counts.push((*rank, count, *group, live));
     }
     // An outcome's bytes are cumulative per authored reference; later members shift.
     let mut outcome = None;
@@ -375,47 +387,43 @@ pub(super) fn removed(index: &mut Write<'_, '_>, f: &Fact) -> Result<bool> {
             .activity_find(T::Outcomes, &member_key(&authored, f.arrival))?
             .is_some()
         {
+            let mut key = hash_key(&reference);
+            key[32..].copy_from_slice(&f.author);
+            let count = index
+                .activity_find(T::OutcomeCount, &key)?
+                .and_then(|count| count.checked_sub(1));
+            let total = index
+                .activity_find(T::OutcomeBytes, &hash_key(&authored))?
+                .and_then(|total| total.checked_sub(f.bytes));
+            let (Some(count), Some(total)) = (count, total) else {
+                return Ok(false);
+            };
             let mut later = Vec::new();
             let mut cursor = member_key(&authored, f.arrival);
             while let Some((key, bytes)) = index.activity_next(T::OutcomeBytes, Some(cursor))? {
                 if key[..32] != authored {
                     break;
                 }
-                later.push((key, bytes.checked_sub(f.bytes).ok_or_else(bad)?));
+                let Some(bytes) = bytes.checked_sub(f.bytes) else {
+                    return Ok(false);
+                };
+                later.push((key, bytes));
                 if later.len() > 512 {
                     return Ok(false);
                 }
                 cursor = key;
             }
-            outcome = Some((reference, authored, later));
+            outcome = Some((key, authored, count, total, later));
         }
     }
-    for (rank, group) in ranks {
-        let count = count_of(rank)?;
+    for (rank, count, group, live) in counts {
         index.activity_set(rank, member_key(&group, f.arrival), None)?;
-        let live = index
-            .activity_find(count, &hash_key(&group))?
-            .unwrap_or(0)
-            .checked_sub(1)
-            .ok_or_else(bad)?;
         index.activity_set(count, hash_key(&group), (live != 0).then_some(live))?;
         plus(index, count, removed_key(&group), 1)?;
     }
-    if let Some((reference, authored, later)) = outcome {
-        let mut key = hash_key(&reference);
-        key[32..].copy_from_slice(&f.author);
+    if let Some((key, authored, count, total, later)) = outcome {
         index.activity_set(T::Outcomes, member_key(&authored, f.arrival), None)?;
-        let count = index
-            .activity_find(T::OutcomeCount, &key)?
-            .unwrap_or(0)
-            .checked_sub(1)
-            .ok_or_else(bad)?;
         index.activity_set(T::OutcomeCount, key, (count != 0).then_some(count))?;
-        let total = index
-            .activity_find(T::OutcomeBytes, &hash_key(&authored))?
-            .unwrap_or(0)
-            .checked_sub(f.bytes)
-            .ok_or_else(bad)?;
         index.activity_set(
             T::OutcomeBytes,
             hash_key(&authored),
