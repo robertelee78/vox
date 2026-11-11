@@ -49,11 +49,15 @@ export default function vox(pi) {
   const socketPath = join(dir, "bridge.sock")
   // The kernel closes this pipe even after SIGKILL. The helper removes only this owned socket
   // and its empty private directory; it does not launch a harness or handle room content.
+  // An orderly shutdown closes the pipe itself, so a long-lived OMP process does not keep one
+  // waiting helper per ended session.
+  let cleanupHelper = null
   try {
-    const cleanup = spawn("/bin/sh", ["-c", "read _; rm -f -- \"$1/bridge.sock\"; rmdir -- \"$1\"", "vox-omp-cleanup", dir],
+    cleanupHelper = spawn("/bin/sh", ["-c", "read _; rm -f -- \"$1/bridge.sock\"; rmdir -- \"$1\"", "vox-omp-cleanup", dir],
       { detached: true, stdio: ["pipe", "ignore", "ignore"] })
-    cleanup.on("error", () => {})
-    cleanup.unref()
+    cleanupHelper.on("error", () => {})
+    cleanupHelper.stdin.on("error", () => {})
+    cleanupHelper.unref()
   } catch {}
   const sockets = new Set(), followers = new Set(), children = new Set(), tools = new Map()
   const semanticFollowers = new Map(), media = new Map()
@@ -1093,6 +1097,7 @@ export default function vox(pi) {
     }
     for (const sock of sockets) sock.destroy(); server.close()
     try { unlinkSync(socketPath); rmdirSync(dir) } catch {}
+    cleanupHelper?.stdin.end()
     await Promise.all(pendingWrites)
   })
   pi.on("before_agent_start", async event => {

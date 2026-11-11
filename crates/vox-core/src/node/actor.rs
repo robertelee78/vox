@@ -6750,6 +6750,13 @@ pub struct Node {
     key_package_governance_wait: BTreeSet<Digest32>,
     /// A selected package whose opening was refused before execution.
     key_package_unopened: BTreeSet<Digest32>,
+    /// A room whose package was refused while its governance refreshed is not selected again
+    /// before this instant. The refusal can wait on a member's records, which no local fold
+    /// brings, so an unpaced retry repeats the same refusal at once (#1203).
+    key_package_retry_at: BTreeMap<Digest32, std::time::Instant>,
+    /// Published rooms whose legacy Session migration waits on a member's records, with the
+    /// time of its next paced retry (#1203).
+    session_upgrade_retry_at: BTreeMap<Digest32, std::time::Instant>,
     key_package_after: Option<Digest32>,
     /// Exact off-actor unwraps; a close/lock cannot be undone by their late result.
     opening_rooms: BTreeMap<Digest32, Arc<()>>,
@@ -7419,6 +7426,8 @@ impl Node {
             key_package_rooms: BTreeMap::new(),
             key_package_governance_wait: BTreeSet::new(),
             key_package_unopened: BTreeSet::new(),
+            key_package_retry_at: BTreeMap::new(),
+            session_upgrade_retry_at: BTreeMap::new(),
             key_package_after: None,
             opening_rooms: BTreeMap::new(),
             locking: 0,
@@ -8409,6 +8418,7 @@ impl Node {
                     // settlement can take it on every tick and starve an ended room forever.
                     let tended = self.tend_lifecycle().await;
                     self.reclaim_session_drive_receipt().await;
+                    self.retry_deferred_session_upgrades().await;
                     // Empty read and key-prune work both take a room's durable owner.
                     // Alternate priority so neither can starve the other; advance the
                     // read-room cursor only on its priority turn.
@@ -18865,23 +18875,39 @@ impl Node {
                 return false;
             }
         }
-        !self.key_package_rooms.is_empty()
+        let now = std::time::Instant::now();
+        self.key_package_rooms
+            .keys()
+            .any(|room| self.key_package_due(room, now))
+    }
+
+    fn key_package_due(&self, room: &Digest32, now: std::time::Instant) -> bool {
+        self.key_package_retry_at
+            .get(room)
+            .is_none_or(|at| *at <= now)
     }
 
     /// Resume one room after the previous package/scan budget. A room with no package in
     /// its first 64 positions still gets its next turn without another network event.
     async fn advance_key_package_turn(&mut self) {
         use std::ops::Bound::{Excluded, Unbounded};
+        let now = std::time::Instant::now();
         let room = self
             .key_package_after
             .and_then(|after| {
                 self.key_package_rooms
                     .range((Excluded(after), Unbounded))
-                    .next()
                     .map(|(id, _)| *id)
+                    .find(|id| self.key_package_due(id, now))
             })
-            .or_else(|| self.key_package_rooms.first_key_value().map(|(id, _)| *id));
+            .or_else(|| {
+                self.key_package_rooms
+                    .keys()
+                    .copied()
+                    .find(|id| self.key_package_due(id, now))
+            });
         let Some(room) = room else { return };
+        self.key_package_retry_at.remove(&room);
         self.key_package_after = Some(room);
         self.install_key_packages(&room).await;
     }
@@ -19682,6 +19708,8 @@ impl Node {
         self.key_package_rooms.clear();
         self.key_package_governance_wait.clear();
         self.key_package_unopened.clear();
+        self.key_package_retry_at.clear();
+        self.session_upgrade_retry_at.clear();
         self.key_package_after = None;
         self.room_publication_authority.clear();
         self.publication_after = None;
@@ -20446,10 +20474,7 @@ impl Node {
                     }
                     // Current policy and classification are prerequisites for private
                     // retention/publication. Pending replay keeps this room unpublished.
-                    prepared.wait_on(
-                        "its governance records being refreshed",
-                        self.now_ms().get(),
-                    );
+                    prepared.wait_on("its governance records to refresh", self.now_ms().get());
                     if prepared.legacy_cleanup_due.is_none() {
                         prepared.legacy_cleanup_due = Some(
                             std::time::Instant::now()
@@ -20611,13 +20636,15 @@ impl Node {
     /// Publish a room only after both shared and local retention have been applied durably.
     async fn begin_publish_open_channel(
         &mut self,
-        ch: ChannelState,
+        mut ch: ChannelState,
         transition: Option<crate::node::channel::own_writer_gate::Transition>,
         lifetime: Option<Arc<maintenance_save::Lifetime>>,
         callback: metadata_save::OpenCallback,
     ) {
         let channel_id = ch.channel_id();
         let governance_deadline = ch.governance_deadline();
+        // A legacy Session migration preparation left for a member's records resumes here.
+        ch.resume_deferred_legacy_upgrade();
         let Some(authority) = lifetime
             .as_ref()
             .map(|held| held.authority.clone())

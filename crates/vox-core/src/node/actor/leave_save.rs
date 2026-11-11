@@ -957,6 +957,8 @@ impl Node {
         self.key_package_rooms.remove(room);
         self.key_package_governance_wait.remove(room);
         self.key_package_unopened.remove(room);
+        self.key_package_retry_at.remove(room);
+        self.session_upgrade_retry_at.remove(room);
         self.cancel_private_pulls(Some(*room));
         self.cancel_own_key_room(*room);
         self.own_recovery_rooms.remove(room);
@@ -1030,6 +1032,8 @@ impl Node {
         self.key_package_rooms.remove(room);
         self.key_package_governance_wait.remove(room);
         self.key_package_unopened.remove(room);
+        self.key_package_retry_at.remove(room);
+        self.session_upgrade_retry_at.remove(room);
         self.cancel_private_pulls(Some(*room));
         self.own_recovery_rooms.remove(room);
         self.own_recovery_body_debts.remove(room);

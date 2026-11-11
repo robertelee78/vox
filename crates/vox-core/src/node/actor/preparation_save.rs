@@ -3,6 +3,7 @@
 use super::*;
 use crate::node::channel::pending_retention::Step;
 use crate::node::channel::pending_session::{SessionSaved, SessionWrite};
+use crate::node::channel::pending_upgrade::UpgradeWait;
 use crate::node::channel::session_projection::{ProjectionProgress, ProjectionWork};
 use maintenance_save::{Lifetime, Saved, Work};
 
@@ -43,6 +44,10 @@ pub(super) struct State {
     reconcile: Option<trust_save::Reconcile>,
     cache_only: bool,
     resume_after_governance: Option<Stage>,
+    /// The resumed stage was refused because governance facts it needs were still refreshing.
+    refused: bool,
+    /// A governance turn since that refusal had local fold work to do.
+    folded: bool,
     policy: Option<(u64, u64)>,
 }
 
@@ -57,6 +62,8 @@ impl Default for State {
             reconcile: None,
             cache_only: false,
             resume_after_governance: None,
+            refused: false,
+            folded: false,
             policy: None,
         }
     }
@@ -372,6 +379,38 @@ impl Node {
         accepted
     }
 
+    /// A legacy Session migration left to the published room (#1203) waits on a member's
+    /// records. Retry it at a pace once the room is published; the governance wake folds
+    /// whatever arrived, which ordinary content alone does not wake.
+    pub(super) async fn retry_deferred_session_upgrades(&mut self) {
+        let now = std::time::Instant::now();
+        let due: Vec<Digest32> = self
+            .session_upgrade_retry_at
+            .iter()
+            .filter(|(_, at)| **at <= now)
+            .map(|(room, _)| *room)
+            .collect();
+        for room in due {
+            let Some(instance) = self.channels.get(&room).cloned() else {
+                if !self.preparing_rooms.contains_key(&room) {
+                    self.session_upgrade_retry_at.remove(&room);
+                }
+                continue;
+            };
+            if instance
+                .try_lock()
+                .is_ok_and(|channel| !channel.legacy_upgrade_pending())
+            {
+                self.session_upgrade_retry_at.remove(&room);
+                continue;
+            }
+            self.session_upgrade_retry_at
+                .insert(room, now + super::PREPARE_WAIT);
+            self.governance_work.wake_room(room);
+            self.spawn_session_projection_catch_up(&room, None).await;
+        }
+    }
+
     pub(super) async fn spawn_session_projection_catch_up(
         &mut self,
         room: &Digest32,
@@ -453,6 +492,16 @@ impl Node {
                     prepared.save.lifetime = None;
                     return Ok(false);
                 }
+                Err(error)
+                    if ChannelState::governance_refreshing(&error)
+                        && prepared.save.stage != Stage::Governance =>
+                {
+                    // The stage's native work needs governance facts this room has not folded
+                    // yet. Only the fold below produces them for a preparing room; retrying the
+                    // same stage would repeat the same refusal (#1203). Fold, then resume it.
+                    refold(prepared, now.get());
+                    return Ok(false);
+                }
                 Err(error) => return Err(error),
             };
             if matches!(saved, Saved::Unavailable) {
@@ -481,6 +530,7 @@ impl Node {
                     Saved::Projection(ProjectionProgress::Governance(progress)),
                 ) => {
                     if !progress.ready {
+                        prepared.save.folded |= prepared.save.refused && progress.pending;
                         if progress.pending {
                             prepared.progressed("folding its governance records", now.get());
                         } else {
@@ -488,6 +538,50 @@ impl Node {
                             prepared.save.lifetime = None;
                         }
                         return Ok(false);
+                    }
+                    if prepared.save.refused {
+                        if progress.pending {
+                            prepared.save.folded = true;
+                            prepared.progressed("folding its governance records", now.get());
+                            return Ok(false);
+                        }
+                        if !prepared.save.folded {
+                            prepared.save.refused = false;
+                            let room = channel.channel_id();
+                            match prepared.save.resume_after_governance {
+                                // Nothing local was left to fold, so the refused stage needs
+                                // records a member has not sent, and a member is reached only
+                                // once the room is published (ADR-037 R1). Continue without
+                                // it: the published room's package owner opens the package
+                                // once its governance settles, as for a package refused after
+                                // publication.
+                                Some(Stage::Packages) => {
+                                    self.key_package_governance_wait.insert(room);
+                                    self.key_package_unopened.insert(room);
+                                    prepared.save.resume_after_governance = Some(Stage::Legacy);
+                                }
+                                // Likewise a legacy Session row whose causal past has not
+                                // arrived: the published room migrates it, at a pace.
+                                Some(Stage::Upgrade) if channel.defer_legacy_upgrade() => {
+                                    self.session_upgrade_retry_at.insert(
+                                        room,
+                                        std::time::Instant::now() + super::PREPARE_WAIT,
+                                    );
+                                }
+                                _ => {
+                                    // Retry the stage once a second, not at once: the next
+                                    // governance turn resumes it.
+                                    prepared
+                                        .wait_on("governance records from its members", now.get());
+                                    prepared.save.lifetime = None;
+                                    prepared.legacy_cleanup_due =
+                                        Some(std::time::Instant::now() + super::PREPARE_WAIT);
+                                    return Ok(false);
+                                }
+                            }
+                        }
+                        prepared.save.refused = false;
+                        prepared.save.folded = false;
                     }
                     prepared.save.cache_only = channel.legacy_cache_only(&store)?;
                     let resume = prepared.save.resume_after_governance.take();
@@ -559,6 +653,11 @@ impl Node {
                     if channel.session_upgrade_local_work() {
                         if saved.advance == SessionAdvance::Advanced {
                             prepared.progressed("restoring its Sessions", now.get());
+                        } else if matches!(saved.wait, Some(UpgradeWait::Governance)) {
+                            // A legacy row's eligibility is refreshing: fold, then retry the
+                            // row or, with nothing local to fold, leave it to the published
+                            // room (#1203).
+                            refold(prepared, now.get());
                         } else {
                             prepared.wait_on("restoring its Sessions", now.get());
                         }
@@ -815,11 +914,22 @@ impl Node {
     }
 }
 
+/// Fold this preparing room's governance records, then resume the refused stage (#1203).
+fn refold(prepared: &mut RoomPreparation, now: u64) {
+    prepared.save.lifetime = None;
+    prepared.save.resume_after_governance = Some(prepared.save.stage);
+    prepared.save.stage = Stage::Governance;
+    prepared.save.refused = true;
+    prepared.save.folded = false;
+    prepared.save.request = Some(Work::Projection(ProjectionWork::Governance));
+    prepared.wait_on(stage_wait(Stage::Governance), now);
+}
+
 fn stage_wait(stage: Stage) -> &'static str {
     match stage {
         Stage::Receiver => "reclaiming earlier sender keys",
         Stage::Startup => "cleaning up its earlier saved form",
-        Stage::Governance => "its governance records being refreshed",
+        Stage::Governance => "its governance records to refresh",
         Stage::Packages => "opening members' key packages",
         Stage::Legacy | Stage::Classification => "classifying its earlier saved history",
         Stage::Upgrade | Stage::Import | Stage::Expiry => "restoring its Sessions",

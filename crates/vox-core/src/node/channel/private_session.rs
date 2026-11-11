@@ -606,6 +606,9 @@ pub(super) type FloorSweep = (u64, u64, Vec<(Digest32, u64)>);
 pub(super) struct PrivateSessions {
     pub(super) legacy_pending: LegacyPending,
     legacy_work: Option<LegacyWork>,
+    // Preparation found the legacy migration waiting on a member's records (a row whose
+    // causal past has not arrived). It resumes once the room is published (#1203).
+    legacy_deferred: bool,
     restoring: bool,
     floor_replay_done: bool,
     // The basis of the last complete correction sweep of this node's retained Session floors:
@@ -1027,8 +1030,31 @@ impl ChannelState {
             || self.private_sessions.restoring
             || !self.private_sessions.floor_replay_done
             || self.private_sessions.controls_import
-            || !self.private_sessions.legacy_pending.is_empty()
+            || (!self.private_sessions.legacy_deferred && self.legacy_upgrade_pending())
+    }
+
+    pub(crate) fn legacy_upgrade_pending(&self) -> bool {
+        !self.private_sessions.legacy_pending.is_empty()
             || self.private_sessions.legacy_work.is_some()
+    }
+
+    /// Leave a legacy migration that waits on a member's records to the published room: a
+    /// member is reached only once the room is published (ADR-037 R1). False when there is
+    /// no such migration to leave, or it was already left.
+    pub(crate) fn defer_legacy_upgrade(&mut self) -> bool {
+        if self.private_sessions.legacy_deferred || !self.legacy_upgrade_pending() {
+            return false;
+        }
+        self.private_sessions.legacy_deferred = true;
+        true
+    }
+
+    pub(crate) fn resume_deferred_legacy_upgrade(&mut self) {
+        self.private_sessions.legacy_deferred = false;
+    }
+
+    pub(crate) fn legacy_upgrade_deferred(&self) -> bool {
+        self.private_sessions.legacy_deferred
     }
 
     // An incomplete governance projection must neither expire saved Session bodies nor

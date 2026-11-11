@@ -340,6 +340,8 @@ impl Node {
                 {
                     self.key_package_governance_wait.insert(room);
                     self.key_package_unopened.insert(room);
+                    self.key_package_retry_at
+                        .insert(room, std::time::Instant::now() + super::PREPARE_WAIT);
                     self.governance_work.wake_room(room);
                 }
                 if attached && !publication_busy {

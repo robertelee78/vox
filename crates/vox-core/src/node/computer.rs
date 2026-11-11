@@ -385,10 +385,7 @@ pub struct Description {
 impl Description {
     /// Identity fingerprint.
     pub fn fingerprint(&self) -> Result<Digest32> {
-        Ok(
-            CompositePublicKey::from_bytes(self.public.as_slice().try_into().map_err(|_| bad())?)?
-                .fingerprint(),
-        )
+        CompositePublicKey::fingerprint_of(self.public.as_slice().try_into().map_err(|_| bad())?)
     }
     /// Canonical presentation bytes.
     pub fn encode(&self) -> Vec<u8> {
@@ -1306,6 +1303,18 @@ impl State {
         else {
             return Ok(Authority::default());
         };
+        // A derivation verifies every signed record, and exchanges and policy reads derive
+        // the same unchanged state many times a second (#1203). It is a function of the
+        // selected enrollment, the locally closed intents and the exact records alone.
+        let key = derive_key(g, &self.cancelled, &self.history);
+        if let Some(derived) = derived_lookup(&key) {
+            return Ok(derived);
+        }
+        let derived = self.derive_from(g)?;
+        derived_store(key, &derived);
+        Ok(derived)
+    }
+    fn derive_from(&self, g: &Enrollment) -> Result<Authority> {
         let group = g.incarnation();
         let mut events = BTreeMap::new();
         for (id, r) in &self.history {
@@ -2411,7 +2420,7 @@ fn verify_binding_context(
     Ok(())
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Authority {
     members: BTreeMap<Digest32, Grant>,
     rosters: BTreeMap<Digest32, Control>,
@@ -2424,6 +2433,73 @@ struct Authority {
     binding_records: BTreeSet<Digest32>,
 }
 type EventGrants = Vec<(Digest32, Grant)>;
+
+/// Recent derivations, by the exact content they were derived from. Each record id hashes its
+/// whole signed record, so equal keys derive equal authority; a miss derives afresh.
+static DERIVED: std::sync::Mutex<Vec<(Digest32, Authority)>> = std::sync::Mutex::new(Vec::new());
+const DERIVED_CAPACITY: usize = 16;
+
+fn derive_key(
+    g: &Enrollment,
+    cancelled: &BTreeMap<Digest32, Enrollment>,
+    history: &BTreeMap<Digest32, Control>,
+) -> Digest32 {
+    let mut e = Encoder::new();
+    e.array(3).bytes(&g.encode()).array(cancelled.len());
+    for intent in cancelled.values() {
+        e.bytes(&intent.encode());
+    }
+    e.array(history.len());
+    for id in history.keys() {
+        e.bytes(id);
+    }
+    sha256(&e.finish())
+}
+
+fn derived_lookup(key: &Digest32) -> Option<Authority> {
+    let mut cache = DERIVED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let at = cache.iter().position(|(k, _)| k == key)?;
+    let entry = cache.remove(at);
+    let derived = entry.1.clone();
+    cache.push(entry);
+    Some(derived)
+}
+
+fn derived_store(key: Digest32, derived: &Authority) {
+    let mut cache = DERIVED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if cache.len() >= DERIVED_CAPACITY {
+        cache.remove(0);
+    }
+    cache.push((key, derived.clone()));
+}
+
+/// Records already verified under a group. An exchange resends every record each time.
+static VERIFIED: std::sync::Mutex<BTreeSet<(Digest32, Digest32)>> =
+    std::sync::Mutex::new(BTreeSet::new());
+const VERIFIED_CAPACITY: usize = 4096;
+
+/// Verify a received record once per process: its id hashes the whole signed record.
+fn verify_record(record: &Control, id: &Digest32, group: &Digest32) -> Result<()> {
+    let verified = || {
+        VERIFIED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
+    if verified().contains(&(*id, *group)) {
+        return Ok(());
+    }
+    record.verify(group)?;
+    let mut set = verified();
+    if set.len() >= VERIFIED_CAPACITY {
+        set.clear();
+    }
+    set.insert((*id, *group));
+    Ok(())
+}
 
 /// Fork exclusion follows sponsor edges, preserving additions on the shared safe prefix.
 fn exclude_retired(
