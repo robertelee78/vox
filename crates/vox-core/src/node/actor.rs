@@ -6466,6 +6466,17 @@ struct PrivatePullOwner {
     task: Option<tokio::task::AbortHandle>,
 }
 
+/// One member's keys not taken in one room (`Node::key_backoff`).
+#[derive(Default)]
+struct KeyBackoff {
+    /// Consecutive keys not taken.
+    refused: u32,
+    /// The unix millisecond before which the tick does not send it another.
+    until: u64,
+    /// The refusal last said as a `KeyNotTaken` note; the same one is not said again.
+    noted: Option<String>,
+}
+
 /// The node actor's state (owned by its task).
 pub struct Node {
     termination: watch::Sender<TerminationState>,
@@ -6899,10 +6910,10 @@ pub struct Node {
     join_cleanup: BTreeMap<Digest32, PendingWithdrawal>,
     /// Per room, the members that had left as of the last tend (V030-08), to see one come back.
     departed_seen: BTreeMap<Digest32, std::collections::BTreeSet<Digest32>>,
-    /// Per `(room, member)`: consecutive keys not taken, and the unix millisecond before which the
-    /// tick does not send it another. Without it, a pair that could not converge was sent a key
-    /// once a tick for as long as both ran: 560 refusals in 3 minutes, measured.
-    key_backoff: BTreeMap<(Digest32, Digest32), (u32, u64)>,
+    /// Per `(room, member)`: the member's keys not taken. Without it, a pair that could not
+    /// converge was sent a key once a tick for as long as both ran: 560 refusals in 3 minutes,
+    /// measured.
+    key_backoff: BTreeMap<(Digest32, Digest32), KeyBackoff>,
     /// One progress cursor per open room, not a materialized set of every historical consenter.
     rekey_after: BTreeMap<Digest32, Digest32>,
     history_after: BTreeMap<Digest32, Digest32>,
@@ -12491,18 +12502,24 @@ impl Node {
                 // A key delivery's opening refused is not a hello race: it backs off as any refusal.
                 let hello_refused = session.is_some()
                     && why == KeyRefusal::describe(KeyRefusal::HelloRefused.code().into_inner());
-                let entry = self.key_backoff.entry((channel_id, peer)).or_insert((0, 0));
-                entry.0 = if hello_refused {
+                let entry = self.key_backoff.entry((channel_id, peer)).or_default();
+                entry.refused = if hello_refused {
                     1
                 } else {
-                    entry.0.saturating_add(1)
+                    entry.refused.saturating_add(1)
                 };
-                entry.1 = now.saturating_add(1_000u64 << entry.0.min(3));
-                let _ = self.event_tx.send(NodeEvent::KeyNotTaken {
-                    channel_id,
-                    peer,
-                    why,
-                });
+                entry.until = now.saturating_add(1_000u64 << entry.refused.min(3));
+                // Said once per refusal, not once per retry: a member that would not take the
+                // key for the same reason every 8 s wrote the same line to the daemon log every
+                // 8 s for as long as both ran. `vox status` keeps showing the key owed.
+                if entry.noted.as_deref() != Some(why.as_str()) {
+                    entry.noted = Some(why.clone());
+                    let _ = self.event_tx.send(NodeEvent::KeyNotTaken {
+                        channel_id,
+                        peer,
+                        why,
+                    });
+                }
             }
             NetEvent::StaleGraceOver {
                 channel_id,

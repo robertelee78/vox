@@ -348,7 +348,7 @@ impl Node {
                 && self
                     .key_backoff
                     .get(&(pass.room, peer))
-                    .is_some_and(|(_, until)| pass.now < *until)
+                    .is_some_and(|backoff| pass.now < backoff.until)
             {
                 continue;
             }
