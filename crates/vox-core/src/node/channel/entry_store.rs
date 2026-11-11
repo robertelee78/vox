@@ -1713,6 +1713,27 @@ impl<'s> Write<'_, 's> {
         }
         Ok(parts)
     }
+    /// Frees every page under `root` without rewriting any: a retired tree is read once,
+    /// page by page, and each page is deleted. Deleting its keys one at a time instead
+    /// re-sealed a root-to-leaf path per key.
+    fn drop_tree(&mut self, root: u64, depth: usize) -> Result<()> {
+        if root == 0 {
+            return Ok(());
+        }
+        if depth >= MAX_DEPTH {
+            return Err(invalid("entry index cycle or depth"));
+        }
+        match Source::OtherBatch(self.batch, self.kind).page(self.sek, self.channel, root)? {
+            Page::Leaf(_) => {}
+            Page::Ranked(_) => return Err(invalid("ranked page in entry tree")),
+            Page::Branch(rows) => {
+                for (_, child) in rows {
+                    self.drop_tree(child, depth + 1)?;
+                }
+            }
+        }
+        self.retire(root)
+    }
     fn change_value(&mut self, root: u64, key: Key, value: Option<Value>) -> Result<u64> {
         let parts = self.replace(root, key, value, 0)?;
         match parts.as_slice() {

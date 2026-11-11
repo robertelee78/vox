@@ -395,6 +395,11 @@ const _: () = assert!(
 /// holding a room, a wait per room would park the actor for seconds on a single publish. See
 /// `Node::view_of`.
 const VIEW_LOCK_PATIENCE: Duration = Duration::from_millis(250);
+/// How long a view owed to a network event may wait for the next one. The view is rebuilt
+/// once for every event inside the window instead of once per event; a command still
+/// publishes before and after it runs, so a client reads its own write and a command handler
+/// decides on a current view.
+const VIEW_COALESCE: Duration = Duration::from_millis(50);
 /// How long [`NodeHandle::open_detail`] waits for an open room's detail to reach the view.
 const OPEN_DETAIL_PATIENCE: Duration = Duration::from_secs(2);
 
@@ -6461,6 +6466,17 @@ struct PrivatePullOwner {
     task: Option<tokio::task::AbortHandle>,
 }
 
+/// One member's keys not taken in one room (`Node::key_backoff`).
+#[derive(Default)]
+struct KeyBackoff {
+    /// Consecutive keys not taken.
+    refused: u32,
+    /// The unix millisecond before which the tick does not send it another.
+    until: u64,
+    /// The refusal last said as a `KeyNotTaken` note; the same one is not said again.
+    noted: Option<String>,
+}
+
 /// The node actor's state (owned by its task).
 pub struct Node {
     termination: watch::Sender<TerminationState>,
@@ -6894,10 +6910,10 @@ pub struct Node {
     join_cleanup: BTreeMap<Digest32, PendingWithdrawal>,
     /// Per room, the members that had left as of the last tend (V030-08), to see one come back.
     departed_seen: BTreeMap<Digest32, std::collections::BTreeSet<Digest32>>,
-    /// Per `(room, member)`: consecutive keys not taken, and the unix millisecond before which the
-    /// tick does not send it another. Without it, a pair that could not converge was sent a key
-    /// once a tick for as long as both ran: 560 refusals in 3 minutes, measured.
-    key_backoff: BTreeMap<(Digest32, Digest32), (u32, u64)>,
+    /// Per `(room, member)`: the member's keys not taken. Without it, a pair that could not
+    /// converge was sent a key once a tick for as long as both ran: 560 refusals in 3 minutes,
+    /// measured.
+    key_backoff: BTreeMap<(Digest32, Digest32), KeyBackoff>,
     /// One progress cursor per open room, not a materialized set of every historical consenter.
     rekey_after: BTreeMap<Digest32, Digest32>,
     history_after: BTreeMap<Digest32, Digest32>,
@@ -7049,6 +7065,8 @@ pub struct Node {
     stuck_after: Duration,
     argon2: Argon2Profile,
     view_tx: watch::Sender<NodeView>,
+    /// A publication owed to network events, due by this instant (`publish_soon`).
+    view_owed: Option<tokio::time::Instant>,
     event_tx: broadcast::Sender<NodeEvent>,
     /// The ADR-020 §3 trust keyring, loaded on unlock and empty while locked
     /// (it is sealed under the identity, so there is nothing to hold locked).
@@ -7528,6 +7546,7 @@ impl Node {
             clock,
             argon2,
             view_tx: watch::Sender::new(NodeView::default()),
+            view_owed: None,
             event_tx,
             trust: crate::node::trust::Keyring::new(),
             dismissed_offers: crate::node::offers::DismissedOffers::default(),
@@ -7861,6 +7880,7 @@ impl Node {
                 }
             };
             tokio::pin!(governance_deadline);
+            let view_due = self.view_owed;
             let deferred_commands = &mut self.deferred_commands;
             tokio::select! {
                 () = async {
@@ -7870,6 +7890,14 @@ impl Node {
                     }
                 } => {
                     self.parked_construction = None;
+                }
+                () = async {
+                    match view_due {
+                        Some(due) => tokio::time::sleep_until(due).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    self.publish().await;
                 }
                 () = journal_ready, if journal_busy => {}
                 () = publication_ready, if resume_publication => {
@@ -7973,6 +8001,11 @@ impl Node {
                     }
                 } => {
                     let Some(ReadRequest { command, reply }) = received else { break };
+                    // A handler decides on a current view (status answers from it), and the reply
+                    // follows a publication that holds the command's own writes.
+                    if self.view_owed.is_some() {
+                        self.publish().await;
+                    }
                     if let NodeCommand::Status { reply: status_reply } = command {
                         self.answer_status(status_reply, flow_release_rx);
                         if let Some(reply) = reply { let _ = reply.send(Outcome::Done); }
@@ -8290,7 +8323,7 @@ impl Node {
                         }
                     }
                     self.note_if_stalled(name, started);
-                    self.publish().await;
+                    self.publish_soon();
                     self.schedule().await;
                 }
                 Some(release) = flow_release_rx.recv() => {
@@ -12469,18 +12502,24 @@ impl Node {
                 // A key delivery's opening refused is not a hello race: it backs off as any refusal.
                 let hello_refused = session.is_some()
                     && why == KeyRefusal::describe(KeyRefusal::HelloRefused.code().into_inner());
-                let entry = self.key_backoff.entry((channel_id, peer)).or_insert((0, 0));
-                entry.0 = if hello_refused {
+                let entry = self.key_backoff.entry((channel_id, peer)).or_default();
+                entry.refused = if hello_refused {
                     1
                 } else {
-                    entry.0.saturating_add(1)
+                    entry.refused.saturating_add(1)
                 };
-                entry.1 = now.saturating_add(1_000u64 << entry.0.min(3));
-                let _ = self.event_tx.send(NodeEvent::KeyNotTaken {
-                    channel_id,
-                    peer,
-                    why,
-                });
+                entry.until = now.saturating_add(1_000u64 << entry.refused.min(3));
+                // Said once per refusal, not once per retry: a member that would not take the
+                // key for the same reason every 8 s wrote the same line to the daemon log every
+                // 8 s for as long as both ran. `vox status` keeps showing the key owed.
+                if entry.noted.as_deref() != Some(why.as_str()) {
+                    entry.noted = Some(why.clone());
+                    let _ = self.event_tx.send(NodeEvent::KeyNotTaken {
+                        channel_id,
+                        peer,
+                        why,
+                    });
+                }
             }
             NetEvent::StaleGraceOver {
                 channel_id,
@@ -13827,9 +13866,16 @@ impl Node {
                 }
             }
             NetEvent::Names(reply) => {
+                // Names come from the published view: pay an owed publication first.
+                if self.view_owed.is_some() {
+                    self.publish().await;
+                }
                 let _ = reply.send(self.resolver_snapshot().await);
             }
             NetEvent::Resolve { name, reply } => {
+                if self.view_owed.is_some() {
+                    self.publish().await;
+                }
                 let mut names = self.resolver_snapshot().await;
                 let result = async {
                     let target = names.lookup(&name)?;
@@ -24436,7 +24482,15 @@ impl Node {
             })
     }
 
+    /// Owes a publication to a network event: the view is rebuilt once the window closes, or
+    /// sooner by any other publication. Replies never wait on this; a command publishes itself.
+    fn publish_soon(&mut self) {
+        self.view_owed
+            .get_or_insert_with(|| tokio::time::Instant::now() + VIEW_COALESCE);
+    }
+
     async fn publish(&mut self) {
+        self.view_owed = None;
         self.refresh_failed_post_reads();
         // State changes cancel validators too. Never wait on a room lock here: the final
         // validation check still requires the exact room and epoch before answering success.
@@ -24498,7 +24552,8 @@ impl Node {
 
     /// The node's view, built **without waiting long on any room a session holds.**
     ///
-    /// `publish()` runs this after every command and every event, and it took each room's lock in
+    /// `publish()` runs this after every command and, coalesced within `VIEW_COALESCE`, after
+    /// network events (it ran after every single event), and it took each room's lock in
     /// turn — the lock a sync session holds for its whole run, across its network waits. So while
     /// any session was waiting on a peer, nearly every event left the actor parked here. When both
     /// ends pushed at once, each actor parked on its own room while its session waited for the other
