@@ -160,7 +160,11 @@ fn run(
     let (mut profile, unlock) = match work {
         Work::Create { passphrase } => {
             match Profile::create_noting(paths, &passphrase, now / 1_000, argon2, &waiting) {
-                Ok(profile) => (profile, None),
+                Ok(profile) => {
+                    // Days sealed before this identity existed open under no key it has (#1206).
+                    decisions.start_fresh(now);
+                    (profile, None)
+                }
                 Err(error) => return (None, Err(fault_of(&error))),
             }
         }

@@ -263,6 +263,76 @@ impl DecisionLog {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
+    /// A new identity starts with an empty record (#1206). Whatever a `decisions/` directory
+    /// holds before the identity exists — days a daemon sealed under an identity that is gone,
+    /// or under no vault at all — nobody can open with the new key: it is moved to
+    /// `decisions/unreadable-<unix ms>/`, said once, and the new identity's days start clean.
+    /// Left in place, the first unlock's local-trust import failed on them (`AtRestUnlockFailed`)
+    /// and automatic local trust never applied, with nothing said of why.
+    pub fn start_fresh(&self, now_ms: u64) {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return;
+        };
+        let days: Vec<std::path::PathBuf> = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.is_file())
+            .collect();
+        if days.is_empty() {
+            return;
+        }
+        let aside = self.dir.join(format!("unreadable-{now_ms}"));
+        if let Err(e) = crate::node::paths::create_private_dir(&aside) {
+            eprintln!(
+                "vox: {} held {} decision file(s) from before this identity, and they could not \
+                 be set aside: {e}",
+                self.dir.display(),
+                days.len()
+            );
+            return;
+        }
+        let mut moved = 0usize;
+        for path in &days {
+            if let Some(name) = path.file_name() {
+                if std::fs::rename(path, aside.join(name)).is_ok() {
+                    moved += 1;
+                }
+            }
+        }
+        eprintln!(
+            "vox: {} held {moved} decision file(s) from before this identity; moved to {} — the new \
+             identity's record starts empty",
+            self.dir.display(),
+            aside.display()
+        );
+    }
+
+    /// A sealed day the current key does not open is set aside as
+    /// `<day>.unreadable-<unix ms>.sealed`, said once, so the days it does open still count
+    /// (#1206). What that day recorded is lost to automation only: a removal in it is not
+    /// imported, and the line says so.
+    fn set_aside_unreadable(&self, path: &std::path::Path, day: i64, why: &crate::error::Error) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        let aside = self
+            .dir
+            .join(format!("{}.unreadable-{now_ms}.sealed", date_of(day)));
+        match std::fs::rename(path, &aside) {
+            Ok(()) => eprintln!(
+                "vox: the decision record for {} does not open under this identity ({why}); moved \
+                 to {} — a trust removal recorded in it is not imported for automatic local trust",
+                date_of(day),
+                aside.display()
+            ),
+            Err(e) => eprintln!(
+                "vox: the decision record for {} does not open under this identity ({why}), and \
+                 could not be set aside: {e}",
+                date_of(day)
+            ),
+        }
+    }
+
     fn key(&self) -> Option<Arc<Sek>> {
         self.key
             .lock()
@@ -529,7 +599,16 @@ impl DecisionLog {
                 detail: e.to_string(),
             })?;
             let events = if sealed {
-                Self::read_day_for_local_trust(&key, day, &bytes)?
+                match Self::read_day_for_local_trust(&key, day, &bytes) {
+                    Ok(events) => events,
+                    // Sealed under a key this identity does not have: set aside, said, and the
+                    // other days still count. A torn or malformed day stays the error it is.
+                    Err(why @ Error::AtRestUnlockFailed) => {
+                        self.set_aside_unreadable(&entry.path(), day, &why);
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
             } else {
                 std::str::from_utf8(&bytes)
                     .map_err(|_| Error::MalformedAtRest("local trust history"))?
