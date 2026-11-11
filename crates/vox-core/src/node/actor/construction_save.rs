@@ -121,6 +121,15 @@ impl Work {
                         return Err(error);
                     }
                 }
+                if let Err(error) = fold_unpublished_governance(&mut channel, store, now) {
+                    metadata_save::purge_unpublished(
+                        store,
+                        signer,
+                        channel.me(),
+                        channel.channel_id(),
+                    )?;
+                    return Err(error);
+                }
                 Ok(channel)
             }
             Self::Join(joined) => {
@@ -180,9 +189,33 @@ impl Work {
                         "accepted join responder authority is unavailable",
                     ));
                 }
+                fold_unpublished_governance(&mut channel, store, now)?;
                 Ok(channel)
             }
         }
+    }
+}
+
+/// Fold a freshly constructed room's governance on this worker, before the room is shared,
+/// announced (`ChannelOpened`) or answered. A room's first rows are governance (its name and
+/// anchors at creation, its admission at a join), and each retires the in-memory governance
+/// display until the actor's bounded maintenance turn folds it again. That turn runs only after
+/// the room is in the open-room map, so a client told the room is open (the app restarts its
+/// observation on `ChannelOpened` and reads the room at once) was answered "room governance is
+/// refreshing" for its roster, services, notices and history, and the daemon logged `network
+/// authorization unavailable` for the room's own creator. This is the same bounded turn the
+/// maintenance ladder runs (`FOLD_STEPS`, `FOLD_BUDGET`), on the worker that already owns the
+/// room's publication lease and just wrote those rows; work the budget leaves over is the
+/// ladder's as before, and a fold still refreshing is not a failed construction.
+fn fold_unpublished_governance(
+    channel: &mut ChannelState,
+    store: &Store,
+    now: crate::time::Ms,
+) -> crate::error::Result<()> {
+    match channel.advance_governance(store, now) {
+        Ok(_) => Ok(()),
+        Err(error) if ChannelState::governance_refreshing(&error) => Ok(()),
+        Err(error) => Err(error),
     }
 }
 

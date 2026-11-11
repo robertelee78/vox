@@ -38,7 +38,12 @@ extension NodeModel {
 
     var roomRosterWords: String {
         guard daemonReachable else { return "members unavailable" }
-        guard !roomMembersPending else { return "members loading" }
+        guard !roomMembersPending else {
+            // The room's first open failed and is being retried: say the node's reason, so a
+            // room whose governance is refreshing is not a room that is silently stuck.
+            if let why = roomOpenRetry { return "members loading (\(why); trying again)" }
+            return "members loading"
+        }
         if memberObservationError != nil {
             return members.isEmpty ? "members unavailable" : "\(members.count + 1) members (stale)"
         }
