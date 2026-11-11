@@ -8917,9 +8917,17 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         Request::ShareList { channel_id } => Frame::Shares {
             shares: handle.shares().list(&channel_id).await,
         },
-        Request::EndedRooms => Frame::EndedRooms {
-            rooms: handle.view().ended,
-        },
+        Request::EndedRooms => {
+            // Sealed under the identity: a locked node answers none of it.
+            let view = handle.view();
+            if view.locked || view.locking {
+                Frame::Error {
+                    reason: crate::node::api::Fault::Locked.explain().into(),
+                }
+            } else {
+                Frame::EndedRooms { rooms: view.ended }
+            }
+        }
         Request::AppendSession {
             channel_id,
             session_id,

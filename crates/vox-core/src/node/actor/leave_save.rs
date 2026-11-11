@@ -286,6 +286,7 @@ fn native(
             paths.remove_room_cursors(&crate::node::link::b32_encode(&room), &name);
             let mut committed_retirement = None;
             let mut noted = None;
+            let mut written = None;
             let result = (|| {
                 let mut batch = store.batch()?;
                 metadata_save::MapChange::Forget(room).queue(store, signer, &mut batch)?;
@@ -310,9 +311,10 @@ fn native(
                         &room,
                         &signer.fingerprint(),
                     )?;
-                    // Remembered with the deletion, so the room's name still answers (#1206).
+                    // Remembered with the deletion, so the room's name still answers (#1206);
+                    // installed only once the batch is committed.
                     let now = record.noted_ms;
-                    noted = Some(crate::node::ended_rooms::note(
+                    written = Some(crate::node::ended_rooms::note(
                         store, &mut batch, signer, *record, now,
                     )?);
                 }
@@ -333,6 +335,7 @@ fn native(
                     }
                 }
                 batch.commit()?;
+                noted = written.take();
                 committed_retirement = pending;
                 if let (Some(permit), Some(pending)) = (retirement, pending) {
                     // This exact receipt is already durable. Rewrite failure cannot strand it.
@@ -900,12 +903,14 @@ impl Node {
                     drop(lifetime);
                     drop(_lifetime);
                     drop(_secret);
-                    if let Some(reply) = pending.reply {
-                        let _ = reply.send(Outcome::Done);
-                    }
+                    // Hidden, reaching nobody and published before the answer: a `room list`
+                    // right after cannot name the room.
                     let departure_ms = self.now_ms().get();
                     self.wait_for_leave(room, departure.generation, departure_ms, Some(committed))
                         .await;
+                    if let Some(reply) = pending.reply {
+                        let _ = reply.send(Outcome::Done);
+                    }
                 }
             }
             (After::Close { transition }, NativeSaved::Close(result)) => {

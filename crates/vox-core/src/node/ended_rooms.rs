@@ -63,10 +63,15 @@ pub struct EndedRooms {
 }
 
 impl EndedRooms {
-    /// The rooms, oldest noted first.
+    /// The rooms still within [`KEPT_MS`] at `now_ms`, oldest noted first: what is published
+    /// and served, so a note is not shown past its bound only because nothing ended since.
     #[must_use]
-    pub fn rooms(&self) -> &[EndedRoom] {
-        &self.rooms
+    pub fn current(&self, now_ms: u64) -> Vec<EndedRoom> {
+        self.rooms
+            .iter()
+            .filter(|room| now_ms.saturating_sub(room.noted_ms) <= KEPT_MS)
+            .cloned()
+            .collect()
     }
 
     /// Note `room`'s end at `now_ms`, forgetting an earlier note of the same room and whatever
@@ -200,10 +205,12 @@ fn sek(signer: &dyn RootSigner) -> Result<Sek> {
 }
 
 /// Note `room`'s end in the store's record, in `batch`: read after writer admission, so a note
-/// never replaces a newer record with an older snapshot. Returns the record as written.
+/// never replaces a newer record with an older snapshot. A record that does not open is a
+/// courtesy lost, not a reason to keep an ended room: it is replaced. Returns the record as
+/// written.
 ///
 /// # Errors
-/// The identity is locked, or the record cannot be read or written.
+/// The identity is locked, or the record cannot be written.
 pub fn note(
     store: &Store,
     batch: &mut Batch<'_>,
@@ -211,7 +218,7 @@ pub fn note(
     room: EndedRoom,
     now_ms: u64,
 ) -> Result<EndedRooms> {
-    let mut next = EndedRooms::load(store, signer)?;
+    let mut next = EndedRooms::load(store, signer).unwrap_or_default();
     next.note(room, now_ms);
     next.queue_save(batch, signer)?;
     Ok(next)

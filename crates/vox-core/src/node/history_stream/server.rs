@@ -86,6 +86,30 @@ pub(super) async fn answer(
                     && room.has_left(&peer);
                 #[cfg(not(feature = "test-knobs"))]
                 let mutant = false;
+                // This node left the room (ADR-023 RL-8.1a): it holds the room only so a
+                // member can take its departure, so it serves its inventory and its own public
+                // feed — which the departure ends — and nothing else of the room.
+                let me = room.me();
+                if room.has_left(&me) && !mutant {
+                    let allowed = match check {
+                        Query::Inventory => true,
+                        Query::Head(author) => author == me,
+                        Query::Header { head, .. }
+                        | Query::Proof { head, .. }
+                        | Query::Entry { head, .. }
+                        | Query::Page { head, .. } => {
+                            room.history_head_by_id(store, &head)?.is_some_and(|head| {
+                                head.binding.author == me
+                                    && head.binding.scope == crate::log::history::LogScope::Public
+                            })
+                        }
+                        Query::Context(hash) => room
+                            .history_head(store, &me)?
+                            .is_some_and(|head| head.root.frontier == hash),
+                        _ => false,
+                    };
+                    return Ok(Some((allowed, false)));
+                }
                 if mutant || room.is_member(&peer) {
                     return Ok(Some((true, false)));
                 }

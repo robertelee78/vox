@@ -177,8 +177,11 @@ struct LeaveWaiter {
     /// The generation the departure was written at: a clean sync round whose HAVE reached it
     /// has been heard.
     generation: u64,
-    /// Which [`LEAVE_BOUND`] timer ends this wait unheard.
+    /// Which bound wake is this wait's (a stale wake of an earlier wait does nothing).
     serial: u64,
+    /// When the room goes unheard, unix milliseconds: [`LEAVE_BOUND_MS`] after the departure's
+    /// own clock.
+    deadline_ms: u64,
     committed: Option<leave_save::CommittedDeparture>,
 }
 
@@ -653,7 +656,13 @@ const ADDRESS_PATIENCE: Duration = Node::BOARD_PATIENCE;
 /// whenever it wants"). The person left when the departure was written; this bounds only how
 /// long the hidden room is held for a member to reach, across restarts, from the departure's
 /// own clock.
-const LEAVE_BOUND: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const LEAVE_BOUND_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+/// The longest a leave's bound timer sleeps before reading the wall clock again: a sleep is
+/// monotonic and stands still while the machine sleeps, so the bound is kept by the clock, not
+/// by one long sleep.
+const LEAVE_BOUND_CHECK: Duration = Duration::from_secs(60 * 60);
+/// How long after a refused unheard purge it is tried again.
+const LEAVE_RETRY_MS: u64 = 10 * 60 * 1_000;
 
 /// How long a join waits before asking its boards again for a room none of them holds yet
 /// (V210-143): a host publishes its room within a second of starting, and retries a failed dial to
@@ -2097,7 +2106,7 @@ enum NetEvent {
     /// A signed withdraw took records off this node's board (V030-14): what it shows changed.
     BoardWithdrew,
     /// A leave begun at `serial` (see `Node::wait_for_leave`) has held its room for
-    /// [`LEAVE_BOUND`] after the departure and no other member has taken it: the room goes
+    /// [`LEAVE_BOUND_MS`] after the departure and no other member has taken it: the room goes
     /// unheard.
     LeaveWaitOver {
         /// The room.
@@ -18636,6 +18645,23 @@ impl Node {
             }
             return;
         }
+        // This node left the room (ADR-023 RL-8.1a): a member may still take its departure over
+        // the bounded exchange, whose server answers only for this node's own feed; the legacy
+        // whole-log exchange serves the room entire, so it is refused.
+        if history.is_none() {
+            let left = match self.channels.get(&channel_id) {
+                Some(shared) => {
+                    let room = shared.lock().await;
+                    room.has_left(&room.me())
+                }
+                None => false,
+            };
+            if left {
+                let (mut send, mut recv) = (send, recv);
+                crate::node::net::refuse_stream(&mut send, &mut recv);
+                return;
+            }
+        }
         let departure_receipt = if history
             .as_ref()
             .is_some_and(|p| p.purpose == crate::node::history_stream::Purpose::Control)
@@ -19898,6 +19924,8 @@ impl Node {
         // is re-opened on the next unlock (ADR-020 §3).
         self.trust = crate::node::trust::Keyring::new();
         self.dismissed_offers = crate::node::offers::DismissedOffers::default();
+        // Sealed under the identity like the keyring: a locked node holds and answers none of it.
+        self.ended_rooms = crate::node::ended_rooms::EndedRooms::default();
         self.peer_book = crate::node::peer_book::PeerBook::new();
         self.peer_book_save = peer_book_save::State::default();
         self.anchor_hints = BootstrapSet::new();
@@ -21691,8 +21719,10 @@ impl Node {
     }
 
     /// Push a written departure to the room's members, and delete the room once one has it, or
-    /// once [`LEAVE_BOUND`] from the departure's clock `departure_ms` is up (ADR-023 RL-8.1a).
-    /// The person has left already: the room is hidden from the moment the departure is durable.
+    /// once [`LEAVE_BOUND_MS`] from the departure's clock `departure_ms` is up (ADR-023 RL-8.1a).
+    /// The person has left already: the room is hidden, reaches nobody and offers nothing from
+    /// the moment this returns, so a reply sent after it cannot be followed by a list that still
+    /// names the room.
     async fn wait_for_leave(
         &mut self,
         channel_id: Digest32,
@@ -21704,18 +21734,29 @@ impl Node {
         let _ = self.sync_channel(&channel_id).await;
         self.leave_serial += 1;
         let serial = self.leave_serial;
+        // Measured from the departure, not from this wait: a restart does not extend the bound.
+        let deadline_ms = departure_ms.saturating_add(LEAVE_BOUND_MS);
         self.leave_waiters.push(LeaveWaiter {
             room: channel_id,
             generation,
             serial,
+            deadline_ms,
             committed,
         });
-        // Measured from the departure, not from this wait: a restart does not extend the bound.
-        let held = Duration::from_millis(self.now_ms().get().saturating_sub(departure_ms));
-        let left = LEAVE_BOUND.saturating_sub(held);
+        self.arm_leave_bound(channel_id, serial, deadline_ms);
+        self.refresh_reachers().await;
+        self.publish().await;
+    }
+
+    /// Wake `finish_leave_unheard` for the leave begun at `serial` once the wall clock reaches
+    /// `deadline_ms`. A sleep is monotonic and stands still while the machine sleeps, so this
+    /// sleeps at most [`LEAVE_BOUND_CHECK`] at a time and the wake reads the wall clock again.
+    fn arm_leave_bound(&self, channel_id: Digest32, serial: u64, deadline_ms: u64) {
+        let wait = Duration::from_millis(deadline_ms.saturating_sub(self.now_ms().get()))
+            .min(LEAVE_BOUND_CHECK);
         let tx = self.net_tx.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(left).await;
+            tokio::time::sleep(wait).await;
             let _ = tx
                 .send(NetEvent::LeaveWaitOver { channel_id, serial })
                 .await;
@@ -21772,24 +21813,40 @@ impl Node {
         }
     }
 
-    /// The [`LEAVE_BOUND`] of the leave begun at `serial` is up and no member took the
-    /// departure: the room goes unheard (ADR-023 RL-8.1a). The members' copies keep listing this
-    /// identity until one of them learns otherwise; the board withdrawal still goes out.
+    /// The wake for the leave begun at `serial`: once [`LEAVE_BOUND_MS`] from the departure is up
+    /// by the wall clock and no member took it, the room goes unheard (ADR-023 RL-8.1a). The
+    /// members' copies keep listing this identity until one of them learns otherwise; the board
+    /// withdrawal still goes out. The waiter stays until the purge lands (`finish_saved_purge`
+    /// takes it), so a purge refused for the moment — a policy save pending, Session cleanup
+    /// busy — is tried again after [`LEAVE_RETRY_MS`].
     async fn finish_leave_unheard(&mut self, channel_id: Digest32, serial: u64) {
-        let Some(at) = self
-            .leave_waiters
-            .iter()
-            .position(|w| w.room == channel_id && w.serial == serial)
-        else {
-            return;
-        };
-        let waiter = self.leave_waiters.remove(at);
-        if let Some(committed) = waiter.committed {
-            if !committed.current(self, &channel_id).await {
+        let (deadline_ms, current) = {
+            let Some(waiter) = self
+                .leave_waiters
+                .iter()
+                .find(|w| w.room == channel_id && w.serial == serial)
+            else {
                 return;
-            }
+            };
+            let current = match &waiter.committed {
+                Some(committed) => committed.current(self, &channel_id).await,
+                None => true,
+            };
+            (waiter.deadline_ms, current)
+        };
+        if !current {
+            // A replacement room attachment or epoch: `resume_leave` arms its own wait.
+            self.leave_waiters
+                .retain(|w| !(w.room == channel_id && w.serial == serial));
+            return;
+        }
+        let now = self.now_ms().get();
+        if now < deadline_ms {
+            self.arm_leave_bound(channel_id, serial, deadline_ms);
+            return;
         }
         self.purge_left_room(channel_id).await;
+        self.arm_leave_bound(channel_id, serial, now.saturating_add(LEAVE_RETRY_MS));
     }
 
     /// Publish the room's board withdrawal and delete the room this identity left. Before
@@ -23024,9 +23081,12 @@ impl Node {
             // trust is room-independent so it cannot name the room, and membership is a
             // passphrase and a proof of work rather than a decision about a person.
             let profile = self.profile.as_ref().ok_or(Error::Profile("locked"))?;
+            // A room this node left reaches nobody and offers nothing (ADR-023 RL-8.1a): it is
+            // held only to deliver the departure.
+            let left = ch.has_left(&ch.me());
             let next = (|| -> crate::error::Result<_> {
                 let mut next = std::collections::BTreeSet::new();
-                if !ch.is_member_removed(profile.store(), &ch.me())? {
+                if !left && !ch.is_member_removed(profile.store(), &ch.me())? {
                     for fp in &trusted {
                         if ch.is_member(fp) && !ch.is_member_removed(profile.store(), fp)? {
                             next.insert(*fp);
@@ -23085,7 +23145,14 @@ impl Node {
                 .offered
                 .entry(*cid)
                 .or_insert_with(crate::node::tunnel::empty_offered);
-            crate::node::tunnel::publish_offered(offer, ch.services().clone());
+            crate::node::tunnel::publish_offered(
+                offer,
+                if left {
+                    BTreeMap::new()
+                } else {
+                    ch.services().clone()
+                },
+            );
         }
         // A channel this node no longer holds must deny, including to tasks still holding
         // the handle: empty it before letting go, or they would read the last value forever.
@@ -24514,7 +24581,7 @@ impl Node {
             channels,
             open_channels: Vec::new(),
             leaving: Vec::new(),
-            ended: self.ended_rooms.rooms().to_vec(),
+            ended: self.ended_rooms.current(self.now_ms().get()),
             forwards: Vec::new(),
             trusted: self.trust_rows(),
             presented: Vec::new(),
@@ -24951,7 +25018,7 @@ impl Node {
             channels,
             open_channels,
             leaving,
-            ended: self.ended_rooms.rooms().to_vec(),
+            ended: self.ended_rooms.current(self.now_ms().get()),
             offers,
             anchoring,
             forwards: self

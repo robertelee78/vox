@@ -1624,7 +1624,9 @@ pub(crate) mod pending_session;
 
 impl ChannelState {
     fn private_peer_current(&self, store: &Store, peer: &Digest32) -> Result<bool> {
-        Ok(self.drive_members().contains(peer)
+        // A room this node left carries no Session traffic either way (ADR-023 RL-8.1a).
+        Ok(!self.has_left(&self.me())
+            && self.drive_members().contains(peer)
             && self.room_peer_current(store, peer)?
             && !self.is_member_removed(store, &self.me())?)
     }
