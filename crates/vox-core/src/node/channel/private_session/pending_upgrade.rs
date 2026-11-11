@@ -238,9 +238,11 @@ impl ChannelState {
                 return Ok(Preparation::Waiting(UpgradeWait::Governance));
             }
             Work::Controls
-        } else if self.private_sessions.legacy_work.is_some()
-            || !self.private_sessions.legacy_pending.is_empty()
-        {
+        } else if self.legacy_upgrade_pending() {
+            if self.legacy_upgrade_deferred() {
+                // It waits on a member's records; the published room resumes it.
+                return Ok(Preparation::Waiting(UpgradeWait::Governance));
+            }
             if !self.legacy_private_controls_ready(store)? {
                 Work::Controls
             } else {
