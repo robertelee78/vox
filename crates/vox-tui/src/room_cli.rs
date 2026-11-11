@@ -233,6 +233,13 @@ async fn ended_room_said(client: &mut IpcClient, prefix: &str) -> Option<AppErro
         Some(name) => format!("room {name:?} ({})", b32_encode(&room.channel_id)),
         None => format!("room {}", b32_encode(&room.channel_id)),
     };
+    if room.by.is_some() && room.by == client.me() {
+        return Some(AppError::Usage(format!(
+            "you left {which} at {}; its members were told, and this node deleted it, so there is \
+             nothing to read or post",
+            held_since(room.ended_ms / 1_000)
+        )));
+    }
     let by = match room.by {
         Some(by) => format!("by {}", crate::ident::name_of(&by)),
         None => "by the idle end its creator chose".to_owned(),

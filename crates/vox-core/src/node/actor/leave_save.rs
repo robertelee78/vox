@@ -774,23 +774,38 @@ impl Node {
             },
         };
         let name = crate::node::resolver::room_shown(channel.name(), &room);
-        // An ended room is remembered as it goes (#1206): who ended it, and when, by its own
-        // clock; a left room is not — the person chose to forget it.
-        let ended = purpose.is_none().then(|| {
-            let now = self.now_ms().get();
-            let (by, ended_ms) = self
-                .profile
-                .as_ref()
-                .and_then(|profile| channel.end_record(profile.store(), now))
-                .unwrap_or((None, now));
-            Box::new(crate::node::ended_rooms::EndedRoom {
-                channel_id: room,
-                name: channel.name().map(str::to_owned),
-                by,
-                ended_ms,
-                noted_ms: now,
-            })
-        });
+        // An ended or left room is remembered as it goes (#1206), so its name still answers
+        // afterwards: who ended it and when, by its own clock; or that this identity left it,
+        // at its departure's clock. A purge that precedes a rejoin remembers nothing.
+        let me = channel.me();
+        let ended = match &purpose {
+            Some(LeftPurgePurpose::Join { .. }) => None,
+            Some(LeftPurgePurpose::Leave { .. }) => {
+                let now = self.now_ms().get();
+                Some(Box::new(crate::node::ended_rooms::EndedRoom {
+                    channel_id: room,
+                    name: channel.name().map(str::to_owned),
+                    by: Some(me),
+                    ended_ms: channel.last_departure_ms(&me).unwrap_or(now),
+                    noted_ms: now,
+                }))
+            }
+            None => {
+                let now = self.now_ms().get();
+                let (by, ended_ms) = self
+                    .profile
+                    .as_ref()
+                    .and_then(|profile| channel.end_record(profile.store(), now))
+                    .unwrap_or((None, now));
+                Some(Box::new(crate::node::ended_rooms::EndedRoom {
+                    channel_id: room,
+                    name: channel.name().map(str::to_owned),
+                    by,
+                    ended_ms,
+                    noted_ms: now,
+                }))
+            }
+        };
         // Preserve the original purge fence before any native writer can admit a publisher.
         self.cancel_own_key_room(room);
         channel.lock_now();
