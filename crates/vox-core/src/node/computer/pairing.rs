@@ -19,6 +19,17 @@ const AUTH_DOMAIN: &[u8] = b"vox/computer-auth/v1";
 const PAIR_OP: u64 = 3;
 const PATIENCE: Duration = Duration::from_secs(15);
 const MANAGEMENT_SLOTS: usize = 8;
+
+/// Takes `review_gate` or `recording`. Their holder runs a durable Computer transaction, whose
+/// gate wait (`blocking_transaction`) can outlast an actor turn; a task that waited for them
+/// directly on a runtime worker held that worker. With two workers, two such waiters left no
+/// worker to poll the actor or the async owner of the `changes` gate that the holder was
+/// waiting for, and the daemon stalled whole (status unanswered, SIGTERM ignored). The wait
+/// is a blocking region, so the worker is handed on. Nested inside a blocking region, it
+/// simply runs.
+fn hold<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    blocking_transaction(|| lock(mutex))
+}
 /// **Test-only** (`test-knobs`): `<arm path>\t<engaged path>`. The arm contains the policy revision
 /// before the proof's change. The later exchange that atomically consumes it creates the engaged
 /// marker after the source-owned local-apply interval and parks until superseded. This gives the
@@ -409,6 +420,7 @@ pub struct Management {
     retry_problem: Mutex<Option<(BackgroundOwner, String)>>,
     application_problem: Mutex<Option<(BackgroundOwner, String)>>,
     conflict: Mutex<Option<ConflictReview>>,
+    /// Held across durable Computer transactions; taken only through `hold`.
     review_gate: Mutex<()>,
     unavailable_nodes: Mutex<Vec<String>>,
     pending_nodes: Mutex<BTreeMap<String, PendingNodeApplication>>,
@@ -418,6 +430,7 @@ pub struct Management {
     /// failed since one succeeded. What `retry` keys its cadence on (ADR-038 FX-15; #989).
     exchanged: Mutex<BTreeMap<Digest32, Exchanged>>,
     /// Serializes outcome persistence without nesting the flight lock with computer state.
+    /// Held across durable Computer transactions; taken only through `hold`.
     recording: Mutex<()>,
     /// Coalesced reasons to reconsider the exact next exchange deadline: local state, a real
     /// network change, an authenticated peer connection/stream, or an attempt ending.
@@ -1191,7 +1204,7 @@ impl Management {
     }
     /// Begin one bounded invitation. Existing pending approval must be cancelled explicitly first.
     pub fn begin(&self) -> Result<ComputerStatus> {
-        let _review_guard = lock(&self.review_gate);
+        let _review_guard = hold(&self.review_gate);
         let endpoints = self.net.local_endpoints()?;
         let id = random_array()?;
         let secret = Zeroizing::new(random_array()?);
@@ -1264,7 +1277,7 @@ impl Management {
     pub fn cancel(&self, operation: &str) -> Result<ComputerStatus> {
         let id = crate::node::link::b32_decode(operation, "computer pairing operation")?;
         {
-            let _review_guard = lock(&self.review_gate);
+            let _review_guard = hold(&self.review_gate);
             let review = lock(&self.conflict)
                 .as_ref()
                 .filter(|review| review.public.operation_id == operation)
@@ -1612,7 +1625,7 @@ impl Management {
         expected: &str,
     ) -> Result<ComputerStatus> {
         if action == "recover-group" {
-            let _review_guard = lock(&self.review_gate);
+            let _review_guard = hold(&self.review_gate);
             let snapshot = crate::node::link::b32_decode(node, "retirement review")?;
             return self.recover_group(expected, None, Some(snapshot));
         }
@@ -1727,7 +1740,7 @@ impl Management {
     }
     /// Explicitly retire the exact authority reviewed after a foreign-group refusal.
     fn replace_group(&self, token: &str, expected: &str) -> Result<ComputerStatus> {
-        let _review_guard = lock(&self.review_gate);
+        let _review_guard = hold(&self.review_gate);
         let review = lock(&self.conflict).clone().ok_or(Error::Profile(
             "the group replacement review is no longer available; review the invitation again",
         ))?;
@@ -2781,7 +2794,7 @@ impl Management {
         pop::verify(&proof, &ci, &transcript, &link.target)?;
         let exchange = d.bytes()?.to_vec();
         d.finish()?;
-        let _review_guard = lock(&self.review_gate);
+        let _review_guard = hold(&self.review_gate);
         let review = {
             let s = lock(&self.computer.state);
             if s.policy_revision != expected_policy_revision {
@@ -3153,7 +3166,7 @@ impl Management {
         let proof = pop::open_pop(isk.as_ref(), sealed)?;
         pop::verify(&proof, &ci, &transcript, &conn.peer_id())?;
         let recorded = {
-            let _review_guard = lock(&self.review_gate);
+            let _review_guard = hold(&self.review_gate);
             let recorded = self.computer.change_until(deadline, |s| {
                 let before_revision = s.revision;
                 if s.policy_revision != initial_policy_revision {
@@ -3906,7 +3919,7 @@ impl Management {
     /// attempt counts, failure pacing or the independent command. Outcome recording serializes
     /// the recheck with a real inbound reply which may already have covered the cause.
     fn record_blocked_deadline(&self, peer: Digest32, owner: u64) -> Result<()> {
-        let _recording = lock(&self.recording);
+        let _recording = hold(&self.recording);
         if !lock(&self.inflight)
             .get(&peer)
             .is_some_and(|flight| flight.origin == Origin::Operator && !flight.superseded)
@@ -3969,7 +3982,7 @@ impl Management {
         mut outcome: std::result::Result<(u64, u64), String>,
         covered_payload: Option<(u64, u64)>,
     ) {
-        let _recording = lock(&self.recording);
+        let _recording = hold(&self.recording);
         // An inbound full exchange can cover and supersede this exact outbound snapshot while its
         // task is finishing. It records the successful coverage under `recording`; the older
         // outbound outcome must not recreate a miss afterward.
@@ -4717,7 +4730,7 @@ impl Management {
         policy_revision: u64,
         involved: bool,
     ) -> Result<()> {
-        let _recording = lock(&self.recording);
+        let _recording = hold(&self.recording);
         let completed = std::time::Instant::now();
         {
             let mut inflight = lock(&self.inflight);

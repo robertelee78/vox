@@ -297,8 +297,10 @@ fn blocking_transaction<T>(transaction: impl FnOnce() -> T) -> T {
     }
 }
 
-/// What a synchronous computer writer says when its bounded wait ends; the caller tries again.
-const WRITER_WAITED: &str = "the computer transaction waited too long for another computer writer or a held publication; it is tried again";
+/// What a synchronous computer writer says when its bounded wait ends. Background callers
+/// (the trust follower, the pairing retry) try again on their own; an operator's command does
+/// not, and says so.
+const WRITER_WAITED: &str = "the computer transaction waited too long for another computer writer or a held publication and was not applied; try again";
 
 fn writer_deadline(deadline: Option<std::time::Instant>) -> std::time::Instant {
     deadline.unwrap_or_else(|| std::time::Instant::now() + COMPUTER_RETURN_SHOWN_WITHIN)
