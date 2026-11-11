@@ -6628,7 +6628,26 @@ async fn offered_in(client: &mut IpcClient, channel_id: Digest32) -> Vec<String>
         })
         .await
     {
-        Ok(Frame::Services { services, .. }) => services.into_iter().map(|(tag, _)| tag).collect(),
+        Ok(Frame::Services { services, .. }) => {
+            // A shared file's service is named by its hash and nonce (`shares.rs`), which no
+            // person reads; a room that keeps messages forever keeps every share alive, and a
+            // leave prompt listed 64 of them raw. Say how many; name the services a person named.
+            let mut named = Vec::new();
+            let mut files = 0usize;
+            for (tag, _) in services {
+                if tag.starts_with("file-") {
+                    files += 1;
+                } else {
+                    named.push(tag);
+                }
+            }
+            match files {
+                0 => {}
+                1 => named.push("1 shared file".to_owned()),
+                n => named.push(format!("{n} shared files")),
+            }
+            named
+        }
         _ => Vec::new(),
     }
 }
