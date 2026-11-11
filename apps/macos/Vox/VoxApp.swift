@@ -96,7 +96,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// SIGTERM, SIGHUP and SIGINT, each a clean quit (ADR-026 S-4).
     private var stops: [DispatchSourceSignal] = []
     private var quitting = false
-    private var quitTimer: Timer?
+    /// Ends the process if a quit is not through within its deadline (A-4, 2026-11-11).
+    private var quitBackstop: DispatchSourceTimer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Vox's sheets ask for an action; quitting cancels the question. AppKit otherwise may
@@ -141,9 +142,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Quitting lets go of the node before the app exits (A-4), so the daemon has detached it
     /// when the app is gone.
+    ///
+    /// **A quit is answered within seconds in every state** (2026-11-11): `vox update` asks the
+    /// app to quit and gives up on it after ten seconds. Letting go of the node is bounded and
+    /// off the main thread (`AppModel.quit`), and a backstop on its own queue ends the process
+    /// when the main thread cannot reply at all: a wedged main thread answers no Apple event,
+    /// no run-loop timer and no main-queue block. The app owns no durable state; the daemon
+    /// lets go of the node when the connection drops.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard !quitting else { return .terminateLater }
         quitting = true
+        let backstop = DispatchSource.makeTimerSource(queue: .global(qos: .userInitiated))
+        backstop.schedule(deadline: .now() + 6)
+        backstop.setEventHandler { _exit(0) }
+        backstop.resume()
+        quitBackstop = backstop
         // Cancel pending presentation, never its protected action. The return code also gives
         // AppKit-owned panels their normal cancellation completion. Set quitting first because
         // dismissing a sheet can itself cause window/lifecycle callbacks.
@@ -153,24 +166,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         guard model.holdsNode else { return .terminateNow }
-        // An independent run-loop deadline: cancellation of a stuck FFI call cannot hold quit.
-        let timer = Timer(timeInterval: 3, repeats: false) { [weak self] _ in
-            MainActor.assumeIsolated { self?.finishQuitting(sender) }
-        }
-        quitTimer = timer
-        RunLoop.main.add(timer, forMode: .common)
         Task {
             await model.quit()
-            finishQuitting(sender)
+            sender.reply(toApplicationShouldTerminate: true)
         }
         return .terminateLater
-    }
-
-    private func finishQuitting(_ sender: NSApplication) {
-        guard quitting else { return }
-        quitting = false
-        quitTimer?.invalidate()
-        quitTimer = nil
-        sender.reply(toApplicationShouldTerminate: true)
     }
 }

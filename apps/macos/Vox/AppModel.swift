@@ -4,6 +4,7 @@ import AppKit
 import Foundation
 import Combine
 import ServiceManagement
+import os
 @MainActor
 final class AppModel: ObservableObject {
     /// The one model: the app observes it, and its delegate starts it and quits it.
@@ -810,11 +811,25 @@ final class AppModel: ObservableObject {
     /// Why turning Keep Running on or off failed, in macOS's or the daemon's words; nil once read.
     @Published var keepRunningSaid: String?
 
-    /// Let go of the node and end the client (A-4).
+    /// Let go of the node and end the client (A-4), within three seconds. UniFFI polls a Rust
+    /// future on the thread that awaits it, so the close runs on its own task, never on the
+    /// main thread; one that is still closing after the deadline (a held connection behind a
+    /// stalled exchange, a daemon that stopped answering) is left to the process's end, when
+    /// the daemon lets go of the node as the connection drops (2026-11-11).
     func quit() async {
         let generation = beginNodeRequest()
         guard let original = client else { return }
-        await original.close()
+        await withCheckedContinuation { (quit: CheckedContinuation<Void, Never>) in
+            let once = OSAllocatedUnfairLock(initialState: false)
+            let finish: @Sendable () -> Void = {
+                if once.withLock({ done in defer { done = true }; return !done }) { quit.resume() }
+            }
+            Task.detached {
+                await original.close()
+                finish()
+            }
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 3, execute: finish)
+        }
         guard ownsNodeRequest(original, generation) else { return }
         client = nil
     }
