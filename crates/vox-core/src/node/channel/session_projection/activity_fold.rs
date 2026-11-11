@@ -305,11 +305,13 @@ pub(super) fn appended(index: &mut Write<'_, '_>, f: &Fact) -> Result<()> {
 pub(super) fn removed(index: &mut Write<'_, '_>, f: &Fact) -> Result<bool> {
     if !index.header.activity.ready {
         // A rebuild still walking retained facts below this arrival never sees it: it goes
-        // on, under a revision that refuses a continuation of an older plan.
+        // on, under a revision that refuses a continuation of an older plan. A restart already
+        // owed (an earlier removal below the cursor) is kept, not erased.
         let Some(work) = index.header.activity.work.as_mut() else {
             return Ok(false);
         };
         if work.phase != 1
+            || work.invalidated != index.header.activity.invalidated
             || work
                 .cursor
                 .as_ref()
