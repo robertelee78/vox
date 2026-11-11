@@ -10948,9 +10948,10 @@ impl Node {
     /// an attempt abandoned with nothing after it left the view behind until something else
     /// happened to refresh it, V210-80.)
     ///
-    /// A locked room still defers the whole rebuild. A room whose removal view cannot be read is
-    /// instead excluded fail-closed, so it cannot prevent other rooms' policy from being refreshed.
-    /// Its membership bucket refuses every room identity and the tick retries the failed room.
+    /// A locked room still defers the whole rebuild. A room whose removal view cannot be read
+    /// (its governance fold is refreshing) cannot prevent other rooms' policy from being
+    /// refreshed: its members keep the stream class the last completed fold gave them, its
+    /// applied exclusions stay excluded, and the tick retries the failed room (#1206).
     async fn refresh_network_view(&mut self) {
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return;
@@ -11024,21 +11025,48 @@ impl Node {
                         crate::node::network::short_id(cid)
                     );
                     incomplete = true;
+                    // The checked view is unreadable — most often because the room's governance
+                    // fold is re-running after a governance row arrived or at startup (#1206).
+                    // The stream admission class stays what the room last proved: its roster
+                    // minus the members that left and minus the exclusions already applied
+                    // (`CurrentRemoved`, written only by a completed fold). Dropping the whole
+                    // roster here classed every member `Unknown` for as long as the fold ran,
+                    // and every sync in both directions was refused as `authenticator invalid`.
+                    // This is only who may *open* a stream; what a stream may carry — content,
+                    // keys, Session bodies — is gated by the fold's own proof
+                    // (`require_governance_ready`) and by the per-entry removal checks, which
+                    // keep failing closed while the view is refreshing.
                     let before = ch.removal_generation(&store);
                     let mut members = ch.author_map();
-                    let removed = members
-                        .keys()
-                        .filter(|peer| ch.peer_removal_applied(&store, peer).unwrap_or(true))
-                        .copied()
-                        .collect::<BTreeSet<_>>();
+                    let mut removed = BTreeSet::new();
+                    let mut unreadable = false;
+                    for peer in members.keys() {
+                        match ch.peer_removal_applied(&store, peer) {
+                            Ok(true) => {
+                                removed.insert(*peer);
+                            }
+                            Ok(false) => {}
+                            Err(_) => unreadable = true,
+                        }
+                    }
                     members.retain(|peer, _| !ch.has_left(peer) && !removed.contains(peer));
+                    policy.add_members(members.keys().copied());
+                    for left in ch
+                        .author_fingerprints()
+                        .into_iter()
+                        .filter(|a| ch.has_left(a))
+                    {
+                        policy.expect_joiner(left);
+                        departed.insert(left);
+                    }
+                    self.retire_removed_room_access(cid, ch.me(), &removed);
                     match before {
                         Ok(generation)
-                            if ch
-                                .removal_generation(&store)
-                                .is_ok_and(|after| after == generation) =>
+                            if !unreadable
+                                && ch
+                                    .removal_generation(&store)
+                                    .is_ok_and(|after| after == generation) =>
                         {
-                            self.retire_removed_room_access(cid, ch.me(), &removed);
                             net.membership().set_member_channel(
                                 cid,
                                 ch.epoch(),
