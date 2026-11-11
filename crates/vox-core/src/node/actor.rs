@@ -20446,10 +20446,7 @@ impl Node {
                     }
                     // Current policy and classification are prerequisites for private
                     // retention/publication. Pending replay keeps this room unpublished.
-                    prepared.wait_on(
-                        "its governance records being refreshed",
-                        self.now_ms().get(),
-                    );
+                    prepared.wait_on("its governance records to refresh", self.now_ms().get());
                     if prepared.legacy_cleanup_due.is_none() {
                         prepared.legacy_cleanup_due = Some(
                             std::time::Instant::now()

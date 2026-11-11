@@ -363,6 +363,42 @@ struct BoardKept {
     notices: BTreeMap<Digest32, (u64, Vec<u8>)>,
     /// `member` → `(withdraw time, withdraw)`, the newest.
     withdraws: BTreeMap<Digest32, (u64, Vec<u8>)>,
+    /// Verified readings of kept notices; never persisted.
+    checked: NoticeChecks,
+}
+
+/// The outcome of parsing a kept notice and verifying its witness signature, keyed by the
+/// notice bytes and room epoch. The result is a pure function of that key and the witness key
+/// named inside it, so a view rebuild need not repeat ML-DSA parsing and verification.
+#[derive(Default)]
+struct NoticeChecks(std::sync::Mutex<BTreeMap<(Digest32, u64), Option<KeptNotice>>>);
+
+/// The authenticated facts `has_left` reads from one verified admission notice.
+#[derive(Clone, Copy)]
+struct KeptNotice {
+    joiner: Digest32,
+    witness: Digest32,
+    at: u64,
+}
+
+/// Bound on retained readings; one per kept notice and epoch in ordinary rooms.
+const NOTICE_CHECKS_MAX: usize = 4 * AUTHORS_HARD_LIMIT;
+
+impl Clone for NoticeChecks {
+    fn clone(&self) -> Self {
+        Self(std::sync::Mutex::new(
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        ))
+    }
+}
+
+impl std::fmt::Debug for NoticeChecks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("NoticeChecks")
+    }
 }
 
 fn board_kept_bytes(kept: &BoardKept) -> Vec<u8> {
@@ -9100,18 +9136,46 @@ impl ChannelState {
         {
             return true;
         }
-        let Ok(notice) = crate::nat::notice::AdmissionNotice::from_wire(wire) else {
+        let Some(notice) = self.kept_notice(wire) else {
             return true;
         };
-        let Some(witness) = self.authors.get(&notice.witness.witness_id) else {
-            return true;
+        notice.joiner != *author || notice.at != *at || self.said_left(&notice.witness)
+    }
+
+    /// A kept admission notice's verified facts, or `None` when it is malformed, its witness is
+    /// not an author here, or the witness signature does not verify for this room and epoch.
+    /// Only results that cannot change for the same bytes, epoch and witness are retained.
+    fn kept_notice(&self, wire: &[u8]) -> Option<KeptNotice> {
+        let key = (crate::hash::sha256(wire), self.epoch);
+        let mut checks = self
+            .board_kept
+            .checked
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(found) = checks.get(&key) {
+            return *found;
+        }
+        let reading = match crate::nat::notice::AdmissionNotice::from_wire(wire) {
+            Err(_) => None,
+            Ok(notice) => {
+                // An unknown witness may become an author later; do not retain that answer.
+                let witness = self.authors.get(&notice.witness.witness_id)?;
+                notice
+                    .verify(witness, &self.channel_id, self.epoch)
+                    .is_ok()
+                    .then(|| KeptNotice {
+                        joiner: notice.joiner(),
+                        witness: notice.witness.witness_id,
+                        at: notice.witness.timestamp_ms,
+                    })
+            }
         };
-        notice.joiner() != *author
-            || notice.witness.timestamp_ms != *at
-            || self.said_left(&notice.witness.witness_id)
-            || notice
-                .verify(witness, &self.channel_id, self.epoch)
-                .is_err()
+        if checks.len() >= NOTICE_CHECKS_MAX {
+            checks.clear();
+        }
+        checks.insert(key, reading);
+        reading
     }
 
     /// Whether `author`'s feed, as this node holds it, ends in its statement that it left.

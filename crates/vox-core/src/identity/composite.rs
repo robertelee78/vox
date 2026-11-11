@@ -129,6 +129,23 @@ impl CompositePublicKey {
             .get_or_init(|| identity_fingerprint(&self.ed25519_bytes(), &self.ml_dsa_bytes()))
     }
 
+    /// [`Self::fingerprint`] of a serialized key without expanding its ML-DSA half.
+    ///
+    /// Equal to `Self::from_bytes(bytes)?.fingerprint()`: the Ed25519 point is validated
+    /// exactly as `from_bytes` does, ML-DSA-65 public-key decoding is total, and its
+    /// re-encoding is the input (`rho ‖ SimpleBitPack(t1, 10)`). Callers that only need the
+    /// identity of an already-encoded key avoid the matrix expansion a verifier needs.
+    pub fn fingerprint_of(bytes: &[u8; COMPOSITE_PUB_LEN]) -> Result<Digest32> {
+        let mut ed_arr = [0u8; ED25519_PUB_LEN];
+        ed_arr.copy_from_slice(&bytes[..ED25519_PUB_LEN]);
+        EdVerifyingKey::from_bytes(&ed_arr).map_err(|_| Error::InvalidKeyEncoding {
+            algo: algo::ED25519,
+        })?;
+        let mut ml_arr = [0u8; ML_DSA_65_PUB_LEN];
+        ml_arr.copy_from_slice(&bytes[ED25519_PUB_LEN..]);
+        Ok(identity_fingerprint(&ed_arr, &ml_arr))
+    }
+
     /// Verify a composite signature over `msg`. Returns `Ok(())` **only if both**
     /// the Ed25519 and the ML-DSA-65 halves verify; otherwise
     /// [`Error::SignatureInvalid`].

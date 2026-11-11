@@ -385,10 +385,7 @@ pub struct Description {
 impl Description {
     /// Identity fingerprint.
     pub fn fingerprint(&self) -> Result<Digest32> {
-        Ok(
-            CompositePublicKey::from_bytes(self.public.as_slice().try_into().map_err(|_| bad())?)?
-                .fingerprint(),
-        )
+        CompositePublicKey::fingerprint_of(self.public.as_slice().try_into().map_err(|_| bad())?)
     }
     /// Canonical presentation bytes.
     pub fn encode(&self) -> Vec<u8> {

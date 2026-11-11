@@ -804,7 +804,8 @@ impl Management {
                 Ok(()) => {
                     let local = self.computer.signer.fingerprint();
                     if state.receipts.get(&local).is_some_and(|receipt| {
-                        valid_receipt(&state, &local, receipt).unwrap_or(false)
+                        valid_receipt(&state, receipts_ready(&state), &local, receipt)
+                            .unwrap_or(false)
                     }) && problem.as_ref().is_some_and(|(held, _)| *held == owner)
                     {
                         *problem = None;
@@ -1861,6 +1862,7 @@ impl Management {
         // under `inflight` and then consults `exchanged`. The state lock held by this status call
         // prevents a policy snapshot from being paired with reservations for another revision.
         let inflight: BTreeSet<_> = lock(&self.inflight).keys().copied().collect();
+        let ready = receipts_ready(&s);
         let applications: Vec<_> = descriptions
             .iter()
             .map(|(id, d)| {
@@ -1869,7 +1871,7 @@ impl Management {
                 let confirmed = !storage_failed
                     && s.receipts
                         .get(id)
-                        .is_some_and(|r| valid_receipt(&s, id, r).unwrap_or(false));
+                        .is_some_and(|r| valid_receipt(&s, ready, id, r).unwrap_or(false));
                 let convergence_state = match missed {
                     Some((revision, true)) if revision == s.policy_revision => "repaired-late",
                     Some((revision, false)) if revision == s.policy_revision => "expired",
@@ -3405,6 +3407,7 @@ impl Management {
             let s = lock(&self.computer.state);
             let policy_revision = s.policy_revision;
             let local = self.computer.signer.fingerprint();
+            let ready = receipts_ready(&s);
             let mut peers: std::collections::BTreeSet<_> = s
                 .descriptions()
                 .into_keys()
@@ -3578,10 +3581,9 @@ impl Management {
                 if let Some(mark) = causal_mark {
                     selected_tokens.insert(*peer, mark.token);
                 }
-                let acknowledged = s
-                    .receipts
-                    .get(peer)
-                    .is_some_and(|receipt| valid_receipt(&s, peer, receipt).unwrap_or(false));
+                let acknowledged = s.receipts.get(peer).is_some_and(|receipt| {
+                    valid_receipt(&s, ready, peer, receipt).unwrap_or(false)
+                });
                 if causal_mark.is_some()
                     || !acknowledged
                     || involved == Some(*peer)
@@ -5596,8 +5598,9 @@ fn merge(s: &mut State, bytes: &[u8], peer: Digest32, signer: &dyn RootSigner) -
             s.received_misses.remove(&peer);
         }
     }
+    let ready = receipts_ready(s);
     for (author, receipt) in receipts {
-        if author != local && valid_receipt(s, &author, &receipt)? {
+        if author != local && valid_receipt(s, ready, &author, &receipt)? {
             s.receipts.insert(author, receipt);
         }
     }
@@ -5682,9 +5685,15 @@ fn receipt_body(s: &State, revision: u64) -> Result<Vec<u8>> {
     e.uint(revision).array(0);
     Ok(e.finish())
 }
-fn valid_receipt(s: &State, author: &Digest32, r: &Signed) -> Result<bool> {
+/// Whether any applied receipt can currently be valid. This derives the complete Computer
+/// history once; callers checking several receipts against one unchanged state share it.
+fn receipts_ready(s: &State) -> bool {
+    s.quarantined.is_empty() && s.history_complete()
+}
+
+fn valid_receipt(s: &State, ready: bool, author: &Digest32, r: &Signed) -> Result<bool> {
     r.verify(b"vox/computer-applied/v1\0", author)?;
-    if !s.history_complete() || !s.quarantined.is_empty() {
+    if !ready {
         return Ok(false);
     }
     let Some(g) = s.genesis.as_ref() else {

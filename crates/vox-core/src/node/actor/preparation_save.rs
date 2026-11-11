@@ -43,6 +43,10 @@ pub(super) struct State {
     reconcile: Option<trust_save::Reconcile>,
     cache_only: bool,
     resume_after_governance: Option<Stage>,
+    /// The resumed stage was refused because governance facts it needs were still refreshing.
+    refused: bool,
+    /// A governance turn since that refusal had local fold work to do.
+    folded: bool,
     policy: Option<(u64, u64)>,
 }
 
@@ -57,6 +61,8 @@ impl Default for State {
             reconcile: None,
             cache_only: false,
             resume_after_governance: None,
+            refused: false,
+            folded: false,
             policy: None,
         }
     }
@@ -453,6 +459,22 @@ impl Node {
                     prepared.save.lifetime = None;
                     return Ok(false);
                 }
+                Err(error)
+                    if ChannelState::governance_refreshing(&error)
+                        && prepared.save.stage != Stage::Governance =>
+                {
+                    // The stage's native work needs governance facts this room has not folded
+                    // yet. Only the fold below produces them for a preparing room; retrying the
+                    // same stage would repeat the same refusal (#1203). Fold, then resume it.
+                    prepared.save.lifetime = None;
+                    prepared.save.resume_after_governance = Some(prepared.save.stage);
+                    prepared.save.stage = Stage::Governance;
+                    prepared.save.refused = true;
+                    prepared.save.folded = false;
+                    prepared.save.request = Some(Work::Projection(ProjectionWork::Governance));
+                    prepared.wait_on(stage_wait(Stage::Governance), now.get());
+                    return Ok(false);
+                }
                 Err(error) => return Err(error),
             };
             if matches!(saved, Saved::Unavailable) {
@@ -481,6 +503,7 @@ impl Node {
                     Saved::Projection(ProjectionProgress::Governance(progress)),
                 ) => {
                     if !progress.ready {
+                        prepared.save.folded |= prepared.save.refused && progress.pending;
                         if progress.pending {
                             prepared.progressed("folding its governance records", now.get());
                         } else {
@@ -488,6 +511,26 @@ impl Node {
                             prepared.save.lifetime = None;
                         }
                         return Ok(false);
+                    }
+                    if prepared.save.refused {
+                        if progress.pending {
+                            prepared.save.folded = true;
+                            prepared.progressed("folding its governance records", now.get());
+                            return Ok(false);
+                        }
+                        if !prepared.save.folded {
+                            // Nothing local was left to fold, so the refused stage may need
+                            // records a member has not sent yet. Retry it once a second, not at
+                            // once: the next governance turn resumes it.
+                            prepared.save.refused = false;
+                            prepared.wait_on("governance records from its members", now.get());
+                            prepared.save.lifetime = None;
+                            prepared.legacy_cleanup_due =
+                                Some(std::time::Instant::now() + super::PREPARE_WAIT);
+                            return Ok(false);
+                        }
+                        prepared.save.refused = false;
+                        prepared.save.folded = false;
                     }
                     prepared.save.cache_only = channel.legacy_cache_only(&store)?;
                     let resume = prepared.save.resume_after_governance.take();
@@ -819,7 +862,7 @@ fn stage_wait(stage: Stage) -> &'static str {
     match stage {
         Stage::Receiver => "reclaiming earlier sender keys",
         Stage::Startup => "cleaning up its earlier saved form",
-        Stage::Governance => "its governance records being refreshed",
+        Stage::Governance => "its governance records to refresh",
         Stage::Packages => "opening members' key packages",
         Stage::Legacy | Stage::Classification => "classifying its earlier saved history",
         Stage::Upgrade | Stage::Import | Stage::Expiry => "restoring its Sessions",

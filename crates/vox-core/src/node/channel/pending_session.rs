@@ -223,7 +223,7 @@ impl ChannelState {
         let refresh_wait = if delivered || package {
             None
         } else if !self.private_policy_ready(store, now.get())? {
-            Some("its governance records being refreshed")
+            Some("its governance records to refresh")
         } else if self.session_upgrade_local_work() {
             Some("its Session upgrade")
         } else {

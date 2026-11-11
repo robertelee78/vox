@@ -1168,15 +1168,8 @@ impl Node {
     }
 
     pub(super) fn computer_change_refused(&self, command: &NodeCommand) -> bool {
-        let Some(computer) = &self.computer else {
-            return false;
-        };
-        if !computer.grouped() {
-            return false;
-        }
-        let Some(me) = self.profile.as_ref().map(Profile::fingerprint) else {
-            return false;
-        };
+        // Only trust changes consult Computer policy. Every other command returns before the
+        // shared Computer state lock, so an expensive status read cannot stall the actor.
         let (peer, requested) = match command {
             NodeCommand::Proved { change, .. } => return self.computer_change_refused(change),
             NodeCommand::Untrust { fingerprint } => (*fingerprint, None),
@@ -1193,6 +1186,15 @@ impl Node {
                 (*fingerprint, Some(crate::node::trust::Capability::Read))
             }
             _ => return false,
+        };
+        let Some(computer) = &self.computer else {
+            return false;
+        };
+        if !computer.grouped() {
+            return false;
+        }
+        let Some(me) = self.profile.as_ref().map(Profile::fingerprint) else {
+            return false;
         };
         match computer.capability(me, &peer) {
             Ok(Some(expected)) => requested != Some(expected),
