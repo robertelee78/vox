@@ -2355,7 +2355,8 @@ final class NodeModel: ObservableObject {
             // and then less often, and its header says why meanwhile. Nothing of the half-read
             // room is published. Every other failure is terminal here, as before: said in the
             // status bar, and the room is not opened again on its own.
-            if case let VoxError.Failed(reason) = error, Self.transientRoomReadRefusal(reason) {
+            if !roomOpened, case let VoxError.Failed(reason) = error,
+               Self.transientRoomReadRefusal(reason) {
                 scheduleRoomOpenRetry(id, reason: sentence(error))
             } else {
                 clearRoomOpenRetry()
@@ -2387,8 +2388,10 @@ final class NodeModel: ObservableObject {
         }
     }
 
+    /// Forget a pending retry. The sleeping Task is not cancelled: a retry that succeeded is
+    /// the Task running this very open, and cancelling it would drop the rest of the open at
+    /// its next cancellation check. A Task still sleeping leaves at its `roomOpened` guard.
     private func clearRoomOpenRetry() {
-        roomOpenRetryTask?.cancel()
         roomOpenRetryTask = nil
         roomOpenRetryDelay = 1
         if roomOpenRetry != nil { roomOpenRetry = nil }
