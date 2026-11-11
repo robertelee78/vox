@@ -266,7 +266,8 @@ impl ChannelState {
         rotation_now: u64,
         force_rotation: bool,
     ) -> Result<PendingText> {
-        self.ensure_local_append_available_for(store, true)?;
+        // A left room takes no post (the decider, 2026-11-11): the leave is not undone by one.
+        self.ensure_local_append_available_for(store, false)?;
         if self.poisoned {
             return Err(self.save_failure());
         }

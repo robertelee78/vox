@@ -1127,10 +1127,24 @@ fn an_admission_reaches_every_member_and_never_outlives_a_leave() {
         panic!("PRODUCT: x joined through the host, and the host's board holds no admission notice of x (#520)");
     };
 
-    // x leaves, as a person does, and stops.
+    // x leaves, as a person does, and stops once the host has its departure: the leave answers
+    // as soon as the departure is written (ADR-023 RL-8.1a), and `vox status` names the room as
+    // leaving until a member has it.
     let (ok, out, err) = vox_in(&x_dir, &["room", "leave", "team"], "");
     assert!(ok, "PRODUCT (staging): x could not leave: {out}{err}");
-    std::thread::sleep(Duration::from_secs(3));
+    let heard_by = Instant::now() + Duration::from_secs(30);
+    loop {
+        let (ok, status, _) = vox_in(&x_dir, &["status", "--json"], "");
+        // Gone: neither held as a room nor leaving.
+        if ok && status.contains("\"leaving\":[]") && !status.contains("\"name\":\"team\"") {
+            break;
+        }
+        assert!(
+            Instant::now() < heard_by,
+            "PRODUCT (staging): the host did not take x's departure within 30 s: {status}"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
     drop(x);
 
     // ---- 2. a replay where the leave is known ---------------------------------------------

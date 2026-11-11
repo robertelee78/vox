@@ -529,10 +529,11 @@ enum RoomCmd {
     /// and joining with it grants nothing. Goes to stdout so it pipes; the
     /// warnings go to stderr so they do not.
     Link(RoomRefArgs),
-    /// Leave a room: the other members are told, then the room is deleted from this node.
+    /// Leave a room: it is gone from this node at once, and the other members are told as
+    /// they are reached.
     ///
-    /// Waits up to 30 s for another member to take the news. If none can be told by then, it
-    /// says so, and the node leaves as soon as one can. Joining again later works.
+    /// Answers as soon as the departure is written. Until a member has it, `vox status` names
+    /// the room as leaving; nothing else shows it. Joining again later works.
     Leave(RoomRefArgs),
     /// End a room for everyone. Only the room's creator, or an admin it named, may.
     ///

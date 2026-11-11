@@ -58,9 +58,20 @@ pub struct ChannelSummary {
     /// person is shown, such as read records (ADR-028 §6). What the room costs this node in
     /// storage and every sync in traffic, which a count of rows does not say.
     pub log_entries: u64,
-    /// Whether the room is over for this node, in plain words (V030-08): this identity left it,
-    /// or it ended. `None` while it is going on, and while it is closed.
+    /// Whether the room is over for this node, in plain words (V030-08): it ended. `None` while
+    /// it is going on, and while it is closed. A room this identity left is not published at
+    /// all ([`NodeView::leaving`]).
     pub over: Option<String>,
+}
+
+/// A room this identity left that this node still holds, hidden, to deliver the departure
+/// (ADR-023 RL-8.1a).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeavingRoom {
+    /// The room.
+    pub channel_id: Digest32,
+    /// Its local name, if it has one.
+    pub name: Option<String>,
 }
 
 /// A rendered, render-gated message.
@@ -826,10 +837,18 @@ pub struct NodeView {
     /// empty when it is not networked or is locked (binding needs the identity).
     /// Public information: it is what an invite link advertises.
     pub listening: Vec<String>,
-    /// Every channel in the profile, in channelID order.
+    /// Every channel in the profile, in channelID order, less the rooms this identity left
+    /// ([`Self::leaving`]).
     pub channels: Vec<ChannelSummary>,
-    /// The open channels' detail, in channelID order.
+    /// The open channels' detail, in channelID order, less the rooms this identity left.
     pub open_channels: Vec<ChannelDetail>,
+    /// Rooms this identity left whose departure no other member has taken yet (ADR-023
+    /// RL-8.1a), in channelID order: held hidden until one has, or for seven days, then
+    /// deleted. Nothing else of them is published; `vox status` names them as leaving.
+    pub leaving: Vec<LeavingRoom>,
+    /// Rooms this node deleted for having ended for everyone (V030-08, #1206), oldest noted
+    /// first, so a person who names one is told why it is gone.
+    pub ended: Vec<crate::node::ended_rooms::EndedRoom>,
     /// The live forwards, in bound-address order (ADR-013 Dial).
     pub forwards: Vec<ForwardInfo>,
     /// The trust keyring: `(fingerprint, petname)` in fingerprint order, empty
@@ -1126,10 +1145,12 @@ pub enum NodeCommand {
         /// The channelID.
         channel_id: Digest32,
     },
-    /// Leave a room (V210-164): say so in the room, and once another member has that, delete
-    /// the room from this node (the decider, 2026-10-03: "leave deletes it"). Answered then, or
-    /// with [`Fault::LeaveNotHeard`] when no member took it within 30 s; the room goes once one
-    /// does.
+    /// Leave a room (V210-164): write the signed departure into the room, and answer once it
+    /// and the room's board withdrawal are durable (the decider, 2026-11-11: "a node should be
+    /// able to leave a room whenever it wants"). The room is gone for the person from then on;
+    /// this node holds it hidden, listed in `vox status` as leaving, until another member has
+    /// the departure, or for seven days, then deletes it (the decider, 2026-10-03: "leave
+    /// deletes it").
     LeaveRoom {
         /// The channelID.
         channel_id: Digest32,
@@ -1672,11 +1693,10 @@ pub enum Fault {
     /// A member holds entries of this node's own feed that this node does not (ADR-037 R5): a
     /// restored older profile. Nothing is written in that room until the person resolves it.
     OwnHistoryBehind,
-    /// A leave was written, but no other member of the room took it within the wait: the room
-    /// is held until one does (V210-164).
-    LeaveNotHeard,
     /// A leave was overtaken: this node wrote in the room after it, or joined it again, so it is
-    /// in the room again (V210-164).
+    /// in the room again (V210-164). Not reachable from a person's post, which a left room
+    /// refuses ([`Fault::RoomLeft`]); the return presence of a rejoin that settles is what
+    /// overtakes it.
     LeaveUndone,
     /// `vox up` was asked for a room that offers no service by name: its host is not fixed by
     /// the room's genesis, so there is no `.vox` name to resolve (ADR-017 decision 4).
@@ -1927,9 +1947,6 @@ impl Fault {
             Fault::OwnHistoryBehind => {
                 "this node's record of its own history in this room is behind what a member holds, as after restoring an older backup; it writes nothing here until that is resolved\n       `vox status --node <name>` names the room; a profile restored from a backup must not write where a newer copy of it already has"
             }
-            Fault::LeaveNotHeard => {
-                "no other member of the room could be told within 30s, so this node still holds it\n       it leaves as soon as one can be told, and the members see it then"
-            }
             Fault::LeaveUndone => {
                 "something was written in the room from this node after the leave, so it is in the room again\n       run `vox room leave` again to leave"
             }
@@ -2117,7 +2134,6 @@ fault_names!(
     AlreadyMember,
     RoomNotSynced,
     OwnHistoryBehind,
-    LeaveNotHeard,
     LeaveUndone,
     NotAServiceRoom,
     NotOffered,

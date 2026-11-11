@@ -309,6 +309,9 @@ pub struct StatusReport {
     pub rooms: Vec<RoomStatus>,
     /// Its rooms still preparing, each with what it waits for (ADR-038 FX-16, #991).
     pub preparing: Vec<PreparingRoom>,
+    /// Rooms this identity left that it holds hidden until another member has the departure,
+    /// or for seven days (ADR-023 RL-8.1a). The one thing said of them.
+    pub leaving: Vec<crate::node::api::LeavingRoom>,
     /// Its live connections.
     pub peers: Vec<PeerStatus>,
     /// How many circuits it carries for others.
@@ -553,6 +556,14 @@ impl StatusReport {
             )
         });
         let _ = write!(j, "\"preparing\":[{}],", list(preparing));
+        let leaving = self.leaving.iter().map(|r| {
+            format!(
+                "{{\"id\":{},\"name\":{}}}",
+                q(&b32_encode(&r.channel_id)),
+                q(r.name.as_deref().unwrap_or_default())
+            )
+        });
+        let _ = write!(j, "\"leaving\":[{}],", list(leaving));
         let refusals = self.refusals.iter().map(|e| {
             serde_json::json!({
                 "at_ms": e.at_ms,

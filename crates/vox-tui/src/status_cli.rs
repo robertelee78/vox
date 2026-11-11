@@ -356,6 +356,18 @@ fn render(v: &Value) -> Result<String, AppError> {
             }
         }
     }
+    // A room this identity left, held only to deliver the departure (ADR-023 RL-8.1a): one
+    // line, and nothing else of it.
+    for r in arr("leaving") {
+        let room = match s(r, "name") {
+            "" => short(s(r, "id")),
+            name => name.to_owned(),
+        };
+        let _ = writeln!(
+            o,
+            "  leaving {room}: no member has been told yet; told when one is reached"
+        );
+    }
     let _ = writeln!(o, "  always-on member: {}", s(v, "always_on_member"));
     let _ = writeln!(o, "\npeers");
     for p in arr("peers") {

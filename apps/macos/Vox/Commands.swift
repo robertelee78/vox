@@ -872,8 +872,9 @@ private struct LeaveSheet: View {
             Text(ending
                 ? "Every member's copy of the room is deleted, and no one can post in it again. "
                     + "Only its creator or an admin can do this."
-                : "This node stops reading and posting here, and the room is deleted here. "
-                    + "The others go on; to come back you need its link and passphrase again.")
+                : "You leave at once: this node stops reading and posting here, and the room is "
+                    + "gone from this list. The other members are told as they are reached, and go "
+                    + "on without you; to come back you need its link and passphrase again.")
             HStack {
                 Button("Cancel") { model.sheet = nil }.keyboardShortcut(.cancelAction)
                 Button(ending ? "End for Everyone" : "Leave", role: .destructive) {

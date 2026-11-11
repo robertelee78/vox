@@ -89,7 +89,8 @@ enum NativeWork {
         paths: crate::node::paths::Paths,
         name: String,
         retirement: Option<RetirementPermit>,
-        ended: bool,
+        /// The room ended for everyone (not left): what this node remembers of its end.
+        ended: Option<Box<crate::node::ended_rooms::EndedRoom>>,
     },
 }
 enum NativeSaved {
@@ -98,6 +99,8 @@ enum NativeSaved {
     ForgottenWithdrawal(crate::error::Result<()>),
     Purge {
         retirement: Option<crate::node::session_ingress::Retirement>,
+        /// The ended-rooms record as written with an ended room's purge.
+        ended: Option<crate::node::ended_rooms::EndedRooms>,
         result: crate::error::Result<()>,
     },
     Failed(Error),
@@ -151,9 +154,11 @@ impl Pending {
             .take();
         match self.after {
             After::Withdrawal { .. } => {
+                // The departure and its withdrawal are durable: the person has left (ADR-023
+                // RL-8.1a); delivery resumes when the room is held again (`resume_leave`).
                 let outcome = match saved {
                     Some(NativeSaved::Withdrawal(Err(error))) => Outcome::Failed(fault_of(&error)),
-                    Some(NativeSaved::Withdrawal(Ok(_))) => Outcome::Failed(Fault::LeaveNotHeard),
+                    Some(NativeSaved::Withdrawal(Ok(_))) => Outcome::Done,
                     _ => Outcome::Failed(Fault::Internal),
                 };
                 if let Some(reply) = self.reply {
@@ -280,6 +285,7 @@ fn native(
         } => {
             paths.remove_room_cursors(&crate::node::link::b32_encode(&room), &name);
             let mut committed_retirement = None;
+            let mut noted = None;
             let result = (|| {
                 let mut batch = store.batch()?;
                 metadata_save::MapChange::Forget(room).queue(store, signer, &mut batch)?;
@@ -298,12 +304,17 @@ fn native(
                     &room,
                     retirement.is_some(),
                 )?;
-                if ended {
+                if let Some(record) = ended {
                     crate::node::channel::erase_own_continuity(
                         &mut batch,
                         &room,
                         &signer.fingerprint(),
                     )?;
+                    // Remembered with the deletion, so the room's name still answers (#1206).
+                    let now = record.noted_ms;
+                    noted = Some(crate::node::ended_rooms::note(
+                        store, &mut batch, signer, *record, now,
+                    )?);
                 }
                 // Purge follows a role receipt (or an alone Leave); release the retained
                 // withdrawal atomically with forgetting the room so restart cannot publish
@@ -335,13 +346,15 @@ fn native(
             })();
             NativeSaved::Purge {
                 retirement: committed_retirement,
+                ended: noted,
                 result,
             }
         }
     }
 }
 
-/// A detached durable departure is not an unsent append, nor a completed leave.
+/// A detached durable departure is not an unsent append; the person has left (ADR-023 RL-8.1a),
+/// and the room goes on leaving when it is held again (`resume_leave`).
 pub(super) fn retire_detached(
     result: crate::error::Result<maintenance_save::Saved>,
     _next: Continuation,
@@ -349,7 +362,7 @@ pub(super) fn retire_detached(
 ) {
     if let Some(reply) = reply {
         let outcome = match result {
-            Ok(maintenance_save::Saved::Leave(_)) => Outcome::Failed(Fault::LeaveNotHeard),
+            Ok(maintenance_save::Saved::Leave(_)) => Outcome::Done,
             Ok(_) => Outcome::Failed(Fault::Internal),
             Err(error) => Outcome::Failed(fault_of(&error)),
         };
@@ -758,6 +771,23 @@ impl Node {
             },
         };
         let name = crate::node::resolver::room_shown(channel.name(), &room);
+        // An ended room is remembered as it goes (#1206): who ended it, and when, by its own
+        // clock; a left room is not — the person chose to forget it.
+        let ended = purpose.is_none().then(|| {
+            let now = self.now_ms().get();
+            let (by, ended_ms) = self
+                .profile
+                .as_ref()
+                .and_then(|profile| channel.end_record(profile.store(), now))
+                .unwrap_or((None, now));
+            Box::new(crate::node::ended_rooms::EndedRoom {
+                channel_id: room,
+                name: channel.name().map(str::to_owned),
+                by,
+                ended_ms,
+                noted_ms: now,
+            })
+        });
         // Preserve the original purge fence before any native writer can admit a publisher.
         self.cancel_own_key_room(room);
         channel.lock_now();
@@ -777,7 +807,7 @@ impl Node {
                 paths: self.paths.clone(),
                 name,
                 retirement,
-                ended: purpose.is_none(),
+                ended,
             },
             After::Purge {
                 transition,
@@ -826,8 +856,9 @@ impl Node {
                     }
                 };
                 if !current || !continuation.attached(self, &room) {
+                    // Durable all the same: the room resumes leaving when held again.
                     if let Some(reply) = pending.reply {
-                        let _ = reply.send(Outcome::Failed(Fault::LeaveNotHeard));
+                        let _ = reply.send(Outcome::Done);
                     }
                     return;
                 }
@@ -860,14 +891,20 @@ impl Node {
                         epoch: departure.epoch,
                     };
                     // Both native workers and their matching actor installs have completed:
-                    // the signed Presence(false), then the durable PendingWithdrawal. Retire
-                    // their physical admission before waiting for a peer. A later purge is a
-                    // new local cleanup under then-current admission, never a replayed leave.
+                    // the signed Presence(false), then the durable PendingWithdrawal. The person
+                    // has left (ADR-023 RL-8.1a): answered now, and the room is held hidden only
+                    // to deliver the departure. Retire their physical admission before waiting
+                    // for a peer. A later purge is a new local cleanup under then-current
+                    // admission, never a replayed leave.
                     drop(continuation);
                     drop(lifetime);
                     drop(_lifetime);
                     drop(_secret);
-                    self.wait_for_leave(room, departure.generation, pending.reply, Some(committed))
+                    if let Some(reply) = pending.reply {
+                        let _ = reply.send(Outcome::Done);
+                    }
+                    let departure_ms = self.now_ms().get();
+                    self.wait_for_leave(room, departure.generation, departure_ms, Some(committed))
                         .await;
                 }
             }
@@ -886,12 +923,19 @@ impl Node {
                     transition,
                     purpose,
                 },
-                NativeSaved::Purge { retirement, result },
+                NativeSaved::Purge {
+                    retirement,
+                    ended,
+                    result,
+                },
             ) => {
                 if let Some(pending) = self.withdrawn.get_mut(&room) {
                     if result.is_ok() {
                         pending.awaiting_departure = false;
                     }
+                }
+                if let Some(ended) = ended {
+                    self.ended_rooms = ended;
                 }
                 if let Some(retirement) = retirement {
                     self.session_rooms_retiring.insert(retirement);
@@ -1020,16 +1064,8 @@ impl Node {
         }
         self.cancel_room_preparation(room, Fault::UnknownChannel);
         self.reopen_failures.remove(room);
-        let (overtaken, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.leave_waiters)
-            .into_iter()
-            .partition(|(r, _, _, _, _)| r == room);
-        self.leave_waiters = waiting;
-        for reply in overtaken
-            .into_iter()
-            .filter_map(|(_, _, reply, _, _)| reply)
-        {
-            let _ = reply.send(Outcome::Failed(Fault::LeaveUndone));
-        }
+        // The room is gone: no departure of it is waited for any more.
+        self.leave_waiters.retain(|waiter| waiter.room != *room);
         self.key_package_rooms.remove(room);
         self.key_package_governance_wait.remove(room);
         self.key_package_unopened.remove(room);

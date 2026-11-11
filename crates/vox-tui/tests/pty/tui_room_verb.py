@@ -60,7 +60,7 @@ CONFIRMS = {
     "end": ("End this room for everyone?", "take no new message in it", "delete it"),
 }
 SAYS = {
-    "leave": ("left the room", "other members see that you left", "no longer holds it"),
+    "leave": ("left the room", "other members see that you left", "no longer lists it"),
     "end": ("ended the room for everyone", "takes no new message in it", "deletes it"),
 }
 

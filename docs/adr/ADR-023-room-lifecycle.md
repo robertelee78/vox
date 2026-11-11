@@ -230,9 +230,26 @@ below remain unchanged.
   chose to retain the minimal non-secret continuity marker specified by RL-8.4 below. That is
   the sole exception to “every stored row”; room content and keys are still erased. The
   marker's technical design requires independent Opus review before implementation.
-- **RL-8.1a.** If no member can be told within 30 s the leave MUST say so (`LeaveNotHeard`), and the
-  node MUST keep the room and go on leaving, across a restart, until one is told. Anything the node
-  writes in the room meanwhile undoes the leave (`LeaveUndone`).
+- **RL-8.1a. Leaving is immediate for the person** (the decider, 2026-11-11: "a node should be
+  able to leave a room whenever it wants"; v0.4.26, #1206). `vox room leave` and the app's Leave
+  MUST answer as soon as the signed departure and the member withdrawal are durable. From then on
+  the room is gone for the person: not in `vox room list`, not in the app's room list, no reads,
+  no posts (a post is refused as `RoomLeft`: "you left this room"), no notifications, no
+  attention items. Delivery of the departure goes on in the background: the node MUST hold the
+  room hidden, and go on leaving across a restart, until a sync session has carried the
+  departure to another member, and MUST then delete it as RL-8.1 says. `vox status` MUST show
+  exactly one line per such room — `leaving <room>: no member has been told yet; told when one
+  is reached` — and nothing else of it. The leave is not undoable from the room: a person's post
+  no longer re-joins it; `LeaveUndone` remains only the name of the race in which a rejoin's
+  return presence overtakes a purge. A join of the room with its link while the departure is
+  undelivered is an ordinary rejoin: what the node holds goes first (RL-8.1b).
+  **Bound.** A departure no member can be told of MUST NOT hold the hidden room for ever: seven
+  days after the departure's own clock, the node deletes the room unheard and publishes its
+  member withdrawal all the same. The members' copies then list this identity until one of them
+  learns otherwise; there is no `vox room forget` (RL-8.3), and this bound is why none is
+  needed. (A room held alone needs no bound: it goes at once, RL-8.1.) `LeaveNotHeard` and the
+  30 s wait that preceded this ruling are removed; the ruling does not touch End, which has no
+  such wait (RL-8.2 answers at once and winds down for 60 s).
 - **RL-8.1b.** A member whose feed ends in its statement that it left MUST be left out of every other
   member's roster, sync and key delivery. Joining again is an ordinary join: once synced, the node
   moves to a sender generation above any its feed shows and says it is back (`here` = true), which
@@ -266,6 +283,13 @@ below remain unchanged.
   Missing or unverifiable evidence keeps the checkpoint: this includes a creator that was
   offline or had left, and boards that restarted and forgot the End. There is no unsigned
   erase, permanent end-evidence ledger or promise of tombstone survival across restart.
+- **RL-8.2a. An ended room's name still answers** (v0.4.26, #1206). A node that deleted a room
+  for having ended MUST keep a short local note of it — the room, its name, who ended it (or
+  that its idle end ran out) and when — sealed under the identity like the keyring, bounded to
+  the last 64 rooms and 30 days, so a `vox room` verb that names it says `room <name> was ended
+  for everyone by <who> at <time>` rather than `nothing here matches`. The note is a courtesy to
+  the person, not evidence: it confers no standing, is not the end-evidence ledger RL-8.2
+  forbids, and an unreadable note is ignored. The app's room list MAY drop the room as today.
 - **RL-8.3.** There MUST NOT be a `vox room forget`: leaving and ending are the only ways a room
   leaves a node.
 

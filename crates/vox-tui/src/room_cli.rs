@@ -137,6 +137,9 @@ fn held_since(since_secs: u64) -> String {
 pub(crate) async fn room_of(client: &mut IpcClient, prefix: &str) -> Result<Digest32, AppError> {
     let rooms = rooms_of(client).await?;
     if rooms.is_empty() {
+        if let Some(ended) = ended_room_said(client, prefix).await {
+            return Err(ended);
+        }
         return Err(AppError::Usage(
             "this node holds no rooms yet — join or create one first".into(),
         ));
@@ -148,7 +151,11 @@ pub(crate) async fn room_of(client: &mut IpcClient, prefix: &str) -> Result<Dige
         .map(|(id, ..)| *id)
         .collect();
     let id = match named.as_slice() {
-        [] => resolve_prefix(prefix, &ids)?,
+        [] => match resolve_prefix(prefix, &ids) {
+            Ok(id) => id,
+            // Not a typo: a room this node deleted because it ended says so (V030-08, #1206).
+            Err(error) => return Err(ended_room_said(client, prefix).await.unwrap_or(error)),
+        },
         [one] => *one,
         // Two rooms of one name (ADR-028 R-3): neither is meant more than the other.
         many => {
@@ -184,6 +191,41 @@ pub(crate) async fn room_of(client: &mut IpcClient, prefix: &str) -> Result<Dige
         return Err(room_closed(&id, &name));
     }
     Ok(id)
+}
+
+/// What a verb says of a room this node deleted for having ended for everyone (V030-08, #1206),
+/// when `prefix` names one — its name whole, or a prefix of its id — rather than
+/// `nothing here matches`, which is what a typo says. The node remembers such rooms for a
+/// while ([`vox_core::node::ended_rooms`]); past that, the name is a stranger again.
+async fn ended_room_said(client: &mut IpcClient, prefix: &str) -> Option<AppError> {
+    let rooms = match client.request(&Request::EndedRooms).await {
+        Ok(Frame::EndedRooms { rooms }) => rooms,
+        _ => return None,
+    };
+    let wanted = prefix.trim().to_ascii_lowercase();
+    if wanted.is_empty() {
+        return None;
+    }
+    // The newest note wins when a name was reused.
+    let room = rooms.iter().rev().find(|room| {
+        room.name
+            .as_deref()
+            .is_some_and(|name| name.eq_ignore_ascii_case(&wanted))
+            || b32_encode(&room.channel_id).starts_with(&wanted)
+    })?;
+    let which = match room.name.as_deref() {
+        Some(name) => format!("room {name:?} ({})", b32_encode(&room.channel_id)),
+        None => format!("room {}", b32_encode(&room.channel_id)),
+    };
+    let by = match room.by {
+        Some(by) => format!("by {}", crate::ident::name_of(&by)),
+        None => "by the idle end its creator chose".to_owned(),
+    };
+    Some(AppError::Usage(format!(
+        "{which} was ended for everyone {by} at {}; this node passed the end on and deleted it, \
+         so there is nothing to read or post",
+        held_since(room.ended_ms / 1_000)
+    )))
 }
 
 /// What every verb says of a room the node holds closed, with a daemon or without one
@@ -5717,9 +5759,9 @@ pub async fn join(
         Ok(parsed) => rooms_of(&mut client)
             .await?
             .into_iter()
-            // A room this identity left is not: it is joined again, with its passphrase, from
-            // scratch (V030-08).
-            .find(|(id, _, open, over, ..)| *id == parsed.channel_id && *open && over != "left")
+            // A room this identity left is not listed at all (ADR-023 RL-8.1a): it is joined
+            // again, with its passphrase, from scratch (V030-08).
+            .find(|(id, _, open, ..)| *id == parsed.channel_id && *open)
             .map(|(id, name, ..)| {
                 if name.is_empty() {
                     b32_encode(&id)
@@ -6653,7 +6695,8 @@ async fn offered_in(client: &mut IpcClient, channel_id: Digest32) -> Vec<String>
 }
 
 /// Whether `tag` is a shared file's service tag, exactly as `shares.rs` forms it:
-/// `file-<16 hex of the SHA-256>-<hex nonce>`. A service a person named `file-…` is not one.
+/// `file-<16 lowercase hex of the SHA-256>-<16 lowercase hex of an 8-byte nonce>`. A service a
+/// person named `file-…` is not one.
 fn is_share_tag(tag: &str) -> bool {
     let Some((sha, nonce)) = tag
         .strip_prefix("file-")
@@ -6661,8 +6704,12 @@ fn is_share_tag(tag: &str) -> bool {
     else {
         return false;
     };
-    let hex = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit());
-    sha.len() == 16 && hex(sha) && hex(nonce)
+    let hex16 = |s: &str| {
+        s.len() == 16
+            && s.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    };
+    hex16(sha) && hex16(nonce)
 }
 
 /// The services this node offers in each of `rooms`: "22 in "team"".
@@ -7245,17 +7292,18 @@ pub fn print_identity(
     Ok(())
 }
 
-/// `vox room leave` — leave a room (V210-164; the decider, 2026-10-03: "leave deletes it").
+/// `vox room leave` — leave a room (V210-164; the decider, 2026-10-03: "leave deletes it";
+/// 2026-11-11: "a node should be able to leave a room whenever it wants").
 ///
-/// The node writes its departure into the room and answers once another member has it; then
-/// the room is gone from this node, and so are the read cursors agent sessions kept for it here
-/// (the node deletes those with the room).
-/// The other members stop listing this identity in the room's roster. Joining again later is an
-/// ordinary join.
+/// The node writes its departure into the room and answers once it is durable: the room is
+/// gone from this node's list from then on, and so are the read cursors agent sessions kept
+/// for it here (the node deletes those with the room). The other members are told as they are
+/// reached — the node holds the room hidden for that, named only by `vox status` as leaving —
+/// and stop listing this identity in the room's roster. Joining again later is an ordinary
+/// join.
 ///
 /// # Errors
-/// If the node cannot be reached, the room is unknown or closed, or no other member could be
-/// told in time (the node then leaves as soon as one can be).
+/// If the node cannot be reached, or the room is unknown or closed.
 pub async fn leave(paths: &Paths, room: &str) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
     let (channel_id, pending_only) = match room_of(&mut client, room).await {
@@ -7280,7 +7328,8 @@ pub async fn leave(paths: &Paths, room: &str) -> Result<(), AppError> {
     let services = offered_in(&mut client, channel_id).await;
     println!(
         "vox: about to leave {which}, or cancel its retained pending admission: this node will \
-         delete the local room and queue its own member withdrawal"
+         delete the local room, tell its members as they are reached and queue its own member \
+         withdrawal"
     );
     if !services.is_empty() {
         println!(
@@ -7293,7 +7342,10 @@ pub async fn leave(paths: &Paths, room: &str) -> Result<(), AppError> {
             if pending_only {
                 println!("vox: cancelled the pending admission for {which}; its member withdrawal is queued");
             } else {
-                println!("vox: left {which} or cancelled its pending admission; its member withdrawal is queued");
+                println!(
+                    "vox: left {which}; members are told as they are reached, and its member \
+                     withdrawal is queued"
+                );
             }
             if !services.is_empty() {
                 println!(

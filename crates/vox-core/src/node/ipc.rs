@@ -394,6 +394,10 @@ const T_SHARE_STOP: u64 = 4931;
 const T_SHARE_LIST: u64 = 4932;
 /// [`Frame::Shares`].
 const T_SHARES: u64 = 4933;
+// The rooms a node deleted for having ended (V030-08, #1206). Additive.
+const T_ENDED_ROOMS_REQ: u64 = 5206;
+/// [`Frame::EndedRooms`].
+const T_ENDED_ROOMS: u64 = 5207;
 // Session entries, sealed to members with drive (ADR-029 SC-1, SC-2). Additive.
 /// `[5430, channel_id, session_id, body]` — [`Request::AppendSession`].
 const T_SESSION_APPEND: u64 = 5430;
@@ -822,6 +826,9 @@ pub enum Request {
         /// The room.
         channel_id: Digest32,
     },
+    /// The rooms this node deleted for having ended for everyone (V030-08, #1206), answered
+    /// with [`Frame::EndedRooms`]: what a verb says of a room name that no longer resolves.
+    EndedRooms,
     /// Append one entry of a Session (ADR-029 SC-1), sealed under this node's drive key so only
     /// members it trusts with drive read it (SC-2). The session's hook sends it; it never shows in
     /// the room's timeline (SC-4).
@@ -1803,6 +1810,9 @@ impl Request {
             }
             Request::ShareList { channel_id } => {
                 e.array(2).uint(T_SHARE_LIST).bytes(channel_id);
+            }
+            Request::EndedRooms => {
+                e.array(1).uint(T_ENDED_ROOMS_REQ);
             }
             Request::OmpMedia {
                 channel_id,
@@ -2812,6 +2822,11 @@ impl Request {
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::ShareList { channel_id })
             }
+            (T_ENDED_ROOMS_REQ, 1) => {
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::EndedRooms)
+            }
             (T_SESSION_APPEND, 4) => {
                 let channel_id = digest(&mut d)?;
                 let session_id = text(&mut d, "ipc session id")?;
@@ -3523,7 +3538,8 @@ pub enum Frame {
     /// The rooms a [`Request::Rooms`] asked for.
     Rooms {
         /// `(channel_id, local name, open, over)` per room; `over` says, in plain words, that
-        /// this identity left the room or it ended (V030-08), and is empty while it goes on.
+        /// the room ended (V030-08), and is empty while it goes on. A room this identity left
+        /// is not listed (ADR-023 RL-8.1a).
         rooms: Vec<RoomRow>,
     },
     /// The services a [`Request::Services`] asked for: the room's local name, and
@@ -3545,6 +3561,12 @@ pub enum Frame {
     Shares {
         /// Each share.
         shares: Vec<crate::node::shares::ShareRow>,
+    },
+    /// The rooms this node deleted for having ended (V030-08, #1206), as a
+    /// [`Request::EndedRooms`] asked for: oldest noted first.
+    EndedRooms {
+        /// Each ended room.
+        rooms: Vec<crate::node::ended_rooms::EndedRoom>,
     },
     /// The exact entry appended by [`Request::AppendSession`] or [`Request::RenameRoom`].
     Appended {
@@ -3997,6 +4019,17 @@ impl Frame {
                         .text(&r.entry)
                         .uint(r.fetched)
                         .uint(r.files);
+                }
+            }
+            Frame::EndedRooms { rooms } => {
+                e.array(2).uint(T_ENDED_ROOMS).array(rooms.len());
+                for r in rooms {
+                    e.array(5)
+                        .bytes(&r.channel_id)
+                        .text(r.name.as_deref().unwrap_or_default())
+                        .bytes(r.by.as_ref().map_or(&[][..], |by| &by[..]))
+                        .uint(r.ended_ms)
+                        .uint(r.noted_ms);
                 }
             }
             Frame::OmpMedia { bytes, cursor } => {
@@ -5212,6 +5245,50 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 });
             }
             return Ok(Frame::Shares { shares });
+        }
+        (T_ENDED_ROOMS, 2) => {
+            let count = d
+                .array()
+                .map_err(|_| Error::MalformedIpc("ipc ended rooms array"))?;
+            if count > crate::node::ended_rooms::KEPT {
+                return Err(Error::MalformedIpc("ipc ended rooms count"));
+            }
+            let mut rooms = Vec::with_capacity(count);
+            for _ in 0..count {
+                if d.array()
+                    .map_err(|_| Error::MalformedIpc("ipc ended room"))?
+                    != 5
+                {
+                    return Err(Error::MalformedIpc("ipc ended room arity"));
+                }
+                let channel_id = digest(d)?;
+                let name = text(d, "ipc ended room name")?;
+                let by = d
+                    .bytes()
+                    .map_err(|_| Error::MalformedIpc("ipc ended room by"))?;
+                let by = if by.is_empty() {
+                    None
+                } else {
+                    Some(
+                        Digest32::try_from(by)
+                            .map_err(|_| Error::MalformedIpc("ipc ended room by length"))?,
+                    )
+                };
+                let ended_ms = d
+                    .uint()
+                    .map_err(|_| Error::MalformedIpc("ipc ended room ended"))?;
+                let noted_ms = d
+                    .uint()
+                    .map_err(|_| Error::MalformedIpc("ipc ended room noted"))?;
+                rooms.push(crate::node::ended_rooms::EndedRoom {
+                    channel_id,
+                    name: (!name.is_empty()).then_some(name),
+                    by,
+                    ended_ms,
+                    noted_ms,
+                });
+            }
+            return Ok(Frame::EndedRooms { rooms });
         }
         (T_OMP_MEDIA, 3) => {
             let bytes = d.bytes()?.to_vec();
@@ -8839,6 +8916,9 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         },
         Request::ShareList { channel_id } => Frame::Shares {
             shares: handle.shares().list(&channel_id).await,
+        },
+        Request::EndedRooms => Frame::EndedRooms {
+            rooms: handle.view().ended,
         },
         Request::AppendSession {
             channel_id,
