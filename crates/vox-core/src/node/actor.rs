@@ -10956,8 +10956,9 @@ impl Node {
     ///
     /// A locked room still defers the whole rebuild. A room whose removal view cannot be read
     /// (its governance fold is refreshing) cannot prevent other rooms' policy from being
-    /// refreshed: its members keep the stream class the last completed fold gave them, its
-    /// applied exclusions stay excluded, and the tick retries the failed room (#1206).
+    /// refreshed: its members keep the stream admission the last completed fold gave them, as
+    /// `PeerClass::Admitted` — opened streams, no relay or punch — its applied exclusions stay
+    /// excluded, and the tick retries the failed room (#1206).
     async fn refresh_network_view(&mut self) {
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return;
@@ -11033,15 +11034,18 @@ impl Node {
                     incomplete = true;
                     // The checked view is unreadable — most often because the room's governance
                     // fold is re-running after a governance row arrived or at startup (#1206).
-                    // The stream admission class stays what the room last proved: its roster
-                    // minus the members that left and minus the exclusions already applied
-                    // (`CurrentRemoved`, written only by a completed fold). Dropping the whole
-                    // roster here classed every member `Unknown` for as long as the fold ran,
-                    // and every sync in both directions was refused as `authenticator invalid`.
-                    // This is only who may *open* a stream; what a stream may carry — content,
-                    // keys, Session bodies — is gated by the fold's own proof
-                    // (`require_governance_ready`) and by the per-entry removal checks, which
-                    // keep failing closed while the view is refreshing.
+                    // Stream admission stays what the room last proved: its roster minus the
+                    // members that left and minus the exclusions already applied
+                    // (`CurrentRemoved`, written only by a completed fold), as
+                    // `PeerClass::Admitted`. Dropping the whole roster here classed every member
+                    // `Unknown` for as long as the fold ran, and every sync in both directions
+                    // was refused as `authenticator invalid`. This is only who may *open* a
+                    // stream; what a stream may carry — content, keys, Session bodies — is gated
+                    // by the fold's own proof (`require_governance_ready`) and by the per-entry
+                    // removal checks, which keep failing closed while the view is refreshing.
+                    // And it is not the member class: this node relays and answers punches for
+                    // a member, which would hand a removal the fold has not applied yet this
+                    // node's endpoints and a session to any other member (`relays_for`).
                     let before = ch.removal_generation(&store);
                     let mut members = ch.author_map();
                     let mut removed = BTreeSet::new();
@@ -11056,7 +11060,7 @@ impl Node {
                         }
                     }
                     members.retain(|peer, _| !ch.has_left(peer) && !removed.contains(peer));
-                    policy.add_members(members.keys().copied());
+                    policy.add_admitted(members.keys().copied());
                     for left in ch
                         .author_fingerprints()
                         .into_iter()

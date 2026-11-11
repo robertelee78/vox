@@ -182,11 +182,14 @@ governance row's arrival re-runs it before the fold has settled, and so does sta
 contributed no members and treated a `peer_removal_applied` error as removed. Every member of
 that room was classed `Unknown` until the fold settled and the next tick rebuilt the view, and
 both directions of its sync were refused as `authenticator invalid`; a member of no other room
-on that node lost every stream. Now such a room keeps the class its last completed fold gave:
+on that node lost every stream. Now such a room keeps what its last completed fold gave —
 roster minus departed minus the exclusions already applied (`CurrentRemoved`, written only by
-a completed fold). This is only who may open a stream; what a stream may carry is gated by
-R3's fold proof and the per-entry removal checks, which keep failing closed while the view
-refreshes, so no removed member gains anything governance gates.
+a completed fold) — as `PeerClass::Admitted`: it opens the streams a member opens, and this
+node relays and answers punches for it no more than for an unknown peer (`relays_for`), so a
+removal the fold has not applied yet learns no endpoint and reaches no member through this
+node. What a stream may carry is gated by R3's fold proof and the per-entry removal checks,
+which keep failing closed while the view refreshes, so no removed member gains anything
+governance gates.
 
 ### R5. Own-authored state is the author's durable fact
 

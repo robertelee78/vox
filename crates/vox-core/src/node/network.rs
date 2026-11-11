@@ -1075,16 +1075,7 @@ impl NodeNet {
         // replacement between two reads must not let an older Member class authorize a stream
         // after the actor has retired it. The board remains the fallback only when this snapshot
         // has no actor-owned answer, exactly as in `classify`.
-        let policy_class = policy.classify(&peer);
-        let class = if policy_class != PeerClass::Unknown {
-            policy_class
-        } else if self.peer_is_member_on_board(&peer) {
-            PeerClass::Member
-        } else if self.peer_has_prejoin(&peer) {
-            PeerClass::PendingJoiner
-        } else {
-            PeerClass::Unknown
-        };
+        let class = self.classify_on(&policy, &peer);
         if !(PeerPolicy::allows(class, kind)
             || policy.allows_peer(&peer, kind)
             || kind == StreamKind::Circuit && self.service.computer_transport_peer(&peer))
@@ -1128,14 +1119,25 @@ impl NodeNet {
     /// the actor being told about every PUT; an identity with no record stays
     /// `Unknown`, so it reaches the board and `WHOAMI`; a separately redeemed computer
     /// capability permits only its exact pair's coord/circuit transport, without reclassification.
+    ///
+    /// A member the policy kept from a refreshing room's last completed fold
+    /// ([`PeerClass::Admitted`], #1206) is a member when the board's records say so — that is
+    /// what classed it before the fold ran — and otherwise stays admitted: a live pre-join
+    /// would class it a joiner, which opens fewer streams than the room it is in grants.
     #[must_use]
     pub fn classify(&self, peer: &Digest32) -> PeerClass {
-        let class = self.policy.snapshot().classify(peer);
-        if class != PeerClass::Unknown {
+        self.classify_on(&self.policy.snapshot(), peer)
+    }
+
+    fn classify_on(&self, policy: &PeerPolicy, peer: &Digest32) -> PeerClass {
+        let class = policy.classify(peer);
+        if !matches!(class, PeerClass::Unknown | PeerClass::Admitted) {
             return class;
         }
         if self.peer_is_member_on_board(peer) {
             PeerClass::Member
+        } else if class == PeerClass::Admitted {
+            class
         } else if self.peer_has_prejoin(peer) {
             PeerClass::PendingJoiner
         } else {

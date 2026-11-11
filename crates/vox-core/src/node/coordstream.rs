@@ -34,7 +34,10 @@
 //! that has a publicly reachable member, which is the dependency this ADR exists to
 //! remove — and a joiner already holds a far more expensive capability, the PoW-gated
 //! join stream. An *unknown* peer gets `WHOAMI` and, from an explicitly served anchor only,
-//! its own `ENDPOINTS`. Neither grants relay or room access.
+//! its own `ENDPOINTS`. Neither grants relay or room access. A member kept from a room's last
+//! completed fold while its governance fold refreshes (`PeerClass::Admitted`, #1206) is
+//! treated here exactly like an unknown peer: a removal the fold has not applied yet must
+//! not have this node carry a session to a member, or answer a punch with its own endpoints.
 //!
 //! One more rule, for the joining case: a session relayed **by this node's own
 //! anchor** is accepted whoever the far peer is. The anchor already applied its own
@@ -431,7 +434,7 @@ where
 }
 
 /// Whether this node will relay signaling for a peer of `class` — see the module docs
-/// for why a pending joiner counts and an unknown peer does not.
+/// for why a pending joiner counts and an unknown or merely admitted peer does not.
 #[must_use]
 pub(crate) fn relays_for(class: PeerClass) -> bool {
     matches!(
