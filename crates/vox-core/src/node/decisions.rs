@@ -601,9 +601,14 @@ impl DecisionLog {
             let events = if sealed {
                 match Self::read_day_for_local_trust(&key, day, &bytes) {
                     Ok(events) => events,
-                    // Sealed under a key this identity does not have: set aside, said, and the
-                    // other days still count. A torn or malformed day stays the error it is.
-                    Err(why @ Error::AtRestUnlockFailed) => {
+                    // Sealed under a key this identity does not have — none of its records
+                    // open — it is set aside, said, and the other days still count. A day of
+                    // which any record opens stays the error it is (a mixed-key day, a damaged
+                    // or tampered record): a removal it holds must not be dropped by setting
+                    // the day aside, so automation stays off, as before.
+                    Err(why @ Error::AtRestUnlockFailed)
+                        if Self::read_day(&key, day, &bytes).is_empty() =>
+                    {
                         self.set_aside_unreadable(&entry.path(), day, &why);
                         continue;
                     }
