@@ -91,6 +91,10 @@ The existing journey drives `install.sh`, the physically installed helpers, an o
 retirement and replacement, identifier launches, two version-changing offline rollbacks, and
 real interruption immediately after exchange followed by offline source restoration. Its
 consumer assertions require the saved message and Ready remembered node after each transition.
+The `stopped-app` case wedges the open app (SIGSTOP: a hung main thread answers no quit
+request) before `vox update`, and requires the update to complete, to say `Vox.app did not
+quit on request; it was stopped`, and to leave one running replacement; the ordinary case
+requires `Vox.app quit on request` (the decider, 2026-11-11: `vox update` always updates).
 The interrupted case also substitutes a separately copied, still-signed bundle and requires
 the installed updater to refuse it. It then restores the original object, preserves the
 original journal bytes, perturbs its two diagnostic device fields in scratch, and requires
