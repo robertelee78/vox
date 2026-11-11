@@ -105,6 +105,11 @@ pub(crate) enum Query {
     Count {
         since: Option<Digest32>,
     },
+    /// The room's readable position as it stood at a pinned arrival: how many rows had
+    /// arrived by `through`, and the newest of them. Answered as [`Reply::Count`].
+    Position {
+        through: HistoryCursor,
+    },
     Locate {
         entries: Vec<Digest32>,
     },
@@ -263,6 +268,7 @@ impl View<'_> {
         if matches!(
             &query,
             Query::Count { .. }
+                | Query::Position { .. }
                 | Query::Older { .. }
                 | Query::ViewPage { .. }
                 | Query::Agreement { .. }
@@ -845,6 +851,7 @@ impl View<'_> {
                     self.ch.effective_retention(),
                     self.ch.effective_step_retention(),
                     self.ch.classification_revision,
+                    self.ch.display_removals,
                 ],
             },
             now_ms: self.ch.now_hint,
@@ -1672,6 +1679,17 @@ impl View<'_> {
                     Some(mark) => self.rendered.after_arrival(mark)?,
                     None => self.count_before(None)?,
                 };
+                Ok(Reply::Count { n, last })
+            }
+            Query::Position { through } => {
+                self.view_instance(through.instance)?;
+                let last = self
+                    .rendered
+                    .step(None, false, Some((through.arrival, [u8::MAX; 32])), true)?
+                    .map(|((_, hash), _)| hash);
+                let n = self
+                    .count_before(None)?
+                    .saturating_sub(self.rendered.after_arrival(through.arrival)?);
                 Ok(Reply::Count { n, last })
             }
             Query::UnreadSummary => {

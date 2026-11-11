@@ -301,7 +301,12 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     mark!("room ready");
 
     // ---- the fold half: a contested claim, a completed handoff, a lapse ----
-    let o = alice.vox(Some("a1"), &["room", "claim", &r, "contested"]);
+    let o = alice.vox_env(
+        None,
+        &[("PI_SESSION_ID", "")],
+        &["room", "claim", &r, "contested", "--session", "a1"],
+        None,
+    );
     assert!(
         o.ok,
         "PRODUCT: alice's claim of a free resource was refused: {o:?}"
@@ -313,20 +318,41 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
         &["room", "board", &r, "--json"],
         |o: &Out| o.ok && support::resource(&o.json(), "contested").is_some(),
     );
-    let o = bob.vox(Some("b1"), &["room", "claim", &r, "contested"]);
+    let o = bob.vox_env(
+        None,
+        &[("PI_SESSION_ID", "")],
+        &["room", "claim", &r, "contested", "--session", "b1"],
+        None,
+    );
     assert_eq!(
         o.code,
         Some(1),
         "PRODUCT: bob's claim of a resource alice holds did not exit 1: {o:?}"
     );
-    let o = alice.vox(Some("a1"), &["room", "claim", &r, "passed"]);
+    let o = alice.vox_env(
+        None,
+        &[("PI_SESSION_ID", "")],
+        &["room", "claim", &r, "passed", "--session", "a1"],
+        None,
+    );
     assert!(
         o.ok,
         "PRODUCT: alice's claim of a free resource was refused: {o:?}"
     );
-    let o = alice.vox(
-        Some("a1"),
-        &["room", "handoff", &r, "passed", "--to", &bob.b32()[..16]],
+    let o = alice.vox_env(
+        None,
+        &[("PI_SESSION_ID", "")],
+        &[
+            "room",
+            "handoff",
+            &r,
+            "passed",
+            "--to",
+            &bob.b32()[..16],
+            "--session",
+            "a1",
+        ],
+        None,
     );
     assert!(o.ok, "PRODUCT: alice's handoff to bob was refused: {o:?}");
     until(
@@ -338,12 +364,31 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
             o.ok && support::resource(&o.json(), "passed").is_some_and(|x| x["state"] == "pending")
         },
     );
-    let o = bob.vox(Some("b1"), &["room", "claim", &r, "passed"]);
+    let o = bob.vox_env(
+        None,
+        &[("PI_SESSION_ID", "")],
+        &["room", "claim", &r, "passed", "--session", "b1"],
+        None,
+    );
     assert!(
         o.ok,
         "PRODUCT: bob could not take the resource handed to him: {o:?}"
     );
-    let o = bob.vox(Some("b1"), &["room", "claim", &r, "lapsed", "--ttl", "1"]);
+    let o = bob.vox_env(
+        None,
+        &[("PI_SESSION_ID", "")],
+        &[
+            "room",
+            "claim",
+            &r,
+            "lapsed",
+            "--ttl",
+            "1",
+            "--session",
+            "b1",
+        ],
+        None,
+    );
     assert!(
         o.ok,
         "PRODUCT: bob's claim of a free resource was refused: {o:?}"

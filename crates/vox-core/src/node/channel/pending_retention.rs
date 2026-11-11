@@ -591,7 +591,7 @@ impl ChannelState {
             }
         }
         if display_changed {
-            self.invalidate_display();
+            self.remove_display_rows();
             match self
                 .entries
                 .render_view(store, &self.sek, &self.channel_id)

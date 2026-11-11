@@ -265,8 +265,8 @@ fn two_agents_split_work_and_only_one_holds_a_contested_resource() {
 /// (6): bob reads a board that needs several pages while the room keeps posting: alice from
 /// her node and a second session of bob's from his, each a post every quarter second.
 /// Staging: alice holds `BUSY_ITEMS` resources (more than one page holds). Busy is measured,
-/// not assumed: the room's `position.entries` must have advanced between bob's reads, else
-/// nothing about reading under traffic was tested.
+/// not assumed: one of bob-2's posts must have landed on bob's node while one of bob's reads
+/// was between its first and last page, else nothing about reading across arrivals was tested.
 fn busy_room_reads_whole_board(alice: &Worker, bob: &Worker, room: &str) {
     use std::sync::atomic::{AtomicBool, Ordering};
     const BUSY_ITEMS: usize = 70;
@@ -306,41 +306,61 @@ fn busy_room_reads_whole_board(alice: &Worker, bob: &Worker, room: &str) {
         |o| o.ok && held(o) == BUSY_ITEMS,
     );
     let stop = AtomicBool::new(false);
+    // When each of bob-2's posts was on bob's node: a local post returns once it is saved and
+    // rendered there, so its completion is an arrival on the node bob reads from.
+    let landed: std::sync::Mutex<Vec<std::time::Instant>> = std::sync::Mutex::new(Vec::new());
     std::thread::scope(|s| {
-        let stop = &stop;
+        let (stop, landed) = (&stop, &landed);
         for (w, session) in [(alice, "alice"), (bob, "bob-2")] {
             s.spawn(move || {
                 let mut n = 0u32;
                 while !stop.load(Ordering::Relaxed) {
                     n += 1;
                     let body = format!("busy chatter {session} {n}");
-                    as_session(w, session, &["room", "post", room, &body]);
+                    let o = as_session(w, session, &["room", "post", room, &body]);
+                    if o.ok && session == "bob-2" {
+                        landed.lock().unwrap().push(std::time::Instant::now());
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(250));
                 }
             });
         }
-        // Alice's posts reach bob through sync, in batches: read until at least READS boards
-        // were read and bob's entry count moved under them, so traffic between pages was real.
-        // The poster is stopped before any red, or the scope would wait on it forever.
+        // Busy is measured inside one read: at least one of bob-2's posts must have landed
+        // while a `vox room board` was between its first page and its last (strictly inside
+        // the read, MARGIN clear of its start and end), else nothing about reading across
+        // arrivals was tested. Reads continue until that is seen, or the deadline names it.
+        // The posters are stopped before any red, or the scope would wait on them forever.
+        const MARGIN: std::time::Duration = std::time::Duration::from_millis(40);
         let deadline = std::time::Instant::now() + support::TIMEOUT;
-        let mut entries: Vec<u64> = Vec::with_capacity(READS);
+        let mut reads: Vec<(std::time::Instant, std::time::Instant, u64)> = Vec::new();
+        let crossed = |reads: &[(std::time::Instant, std::time::Instant, u64)]| {
+            let landed = landed.lock().unwrap();
+            reads.iter().position(|(start, end, _)| {
+                landed
+                    .iter()
+                    .any(|t| *t >= *start + MARGIN && *t + MARGIN <= *end)
+            })
+        };
         let verdict = loop {
-            if entries.len() >= READS && entries.last() > entries.first() {
+            if reads.len() >= READS && crossed(&reads).is_some() {
                 break Ok(());
             }
             if std::time::Instant::now() >= deadline {
                 break Err(format!(
-                    "APPARATUS, CANNOT MEASURE: in {}s the room's entry count never advanced \
-                     across bob's {} reads ({entries:?}); reading under traffic was not exercised",
+                    "APPARATUS, CANNOT MEASURE: in {}s none of bob-2's {} posts landed inside \
+                     one of bob's {} board reads; reading across arrivals was not exercised",
                     support::TIMEOUT.as_secs(),
-                    entries.len()
+                    landed.lock().unwrap().len(),
+                    reads.len()
                 ));
             }
-            let i = entries.len();
+            let i = reads.len();
+            let start = std::time::Instant::now();
             let o = as_session(bob, "bob", &["room", "board", room, "--json"]);
+            let end = std::time::Instant::now();
             if !o.ok {
                 break Err(format!(
-                    "PRODUCT: read {i} of a {BUSY_ITEMS}-claim board while alice kept posting \
+                    "PRODUCT: read {i} of a {BUSY_ITEMS}-claim board while the room kept posting \
                      failed (exit {:?}): {}",
                     o.code,
                     o.stderr.trim()
@@ -349,22 +369,28 @@ fn busy_room_reads_whole_board(alice: &Worker, bob: &Worker, room: &str) {
             let seen = held(&o);
             if seen != BUSY_ITEMS {
                 break Err(format!(
-                    "PRODUCT: read {i} of the board while alice kept posting returned {seen} of \
-                     alice's {BUSY_ITEMS} held resources: {o:?}"
+                    "PRODUCT: read {i} of the board while the room kept posting returned {seen} \
+                     of alice's {BUSY_ITEMS} held resources: {o:?}"
                 ));
             }
-            entries.push(o.json()["position"]["entries"].as_u64().unwrap_or(0));
+            reads.push((
+                start,
+                end,
+                o.json()["position"]["entries"].as_u64().unwrap_or(0),
+            ));
         };
         stop.store(true, Ordering::Relaxed);
         if let Err(red) = verdict {
             panic!("{red}");
         }
+        let inside = crossed(&reads).unwrap_or(0);
         println!(
-            "[proof] {} whole {BUSY_ITEMS}-claim boards read while the room posted; entries \
-             advanced {} -> {}",
-            entries.len(),
-            entries[0],
-            entries[entries.len() - 1]
+            "[proof] {} whole {BUSY_ITEMS}-claim boards read while the room posted; read {inside} \
+             ({:?}) had a post land between its pages; entries {} -> {}",
+            reads.len(),
+            reads[inside].1 - reads[inside].0,
+            reads[0].2,
+            reads[reads.len() - 1].2
         );
     });
 }
