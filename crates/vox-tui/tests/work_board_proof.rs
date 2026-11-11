@@ -34,6 +34,10 @@
 //! 4. **A release frees it**, and only the owner's release counts.
 //! 5. **A lapsed `--ttl` frees it with nobody acting** — the property that stops a
 //!    dead agent holding a resource forever.
+//! 6. **A board of several pages reads whole while the room keeps posting.** Every page
+//!    of one `vox room board` folds the same pinned snapshot, so other agents' posts
+//!    between pages do not turn the reader away (v0.4.26 on a busy room: every attempt
+//!    ended in "the room's work board changed while reading").
 //!
 //! Real wall-clock time is used rather than a fixed test clock, because `--ttl`
 //! expiry is compared against the *client's* clock and a node pinned to a fixed
@@ -65,9 +69,18 @@ mod watchdog;
 
 use support::{until, Worker};
 
+/// `vox …` as `session` of this worker. The session is said as a person's own `--session`,
+/// with no inherited harness mark: a harness mark names a registered Session, and no proof
+/// worker registers one.
+fn as_session(w: &Worker, session: &str, args: &[&str]) -> support::Out {
+    let mut args = args.to_vec();
+    args.extend(["--session", session]);
+    w.vox_env(None, &[("PI_SESSION_ID", "")], &args, None)
+}
+
 /// `vox …` as this agent's one session, returning (ok, stdout, stderr).
 fn vox(w: &Worker, args: &[&str]) -> (bool, String, String) {
-    let o = w.vox(Some(&w.name), args);
+    let o = as_session(w, &w.name, args);
     (o.ok, o.stdout, o.stderr)
 }
 
@@ -109,10 +122,10 @@ fn two_agents_split_work_and_only_one_holds_a_contested_resource() {
     // Bob must see alice's claim before his own can lose to it.
     until(
         bob,
-        Some("bob"),
+        None,
         "alice's claim to reach bob",
-        &["room", "board", &room],
-        |o| o.stdout.contains("port-the-codec"),
+        &["room", "board", &room, "--session", "bob"],
+        |o| o.ok && o.stdout.contains("port-the-codec"),
     );
 
     let (ok, out, err) = vox(bob, &["room", "claim", &room, "port-the-codec"]);
@@ -146,15 +159,21 @@ fn two_agents_split_work_and_only_one_holds_a_contested_resource() {
     // What a release guarantees is that **the releaser stops holding it** — not
     // that the resource is unowned, because bob's earlier losing claim may sort
     // after the release and acquire it. See the header.
+    //
+    // Bob's board names the holder by his own name for her, `alice/alice` (V210-162), never by
+    // her fingerprint: a predicate on the fingerprint is satisfied by any board at all, and bob
+    // then claims before the release has reached him.
+    let alice_holds = format!("{}/", alice.name);
     until(
         bob,
-        Some("bob"),
+        None,
         "alice to stop holding the resource",
-        &["room", "board", &room],
+        &["room", "board", &room, "--session", "bob"],
         |o| {
-            !o.stdout
+            o.ok && !o
+                .stdout
                 .lines()
-                .any(|l| l.starts_with("port-the-codec") && l.contains(&alice_short))
+                .any(|l| l.starts_with("port-the-codec") && l.contains(&alice_holds))
         },
     );
     let (ok, out, err) = vox(bob, &["room", "claim", &room, "port-the-codec"]);
@@ -168,8 +187,9 @@ fn two_agents_split_work_and_only_one_holds_a_contested_resource() {
     // The expiry vox computed is read from its own answer, so every step below is timed
     // against the same clock the claim lapses on.
     let ttl = TTL_SECS.to_string();
-    let o = alice.vox(
-        Some(&alice.name),
+    let o = as_session(
+        alice,
+        &alice.name,
         &[
             "room",
             "claim",
@@ -187,7 +207,7 @@ fn two_agents_split_work_and_only_one_holds_a_contested_resource() {
     // Bob must have the live claim before his own can be bound by it. Seeing it is
     // staging; if the claim lapses first, nothing about binding was tested.
     loop {
-        let b = bob.vox(Some("bob"), &["room", "board", &room]);
+        let b = as_session(bob, "bob", &["room", "board", &room]);
         let seen = now_ms();
         if b.stdout.contains("flaky-test") {
             break;
@@ -238,6 +258,115 @@ fn two_agents_split_work_and_only_one_holds_a_contested_resource() {
         "[proof] contested claim: 1 winner, loser refused naming the holder; release freed it; \
          a {TTL_SECS}s ttl bound bob while live and freed itself once it lapsed"
     );
+
+    busy_room_reads_whole_board(alice, bob, &room);
+}
+
+/// (6): bob reads a board that needs several pages while the room keeps posting: alice from
+/// her node and a second session of bob's from his, each a post every quarter second.
+/// Staging: alice holds `BUSY_ITEMS` resources (more than one page holds). Busy is measured,
+/// not assumed: the room's `position.entries` must have advanced between bob's reads, else
+/// nothing about reading under traffic was tested.
+fn busy_room_reads_whole_board(alice: &Worker, bob: &Worker, room: &str) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    const BUSY_ITEMS: usize = 70;
+    const READS: usize = 5;
+    std::thread::scope(|s| {
+        for t in 0..7 {
+            s.spawn(move || {
+                for i in (t..BUSY_ITEMS).step_by(7) {
+                    let item = format!("busy-item-{i:02}");
+                    let o = as_session(alice, "alice", &["room", "claim", room, &item]);
+                    // Exit 5 says the claim is posted but not yet agreed by every member; the
+                    // quiet-room board read below is what confirms the staging.
+                    assert!(
+                        o.ok || o.code == Some(5),
+                        "APPARATUS (staging): alice's claim of {item} failed: {o:?}"
+                    );
+                }
+            });
+        }
+    });
+    let held = |o: &support::Out| {
+        o.json()["resources"].as_array().map_or(0, |rs| {
+            rs.iter()
+                .filter(|r| {
+                    r["resource"]
+                        .as_str()
+                        .is_some_and(|r| r.starts_with("busy-item-"))
+                })
+                .count()
+        })
+    };
+    until(
+        bob,
+        None,
+        "every busy-item claim to reach bob's board in a quiet room",
+        &["room", "board", room, "--json", "--session", "bob"],
+        |o| o.ok && held(o) == BUSY_ITEMS,
+    );
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|s| {
+        let stop = &stop;
+        for (w, session) in [(alice, "alice"), (bob, "bob-2")] {
+            s.spawn(move || {
+                let mut n = 0u32;
+                while !stop.load(Ordering::Relaxed) {
+                    n += 1;
+                    let body = format!("busy chatter {session} {n}");
+                    as_session(w, session, &["room", "post", room, &body]);
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+            });
+        }
+        // Alice's posts reach bob through sync, in batches: read until at least READS boards
+        // were read and bob's entry count moved under them, so traffic between pages was real.
+        // The poster is stopped before any red, or the scope would wait on it forever.
+        let deadline = std::time::Instant::now() + support::TIMEOUT;
+        let mut entries: Vec<u64> = Vec::with_capacity(READS);
+        let verdict = loop {
+            if entries.len() >= READS && entries.last() > entries.first() {
+                break Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                break Err(format!(
+                    "APPARATUS, CANNOT MEASURE: in {}s the room's entry count never advanced \
+                     across bob's {} reads ({entries:?}); reading under traffic was not exercised",
+                    support::TIMEOUT.as_secs(),
+                    entries.len()
+                ));
+            }
+            let i = entries.len();
+            let o = as_session(bob, "bob", &["room", "board", room, "--json"]);
+            if !o.ok {
+                break Err(format!(
+                    "PRODUCT: read {i} of a {BUSY_ITEMS}-claim board while alice kept posting \
+                     failed (exit {:?}): {}",
+                    o.code,
+                    o.stderr.trim()
+                ));
+            }
+            let seen = held(&o);
+            if seen != BUSY_ITEMS {
+                break Err(format!(
+                    "PRODUCT: read {i} of the board while alice kept posting returned {seen} of \
+                     alice's {BUSY_ITEMS} held resources: {o:?}"
+                ));
+            }
+            entries.push(o.json()["position"]["entries"].as_u64().unwrap_or(0));
+        };
+        stop.store(true, Ordering::Relaxed);
+        if let Err(red) = verdict {
+            panic!("{red}");
+        }
+        println!(
+            "[proof] {} whole {BUSY_ITEMS}-claim boards read while the room posted; entries \
+             advanced {} -> {}",
+            entries.len(),
+            entries[0],
+            entries[entries.len() - 1]
+        );
+    });
 }
 
 /// ADR-033 WD: this is also the narrow on-demand excerpt for the member-panel backend.
@@ -245,8 +374,9 @@ fn two_agents_split_work_and_only_one_holds_a_contested_resource() {
 /// Native rendering, plain non-link text and reopening are observed separately in the app.
 fn member_work_roundtrip(alice: &Worker, bob: &Worker, room: &str) {
     const WORK: &str = "gwa:example/room:member-work";
-    let claim = alice.vox(
-        Some("alice"),
+    let claim = as_session(
+        alice,
+        "alice",
         &[
             "room", "claim", room, "--work", WORK, "--task", "#769", "--json",
         ],
@@ -268,7 +398,7 @@ fn member_work_roundtrip(alice: &Worker, bob: &Worker, room: &str) {
             re: None,
         },
     );
-    let board = bob.vox(Some("bob"), &["room", "board", room, "--json"]);
+    let board = as_session(bob, "bob", &["room", "board", room, "--json"]);
     board.expect_ok("read the member work board");
     let json = board.json();
     let work = json["work"]
@@ -279,8 +409,9 @@ fn member_work_roundtrip(alice: &Worker, bob: &Worker, room: &str) {
         && r["tags"].as_array().is_some_and(|ts| ts.iter().any(|t| t == "task:#769"))),
         "PRODUCT: daemon board omitted the current member/Session claim, task or plain work reference: {board:?}");
 
-    let ask = alice.vox(
-        Some("alice"),
+    let ask = as_session(
+        alice,
+        "alice",
         &[
             "room", "post", room, "WD_ASK", "--type", "ask", "--to", "bob", "--work", WORK,
             "--json",
@@ -303,7 +434,7 @@ fn member_work_roundtrip(alice: &Worker, bob: &Worker, room: &str) {
             re: None,
         },
     );
-    let unread = bob.vox(Some("bob"), &["room", "board", room, "--json"]);
+    let unread = as_session(bob, "bob", &["room", "board", room, "--json"]);
     unread.expect_ok("read the unanswered ask");
     assert!(
         unread.json()["work"]
@@ -315,8 +446,9 @@ fn member_work_roundtrip(alice: &Worker, bob: &Worker, room: &str) {
                 && r["from"] == "alice")),
         "PRODUCT: the addressed, unanswered ask is absent from bob's board: {unread:?}"
     );
-    let unrelated = alice.vox(
-        Some("alice"),
+    let unrelated = as_session(
+        alice,
+        "alice",
         &[
             "room",
             "post",
@@ -328,7 +460,7 @@ fn member_work_roundtrip(alice: &Worker, bob: &Worker, room: &str) {
         ],
     );
     unrelated.expect_ok("post the asker's own follow-up");
-    let still = alice.vox(Some("alice"), &["room", "board", room, "--json"]);
+    let still = as_session(alice, "alice", &["room", "board", room, "--json"]);
     still.expect_ok("read the ask after an unrelated responder");
     assert!(
         still.json()["work"]
@@ -336,8 +468,9 @@ fn member_work_roundtrip(alice: &Worker, bob: &Worker, room: &str) {
             .is_some_and(|rs| rs.iter().any(|r| r["entry_hash"] == ask_id)),
         "PRODUCT: the asker's own reply incorrectly answered bob's ask: {still:?}"
     );
-    let answer = bob.vox(
-        Some("bob"),
+    let answer = as_session(
+        bob,
+        "bob",
         &[
             "room",
             "post",
@@ -367,7 +500,7 @@ fn member_work_roundtrip(alice: &Worker, bob: &Worker, room: &str) {
             re: Some(&ask_id),
         },
     );
-    let answered = alice.vox(Some("alice"), &["room", "board", room, "--json"]);
+    let answered = as_session(alice, "alice", &["room", "board", room, "--json"]);
     answered.expect_ok("read the answered work board");
     assert!(
         answered.json()["work"]
@@ -376,8 +509,9 @@ fn member_work_roundtrip(alice: &Worker, bob: &Worker, room: &str) {
         "PRODUCT: bob's exact reply did not clear his addressed ask: {answered:?}"
     );
 
-    let blocked = alice.vox(
-        Some("alice"),
+    let blocked = as_session(
+        alice,
+        "alice",
         &[
             "room",
             "post",
@@ -393,7 +527,7 @@ fn member_work_roundtrip(alice: &Worker, bob: &Worker, room: &str) {
         ],
     );
     blocked.expect_ok("publish the owner's blocked reason");
-    let waiting = alice.vox(Some("alice"), &["room", "board", room, "--json"]);
+    let waiting = as_session(alice, "alice", &["room", "board", room, "--json"]);
     waiting.expect_ok("read the blocked work");
     assert!(
         waiting.json()["work"].as_array().is_some_and(|rs| rs
@@ -401,23 +535,23 @@ fn member_work_roundtrip(alice: &Worker, bob: &Worker, room: &str) {
             .any(|r| r["type"] == "blocked" && r["work"] == WORK)),
         "PRODUCT: board omitted the owner's blocked work: {waiting:?}"
     );
-    alice
-        .vox(
-            Some("alice"),
-            &[
-                "room",
-                "post",
-                room,
-                "WD_WORKING",
-                "--type",
-                "working",
-                "--work",
-                WORK,
-                "--json",
-            ],
-        )
-        .expect_ok("publish the owner's resumed work");
-    let resumed = alice.vox(Some("alice"), &["room", "board", room, "--json"]);
+    as_session(
+        alice,
+        "alice",
+        &[
+            "room",
+            "post",
+            room,
+            "WD_WORKING",
+            "--type",
+            "working",
+            "--work",
+            WORK,
+            "--json",
+        ],
+    )
+    .expect_ok("publish the owner's resumed work");
+    let resumed = as_session(alice, "alice", &["room", "board", room, "--json"]);
     resumed.expect_ok("read resumed work");
     assert!(
         resumed.json()["work"].as_array().is_some_and(|rs| !rs
@@ -425,8 +559,9 @@ fn member_work_roundtrip(alice: &Worker, bob: &Worker, room: &str) {
             .any(|r| r["type"] == "blocked" && r["work"] == WORK)),
         "PRODUCT: owner's working post did not clear blocked work: {resumed:?}"
     );
-    let handoff = alice.vox(
-        Some("alice"),
+    let handoff = as_session(
+        alice,
+        "alice",
         &[
             "room",
             "handoff",
@@ -463,7 +598,7 @@ fn member_work_roundtrip(alice: &Worker, bob: &Worker, room: &str) {
         },
     );
     handoff_live(deadline);
-    let pending = bob.vox(Some("bob"), &["room", "board", room, "--json"]);
+    let pending = as_session(bob, "bob", &["room", "board", room, "--json"]);
     handoff_live(deadline);
     pending.expect_ok("read the pending handoff");
     assert!(pending.json()["work"].as_array().is_some_and(|rows| rows.iter().any(|r|
@@ -472,15 +607,16 @@ fn member_work_roundtrip(alice: &Worker, bob: &Worker, room: &str) {
             && r["resource"] == WORK)),
         "PRODUCT: pending handoff omitted the exact recipient or authenticated sender/Session: {pending:?}");
     handoff_live(deadline);
-    let accepted = bob.vox(
-        Some("bob"),
+    let accepted = as_session(
+        bob,
+        "bob",
         &[
             "room", "claim", room, "--work", WORK, "--task", "#769", "--json",
         ],
     );
     handoff_live(deadline);
     accepted.expect_ok("bob accepts the exact handoff by claiming");
-    let accepted_board = bob.vox(Some("bob"), &["room", "board", room, "--json"]);
+    let accepted_board = as_session(bob, "bob", &["room", "board", room, "--json"]);
     handoff_live(deadline);
     accepted_board.expect_ok("read the accepted handoff");
     let accepted_json = accepted_board.json();
@@ -490,9 +626,9 @@ fn member_work_roundtrip(alice: &Worker, bob: &Worker, room: &str) {
     assert!(accepted_work.iter().any(|r| r["type"] == "claim" && r["work"] == WORK && r["member"] == bob.b32()
         && r["session"] == "bob") && !accepted_work.iter().any(|r| r["entry_hash"] == handoff_id),
         "PRODUCT: handoff did not become bob's claim or remained pending after acceptance: {accepted_board:?}");
-    bob.vox(Some("bob"), &["room", "release", room, WORK, "--json"])
+    as_session(bob, "bob", &["room", "release", room, WORK, "--json"])
         .expect_ok("release member-panel work");
-    let fresh = bob.vox(Some("bob"), &["room", "board", room, "--json"]);
+    let fresh = as_session(bob, "bob", &["room", "board", room, "--json"]);
     fresh.expect_ok("reopen the work board after release");
     assert!(
         fresh.json()["work"]
