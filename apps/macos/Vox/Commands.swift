@@ -818,6 +818,9 @@ private struct EndRoomSheet: View {
         VStack(alignment: .leading, spacing: Space.s12) {
             Text("End this room for everyone?").title()
             Text("Every member's copy of the room is deleted, and no one can post in it again.")
+            if let offered = LeaveSheet.offeredWords(model.roomOffered) {
+                Text(offered).accessibilityIdentifier("end-room-offered")
+            }
             if checking {
                 Text("Checking whether you are this room's creator or an admin…")
                     .accessibilityIdentifier("end-room-reason")
