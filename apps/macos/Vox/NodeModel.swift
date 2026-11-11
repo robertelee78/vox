@@ -1455,10 +1455,11 @@ final class NodeModel: ObservableObject {
         guard case let .room(id) = selection, ended == nil, !showingSession, !roomReloadNeeded,
               let room = rooms.first(where: { $0.id == id }),
               !room.preparing, room.openFailure == nil else { return }
-        // A room whose first open failed has no roster, services or notices yet: a page alone
-        // would publish a half-empty room. Run the whole open again instead, unless one is
-        // already running.
-        guard roomOpened else {
+        // A room whose first open was refused transiently has no roster, services or notices
+        // yet: a page alone would publish a half-empty room. Run the whole open again instead,
+        // unless one is already running. Any other unopened room takes the ordinary page path,
+        // whose terminal refusals retire the page as before.
+        if !roomOpened, roomOpenRetry != nil {
             if roomShowsInFlight == 0 { await show(.room(id)) }
             return
         }
@@ -2349,11 +2350,17 @@ final class NodeModel: ObservableObject {
                   epoch == nodeObservationEpoch, self.selection == .room(id),
                   ended == nil || whileRecovering && observationNeedsRestart else { return false }
             // A room created or joined a moment ago refuses its first reads while its governance
-            // is refreshing (the node's maintenance turn folds the new rows within seconds). The
-            // room stays selected and is opened again, soon and then less often; its header says
-            // why meanwhile. Nothing of the half-read room is published.
-            scheduleRoomOpenRetry(id, reason: sentence(error))
-            if roomOpened { reportBackground(error) }
+            // is refreshing (the node's maintenance turn folds the new rows within seconds). Only
+            // that kind of refusal is retried: the room stays selected and is opened again, soon
+            // and then less often, and its header says why meanwhile. Nothing of the half-read
+            // room is published. Every other failure is terminal here, as before: said in the
+            // status bar, and the room is not opened again on its own.
+            if case let VoxError.Failed(reason) = error, Self.transientRoomReadRefusal(reason) {
+                scheduleRoomOpenRetry(id, reason: sentence(error))
+            } else {
+                clearRoomOpenRetry()
+                reportBackground(error)
+            }
             return false
         }
     }
