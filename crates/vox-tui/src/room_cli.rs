@@ -6635,7 +6635,7 @@ async fn offered_in(client: &mut IpcClient, channel_id: Digest32) -> Vec<String>
             let mut named = Vec::new();
             let mut files = 0usize;
             for (tag, _) in services {
-                if tag.starts_with("file-") {
+                if is_share_tag(&tag) {
                     files += 1;
                 } else {
                     named.push(tag);
@@ -6650,6 +6650,19 @@ async fn offered_in(client: &mut IpcClient, channel_id: Digest32) -> Vec<String>
         }
         _ => Vec::new(),
     }
+}
+
+/// Whether `tag` is a shared file's service tag, exactly as `shares.rs` forms it:
+/// `file-<16 hex of the SHA-256>-<hex nonce>`. A service a person named `file-…` is not one.
+fn is_share_tag(tag: &str) -> bool {
+    let Some((sha, nonce)) = tag
+        .strip_prefix("file-")
+        .and_then(|rest| rest.split_once('-'))
+    else {
+        return false;
+    };
+    let hex = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit());
+    sha.len() == 16 && hex(sha) && hex(nonce)
 }
 
 /// The services this node offers in each of `rooms`: "22 in "team"".
