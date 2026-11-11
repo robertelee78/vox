@@ -875,6 +875,9 @@ private struct LeaveSheet: View {
                 : "You leave at once: this node stops reading and posting here, and the room is "
                     + "gone from this list. The other members are told as they are reached, and go "
                     + "on without you; to come back you need its link and passphrase again.")
+            if let offered = Self.offeredWords(model.roomOffered) {
+                Text(offered).accessibilityIdentifier("leave-offered")
+            }
             HStack {
                 Button("Cancel") { model.sheet = nil }.keyboardShortcut(.cancelAction)
                 Button(ending ? "End for Everyone" : "Leave", role: .destructive) {
@@ -900,5 +903,36 @@ private struct LeaveSheet: View {
         }
         .padding(Space.s24)
         .frame(width: Theme.scaled(440))
+    }
+
+    /// "Your services offered here go with it: 2 shared files and ssh." as `vox room leave`
+    /// says it; a share's service is named by its hash, which no one reads, so shares are
+    /// counted. Nothing when this node offers nothing here.
+    static func offeredWords(_ tags: [String]) -> String? {
+        if tags.isEmpty { return nil }
+        var named: [String] = []
+        var files = 0
+        for tag in tags {
+            if isShareTag(tag) { files += 1 } else { named.append(tag) }
+        }
+        if files == 1 { named.append("1 shared file") }
+        if files > 1 { named.append("\(files) shared files") }
+        let list: String
+        switch named.count {
+        case 1: list = named[0]
+        case 2: list = "\(named[0]) and \(named[1])"
+        default: list = named.dropLast().joined(separator: ", ") + " and " + named[named.count - 1]
+        }
+        return "Your services offered here go with it: \(list)."
+    }
+
+    /// `file-<16 lowercase hex>-<16 lowercase hex>`, as a share's service is tagged.
+    private static func isShareTag(_ tag: String) -> Bool {
+        let parts = tag.split(separator: "-", omittingEmptySubsequences: false)
+        guard parts.count == 3, parts[0] == "file" else { return false }
+        let hex16 = { (s: Substring) -> Bool in
+            s.count == 16 && s.allSatisfy { ("0"..."9").contains($0) || ("a"..."f").contains($0) }
+        }
+        return hex16(parts[1]) && hex16(parts[2])
     }
 }

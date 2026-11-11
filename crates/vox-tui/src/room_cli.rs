@@ -194,17 +194,33 @@ pub(crate) async fn room_of(client: &mut IpcClient, prefix: &str) -> Result<Dige
 }
 
 /// What a verb says of a room this node deleted for having ended for everyone (V030-08, #1206),
-/// when `prefix` names one — its name whole, or a prefix of its id — rather than
-/// `nothing here matches`, which is what a typo says. The node remembers such rooms for a
-/// while ([`vox_core::node::ended_rooms`]); past that, the name is a stranger again.
+/// or is leaving, when `prefix` names one — its name whole, or a prefix of its id — rather than
+/// `nothing here matches`, which is what a typo says. The node remembers ended rooms for a
+/// while ([`vox_core::node::ended_rooms`]); past that, the name is a stranger again. A room
+/// being left is hidden until a member has the departure (ADR-023 RL-8.1a).
 async fn ended_room_said(client: &mut IpcClient, prefix: &str) -> Option<AppError> {
-    let rooms = match client.request(&Request::EndedRooms).await {
-        Ok(Frame::EndedRooms { rooms }) => rooms,
+    let (rooms, leaving) = match client.request(&Request::EndedRooms).await {
+        Ok(Frame::EndedRooms { rooms, leaving }) => (rooms, leaving),
         _ => return None,
     };
     let wanted = prefix.trim().to_ascii_lowercase();
     if wanted.is_empty() {
         return None;
+    }
+    if let Some(room) = leaving.iter().find(|room| {
+        room.name
+            .as_deref()
+            .is_some_and(|name| name.eq_ignore_ascii_case(&wanted))
+            || b32_encode(&room.channel_id).starts_with(&wanted)
+    }) {
+        let which = match room.name.as_deref() {
+            Some(name) => format!("room {name:?} ({})", b32_encode(&room.channel_id)),
+            None => format!("room {}", b32_encode(&room.channel_id)),
+        };
+        return Some(AppError::Usage(format!(
+            "you left {which}; its members are told as they are reached, and there is nothing \
+             to read or post in it"
+        )));
     }
     // The newest note wins when a name was reused.
     let room = rooms.iter().rev().find(|room| {

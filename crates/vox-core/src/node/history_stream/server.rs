@@ -87,29 +87,18 @@ pub(super) async fn answer(
                 #[cfg(not(feature = "test-knobs"))]
                 let mutant = false;
                 // This node left the room (ADR-023 RL-8.1a): it holds the room only so a
-                // member can take its departure, so it serves its inventory and its own public
-                // feed — which the departure ends — and nothing else of the room.
+                // member can take its departure. A member catching up asks for whatever it
+                // lacks — other authors' heads and entries too, and the departure may be the
+                // last thing it reaches — and a refused query ends its whole session before
+                // it gets there (measured: a member back from offline never took the
+                // departure, its roster kept the leaver). So a member is still served the
+                // room's public history, as it was while this node was a member a moment ago
+                // and as it was while a leave waited to be heard before this ruling; what
+                // stops at once is everything else: services, Sessions, relays. A stranger
+                // gets the own-recovery confinement below, as before.
                 let me = room.me();
-                if room.has_left(&me) && !mutant {
-                    let allowed = match check {
-                        Query::Inventory => true,
-                        Query::Head(author) => author == me,
-                        Query::Header { head, .. }
-                        | Query::Proof { head, .. }
-                        | Query::Entry { head, .. }
-                        | Query::Page { head, .. } => {
-                            room.history_head_by_id(store, &head)?.is_some_and(|head| {
-                                head.binding.author == me
-                                    && head.binding.scope == crate::log::history::LogScope::Public
-                            })
-                        }
-                        // A member checking the departure needs its pre-context and the
-                        // proof siblings' frontier contexts; a context carries only
-                        // author/seq/hash coordinates, never a body.
-                        Query::Context(_) => true,
-                        _ => false,
-                    };
-                    return Ok(Some((allowed, false)));
+                if room.has_left(&me) && !mutant && !room.is_member(&peer) {
+                    return Ok(Some((false, false)));
                 }
                 if mutant || room.is_member(&peer) {
                     return Ok(Some((true, false)));

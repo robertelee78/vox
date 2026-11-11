@@ -3563,10 +3563,13 @@ pub enum Frame {
         shares: Vec<crate::node::shares::ShareRow>,
     },
     /// The rooms this node deleted for having ended (V030-08, #1206), as a
-    /// [`Request::EndedRooms`] asked for: oldest noted first.
+    /// [`Request::EndedRooms`] asked for: oldest noted first; and the rooms it is leaving,
+    /// hidden until a member has the departure, so a verb can say "you left" of one.
     EndedRooms {
         /// Each ended room.
         rooms: Vec<crate::node::ended_rooms::EndedRoom>,
+        /// Each room being left.
+        leaving: Vec<crate::node::api::LeavingRoom>,
     },
     /// The exact entry appended by [`Request::AppendSession`] or [`Request::RenameRoom`].
     Appended {
@@ -4021,8 +4024,8 @@ impl Frame {
                         .uint(r.files);
                 }
             }
-            Frame::EndedRooms { rooms } => {
-                e.array(2).uint(T_ENDED_ROOMS).array(rooms.len());
+            Frame::EndedRooms { rooms, leaving } => {
+                e.array(3).uint(T_ENDED_ROOMS).array(rooms.len());
                 for r in rooms {
                     e.array(5)
                         .bytes(&r.channel_id)
@@ -4030,6 +4033,12 @@ impl Frame {
                         .bytes(r.by.as_ref().map_or(&[][..], |by| &by[..]))
                         .uint(r.ended_ms)
                         .uint(r.noted_ms);
+                }
+                e.array(leaving.len());
+                for r in leaving {
+                    e.array(2)
+                        .bytes(&r.channel_id)
+                        .text(r.name.as_deref().unwrap_or_default());
                 }
             }
             Frame::OmpMedia { bytes, cursor } => {
@@ -5246,7 +5255,7 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             }
             return Ok(Frame::Shares { shares });
         }
-        (T_ENDED_ROOMS, 2) => {
+        (T_ENDED_ROOMS, 3) => {
             let count = d
                 .array()
                 .map_err(|_| Error::MalformedIpc("ipc ended rooms array"))?;
@@ -5288,7 +5297,28 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                     noted_ms,
                 });
             }
-            return Ok(Frame::EndedRooms { rooms });
+            let count = d
+                .array()
+                .map_err(|_| Error::MalformedIpc("ipc leaving rooms array"))?;
+            if count > 4096 {
+                return Err(Error::MalformedIpc("ipc leaving rooms count"));
+            }
+            let mut leaving = Vec::with_capacity(count);
+            for _ in 0..count {
+                if d.array()
+                    .map_err(|_| Error::MalformedIpc("ipc leaving room"))?
+                    != 2
+                {
+                    return Err(Error::MalformedIpc("ipc leaving room arity"));
+                }
+                let channel_id = digest(d)?;
+                let name = text(d, "ipc leaving room name")?;
+                leaving.push(crate::node::api::LeavingRoom {
+                    channel_id,
+                    name: (!name.is_empty()).then_some(name),
+                });
+            }
+            return Ok(Frame::EndedRooms { rooms, leaving });
         }
         (T_OMP_MEDIA, 3) => {
             let bytes = d.bytes()?.to_vec();
@@ -8925,7 +8955,10 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                     reason: crate::node::api::Fault::Locked.explain().into(),
                 }
             } else {
-                Frame::EndedRooms { rooms: view.ended }
+                Frame::EndedRooms {
+                    rooms: view.ended,
+                    leaving: view.leaving,
+                }
             }
         }
         Request::AppendSession {

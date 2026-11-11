@@ -238,10 +238,12 @@ below remain unchanged.
   attention items. Delivery of the departure goes on in the background: the node MUST hold the
   room hidden, and go on leaving across a restart, until a sync session has carried the
   departure to another member, and MUST then delete it as RL-8.1 says. The hidden room serves
-  nothing else meanwhile: it publishes no reachers and offers no services (tunnels into it are
-  refused), carries no Session traffic either way, refuses the whole-log exchange, and answers a
-  member's bounded exchange only with its inventory and its own public feed — the feed the
-  departure ends; nothing of any other author. Its own sessions advertise its head and probe
+  members its public history as it did a moment before (a member catching up asks for whatever
+  it lacks, and the departure may be the last thing it reaches; measured on the candidate, a
+  member back from offline whose every other query was refused never took the departure), and
+  nothing else: it publishes no reachers and offers no services (tunnels into it are refused),
+  carries no Session traffic either way, refuses the whole-log exchange, and serves a stranger
+  only its own recovery as before. Its own sessions advertise its head and probe
   that head on the member, following no archive. `vox status` MUST show
   exactly one line per such room — `leaving <room>: no member has been told yet; told when one
   is reached` — and nothing else of it. The leave is not undoable from the room: a person's post
