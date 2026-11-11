@@ -270,6 +270,17 @@ final class NodeModel: ObservableObject {
     }
     @Published private var roomHasNewer = false
     @Published private(set) var roomReloadNeeded = false
+    /// Why the room on screen is not open yet, in the node's words, while its first open is
+    /// retried: a room created or joined a moment ago answers "room governance is refreshing"
+    /// for the next second or two, and a first open that lands in that window must not leave
+    /// the room on "members loading" until it is selected again.
+    @Published private(set) var roomOpenRetry: String?
+    private var roomOpenRetryTask: Task<Void, Never>?
+    private var roomOpenRetryDelay: Double = 1
+    /// The selected room's page and inspector have been published together since it was
+    /// selected or its observation restarted. Until then a watcher page re-runs the whole open.
+    private var roomOpened = false
+    private var roomShowsInFlight = 0
     private static let roomWindowLimit = 128
     @Published private var roomReadingOlder = false
     private var roomOlderRead = UUID()
@@ -1390,10 +1401,15 @@ final class NodeModel: ObservableObject {
     /// read. These refusals keep the visible snapshot and retry; lifecycle and access refusals do
     /// not become transient merely because they are also `Failed`.
     private static func transientRoomReadRefusal(_ reason: String) -> Bool {
+        // The node prefixes its own refusals with "node: " (`Error::Profile`); a history page
+        // says "room governance is refreshing" without the "try again" tail that the governance
+        // pages add. Both are the same refreshing window after a governance row, and both pass.
+        let reason = reason.hasPrefix("node: ") ? String(reason.dropFirst("node: ".count)) : reason
         switch reason {
         case "The room changed while reading. Refresh and try again.",
              "the room changed while reading; refresh and retry",
              "the room is preparing selected history; retry",
+             "room governance is refreshing",
              "room governance is refreshing; try again when it is ready",
              "the room is removing expired saved history; retry",
              "the room is refreshing saved history; retry":
@@ -1439,6 +1455,13 @@ final class NodeModel: ObservableObject {
         guard case let .room(id) = selection, ended == nil, !showingSession, !roomReloadNeeded,
               let room = rooms.first(where: { $0.id == id }),
               !room.preparing, room.openFailure == nil else { return }
+        // A room whose first open failed has no roster, services or notices yet: a page alone
+        // would publish a half-empty room. Run the whole open again instead, unless one is
+        // already running.
+        guard roomOpened else {
+            if roomShowsInFlight == 0 { await show(.room(id)) }
+            return
+        }
         let generation = roomReadGeneration, epoch = nodeObservationEpoch
         let view = selectedRoomView, displayed = showing, viewGeneration = roomViewGeneration
         let revision = roomMessageRevision, follows = timelineFollowingNewest
@@ -1481,7 +1504,7 @@ final class NodeModel: ObservableObject {
             // recovery path below.
             if follows, case let VoxError.Failed(reason) = error,
                Self.transientRoomReadRefusal(reason) {
-                if reason == "the room is preparing selected history; retry" {
+                if reason.hasSuffix("the room is preparing selected history; retry") {
                     let refreshed = await refresh(restartObservation: false)
                     guard refreshed, current() else { return }
                     if rooms.first(where: { $0.id == id })?.preparing != true {
@@ -2085,6 +2108,7 @@ final class NodeModel: ObservableObject {
         cancelSidebarSelection()
         guard selection != self.selection else { return }
         invalidateRosterObservation(clearError: true)
+        clearRoomOpenRetry()
         trustsMe.removeAll()
         // Preserve the room's reply draft when leaving it (D12).
         if case let .room(left) = self.selection {
@@ -2109,6 +2133,7 @@ final class NodeModel: ObservableObject {
         roomInstance = nil
         roomHasNewer = false
         roomReloadNeeded = false
+        roomOpened = false
         unreadFrom = nil
         unreadCount = 0
         messageFooters = [:]
@@ -2215,6 +2240,8 @@ final class NodeModel: ObservableObject {
         let messageRevision = roomMessageRevision
         let metadataToken = sessionsMetadataRead
         let liveAfter = sessionsOpenAfter, historyAfter = sessionsHistoryAfter
+        roomShowsInFlight += 1
+        defer { roomShowsInFlight -= 1 }
         do {
             // Each read lands only if the room is still the one on screen: a quick switch must not
             // draw one room's messages under another.
@@ -2277,6 +2304,8 @@ final class NodeModel: ObservableObject {
             // The page and its inspector replace the prior view together, after both reads
             // have succeeded. An ordinary refresh must not publish a half-empty room.
             publishRoomPage(page, unread: unread)
+            roomOpened = true
+            clearRoomOpenRetry()
             roomServices = services.shared
             roomOffered = services.offered.map(\.tag)
             roomServicesNext = services.next
@@ -2319,9 +2348,43 @@ final class NodeModel: ObservableObject {
             guard viewGeneration == roomViewGeneration, generation == roomReadGeneration,
                   epoch == nodeObservationEpoch, self.selection == .room(id),
                   ended == nil || whileRecovering && observationNeedsRestart else { return false }
-            reportBackground(error)
+            // A room created or joined a moment ago refuses its first reads while its governance
+            // is refreshing (the node's maintenance turn folds the new rows within seconds). The
+            // room stays selected and is opened again, soon and then less often; its header says
+            // why meanwhile. Nothing of the half-read room is published.
+            scheduleRoomOpenRetry(id, reason: sentence(error))
+            if roomOpened { reportBackground(error) }
             return false
         }
+    }
+
+    /// Open `room` again after a failed open, 1 s after the first failure and then twice as
+    /// long each time, at most 8 s apart, while it stays selected and unopened. A stopped
+    /// observation keeps its own recovery (the follow loop re-runs the open as `whileRecovering`);
+    /// the reason stays visible for it.
+    private func scheduleRoomOpenRetry(_ room: String, reason: String) {
+        roomOpenRetry = reason
+        let delay = roomOpenRetryDelay
+        roomOpenRetryDelay = min(roomOpenRetryDelay * 2, 8)
+        roomOpenRetryTask?.cancel()
+        roomOpenRetryTask = Task { [weak self] in
+            do { try await Task.sleep(for: .seconds(delay)) } catch { return }
+            guard let self, !Task.isCancelled, self.selection == .room(room),
+                  !self.roomOpened, self.roomOpenRetry != nil else { return }
+            guard self.ended == nil, self.roomShowsInFlight == 0 else {
+                // Recovery or an open already under way re-runs the open itself; look again after.
+                self.scheduleRoomOpenRetry(room, reason: reason)
+                return
+            }
+            await self.show(.room(room))
+        }
+    }
+
+    private func clearRoomOpenRetry() {
+        roomOpenRetryTask?.cancel()
+        roomOpenRetryTask = nil
+        roomOpenRetryDelay = 1
+        if roomOpenRetry != nil { roomOpenRetry = nil }
     }
 
     // ---- the keyring (M-16) ----------------------------------------------------------------
@@ -4220,6 +4283,7 @@ final class NodeModel: ObservableObject {
         roomInstance = nil
         roomHasNewer = false
         roomReloadNeeded = false
+        roomOpened = false
         unreadFrom = nil
         unreadCount = 0
         sessionPages.clear()

@@ -2880,7 +2880,9 @@ private struct Inspector: View {
                             }
                         }
                     } else {
-                        Text(model.memberWorkLoading ? "Reading room work…" : "Room work unavailable").caption().secondaryText()
+                        Text(model.memberWorkLoading ? "Reading room work…"
+                             : model.roomOpenRetry == nil ? "Room work unavailable" : "Room work not read yet; the room is being opened again")
+                            .caption().secondaryText()
                     }
                     if let problem = model.memberRolesError {
                         Text(problem).secondaryText().fixedSize(horizontal: false, vertical: true)
@@ -3005,7 +3007,8 @@ private struct Inspector: View {
                     .accessibilityIdentifier("member-role-" + fingerprint)
             }
         } else {
-            Text(model.memberRolesLoading ? "Checking room role…" : "Room role unavailable")
+            Text(model.memberRolesLoading ? "Checking room role…"
+                 : model.roomOpenRetry == nil ? "Room role unavailable" : "Room role not read yet; the room is being opened again")
                 .caption().secondaryText()
                 .accessibilityIdentifier("member-role-" + fingerprint)
         }
