@@ -296,6 +296,13 @@ fn blocking_transaction<T>(transaction: impl FnOnce() -> T) -> T {
         transaction()
     }
 }
+
+/// What a synchronous computer writer says when its bounded wait ends; the caller tries again.
+const WRITER_WAITED: &str = "the computer transaction waited too long for another computer writer or a held publication; it is tried again";
+
+fn writer_deadline(deadline: Option<std::time::Instant>) -> std::time::Instant {
+    deadline.unwrap_or_else(|| std::time::Instant::now() + COMPUTER_RETURN_SHOWN_WITHIN)
+}
 fn arity(d: &mut Decoder<'_>, n: usize) -> Result<()> {
     if d.array()? == n {
         Ok(())
@@ -2756,6 +2763,26 @@ impl Computer {
         drop(self.publications.read().await);
     }
 
+    /// A synchronous writer waits at most until the transaction's own deadline, else the
+    /// return window (`publication_gate::Gate::blocking_write_until`).
+    fn changes_writer(
+        &self,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<publication_gate::Writer> {
+        self.changes
+            .blocking_write_until(writer_deadline(deadline))
+            .ok_or(Error::Profile(WRITER_WAITED))
+    }
+
+    fn publications_writer(
+        &self,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<publication_gate::Writer> {
+        self.publications
+            .blocking_write_until(writer_deadline(deadline))
+            .ok_or(Error::Profile(WRITER_WAITED))
+    }
+
     pub(crate) fn try_journal_writer(&self) -> Option<ComputerJournalWriter> {
         Some(ComputerJournalWriter {
             lease: self.changes.try_write()?,
@@ -2837,7 +2864,7 @@ impl Computer {
     /// publication (or failure); take no view, slot or state lock while waiting for it.
     pub(crate) fn policy_target_after_writer(&self) -> Result<ComputerPolicyTarget> {
         blocking_transaction(|| {
-            let _change = self.changes.blocking_write();
+            let _change = self.changes_writer(None)?;
             if self
                 .authority_blocked
                 .load(std::sync::atomic::Ordering::Acquire)
@@ -3432,7 +3459,7 @@ impl Computer {
                 self.require_transition(transition);
                 None
             } else {
-                Some(self.changes.blocking_write())
+                Some(self.changes_writer(None)?)
             };
             self.storage_ready()?;
             let held = lock(&self.state).clone();
@@ -4197,11 +4224,15 @@ impl Computer {
     ) -> Result<Option<T>> {
         // A writer owns the transaction order, but readers own no part of its filesystem work:
         // status and authorization observations remain live while staging or flush is slow.
+        let deadline = match boundary {
+            ComputerChangeBoundary::Deadline(deadline) => Some(deadline),
+            ComputerChangeBoundary::Current(_) => None,
+        };
         let _change = if let Some(transition) = transition {
             self.require_transition(transition);
             None
         } else {
-            Some(self.changes.blocking_write())
+            Some(self.changes_writer(deadline)?)
         };
         self.storage_ready()?;
         let held = lock(&self.state).clone();
@@ -4280,8 +4311,11 @@ impl Computer {
                 );
             #[cfg(not(feature = "test-knobs"))]
             let skip_publication = false;
-            let _publication = (publication_changed && transition.is_none() && !skip_publication)
-                .then(|| self.publications.blocking_write());
+            let _publication = if publication_changed && transition.is_none() && !skip_publication {
+                Some(self.publications_writer(deadline)?)
+            } else {
+                None
+            };
             #[cfg(feature = "test-knobs")]
             if publication_changed && fx28_mutant("join-policy-not-applied") {
                 if let Ok(spec) = std::env::var("VOX_TEST_HOLD_ROOM_JOIN_AFTER_BOARD") {
@@ -4529,7 +4563,7 @@ impl Computer {
             self.require_transition(transition);
             None
         } else {
-            Some(self.changes.blocking_write())
+            Some(self.changes_writer(None)?)
         };
         self.change_durable_under_writer(f, transition.is_some())
     }
@@ -4558,8 +4592,11 @@ impl Computer {
                 );
             #[cfg(not(feature = "test-knobs"))]
             let skip_publication = false;
-            let _publication = (publication_changed && !publication_owned && !skip_publication)
-                .then(|| self.publications.blocking_write());
+            let _publication = if publication_changed && !publication_owned && !skip_publication {
+                Some(self.publications_writer(None)?)
+            } else {
+                None
+            };
             if publication_changed {
                 self.block_own_key_authority();
             }

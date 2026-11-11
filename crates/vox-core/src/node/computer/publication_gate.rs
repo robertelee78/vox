@@ -112,20 +112,37 @@ impl Gate {
     /// The caller is already on a blocking transaction thread and owns no state/room guard.
     /// A Condvar also preserves synchronous/current-thread-runtime callers, unlike Tokio's
     /// `blocking_write`, which rejects calls from a current-thread runtime.
-    pub(super) fn blocking_write(self: &Arc<Self>) -> Writer {
+    ///
+    /// The wait ends at `deadline` with `None`. A synchronous writer runs under the pairing
+    /// mutex or the `changes` writer; a reader or writer it waits for can be a parked owner
+    /// that needs the actor's command lane, which `writer_pending` closes while this waits.
+    /// Waiting without bound turned that into a stall of the whole daemon (status unanswered,
+    /// SIGTERM ignored); a bounded wait fails the transaction, which its caller tries again.
+    pub(super) fn blocking_write_until(
+        self: &Arc<Self>,
+        deadline: std::time::Instant,
+    ) -> Option<Writer> {
         let mut state = self.state();
         state.waiting += 1;
         while state.writing || state.readers != 0 {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                state.waiting -= 1;
+                drop(state);
+                self.wake();
+                return None;
+            }
             state = self
                 .drained
-                .wait(state)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .wait_timeout(state, deadline - now)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
         }
         state.waiting -= 1;
         state.writing = true;
-        Writer {
+        Some(Writer {
             gate: Arc::clone(self),
-        }
+        })
     }
 }
 
