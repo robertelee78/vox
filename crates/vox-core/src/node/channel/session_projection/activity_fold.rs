@@ -303,22 +303,35 @@ pub(super) fn appended(index: &mut Write<'_, '_>, f: &Fact) -> Result<()> {
 /// this is the common shape. A request, a drive, an OMP reset or replacement and a
 /// multipart body reach other derived trees and rebuild, as before.
 pub(super) fn removed(index: &mut Write<'_, '_>, f: &Fact) -> Result<bool> {
-    let activity = &index.header.activity;
-    if !activity.ready {
-        // A rebuild still walking retained facts below this arrival never sees it.
-        return Ok(activity.work.as_ref().is_some_and(|work| {
-            work.phase == 1
-                && work
-                    .cursor
-                    .as_ref()
-                    .is_none_or(|cursor| super::activity_index::arrival_of(cursor) < f.arrival)
-        }));
+    if !index.header.activity.ready {
+        // A rebuild still walking retained facts below this arrival never sees it: it goes
+        // on, under a revision that refuses a continuation of an older plan.
+        let Some(work) = index.header.activity.work.as_mut() else {
+            return Ok(false);
+        };
+        if work.phase != 1
+            || work
+                .cursor
+                .as_ref()
+                .is_some_and(|cursor| super::activity_index::arrival_of(cursor) >= f.arrival)
+        {
+            return Ok(false);
+        }
+        let revision = index
+            .header
+            .activity
+            .invalidated
+            .checked_add(1)
+            .ok_or_else(bad)?;
+        work.invalidated = revision;
+        index.header.activity.invalidated = revision;
+        return Ok(true);
     }
-    if f.arrival > activity.applied {
+    if f.arrival > index.header.activity.applied {
         return Ok(true);
     }
     if f.latest_only
-        || f.part.is_some_and(|(_, n)| n > 1)
+        || f.part.is_some_and(|(i, n)| (i, n) != (1, 1))
         || !matches!(
             f.kind,
             Kind::Other
@@ -374,7 +387,7 @@ pub(super) fn removed(index: &mut Write<'_, '_>, f: &Fact) -> Result<bool> {
                 }
                 cursor = key;
             }
-            outcome = Some((authored, later));
+            outcome = Some((reference, authored, later));
         }
     }
     for (rank, group) in ranks {
@@ -388,8 +401,8 @@ pub(super) fn removed(index: &mut Write<'_, '_>, f: &Fact) -> Result<bool> {
         index.activity_set(count, hash_key(&group), (live != 0).then_some(live))?;
         plus(index, count, removed_key(&group), 1)?;
     }
-    if let Some((authored, later)) = outcome {
-        let mut key = hash_key(&authored);
+    if let Some((reference, authored, later)) = outcome {
+        let mut key = hash_key(&reference);
         key[32..].copy_from_slice(&f.author);
         index.activity_set(T::Outcomes, member_key(&authored, f.arrival), None)?;
         let count = index
@@ -413,6 +426,14 @@ pub(super) fn removed(index: &mut Write<'_, '_>, f: &Fact) -> Result<bool> {
             index.activity_set(T::OutcomeBytes, key, Some(bytes))?;
         }
     }
+    // A plan made before this removal may hold the arrival; its continuation is refused by
+    // the revision (`activity_query` `check`), and a fresh plan is exact.
+    index.header.activity.invalidated = index
+        .header
+        .activity
+        .invalidated
+        .checked_add(1)
+        .ok_or_else(bad)?;
     Ok(true)
 }
 
