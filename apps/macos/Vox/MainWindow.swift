@@ -1097,6 +1097,44 @@ private struct RoomUnreadBar: View {
     }
 }
 
+/// Coalesces layout measurements without publishing state during SwiftUI's layout pass.
+private final class TimelineMeasurements: ObservableObject {
+    private(set) var pendingFrames: [String: CGRect]?
+    private var pending: (() -> Void)?
+    private var scheduled = false
+    private var resized = false
+    var followedRows = false
+
+    func enqueue(frames: [String: CGRect], resized: Bool = false,
+                 apply: @escaping ([String: CGRect], Bool) -> Void) {
+        pendingFrames = frames
+        self.resized = self.resized || resized
+        pending = { [weak self] in
+            guard let self else { return }
+            let resized = self.resized
+            self.resized = false
+            apply(frames, resized)
+        }
+        guard !scheduled else { return }
+        scheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            let apply = self.pending
+            self.pending = nil
+            self.pendingFrames = nil
+            self.scheduled = false
+            apply?()
+        }
+    }
+
+    func cancel() {
+        pending = nil
+        pendingFrames = nil
+        resized = false
+        followedRows = false
+    }
+}
+
 /// The room on screen: its timeline and a field to post, with its members beside it.
 private struct RoomTimelineView: View {
     /// The conversation's text size, for its spacing (L-1a): this view sets it on the timeline and
@@ -1146,6 +1184,7 @@ private struct RoomTimelineView: View {
     @State private var timelineFocused = false
     /// Each drawn row's frame in the timeline, for a drag across rows.
     @State private var rowFrames: [String: CGRect] = [:]
+    @StateObject private var measurements = TimelineMeasurements()
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     /// The inspector's width: the one last dragged to, kept across launches (Columns).
     @State private var inspectorWidth = Columns.width(.inspector)
@@ -1492,42 +1531,24 @@ private struct RoomTimelineView: View {
                                 }
                             }
                             .onPreferenceChange(RowFrames.self) { frames in
-                                rowFrames = frames
-                                // Seen: at least half of the row inside the timeline's bounds.
-                                let bounds = CGRect(origin: .zero, size: viewport.size)
-                                inView = Set(frames.compactMap { id, frame in
-                                    let shown = frame.intersection(bounds)
-                                    return !shown.isNull && shown.height * 2 >= frame.height ? id : nil
-                                })
-                                model.threadRootsVisible(in: room, ids: inView)
-                                // The last three rows' frames and the viewport, for reading a row
-                                // never counted in view (debug: kept only when asked for).
-                                let tail = model.timelineItems.suffix(3).map { item in
-                                    frames[item.id].map { "\(item.id.prefix(10)) \(Int($0.minY))..\(Int($0.maxY))" }
-                                        ?? "\(item.id.prefix(10)) unmeasured"
+                                guard frames != rowFrames || measurements.pendingFrames != nil else { return }
+                                let size = viewport.size
+                                let showing = model.showing
+                                measurements.enqueue(frames: frames) { frames, resized in
+                                    guard model.showing == showing else { return }
+                                    if resized { measurements.followedRows = false }
+                                    applyMeasurements(frames, size, scroller, resized ? "viewport" : "rows")
                                 }
-                                readLog.debug("frames in \(room, privacy: .public): viewport \(Int(viewport.size.width))x\(Int(viewport.size.height)), \(frames.count) measured, last: \(tail.joined(separator: "; "), privacy: .public)")
-                                // Lazy rows may appear before they are on screen. Read older
-                                // entries only when the person has scrolled to their marker.
-                                let olderShown = !following && model.timelineItems
-                                    .first(where: \.loadsOlder).map { inView.contains($0.id) } == true
-                                if olderShown && !olderVisible {
-                                    Task { await model.readOlderTimeline() }
-                                }
-                                olderVisible = olderShown
-                                markSeen()
-                                keepNewest(scroller, viewport.size.height, "rows")
                             }
-                            // The timeline shrank or grew (the composer grows with To:, a draft
-                            // or a reply): the newest line kept in view.
+                            // Size changes also affect visibility even when row frames do not change.
                             .onChange(of: viewport.size) { size in
-                                let bounds = CGRect(origin: .zero, size: size)
-                                let visible = Set(rowFrames.compactMap { id, frame in
-                                    let shown = frame.intersection(bounds)
-                                    return !shown.isNull && shown.height * 2 >= frame.height ? id : nil
-                                })
-                                model.threadRootsVisible(in: room, ids: visible)
-                                keepNewest(scroller, size.height, "viewport")
+                                let frames = measurements.pendingFrames ?? rowFrames
+                                let showing = model.showing
+                                measurements.enqueue(frames: frames, resized: true) { frames, resized in
+                                    guard model.showing == showing else { return }
+                                    if resized { measurements.followedRows = false }
+                                    applyMeasurements(frames, size, scroller, "viewport")
+                                }
                             }
                             // A room opens at its newest message: loaded before the view
                             // appeared, its count never changed and it stayed at the top, so the
@@ -1556,6 +1577,7 @@ private struct RoomTimelineView: View {
                             // newest line, or, a Session with a request waiting, at that request,
                             // centred, so going to an approval shows it (P7).
                             .onChange(of: model.showing) { _ in
+                                measurements.cancel()
                                 model.threadRootsVisible(in: room, ids: [])
                                 olderVisible = false
                                 // The rows of what is now shown are laid out after this change,
@@ -1578,6 +1600,7 @@ private struct RoomTimelineView: View {
                             // end, is not a line to follow), so a Session follows its output
                             // as General follows its messages.
                             .onChange(of: model.followSignature) { _ in
+                                measurements.followedRows = false
                                 keepNewest(scroller, viewport.size.height, "lines")
                                 // A request gone to (⌘J, a notification) stays where it was
                                 // centred: new output does not scroll it away (P1, P7).
@@ -1616,6 +1639,7 @@ private struct RoomTimelineView: View {
                     .onChange(of: model.readMarkRevision) { _ in markSeen() }
                     .onChange(of: model.showing) { _ in updateLooking() }
                     .onDisappear {
+                        measurements.cancel()
                         model.threadRootsVisible(in: room, ids: [])
                         if model.lookingAt == room { model.lookingAt = nil }
                     }
@@ -2157,20 +2181,60 @@ private struct RoomTimelineView: View {
         return true
     }
 
+    /// Apply the latest measurements after layout, retaining the half-row read boundary.
+    private func applyMeasurements(_ frames: [String: CGRect], _ size: CGSize,
+                                   _ scroller: ScrollViewProxy, _ why: String) {
+        if rowFrames != frames { rowFrames = frames }
+        let bounds = CGRect(origin: .zero, size: size)
+        let visible = Set(frames.compactMap { id, frame in
+            let shown = frame.intersection(bounds)
+            return !shown.isNull && shown.height * 2 >= frame.height ? id : nil
+        })
+        if inView != visible { inView = visible }
+        model.threadRootsVisible(in: room, ids: visible)
+        let tail = model.timelineItems.suffix(3).map { item in
+            frames[item.id].map { "\(item.id.prefix(10)) \(Int($0.minY))..\(Int($0.maxY))" }
+                ?? "\(item.id.prefix(10)) unmeasured"
+        }
+        readLog.debug("frames in \(room, privacy: .public): viewport \(Int(size.width))x\(Int(size.height)), \(frames.count) measured, last: \(tail.joined(separator: "; "), privacy: .public)")
+        let olderShown = !following && model.timelineItems
+            .first(where: \.loadsOlder).map { visible.contains($0.id) } == true
+        if olderShown && !olderVisible {
+            Task { await model.readOlderTimeline() }
+        }
+        if olderVisible != olderShown { olderVisible = olderShown }
+        markSeen()
+        if let last = model.followItem, let frame = frames[last],
+           frame.maxY <= size.height + 1 && (frame.minY >= -1 || frame.height > size.height) {
+            measurements.followedRows = false
+        } else if !measurements.followedRows {
+            measurements.followedRows = keepNewest(scroller, size.height, why)
+        }
+    }
+
     /// While following, the newest line kept in view: on any change of the lines, the rows' frames
     /// or the timeline's size that leaves it out of view or undrawn, a scroll to the timeline's
     /// end on the next turn of the main loop. A request centred (P1, P7) is left where it is.
-    private func keepNewest(_ scroller: ScrollViewProxy, _ height: CGFloat, _ why: String) {
+    @discardableResult
+    private func keepNewest(_ scroller: ScrollViewProxy, _ height: CGFloat, _ why: String) -> Bool {
         guard following, model.selectedRequest == nil, model.waitingEntry == nil,
-              let last = model.followItem else { return }
-        let shown = rowFrames[last].map { $0.maxY <= height + 1 } ?? false
-        readLog.debug("follow in \(room, privacy: .public) on \(why, privacy: .public): following \(following), newest \(last, privacy: .public) at its end in view? \(shown), rows \(inView.count)")
-        guard !shown, !keeping else { return }
+              let last = model.followItem else { return false }
+        let shown = rowFrames[last].map {
+            $0.maxY <= height + 1 && ($0.minY >= -1 || $0.height > height)
+        } ?? false
+        readLog.debug("follow in \(room, privacy: .public) on \(why, privacy: .public): following \(following), newest \(last, privacy: .public) fully in view? \(shown), rows \(inView.count)")
+        guard !shown, !keeping else { return false }
         keeping = true
         DispatchQueue.main.async {
             keeping = false
-            if following { scroller.scrollTo(TimelineEnd.id, anchor: .bottom) }
+            guard following, model.selectedRequest == nil, model.waitingEntry == nil,
+                  model.followItem == last else { return }
+            let shown = rowFrames[last].map {
+                $0.maxY <= height + 1 && ($0.minY >= -1 || $0.height > height)
+            } ?? false
+            if !shown { scroller.scrollTo(TimelineEnd.id, anchor: .bottom) }
         }
+        return true
     }
 
     /// What is shown, at its newest line; or a Session's request waiting for an answer, centred.

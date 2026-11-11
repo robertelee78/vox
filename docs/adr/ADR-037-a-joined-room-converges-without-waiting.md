@@ -159,6 +159,43 @@ replacements and multipart bodies reach other derived trees and still rebuild. A
 generation is freed page by page in one turn, never key by key. The answer a page gives is
 unchanged: exact counts over the rows the node holds and has not expired.
 
+**v0.4.26 correction (#1206): a lagging control frontier is answered per author and caught up
+unasked.** An author's Session control frontier (`private_index::control(author).through`)
+advances in the receive path only through a contiguous row; a page of bounded sync or a row
+held and released later leaves it behind the author's verified head, and only the bounded
+catch-up (`Work::Controls`) closes the gap. That catch-up ran only from a Session query, a
+refused room publication, or a deferred legacy migration, so a room that received rows out of
+sequence answered "Session control facts are refreshing" for that author indefinitely. Two
+consequences were room-wide, against this requirement: the legacy Session announcement round
+refused itself whole when any consented reader lagged, withholding this node's Sessions and
+the own-feed control append from every other member; and a departure `vox room leave` writes
+is heard only by a round that ends cleanly, so it waited behind the same refusals. Now the
+actor drives the catch-up for every published room whose frontier lags
+(`drive_session_control_catch_up`): after the tick's settlement and reads, one room per tick,
+the rooms taking turns from the one begun last, and a room whose catch-up ends waiting on a
+peer with nothing advanced (a control entry this node does not hold, a departed author's
+frontier) looked at again after a doubling wait of up to a minute — it would otherwise take
+the one Store turn every tick ahead of every other room. The announcement round skips the
+lagging reader instead of refusing, keeping it recorded at the grant it was last announced at,
+so it is not a new reader — the whole own feed announced again — once it is current; the
+reader set differing from the announced one re-announces once that author is current. Nothing
+is encrypted to a reader the round could not vouch for.
+
+**v0.4.26 correction (#1206): a refreshing fold keeps stream admission.** `refresh_network_view`
+rebuilds the whole `PeerPolicy` and, for a room whose checked view answered REFRESHING (every
+governance row's arrival re-runs it before the fold has settled, and so does startup), it
+contributed no members and treated a `peer_removal_applied` error as removed. Every member of
+that room was classed `Unknown` until the fold settled and the next tick rebuilt the view, and
+both directions of its sync were refused as `authenticator invalid`; a member of no other room
+on that node lost every stream. Now such a room keeps what its last completed fold gave —
+roster minus departed minus the exclusions already applied (`CurrentRemoved`, written only by
+a completed fold) — as `PeerClass::Admitted`: it opens the streams a member opens, and this
+node relays and answers punches for it no more than for an unknown peer (`relays_for`), so a
+removal the fold has not applied yet learns no endpoint and reaches no member through this
+node. What a stream may carry is gated by R3's fold proof and the per-entry removal checks,
+which keep failing closed while the view refreshes, so no removed member gains anything
+governance gates.
+
 ### R5. Own-authored state is the author's durable fact
 
 A node's own sequence and own drive generation in a room MUST come from its local store. A

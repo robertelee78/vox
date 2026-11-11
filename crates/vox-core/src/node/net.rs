@@ -65,6 +65,12 @@ pub enum PeerClass {
     /// A member this node is joining a room *through* right now. It sends its sender key the
     /// moment it admits us, before this node holds the room or knows it as a member.
     JoinResponder,
+    /// A member of a room whose governance fold is refreshing, kept from the fold that last
+    /// completed (#1206). It opens what a member opens — each stream's own room, epoch and
+    /// governance gates still judge what it carries — but this node coordinates nothing for
+    /// it: no relay, no punch answered to it, so a removal the fold has not applied yet
+    /// discloses no endpoint. Membership, anchoring and an expected join all outrank it.
+    Admitted,
     /// Authenticated, but otherwise unknown to us.
     Unknown,
 }
@@ -78,6 +84,7 @@ pub struct PeerPolicy {
     anchors: HashSet<Digest32>,
     pending_joiners: HashSet<Digest32>,
     join_responders: HashSet<Digest32>,
+    admitted: HashSet<Digest32>,
 }
 
 impl PeerPolicy {
@@ -90,6 +97,12 @@ impl PeerPolicy {
     /// Add the members of a channel (the union across channels is what matters).
     pub fn add_members(&mut self, members: impl IntoIterator<Item = Digest32>) {
         self.members.extend(members);
+    }
+
+    /// Add the members of a room whose governance fold is refreshing, as its last completed
+    /// fold left them ([`PeerClass::Admitted`]).
+    pub fn add_admitted(&mut self, members: impl IntoIterator<Item = Digest32>) {
+        self.admitted.extend(members);
     }
 
     /// Add a configured anchor.
@@ -131,7 +144,8 @@ impl PeerPolicy {
     }
 
     /// Classify a peer. Membership wins over every other class: a member that is
-    /// also an anchor or a pending joiner is a member.
+    /// also an anchor or a pending joiner is a member. Admission to a refreshing room ranks
+    /// last: it must not take relay authority from an anchor or a joiner, nor add it to one.
     #[must_use]
     pub fn classify(&self, peer: &Digest32) -> PeerClass {
         if self.members.contains(peer) {
@@ -142,6 +156,8 @@ impl PeerPolicy {
             PeerClass::PendingJoiner
         } else if self.join_responders.contains(peer) {
             PeerClass::JoinResponder
+        } else if self.admitted.contains(peer) {
+            PeerClass::Admitted
         } else {
             PeerClass::Unknown
         }
@@ -188,6 +204,8 @@ impl PeerPolicy {
     ///   granted by this transport classification. Never `tunnel`.
     /// - **JoinResponder**: `pairwise` (its sender key), `rendezvous`, `coord`, and the
     ///   same independently gated `sync` transport.
+    /// - **Admitted**: what a member may open; `coord` and `circuit` reach `node::coordstream`,
+    ///   which relays for a member and not for it (`relays_for`).
     /// - **Unknown**: `rendezvous`, gated further by the service's own policy (ADR-012:
     ///   reads open, member-only writes refused there), and `coord`, where its only verb is
     ///   `WHOAMI`.
@@ -202,7 +220,7 @@ impl PeerPolicy {
             return true;
         }
         match class {
-            PeerClass::Member => true,
+            PeerClass::Member | PeerClass::Admitted => true,
             PeerClass::Anchor => matches!(
                 kind,
                 StreamKind::Rendezvous | StreamKind::Sync | StreamKind::Coord | StreamKind::Circuit
@@ -263,6 +281,7 @@ impl PeerPolicy {
             .chain(self.anchors.iter())
             .chain(self.pending_joiners.iter())
             .chain(self.join_responders.iter())
+            .chain(self.admitted.iter())
             .copied()
             .collect();
         Admission::Pinned(known)

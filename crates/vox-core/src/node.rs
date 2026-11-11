@@ -41,6 +41,7 @@ pub mod daemonipc;
 pub mod decisions;
 pub mod drive;
 pub mod drive_input;
+pub mod ended_rooms;
 pub mod folder;
 pub mod headless;
 pub mod history_budget;

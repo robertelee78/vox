@@ -2765,17 +2765,13 @@ impl Node {
         {
             return AdmissionWork::unowned("required", Lane::Control, service);
         }
-        if self
-            .leave_waiters
-            .iter()
-            .any(|(left_room, generation, _, _, _)| {
-                *left_room == room
-                    && self
-                        .ports
-                        .get(&(room, peer))
-                        .is_some_and(|port| port.done_gen >= *generation)
-            })
-        {
+        if self.leave_waiters.iter().any(|waiter| {
+            waiter.room == room
+                && self
+                    .ports
+                    .get(&(room, peer))
+                    .is_some_and(|port| port.done_gen >= waiter.generation)
+        }) {
             return AdmissionWork::unowned("departure", Lane::Control, service);
         }
         if self.history_hints.pending(room, peer) {
@@ -3818,7 +3814,7 @@ impl Node {
                         || self
                             .leave_waiters
                             .iter()
-                            .any(|(room, _, _, _, _)| *room == work.room)
+                            .any(|waiter| waiter.room == work.room)
                         || self.bounded_sync.required.iter().any(|required| {
                             required.room == work.room && required.peer == work.peer
                         });
@@ -4351,7 +4347,7 @@ impl Node {
                         }) || self
                             .leave_waiters
                             .iter()
-                            .any(|(r, _, _, _, _)| *r == work.room)
+                            .any(|waiter| waiter.room == work.room)
                             || self.bounded_sync.required.iter().any(|required| {
                                 required.room == work.room && required.peer == work.peer
                             }))
@@ -4797,12 +4793,12 @@ impl Node {
                     // Inventory must first advertise the new local departure. Once that fixed
                     // exchange completes, probe only our own exact head; no archive is followed.
                     let departure_hint = if service == OutboundService::Public
-                        && self.leave_waiters.iter().any(|(r, generation, _, _, _)| {
-                            *r == room
+                        && self.leave_waiters.iter().any(|waiter| {
+                            waiter.room == room
                                 && self
                                     .ports
                                     .get(&(room, peer))
-                                    .is_some_and(|p| p.done_gen >= *generation)
+                                    .is_some_and(|p| p.done_gen >= waiter.generation)
                         }) {
                         let bytes_wake = state_job.bytes_wake();
                         let Some(_read_charge) = state_job.reserve(4 * 1024 * 1024) else {

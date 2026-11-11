@@ -847,6 +847,9 @@ final class NodeModel: ObservableObject {
 
     /// The services members share in the room on screen, as cards above its timeline.
     @Published private(set) var roomServices: [SharedService] = []
+    /// What this node offers in the room on screen (`vox service list`'s tags), said by the
+    /// Leave and End sheets as what goes with the room (E-5).
+    @Published private(set) var roomOffered: [String] = []
     @Published private(set) var roomServicesNext: ServiceCursor?
     private var roomServicesCursor: ServiceCursor?
     private var roomServicesRevision: UInt64?
@@ -2147,6 +2150,7 @@ final class NodeModel: ObservableObject {
         sessionNote = nil
         members = []
         roomServices = []
+        roomOffered = []
         selectedMessage = nil
         selectedMessages = []
         selectionAnchor = nil
@@ -2274,6 +2278,7 @@ final class NodeModel: ObservableObject {
             // have succeeded. An ordinary refresh must not publish a half-empty room.
             publishRoomPage(page, unread: unread)
             roomServices = services.shared
+            roomOffered = services.offered.map(\.tag)
             roomServicesNext = services.next
             roomServicesRevision = services.revision
             // Members, reciprocal consent and presentation were committed together above.
@@ -3436,6 +3441,7 @@ final class NodeModel: ObservableObject {
                 revision: noticeCursor == nil ? nil : noticesRevision)
             guard governanceRead == token, roomReadGeneration == generation, roomOnScreen == room, !Task.isCancelled else { return }
             roomServices = services.shared
+            roomOffered = services.offered.map(\.tag)
             roomServicesCursor = serviceCursor
             roomServicesNext = services.next
             roomServicesRevision = services.revision

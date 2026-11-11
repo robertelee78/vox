@@ -23,6 +23,7 @@ pub(super) struct Loaded {
     withdrawals: BTreeMap<Digest32, PendingWithdrawal>,
     joins: BTreeMap<Digest32, PendingWithdrawal>,
     accepted_names: BTreeMap<Digest32, String>,
+    ended: crate::node::ended_rooms::EndedRooms,
 }
 
 struct Returned {
@@ -124,6 +125,10 @@ fn prepare(profile: &Profile, decisions: &DecisionLog, now: u64) -> crate::error
     }
     // The helper merges the latest writer-admitted maps. Never reinstall the pre-abort snapshot.
     let (withdrawals, joins) = ledgers(profile)?;
+    // An unreadable record explains nothing; it is not a reason to withhold the identity.
+    let mut ended =
+        crate::node::ended_rooms::EndedRooms::load(profile.store(), signer).unwrap_or_default();
+    ended.prune(now);
     Ok(Loaded {
         ring,
         dismissed,
@@ -137,6 +142,7 @@ fn prepare(profile: &Profile, decisions: &DecisionLog, now: u64) -> crate::error
             .into_iter()
             .map(|(room, join)| (room, join.name))
             .collect(),
+        ended,
     })
 }
 
@@ -154,7 +160,11 @@ fn run(
     let (mut profile, unlock) = match work {
         Work::Create { passphrase } => {
             match Profile::create_noting(paths, &passphrase, now / 1_000, argon2, &waiting) {
-                Ok(profile) => (profile, None),
+                Ok(profile) => {
+                    // Days sealed before this identity existed open under no key it has (#1206).
+                    decisions.start_fresh(now);
+                    (profile, None)
+                }
                 Err(error) => return (None, Err(fault_of(&error))),
             }
         }
@@ -550,6 +560,7 @@ impl Node {
                 self.withdrawn = loaded.withdrawals;
                 self.join_cleanup = loaded.joins;
                 self.join_name_reservations = loaded.accepted_names;
+                self.ended_rooms = loaded.ended;
                 if let Some(policy) = returned.policy {
                     self.trust = policy.trust;
                     self.consent_keys = policy.consent_keys;

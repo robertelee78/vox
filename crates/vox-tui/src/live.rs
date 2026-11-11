@@ -3997,7 +3997,8 @@ impl CoreHandle for DaemonCore {
                 self.send(Request::CloseRoom { channel_id })
             }
             Command::LeaveRoom { channel_id } => {
-                // Answered once another member has the leave; the room is gone then. What it did
+                // Answered once the departure is durable: the room is gone from the list then,
+                // and its members are told as they are reached (ADR-023 RL-8.1a). What it did
                 // is said, not "done" (ADR-028 E-5).
                 let status = self.send(Request::Leave { channel_id });
                 if !matches!(status, CommandStatus::Done) {
@@ -4007,8 +4008,8 @@ impl CoreHandle for DaemonCore {
                     self.active = None;
                 }
                 CommandStatus::Said(
-                    "left the room: its other members see that you left; this node no longer \
-                     holds it"
+                    "left the room: its other members see that you left as they are reached; \
+                     this node no longer lists it"
                         .to_owned(),
                 )
             }

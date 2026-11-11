@@ -288,7 +288,8 @@ pub struct RoomSummary {
     pub waiting: String,
     /// Since when it waits for that, unix milliseconds; 0 when it has not said.
     pub waiting_since_ms: u64,
-    /// Empty while the room goes on; else, in words, that this node left it or it ended.
+    /// Empty while the room goes on; else, in words, that it ended. A room this node left is
+    /// not listed (ADR-023 RL-8.1a).
     pub over: String,
 }
 

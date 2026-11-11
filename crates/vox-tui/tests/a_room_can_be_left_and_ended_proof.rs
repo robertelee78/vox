@@ -987,14 +987,15 @@ fn a_member_that_left_is_synced_with_and_delivered_to_no_more() {
     let id = room.id.as_str();
 
     let t = Instant::now();
-    // Stage a live commitment response while neither peer can apply the departure.
+    // Stage a live commitment response while neither peer can apply the departure: the leave
+    // answers all the same (ADR-023 RL-8.1a; the decider, 2026-11-11: "a node should be able to
+    // leave a room whenever it wants"), the room is gone from alice's list and named only by
+    // `vox status` as leaving, and the peers learn of it once they can apply it.
     #[cfg(feature = "test-knobs")]
-    let o = std::thread::scope(|scope| {
+    let o = {
         std::fs::write(&hold, b"hold").expect("APPARATUS: arm departure hold");
-        let (tx, rx) = std::sync::mpsc::channel();
-        scope.spawn(move || {
-            let _ = tx.send(alice.vox(None, &["room", "leave", id]));
-        });
+        let o = alice.vox(None, &["room", "leave", id]);
+        assert!(o.ok, "PRODUCT: `vox room leave` was refused: {o:?}");
         let deadline = Instant::now() + WITHIN;
         while !hold.with_extension("live").is_file() {
             assert!(
@@ -1011,15 +1012,23 @@ fn a_member_that_left_is_synced_with_and_delivered_to_no_more() {
                 w.name
             );
         }
-        let early = rx.recv_timeout(Duration::from_secs(3));
-        std::fs::remove_file(&hold).expect("APPARATUS: release departure hold");
+        let listed = alice.vox(None, &["room", "list"]);
         assert!(
-            early.is_err(),
-            "PRODUCT: Alice's leave returned before any peer applied her departure: {early:?}"
+            listed.ok && !listed.stdout.contains(id),
+            "PRODUCT: alice left, and no member has her departure yet, but her room list still \
+             names the room: {listed:?}"
         );
-        rx.recv_timeout(WITHIN)
-            .expect("PRODUCT: Alice's leave did not finish after peers resumed")
-    });
+        let status = alice.vox(None, &["status"]);
+        assert!(
+            status.ok
+                && status.stdout.contains("leaving ")
+                && status.stdout.contains("no member has been told yet"),
+            "PRODUCT: `vox status` must name the room alice left as leaving while no member has \
+             her departure: {status:?}"
+        );
+        std::fs::remove_file(&hold).expect("APPARATUS: release departure hold");
+        o
+    };
     #[cfg(not(feature = "test-knobs"))]
     let o = alice.vox(None, &["room", "leave", id]);
     assert!(o.ok, "PRODUCT: `vox room leave` was refused: {o:?}");

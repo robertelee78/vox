@@ -584,7 +584,7 @@ fn outcome(result: &crate::error::Result<Saved>) -> Outcome {
             result: Err(error), ..
         })) => Outcome::Failed(fault_of(error)),
         Ok(Saved::Unavailable) => Outcome::Failed(Fault::RoomChangePending),
-        Ok(Saved::Leave(leave_save::Saved::Detached)) => Outcome::Failed(Fault::LeaveNotHeard),
+        Ok(Saved::Leave(leave_save::Saved::Detached)) => Outcome::Done,
         Ok(Saved::Read(saved)) => read_save::outcome(saved),
         Ok(Saved::Roster(roster_save::Saved {
             result: Err(error), ..

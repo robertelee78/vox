@@ -9313,6 +9313,26 @@ impl ChannelState {
         })
     }
 
+    /// What a node remembers of this room's end once it deletes it (V030-08, #1206): who ended
+    /// it — the author of the end entry, or `None` for the idle end — and when, by the room's
+    /// own clock. `None` while the room goes on.
+    #[must_use]
+    pub fn end_record(&self, store: &Store, now_ms: u64) -> Option<(Option<Digest32>, u64)> {
+        match self.ended(now_ms)? {
+            RoomEnd::ByCreator => {
+                let hash = self.governance_display.lifecycle.ended_by?;
+                let read = self.entries.read(store, &self.sek, &self.channel_id).ok()?;
+                let by = read.locate(&hash).ok().flatten().map(|(author, _)| author);
+                let at = read.clock(&hash).ok().flatten().unwrap_or(now_ms);
+                Some((by, at))
+            }
+            RoomEnd::Idle { idle_secs } => {
+                let last = self.dag.newest_clock().unwrap_or_else(|| self.created());
+                Some((None, last.saturating_add(idle_secs.saturating_mul(1_000))))
+            }
+        }
+    }
+
     /// The idle end this room's creator chose, in seconds, if any (V030-08).
     #[must_use]
     pub fn idle_end(&self) -> Option<u64> {

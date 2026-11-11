@@ -92,9 +92,9 @@ impl ChannelState {
         self.ensure_local_append_available_for(store, false)
     }
 
-    /// An automatic append may not pass this identity's departure. The only callers that may
-    /// set `after_departure` are an intentional post, which explicitly undoes a pending leave,
-    /// and the authenticated return presence written while a rejoin settles.
+    /// An automatic append may not pass this identity's departure, and neither may a person's
+    /// post, which a left room refuses. The only caller that may set `after_departure` is the
+    /// authenticated return presence written while a rejoin settles.
     pub(super) fn ensure_local_append_available_for(
         &self,
         store: &Store,
