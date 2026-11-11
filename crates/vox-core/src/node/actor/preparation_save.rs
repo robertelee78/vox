@@ -519,15 +519,27 @@ impl Node {
                             return Ok(false);
                         }
                         if !prepared.save.folded {
-                            // Nothing local was left to fold, so the refused stage may need
-                            // records a member has not sent yet. Retry it once a second, not at
-                            // once: the next governance turn resumes it.
                             prepared.save.refused = false;
-                            prepared.wait_on("governance records from its members", now.get());
-                            prepared.save.lifetime = None;
-                            prepared.legacy_cleanup_due =
-                                Some(std::time::Instant::now() + super::PREPARE_WAIT);
-                            return Ok(false);
+                            if prepared.save.resume_after_governance == Some(Stage::Packages) {
+                                // Nothing local was left to fold, so the package needs records
+                                // a member has not sent, and a member is reached only once the
+                                // room is published (ADR-037 R1). Continue without it: the
+                                // published room's package owner opens it once its governance
+                                // settles, as for a package refused after publication.
+                                let room = channel.channel_id();
+                                self.key_package_governance_wait.insert(room);
+                                self.key_package_unopened.insert(room);
+                                prepared.save.resume_after_governance = Some(Stage::Legacy);
+                            } else {
+                                // The refused stage may need records a member has not sent yet.
+                                // Retry it once a second, not at once: the next governance turn
+                                // resumes it.
+                                prepared.wait_on("governance records from its members", now.get());
+                                prepared.save.lifetime = None;
+                                prepared.legacy_cleanup_due =
+                                    Some(std::time::Instant::now() + super::PREPARE_WAIT);
+                                return Ok(false);
+                            }
                         }
                         prepared.save.refused = false;
                         prepared.save.folded = false;
