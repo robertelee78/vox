@@ -1,7 +1,9 @@
 //! Ephemeral, bounded daemon projection of the room's canonical work protocol (ADR-033 WD).
 //! No derived board is persisted. Each requested page reads the existing structured/notice
-//! indexes and invokes the same claim fold used by coordination. A changed room refuses the
-//! whole answer. Client continuations carry an existing display token, never a saved snapshot.
+//! indexes up to one pinned arrival head and invokes the same claim fold used by coordination,
+//! so every page of one board folds the same input while the room keeps posting. A changed
+//! room (instance, roster, governance, retention) refuses the whole answer. Client
+//! continuations carry an existing snapshot token, never a saved fold.
 
 use super::{
     actor::NodeHandle,
@@ -27,7 +29,10 @@ const PAGE_ROWS: usize = 64;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 // Two transient folds across the daemon. Admission refuses rather than accumulating waiters.
 static READERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
-const CHANGED: &str = "the room's work board changed while reading; refresh and retry";
+const CHANGED: &str = "the room's work board changed while reading";
+fn changed(why: &str) -> String {
+    format!("{CHANGED} ({why}); refresh and retry")
+}
 const TYPES: &[&str] = &[
     claim::CLAIM,
     claim::RELEASE,
@@ -79,8 +84,15 @@ pub struct Query {
 /// Stateless continuation. A changed room or elapsed lapse refuses it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Cursor {
-    /// Actor/room/display/roster identity of the fold.
+    /// Actor/room/roster/governance/policy identity of the fold. New posts do not move it.
     pub revision: Digest32,
+    /// Saved history instance whose arrival ids this cursor speaks of.
+    pub instance: [u8; 16],
+    /// Newest readable arrival folded into this board; later arrivals wait for a fresh board.
+    pub arrival: u64,
+    /// Readable-row removals (pruning, retention) the saved history had seen; one more means
+    /// the pinned range no longer folds the same input.
+    pub removals: u64,
     /// Clock at which the canonical fold was evaluated.
     pub now_millis: u64,
     /// First deadline at which this board must be recomputed.
@@ -151,9 +163,10 @@ pub struct Page {
     pub version: String,
     /// Whether the canonical version table refuses coordination.
     pub refused: bool,
-    /// Whole-room readable entry count at this fold's position.
+    /// Rendered rows at or below the pinned arrival head this board folds: the prefix folded
+    /// (ADR-021 §7.4). A message still owed has no body and no arrival, and is not counted.
     pub entries: u64,
-    /// Whole-room newest arrival, not greatest send timestamp.
+    /// Newest arrival at the pinned head, not greatest send timestamp.
     pub last: Option<Digest32>,
     /// Bounded selected records.
     pub rows: Vec<Row>,
@@ -166,36 +179,89 @@ fn now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
-fn roster(handle: &NodeHandle, room: Digest32) -> Result<(Digest32, Vec<Digest32>), String> {
+/// The room's identity for one board: who reads, who is a member, and which governance
+/// projection decided that. Ordinary arrivals change none of it.
+struct Roster {
+    me: Digest32,
+    members: Vec<Digest32>,
+    governance: u64,
+}
+fn roster(handle: &NodeHandle, room: Digest32) -> Result<Roster, String> {
     handle.inspect_published_view(|view| {
         let me = view
             .identity
             .as_ref()
             .ok_or("the node is locked")?
             .fingerprint;
-        let members = view
+        let detail = view
             .open_channels
             .iter()
             .find(|r| r.channel_id == room)
-            .ok_or("room not open")?
-            .members
-            .clone();
-        Ok((me, members))
+            .ok_or("room not open")?;
+        Ok(Roster {
+            me,
+            members: detail.members.clone(),
+            governance: detail.governance_revision,
+        })
     })
 }
-async fn token(handle: &NodeHandle, room: Digest32) -> Result<Digest32, String> {
-    let revision = handle.room_display_revision(&room).await?;
-    let (me, members) = roster(handle, room)?;
-    let mut bytes = Vec::with_capacity(64 + members.len() * 32);
-    bytes.extend_from_slice(&revision);
-    bytes.extend_from_slice(&me);
-    for member in members {
-        bytes.extend_from_slice(&member);
+/// What one board is read against: the pinned arrival head (saved instance and arrival), the
+/// saved history's removal count, and the roster, governance and policy summarized in
+/// `revision`. Appends after `through` leave all three alone, and so does a late arrival that
+/// only rewrites the display order (the fold sorts by send time, not display position). A
+/// changed saved instance, or a row pruned or expired out of the saved history, refuses as
+/// "saved history"; a changed retention or classification policy, roster or governance
+/// projection as "roster, governance or policy".
+struct Snapshot {
+    roster: Roster,
+    through: HistoryCursor,
+    revision: Digest32,
+    removals: u64,
+    /// Message retention in seconds, 0 forever.
+    retention: u64,
+}
+impl Snapshot {
+    /// Why a continuation pinned at (`through`, `revision`, `removals`) no longer reads this room.
+    fn refuses(
+        &self,
+        through: HistoryCursor,
+        revision: Digest32,
+        removals: u64,
+    ) -> Option<&'static str> {
+        if self.through.instance != through.instance || self.removals != removals {
+            Some("saved history")
+        } else if self.revision != revision {
+            Some("roster, governance or policy")
+        } else {
+            None
+        }
     }
-    Ok(crate::hash::sha256(&bytes))
+}
+async fn snapshot(handle: &NodeHandle, room: Digest32) -> Result<Snapshot, String> {
+    let state = handle.history_reader().notice_state(room).await?;
+    let roster = roster(handle, room)?;
+    let [_rewrite, retention, step_retention, classification, removals] = state.revision.facts;
+    let mut bytes = Vec::with_capacity(128 + roster.members.len() * 32);
+    bytes.extend_from_slice(b"vox-work-board-snapshot-v1");
+    for fact in [retention, step_retention, classification, roster.governance] {
+        bytes.extend_from_slice(&fact.to_be_bytes());
+    }
+    bytes.extend_from_slice(&roster.me);
+    for member in &roster.members {
+        bytes.extend_from_slice(member);
+    }
+    Ok(Snapshot {
+        roster,
+        through: state.head,
+        revision: crate::hash::sha256(&bytes),
+        removals,
+        retention,
+    })
 }
 /// Read one fresh daemon-folded page. Indexed input is capped before allocation; CPU folding
 /// runs outside the node actor and has at most two simultaneous readers across the daemon.
+/// A continuation folds the input through the arrival head its first page pinned, so a room
+/// that keeps posting still reads as one board; only a changed snapshot refuses it.
 ///
 /// # Errors
 /// Current-authority/read refusal, changed selection, busy reader, or explicit finite capacity.
@@ -203,26 +269,43 @@ pub async fn page(handle: &NodeHandle, room: Digest32, query: Query) -> Result<P
     let permit = READERS
         .try_acquire()
         .map_err(|_| "work board readers are busy; retry")?;
-    let revision = token(handle, room).await?;
+    let Snapshot {
+        roster: Roster { me, members, .. },
+        through: head,
+        revision,
+        removals,
+        retention,
+    } = snapshot(handle, room).await?;
     let clock = now();
     if let Some(c) = &query.after {
-        if c.revision != revision
-            || c.section != query.section
-            || c.member != query.member
-            || clock >= c.valid_until
-            || c.now_millis > clock
-            || c.valid_until > c.now_millis.saturating_add(30_000)
-            || c.offset > POSTS * 1024
-        {
-            return Err(CHANGED.into());
+        let why =
+            if c.instance != head.instance || c.removals != removals || c.arrival > head.arrival {
+                Some("saved history")
+            } else if c.revision != revision {
+                Some("roster, governance or policy")
+            } else if c.section != query.section || c.member != query.member {
+                Some("selection")
+            } else if clock >= c.valid_until
+                || c.now_millis > clock
+                || c.valid_until > c.now_millis.saturating_add(30_000)
+            {
+                Some("cursor lapsed")
+            } else if c.offset > POSTS * 1024 {
+                Some("cursor offset")
+            } else {
+                None
+            };
+        if let Some(why) = why {
+            return Err(changed(why));
         }
     }
     let at = query.after.as_ref().map_or(clock, |c| c.now_millis);
-    let (me, members) = roster(handle, room)?;
-    let through = handle.history_reader().arrival_head(room).await?;
+    let through = HistoryCursor {
+        instance: head.instance,
+        arrival: query.after.as_ref().map_or(head.arrival, |c| c.arrival),
+    };
     let mut input = Input::default();
     let mut after = None;
-    let mut instance = None;
     loop {
         let filters = TYPES
             .iter()
@@ -242,14 +325,17 @@ pub async fn page(handle: &NodeHandle, room: Digest32, query: Query) -> Result<P
         else {
             return Err("unexpected work board input".into());
         };
-        if page.instance != through.instance || instance.is_some_and(|i| i != page.instance) {
-            return Err(CHANGED.into());
+        if page.instance != through.instance {
+            return Err(changed("saved history"));
         }
-        instance = Some(page.instance);
+        // Arrival ids only grow: everything past the pinned head belongs to a later board.
         for row in page.rows {
-            input.admit(row)?;
+            if row.arrival <= through.arrival {
+                input.admit(row)?;
+            }
         }
         match page.next {
+            Some(next) if next.arrival >= through.arrival => break,
             Some(next) if after != Some(next) => after = Some(next),
             Some(_) => return Err("work board input did not advance".into()),
             None => break,
@@ -258,24 +344,53 @@ pub async fn page(handle: &NodeHandle, room: Digest32, query: Query) -> Result<P
     if query.section == Section::Work {
         input.expand_operations(handle, room, through).await?;
     }
+    // The position names the prefix folded (ADR-021 §7.4), never arrivals past the pinned head.
     let Reply::Count { n: entries, last } = handle
-        .room_history(room, HistoryQuery::Count { since: None })
+        .room_history(room, HistoryQuery::Position { through })
         .await?
     else {
         return Err("unexpected work board position".into());
     };
-    if token(handle, room).await? != revision {
-        return Err(CHANGED.into());
+    if let Some(why) = snapshot(handle, room)
+        .await?
+        .refuses(through, revision, removals)
+    {
+        return Err(changed(why));
     }
     // The permit travels into blocking work: cancellation cannot admit an unbounded queue of folds.
+    let pinned = Cursor {
+        revision,
+        instance: through.instance,
+        arrival: through.arrival,
+        removals,
+        now_millis: at,
+        valid_until: 0,
+        section: query.section,
+        member: query.member,
+        offset: 0,
+    };
     let result = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        project(input, members, me, (entries, last), revision, at, query)
+        project(
+            input,
+            members,
+            me,
+            (entries, last),
+            pinned,
+            retention,
+            query,
+        )
     })
     .await
     .map_err(|_| "work board reader stopped")??;
-    if token(handle, room).await? != revision || now() >= result.cursor.valid_until {
-        return Err(CHANGED.into());
+    if let Some(why) = snapshot(handle, room)
+        .await?
+        .refuses(through, revision, removals)
+    {
+        return Err(changed(why));
+    }
+    if now() >= result.cursor.valid_until {
+        return Err(changed("a claim lapsed"));
     }
     Ok(result)
 }
@@ -481,15 +596,20 @@ fn work(post: &Posted, member: Digest32, session: String, kind: &str) -> Work {
 fn matched(q: &Query, row: &Work) -> bool {
     q.member.is_none_or(|m| m == row.member)
 }
+/// `pinned` is the snapshot every page of this board folds against; its `valid_until` is set
+/// here from the first claim lapse the fold found and, under a message retention of
+/// `retention` seconds (0 forever), the first input row to expire: an expired row leaves the
+/// saved history before it is pruned, so the board is not continued past that moment.
 fn project(
     input: Input,
     members: Vec<Digest32>,
     me: Digest32,
     position: (u64, Option<Digest32>),
-    revision: Digest32,
-    at: u64,
+    pinned: Cursor,
+    retention: u64,
     query: Query,
 ) -> Result<Page, String> {
+    let at = pinned.now_millis;
     let (entries, last) = position;
     let Input {
         mut posts,
@@ -507,13 +627,26 @@ fn project(
     let fold = claim::fold(&coordination, VERSION, at);
     let table = version::version_table(&coordination, me, &members, VERSION, at, &fold);
     let by_hash: BTreeMap<_, _> = posts.iter().map(|p| (p.entry_hash, p)).collect();
+    let expiry = (retention != 0)
+        .then(|| {
+            posts
+                .iter()
+                .map(|p| {
+                    p.created_millis
+                        .saturating_add(retention.saturating_mul(1_000))
+                })
+                .min()
+        })
+        .flatten();
     let until = fold
         .resources
         .values()
         .filter_map(State::lapses_at)
+        .chain(expiry)
         .chain(std::iter::once(at.saturating_add(30_000)))
         .min()
-        .unwrap_or(at.saturating_add(30_000));
+        .unwrap_or(at.saturating_add(30_000))
+        .max(at.saturating_add(1));
     let mut out = Output {
         skip: query.after.as_ref().map_or(0, |c| c.offset),
         seen: 0,
@@ -682,12 +815,8 @@ fn project(
         }
     }
     let cursor = Cursor {
-        revision,
-        now_millis: at,
         valid_until: until,
-        section: query.section,
-        member: query.member,
-        offset: 0,
+        ..pinned
     };
     let next = out.more.then(|| Cursor {
         offset: out.seen,

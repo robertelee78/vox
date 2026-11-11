@@ -440,7 +440,9 @@ pub struct SessionFilePage {
 #[derive(Debug, Clone)]
 pub struct NoticeRevision {
     pub(crate) incarnation: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    pub(crate) facts: [u64; 4],
+    /// Display rewrite, retention, step retention, classification, and readable-row removals
+    /// (the last a subset of the first, counted apart for readers that ignore reorders).
+    pub(crate) facts: [u64; 5],
 }
 impl PartialEq for NoticeRevision {
     fn eq(&self, other: &Self) -> bool {

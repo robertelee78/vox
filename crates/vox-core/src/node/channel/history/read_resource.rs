@@ -10,6 +10,7 @@ pub(super) struct ReadFacts {
     pub generation: u64,
     pub projection_ready: bool,
     pub display_rewrite: u64,
+    pub display_removals: u64,
     pub reorder_generation: u64,
     pub body_generation: u64,
     pub classification_revision: u64,
@@ -45,6 +46,7 @@ impl ReadFacts {
                         ch.legacy_sessions.display_revision(),
                     ]),
             display_rewrite: ch.display_rewrite,
+            display_removals: ch.display_removals,
             reorder_generation: ch.dag.reorder_generation(),
             body_generation: ch.dag.body_generation(),
             classification_revision: ch.legacy_sessions.display_revision(),
@@ -103,6 +105,7 @@ impl ReadFacts {
             && self.generation == other.generation
             && self.projection_ready == other.projection_ready
             && self.display_rewrite == other.display_rewrite
+            && self.display_removals == other.display_removals
             && self.reorder_generation == other.reorder_generation
             && self.body_generation == other.body_generation
             && self.classification_revision == other.classification_revision

@@ -248,7 +248,10 @@ refreshing`, or a read says `the room changed while reading; refresh and retry`.
 **Meaning:** a changed room decision is being applied, or the read's selected view changed.
 Vox must not answer an authorization question using superseded grants or an expired
 administrator certificate. Unchanged questions use the completed in-memory room facts;
-after restart those facts are rebuilt from the sealed index.
+after restart those facts are rebuilt from the sealed index. `vox room board` says `the
+room's work board changed while reading` only when the room's membership, governance,
+retention or saved instance changed between its pages; every page of one board folds the
+same snapshot, so other members posting while you read does not interrupt it.
 
 **Fix:** refresh the question as instructed. Do not remove and re-add trust or erase the
 profile to clear it. Once the changed decision is current, `vox room admin list <room>`,

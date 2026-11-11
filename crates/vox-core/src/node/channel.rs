@@ -1350,6 +1350,9 @@ pub struct ChannelState {
     display_shown_at: u64,
     /// Changes that cannot extend the previous rendered prefix.
     display_rewrite: u64,
+    /// Readable rows removed from the rendered prefix (pruning, retention, missing-position
+    /// cleanup); a late arrival that only reorders the prefix leaves it alone.
+    display_removals: u64,
     /// entry hash -> the `LogDb` page it is stored in, so a signature dropped under a
     /// checkpoint (ADR-023 decision 3) can be rewritten in place.
     entries: entry_store::EntryIndex,
@@ -2304,6 +2307,7 @@ impl ChannelState {
             display_order_revision: 0,
             display_shown_at: 0,
             display_rewrite: 0,
+            display_removals: 0,
             entries,
             legacy_preparation: entry_store::Preparation::Ready,
             legacy_cache_trusted: None,
@@ -2944,6 +2948,7 @@ impl ChannelState {
             display_order_revision,
             display_shown_at: 0,
             display_rewrite: 0,
+            display_removals: 0,
             entries,
             legacy_preparation,
             legacy_cache_trusted: None,
@@ -3434,6 +3439,7 @@ impl ChannelState {
             display_order_revision: 0,
             display_shown_at: 0,
             display_rewrite: 0,
+            display_removals: 0,
             entries,
             legacy_preparation: entry_store::Preparation::Ready,
             legacy_cache_trusted: None,
@@ -5795,7 +5801,7 @@ impl ChannelState {
                 writer.seal()?;
                 batch.commit()?;
                 self.entries.committed();
-                self.invalidate_display();
+                self.remove_display_rows();
             }
             self.projection_state.cleanup_cursor = next;
             Ok(())
@@ -5892,6 +5898,13 @@ impl ChannelState {
 
     fn invalidate_display(&mut self) {
         self.display_rewrite = self.display_rewrite.wrapping_add(1);
+    }
+
+    /// [`Self::invalidate_display`] for a change that took readable rows away, which a reader
+    /// folding a fixed arrival range must notice; a reorder is not one.
+    fn remove_display_rows(&mut self) {
+        self.invalidate_display();
+        self.display_removals = self.display_removals.wrapping_add(1);
     }
 
     /// Compare the same sealed snapshot facts used to publish the candidate view. Expiry
@@ -6267,7 +6280,7 @@ impl ChannelState {
         self.entries.committed();
         self.legacy_sessions.committed();
         if display_changed {
-            self.invalidate_display();
+            self.remove_display_rows();
             let tail = self
                 .entries
                 .render_view(store, &self.sek, &self.channel_id)

@@ -935,7 +935,7 @@ impl SemanticProjection {
             channel.dag.install_retention_delta(self.pruned, &[]);
         }
         if self.display_changed {
-            channel.invalidate_display();
+            channel.remove_display_rows();
             channel.display_tail = channel
                 .entries
                 .render_view(store, &channel.sek, &channel.channel_id)?
