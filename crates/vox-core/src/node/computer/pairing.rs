@@ -5543,7 +5543,7 @@ fn merge(s: &mut State, bytes: &[u8], peer: Digest32, signer: &dyn RootSigner) -
         if id != r.id() {
             return Err(bad());
         }
-        r.verify(&group)?;
+        verify_record(&r, &id, &group)?;
         if !s.history.contains_key(&id) && s.history.len() >= MAX_RECORDS {
             return Err(Error::Profile(if previously_enrolled {
                 HISTORY_FULL
