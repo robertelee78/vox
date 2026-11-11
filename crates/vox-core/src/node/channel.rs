@@ -1280,6 +1280,9 @@ pub struct ChannelState {
     /// R5): durable in `SEG_OWN_BEHIND`; every write here refuses with `OwnHistoryBehind`.
     own_behind: bool,
     own_recovery: own_history::Recovery,
+    /// Own heads already verified under this node's key, as exact wire digests
+    /// (`own_history::checked_own_head`); bounded, volatile.
+    own_heads_verified: std::sync::Mutex<Vec<Digest32>>,
     /// Volatile bounded retirement scan; restart begins a fresh safety audit, not a deletion.
     historical_retirement: own_historical_keys::Retirement,
     availability: availability::State,
@@ -2266,6 +2269,7 @@ impl ChannelState {
             governance_semantic: std::sync::Mutex::new(governance::SemanticState::default()),
             own_behind: false,
             own_recovery: own_history::Recovery::UnknownBehind,
+            own_heads_verified: std::sync::Mutex::new(Vec::new()),
             historical_retirement: own_historical_keys::Retirement::default(),
             availability: availability::State::new()?,
             presence: BTreeMap::new(),
@@ -2904,6 +2908,7 @@ impl ChannelState {
             governance_semantic: std::sync::Mutex::new(governance::SemanticState::default()),
             own_behind,
             own_recovery,
+            own_heads_verified: std::sync::Mutex::new(Vec::new()),
             historical_retirement: own_historical_keys::Retirement::default(),
             availability: availability::State::new()?,
             presence,
@@ -3394,6 +3399,7 @@ impl ChannelState {
             governance_semantic: std::sync::Mutex::new(governance::SemanticState::default()),
             own_behind: recovery.is_some(),
             own_recovery: recovery.unwrap_or(own_history::Recovery::UnknownBehind),
+            own_heads_verified: std::sync::Mutex::new(Vec::new()),
             historical_retirement: own_historical_keys::Retirement::default(),
             availability: availability::State::new()?,
             presence: BTreeMap::new(),

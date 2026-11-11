@@ -1034,6 +1034,11 @@ impl ChannelState {
         Ok(())
     }
 
+    /// `SignedHead::verify` is a pure function of the head's wire bytes (body and
+    /// signature) and the key, so a head this node already verified under its own key is
+    /// not verified again on every outbound sync start. The memo is keyed by the digest of
+    /// the exact wire bytes and the key's fingerprint, never by `SignedHead::id`, which
+    /// excludes the signature; it holds only heads that completed verification.
     fn checked_own_head(&self, head: &SignedHead) -> Result<()> {
         if head.binding.room != self.channel_id
             || head.binding.author != self.me()
@@ -1045,8 +1050,24 @@ impl ChannelState {
             .authors
             .get(&self.me())
             .ok_or(Error::OwnHistoryBehind)?;
+        let mut input = head.to_wire();
+        input.extend_from_slice(&key.fingerprint());
+        let memo = sha256(&input);
+        let mut verified = self
+            .own_heads_verified
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if verified.contains(&memo) {
+            return Ok(());
+        }
         match head.verify(key, &mut WorkBudget::default())? {
-            HistoryStep::Complete(_) => Ok(()),
+            HistoryStep::Complete(_) => {
+                if verified.len() >= 8 {
+                    verified.remove(0);
+                }
+                verified.push(memo);
+                Ok(())
+            }
             HistoryStep::Yielded | HistoryStep::Progress(_) | HistoryStep::MissingContext(_) => {
                 Err(Error::OwnHistoryBehind)
             }
