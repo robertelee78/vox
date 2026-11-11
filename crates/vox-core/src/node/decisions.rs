@@ -307,32 +307,6 @@ impl DecisionLog {
         );
     }
 
-    /// A sealed day the current key does not open is set aside as
-    /// `<day>.unreadable-<unix ms>.sealed`, said once, so the days it does open still count
-    /// (#1206). What that day recorded is lost to automation only: a removal in it is not
-    /// imported, and the line says so.
-    fn set_aside_unreadable(&self, path: &std::path::Path, day: i64, why: &crate::error::Error) {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
-        let aside = self
-            .dir
-            .join(format!("{}.unreadable-{now_ms}.sealed", date_of(day)));
-        match std::fs::rename(path, &aside) {
-            Ok(()) => eprintln!(
-                "vox: the decision record for {} does not open under this identity ({why}); moved \
-                 to {} — a trust removal recorded in it is not imported for automatic local trust",
-                date_of(day),
-                aside.display()
-            ),
-            Err(e) => eprintln!(
-                "vox: the decision record for {} does not open under this identity ({why}), and \
-                 could not be set aside: {e}",
-                date_of(day)
-            ),
-        }
-    }
-
     fn key(&self) -> Option<Arc<Sek>> {
         self.key
             .lock()
@@ -601,16 +575,22 @@ impl DecisionLog {
             let events = if sealed {
                 match Self::read_day_for_local_trust(&key, day, &bytes) {
                     Ok(events) => events,
-                    // Sealed under a key this identity does not have — none of its records
-                    // open — it is set aside, said, and the other days still count. A day of
-                    // which any record opens stays the error it is (a mixed-key day, a damaged
-                    // or tampered record): a removal it holds must not be dropped by setting
-                    // the day aside, so automation stays off, as before.
-                    Err(why @ Error::AtRestUnlockFailed)
-                        if Self::read_day(&key, day, &bytes).is_empty() =>
-                    {
-                        self.set_aside_unreadable(&entry.path(), day, &why);
-                        continue;
+                    // A day this identity cannot open keeps automation off, as before: a
+                    // removal it may hold must not be dropped, and no decrypt can tell an
+                    // obsolete key from a tampered record. The line names the file, so a
+                    // person who recreated this node (the one case that leaves such a day
+                    // behind; a new identity now starts empty, `start_fresh`) can move it aside.
+                    Err(Error::AtRestUnlockFailed) => {
+                        return Err(Error::Storage {
+                            op: "open local trust history",
+                            detail: format!(
+                                "the decision record {} does not open under this identity; if this \
+                                 node was recreated over an earlier one, move that file out of {} \
+                                 and automatic local trust resumes",
+                                entry.path().display(),
+                                self.dir.display()
+                            ),
+                        });
                     }
                     Err(error) => return Err(error),
                 }
