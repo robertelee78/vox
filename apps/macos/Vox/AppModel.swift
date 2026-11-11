@@ -124,6 +124,7 @@ final class AppModel: ObservableObject {
             }
         }
         Daemon.refreshSkillPack { [weak self] said in self?.agentSetupSaid = said }
+        Task { await showUpdateResult() }
         if Daemon.kept() == nil {
             phase = .askingLoginItem
             return
@@ -186,33 +187,31 @@ final class AppModel: ObservableObject {
 
     @Published private(set) var updating = false
     @Published private(set) var updateSaid: String?
-    @Published private(set) var updated = false
 
-    /// The app uses the same verified bundle replacement and daemon restart as `vox update`.
+    /// The app runs the same `vox update` a terminal does, detached from this process: the
+    /// updater quits this app (or stops it when it does not quit) and reopens the installed
+    /// one, so a child in the app's session with a pipe to it would die or SIGPIPE with it
+    /// (2026-11-11). What the updater says is read from its log, by this process if it is
+    /// still here when the update ends, else by the app the updater reopened (`start`).
     func updateVox() async {
         guard !updating else { return }
-        updating = true
         updateSaid = nil
-        updated = false
-        defer { updating = false }
         do {
-            updateSaid = try await Daemon.command(["update"], patience: 300)
-            updated = true
+            try Daemon.startDetachedUpdate()
         } catch {
             updateSaid = sentence(error)
+            return
         }
+        await showUpdateResult()
     }
 
-    /// Open the installed bundle after updating; the current process keeps its old code until quit.
-    func reopenUpdatedApp() {
-        let configuration = NSWorkspace.OpenConfiguration()
-        configuration.createsNewApplicationInstance = true
-        NSWorkspace.shared.openApplication(at: Bundle.main.bundleURL, configuration: configuration) { _, error in
-            Task { @MainActor in
-                if let error { self.updateSaid = sentence(error) }
-                else { NSApp.terminate(nil) }
-            }
-        }
+    /// What the last `vox update` run from this app said, once it has ended; shown by the app
+    /// the updater reopened. Nothing when no update was run from the app.
+    private func showUpdateResult() async {
+        guard Daemon.updateRunning() else { return }
+        updating = true
+        defer { updating = false }
+        if let said = await Daemon.updateResult() { updateSaid = said }
     }
 
     /// Restart the same account's daemon using this app's bundled version (ADR-034 UP-2).
