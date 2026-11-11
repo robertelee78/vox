@@ -85,8 +85,15 @@ impl ChannelState {
             {
                 continue;
             }
+            // One peer whose Session control facts still lag its verified head is not a reader
+            // of this round: its support declaration may be in the rows not yet projected. It is
+            // answered per author (ADR-037 R4), not by refusing the whole announcement — that
+            // withheld this node's own Sessions from every other member, and with them the
+            // control append the round carries, for as long as one member's frontier lagged
+            // (#1206). The reader set differing from the announced one re-announces once the
+            // catch-up brings that peer current.
             if !self.current_session_control_ready(store, peer)? {
-                return Err(Error::StreamRefused(private_session::CONTROL_REFRESHING));
+                continue;
             }
             if private_index::control(&store.snapshot()?, &self.sek, &self.channel_id, peer)?
                 .support

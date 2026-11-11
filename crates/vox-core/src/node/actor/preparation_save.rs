@@ -411,6 +411,48 @@ impl Node {
         }
     }
 
+    /// Drive the Session control catch-up of every published room whose frontier lags an
+    /// author's verified head, at a pace (#1206). The catch-up used to run only from a Session
+    /// query, a refused room publication, or a deferred legacy migration; a room that merely
+    /// received an author's rows out of sequence kept answering "Session control facts are
+    /// refreshing" for that author — refusing its Session pulls, its announcement round, and
+    /// with it the own-feed control append every member waits on — until a client happened
+    /// to ask about Sessions. Each room is inspected at most once per `PREPARE_WAIT`; the
+    /// inspection is scalar reads under a try-lock, and a current room costs nothing more.
+    pub(super) async fn drive_session_control_catch_up(&mut self) {
+        let now = std::time::Instant::now();
+        let Some(store) = self
+            .profile
+            .as_ref()
+            .filter(|profile| profile.is_unlocked())
+            .map(|profile| profile.store_handle())
+        else {
+            return;
+        };
+        let rooms: Vec<(Digest32, SharedChannel)> = self
+            .channels
+            .iter()
+            .filter(|(room, _)| {
+                self.session_control_check_at
+                    .get(*room)
+                    .is_none_or(|at| *at <= now)
+            })
+            .map(|(room, instance)| (*room, Arc::clone(instance)))
+            .collect();
+        for (room, instance) in rooms {
+            let Ok(channel) = instance.try_lock() else {
+                continue; // A session holds it; the next tick looks again.
+            };
+            self.session_control_check_at
+                .insert(room, now + super::PREPARE_WAIT);
+            let lagging = matches!(channel.session_controls_lagging(&store), Ok(true));
+            drop(channel);
+            if lagging {
+                self.spawn_session_projection_catch_up(&room, None).await;
+            }
+        }
+    }
+
     pub(super) async fn spawn_session_projection_catch_up(
         &mut self,
         room: &Digest32,

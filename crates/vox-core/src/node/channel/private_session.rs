@@ -1009,6 +1009,20 @@ impl ChannelState {
         Ok(true)
     }
 
+    /// Whether some author's Session control frontier is behind its verified head here, so
+    /// the bounded catch-up has work (#1206). A frontier falls behind whenever an author's
+    /// rows are accepted out of sequence — a page of bounded sync, a row held and released
+    /// later — because the receive path advances it only through a contiguous row; nothing
+    /// but the catch-up closes the gap, and until it does every answer about that author is
+    /// "Session control facts are refreshing".
+    pub(crate) fn session_controls_lagging(&self, store: &Store) -> Result<bool> {
+        if self.poisoned || self.has_left(&self.me()) {
+            return Ok(false);
+        }
+        self.current_session_controls_ready(store)
+            .map(|ready| !ready)
+    }
+
     pub(crate) fn needs_session_upgrade(&self) -> bool {
         self.private_sessions.upgrading
             || self.private_sessions.restoring

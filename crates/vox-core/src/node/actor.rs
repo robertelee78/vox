@@ -6773,6 +6773,10 @@ pub struct Node {
     /// Published rooms whose legacy Session migration waits on a member's records, with the
     /// time of its next paced retry (#1203).
     session_upgrade_retry_at: BTreeMap<Digest32, std::time::Instant>,
+    /// Published rooms whose Session control frontier was last checked against its authors'
+    /// verified heads, with the time of the next paced check; a lagging room's catch-up is
+    /// driven from here, not only from a Session query or a refused publication (#1206).
+    session_control_check_at: BTreeMap<Digest32, std::time::Instant>,
     key_package_after: Option<Digest32>,
     /// Exact off-actor unwraps; a close/lock cannot be undone by their late result.
     opening_rooms: BTreeMap<Digest32, Arc<()>>,
@@ -7446,6 +7450,7 @@ impl Node {
             key_package_unopened: BTreeSet::new(),
             key_package_retry_at: BTreeMap::new(),
             session_upgrade_retry_at: BTreeMap::new(),
+            session_control_check_at: BTreeMap::new(),
             key_package_after: None,
             opening_rooms: BTreeMap::new(),
             locking: 0,
@@ -8452,6 +8457,7 @@ impl Node {
                     let tended = self.tend_lifecycle().await;
                     self.reclaim_session_drive_receipt().await;
                     self.retry_deferred_session_upgrades().await;
+                    self.drive_session_control_catch_up().await;
                     // Empty read and key-prune work both take a room's durable owner.
                     // Alternate priority so neither can starve the other; advance the
                     // read-room cursor only on its priority turn.
@@ -19784,6 +19790,7 @@ impl Node {
         self.key_package_unopened.clear();
         self.key_package_retry_at.clear();
         self.session_upgrade_retry_at.clear();
+        self.session_control_check_at.clear();
         self.key_package_after = None;
         self.room_publication_authority.clear();
         self.publication_after = None;
