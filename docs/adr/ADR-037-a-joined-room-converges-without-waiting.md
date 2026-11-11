@@ -170,13 +170,18 @@ consequences were room-wide, against this requirement: the legacy Session announ
 refused itself whole when any consented reader lagged, withholding this node's Sessions and
 the own-feed control append from every other member; and a departure `vox room leave` writes
 is heard only by a round that ends cleanly, so it waited behind the same refusals. Now the
-actor drives the catch-up
-for every published room whose frontier lags, paced once per second per room
-(`drive_session_control_catch_up`), and the announcement round skips the lagging reader
-instead of refusing: the reader set differing from the announced one re-announces once that
-author is current. Nothing is encrypted to a reader the round could not vouch for.
+actor drives the catch-up for every published room whose frontier lags
+(`drive_session_control_catch_up`): after the tick's settlement and reads, one room per tick,
+the rooms taking turns from the one begun last, and a room whose catch-up ends waiting on a
+peer with nothing advanced (a control entry this node does not hold, a departed author's
+frontier) looked at again after a doubling wait of up to a minute — it would otherwise take
+the one Store turn every tick ahead of every other room. The announcement round skips the
+lagging reader instead of refusing, keeping it recorded at the grant it was last announced at,
+so it is not a new reader — the whole own feed announced again — once it is current; the
+reader set differing from the announced one re-announces once that author is current. Nothing
+is encrypted to a reader the round could not vouch for.
 
-**v0.4.26 correction (#1206): a refreshing fold keeps the stream class.** `refresh_network_view`
+**v0.4.26 correction (#1206): a refreshing fold keeps stream admission.** `refresh_network_view`
 rebuilds the whole `PeerPolicy` and, for a room whose checked view answered REFRESHING (every
 governance row's arrival re-runs it before the fold has settled, and so does startup), it
 contributed no members and treated a `peer_removal_applied` error as removed. Every member of

@@ -115,6 +115,68 @@ pub(super) fn publication_eligible(
             || node.room_publication_authority.contains_key(room))
 }
 
+/// The longest a room whose Session control catch-up keeps ending with nothing advanced waits
+/// between driven checks (#1206).
+const SESSION_CONTROL_CHECK_MAX: Duration = Duration::from_secs(60);
+
+/// When each published room's Session control frontier is next checked against its authors'
+/// verified heads by [`Node::drive_session_control_catch_up`], and whose turn it is (#1206).
+#[derive(Default)]
+pub(super) struct SessionControlChecks {
+    /// Per room: the time of its next check, and the wait that set it. A catch-up that ended
+    /// waiting on a peer with nothing advanced doubles the wait, up to
+    /// [`SESSION_CONTROL_CHECK_MAX`]; one that advanced, or a current frontier, resets it to
+    /// `PREPARE_WAIT`.
+    rooms: BTreeMap<Digest32, (std::time::Instant, Duration)>,
+    /// The room whose catch-up the driver last began; the next tick looks after it first.
+    cursor: Option<Digest32>,
+}
+
+impl SessionControlChecks {
+    pub(super) fn remove(&mut self, room: &Digest32) {
+        self.rooms.remove(room);
+    }
+
+    pub(super) fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    fn due(&self, room: &Digest32, now: std::time::Instant) -> bool {
+        self.rooms.get(room).is_none_or(|(at, _)| *at <= now)
+    }
+
+    fn wait_of(&self, room: &Digest32) -> Duration {
+        self.rooms
+            .get(room)
+            .map_or(super::PREPARE_WAIT, |(_, wait)| *wait)
+    }
+
+    /// The room's frontier is current: looked at again after `PREPARE_WAIT`.
+    fn current(&mut self, room: Digest32, now: std::time::Instant) {
+        self.rooms
+            .insert(room, (now + super::PREPARE_WAIT, super::PREPARE_WAIT));
+    }
+
+    /// A catch-up for the room was attempted: its turn is taken, at its current wait.
+    fn began(&mut self, room: Digest32, now: std::time::Instant) {
+        let wait = self.wait_of(&room);
+        self.rooms.insert(room, (now + wait, wait));
+        self.cursor = Some(room);
+    }
+
+    /// A catch-up run for the room ended. Nothing advanced: the next look waits twice as long,
+    /// up to [`SESSION_CONTROL_CHECK_MAX`]. Something did: the pace is back to `PREPARE_WAIT`.
+    fn catch_up_ended(&mut self, room: Digest32, advanced: bool) {
+        let wait = if advanced {
+            super::PREPARE_WAIT
+        } else {
+            (self.wait_of(&room) * 2).min(SESSION_CONTROL_CHECK_MAX)
+        };
+        self.rooms
+            .insert(room, (std::time::Instant::now() + wait, wait));
+    }
+}
+
 pub(super) struct Continuation {
     pub(super) instance: SharedChannel,
     pub(super) attachment: u64,
@@ -123,6 +185,9 @@ pub(super) struct Continuation {
     // The pre-existing catch-up bound, not a new maintenance cap. Each projection quantum
     // consumes one turn; prerequisite writes remain part of that same turn.
     remaining: usize,
+    /// Whether any quantum of this catch-up run advanced something (#1206): a run that ends
+    /// waiting on a peer having advanced nothing paces that room's next driven check.
+    advanced: bool,
 }
 
 impl Continuation {
@@ -133,6 +198,7 @@ impl Continuation {
             lifetime: None,
             stage,
             remaining: 64,
+            advanced: false,
         }
     }
     pub(super) fn lifetime(&self) -> Option<Arc<Lifetime>> {
@@ -283,10 +349,15 @@ impl Node {
         continuation.lifetime = Some(lifetime);
         let next = match (continuation.stage, saved) {
             (Stage::CatchUpgrade, Saved::Private(private_save::Saved::UpgradeComplete)) => {
+                continuation.advanced = true;
                 let Ok(channel) = continuation.instance.try_lock() else {
+                    self.session_control_check_at
+                        .catch_up_ended(room, continuation.advanced);
                     return;
                 };
                 if channel.needs_session_upgrade() {
+                    self.session_control_check_at
+                        .catch_up_ended(room, continuation.advanced);
                     return;
                 }
                 drop(channel);
@@ -294,23 +365,29 @@ impl Node {
                 Work::Projection(ProjectionWork::Sessions)
             }
             (Stage::CatchUpgrade, Saved::Private(private_save::Saved::ControlImport)) => {
+                continuation.advanced = true;
                 continuation.stage = Stage::CatchImport;
                 Work::Consent(consent_save::Work::ControlImport)
             }
             (Stage::CatchUpgrade, Saved::Private(private_save::Saved::PrivateExpiry)) => {
+                continuation.advanced = true;
                 continuation.stage = Stage::CatchExpiry;
                 Work::Retention(Step::PrivateExpiry)
             }
             (Stage::CatchUpgrade, Saved::Private(private_save::Saved::Upgrade(saved))) => {
                 if saved.advance == SessionAdvance::Waiting {
+                    self.session_control_check_at
+                        .catch_up_ended(room, continuation.advanced);
                     return;
                 }
+                continuation.advanced = true;
                 Work::Private(private_save::Work::Upgrade {
                     finish_initial: false,
                 })
             }
             (Stage::CatchImport, Saved::Consent(consent_save::Effect::ControlImport))
             | (Stage::CatchExpiry, Saved::Retention(_)) => {
+                continuation.advanced = true;
                 continuation.stage = Stage::CatchUpgrade;
                 Work::Private(private_save::Work::Upgrade {
                     finish_initial: false,
@@ -320,6 +397,7 @@ impl Node {
                 Stage::CatchProjection,
                 Saved::Projection(ProjectionProgress::Sessions { advanced: true }),
             ) if continuation.remaining > 1 => {
+                continuation.advanced = true;
                 continuation.remaining -= 1;
                 continuation.stage = Stage::CatchUpgrade;
                 Work::Private(private_save::Work::Upgrade {
@@ -328,7 +406,11 @@ impl Node {
             }
             // Waiting, unavailable and a genuinely finished projection stop this original
             // catch-up run. A later ordinary query/announcement can request another run.
-            _ => return,
+            _ => {
+                self.session_control_check_at
+                    .catch_up_ended(room, continuation.advanced);
+                return;
+            }
         };
         tokio::task::yield_now().await;
         Box::pin(self.begin_pending_maintenance(
@@ -417,9 +499,20 @@ impl Node {
     /// received an author's rows out of sequence kept answering "Session control facts are
     /// refreshing" for that author — refusing its Session pulls, its announcement round, and
     /// with it the own-feed control append every member waits on — until a client happened
-    /// to ask about Sessions. Each room is inspected at most once per `PREPARE_WAIT`; the
-    /// inspection is scalar reads under a try-lock, and a current room costs nothing more.
+    /// to ask about Sessions. The inspection is scalar reads under a try-lock; a current room
+    /// costs nothing more and is looked at once per `PREPARE_WAIT`.
+    ///
+    /// One catch-up is begun per tick — its save owns the Store — and the rooms take turns
+    /// from the one begun last ([`SessionControlChecks::cursor`]). A room whose catch-up ends
+    /// waiting on a peer with nothing advanced (an author's control entry this node does not
+    /// hold, a departed author's frontier) is looked at again after a doubling wait, up to
+    /// [`SESSION_CONTROL_CHECK_MAX`]: it would otherwise take the one turn every tick, ahead
+    /// of every other room's catch-up and of the room maintenance that runs after this.
     pub(super) async fn drive_session_control_catch_up(&mut self) {
+        // Nothing can be begun while a save owns the Store; the due rooms stay due.
+        if self.store_save_pending() {
+            return;
+        }
         let now = std::time::Instant::now();
         let Some(store) = self
             .profile
@@ -429,42 +522,51 @@ impl Node {
         else {
             return;
         };
-        let rooms: Vec<(Digest32, SharedChannel)> = self
+        let mut rooms: Vec<(Digest32, SharedChannel)> = self
             .channels
             .iter()
-            .filter(|(room, _)| {
-                self.session_control_check_at
-                    .get(*room)
-                    .is_none_or(|at| *at <= now)
-            })
+            .filter(|(room, _)| self.session_control_check_at.due(room, now))
             .map(|(room, instance)| (*room, Arc::clone(instance)))
             .collect();
+        if let Some(cursor) = self.session_control_check_at.cursor {
+            let first = rooms
+                .iter()
+                .position(|(room, _)| *room > cursor)
+                .unwrap_or(0);
+            rooms.rotate_left(first);
+        }
         for (room, instance) in rooms {
             let Ok(channel) = instance.try_lock() else {
                 continue; // A session holds it; the next tick looks again.
             };
-            self.session_control_check_at
-                .insert(room, now + super::PREPARE_WAIT);
             let lagging = matches!(channel.session_controls_lagging(&store), Ok(true));
             drop(channel);
-            if lagging {
-                self.spawn_session_projection_catch_up(&room, None).await;
+            if !lagging {
+                self.session_control_check_at.current(room, now);
+                continue;
+            }
+            let began = self.spawn_session_projection_catch_up(&room, None).await;
+            self.session_control_check_at.began(room, now);
+            if began {
+                return;
             }
         }
     }
 
+    /// Whether the catch-up was begun; it is not when a save already owns the Store, or the
+    /// room cannot take maintenance right now.
     pub(super) async fn spawn_session_projection_catch_up(
         &mut self,
         room: &Digest32,
         lifetime: Option<Arc<Lifetime>>,
-    ) {
+    ) -> bool {
         if self.pending_posts.contains_key(room)
             || (lifetime.is_none() && self.store_save_pending())
         {
-            return;
+            return false;
         }
         let Some(instance) = self.channels.get(room).cloned() else {
-            return;
+            return false;
         };
         let mut continuation =
             Continuation::new(instance, self.delivery_epoch, Stage::CatchUpgrade);
@@ -477,7 +579,7 @@ impl Node {
             maintenance_save::Continuation::Preparation(continuation),
             None,
         )
-        .await;
+        .await
     }
 
     /// Establish the same prerequisites as the former synchronous preparation, in the

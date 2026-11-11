@@ -6773,10 +6773,10 @@ pub struct Node {
     /// Published rooms whose legacy Session migration waits on a member's records, with the
     /// time of its next paced retry (#1203).
     session_upgrade_retry_at: BTreeMap<Digest32, std::time::Instant>,
-    /// Published rooms whose Session control frontier was last checked against its authors'
-    /// verified heads, with the time of the next paced check; a lagging room's catch-up is
+    /// When each published room's Session control frontier is next checked against its
+    /// authors' verified heads, and whose turn the catch-up is; a lagging room's catch-up is
     /// driven from here, not only from a Session query or a refused publication (#1206).
-    session_control_check_at: BTreeMap<Digest32, std::time::Instant>,
+    session_control_check_at: preparation_save::SessionControlChecks,
     key_package_after: Option<Digest32>,
     /// Exact off-actor unwraps; a close/lock cannot be undone by their late result.
     opening_rooms: BTreeMap<Digest32, Arc<()>>,
@@ -7450,7 +7450,7 @@ impl Node {
             key_package_unopened: BTreeSet::new(),
             key_package_retry_at: BTreeMap::new(),
             session_upgrade_retry_at: BTreeMap::new(),
-            session_control_check_at: BTreeMap::new(),
+            session_control_check_at: preparation_save::SessionControlChecks::default(),
             key_package_after: None,
             opening_rooms: BTreeMap::new(),
             locking: 0,
@@ -8457,7 +8457,6 @@ impl Node {
                     let tended = self.tend_lifecycle().await;
                     self.reclaim_session_drive_receipt().await;
                     self.retry_deferred_session_upgrades().await;
-                    self.drive_session_control_catch_up().await;
                     // Empty read and key-prune work both take a room's durable owner.
                     // Alternate priority so neither can starve the other; advance the
                     // read-room cursor only on its priority turn.
@@ -8499,6 +8498,11 @@ impl Node {
                     self.resume_session_retirements();
                     self.retry_upgrades_if_due().await;
                     self.maintain_prekeys();
+                    // After settlement and the reads: a lagging Session control frontier's
+                    // catch-up is maintenance a room can wait a tick for, and a room whose
+                    // catch-up waits on a peer must not take every room's one Store turn ahead
+                    // of them (#1206).
+                    self.drive_session_control_catch_up().await;
                     self.renew_records_if_due().await;
                     if self.view_stale.load(std::sync::atomic::Ordering::Relaxed) {
                         self.refresh_network_view().await;

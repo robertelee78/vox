@@ -26,6 +26,10 @@ pub(crate) struct PendingAnnouncement {
     sek: crate::atrest::sek::WeakSek,
     previous: Option<Announcements>,
     readers: BTreeMap<Digest32, (u64, u64, u64, u64)>,
+    /// Consented readers this round cannot vouch for because their Session control facts lag
+    /// (#1206). Their last announced grant is kept in the recorded reader set, see
+    /// [`Announcements::keep_lagging`].
+    lagging: BTreeSet<Digest32>,
     feed: Option<crate::log::feed::Feed>,
     verified: u64,
     now: crate::time::Ms,
@@ -77,6 +81,7 @@ impl ChannelState {
             return Ok(None);
         }
         let mut readers = BTreeMap::new();
+        let mut lagging = BTreeSet::new();
         for peer in self.authors.keys() {
             if *peer == me
                 || self.has_left(peer)
@@ -90,9 +95,10 @@ impl ChannelState {
             // answered per author (ADR-037 R4), not by refusing the whole announcement — that
             // withheld this node's own Sessions from every other member, and with them the
             // control append the round carries, for as long as one member's frontier lagged
-            // (#1206). The reader set differing from the announced one re-announces once the
-            // catch-up brings that peer current.
+            // (#1206). What it was last announced at stays recorded (`keep_lagging`), so a reader
+            // merely lagging is not a new one once it is current again.
             if !self.current_session_control_ready(store, peer)? {
+                lagging.insert(*peer);
                 continue;
             }
             if private_index::control(&store.snapshot()?, &self.sek, &self.channel_id, peer)?
@@ -107,6 +113,9 @@ impl ChannelState {
                     (self.admission(peer).0, self.epoch, *generation, *iteration),
                 );
             }
+        }
+        if let Some(previous) = &self.legacy_announced {
+            previous.keep_lagging(&mut readers, &lagging);
         }
         let verified = self.dag.verified_head(&me);
         if self
@@ -128,6 +137,7 @@ impl ChannelState {
             sek: self.sek.reader(),
             previous,
             readers,
+            lagging,
             feed,
             verified,
             now,
@@ -181,6 +191,8 @@ impl PendingAnnouncement {
                     None => Announcements::default(),
                 },
             };
+            // The cursor may have been read from the segment only now.
+            previous.keep_lagging(&mut self.readers, &self.lagging);
             let new_reader = self
                 .readers
                 .iter()
@@ -298,6 +310,23 @@ pub(super) fn entry_steps_in(
 }
 
 impl Announcements {
+    /// Keep a lagging reader at the grant it was last announced at. Dropping it from the
+    /// recorded reader set made it a new reader when it was current again — `through` back to
+    /// 0, and this node's whole own feed announced to every reader a second time as duplicate
+    /// `LegacySessionIndex` entries (#1206). A reader never announced to stays out: nothing
+    /// was vouched for it. A grant that changed while it lagged still makes it new.
+    fn keep_lagging(
+        &self,
+        readers: &mut BTreeMap<Digest32, (u64, u64, u64, u64)>,
+        lagging: &BTreeSet<Digest32>,
+    ) {
+        for peer in lagging {
+            if let Some(grant) = self.readers.get(peer) {
+                readers.insert(*peer, *grant);
+            }
+        }
+    }
+
     fn seal(&self, sek: &Sek, me: &Digest32) -> Result<SealedSegment> {
         let mut cursor = Encoder::new();
         cursor
