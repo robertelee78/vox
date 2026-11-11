@@ -103,9 +103,10 @@ pub(super) async fn answer(
                                     && head.binding.scope == crate::log::history::LogScope::Public
                             })
                         }
-                        Query::Context(hash) => room
-                            .history_head(store, &me)?
-                            .is_some_and(|head| head.root.frontier == hash),
+                        // A member checking the departure needs its pre-context and the
+                        // proof siblings' frontier contexts; a context carries only
+                        // author/seq/hash coordinates, never a body.
+                        Query::Context(_) => true,
                         _ => false,
                     };
                     return Ok(Some((allowed, false)));

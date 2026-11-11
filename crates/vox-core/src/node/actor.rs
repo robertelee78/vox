@@ -182,6 +182,8 @@ struct LeaveWaiter {
     /// When the room goes unheard, unix milliseconds: [`LEAVE_BOUND_MS`] after the departure's
     /// own clock.
     deadline_ms: u64,
+    /// A member has the departure, and only the purge is owed (`finish_leave_if_heard`).
+    heard: bool,
     committed: Option<leave_save::CommittedDeparture>,
 }
 
@@ -13779,12 +13781,18 @@ impl Node {
                     self.spawn_session_projection_catch_up(&channel_id, None)
                         .await;
                 }
+                // A room this identity left is read no more (ADR-023 RL-8.1a): the same answer
+                // a post gets, whoever still holds the room's id.
                 let result = match (self.channels.get(&channel_id), self.profile.as_ref()) {
                     (Some(shared), Some(profile)) => {
                         let mut room = shared.lock().await;
-                        // A saved read never takes the store writer. The existing bounded
-                        // fold worker publishes catch-up separately from this query.
-                        room.session_activity_query(profile.store(), query, self.now_ms().get())
+                        if room.has_left(&room.me()) {
+                            Err(Fault::RoomLeft.explain().to_owned())
+                        } else {
+                            // A saved read never takes the store writer. The existing bounded
+                            // fold worker publishes catch-up separately from this query.
+                            room.session_activity_query(profile.store(), query, self.now_ms().get())
+                        }
                     }
                     _ => Err("room not open".into()),
                 };
@@ -13802,12 +13810,16 @@ impl Node {
                 let result = match (self.channels.get(&channel_id), self.profile.as_ref()) {
                     (Some(shared), Some(profile)) => {
                         let mut room = shared.lock().await;
-                        room.session_query(
-                            profile.store(),
-                            query,
-                            crate::node::ipc::rows_budget(),
-                            self.now_ms().get(),
-                        )
+                        if room.has_left(&room.me()) {
+                            Err(Fault::RoomLeft.explain().to_owned())
+                        } else {
+                            room.session_query(
+                                profile.store(),
+                                query,
+                                crate::node::ipc::rows_budget(),
+                                self.now_ms().get(),
+                            )
+                        }
                     }
                     _ => Err("room not open".into()),
                 };
@@ -13825,12 +13837,16 @@ impl Node {
                 let result = match (self.channels.get(&channel_id), self.profile.as_ref()) {
                     (Some(shared), Some(profile)) => {
                         let mut room = shared.lock().await;
-                        room.session_file_query(
-                            profile.store(),
-                            query,
-                            crate::node::ipc::rows_budget(),
-                            self.now_ms().get(),
-                        )
+                        if room.has_left(&room.me()) {
+                            Err(Fault::RoomLeft.explain().to_owned())
+                        } else {
+                            room.session_file_query(
+                                profile.store(),
+                                query,
+                                crate::node::ipc::rows_budget(),
+                                self.now_ms().get(),
+                            )
+                        }
                     }
                     _ => Err("room not open".into()),
                 };
@@ -21741,6 +21757,7 @@ impl Node {
             generation,
             serial,
             deadline_ms,
+            heard: false,
             committed,
         });
         self.arm_leave_bound(channel_id, serial, deadline_ms);
@@ -21791,25 +21808,42 @@ impl Node {
 
     /// A sync session of `channel_id` ended cleanly having sent this node's HAVE at generation
     /// `sent`: a leave whose departure was written at or before it has been heard, and the room
-    /// is deleted.
+    /// is deleted. As the unheard path, the waiter stays until the purge lands
+    /// (`finish_saved_purge` takes it); a purge refused for the moment is tried again after
+    /// [`LEAVE_RETRY_MS`], and the room stays named as leaving until then.
     async fn finish_leave_if_heard(&mut self, channel_id: Digest32, sent: u64) {
-        let (heard, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.leave_waiters)
-            .into_iter()
-            .partition(|w| w.room == channel_id && w.generation <= sent);
-        self.leave_waiters = waiting;
+        let mut heard = Vec::new();
+        let mut stale = Vec::new();
+        for waiter in self
+            .leave_waiters
+            .iter()
+            // One already heard has its purge, and its retry, in hand.
+            .filter(|w| w.room == channel_id && w.generation <= sent && !w.heard)
+        {
+            // A late legacy receipt cannot purge a replacement room attachment or epoch.
+            match &waiter.committed {
+                Some(committed) if !committed.current(self, &channel_id).await => {
+                    stale.push(waiter.serial);
+                }
+                _ => heard.push(waiter.serial),
+            }
+        }
+        self.leave_waiters
+            .retain(|w| !(w.room == channel_id && stale.contains(&w.serial)));
         if heard.is_empty() {
             return;
         }
-        let mut current_departure = false;
-        for waiter in heard {
-            // A late legacy receipt cannot purge a replacement room attachment or epoch.
-            match waiter.committed {
-                Some(committed) if !committed.current(self, &channel_id).await => {}
-                _ => current_departure = true,
-            }
+        for waiter in self
+            .leave_waiters
+            .iter_mut()
+            .filter(|w| w.room == channel_id && heard.contains(&w.serial))
+        {
+            waiter.heard = true;
         }
-        if current_departure {
-            self.purge_left_room(channel_id).await;
+        self.purge_left_room(channel_id).await;
+        let retry = self.now_ms().get().saturating_add(LEAVE_RETRY_MS);
+        for serial in heard {
+            self.arm_leave_bound(channel_id, serial, retry);
         }
     }
 
@@ -21818,9 +21852,9 @@ impl Node {
     /// members' copies keep listing this identity until one of them learns otherwise; the board
     /// withdrawal still goes out. The waiter stays until the purge lands (`finish_saved_purge`
     /// takes it), so a purge refused for the moment — a policy save pending, Session cleanup
-    /// busy — is tried again after [`LEAVE_RETRY_MS`].
+    /// busy — is tried again after [`LEAVE_RETRY_MS`]; a wait already heard is purged at once.
     async fn finish_leave_unheard(&mut self, channel_id: Digest32, serial: u64) {
-        let (deadline_ms, current) = {
+        let (deadline_ms, heard, current) = {
             let Some(waiter) = self
                 .leave_waiters
                 .iter()
@@ -21832,7 +21866,7 @@ impl Node {
                 Some(committed) => committed.current(self, &channel_id).await,
                 None => true,
             };
-            (waiter.deadline_ms, current)
+            (waiter.deadline_ms, waiter.heard, current)
         };
         if !current {
             // A replacement room attachment or epoch: `resume_leave` arms its own wait.
@@ -21841,7 +21875,7 @@ impl Node {
             return;
         }
         let now = self.now_ms().get();
-        if now < deadline_ms {
+        if !heard && now < deadline_ms {
             self.arm_leave_bound(channel_id, serial, deadline_ms);
             return;
         }
