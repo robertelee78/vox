@@ -729,9 +729,31 @@ impl Source {
                     return Err(Error::Unreachable("history room access changed"));
                 }
             }
-            if room.post_pending()
-                || (!publication && room.history_publication_busy(&self.store)?)
-            {
+            if room.post_pending() {
+                // An authored save holds the room's one pending write for the length of one
+                // blocking store commit, and every release of it wakes this edge. Wait it out:
+                // answered Busy instead, a peer fetching from a node that posts back to back
+                // paid a round, a 200 ms Busy backoff and, with the next post already announced,
+                // the restart of its flow for nearly every body it asked for (measured: a
+                // reader held 2 of 1,272 rows after a 60 s burst at 20 posts/s). A flow's own
+                // deadline still bounds the wait: past it the answer is the Busy it was.
+                let wake = room.history_publication_wake();
+                drop(room);
+                if continuation.is_some() {
+                    wake.await;
+                } else {
+                    tokio::select! {
+                        biased;
+                        () = self.fence.retired() => {
+                            return Err(Error::Unreachable("history request cancelled"));
+                        }
+                        () = tokio::time::sleep_until(self.deadline) => return Ok(Lookup::Busy),
+                        () = wake => {}
+                    }
+                }
+                continue;
+            }
+            if !publication && room.history_publication_busy(&self.store)? {
                 if continuation.is_none() {
                     // This operation has not inspected evidence: another native publication
                     // owns the room. Proof serving must not turn that wait into a durable

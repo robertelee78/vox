@@ -7953,6 +7953,15 @@ impl Node {
                     self.start_own_key_computer_drain();
                     self.resume_parked_construction();
                     self.resume_peer_book_save();
+                    // A completed save is the event that frees the ports (ADR-025 D6a): a
+                    // local append owes its peers a round, and a reader's bounded flow that
+                    // returned while this node's own maintenance held the store waited for
+                    // the next unrelated event or the tick to run again. Under a posting
+                    // burst that gap, repeated per row, held a reader to 4 rows a second
+                    // against 20 posted.
+                    if !self.store_save_pending() && (self.sched_all || !self.sched_rooms.is_empty()) {
+                        self.schedule().await;
+                    }
                 }
                 () = self.availability_wake.notified() => { self.accept_availability(); self.schedule().await; }
                 () = own_key_completions.notify.notified() => {
@@ -17361,7 +17370,14 @@ impl Node {
         let now = std::time::Instant::now();
         let since = prior.filter(|b| b.failures > 0).map_or(now, |b| b.since);
         let mut wait = crate::node::ports::backoff_wait(kind, failures);
-        if failures >= 2 && now.saturating_duration_since(since) >= Duration::from_secs(30) {
+        // A Busy refusal costs the peer one lookup and its retry curve never grows past 1 s
+        // (ADR-037 R8); only an unreachable, failing or refusing peer earns the persistent
+        // pacing. Keyed on the port's own streak since a871876cf, a Busy streak of 30 s —
+        // a peer draining a backlog — paced this port at 30 s to 5 min.
+        if kind != crate::node::status::BackoffKind::Busy
+            && failures >= 2
+            && now.saturating_duration_since(since) >= Duration::from_secs(30)
+        {
             // Keep the existing persistent-failure pacing, scoped to this owner.
             wait = wait.max(Duration::from_secs(
                 30u64
