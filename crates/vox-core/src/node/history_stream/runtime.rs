@@ -351,6 +351,10 @@ pub(crate) struct Flow {
     /// A durable body chunk moved in this flow's last turn: the waiting slice is
     /// progress, not a busy wait, and its port must not grow a Busy backoff.
     pub(crate) body_progress: bool,
+    /// When this flow was built. A newer hint for its author supersedes it only once it has
+    /// had [`HINT_TURN`] of progress or stops progressing, so a burst of appends does not
+    /// restart it before it fetches a body.
+    pub(crate) since: std::time::Instant,
     /// This turn's slice waits on the room's governance fold, which is not ready yet (ADR-037
     /// R2): a local wait, not a body slot held against a busy peer, so it never retires the slot,
     /// and the actor's fold hook is asked to drive the fold.
@@ -581,6 +585,7 @@ impl Flow {
             slots,
             owners: [None, None, None],
             body_progress: false,
+            since: std::time::Instant::now(),
             governance_wait: false,
             publication_wait: false,
             publication_owner_wait: None,
@@ -783,6 +788,7 @@ impl Flow {
             slots,
             owners: [None, None, None],
             body_progress: false,
+            since: std::time::Instant::now(),
             governance_wait: false,
             publication_wait: false,
             publication_owner_wait: None,

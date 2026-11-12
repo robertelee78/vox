@@ -13,6 +13,10 @@ use std::future::Future;
 use std::sync::atomic::Ordering;
 use std::sync::Mutex as StdMutex;
 
+/// How long a hinted flow keeps its turn against a newer head for the same author while it is
+/// fetching: the bound on a fresh message's wait behind the bodies before it.
+const HINT_TURN: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// The native recovery-fence write belongs to a retained physical worker, not the actor's
 /// BoundedHeadCompleted callback. Only its matching reservation may install the durable fence.
 pub(super) async fn refresh_own_recovery_owned(
@@ -4066,7 +4070,18 @@ impl Node {
                 self.sched_rooms.insert(work.room);
                 continue;
             }
-            let superseded = !flow.local_own_root()
+            // A newer head from the same author replaces this flow (ADR-036: fresh messages
+            // never wait for old bodies) once it stops progressing or has had its turn. Not
+            // sooner: replaced at every slice boundary while a peer posted back to back, a
+            // reader's flow fetched the new head and its proof, was replaced by the next
+            // announcement, and never reached a body (measured: 8 restarts a second, 2 of 1,272
+            // rows held after a 60 s burst at 20 posts/s). The replacement selects the same live
+            // window, so the fresh positions are walked first when it does run.
+            let progressing = !flow.waiting
+                && (fetched != 0 || flow.body_progress)
+                && flow.since.elapsed() < HINT_TURN;
+            let superseded = !progressing
+                && !flow.local_own_root()
                 && flow.hint.is_some_and(|hint| {
                     self.history_hints.newer_pending(
                         work.room,
