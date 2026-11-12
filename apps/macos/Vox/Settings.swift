@@ -8,7 +8,7 @@ import ServiceManagement
 import SwiftUI
 
 private enum SettingsFocus: Hashable {
-    case setup(String), keepRunning, loginItems, menuBar, update, restart
+    case setup(String), keepRunning, loginItems, menuBar, update
     case computers, network, daemonLog, textSize
 }
 
@@ -115,15 +115,9 @@ struct SettingsView: View {
                         .focused($focused, equals: .update)
                         .id(SettingsFocus.update)
                     if app.updating { ProgressView("Updating Vox…") }
-                    if app.updated {
-                        Button("Restart Vox") { app.reopenUpdatedApp() }
-                            .accessibilityIdentifier("settings-update-restart")
-                            .focused($focused, equals: .restart)
-                            .id(SettingsFocus.restart)
-                    }
                 }
             } said: {
-                Text("Installs the latest release and restarts its daemon. Remembered nodes return automatically; held sessions end.")
+                Text("Installs the latest release, restarts its daemon and reopens Vox. Remembered nodes return automatically; held sessions end.")
                 if let said = app.updateSaid {
                     Text(said).textSelection(.enabled)
                         .accessibilityIdentifier("settings-update-said")

@@ -4,6 +4,7 @@ import AppKit
 import Foundation
 import Combine
 import ServiceManagement
+import os
 @MainActor
 final class AppModel: ObservableObject {
     /// The one model: the app observes it, and its delegate starts it and quits it.
@@ -123,6 +124,7 @@ final class AppModel: ObservableObject {
             }
         }
         Daemon.refreshSkillPack { [weak self] said in self?.agentSetupSaid = said }
+        Task { await showUpdateResult() }
         if Daemon.kept() == nil {
             phase = .askingLoginItem
             return
@@ -185,33 +187,33 @@ final class AppModel: ObservableObject {
 
     @Published private(set) var updating = false
     @Published private(set) var updateSaid: String?
-    @Published private(set) var updated = false
 
-    /// The app uses the same verified bundle replacement and daemon restart as `vox update`.
+    /// The app runs the same `vox update` a terminal does, detached from this process: the
+    /// updater quits this app (or stops it when it does not quit) and reopens the installed
+    /// one, so a child in the app's session with a pipe to it would die or SIGPIPE with it
+    /// (2026-11-11). What the updater says is read from its log, by this process if it is
+    /// still here when the update ends, else by the app the updater reopened (`start`).
     func updateVox() async {
         guard !updating else { return }
         updating = true
-        updateSaid = nil
-        updated = false
         defer { updating = false }
+        updateSaid = nil
         do {
-            updateSaid = try await Daemon.command(["update"], patience: 300)
-            updated = true
+            try await Daemon.startDetachedUpdate()
         } catch {
             updateSaid = sentence(error)
+            return
         }
+        if let said = await Daemon.updateResult() { updateSaid = said }
     }
 
-    /// Open the installed bundle after updating; the current process keeps its old code until quit.
-    func reopenUpdatedApp() {
-        let configuration = NSWorkspace.OpenConfiguration()
-        configuration.createsNewApplicationInstance = true
-        NSWorkspace.shared.openApplication(at: Bundle.main.bundleURL, configuration: configuration) { _, error in
-            Task { @MainActor in
-                if let error { self.updateSaid = sentence(error) }
-                else { NSApp.terminate(nil) }
-            }
-        }
+    /// What the last `vox update` run from this app said, once it has ended; shown by the app
+    /// the updater reopened. Nothing when no update was run from the app.
+    private func showUpdateResult() async {
+        guard !updating, Daemon.updateRunning() else { return }
+        updating = true
+        defer { updating = false }
+        if let said = await Daemon.updateResult() { updateSaid = said }
     }
 
     /// Restart the same account's daemon using this app's bundled version (ADR-034 UP-2).
@@ -810,11 +812,25 @@ final class AppModel: ObservableObject {
     /// Why turning Keep Running on or off failed, in macOS's or the daemon's words; nil once read.
     @Published var keepRunningSaid: String?
 
-    /// Let go of the node and end the client (A-4).
+    /// Let go of the node and end the client (A-4), within three seconds. UniFFI polls a Rust
+    /// future on the thread that awaits it, so the close runs on its own task, never on the
+    /// main thread; one that is still closing after the deadline (a held connection behind a
+    /// stalled exchange, a daemon that stopped answering) is left to the process's end, when
+    /// the daemon lets go of the node as the connection drops (2026-11-11).
     func quit() async {
         let generation = beginNodeRequest()
         guard let original = client else { return }
-        await original.close()
+        await withCheckedContinuation { (quit: CheckedContinuation<Void, Never>) in
+            let once = OSAllocatedUnfairLock(initialState: false)
+            let finish: @Sendable () -> Void = {
+                if once.withLock({ done in defer { done = true }; return !done }) { quit.resume() }
+            }
+            Task.detached {
+                await original.close()
+                finish()
+            }
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 3, execute: finish)
+        }
         guard ownsNodeRequest(original, generation) else { return }
         client = nil
     }

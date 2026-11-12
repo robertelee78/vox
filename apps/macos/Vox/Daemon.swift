@@ -263,6 +263,115 @@ enum Daemon {
         }.value
     }
 
+    // ---- Update Vox: `vox update`, detached from the app it quits ----
+
+    /// Where the app's `vox update` writes what it says: `<config dir>/app/update.log`. The
+    /// updater quits or stops this app and reopens the installed one, so the result is read
+    /// from this file by whichever app is there when it ends. Nil when the config directory
+    /// cannot be found.
+    private static func updateLog() -> URL? {
+        guard let dir = try? configDir(dataRoot: "") else { return nil }
+        return URL(fileURLWithPath: dir).appendingPathComponent("app/update.log")
+    }
+
+    /// The log's first line, with the pid of the shell running the update after it; the last
+    /// line once the update has ended, with the updater's exit status after it.
+    private static let updateStarted = "vox update pid "
+    private static let updateEnded = "vox update exited "
+
+    /// Whether an update run from the app has been started and not yet read.
+    static func updateRunning() -> Bool {
+        updateLog().map { FileManager.default.fileExists(atPath: $0.path) } ?? false
+    }
+
+    /// Start `vox update` in its own session, with no pipe to this app, its input from
+    /// /dev/null and its output appended to the update log by a `/bin/sh` that records the
+    /// exit status as the log's last line. The updater quits or stops this app on its way; a
+    /// child in the app's session with a pipe to it would be ended or SIGPIPEd with it. The
+    /// shell puts the update in the background and exits at once, so launchd, not this app,
+    /// reaps the updater; the shell itself is waited for here. Returns once the updater is
+    /// running.
+    static func startDetachedUpdate() async throws {
+        guard let log = updateLog() else {
+            throw VoxError.Failed(reason: "Vox could not find its configuration directory.")
+        }
+        try FileManager.default.createDirectory(at: log.deletingLastPathComponent(),
+                                                withIntermediateDirectories: true)
+        guard FileManager.default.createFile(atPath: log.path, contents: nil,
+                                             attributes: [.posixPermissions: 0o600]) else {
+            throw VoxError.Failed(reason: "Vox could not create \(log.path).")
+        }
+        let vox = vox.path
+        try await Task.detached {
+            var actions: posix_spawn_file_actions_t?
+            posix_spawn_file_actions_init(&actions)
+            defer { posix_spawn_file_actions_destroy(&actions) }
+            posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0)
+            posix_spawn_file_actions_addopen(&actions, 1, log.path, O_WRONLY | O_APPEND, 0)
+            posix_spawn_file_actions_adddup2(&actions, 1, 2)
+            var attributes: posix_spawnattr_t?
+            posix_spawnattr_init(&attributes)
+            defer { posix_spawnattr_destroy(&attributes) }
+            // Its own session, and none of this app's other descriptors.
+            posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETSID | POSIX_SPAWN_CLOEXEC_DEFAULT))
+            // A nested sh so that `$$` is the backgrounded shell's own pid.
+            let script = "sh -c 'echo \"\(updateStarted)$$\"; \"$1\" update; echo \"\(updateEnded)$?\"' sh \"$1\" &"
+            let argv = ["/bin/sh", "-c", script, "sh", vox].map { strdup($0) } + [nil]
+            defer { argv.forEach { free($0) } }
+            var pid: pid_t = 0
+            let failure = posix_spawn(&pid, "/bin/sh", &actions, &attributes, argv, environ)
+            guard failure == 0 else {
+                try? FileManager.default.removeItem(at: log)
+                throw VoxError.Failed(reason: "Vox could not start its updater: \(String(cString: strerror(failure))).")
+            }
+            var status: Int32 = 0
+            while waitpid(pid, &status, 0) == -1 && errno == EINTR {}
+            guard status == 0 else {
+                try? FileManager.default.removeItem(at: log)
+                throw VoxError.Failed(reason: "Vox could not start its updater: the shell exited with status \(status).")
+            }
+        }.value
+    }
+
+    /// What the update said, once it has ended: the log without its pid and status lines, or
+    /// the status alone when the updater said nothing; the log is removed, read once. A log
+    /// whose updater is no longer running and never wrote its status (a logout or power loss
+    /// mid-update) is stale: removed, and said so. Nil when no update was started from the
+    /// app, or one has not ended within ten minutes.
+    static func updateResult() async -> String? {
+        guard let log = updateLog() else { return nil }
+        for _ in 0..<1200 {
+            guard let text = try? String(contentsOf: log, encoding: .utf8) else { return nil }
+            if let ended = text.range(of: updateEnded, options: .backwards),
+               let status = Int32(text[ended.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)) {
+                try? FileManager.default.removeItem(at: log)
+                let words = text[..<ended.lowerBound]
+                    .split(separator: "\n", omittingEmptySubsequences: false)
+                    .filter { !$0.hasPrefix(updateStarted) }
+                    .joined(separator: "\n")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                return words.isEmpty ? "Vox exited with status \(status)." : words
+            }
+            if updateStale(log, text) {
+                try? FileManager.default.removeItem(at: log)
+                return "An earlier update did not finish."
+            }
+            try? await Task.sleep(nanoseconds: 500_000_000)
+        }
+        return nil
+    }
+
+    /// The update's shell is gone without writing its status, or never said its pid within a
+    /// minute of the log being made.
+    private static func updateStale(_ log: URL, _ text: String) -> Bool {
+        if let started = text.range(of: updateStarted),
+           let pid = pid_t(text[started.upperBound...].prefix(while: \.isNumber)) {
+            return kill(pid, 0) != 0 && errno == ESRCH
+        }
+        let modified = (try? FileManager.default.attributesOfItem(atPath: log.path))?[.modificationDate] as? Date
+        return Date().timeIntervalSince(modified ?? .distantPast) > 60
+    }
+
     /// The login item's last word on why it would not start, with when: its daemon writes it to
     /// `~/Library/Logs/Vox/login-item.log` (as `<unix milliseconds> <reason>`) and ends, rather than
     /// being started again every ten seconds.

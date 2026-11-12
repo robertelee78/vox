@@ -3918,10 +3918,14 @@ fn active_executable(bundle: &Path) -> Result<PathBuf, AppError> {
 
 /// AppKit identifies a running application by its bundle URL, executable URL and PID.
 /// Never address it by display name or bundle identifier: another install can share both.
-/// `terminate` is the ordinary, cancellable application quit, not a forced signal.
+/// `terminate` is the ordinary, cancellable application quit; an app that has not quit on it
+/// within ten seconds is stopped (`forceTerminate`, then SIGKILL to the verified pid), and the
+/// update goes on: the app owns no durable state, and its daemon is stopped and restarted
+/// right after. Only an app that cannot be stopped fails the update, naming its pid.
 const APP_HANDOFF: &str = r#"
 ObjC.import('AppKit');
 ObjC.import('Foundation');
+ObjC.import('signal');
 function run(argv) {
     const action = argv[0];
     const url = $.NSURL.fileURLWithPath($(argv[1])).URLByResolvingSymlinksInPath;
@@ -3965,12 +3969,29 @@ function run(argv) {
         if (action === 'inspect') return JSON.stringify(instance);
         if (instance.pid !== Number(argv[2]) || instance.started !== Number(argv[3]))
             throw new Error('application changed before the quit request; none was stopped');
-        if (!app.terminate) throw new Error('application pid ' + instance.pid + ' refused the quit request');
-        for (let i = 0; i < 150; i++) {
-            if (app.isTerminated) return 'stopped';
-            $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.2));
-        }
-        throw new Error('application pid ' + instance.pid + ' did not quit within 30 seconds');
+        // The captured instance is still this process: the pid is looked up afresh and its
+        // launch date compared, so a recycled pid is never signalled. An instance that is no
+        // longer there has exited, which is what a quit or a stop was for.
+        const still = () => {
+            if (app.isTerminated) return false;
+            const now = $.NSRunningApplication.runningApplicationWithProcessIdentifier(instance.pid);
+            if (now.isNil() || now.isTerminated) return false;
+            const current = identity(now);
+            return current.pid === instance.pid && current.started === instance.started;
+        };
+        const wait = (rounds) => {
+            for (let i = 0; i < rounds; i++) {
+                if (!still()) return true;
+                $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.2));
+            }
+            return !still();
+        };
+        if (app.terminate && wait(50)) return 'quit';
+        // forceTerminate asks the system to end the app, which on macOS 26 leaves a process that
+        // is stopped or cannot run its handlers; the re-verified pid is then killed outright.
+        if (!still() || (app.forceTerminate && wait(25))) return 'stopped';
+        if (!still() || ($.kill(instance.pid, $.SIGKILL) === 0 && wait(25))) return 'stopped';
+        throw new Error('application pid ' + instance.pid + ' did not quit on request and could not be stopped');
     }
     const oldPid = Number(argv[2]);
     const oldStarted = Number(argv[3]);
@@ -4073,9 +4094,20 @@ fn inspect_app(active: &Path) -> Result<Option<StoppedApp>, AppError> {
     }))
 }
 
+/// Quit the captured app, or stop it when it does not quit on request; either way the update
+/// goes on, and the person is told which happened.
 fn stop_captured_app(active: &Path, app: &Option<StoppedApp>) -> Result<(), AppError> {
     let Some(app) = app else { return Ok(()) };
-    app_handoff("stop", active, Some(&app.identity))?;
+    match app_handoff("stop", active, Some(&app.identity))?.as_str() {
+        "quit" => println!("Vox.app quit on request"),
+        "stopped" => println!("Vox.app did not quit on request; it was stopped"),
+        other => {
+            return Err(usage(format!(
+                "application handoff for {} returned {other:?}",
+                active.display()
+            )))
+        }
+    }
     Ok(())
 }
 

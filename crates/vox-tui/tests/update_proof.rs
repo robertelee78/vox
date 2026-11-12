@@ -1887,6 +1887,9 @@ fn shipped_notarized(path: &Path) -> Result<(), String> {
 struct HeldApp {
     observer: std::process::Child,
     path: PathBuf,
+    pid: rustix::process::Pid,
+    /// Stopped by `stop`, and not yet seen retired: ended in `drop` if the product left it.
+    wedged: bool,
 }
 
 #[cfg(all(target_os = "macos", feature = "optional-proofs"))]
@@ -1933,6 +1936,7 @@ let launchToken = center.addObserver(forName: NSWorkspace.didLaunchApplicationNo
     originalExit = monitor
     monitor.resume()
     print(app.bundleURL?.path ?? "")
+    print(pid)
     fflush(stdout)
 }
 DispatchQueue.global().async {
@@ -2004,12 +2008,32 @@ withExtendedLifetime(launchToken) { RunLoop.main.run() }
             .read_line(&mut line)
             .expect("APPARATUS: exact native launch event");
         let path = PathBuf::from(line.trim());
-        let app = Self { observer, path };
+        line.clear();
+        lines
+            .read_line(&mut line)
+            .expect("APPARATUS: launched app pid");
+        let pid = rustix::process::Pid::from_raw(
+            line.trim().parse().expect("APPARATUS: launched app pid"),
+        )
+        .expect("APPARATUS: launched app pid");
+        let app = Self {
+            observer,
+            path,
+            pid,
+            wedged: false,
+        };
         assert_eq!(
             app.path, active,
             "PRODUCT: path launch selected the wrong Vox.app"
         );
         app
+    }
+
+    /// Wedge the app: a stopped process answers no quit request, as a hung main thread does.
+    fn stop(&mut self) {
+        rustix::process::kill_process(self.pid, rustix::process::Signal::STOP)
+            .expect("APPARATUS: stopping the launched app");
+        self.wedged = true;
     }
 
     fn finish_handoff(mut self) {
@@ -2021,6 +2045,9 @@ withExtendedLifetime(launchToken) { RunLoop.main.run() }
             .observer
             .wait()
             .expect("APPARATUS: observe graceful app termination");
+        if status.success() {
+            self.wedged = false;
+        }
         assert!(
             status.success(),
             "PRODUCT: update did not retire the original app and restore one running replacement: {status}, launched {:?}",
@@ -2033,6 +2060,11 @@ withExtendedLifetime(launchToken) { RunLoop.main.run() }
 impl Drop for HeldApp {
     fn drop(&mut self) {
         use std::io::Write as _;
+        // A wedged original the product failed to stop would hold the observer's quit for
+        // ever: it is ended here first, so the red stays attributed and the guest clean.
+        if self.wedged {
+            let _ = rustix::process::kill_process(self.pid, rustix::process::Signal::KILL);
+        }
         if let Some(mut input) = self.observer.stdin.take() {
             let _ = writeln!(input, "QUIT");
         }
@@ -2221,12 +2253,13 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
     let scenarios: &[&str] = if legacy_release.is_some() {
         &[
             "update-and-rollback",
+            "stopped-app",
             "interrupted-publish",
             "legacy-handoff",
             "legacy-handoff-device",
         ]
     } else {
-        &["update-and-rollback", "interrupted-publish"]
+        &["update-and-rollback", "stopped-app", "interrupted-publish"]
     };
     for &scenario in scenarios {
         let scratch = tempfile::Builder::new()
@@ -2736,7 +2769,13 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
             continue;
         }
 
-        let old_app = HeldApp::launch(home, &active, &cleanup.bundles);
+        let mut old_app = HeldApp::launch(home, &active, &cleanup.bundles);
+        // `vox update` always updates (the decider, 2026-11-11): an app that does not quit on
+        // request is stopped, the update goes on, and its output says which happened.
+        let stopped_app = scenario == "stopped-app";
+        if stopped_app {
+            old_app.stop();
+        }
         let updated = vox(&helper, home, &["update"], &env);
         println!("{scenario} update {}: {}", updated.status, said(&updated));
         claims.push(claim(
@@ -2745,6 +2784,22 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
                 && app_says(&active) == after_version
                 && reports(&helper) == format!("vox {after_version}")
                 && profile_intact(),
+            said(&updated),
+        ));
+        let (fate, sentence) = if stopped_app {
+            (
+                "bundle.an_app_that_does_not_quit_is_stopped_and_the_update_goes_on",
+                "Vox.app did not quit on request; it was stopped",
+            )
+        } else {
+            (
+                "bundle.the_running_app_quit_on_request",
+                "Vox.app quit on request",
+            )
+        };
+        claims.push(claim(
+            fate,
+            updated.status.success() && said(&updated).contains(sentence),
             said(&updated),
         ));
         if !updated.status.success() || app_says(&active) != after_version {
@@ -2756,6 +2811,12 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
             );
         }
         old_app.finish_handoff();
+        if stopped_app {
+            receipts.insert(scenario.to_owned(), said(&updated));
+            let _ = daemon.kill();
+            let _ = daemon.wait();
+            continue;
+        }
         let records =
             launch_services_paths("us.vox.app").expect("APPARATUS: records after graceful quit");
         claims.push(claim(

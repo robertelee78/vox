@@ -82,8 +82,13 @@ its replacement runs detached on the same configured address and anchors.
 On a Mac, update and rollback quit and relaunch the app from the installation being changed if
 it was running. They preserve that app's profile even when the updater uses different data,
 config or home directories. An app that was closed stays closed; another Vox installation is
-not restarted. A refused quit or failed relaunch is reported as a failure, not success.
-An open `vox tui` still runs its original version until you restart that terminal client.
+not restarted. An app that has not quit ten seconds after being asked is stopped, and the
+update goes on and says so (`Vox.app did not quit on request; it was stopped`): the app keeps
+no state of its own, and its daemon is restarted right after. Only an app that cannot be
+stopped, or a failed relaunch, is reported as a failure, not success. The app's own "Update
+Vox" button runs the same `vox update`, detached from the app, and the reopened app shows what
+it said. An open `vox tui` still runs its original version until you restart that terminal
+client.
 
 An update can install the new app before a later cleanup operation is refused. Vox reports
 what is installed, which handoff failed, and the affected operation and path; it retains the
