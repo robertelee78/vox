@@ -49,6 +49,7 @@ primitive) precedes ADR-007 (consent, which is stored on the log) in build order
 | [035](ADR-035-computer-trust-and-daemon-identities.md) | Computer Trust and Daemon Identities (pair once, all managed nodes, selected personal nodes get drive, individual node trust remains) — product requirements and technical contract revision 2 accepted for v0.4.5 | 002, 003, 010, 012, 018, 026, 028, 029, 031 |
 | [037](ADR-037-a-joined-room-converges-without-waiting.md) | A Joined Room Converges Without Waiting (Ready is a constant wait; one fast fold is the gate for everything irreversible and content never holds it; reads answer known data; own-authored state is durable; proofs with mutants) — proposed for v0.4.6 | 007, 008, 018, 026, 029, 031, 036 |
 | [038](ADR-038-daemons-trust-daemons-and-sessions-are-presence.md) | Daemons Trust Daemons, and Sessions Are Presence (daemon trust is the obvious path; presence is live Sessions; idle harness windows; idle Vox costs nothing and tells the truth; no legacy; small releases) — proposed after v0.4.6 | 018, 020, 026, 029, 031, 033, 034, 035, 036, 037 |
+| [039](ADR-039-replies-in-place.md) | Replies in Place (replies in the timeline grouped under what they answer, each with a preview; a conversation moves to the bottom on a new reply; the latest three replies shown; Focus instead of a thread panel; long posts collapse; one task read end to end; no threads inbox) — proposed | 014, 020, 023, 028, 033, 034 |
 
 ## Tiers
 
@@ -114,6 +115,7 @@ planned. This is the roll-up.
 | 034 | accepted for v0.4.4 (the decider, 2026-10-10), **not built**; amends 014, 026, 028 |
 | 035 | product requirements accepted for v0.4.5 (the decider, 2026-10-12); technical contract revision 2 independently accepted (GO), **not built**; narrowly amends 002, 010, 020, 026, 031 while preserving node identities and one daemon endpoint |
 | 037 | proposed for v0.4.6 (the decider, 2026-10-19); R1–R6 **not built**, each is to land with its proof; the pacing fixes R8–R11 are on PR #946's branch, unreleased; finishes ADR-036 H-1 on the first-use paths and keeps ADR-007's fold as the gate |
+| 039 | proposed (the decider's rulings of 2026-11-12; open questions Q1–Q14 pending), **not built**; would replace ADR-028 R-9 and amend 014, 023, 028, 033, 034 |
 
 ## Conformance-vector obligations
 
