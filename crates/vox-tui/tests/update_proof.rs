@@ -2792,7 +2792,10 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
                 "Vox.app did not quit on request; it was stopped",
             )
         } else {
-            ("bundle.the_running_app_quit_on_request", "Vox.app quit on request")
+            (
+                "bundle.the_running_app_quit_on_request",
+                "Vox.app quit on request",
+            )
         };
         claims.push(claim(
             fate,
