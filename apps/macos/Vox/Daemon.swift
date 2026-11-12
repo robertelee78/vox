@@ -274,7 +274,9 @@ enum Daemon {
         return URL(fileURLWithPath: dir).appendingPathComponent("app/update.log")
     }
 
-    /// The log's last line once the update has ended, with the updater's exit status after it.
+    /// The log's first line, with the pid of the shell running the update after it; the last
+    /// line once the update has ended, with the updater's exit status after it.
+    private static let updateStarted = "vox update pid "
     private static let updateEnded = "vox update exited "
 
     /// Whether an update run from the app has been started and not yet read.
@@ -312,7 +314,8 @@ enum Daemon {
             defer { posix_spawnattr_destroy(&attributes) }
             // Its own session, and none of this app's other descriptors.
             posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETSID | POSIX_SPAWN_CLOEXEC_DEFAULT))
-            let script = "(\"$1\" update; echo \"\(updateEnded)$?\") &"
+            // A nested sh so that `$$` is the backgrounded shell's own pid.
+            let script = "sh -c 'echo \"\(updateStarted)$$\"; \"$1\" update; echo \"\(updateEnded)$?\"' sh \"$1\" &"
             let argv = ["/bin/sh", "-c", script, "sh", vox].map { strdup($0) } + [nil]
             defer { argv.forEach { free($0) } }
             var pid: pid_t = 0
@@ -330,9 +333,11 @@ enum Daemon {
         }.value
     }
 
-    /// What the update said, once it has ended: the log without its status line, or the status
-    /// alone when the updater said nothing; the log is removed, read once. Nil when no update
-    /// was started from the app, or one has not ended within ten minutes.
+    /// What the update said, once it has ended: the log without its pid and status lines, or
+    /// the status alone when the updater said nothing; the log is removed, read once. A log
+    /// whose updater is no longer running and never wrote its status (a logout or power loss
+    /// mid-update) is stale: removed, and said so. Nil when no update was started from the
+    /// app, or one has not ended within ten minutes.
     static func updateResult() async -> String? {
         guard let log = updateLog() else { return nil }
         for _ in 0..<1200 {
@@ -340,12 +345,31 @@ enum Daemon {
             if let ended = text.range(of: updateEnded, options: .backwards),
                let status = Int32(text[ended.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)) {
                 try? FileManager.default.removeItem(at: log)
-                let words = text[..<ended.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines)
+                let words = text[..<ended.lowerBound]
+                    .split(separator: "\n", omittingEmptySubsequences: false)
+                    .filter { !$0.hasPrefix(updateStarted) }
+                    .joined(separator: "\n")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
                 return words.isEmpty ? "Vox exited with status \(status)." : words
+            }
+            if updateStale(log, text) {
+                try? FileManager.default.removeItem(at: log)
+                return "An earlier update did not finish."
             }
             try? await Task.sleep(nanoseconds: 500_000_000)
         }
         return nil
+    }
+
+    /// The update's shell is gone without writing its status, or never said its pid within a
+    /// minute of the log being made.
+    private static func updateStale(_ log: URL, _ text: String) -> Bool {
+        if let started = text.range(of: updateStarted),
+           let pid = pid_t(text[started.upperBound...].prefix(while: \.isNumber)) {
+            return kill(pid, 0) != 0 && errno == ESRCH
+        }
+        let modified = (try? FileManager.default.attributesOfItem(atPath: log.path))?[.modificationDate] as? Date
+        return Date().timeIntervalSince(modified ?? .distantPast) > 60
     }
 
     /// The login item's last word on why it would not start, with when: its daemon writes it to
