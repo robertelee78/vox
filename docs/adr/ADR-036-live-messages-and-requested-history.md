@@ -708,18 +708,28 @@ transient continuation: retire its capabilities, keep every durable receipt/curs
 already committed, discard the obsolete scalar and start the one retained successor. This is
 coalescing, not cancellation of durable recovery. Equal-size distinct heads never supersede one
 another because they may be attributable fork evidence.
-**The owner's turn (decider, 2026-11-12).** An owner that is progressing — not waiting, and with
-a receipt committed or a body moved in its last slice — keeps its turn against a strictly newer
-head for up to **1 s** from the owner's start (`HINT_TURN`); the newer head is retained and starts
-at the first slice boundary after that, or as soon as the owner stops progressing. A retained
-owner's next wire step is bounded by what remains of that second. Why: under sustained posting
-(20 posts/s from one node) a newer head exists at every slice boundary, so immediate supersession
-restarted the fetch about eight times a second, refetched head and proof each time and never
-reached a body (37 of 1,272 rows in 45 s, on v0.4.19 and v0.4.28 alike). With the turn, a peer's
-count advanced every second and 200 of 200 claims reached a reader's board in under a second at
-p99. The cost accepted is that the newest message may follow a still-progressing older fetch by
-up to one second. #934's ruling that fresh messages never wait for old bodies is amended to this
-bound.
+**The owner's turn (decider, 2026-11-12).** An owner that is progressing — not waiting on the
+peer, and with a receipt committed or a body moved since it started — keeps its turn against a
+strictly newer head for up to **1 s** from the owner's start (`HINT_TURN`); the newer head is
+retained and starts at the first slice boundary after that, or as soon as the owner stops
+progressing. A retained owner's next wire step is bounded by what remains of that second. Why:
+under sustained posting (20 posts/s from one node) a newer head exists at every slice boundary,
+so immediate supersession restarted the fetch about eight times a second, refetched head and
+proof each time and never reached a body (37 of 1,272 rows in 45 s, on v0.4.19 and v0.4.28
+alike). With the turn, a peer's count advanced every second and 200 of 200 claims reached a
+reader's board in under a second at p99. The cost accepted is that the newest message may follow
+a still-progressing older fetch by up to one second. #934's ruling that fresh messages never
+wait for old bodies is amended to this bound. Progress is judged over the turn, not over the
+owner's last slice alone: every wire exchange is followed by a local slice that commits nothing
+(it holds the header and builds the next query), and an owner judged on that slice was superseded
+at it, ~40 ms after it started, whenever the poster's next append had been announced — under a
+gapless 24 posts/s that was every time (1,411 supersessions for 1,472 posts; the reader held 24
+rows after 60 s, 458 once judged over the turn). A wait for a body slot or publication held by a
+sibling flow of this node, which has an exact release wake, is not the owner stopping: the owner
+resumes on that edge. Judged as stopping, a reader with three other readers (every one of which
+gossips the author's head, so four flows for one author contend for the one live body slot) lost
+the author's port's turn to the next head at every slot collision (90 times in 60 s) and held
+~100 rows where one reader held 478.
 After restart, an inventory head already committed with a complete live window MUST remain eligible
 until its exact control receipt is durable. Re-observing that same scalar reconstructs bounded
 control closure; it MUST NOT request omitted ordinary bodies or treat live-window completion as

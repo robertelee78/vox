@@ -3414,6 +3414,7 @@ impl Node {
                 flow.work_committed
                     .swap(false, std::sync::atomic::Ordering::AcqRel),
             );
+            flow.turn_progress |= fetched != 0 || flow.body_progress;
             if flow.own_head_observed.swap(false, Ordering::AcqRel)
                 && self
                     .channels
@@ -4078,8 +4079,16 @@ impl Node {
             // announcement, and never reached a body (measured: 8 restarts a second, 2 of 1,272
             // rows held after a 60 s burst at 20 posts/s). The replacement selects the same live
             // window, so the fresh positions are walked first when it does run.
-            let progressing = !flow.waiting
-                && (fetched != 0 || flow.body_progress)
+            // Progress is what the flow has committed since it was built, not what this one
+            // slice committed: every wire exchange is followed by a slice that commits nothing
+            // (it holds the header and builds the next query), and judged slice by slice the
+            // flow was superseded at that slice ~40 ms after it started, as soon as the next
+            // append was announced (measured: 1,411 supersessions for 1,472 posts in 60 s, the
+            // reader held 24 rows). A wait with an exact local wake (`slot_wait`: a body slot
+            // or publication held by a sibling flow of this node) is not the owner stopping;
+            // it resumes on that edge. The 1 s bound and a peer wait still end a stalled turn.
+            let progressing = (!flow.waiting || flow.slot_wait.is_some())
+                && flow.turn_progress
                 && flow.since.elapsed() < HINT_TURN;
             let superseded = !progressing
                 && !flow.local_own_root()
