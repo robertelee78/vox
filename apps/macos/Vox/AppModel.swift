@@ -195,20 +195,22 @@ final class AppModel: ObservableObject {
     /// still here when the update ends, else by the app the updater reopened (`start`).
     func updateVox() async {
         guard !updating else { return }
+        updating = true
+        defer { updating = false }
         updateSaid = nil
         do {
-            try Daemon.startDetachedUpdate()
+            try await Daemon.startDetachedUpdate()
         } catch {
             updateSaid = sentence(error)
             return
         }
-        await showUpdateResult()
+        if let said = await Daemon.updateResult() { updateSaid = said }
     }
 
     /// What the last `vox update` run from this app said, once it has ended; shown by the app
     /// the updater reopened. Nothing when no update was run from the app.
     private func showUpdateResult() async {
-        guard Daemon.updateRunning() else { return }
+        guard !updating, Daemon.updateRunning() else { return }
         updating = true
         defer { updating = false }
         if let said = await Daemon.updateResult() { updateSaid = said }

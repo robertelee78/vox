@@ -285,9 +285,11 @@ enum Daemon {
     /// Start `vox update` in its own session, with no pipe to this app, its input from
     /// /dev/null and its output appended to the update log by a `/bin/sh` that records the
     /// exit status as the log's last line. The updater quits or stops this app on its way; a
-    /// child in the app's session with a pipe to it would be ended or SIGPIPEd with it. Returns
-    /// once the updater is running.
-    static func startDetachedUpdate() throws {
+    /// child in the app's session with a pipe to it would be ended or SIGPIPEd with it. The
+    /// shell puts the update in the background and exits at once, so launchd, not this app,
+    /// reaps the updater; the shell itself is waited for here. Returns once the updater is
+    /// running.
+    static func startDetachedUpdate() async throws {
         guard let log = updateLog() else {
             throw VoxError.Failed(reason: "Vox could not find its configuration directory.")
         }
@@ -297,26 +299,35 @@ enum Daemon {
                                              attributes: [.posixPermissions: 0o600]) else {
             throw VoxError.Failed(reason: "Vox could not create \(log.path).")
         }
-        var actions: posix_spawn_file_actions_t?
-        posix_spawn_file_actions_init(&actions)
-        defer { posix_spawn_file_actions_destroy(&actions) }
-        posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0)
-        posix_spawn_file_actions_addopen(&actions, 1, log.path, O_WRONLY | O_APPEND, 0)
-        posix_spawn_file_actions_adddup2(&actions, 1, 2)
-        var attributes: posix_spawnattr_t?
-        posix_spawnattr_init(&attributes)
-        defer { posix_spawnattr_destroy(&attributes) }
-        // Its own session, and none of this app's other descriptors.
-        posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETSID | POSIX_SPAWN_CLOEXEC_DEFAULT))
-        let script = "\"$1\" update; echo \"\(updateEnded)$?\""
-        let argv = ["/bin/sh", "-c", script, "sh", vox.path].map { strdup($0) } + [nil]
-        defer { argv.forEach { free($0) } }
-        var pid: pid_t = 0
-        let failure = posix_spawn(&pid, "/bin/sh", &actions, &attributes, argv, environ)
-        guard failure == 0 else {
-            try? FileManager.default.removeItem(at: log)
-            throw VoxError.Failed(reason: "Vox could not start its updater: \(String(cString: strerror(failure))).")
-        }
+        let vox = vox.path
+        try await Task.detached {
+            var actions: posix_spawn_file_actions_t?
+            posix_spawn_file_actions_init(&actions)
+            defer { posix_spawn_file_actions_destroy(&actions) }
+            posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0)
+            posix_spawn_file_actions_addopen(&actions, 1, log.path, O_WRONLY | O_APPEND, 0)
+            posix_spawn_file_actions_adddup2(&actions, 1, 2)
+            var attributes: posix_spawnattr_t?
+            posix_spawnattr_init(&attributes)
+            defer { posix_spawnattr_destroy(&attributes) }
+            // Its own session, and none of this app's other descriptors.
+            posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETSID | POSIX_SPAWN_CLOEXEC_DEFAULT))
+            let script = "(\"$1\" update; echo \"\(updateEnded)$?\") &"
+            let argv = ["/bin/sh", "-c", script, "sh", vox].map { strdup($0) } + [nil]
+            defer { argv.forEach { free($0) } }
+            var pid: pid_t = 0
+            let failure = posix_spawn(&pid, "/bin/sh", &actions, &attributes, argv, environ)
+            guard failure == 0 else {
+                try? FileManager.default.removeItem(at: log)
+                throw VoxError.Failed(reason: "Vox could not start its updater: \(String(cString: strerror(failure))).")
+            }
+            var status: Int32 = 0
+            while waitpid(pid, &status, 0) == -1 && errno == EINTR {}
+            guard status == 0 else {
+                try? FileManager.default.removeItem(at: log)
+                throw VoxError.Failed(reason: "Vox could not start its updater: the shell exited with status \(status).")
+            }
+        }.value
     }
 
     /// What the update said, once it has ended: the log without its status line, or the status
