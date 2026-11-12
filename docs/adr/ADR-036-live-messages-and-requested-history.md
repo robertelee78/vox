@@ -712,7 +712,9 @@ another because they may be attributable fork evidence.
 peer, and with a receipt committed or a body moved since it started — keeps its turn against a
 strictly newer head for up to **1 s** from the owner's start (`HINT_TURN`); the newer head is
 retained and starts at the first slice boundary after that, or as soon as the owner stops
-progressing. A retained owner's next wire step is bounded by what remains of that second. Why:
+progressing. A retained owner's next round — its board exchange included — is bounded by what
+remains of that second; what it published before that deadline is signalled as after a policy
+retirement, not discarded with the cut-short turn. Why:
 under sustained posting (20 posts/s from one node) a newer head exists at every slice boundary,
 so immediate supersession restarted the fetch about eight times a second, refetched head and
 proof each time and never reached a body (37 of 1,272 rows in 45 s, on v0.4.19 and v0.4.28

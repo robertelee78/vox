@@ -564,6 +564,9 @@ struct Running {
     lane: crate::node::history_budget::Lane,
     retirement_key: RetirementKey,
     policy_retire: Option<RequestId>,
+    /// Set by the hint-turn timer before it retires the fence: the turn was cut short for a
+    /// newer head, and what it published is handled like a policy-retired turn's, not discarded.
+    preempted: Arc<std::sync::atomic::AtomicBool>,
     fence: Arc<crate::transport::stream_transport::Fence>,
     /// Exclusive ownership stays outside the fallible worker future. The supervised outer task
     /// observes its JoinError and the actor reclaims this exact Flow even when the worker panics.
@@ -701,12 +704,16 @@ struct ByteAdmission {
     owner: Option<WorkKey>,
     /// Scheduling need captured by the ended worker, never the port's newer current need.
     port_request: Option<u64>,
+    /// The parked owner waits on an exact local wake (a body slot or publication held by a
+    /// sibling flow of this node), not on a refused allocation: its turn (ADR-036) goes on.
+    local: bool,
     task: tokio::task::JoinHandle<()>,
 }
 struct ByteWait {
     wake: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
     owner: Option<WorkKey>,
     port_request: Option<u64>,
+    local: bool,
 }
 struct PoolAdmission {
     token: u64,
@@ -1534,7 +1541,10 @@ impl Controller {
         service: crate::node::ports::OutboundService,
         inbox: &stream::HintInbox,
     ) -> Option<(Flow, u64)> {
-        let superseded = |flow: &Flow, owner: WorkKey| {
+        // A parked owner waiting on a sibling's slot keeps its turn (ADR-036, the supersede
+        // check in `accept_bounded_sync`): a newer head replaces it once the second has passed.
+        // A refused allocation keeps nothing; the newer head is its causal replacement edge.
+        let superseded = |flow: &Flow, owner: WorkKey, local: bool| {
             flow.room == room
                 && flow.peer == peer
                 && WorkKey::of(flow) == owner
@@ -1542,6 +1552,7 @@ impl Controller {
                 && flow.archive_request.is_none()
                 && flow.required_root.is_none()
                 && !flow.local_own_root()
+                && !(local && flow.turn_progress && flow.since.elapsed() < HINT_TURN)
                 && flow.hint.is_some_and(|hint| {
                     inbox.newer_pending(room, flow.hint_peer, hint.author, hint.size)
                 })
@@ -1555,25 +1566,25 @@ impl Controller {
                         .iter()
                         .flatten()
                         .chain(self.deferred.iter())
-                        .any(|flow| superseded(flow, owner))
+                        .any(|flow| superseded(flow, owner, admission.local))
                 })
             })?;
         let token = key.3;
         let owner = admission.owner?;
         let port_request = admission.port_request?;
+        let local = admission.local;
         // Only the exact byte waiter's parked hinted owner can be replaced. Archive and
         // required roots, other ports and replacement generations keep their continuations.
-        let flow = if let Some(index) = self
-            .ready
-            .iter()
-            .position(|slot| slot.as_ref().is_some_and(|flow| superseded(flow, owner)))
-        {
+        let flow = if let Some(index) = self.ready.iter().position(|slot| {
+            slot.as_ref()
+                .is_some_and(|flow| superseded(flow, owner, local))
+        }) {
             self.ready[index].take()?
         } else {
             let index = self
                 .deferred
                 .iter()
-                .position(|flow| superseded(flow, owner))?;
+                .position(|flow| superseded(flow, owner, local))?;
             self.deferred.remove(index)?
         };
         // No await occurs between identity selection and cancellation. A queued old ready
@@ -1607,6 +1618,7 @@ impl Controller {
             wake,
             owner,
             port_request,
+            local,
         } = waiting;
         let task = tokio::spawn(async move {
             wake.await;
@@ -1626,6 +1638,7 @@ impl Controller {
                 lane: work.lane,
                 owner: owner.or(work.key),
                 port_request,
+                local,
                 task,
             },
         );
@@ -3580,9 +3593,14 @@ impl Node {
             // Authorization and local-durability exits carry ownership themselves. Handle them
             // even when the trust edit also retired the port/fence; generic stale disposal would
             // otherwise discard the only hint, required root, or archive controller dispatch.
+            // A turn the hint-turn timer cut short is the same case: the fence is retired, the
+            // flow is disposed below, but what its slices published before the deadline
+            // (a render, a governance fold wake, a key package, a board growth, the peer's
+            // held note, an external root) happened and is signalled, as after a policy retire.
             if flow.authorization_changed
                 || flow.local_retry.is_some()
                 || work.policy_retire.is_some()
+                || work.preempted.load(Ordering::SeqCst)
             {
                 if let Some(seq) = flow.mine_held.take() {
                     self.held_notes.push((work.room, work.peer, seq));
@@ -4139,6 +4157,7 @@ impl Node {
                     owner: Some(WorkKey::of(&flow)),
                     port_request: (work.service == OutboundService::Public).then_some(work.request),
                     wake,
+                    local: true,
                 };
                 if work.service == OutboundService::Public {
                     self.bounded_sync.deferred.push_back(flow);
@@ -4166,6 +4185,7 @@ impl Node {
                     owner: Some(WorkKey::of(&flow)),
                     port_request: (work.service == OutboundService::Public).then_some(work.request),
                     wake: Box::pin(pressure.released()),
+                    local: false,
                 };
                 if work.service == OutboundService::Public {
                     self.bounded_sync.deferred.push_back(flow);
@@ -4837,6 +4857,7 @@ impl Node {
                                     owner: pending_work.key,
                                     port_request: pending_public_request,
                                     wake: bytes_wake,
+                                    local: false,
                                 },
                             );
                             self.note_start(room, peer, service, "control_budget_busy");
@@ -4894,6 +4915,7 @@ impl Node {
                                     owner: pending_work.key,
                                     port_request: pending_public_request,
                                     wake: bytes_wake,
+                                    local: false,
                                 },
                             );
                             return false;
@@ -5440,6 +5462,7 @@ impl Node {
                         .then(|| self.ports.get(&(room, peer)).map(|port| port.req_gen))
                         .flatten(),
                     wake: bytes_wake,
+                    local: false,
                 },
             );
             self.note_start(room, peer, service, "control_budget_busy");
@@ -5645,6 +5668,8 @@ impl Node {
         let settlement_flow = Arc::clone(&flow);
         let output = result.clone();
         let worker_fence = fence.clone();
+        let preempted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_preempted = Arc::clone(&preempted);
         let completion_wake = self.bounded_sync.completion_wake();
         let inbox = self.history_hints.clone();
         let inbox_generation = inbox.generation(room, peer);
@@ -5688,6 +5713,21 @@ impl Node {
             #[cfg(feature = "test-knobs")]
             let deadline =
                 tokio::time::Instant::now() + crate::node::history_budget::BOUNDED_ROUND_PATIENCE;
+            // The turn of a flow retained against a newer head ends at its hint-turn deadline,
+            // not at the round's deadline or the frame timeout: the fence is retired there, which
+            // the next wire or room step observes as a local cancellation (ADR-037 R8: no
+            // failure, no backoff), and the newer head's own flow runs next. Armed before the
+            // board prelude: a retained flow that wants the board waits for publication
+            // authority and exchanges boards under the same bound, through the same fence.
+            let preempt = preempt_at.map(|at| {
+                let fence = worker_fence.clone();
+                let preempted = Arc::clone(&worker_preempted);
+                tokio::spawn(async move {
+                    tokio::time::sleep_until(at).await;
+                    preempted.store(true, Ordering::SeqCst);
+                    fence.retire();
+                })
+            });
             if flow.needs_board() && !worker_fence.is_retired() {
                 if let (Some(net), Some(authority), Some(scope), Some(signer)) =
                     (net, authority, board_scope, board_signer)
@@ -5717,17 +5757,6 @@ impl Node {
                     }
                 }
             }
-            // The turn of a flow retained against a newer head ends at its hint-turn deadline,
-            // not at the round's deadline or the frame timeout: the fence is retired there, which
-            // the next wire or room step observes as a local cancellation (ADR-037 R8: no
-            // failure, no backoff), and the newer head's own flow runs next.
-            let preempt = preempt_at.map(|at| {
-                let fence = worker_fence.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep_until(at).await;
-                    fence.retire();
-                })
-            });
             let mut failure = flow
                 .turn(
                     store,
@@ -5790,6 +5819,7 @@ impl Node {
             lane,
             retirement_key: running_retirement_key,
             policy_retire: None,
+            preempted,
             fence,
             flow,
             result,
