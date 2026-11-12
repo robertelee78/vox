@@ -1888,6 +1888,8 @@ struct HeldApp {
     observer: std::process::Child,
     path: PathBuf,
     pid: rustix::process::Pid,
+    /// Stopped by `stop`, and not yet seen retired: ended in `drop` if the product left it.
+    wedged: bool,
 }
 
 #[cfg(all(target_os = "macos", feature = "optional-proofs"))]
@@ -2018,6 +2020,7 @@ withExtendedLifetime(launchToken) { RunLoop.main.run() }
             observer,
             path,
             pid,
+            wedged: false,
         };
         assert_eq!(
             app.path, active,
@@ -2027,9 +2030,10 @@ withExtendedLifetime(launchToken) { RunLoop.main.run() }
     }
 
     /// Wedge the app: a stopped process answers no quit request, as a hung main thread does.
-    fn stop(&self) {
+    fn stop(&mut self) {
         rustix::process::kill_process(self.pid, rustix::process::Signal::STOP)
             .expect("APPARATUS: stopping the launched app");
+        self.wedged = true;
     }
 
     fn finish_handoff(mut self) {
@@ -2041,6 +2045,9 @@ withExtendedLifetime(launchToken) { RunLoop.main.run() }
             .observer
             .wait()
             .expect("APPARATUS: observe graceful app termination");
+        if status.success() {
+            self.wedged = false;
+        }
         assert!(
             status.success(),
             "PRODUCT: update did not retire the original app and restore one running replacement: {status}, launched {:?}",
@@ -2053,6 +2060,11 @@ withExtendedLifetime(launchToken) { RunLoop.main.run() }
 impl Drop for HeldApp {
     fn drop(&mut self) {
         use std::io::Write as _;
+        // A wedged original the product failed to stop would hold the observer's quit for
+        // ever: it is ended here first, so the red stays attributed and the guest clean.
+        if self.wedged {
+            let _ = rustix::process::kill_process(self.pid, rustix::process::Signal::KILL);
+        }
         if let Some(mut input) = self.observer.stdin.take() {
             let _ = writeln!(input, "QUIT");
         }
@@ -2757,7 +2769,7 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
             continue;
         }
 
-        let old_app = HeldApp::launch(home, &active, &cleanup.bundles);
+        let mut old_app = HeldApp::launch(home, &active, &cleanup.bundles);
         // `vox update` always updates (the decider, 2026-11-11): an app that does not quit on
         // request is stopped, the update goes on, and its output says which happened.
         let stopped_app = scenario == "stopped-app";
