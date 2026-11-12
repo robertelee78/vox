@@ -3680,6 +3680,7 @@ impl Node {
                 );
                 self.settle_archive_exit(&mut flow, failure);
                 self.dispose_rearming_hint(flow);
+                self.sched_rooms.insert(work.room);
                 continue;
             }
             if let Some(receipt) = (work.service == OutboundService::Public)
@@ -5614,6 +5615,21 @@ impl Node {
             .ports
             .get(&(room, peer))
             .and_then(|p| p.availability.remote(conn.serial()));
+        // A flow retained against a newer head for its author (`HINT_TURN`, the supersede
+        // check above) may not hold that head behind an obsolete body for the whole round:
+        // its next turn is retired at the hint-turn deadline.
+        let preempt_at = flow
+            .hint
+            .filter(|hint| {
+                !flow.local_own_root()
+                    && self.history_hints.newer_pending(
+                        room,
+                        flow.hint_peer,
+                        hint.author,
+                        hint.size,
+                    )
+            })
+            .map(|_| tokio::time::Instant::from_std(flow.since + HINT_TURN));
         let flow = Arc::new(tokio::sync::Mutex::new(Some(flow)));
         let result = Arc::new(StdMutex::new(None));
         let worker_flow = Arc::clone(&flow);
@@ -5692,12 +5708,23 @@ impl Node {
                     }
                 }
             }
+            // The turn of a flow retained against a newer head ends at its hint-turn deadline,
+            // not at the round's deadline or the frame timeout: the fence is retired there, which
+            // the next wire or room step observes as a local cancellation (ADR-037 R8: no
+            // failure, no backoff), and the newer head's own flow runs next.
+            let preempt = preempt_at.map(|at| {
+                let fence = worker_fence.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep_until(at).await;
+                    fence.retire();
+                })
+            });
             let mut failure = flow
                 .turn(
                     store,
                     &conn,
                     &job,
-                    worker_fence,
+                    worker_fence.clone(),
                     deadline,
                     &inbox,
                     inbox_generation,
@@ -5706,6 +5733,9 @@ impl Node {
                 .await
                 .err()
                 .map(ReturnedFailure::from_error);
+            if let Some(preempt) = preempt {
+                preempt.abort();
+            }
             if failure.is_none()
                 && flow.done()
                 && !flow.archive
