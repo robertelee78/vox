@@ -105,3 +105,8 @@ jobs:
         run: cargo clippy --all-targets --features vox-tui/test-knobs -- -D warnings
       - name: Clippy (optional proofs)
         run: cargo clippy -p vox-tui --all-targets --features optional-proofs -- -D warnings
+      # The app is Swift; nothing above compiles it. Twice (v0.4.29) a tag's release build was the
+      # first to find a Swift line the runner's compiler refused, an hour each time.
+      - name: Build Vox.app (unsigned)
+        if: matrix.os == 'macos-26'
+        run: scripts/build-macos-app.sh "$RUNNER_TEMP/app-build" >/dev/null
