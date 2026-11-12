@@ -316,9 +316,11 @@ enum Daemon {
             posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETSID | POSIX_SPAWN_CLOEXEC_DEFAULT))
             // A nested sh so that `$$` is the backgrounded shell's own pid.
             let script = "sh -c 'echo \"\(updateStarted)$$\"; \"$1\" update; echo \"\(updateEnded)$?\"' sh \"$1\" &"
-            let argv: [UnsafeMutablePointer<CChar>?] =
-                ["/bin/sh", "-c", script, "sh", vox].map { strdup($0) } + [nil]
-            defer { argv.forEach { free($0) } }
+            let words: [String] = ["/bin/sh", "-c", script, "sh", vox]
+            var argv: [UnsafeMutablePointer<CChar>?] = []
+            for word in words { argv.append(strdup(word)) }
+            argv.append(nil)
+            defer { for word in argv { free(word) } }
             var pid: pid_t = 0
             let failure = posix_spawn(&pid, "/bin/sh", &actions, &attributes, argv, environ)
             guard failure == 0 else {
