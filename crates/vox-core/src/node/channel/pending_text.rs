@@ -15,6 +15,28 @@ pub(crate) mod read;
 #[path = "pending_recovery.rs"]
 pub(crate) mod recovery;
 
+/// How long a write waits for the room's one pending write before it reports the room busy.
+/// An authored save or a served write holds `pending_text` for one blocking store commit,
+/// and every release wakes the waiters; this bounds a wait behind a holder that stalls.
+pub(crate) const PENDING_WRITE_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// An authored save registered as waiting for the room's pending write. While it lives, a
+/// served write that wakes on the room's release stands aside; it is dropped once the save
+/// holds `pending_text` or stops waiting, and that wakes the writes standing aside, since a
+/// save that leaves without reserving releases nothing.
+pub(crate) struct AuthoredWait {
+    waiters: Arc<std::sync::atomic::AtomicUsize>,
+    changed: Arc<tokio::sync::Notify>,
+}
+
+impl Drop for AuthoredWait {
+    fn drop(&mut self) {
+        self.waiters
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        self.changed.notify_waiters();
+    }
+}
+
 pub(crate) struct PendingText {
     owner: Arc<()>,
     room: Digest32,
@@ -197,6 +219,23 @@ pub(crate) enum PolicyBlocker {
 impl ChannelState {
     pub(crate) fn post_pending(&self) -> bool {
         self.pending_text.is_some()
+    }
+
+    /// Register this node's authored save as waiting for the room's pending write.
+    pub(crate) fn authored_save_waiting(&self) -> AuthoredWait {
+        self.authored_waiters
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        AuthoredWait {
+            waiters: Arc::clone(&self.authored_waiters),
+            changed: Arc::clone(&self.history_publication_changed),
+        }
+    }
+
+    /// Whether an authored save is waiting for the room's pending write.
+    pub(crate) fn authored_save_waits(&self) -> bool {
+        self.authored_waiters
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0
     }
 
     /// Inspect a managed-policy prerequisite while holding the room mutex.

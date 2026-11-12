@@ -2,7 +2,7 @@
 use super::*;
 use crate::identity::composite::RootSigner as _;
 use crate::node::channel::pending_text::{
-    CompletedText, GovernancePreparation, GovernanceWrite, Saved,
+    CompletedText, GovernancePreparation, GovernanceWrite, Saved, PENDING_WRITE_WAIT,
 };
 use crate::node::store::Store;
 
@@ -556,6 +556,29 @@ impl Node {
                 Ok(None) => return Err(Fault::RoomChangePending),
                 Err(_) => return Err(Fault::ComputerPolicy),
             };
+            // The room's one pending write may be held by a peer's served write (or another
+            // local write); every release wakes this edge. Wait for it here, registered so a
+            // served write that wakes on the same release stands aside (`history_stream::
+            // source`): otherwise, with the served writes woken the instant the room frees,
+            // a node that posts back to back would reach `prepare_pending_text` only to find
+            // the room taken again and pay a 100 ms retry per post. Past the cap the save
+            // proceeds and reports the room busy as before, which the poster retries.
+            let mut waiting = None;
+            let cap = tokio::time::Instant::now() + PENDING_WRITE_WAIT;
+            loop {
+                let channel = worker_room.lock().await;
+                if !channel.post_pending() {
+                    break;
+                }
+                let wake = channel.history_publication_wake();
+                waiting.get_or_insert_with(|| channel.authored_save_waiting());
+                drop(channel);
+                tokio::select! {
+                    biased;
+                    () = tokio::time::sleep_until(cap) => break,
+                    () = wake => {}
+                }
+            }
             let saved =
                 tokio::task::spawn_blocking(move || -> std::result::Result<SavedAppend, Fault> {
                     let pending = {
@@ -667,6 +690,8 @@ impl Node {
                             }
                         }
                     };
+                    // Registered no longer: the save holds the room's pending write.
+                    drop(waiting);
                     Ok((pending.run(&worker_store, signer.as_ref(), &text), None))
                 })
                 .await;

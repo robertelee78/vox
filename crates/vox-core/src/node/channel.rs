@@ -1460,6 +1460,10 @@ pub struct ChannelState {
     history_publication_flow: Option<([u8; 16], [u8; 16])>,
     /// Exact publication completion/key-erasure edge for cleanup blocked behind this room.
     history_publication_changed: std::sync::Arc<tokio::sync::Notify>,
+    /// Authored saves waiting for `pending_text` (`pending_text::AuthoredWait`). A peer's
+    /// served write stands aside while one is registered, so a node that posts back to back
+    /// keeps its own turn at the room ahead of the writes its readers queue.
+    authored_waiters: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     role_owed: std::sync::Arc<role_owed::RoleOwed>,
     pub(crate) own_writer_gate: std::sync::Arc<own_writer_gate::Gate>,
     /// Whether this node holds its own feed in the room as the room does (V210-164). A room
@@ -2342,6 +2346,7 @@ impl ChannelState {
             pending_text: None,
             history_publication_flow: None,
             history_publication_changed: std::sync::Arc::new(tokio::sync::Notify::new()),
+            authored_waiters: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             role_owed: std::sync::Arc::new(role_owed::RoleOwed::default()),
             own_writer_gate: std::sync::Arc::new(own_writer_gate::Gate::default()),
             settled: true,
@@ -2981,6 +2986,7 @@ impl ChannelState {
             pending_text: None,
             history_publication_flow: None,
             history_publication_changed: std::sync::Arc::new(tokio::sync::Notify::new()),
+            authored_waiters: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             role_owed: std::sync::Arc::new(role_owed::RoleOwed::default()),
             own_writer_gate: std::sync::Arc::new(own_writer_gate::Gate::default()),
             settled,
@@ -3473,6 +3479,7 @@ impl ChannelState {
             pending_text: None,
             history_publication_flow: None,
             history_publication_changed: std::sync::Arc::new(tokio::sync::Notify::new()),
+            authored_waiters: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             role_owed: std::sync::Arc::new(role_owed::RoleOwed::default()),
             own_writer_gate: std::sync::Arc::new(own_writer_gate::Gate::default()),
             settled: false,
