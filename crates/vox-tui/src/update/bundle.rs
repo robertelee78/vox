@@ -3969,21 +3969,28 @@ function run(argv) {
         if (action === 'inspect') return JSON.stringify(instance);
         if (instance.pid !== Number(argv[2]) || instance.started !== Number(argv[3]))
             throw new Error('application changed before the quit request; none was stopped');
-        // isTerminated is a run-loop fed observation; the process itself is asked too, so a
-        // stopped app is never waited on past its exit.
-        const gone = () => app.isTerminated || $.kill(instance.pid, 0) !== 0;
+        // The captured instance is still this process: the pid is looked up afresh and its
+        // launch date compared, so a recycled pid is never signalled. An instance that is no
+        // longer there has exited, which is what a quit or a stop was for.
+        const still = () => {
+            if (app.isTerminated) return false;
+            const now = $.NSRunningApplication.runningApplicationWithProcessIdentifier(instance.pid);
+            if (now.isNil() || now.isTerminated) return false;
+            const current = identity(now);
+            return current.pid === instance.pid && current.started === instance.started;
+        };
         const wait = (rounds) => {
             for (let i = 0; i < rounds; i++) {
-                if (gone()) return true;
+                if (!still()) return true;
                 $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.2));
             }
-            return gone();
+            return !still();
         };
         if (app.terminate && wait(50)) return 'quit';
         // forceTerminate asks the system to end the app, which on macOS 26 leaves a process that
-        // is stopped or cannot run its handlers; the verified pid is then killed outright.
-        if (app.forceTerminate && wait(25)) return 'stopped';
-        if ($.kill(instance.pid, $.SIGKILL) === 0 && wait(25)) return 'stopped';
+        // is stopped or cannot run its handlers; the re-verified pid is then killed outright.
+        if (!still() || (app.forceTerminate && wait(25))) return 'stopped';
+        if (!still() || ($.kill(instance.pid, $.SIGKILL) === 0 && wait(25))) return 'stopped';
         throw new Error('application pid ' + instance.pid + ' did not quit on request and could not be stopped');
     }
     const oldPid = Number(argv[2]);
