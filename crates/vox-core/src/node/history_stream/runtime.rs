@@ -2379,11 +2379,13 @@ impl Flow {
                             }
                             // A head no newer than the window's top resumes it. A newer head
                             // selects a new window at once, even over an unfinished one: fresh
-                            // messages never wait for old bodies (ADR-036; the decider, #934), and
-                            // the selector keeps the unfinished positions inside the new window,
-                            // walked newest first after the fresh ones, held positions passing
-                            // locally. Measured before this: a joiner read the creator's next post
-                            // only when his drain of her 150-post window ended, 51–59 s on.
+                            // messages wait for old bodies at most the owner's 1 s turn
+                            // (ADR-036 "the owner's turn"; the decider, #934 as amended
+                            // 2026-11-12), and the selector keeps the unfinished positions inside
+                            // the new window, walked newest first after the fresh ones, held
+                            // positions passing locally. Measured before this: a joiner read the
+                            // creator's next post only when his drain of her 150-post window
+                            // ended, 51–59 s on.
                             if let Some(window) = state.live {
                                 if window.through >= target.root.leaves {
                                     return Ok(Selection::Held(window, target.root.leaves));
