@@ -16,6 +16,7 @@ use crate::log::history::{
     consistency_ranges, inclusion_ranges, split, ConsistencyProof, ControlRangeProof, ControlToken,
     Descriptor, InclusionProof, SignedHead, MAX_CONTROL_HEADERS, MAX_PROOF_TOKENS, MAX_TREE_DEPTH,
 };
+use crate::node::channel::pending_text::PENDING_WRITE_WAIT;
 use crate::node::channel::ChannelState;
 use crate::node::history_budget::{BufferCharge, Job};
 use crate::node::store::Store;
@@ -696,6 +697,7 @@ impl Source {
         let publication_flow = begin
             .map(|request| self.retirement_request().map(|root| (request, root)))
             .transpose()?;
+        let mut waited: Option<Instant> = None;
         let mut room = loop {
             let room = if continuation.is_some() {
                 self.room.clone().lock_owned().await
@@ -729,9 +731,35 @@ impl Source {
                     return Err(Error::Unreachable("history room access changed"));
                 }
             }
-            if room.post_pending()
-                || (!publication && room.history_publication_busy(&self.store)?)
-            {
+            // A served write stands aside for the node's own authored save: the one the
+            // room's pending write is held by, and one waiting for it (`authored_save_waits`,
+            // registered by the post worker before it waits on the same edge). Every release
+            // of the pending write wakes this edge. Wait it out: answered Busy instead, a peer
+            // fetching from a node that posts back to back paid a round, a 200 ms Busy backoff
+            // and, with the next post already announced, the restart of its flow for nearly
+            // every body it asked for (measured: a reader held 2 of 1,272 rows after a 60 s
+            // burst at 20 posts/s). A short cap over the whole wait bounds it behind a holder
+            // that stalls; past it the answer is the Busy it was. The flow's own deadline
+            // cannot serve: the reader's turn elapses first and it would see no answer.
+            if room.post_pending() || (continuation.is_none() && room.authored_save_waits()) {
+                let wake = room.history_publication_wake();
+                drop(room);
+                if continuation.is_some() {
+                    wake.await;
+                } else {
+                    let cap = *waited.get_or_insert_with(|| Instant::now() + PENDING_WRITE_WAIT);
+                    tokio::select! {
+                        biased;
+                        () = self.fence.retired() => {
+                            return Err(Error::Unreachable("history request cancelled"));
+                        }
+                        () = tokio::time::sleep_until(cap) => return Ok(Lookup::Busy),
+                        () = wake => {}
+                    }
+                }
+                continue;
+            }
+            if !publication && room.history_publication_busy(&self.store)? {
                 if continuation.is_none() {
                     // This operation has not inspected evidence: another native publication
                     // owns the room. Proof serving must not turn that wait into a durable

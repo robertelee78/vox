@@ -116,11 +116,13 @@ pub(crate) struct AnnouncementReceipt {
 }
 
 /// Scalar ownership of the existing fixed body slots. A progressing transfer keeps its slot
-/// across quanta; another deferred flow may advance metadata but cannot reset that body.
+/// across quanta; another deferred flow may advance metadata but cannot reset that body. Each
+/// slot's release wakes the flows waiting for it (`released`), so a flow that found its slot
+/// held by a sibling waits for that exact edge rather than retrying at a Busy cadence.
 #[derive(Default)]
 pub(crate) struct BodySlots {
     owners: StdMutex<[Option<RequestId>; 3]>,
-    key_wake: Arc<tokio::sync::Notify>,
+    wakes: [Arc<tokio::sync::Notify>; 3],
 }
 impl BodySlots {
     fn claim(&self, purpose: Purpose, request: RequestId, key_body: bool) -> bool {
@@ -148,13 +150,13 @@ impl BodySlots {
         if slots[index] == Some(request) {
             slots[index] = None;
             drop(slots);
-            if index == 2 {
-                self.key_wake.notify_waiters();
-            }
+            self.wakes[index].notify_waiters();
         }
     }
-    fn key_released(&self) -> std::pin::Pin<Box<tokio::sync::futures::OwnedNotified>> {
-        let mut wake = Box::pin(Arc::clone(&self.key_wake).notified_owned());
+    /// The next release of slot `index`. Subscribe before checking the slot, so a release
+    /// between the failed claim and the wait is not lost.
+    fn released(&self, index: usize) -> std::pin::Pin<Box<tokio::sync::futures::OwnedNotified>> {
+        let mut wake = Box::pin(Arc::clone(&self.wakes[index]).notified_owned());
         wake.as_mut().enable();
         wake
     }
@@ -351,6 +353,16 @@ pub(crate) struct Flow {
     /// A durable body chunk moved in this flow's last turn: the waiting slice is
     /// progress, not a busy wait, and its port must not grow a Busy backoff.
     pub(crate) body_progress: bool,
+    /// When this flow was built. A newer hint for its author supersedes it only once it has
+    /// had [`HINT_TURN`] of progress or stops progressing, so a burst of appends does not
+    /// restart it before it fetches a body.
+    pub(crate) since: std::time::Instant,
+    /// A receipt was committed or a body moved in some turn since this flow was built: the
+    /// progress the owner's turn (ADR-036) is kept for. Not the last turn's alone: between
+    /// wire exchanges a turn commits nothing (it builds the next query from the header it
+    /// just held), and judged on that turn a flow was superseded ~40 ms after it started,
+    /// at its first such turn after the poster's next append, never reaching a body.
+    pub(crate) turn_progress: bool,
     /// This turn's slice waits on the room's governance fold, which is not ready yet (ADR-037
     /// R2): a local wait, not a body slot held against a busy peer, so it never retires the slot,
     /// and the actor's fold hook is asked to drive the fold.
@@ -581,6 +593,8 @@ impl Flow {
             slots,
             owners: [None, None, None],
             body_progress: false,
+            turn_progress: false,
+            since: std::time::Instant::now(),
             governance_wait: false,
             publication_wait: false,
             publication_owner_wait: None,
@@ -783,6 +797,8 @@ impl Flow {
             slots,
             owners: [None, None, None],
             body_progress: false,
+            turn_progress: false,
+            since: std::time::Instant::now(),
             governance_wait: false,
             publication_wait: false,
             publication_owner_wait: None,
@@ -2373,11 +2389,13 @@ impl Flow {
                             }
                             // A head no newer than the window's top resumes it. A newer head
                             // selects a new window at once, even over an unfinished one: fresh
-                            // messages never wait for old bodies (ADR-036; the decider, #934), and
-                            // the selector keeps the unfinished positions inside the new window,
-                            // walked newest first after the fresh ones, held positions passing
-                            // locally. Measured before this: a joiner read the creator's next post
-                            // only when his drain of her 150-post window ended, 51–59 s on.
+                            // messages wait for old bodies at most the owner's 1 s turn
+                            // (ADR-036 "the owner's turn"; the decider, #934 as amended
+                            // 2026-11-12), and the selector keeps the unfinished positions inside
+                            // the new window, walked newest first after the fresh ones, held
+                            // positions passing locally. Measured before this: a joiner read the
+                            // creator's next post only when his drain of her 150-post window
+                            // ended, 51–59 s on.
                             if let Some(window) = state.live {
                                 if window.through >= target.root.leaves {
                                     return Ok(Selection::Held(window, target.root.leaves));
@@ -3824,7 +3842,12 @@ impl Flow {
         job: &Job,
     ) -> Result<StageStart> {
         let is_key = self.key_body_root.is_some() && purpose == Purpose::Control;
-        let wake = is_key.then(|| self.slots.key_released());
+        // A slot held by a sibling flow of this node is a local wait with an exact release
+        // edge, for every slot: judged a Busy wait, a reader's flow toward the author lost its
+        // owner's turn (ADR-036) to the next head every time a flow toward another reader held
+        // the live slot for the same author, and refetched head and proof (measured: four
+        // readers, 90 such supersessions on the author's port in 60 s, ~100 rows each).
+        let wake = body_slot(purpose, is_key).map(|index| self.slots.released(index));
         if !self.slots.claim(purpose, request, is_key) {
             self.slot_wait = wake.map(|wake| {
                 wake as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + Sync>>
