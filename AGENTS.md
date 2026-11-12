@@ -115,3 +115,11 @@ unreachable when it was reached. When an anchor is missing, say truthfully what 
 ## House rule
 
 - Never state planned work as done: write "is to" or "must" until it has landed.
+
+## The operator's machines
+
+- **Never change the Vox version on any of the operator's machines without his explicit go for that
+  specific action.** No `vox update`, no `vox update --rollback`, no reinstall, on this Mac or on any
+  host he owns (beast, vince's, .203, .46). The decider, 2026-11-12, after an agent rolled two
+  machines back during his work day. The same goes for restarting his daemon: say first what it
+  will cost (a Linux node needs its passphrase again), then wait for his word.
