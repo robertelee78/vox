@@ -361,7 +361,8 @@ Each claim MUST be proved by real use of the shipped binary (ADR-018), with one 
 10. a fresh data root works end to end, and one holding a node's files outside `nodes/`, an
     unsupported future format or a malformed format marker is refused with the reason and left
     unchanged (`a_data_root_of_an_earlier_release_is_refused_proof`). The former previous-release
-    upgrade arm is no longer required for v0.4.5 (F-3, decider 2026-10-12);
+    upgrade arm is no longer required for v0.4.5 or v0.4.10 (F-3, decider 2026-10-12 and
+    2026-10-27);
 11. a node keeps running in full past the keyring window, and only a keyring change asks for the
     passphrase again (`a_keyring_change_needs_a_recent_passphrase_proof`);
 12. R40 and R42 are re-measured (`perf_r40_chat_latency_proof`, `perf_r40_relayed_chat_proof`,
