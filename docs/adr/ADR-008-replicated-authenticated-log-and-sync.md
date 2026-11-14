@@ -27,9 +27,10 @@ comes from per-author signatures, membership (ADR-007) and the fork handling bel
 
 [ADR-036 H-6–H-8](ADR-036-live-messages-and-requested-history.md#h-6-concrete-new-format-wire-contract)
 defines the v2 implementation contract. For that format it supersedes LS-3's automatic replicate-all
-interpretation, LS-4/LS-10's v1 skeleton shape, LS-28/LS-29's continuous-prefix archive request and
-automatic continuation, and LS-11/LS-12's exact-predecessor/increase-only behavior for sparse held
-sets. Ciphertext remains eligible for replication independently of decryption, but old history is
+interpretation, LS-4/LS-10's v1 skeleton shape, and LS-11/LS-12's exact-predecessor/increase-only
+behavior for sparse held sets. LS-28's frontier exchange is the v2 contract again, in ADR-046
+SY-12's form. *(Amended 2026-11-13 by ADR-046.)* Ciphertext remains eligible for replication
+independently of decryption, but old history is
 fetched only on explicit bounded demand. Same-held-set convergence, actual arrival cursors,
 attributable fork evidence and authority checks remain required. The v2 sparse/committed state
 must not advance the existing contiguous Feed. Old entry bytes and v1 rules remain intact;
@@ -223,12 +224,17 @@ consent grants (ADR-007), rendezvous records (ADR-012), the transport identity e
 - **LS-27. Range reconciliation.** Above about 100 active authors (`RANGE_MODE_AUTHOR_THRESHOLD`),
   where `HAVE` size dominates, peers that both set bit 1 MUST use range reconciliation. `NEG` MUST
   carry Negentropy v1 keyed by the full 32-byte SHA-256 entry hash, with no truncation. *Status:*
-  planned. `range_reconcile_exchange` exists and nothing calls it; `should_use_range_mode` is never
-  called; every session offers frontier only.
-- **LS-28. Frontier mode.** `HAVE` MUST list the feeds a peer holds. The receiver MUST reply `WANT`
-  with the missing ranges, asking from its own head (not past it) so that the peer's entry at that
-  position is compared with its own (V210-63). The holder MUST stream `ENTRY` frames (skeleton and
-  any retained payload) over a reliable QUIC stream (ADR-011).
+  below about 100 authors, `Have`'s per-author intervals with `Probe` are the exact form of range
+  reconciliation (ADR-046). Negentropy above that stays planned and unbuilt;
+  `range_reconcile_exchange` and `should_use_range_mode` are deleted until it is built. *(Amended
+  2026-11-13 by ADR-046.)*
+- **LS-28. Frontier mode.** `Have` MUST list, per author, the size, head, held intervals and
+  control-complete position a peer holds. The receiver MUST ask for missing ranges with `Range`
+  and `ControlRange`, starting at its own last held position (not past it) so that the holder's
+  entry there is compared with its own (V210-63), and MUST treat nothing in a `Have` as a size.
+  The holder MUST answer with `Entry` frames (header and any retained body the requester may
+  receive) over a reliable QUIC stream (ADR-011; ADR-046 SY-12, SY-25). *(Amended 2026-11-13 by
+  ADR-046.)*
 - **LS-29. A `WANT` is bounded by what is held (PRD-001 R4).** The holder MUST trust nothing in a
   `WANT` for size: each author's ranges MUST be sorted and merged, and each merged range MUST walk
   only the entries actually held. One session MUST serve at most `MAX_SERVE_ENTRIES` (1,024) entries

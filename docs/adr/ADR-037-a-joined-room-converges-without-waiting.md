@@ -73,9 +73,9 @@ served newest-first so a page cut short leaves a contiguous top and a missing bo
 hole; the selector counts a row held only once it is rendered. An ask for a row the page in
 flight already covers joins that page (it is answered with the page's status) and does not
 restart it. The decider, 2026-10-19: downloading all prior messages "should not be
-wired and is not necessarily expected that an agent would choose to do". The live window still
-fetches each author's newest 128 bodies on join; that is the one known deviation from this rule,
-and making the window fetch bodies only from the join on is the next change (see Consequences).
+wired and is not necessarily expected that an agent would choose to do". A joined node fetches
+each author's bodies from its join anchor on, and every author's control entries for all time;
+older bodies come only on request (ADR-046 SY-4, SY-14). *(Amended 2026-11-13 by ADR-046.)*
 
 A room's preparation on open MUST wait only on work this node finishes alone: its governance
 fold, the restore of its indexes, its legacy imports. Anything that needs a peer (an author's
@@ -284,10 +284,10 @@ A Busy refusal (the peer is mid-operation) costs the peer one lookup; an unreach
 a dial. The retry curve for a Busy refusal MUST NOT grow past 1 s. Entries converge at the
 refusal's true cost, not at an unreachable's cost.
 
-A history worker this node's own actor cancelled (its ask was replaced by a newer one, paused or
-stopped) is neither: it stopped at its next store step on a local decision. Its port MUST NOT be
-failed or backed off, and the room MUST NOT be poisoned by the cancellation; the replacing ask's
-own flow runs next.
+A request this node withdrew (room closed, peer retired, shutdown) is a cancellation: it is sent
+as `Cancelled`, and neither side counts it as a failure, backs off, or marks the room unable to
+save. No request is withdrawn because a newer head exists (ADR-046 SY-1, SY-21). *(Amended
+2026-11-13 by ADR-046.)*
 
 ### R9. Admission distinguishes accepted from committed
 
@@ -297,47 +297,19 @@ committed alone. A control range at an earlier, proven-but-uncommitted head MUST
 ### R10. A settlement's own feed is the settlement's own work
 
 Under R5 the acknowledgement of a node's own head is the conflict detector's input, not a write
-precondition; it MUST still be driven. A sparse settlement whose only missing piece is the
-node's own live-window acknowledgement MUST offer the own-author hint for the committed own head
-to every connected peer, so the next round fetches it now. Settlement MUST be retried for every
-open room on every tick: no other sync event reliably arrives for a room whose remaining piece
-is its own acknowledgement.
+precondition; it MUST still be driven. The join answer carries the node's own feed and each
+member's signed head of it (ADR-046 SY-11, SY-17). Settlement is re-checked when a `Head` answer
+for the own feed or an own-feed `Range` answer arrives. *(Amended 2026-11-13 by ADR-046.)*
 
 The own-author flow records the peer's authenticated head and walks no window: every position
 of the node's own log is already held, and a peer holding more of it is the conflict R5 stops
 the node on, not something to fetch. Measured before this: a creator walked her own ten-entry log
 through a joiner's port for 8 s (103 rounds) while two other joiners' first posts waited.
 
-### R11. A turn may run several control chunks, never a cycle
+### R11. A turn may run several control chunks, never a cycle (withdrawn)
 
-Control-lane work is metadata work (a proof check, a header fetch, a verify) where each step
-costs the peer one lookup. A turn MAY process a bounded number of control-lane chunks
-back-to-back (16); one chunk per round paces a whole convergence at one entry per second. A
-step that signals a dependency need or a Busy answer MUST end the turn: cycling a need or a
-busy answer inside one turn was measured as a spin (the product held 102% CPU until the proof
-watchdog killed it). Live body work stays one step per round: a body chunk is the expensive
-kind.
-
-This holds for every local slice of a bounded-sync flow, not only control chunks: a turn MUST run
-its local slices (verify, entry, reclaim, window steps) back to back until one needs the wire,
-waits, errs, or the turn has spent 20 ms or 64 slices; a wire exchange still ends the turn. Each
-slice as a turn of its own cost an actor round trip (~10 ms), about thirty per body: a joiner
-drained a 128-position live window at three positions a second, and a creator serving three
-joiners at once read their first posts after 30 s.
-
-A need for the fold is such a dependency need. An entry slice that needs the governance fold
-MAY run a bounded fold step and re-derive itself at most four times in one turn (R2 a); a need
-still open after that MUST end the turn as a wait, MUST mark the actor's fold work pending so its
-hook drives the fold (R2 b), and the flow resumes at the port's Busy cadence (R8). Treating each
-fold step as progress cycled the need without bound: the entry slice ran again at once against
-the same unready fold, 32 slices a turn and 77 turns a second (229,000 fold checks in 59 s), and
-because the one foreground lane went back to the same flow every round, the node's other peer
-never got a round: a post made while the fold was held reached no one in 30 s. Waiting on the
-fold is a local wait, not a body slot held against a busy peer, so it MUST NOT count toward
-retiring the flow's body slot.
-The lane's queue is fair as well: a port whose turn found the lane taken keeps its place ahead
-of the ports that become eligible after it, so the port sorted first cannot retake the lane
-round after round while its flow waits.
+*Withdrawn 2026-11-13 by ADR-046:* there is no flow turn. A request is one exchange; the
+scheduler order is ADR-046 SY-15. The withdrawn text stays in the git history.
 
 ### R12. A late entry re-arms the fold, and the fold re-settles at its own cost
 
@@ -371,11 +343,6 @@ land in released commits; the measured evidence lives on the tracked issue.
   pending hints, required work). v0.4.6 adds the one that was missing; it does not consolidate.
   One derived `needs()` from one set of facts, with nothing else able to start or suppress a
   round, is the next design change after the body-lazy window.
-- The live window fetches each author's newest 128 bodies on join (about 40 s of lane time per
-  author) against R1's rule. Fetching bodies only from the join on, headers for the rest, is the
-  first change after this release; the newcomer proofs then say: post-join rows at once, earlier
-  rows on demand.
-
 - The tick does settlement work for every open room every second: bounded, but no longer free.
 - A page read while the fold is behind carries a provisional note; a room marked own-history
   behind refuses every write until a person resolves it. Both are loud by design.
