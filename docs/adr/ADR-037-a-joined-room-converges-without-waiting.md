@@ -1,11 +1,14 @@
 # ADR-037: A Joined Room Converges Without Waiting
 
-- **Status**: Proposed for v0.4.6. The decider ruled (2026-10-18/19): "Ready is a constant
+- **Status**: Accepted. On 2026-11-13 the decider directed that the status be brought up to date
+  after the work shipped. The decider ruled (2026-10-18/19): "Ready is a constant
   wait"; "stories #952–#958 are essential to v0.4.6"; "the correct long-term solve, no
-  band-aids"; "Security outranks speed: the cryptography must be provably correct." R1–R6 are
-  the v0.4.6 release line and are not built: each is to land with its proof (R6). R7–R13 are the
-  measured pacing requirements that keep the background work bounded; the fixes for R8–R11 are
-  on PR #946's branch and unreleased. No release acceptance is claimed.
+  band-aids"; "Security outranks speed: the cryptography must be provably correct."
+  Stories #952–#956 and #958 for R1–R6 were delivered in v0.4.6; #957 for background
+  fold re-arming (R7 and R12) was delivered in v0.4.6. Subsequent corrective stories #1047
+  and #1051 were delivered in v0.4.10, #1203 in v0.4.25, and #1206 in v0.4.26.
+  Delivery of all R7–R13 requirements has not been established. PR #946 remains open;
+  no release was found containing its commits.
 - **Date**: 2026-10-19
 - **Deciders**: Robert E. Lee
 - **Tags**: sync, convergence, governance, settlement, sessions, drive keys, timing
