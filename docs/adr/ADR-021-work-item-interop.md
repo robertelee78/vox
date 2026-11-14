@@ -157,11 +157,13 @@ them, and the threat model is cooperating workers that may be buggy, never adver
 
 - **5.1** Every claim-protocol operation and every work `hello` MUST carry `data.vox`, set by the
   binary to exactly what `vox --version` reports. The CLI MUST refuse a caller-supplied `vox` (or
-  `op`) key in `--data`. Comparison is exact string equality; a stamp that is not a valid semantic
-  version is unknown.
-- **5.2** The fold MUST apply only operations stamped with the folding worker's own version; others
-  change nothing and are reported. An upgrade therefore ends every claim made under the previous
-  version.
+  `op`) key in `--data`. Every claim-protocol operation and work `hello` MUST also carry
+  `data.coord`, the claim-protocol level; comparison is equality on that level; `data.vox` is shown,
+  never compared (ADR-041 RS-10). *(Amended 2026-11-13 by ADR-041.)*
+- **5.2** The fold MUST apply only operations at the folding worker's own claim-protocol level;
+  others change nothing and are reported. An update that keeps the level keeps every claim; a
+  release that raises it ships the room's transition (ADR-041 RS-10). *(Amended 2026-11-13 by
+  ADR-041.)*
 - **5.3** A counted participation record is a claim-protocol operation, a work `hello` carrying
   `data.vox`, or a `bye`. The latest record is the maximum `(created_millis, entry_hash)`, the same
   ordering for every lookup in this section. A worker is a participant if it is in the room's
@@ -176,17 +178,21 @@ them, and the threat model is cooperating workers that may be buggy, never adver
   carry exactly the caller's version. A historical matching `hello` MUST NOT suppress a fresh
   announcement after a later record supersedes it with another, missing or unknown version, or
   with a `bye`. The new `hello` MUST use only the calling node's identity and the calling session;
-  it does not announce for another session or node. The drain hook and idle clients do not
-  announce. Updating a daemon or harness integration alone does not rewrite room participation.
-- **5.5** When any participant's version is mismatched, missing or unknown: every claim-protocol
-  verb and every `post --work` MUST refuse before posting, with exit status 3; the drain hook MUST
-  tell the session every turn that coordination is refused and why; `board --json` MUST report
-  `coordination: refused` with the table. Plain conversation MUST NOT be refused.
+  it does not announce for another session or node. The daemon announces each Session it opens or
+  reopens with a work `hello` at the level its node runs now, and ends it with a `bye` for that
+  Session alone (ADR-041 RS-11); a hook never announces; a `hello` from a verb is posted only with
+  no Session. *(Amended 2026-11-13 by ADR-041.)*
+- **5.5** When any participant's claim-protocol level differs from this worker's, or is missing or
+  malformed: every claim-protocol verb and every `post --work` MUST refuse before posting, with exit
+  status 3; the drain hook MUST tell the session every turn that coordination is refused and why;
+  `board --json` MUST report `coordination: refused` with the table. *(Amended 2026-11-13 by
+  ADR-041.)* Plain conversation MUST NOT be refused.
 - **5.6** The refusal MUST name the incompatible worker (fingerprint, session), its last announced
   version, the recorded time of that announcement and the required version (the refuser's own).
   Refusal and doctor output MUST describe the last counted room record, not claim that the stored
-  stamp identifies a currently running daemon, CLI or harness plugin. These diagnostics and the
-  refresh in §5.4 MUST NOT weaken the exact-version gate or the version-filtered claim fold.
+  stamp identifies a currently running daemon, CLI or harness plugin. These diagnostics MUST NOT
+  weaken the level gate or the level-filtered claim fold; the refusal names the level the other
+  worker speaks and this worker's own (ADR-041 RS-10). *(Amended 2026-11-13 by ADR-041.)*
 - **5.7** Known limits: workers whose clocks disagree may disagree about a participant at the
   horizon's edge, which can shift a refusal but not an owner; a binary that predates this gate
   enforces nothing, and its operations read as missing stamps.

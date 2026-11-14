@@ -759,7 +759,9 @@ settlement evidence.
 
 Use existing sealed segments and EntryIndex B-trees, adding only the roots/values needed for:
 
-- content-addressed head, context and proof objects, plus `(author, tree range) -> descriptor`;
+- content-addressed head and context objects, plus `(author, tree range) -> descriptor` for accepted
+  ranges only; no verified range is kept per head, for verifying or for serving: a served range is
+  derived from the leaves' headers when asked (ADR-047 SO-1); *(Amended 2026-11-13 by ADR-047.)*
 - `(author, seq) -> header/locator/admission flags`, independently of the contiguous feed;
 - accepted commitments, exact-head verified control intervals, receipt/dependency obligations
   and missing position/body intervals;

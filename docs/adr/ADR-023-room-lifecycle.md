@@ -223,21 +223,27 @@ below remain unchanged.
 
 - **RL-8.1. Leave.** `vox room leave` MUST post the node's presence statement (`0x0015`, `here` =
   false), take the node's records off boards with a signed member withdraw (`0x001A`), and MUST
-  delete the room from the node — every stored row and its key, the store rewritten so none of the
-  deleted bytes stay — once a sync session has carried the statement to another member (V210-164).
-  A room held alone MUST go at once.
+  delete the room from the node — every stored row and its key; the bytes they occupied are cleared
+  at the store's next rewrite (ADR-047 SO-10), not by a rewrite at the leave (the decider,
+  2026-11-13, ledger row 61) — once a member has echoed the departure head (ADR-049 LE-3), or at
+  RL-8.1a's bound, or at once when the room cannot sign a departure (ADR-049 LE-2, LE-4). *(Amended
+  2026-11-13 by ADR-049.)* A room held alone MUST go at once.
   **2026-11-06 product amendment, selected for v0.4.20; not built:** the operator explicitly
   chose to retain the minimal non-secret continuity marker specified by RL-8.4 below. That is
   the sole exception to “every stored row”; room content and keys are still erased. The
   marker's technical design requires independent Opus review before implementation.
 - **RL-8.1a. Leaving is immediate for the person** (the decider, 2026-11-11: "a node should be
   able to leave a room whenever it wants"; v0.4.26, #1206). `vox room leave` and the app's Leave
-  MUST answer as soon as the signed departure and the member withdrawal are durable. From then on
+  MUST answer, with success, as soon as the leave record (the member withdrawal and the leave's
+  state) is durable, on an unlocked node, in every room state (ADR-049 LE-1); the departure is
+  signed when the room's own head is authoritative and owed as a named wait until then (LE-2).
+  *(Amended 2026-11-13 by ADR-049.)* From then on
   the room is gone for the person: not in `vox room list`, not in the app's room list, no reads,
   no posts (a post is refused as `RoomLeft`: "you left this room"), no notifications, no
-  attention items. Delivery of the departure goes on in the background: the node MUST hold the
-  room hidden, and go on leaving across a restart, until a sync session has carried the
-  departure to another member, and MUST then delete it as RL-8.1 says. The hidden room serves
+  attention items. Delivery of the departure goes on in the background: the node MUST hold the room
+  hidden, and go on leaving across a restart, until a member has echoed the departure head, and MUST
+  then delete it as RL-8.1 says (ADR-049 LE-3, LE-4); a member's refusal is not a receipt. *(Amended
+  2026-11-13 by ADR-049.)* The hidden room serves
   members its public history as it did a moment before (a member catching up asks for whatever
   it lacks, and the departure may be the last thing it reaches; measured on the candidate, a
   member back from offline whose every other query was refused never took the departure), and
@@ -248,11 +254,14 @@ below remain unchanged.
   exactly one line per such room — `leaving <room>: no member has been told yet; told when one
   is reached` — and nothing else of it. The leave is not undoable from the room: a person's post
   no longer re-joins it; `LeaveUndone` remains only the name of the race in which a rejoin's
-  return presence overtakes a purge. A join of the room with its link while the departure is
-  undelivered is an ordinary rejoin: what the node holds goes first (RL-8.1b).
-  **Bound.** A departure no member can be told of MUST NOT hold the hidden room for ever: seven
-  days after the departure's own clock, the node deletes the room unheard and publishes its
-  member withdrawal all the same. The members' copies then list this identity until one of them
+  return presence overtakes a purge. A join of the room with its link, while the departure is
+  undelivered or after it, is a fresh join (ADR-049 LE-9): the hidden copy is discarded first, the
+  node's own unconfirmed signed entries go first, and the person sees nothing older than the join
+  and no refusal. *(Amended 2026-11-13 by ADR-049.)*
+  **Bound.** A departure no member can be told of MUST NOT hold the hidden room for ever: two days
+  after the departure's own clock (the decider, 2026-11-13, ledger row 58), the node deletes the
+  room unheard and publishes its member withdrawal all the same (ADR-049 LE-4). *(Amended 2026-11-13
+  by ADR-049.)* The members' copies then list this identity until one of them
   learns otherwise; there is no `vox room forget` (RL-8.3), and this bound is why none is
   needed. (A room held alone needs no bound: it goes at once, RL-8.1.) `LeaveNotHeard` and the
   30 s wait that preceded this ruling are removed; the ruling does not touch End, which has no
@@ -269,10 +278,15 @@ below remain unchanged.
   room-lifecycle fact `0x0019`, kind end); the creator MAY choose an idle end at creation (kind idle
   end), and the room then ends once nothing is said in it for that long. A node holding an ended
   room MUST take no new message in it, MUST pass the end on to each member at its next sync (for at
-  most 60 s for a member it cannot reach), and MUST then delete the room as RL-8.1 does. The
-  ender's node MUST take the whole room off boards (`0x001A`, room scope); a board MUST take that
-  only from the creator or an admin on the creator's signed roster (`0x001B`), and MUST answer a
-  later join of the room as ended. Lifecycle kind codes 1 and 4 (a leave and a return, before this
+  most 60 s for a member it cannot reach, measured from the end entry's own clock), and MUST then
+  delete the room as RL-8.1 does; a cleanup of the room's sync state that failed is discarded with
+  the room, never keeps it, and the deletion that cannot run now is a named wait (ADR-049 LE-4,
+  LE-6); until the room is gone every surface that lists rooms shows it ended; a member's leave
+  during the wind-down neither shortens it nor touches the room-scope withdrawal (LE-7). *(Amended
+  2026-11-13 by ADR-049.)* The ender's node MUST take the whole room off boards (`0x001A`, room
+  scope); a board MUST take that only from the creator or an admin on the creator's signed roster
+  (`0x001B`), and MUST answer a later join of the room as ended. Lifecycle kind codes 1 and 4 (a
+  leave and a return, before this
   ruling) are reserved and MUST be refused.
   Lifecycle work MUST get the free actor turn before new read or settlement maintenance
   takes the writer slot. Already-running writers and the existing lifecycle safety gates
@@ -303,10 +317,22 @@ below remain unchanged.
 ### v0.4.20 corrective design
 
 - **RL-8.4. Durable author continuity.** Before any own signed room entry can become externally
-  visible, the append transaction MUST durably retain a room/author-bound continuity marker:
-  the last own signed history head (the existing recovery-head type, including room/author
-  binding and signature), highest authored sender chain/generation, and immutable verified
-  public genesis bound to that same room. The genesis adds no room name, passphrase, room key,
+  visible, the append transaction MUST durably retain a room/author-bound continuity marker: the
+  last own signed history head (the existing recovery-head type, including room/author binding and
+  signature), highest authored sender chain/generation, and immutable verified public genesis bound
+  to that same room and, from the leave fence on (ADR-049 LE-2 step 2), this author's
+  **continuity**: everything the own append reads of the feed at that head
+  (`prepare_own_append_ranges`, `own_history.rs:1518-1586`: the append forest and root context;
+  `Entry::build_signed`, `pending_text.rs:1110-1121`: the entry hashes a later entry's `prev_hash`
+  and `lipmaa_backlink` can name), the signed headers of this author's entries above the last
+  member-confirmed position, and the public payload, with its signature, of each lifecycle entry
+  among them (a Presence: departure or rotation), all public and non-secret, no post body and no
+  key, so that a rejoin after erasure appends from its own authenticated material and members can
+  verify the chain and project the departure (ADR-049 LE-9); and, while own-history recovery is
+  pending, the highest verified supplied own head (ADR-049 LE-9 case 2). The continuity is derived
+  only from an authoritative own head and sets no fence; the marker keeps its existing lifetime.
+  *(The continuity clause from "and, from the leave fence on" amended 2026-11-13 by ADR-049.)* The
+  genesis adds no room name, passphrase, room key,
   messages, private Session data, member list or append frontier. Bound its encoded size by
   the existing genesis format's composite public-key/signature limits plus fixed framing;
   validate it and its room binding on load. Derive the append frontier during verified

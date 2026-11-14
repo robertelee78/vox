@@ -100,7 +100,10 @@ decider named: read records, the room's shared name, the decision record and the
   a new node, and that the people who trust the old one remove it from their keyrings.
 - **K-9.** The keyring window (ADR-026 N-2, 30 minutes) MUST be visible where the person works:
   the TUI status bar and the app's menu bar extra MUST show whether a keyring change will ask for
-  the passphrase, for example `keyring open 23m`.
+  the passphrase, for example `keyring open 23m`. *Amended 2026-11-13 by ADR-042:* `vox status`
+  shows it as a fact row directly after the log line,
+  `keyring: locked; a trust change will ask for your passphrase` or `keyring: open, 23m left`, never
+  beside the health verdict (ADR-042 TR-9).
 - **K-10. A node attached with its passphrase is remembered.** *Amended 2026-10-10 (#666):* the
   decider, 2026-10-09: "vox is unusable"; "if it need a passphrase it should tell me what to do",
   "not silently fail". Attaching a node with its identity passphrase (`vox node attach`, the app's
@@ -111,11 +114,13 @@ decider named: read records, the room's shared name, the decision record and the
   daemon restart, `vox update`, the app's quit and a reboot. `vox node attach --no-remember`
   MUST store nothing, and `vox node forget-passphrase <node>` MUST remove what is stored. Where
   the passphrase is asked for, Vox MUST say that anyone who can unlock this Mac's login keychain
-  can then attach the node. Where there is no Keychain Vox can use (Linux), Vox MUST say plainly
-  that the node is not remembered and how to keep it (`--keep --passphrase-file`). A remembered
-  node that cannot be attached at the daemon's start MUST be said to the person: a notification
-  with the command, and an Attach… action on its row under ON THIS MACHINE in the app. (Until this
-  amendment the Keychain was opt-in per node in the app only, off by default.)
+  can then attach the node. On Linux the kernel's per-user persistent keyring is the store (ADR-041
+  RS-1); after a reboot a node is Ready only from a credential or a passphrase file, and otherwise
+  says its remembered passphrase is gone and how to unlock it once (ADR-041 RS-3). *(Amended
+  2026-11-13 by ADR-041.)* A remembered node that cannot be attached at the daemon's start MUST be
+  said to the person: a notification with the command, and an Attach… action on its row under ON
+  THIS MACHINE in the app. (Until this amendment the Keychain was opt-in per node in the app only,
+  off by default.)
 
 ### 2a. Passphrases and trust offers (the decider, 2026-10-06)
 
@@ -454,8 +459,10 @@ keep code in sync through GitHub.
 - **L-3.** The accent MUST mean only focus or "live" (a peer connecting, a key arriving, a transfer
   verifying, a share going live). It MUST NOT mark trust, danger or decoration.
 - **L-4.** Trust MUST be shown by glyph and weight: a node in the keyring in text.primary bold with
-  `⇄` (each trusts the other) or `→` (only this node trusts it); not in keyring in text.secondary
-  with `·` and the words "not in keyring". ASCII fallbacks: `<>`, `->`, `.`.
+  `⇄` (each trusts the other) or `→` (this node trusts it, and as of the other's verified head it
+  had not); while this node cannot yet tell, `→` is followed by "cannot tell yet" (ADR-042 TR-10);
+  not in keyring in text.secondary with `·` and the words "not in keyring". *(Amended 2026-11-13 by
+  ADR-042.)* ASCII fallbacks: `<>`, `->`, `.`.
 - **L-5.** The TUI MUST detect truecolour, then 256, then 16 colours, and honour `NO_COLOR`.
   Motion MUST be at most 3 frames in the TUI, off over SSH and slow links, and in the app MUST
   respect Reduce Motion, Reduce Transparency and Increase Contrast.

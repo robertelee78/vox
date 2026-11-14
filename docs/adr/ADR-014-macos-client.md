@@ -83,8 +83,18 @@ app (v0.4.1) hosts its own node and is not covered here; calls are v0.5.0.
   app MUST say plainly that the rooms are reachable only while Vox is open.
 - **M-9.** The app MUST start and reach that daemon; it MUST NOT start a second one for the same
   data root (ADR-026 D-1). With the login item declined, the app MUST start the daemon as `vox`
-  does (ADR-026 S-2). The login item's daemon, finding another daemon serving the data root, MUST
-  wait and serve once that one stops: launchd restarts it only after a crash.
+  does (ADR-026 S-2). With Keep Running on, the app, the updater and `vox daemon --restart` enroll
+  the login item for the data root (`<data root>.control/manager`). The login item's daemon, finding
+  the data root served by a daemon a client started (`--as-detached`, or one serving `unsupervised`
+  after launchd refused), MUST take the root over: holding the restart lease, it asks that daemon to
+  stop by product request and serves once it has; finding it served by a daemon a person runs in a
+  terminal, or by another login-item daemon still stopping, it MUST wait and serve once that one
+  stops (ADR-041 RS-2, RS-5). No client starts a daemon of its own while the login item is enrolled
+  and launchd can run it; when launchd refuses, the client's daemon serves `unsupervised` until the
+  login item's takes over (the decider, 2026-11-13, Q4). launchd restarts the login item after any
+  signal stop (RS-5). A waiting login-item daemon takes the restart lease for each lock attempt and
+  binds to the data root it finds when it takes the lock (ADR-041 RS-13, RS-15). *(Amended
+  2026-11-13 by ADR-041.)*
 - **M-10.** The family LAN's root part MUST be a privileged helper registered with
   `SMAppService.daemon(plistName:)` (`Contents/Library/LaunchDaemons/us.vox.lanhelper.plist`),
   approved once by the person in System Settings. It replaces `sudo vox lan helper` on macOS. It

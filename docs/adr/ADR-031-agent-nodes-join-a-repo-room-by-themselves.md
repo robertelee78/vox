@@ -12,7 +12,7 @@ removes prior-release data and wire compatibility and migration proofs from v0.4
 The remaining feature requirements retain their stated release targets.
 SA-14's v0.4.20 removal clarification is proposed pending targeted independent review;
 it does not change SA-7's privacy boundary or grant earlier history.
-**Date**: 2026-10-10; amended 2026-11-06 (proposed SA-14 removal/readmission enforcement)
+**Date**: 2026-10-10; amended 2026-11-06 (proposed SA-14 removal/readmission enforcement); amended 2026-11-13 (CW-3 by ADR-041; SA-7, SA-9 by ADR-047)
 **Deciders**: Robert E. Lee
 **Tags**: agents, onboarding, hooks, keyring, trust, drive, sessions, macos
 **Related**: ADR-001, ADR-005, ADR-007, ADR-010, ADR-014, ADR-020, ADR-026, ADR-028, ADR-029, ADR-033, ADR-034
@@ -181,7 +181,9 @@ allow drive access for the node I'm using from the macOS app."
 - **CW-2.** **Unlock…** MUST be the one action on a Locked node. It MUST ask for the passphrase and
   always remember the node (ADR-028 K-10: the Keychain on a Mac), with no choice to offer.
 - **CW-3.** After a daemon restart, an update or a reboot, every remembered node MUST come back
-  Ready by itself, the person's node included, whatever any "keep running" setting says.
+  Ready by itself, the person's node included, whatever any "keep running" setting says. *Amended
+  2026-11-13 by ADR-041:* A node is remembered only where its store can hold it (ADR-041 RS-1); on
+  Linux, after a reboot, a node comes back Ready by itself only as ADR-041 RS-3 says.
 - **CW-4.** **Forget** MUST be in the node's menu. It MUST lock the node and forget what brings it
   back (its stored passphrase and its remembered state); the node, its rooms and its messages MUST
   stay on disk.
@@ -259,17 +261,19 @@ on a point the decider left open).
   drive holds MAY need a Session step to verify or to sync. A member that loses drive MUST keep what
   it already read and MUST receive nothing newer (ADR-029 SC-2b holds). The former migration of
   earlier-release stored steps is out of v0.4.5 scope (SA-5); current-version authorization is
-  unchanged.
+  unchanged. *Amended 2026-11-13 by ADR-047:* A private record MUST carry exactly one composite
+  signature, by the author's root key (the decider, 2026-11-13); a stored record keeps the format it
+  was written in and its identity (ADR-047 SO-4).
 - **SA-8. Forward from the join.** A node that joins a room MUST get a Session's steps only from
   the later of its join and its gaining drive, going forward. No node MAY send it, and it MUST NOT
   fetch, a step written before then, whatever its trust. The decider: "A node that joins syncs a
   Session only from the point it joined, going forward — no backfill of Session history."
 - **SA-9. A retention for Session steps.** A room MUST have a retention for its Session steps,
-  apart from its message retention (ADR-010 AR-28). Its default MUST be 7 days or the room's message
+  apart from its message retention (ADR-010 AR-28). Its default MUST be 2 days or the room's message
   retention, whichever is shorter, where forever is longer than any duration. Steps MUST never
   outlive the room's messages: the retention in force is always the shorter of the one set and the
   message retention. It MUST be set with `vox room retention <room> --steps <dur>`, for example
-  `--steps 7d`. The 7-day default MUST apply plainly to rooms an earlier release created, from the
+  `--steps 7d`. The 2-day default MUST apply plainly to rooms an earlier release created, from the
   first start of the release that brings SA-9; no older step is kept for them. The decider: "lol
   I'm the only user dude, we're still pre-alpha"; "yes" to steps never outliving messages and to
   `--steps 7d`. The decider: "a room
@@ -279,7 +283,11 @@ on a point the decider left open).
   message retention is set, with no identity passphrase (ADR-028 K-11). A member's own lower
   retention (ADR-010 AR-29) and the shorter-wins rule (AR-30) MUST apply to Session steps as they
   do to messages. `vox status --json` and the app's room settings MUST show it beside the message
-  retention. An ended Session's steps age by it (ADR-029 SE-5 as amended).
+  retention. An ended Session's steps age by it (ADR-029 SE-5 as amended). *Amended 2026-11-13 by
+  ADR-047 (the decider's Q1; the default was 7 days):* The default step retention is 2 days (the
+  decider, 2026-11-13), applied retroactively at the first v0.4.31 start; a room's admin MAY set
+  another value. There is no byte budget for steps (ADR-047 SO-8). The bound on a left room's hidden
+  copy is ADR-049's, ruled separately.
 - **SA-10. Peers of earlier releases — superseded for v0.4.5.** Mixed-version wire
   compatibility, a shipped-older-binary experiment and compatibility release notes are not
   required by the 2026-10-12 scope decision (ADR-026 F-3). Current peers MUST still enforce

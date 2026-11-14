@@ -42,7 +42,9 @@
   amended 2026-11-07 (FX-61a: retain unadmitted construction across policy supersession;
   FX-61b: observed ordinary-governance loss and retained-policy handoff); amended 2026-11-07
   (FX-64: a direct member route is not an anchor, and join publication targets it);
-  amended 2026-11-07 (FX-66: explicit individual-mode Drive withdrawal survives local reconciliation)
+  amended 2026-11-07 (FX-66: explicit individual-mode Drive withdrawal survives local reconciliation);
+  amended 2026-11-13 (FX-16, FX-29, FX-33, FX-34, FX-35 and the superseded-lines row: ADR-041,
+  ADR-042 and ADR-047 for v0.4.31)
 - **Deciders**: Robert E. Lee
 - **Tags**: trust, daemon identity, sessions, presence, agent comms, sync, health, releases
 - **Related**: ADR-012, ADR-018, ADR-020, ADR-026, ADR-029, ADR-031, ADR-033, ADR-034, ADR-035, ADR-036,
@@ -215,9 +217,10 @@ lessons. It changes neither this record's decision status nor any requirement or
   peer has completely satisfied for that peer's role. An authenticated header whose private
   payload and effect are addressed only to another member counts as satisfied without the other
   member's payload; it MUST NOT cause a permanent receipt probe, partial round or repeated offer.
-- **FX-16.** `vox status` and the app MUST record each round the lane completes as the room's
-  and the peer's last completed sync; "no completed sync" MUST fire only when it is true
-  (ADR-034 §5 "Health is true", HL-1; PRD-001 R35).
+- **FX-16.** `vox status --json` MUST report each completed round as `last_round_ms` (activity, not
+  shown in text). What `vox status` and the app say about a room is ADR-042's verdict (TR-2, TR-4,
+  TR-24, TR-25), measured by entries delivered, heads verified and inventories received, never by
+  rounds; there is no "no completed sync" condition. *(Amended 2026-11-13 by ADR-042.)*
 - **FX-17.** The daemon MUST answer its control socket within a harness hook's wait while it
   syncs; a hook that reports "the vox daemon here did not answer promptly" on an idle machine
   is a product defect.
@@ -559,12 +562,12 @@ lessons. It changes neither this record's decision status nor any requirement or
   already accepted serving progress retains its exact selected query and hint owner as runnable,
   not as a peer failure or parked refusal. Local refusal-bookkeeping capacity keeps that same
   owner at the existing Busy cadence. A different advertised head alone, including in a role hint,
-  is not new evidence for the old head; a head or header already held is not saved again; and a verifier
-  persists its progress once per proof verified to its end (an inclusion proof or a
-  control range), never once per Merkle join, since a proof is bounded and is verified again
-  from its bytes after a crash. Measured cause, the same daemon: 1,367 durable store commits per second across the four node stores
-  (redb transaction ids read 30 s apart: robert-work 524/s, opencode-work 495/s, codex-work
-  197/s, claude-work 151/s; robert-work's store at transaction 20.4 million) with no room
+  is not new evidence for the old head; a head or header already held is not saved again; and a
+  verifier persists no progress: a proof is verified in memory and dropped, and what is still wanted
+  is derived again after a crash (ADR-046 SY-14, SY-18; ADR-047 SO-3). *(Amended 2026-11-13 by
+  ADR-047.)* Measured cause, the same daemon: 1,367 durable store commits per second across the four
+  node stores (redb transaction ids read 30 s apart: robert-work 524/s, opencode-work 495/s,
+  codex-work 197/s, claude-work 151/s; robert-work's store at transaction 20.4 million) with no room
   gaining an entry. By site, ≈64% of commit wall time was `history_stream::admission::advance`
   committing the context and the cursor after every `Progress` step of `ControlRangeVerifier`
   and `InclusionVerifier` (a `WorkBudget` of 4 signatures or 32 descriptors; the step's own CPU
@@ -681,12 +684,19 @@ lessons. It changes neither this record's decision status nor any requirement or
   than the new lifetime MUST expire on it, and no daemon MUST say it cannot save because of the
   sweep that change started. A room's recovery after a failed save MUST NOT impair the node's
   other rooms: while one room recovers, and when its recovery fails, every other room of the
-  node MUST still read and post, and `vox status` MUST still answer. Decision: the recovery
-  re-saves the room's sealed state in an ordinary write transaction on the store as it is
-  open, never by closing and reopening the node's store file; the sweep prunes what the node holds; a signed-format
-  entry is never a legacy Session; an entry whose body never arrived, or that sits past its
-  author's verified head, is skipped that sweep and is not evidence of a malformed store; a row
-  the sweep cannot classify (a Session step or a message) expires under the message lifetime,
+  node MUST still read and post, and `vox status` MUST still answer. Decision: the recovery re-saves
+  the room's sealed state in an ordinary write transaction on the store as it is open; only when
+  redb has latched an OS write failure does the daemon reopen the same store file, after every
+  holder of the database has dropped it (its `Arc` count is 1), with any holder that outlives 5 s
+  named in status and every room readable while it waits; a refused reopen is named with its error
+  and retried every 5 s; the re-save follows the reopen (ADR-047 SO-12). The outcome 'other rooms
+  remain writable' is replaced by 'every room of the node stays readable while the store drains, and
+  other nodes' stores are untouched': no design keeps a latched store writable for any room. The
+  outage of 2026-10-21 was a refused reopen with no retry and no readable state; both now exist.
+  *(Amended 2026-11-13 by ADR-047, the decider's Q4.)* the sweep prunes what the node holds; a
+  signed-format entry is never a legacy Session; an entry whose body never arrived, or that sits
+  past its author's verified head, is skipped that sweep and is not evidence of a malformed store; a
+  row the sweep cannot classify (a Session step or a message) expires under the message lifetime,
   the longer of the two, once it is older than that, so nothing is kept forever for want of a
   classification. Measured cause, 2026-10-20 (the
   decider's node, vox 0.4.9, its daemon log `.daemon/log` at 2026-10-21T00:00:11Z): he set his
@@ -708,11 +718,13 @@ lessons. It changes neither this record's decision status nor any requirement or
   Ready for this daemon's life on every system, and the Locked status line MUST name a command
   that works. Where the system has a credential store Vox uses, the Keychain on macOS
   (ADR-028 K-10), `vox node unlock` MAY also remember the node there and MUST say so, and `vox
-  node lock` MUST forget it. Where there is no such store, Linux today, `vox node unlock` MUST
-  NOT persist the passphrase anywhere and MUST say that a daemon restart will ask again; a node
-  Locked after a restart is unlocked again by hand, which the decider accepts ("that's ok as
-  long as I can actually unlock them", 2026-10-21), so no Linux credential store is built for
-  now. Vox MUST remember a plaintext passphrase file only by the path the person named with
+  node lock` MUST forget it. On Linux, `vox node unlock` MUST store the passphrase in the kernel's
+  per-user persistent keyring, never on disk, so a restart, an update or a crash needs nothing typed
+  while the key is kept (ADR-041 RS-1); after the computer restarts the node returns as ADR-041 RS-3
+  says. Where the kernel refuses the keyring, `vox node unlock` MUST say the node is not remembered,
+  name the refused call and the kernel's answer, and say that a restart asks again unless the person
+  names a passphrase file. *(Amended 2026-11-13 by ADR-041.)* Vox MUST remember a plaintext
+  passphrase file only by the path the person named with
   `--passphrase-file` (it copies nothing), and MUST never write one on its own. "I'm not saying passphrases should be stored,
   but there has to be a way to unlock a node"; "at least put the files in a correct place" (the
   decider, 2026-10-21). Measured cause, 2026-10-21 (the decider's Linux host, Ubuntu 26.04, vox
@@ -793,13 +805,10 @@ lessons. It changes neither this record's decision status nor any requirement or
   that node's node ID, whose value is that node's integer in-use count; the member values MUST
   sum to `in_use` and `occupied` respectively; a node's `round_running` values and its own `by_node` member MUST be taken
   from one snapshot, and that member MUST equal the number of that node's ports whose
-  `round_running` is true. While at least one port in a room has a retained flow-state
-  continuation waiting for the exact release edge, any "no completed sync" text shown for that
-  room in `vox status` or in the app MUST contain the literal text `flow-state pool`; when no port
-  in the room has such a continuation, that text MUST NOT identify the flow-state pool as the
-  cause. Before the stale threshold, that exact retained ownership is already an unhealthy
-  `room-flow-state-pool:<room>` condition: diagnosis MUST name it immediately rather than wait on
-  elapsed time, and MUST NOT attach it to another room. Measured cause,
+  `round_running` is true. *(Deleted 2026-11-13 by ADR-042: there is no flow-state pool and no
+  retained continuation under the replacement (ADR-046 SY-19); a `NOT RECEIVING` or `NOT ASKING`
+  line names its cause in its own clauses (ADR-042 TR-4, TR-25). The `room-flow-state-pool:<room>`
+  condition is deleted with it.)* Measured cause,
   2026-10-21 (UTC, as every date in this record): on the decider's daemon (four hosted nodes,
   three rooms, restarted 02:32Z) every port of every node had started no round, `queued` froze,
   every room said "no completed sync in 10 minutes", and posts moved neither between the two
@@ -1702,7 +1711,7 @@ Narrow successor amendments. Requirements not named here remain in force.
 | FX-44: an installed authorized receiver retains its actual read demand | FX-50 retains the receiver's page obligation through a temporarily unprojected opening, without changing floors or replacing a sender-drive obligation |
 | FX-28, FX-49: managed application preserves its committed prefix across derived reads | FX-51 retains the original post-issued-consent continuation through rekey-selection governance readiness without repeating issue or outbound enqueue |
 | ADR-035 computer enrollment and FX-2: exact two-sided approval and group-bound enrollment | Preserved; FX-52 makes group selection independent of invitation direction without weakening authentication-before-history |
-| ADR-034 §5 "Health is true" (HL-1, HL-2), PRD-001 R35 | The lane's completed rounds are completed syncs (FX-16); the control socket answers under sync load (FX-17) |
+| ADR-034 §5 "Health is true" (HL-1, HL-2), PRD-001 R35 | Health is measured by what was delivered and what members have signed and said (ADR-042 TR-1–TR-6, TR-24, TR-25); the control socket answers under sync load (FX-17) *(Amended 2026-11-13 by ADR-042.)* |
 
 ## Implementation order and related work
 
