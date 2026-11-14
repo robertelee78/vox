@@ -227,9 +227,9 @@ reconciliation for having no collision state.
 - **D6.2.** A port that needs a session and has no slot MUST be queued, never skipped. Queued ports
   are served round-robin across peers and FIFO within a peer. A queued port MUST re-check its need
   when its turn comes, and a port that still needs a session after its turn MUST go to the tail.
-- **D6.3. Known limit.** Four stalled peers can occupy all 16 slots until their sessions time out (a
-  frame timeout of 20 s, plus the budgets), and a live peer then waits up to that long. Round-robin
-  decides admission and does not pre-empt. This is **not fixed**, and no proof claims a bound for it.
+- **D6.3.** *(Withdrawn 2026-11-13 by ADR-046.)* The known limit went with the shared slots: a
+  stalled peer holds only its own K = 2 requests, each released at its deadline, and costs no
+  other peer anything (D1.5; ADR-046 SY-15, SY-24).
 
 ### D6a. When ports are evaluated
 

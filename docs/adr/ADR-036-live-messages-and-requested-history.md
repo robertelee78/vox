@@ -496,9 +496,10 @@ requests are ADR-046 SY-12's: `Have` (per author a size, HeadID, control-complet
 `ControlRange(author, since, from, to)`, `Context(hash)` and `Probe(author, from, to)` and
 `Snapshot(hash)`, with the answers and bounds given there. *(Amended 2026-11-13 by ADR-046.)*
 
-Inventory is `WANT -> client HAVE -> server HAVE -> DONE`, with the full bidirectional
-exchange charged to the same 1 MiB wire quantum. A `Have` conveys no body permission, authority
-or size: it says where to ask. A size above the known size, or a HeadID not accepted at or below
+Each request is one exchange, the request and its answer, charged to the same 1 MiB wire quantum
+(ADR-046 SY-12; the `WANT -> client HAVE -> server HAVE -> DONE` inventory is withdrawn). A
+`Have` conveys no body permission, authority or size: it says where to ask. A size above the
+known size, or a HeadID not accepted at or below
 it (a same-size distinct head stays eligible, as before), raises one `Head` request and sets
 nothing else. There is no hint inbox and no flow owner. What a node wants is derived from what it
 holds and the signed heads it has accepted (ADR-046 SY-14). *(Amended 2026-11-13 by ADR-046.)*
