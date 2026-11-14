@@ -85,7 +85,10 @@ readable: who reads whom is decided by trust (ADR-007).
 - **J-17.** The joiner MUST prove first. A wrong passphrase is detected by the responder, which MUST
   answer with one opaque `Refused`: a wrong passphrase MUST NOT be distinguishable from an identity
   mismatch or a policy refusal. `PowInvalid` and `Malformed` MAY stay distinguishable (they are
-  structural).
+  structural). *Amended 2026-11-13 by ADR-047:* `Unavailable` MAY stay distinguishable: it says the
+  member's own store could not record the join, it is sent before the exchange when the member
+  cannot save, it carries no detail, and after the passphrase check it tells no more than
+  `NotAdmitted` does (ADR-047 SO-14).
 - **J-18.** The exchange MUST be ordered frames on a bi-stream typed `join` (ADR-016 M14.4):
   CHALLENGE → SOLVE → SHARE → PROOF → PROOF → INIT, then ACCEPTED, REJECTED, or, for a joiner the room
   cannot take (ADR-007 G-22), FULL at its member cap, TAKEN when its last place went to another newcomer,

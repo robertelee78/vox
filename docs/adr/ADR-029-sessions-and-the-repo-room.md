@@ -63,7 +63,10 @@ relies on is ADR-028 K-14.
   for example
   `codex@device-2 · gso-cap · 3f0c25bf`.
 - **SE-4.** A Session MUST end only on the harness's real end: the hook's `SessionEnd`, which
-  unregisters the session (ADR-020 6.10). A `SessionEnd` whose reason is `resume`, or a resumed
+  unregisters the session (ADR-020 6.10). *Amended 2026-11-13 by ADR-041:* For OMP, the end of its
+  process, found as ADR-041 RS-8 says (its watcher's lifetime lock free and its wake endpoint
+  refusing, twice), is also the harness's real end; the end is posted once, however many times the
+  daemon restarts. A `SessionEnd` whose reason is `resume`, or a resumed
   session id, MUST keep the Session open.
 - **SE-5.** An ended Session MUST be closed and moved out of the person's way (shown apart from
   open Sessions, like an archived conversation). Its content MUST NOT be deleted when the session

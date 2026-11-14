@@ -28,9 +28,15 @@ network presence from the start: there is no interim design with one socket per 
 ### 1. The daemon
 
 - **D-1.** There MUST be at most one daemon per data root, so normally one per OS account, which has
-  one data root. Two data roots under one OS account (`VOX_DATA_DIR`) MAY each run their own daemon; each has its own lock, socket, port and nodes. A
-  daemon MUST hold an exclusive lock on `<data root>/.daemon/lock` for its whole life; a second daemon
-  that cannot take the lock MUST exit, saying a daemon is already running. A second `vox daemon`
+  one data root. Two data roots under one OS account (`VOX_DATA_DIR`) MAY each run their own daemon;
+  each has its own lock, socket, port and nodes. A daemon MUST hold an exclusive lock on
+  `<data root>/.daemon/lock`, opened through the data root's directory, for its whole life; it MUST
+  write only into the directories it opened, and MUST stop when it sees its data root replaced or
+  removed (ADR-041 RS-13). No process tries that lock without holding `<data root>.control/restart`,
+  taken immediately before the attempt; a daemon keeps it until its remembered nodes are terminal, a
+  waiting daemon releases it after each failed attempt, and a process that finds it held by another
+  never tries the lock (ADR-041 Terms, RS-2, RS-15); a second daemon that cannot take the lock MUST
+  exit, saying a daemon is already running. *(Amended 2026-11-13 by ADR-041.)* A second `vox daemon`
   invocation that names a node MUST hand that node to the running daemon (attach, §3) instead.
 - **D-2.** The daemon MUST NOT be a node. It holds no identity key, takes no part in any room and
   MUST run with zero nodes attached.
@@ -121,8 +127,9 @@ network presence from the start: there is no interim design with one socket per 
   (an anchor's headless key, N-1), or a file path. A file source serves attach only, never a keyring
   change (ADR-028 K-13; the decider, 2026-10-06). On daemon start each kept node MUST re-attach, and its rooms and services MUST come
   back. *Deferred (additive):* an environment-variable passphrase source in the attach file.
-- **L-5. Silent harness death.** *Deferred (additive):* a sweep that unregisters the sessions of a
-  harness that died without ending them. Until it exists, such a session MUST keep holding its node.
+- **L-5. Silent harness death.** An OMP registration whose process is gone is ended, once, and
+  removed (ADR-041 RS-8). A harness without a fence instance keeps holding its node until it ends
+  its session. *(Amended 2026-11-13 by ADR-041.)*
 - **L-6. Panic isolation.** Each node's actor MUST run as its own task. The daemon MUST watch its
   handle; a panic MUST detach that node only, and MUST be reported (status, event and log). The
   daemon and every other node MUST keep running. Process-wide state MUST tolerate a poisoned lock.
@@ -203,11 +210,18 @@ network presence from the start: there is no interim design with one socket per 
 ### 5. Starting the daemon and the clients
 
 - **S-1.** `vox daemon` MUST run in the foreground. SIGHUP, SIGTERM, SIGINT and SIGQUIT MUST each
-  detach every node cleanly and then stop the daemon.
+  detach every node cleanly and then stop the daemon. *Amended 2026-11-13 by ADR-041:* The stop line
+  MUST name the signal's sender as far as it can be read (ADR-041 RS-6). A product stop is a
+  `Stop { reason }` request, never a signal; a `--login-item` daemon stopped by any signal exits 71
+  after its clean stop so that launchd starts it again, and a unit's daemon likewise
+  (`RestartForceExitStatus=71`); every other daemon keeps exit 0 (V210-93; ADR-041 RS-5).
 - **S-2. Auto-start.** A client that may attach a node (L-2: a session-holding verb, the TUI,
-  `vox node attach`), or an agent's hook, that finds no daemon MUST start
-  `vox daemon --detach`, writing its stderr to `<data root>/.daemon/log` from its first line, and MUST
-  wait up to 15 s for the socket. After that it MUST fail, saying the daemon did not start and naming
+  `vox node attach`), or an agent's hook, that finds no daemon MUST wait while
+  `<data root>.control/restart` is held, then start the daemon through the manager enrolled for the
+  data root, and otherwise MUST start `vox daemon --detach`, which itself takes the lease before the
+  lock or exits if another holds it (ADR-041 RS-2, RS-5), writing its stderr to
+  `<data root>/.daemon/log` from its first line, and MUST wait up to 15 s for the socket. *(Amended
+  2026-11-13 by ADR-041.)* After that it MUST fail, saying the daemon did not start and naming
   the log's path. Concurrent starts MUST end with exactly one daemon (D-1).
 - **S-3.** No verb MUST host its own node: `serve`, `connect`, `up`, `forward`, `service`, `trust` and
   every other verb MUST be clients of the daemon.
@@ -253,8 +267,10 @@ network presence from the start: there is no interim design with one socket per 
   ```
   `fingerprint` is the node's identity fingerprint (base32) and the SHA-256 of the `vault.cbor`
   beside it, written from the unlocked profile at create and unlock, so a node not attached can be
-  shown with it (P8, #617). It MUST be shown only while that hash matches the vault there, and is
-  for display only: nothing MAY decide trust, an attach or anything else from it.
+  shown with it (P8, #617). It MUST be shown only while that hash matches the vault there. Nothing
+  MAY grant trust or an attach from it; it MAY be used to refuse to open a store of another identity
+  before the passphrase is asked, with the decrypted vault the final word (ADR-041 RS-14). *(Amended
+  2026-11-13 by ADR-041.)*
 - **F-2.** A node's setting MUST be read from `nodes/<name>/config/<file>`; when that file is missing,
   from the same file in the account's config directory. The daemon's own settings (listen, metrics,
   relay limits) MUST be read from `.daemon/config`; the relay limits are `relay-circuits` and
@@ -328,8 +344,9 @@ network presence from the start: there is no interim design with one socket per 
 
 ### 9. Diagnostics
 
-- **G-1.** A dial that finds no node answering as the expected identity MUST say "nothing at
-  `<address>` answers as `<expected node>`". It MUST NOT say who else answered there: the generic
+- **G-1.** A dial that finds no node answering as the expected identity MUST say "`<address>`
+  answered, but holds no node attached as `<expected node>`". *(Amended 2026-11-13 by ADR-042.)* It
+  MUST NOT say who else answered there: the generic
   refusal (ADR-011) gives a dialler nothing more, and a daemon's leaf names no node.
 
 ### 10. Proofs

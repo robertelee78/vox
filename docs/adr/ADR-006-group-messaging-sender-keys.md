@@ -54,7 +54,10 @@ recipient, which is what per-sender trust needs.
   the SKDM against the author's admitted key (`ChannelState::accept_skdm`).
 - **S-8.** A message header MUST be `{channelID, epoch, author_id, chain_id, iteration}`, bound as AEAD
   associated data `vox/group-msg-ad/v1 ‖ cbor[cid, epoch, author_id, chain_id, iteration]`; the
-  ciphertext MUST be Sender-Key-signed under `vox/group-msg/v1`.
+  ciphertext MUST be Sender-Key-signed under `vox/group-msg/v1`. *Amended 2026-11-13 by ADR-047:* A
+  private Session record (ADR-031 SA-7) is the exception: its ciphertext is not Sender-Key-signed;
+  the author's root key signs `[room, header, ciphertext]` under `vox/private-session/v3`, and a
+  receiver verifies that signature before the AEAD opens (ADR-047 SO-4).
 - **S-9.** The chain KDF MUST be `mk = HMAC(CK, 0x01)`, `CK' = HMAC(CK, 0x02)`, and the AEAD nonce
   `HMAC(mk, 0x03 ‖ header)[..12]`.
 - **S-10.** A receiver MUST accept a message only if its `iteration` advances the last seen for

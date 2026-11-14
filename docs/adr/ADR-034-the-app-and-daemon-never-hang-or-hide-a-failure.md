@@ -52,18 +52,21 @@ each of these broke.
 
 ### 1. Updates
 
-- **UP-1.** `vox update` and the app's update MUST stop the running daemon and start the new
-  version's daemon as part of the update, so every remembered node comes back Ready (ADR-031 CW-3),
+- **UP-1.** `vox update` and the app's update MUST bring up the new version's daemon as part of the
+  update, after the new bundle is published, under the restart lease and through the daemon's
+  manager where it has one (ADR-041 RS-2), so every remembered node comes back Ready (ADR-031 CW-3),
   and MUST say so in one sentence, naming any held session (ADR-026 L-7) the restart ended.
+  *(Amended 2026-11-13 by ADR-041.)*
 - **UP-2.** A client of a daemon (the app, the TUI, every verb and every hook) MUST refuse its own
-  daemon when their versions differ, and MUST NOT attempt any other request on that connection.
+  daemon when their control-protocol numbers differ, and MUST NOT attempt any other request on that
+  connection (ADR-041 RS-12). *(Amended 2026-11-13 by ADR-041.)*
   The decider: "if not matching, don't attempt". The refusal MUST be one plain sentence naming both
   versions and the action that fixes it ("Vox's daemon is 0.4.2 and this app is 0.4.4: restart the
   daemon"); the app MUST offer that action as a button. This applies only between a client and its
   own daemon: peers of different versions MUST be left as they are, and no node MAY refuse to sync,
   relay or send a room's entries to a peer because its version differs (the decider, 2026-10-10).
-  Measuring when two versions are compatible, between a client and its daemon and between peers,
-  is planned for v0.4.5 and is not part of this ADR.
+  *(A sentence deferring the measure of version compatibility to v0.4.5 deleted 2026-11-13 by
+  ADR-041.)*
 - **UP-3.** When a client's and its daemon's versions differ, `vox status` and the app's status MUST
   name both versions.
 
@@ -172,23 +175,45 @@ we're working on hot fixes -- but this needs to be codified into ADRs, projects/
   bound applies only while the disk is full, a physical limit; it is not a cap on a person's data
   in normal use (FR-8; the lead's call, 2026-10-10).
 - **SR-5.** The fault MUST keep the operating system's error text.
+- **SR-6.** Vox MUST refuse a write before the operating system would, when the disk holding the
+  store cannot hold the write's reservation above the floor, and MUST say so in SR-2's words;
+  reclamation (deletes and cleanups) MUST stay possible on Vox's own ballast when the disk is
+  otherwise full, and a first start with no ballast MUST name the bytes it needs (ADR-047 SO-11,
+  SO-2). *(Added 2026-11-13 by ADR-047.)*
+- **SR-7.** A recovery MUST need no more disk than the failure left plus the ballast, and nothing it
+  creates MAY outlive it (ADR-047 SO-9, SO-12). *(Added 2026-11-13 by ADR-047.)*
+- **SR-8.** A room that passes from 'cannot save' to 'can save' MUST raise one event,
+  `StoreRecovered(room)`; the recovery owner MUST run the room's own pending save directly when
+  admission becomes possible and raise the event after that save committed, never waiting for the
+  event to start it; and every piece of work that waited on the store MUST be retried from the event
+  (ADR-047 SO-11; ADR-046 SY-24; ADR-040 NW-2). *(Added 2026-11-13 by ADR-047.)*
 
 ### 5. Health is true
 
-- **HL-1.** `vox status` and the app MUST NOT say healthy while a room cannot save (SR-2) or a peer's
-  syncs all fail.
+- **HL-1.** `vox status` and the app MUST NOT say healthy while a room cannot save (SR-2), a peer's
+  syncs all fail, a room is not receiving, not asking, hears from no member, or holds entries it
+  cannot read (ADR-042 TR-4, TR-5, TR-25); and MUST NOT say up to date of a room whose authors'
+  heads it has not verified (TR-24). *(Amended 2026-11-13 by ADR-042.)*
 - **HL-2.** A peer whose every sync fails over a window MUST be shown as "sync failing", with the
-  reason, and its syncs MUST back off (ADR-025), not repeat every few seconds.
+  reason, and its syncs MUST back off (ADR-025), not repeat every few seconds. *Amended 2026-11-13
+  by ADR-042:* Any authenticated answer from the peer ends the failing window; whether the room
+  receives is a separate measure (ADR-042 TR-4, TR-6). *Amended 2026-11-13 by ADR-049:* A room that
+  has ended or that this identity left raises no "sync failing": a member that refuses it has
+  deleted it, which is what the end asked for, or has not yet taken the departure, which the hidden
+  room goes on serving (ADR-049 LE-3, LE-6).
 
 ### 6. Logs
 
-- **LG-1.** The daemon's log MUST be bounded in size, and a line repeated many times MUST be written
-  once with its count.
+- **LG-1.** The daemon's log MUST be bounded in size and MUST keep its newest 21 MiB of lines, 48
+  hours at twice the busiest measured rate (ADR-042 TR-17); a line repeated many times MUST be
+  written once with its count and its last time; opening the log MUST NOT truncate, rewrite or
+  delete a file, and a restart MUST NOT cost retention. *(Amended 2026-11-13 by ADR-042.)*
   This bounds only the daemon's own log, so it cannot fill the disk; it is not a cap on a person's
   data (FR-8; the lead's call, 2026-10-10).
 - **LG-2.** Every line MUST carry a UTC timestamp and the node it is about, and a room's id when it is
   about a room.
-- **LG-3.** `vox status` and the app MUST name the log's path.
+- **LG-3.** `vox status` and the app MUST name the log's path, how much it keeps, and the time of
+  its oldest line. *(Amended 2026-11-13 by ADR-042.)*
 
 ### 7. Every action ends
 

@@ -99,7 +99,10 @@ unreachable when it was reached. When an anchor is missing, say truthfully what 
 - **Never run `vox` against a real profile.** Every `vox` you start sets both `VOX_DATA_DIR` and
   `VOX_CONFIG_DIR` to a scratch directory. Why: even a failed unlock writes to the profile's store.
 - **Never use `sudo`**, even a `sudo -n` that does not prompt. Shape traffic and do everything else
-  in userspace.
+  in userspace. This covers the host and every machine the operator owns. A proof may act as root
+  inside a disposable Linux test VM or container, to run the installer as a person does and to set
+  that guest's sysctls for a staged case: "Yes, inside the test VM only. Never on the Mac or any of
+  my machines." (The decider, 2026-11-13; ADR-041 RS-1, ADR-045 FG-4)
 
 ## Work tracking
 
