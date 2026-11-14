@@ -781,8 +781,11 @@ Bound unverified/pending state as well as accepted pages. At most one current ob
 reference per admitted author (2,048 author cap) is resident; additional signed evidence is
 stored lazily with its exact attributable bindings. At most 4,096 unresolved dependency keys per
 room are admitted at once; additional work remains pending before allocation. A process-wide
-lazy object cache is at most 64 objects and 4 MiB, subject to the shared buffer permits. Neither
-an unlimited pending-head map nor a restart-time load of all proof/context objects is permitted.
+lazy object cache is at most 64 objects and 4 MiB, and a cache of tree descriptors this node's
+committed snapshot produced, each with the context its reconstruction generated, keyed by (room,
+history instance, binding, start, leaves), is at most 8 MiB, both subject to the shared buffer
+permits (ADR-044 RD-9). *(Amended 2026-11-13 by ADR-044.)* Neither an unlimited pending-head map
+nor a restart-time load of all proof/context objects is permitted.
 Discarding an unaccepted relay hint to stay within a bound does not discard accepted evidence.
 
 An archive operation progresses through explicit local demand, cache lookup, bounded missing

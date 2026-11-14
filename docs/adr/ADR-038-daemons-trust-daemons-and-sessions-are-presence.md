@@ -5,7 +5,7 @@
   remain proposed. The 2026-11-01 correction workflow and release were selected by the decider;
   Opus technical approval and implementation, acceptance and delivery are recorded on the
   source-bound issues, separately from decision status. Each product requirement MUST land
-  with its proof (ADR-018) in a small release (FX-19).
+  with its proof (ADR-018) in a release that meets FX-19. *(Amended 2026-11-13 by ADR-045.)*
   FX-52's 2026-11-02 pairing design is approved; implementation and acceptance are separate.
   For v0.4.20, independent Opus reviews approved FX-55–FX-57, FX-59–FX-60 and FX-63 at
   `37b0ffbf4`, FX-53–FX-54 at `e8ad3b894`, and FX-58/FX-62 at `0f5988648`.
@@ -222,8 +222,9 @@ lessons. It changes neither this record's decision status nor any requirement or
   TR-24, TR-25), measured by entries delivered, heads verified and inventories received, never by
   rounds; there is no "no completed sync" condition. *(Amended 2026-11-13 by ADR-042.)*
 - **FX-17.** The daemon MUST answer its control socket within a harness hook's wait while it
-  syncs; a hook that reports "the vox daemon here did not answer promptly" on an idle machine
-  is a product defect.
+  syncs and while its agents post and step (ADR-044 RD-1); a hook that reports "the vox daemon
+  here did not answer promptly" on an idle machine, or under that load, is a product defect.
+  *(Amended 2026-11-13 by ADR-044.)*
 
 ### 5. No legacy
 
@@ -245,9 +246,10 @@ lessons. It changes neither this record's decision status nor any requirement or
 
 ### 6. How this ships
 
-- **FX-19.** Releases MUST be small and incremental until Vox is back to "somewhat usable":
-  each cut is one clean batch of fixes from this ADR, published and closed with its release
-  milestone (v0.4.7, v0.4.8, …).
+- **FX-19.** From v0.4.31 a release MUST NOT be minimal or partial ("minimal continues the shit
+  cascade", the decider, recorded 2026-11-12): it ships every item of its fix list, proven by the
+  fleet gate (ADR-045 FG-1), or it does not ship. It is published and closed with its release
+  milestone. *(Amended 2026-11-13 by ADR-045.)*
 - **FX-20.** Two tracks MUST run in parallel: a scripted walkthrough of two computers that the
   decider drives (fresh install, daemon trust both ways, a repo room, Claude Code, Codex and
   OpenCode, one task end to end), with every surprise recorded as a defect under this ADR; and
@@ -326,7 +328,13 @@ lessons. It changes neither this record's decision status nor any requirement or
   A node actor which has not applied the revision at the local observation boundary remains
   attached but non-authoritative: status names it pending and its prior projection fails every
   current-policy fence. The accepted application retains ownership and continues when its queue,
-  room lock or storage can progress. Crossing the observation boundary records lateness; it is
+  room lock or storage can progress. *Amended 2026-11-13 by ADR-048:* A node has applied the
+  revision once its keyring batch is durable and every open room's trust debt is installed from
+  it (ADR-048 TC-4). A room whose withdrawal is not yet paid holds that room's trust debt: it
+  encrypts nothing under its sender or drive chain and releases no key of them until the debt is
+  paid (ADR-048 TC-3); the debt neither keeps the node non-authoritative nor reserves, marks or
+  closes any other room (TC-5). A room this identity has left holds no debt (TC-2; ADR-049).
+  Crossing the observation boundary records lateness; it is
   not an authorization lease and MUST NOT discard still-current work or its unlocked credential.
   Only an actual policy/expiry change, detach, lock or shutdown supersedes that work. Completion
   clears the exact owned pending result while preserving the historical miss. A later unrelated
@@ -429,10 +437,11 @@ lessons. It changes neither this record's decision status nor any requirement or
   a second attempt only when both named fallback instants were already overlapping. Every recorded
   completion must advance the opposite daemon's `last_answered_exchange`; an overlapped attempt
   without its own completion is covered only when that same daemon answered the successful peer
-  round and retained no failure. CLI JSON, plain CLI, the app
-  FFI and the native Computer Trust screen expose the exact missed revision, whether it repaired
-  late, and whether it is expired, replaced, pending or converged, alongside policy revision,
-  per-peer exchange records/counters and per-node binding revision/derivation moment. Neither
+  round and retained no failure. CLI JSON, `vox computer status --details`, the app FFI and the
+  native Computer Trust screen expose the exact missed revision, whether it repaired late, and
+  whether it is expired, replaced, pending or converged, alongside policy revision, per-peer
+  exchange records/counters and per-node binding revision/derivation moment; the plain CLI prints
+  ADR-043 CJ-1's two lines and peer rows instead. *(Amended 2026-11-13 by ADR-043.)* Neither
   client has to infer currentness from elapsed time or free-text failure wording.
   Each per-peer application also names `exchange_in_flight`, true for the whole reservation from
   selection through completion. Attempts say that work started and exchanges that it completed;
@@ -647,7 +656,9 @@ lessons. It changes neither this record's decision status nor any requirement or
   NOT move. Decision: derived state commits at redb `Durability::None` (redb 4.3.0 has no
   `Eventual`; a later durable commit carries it) and the ruled set stays `Immediate` however it
   arrived: a received consent, trust change, key package or Session record is flushed like the
-  node's own.
+  node's own. *Amended 2026-11-13 by ADR-044:* Every ruled commit runs on the store's blocking
+  path, never on the actor's turn, and its reply is produced only from that commit's own result
+  (ADR-044 RD-5, RD-7).
   Any other received entry commits with the derived state that admitted it and reaches disk
   with the next durable commit, before this node acknowledges holding it to its sender (ADR-028
   R-6), so a crash in between loses only what the sender has not yet seen acknowledged and
@@ -659,7 +670,14 @@ lessons. It changes neither this record's decision status nor any requirement or
   flush. While a save is stalled, status publication and `vox status` queries, reads of
   already-saved messages, attention selection and other unrelated non-disk work MUST remain
   responsive; `vox status` MUST NOT say "room publication is busy" for a room whose only activity
-  is a flush. No commit's flush runs while the room's lock is held. A new post stays pending while
+  is a flush. No commit's flush runs while the room's lock is held, and no commit runs on a thread
+  of the daemon's async runtime (ADR-044 RD-5–RD-7). Answering a peer's history query reads a
+  lease of the committed snapshot: it writes nothing, waits for no save, holds neither the room's
+  lock nor its publication through the read, and stands however many posts were published
+  meanwhile (ADR-044 RD-8); it is admitted and released without the actor (ADR-044 RD-16). A
+  node's own post waits only for the owners of its own room that were ready before it, and every
+  owner is served in the order it became ready (ADR-044 RD-10). *(Amended 2026-11-13 by
+  ADR-044.)* A new post stays pending while
   its own save can still complete and reports success only after that save is durable, as FX-30
   requires. If its save definitively fails, the post reports failure and MUST NOT be reported as
   saved. Any surface that reports save or recovery state MUST report it truthfully. The
@@ -976,8 +994,13 @@ lessons. It changes neither this record's decision status nor any requirement or
   computer-policy target MUST preserve its current authority; it MUST NOT replay managed-room
   application merely because the app reopened. This shortcut MUST NOT apply when the
   authenticated identity, lifecycle, policy target or actual application is no longer current.
-  Required authoritative application MUST settle its durable binding, keyring, revocation,
-  key-package and consent work before publishing the exact current actor authority. It MUST
+  Required authoritative application MUST settle its durable binding and keyring, install every
+  open room's trust debt from that keyring and release its exclusive publication transition,
+  before publishing the exact current actor authority; it MUST be non-authoritative from before
+  the keyring batch commits until then. Its revocation, key-package and consent work is settled
+  room by room afterwards: a room whose share is not yet settled holds a trust debt and encrypts
+  nothing and releases no key of its chains until it is paid (ADR-048 TC-3, TC-4); it does not
+  hold back the authority publication. *(Amended 2026-11-13 by ADR-048.)* It MUST
   release the exclusive policy publication transition before network-dependent private/session
   delivery can require publication readers. The original room obligations MUST transfer to
   ordinary room-drive ownership extended to retain their exact causal continuation; they
@@ -993,7 +1016,10 @@ lessons. It changes neither this record's decision status nor any requirement or
   Tick and Status MUST NOT retry unchanged parked work. Lock/shutdown, room removal or
   replacement and policy supersession MUST retire the exact parked owner. Neither policy
   completion nor application receipts claim remote message delivery. Pending work MUST NOT
-  become terminal failure, fabricated delivery or timer-driven retry.
+  become terminal failure, fabricated delivery or timer-driven retry. *Amended 2026-11-13 by
+  ADR-040:* These rules govern every not-yet refusal in the daemon, not only room and
+  private-drive obligations, through one per-node registry keyed by room and kind and parked on
+  a prerequisite whose generation is checked at the park (ADR-040 NW-1–NW-4).
 
   The v0.4.14 re-selection path could invalidate the actor's already-current projection,
   replay room tails and return before restoring authority. Its private-room aggregator
@@ -1020,12 +1046,16 @@ lessons. It changes neither this record's decision status nor any requirement or
   An ordinary pending dependency MUST resume its original operation when that dependency
   progresses; a stale target MUST remain unable to publish.
 
-- **FX-41.** Every pairing surface MUST state the next action and the authenticated computer
-  on which it belongs. Before local approval, the person MUST see the peer and fixed policy
+- **FX-41.** Every pairing and computer surface MUST begin with the state line and next line of
+  ADR-043 CJ-1, naming the computer on which the next action belongs. *(Amended 2026-11-13 by
+  ADR-043.)* Before local approval, the person MUST see the peer and fixed policy
   and have the exact local approval action. After local approval, waiting text MUST name the
   other computer rather than invite repeated local approval. Repeated approval MUST remain
-  idempotent. Expired or canceled attempts MUST offer truthful local closure and MUST NOT
-  claim withdrawal of signed authority already recorded elsewhere.
+  idempotent. A computer holding an incomplete attempt, approved or not, MUST be able to close it
+  at once (ADR-043 CJ-6, Q1). Closing MUST mark the attempt so it can never complete on this
+  computer, MUST state whether the other computer can still complete it with what it holds, and
+  MUST NOT claim withdrawal of signed authority recorded elsewhere. *(Amended 2026-11-13 by
+  ADR-043.)*
 
   Pairing handoffs MUST provide complete safely quoted actions for the named acting computer,
   without including invitation secrets in diagnostic output. Configured computer policy MUST
@@ -1131,7 +1161,11 @@ lessons. It changes neither this record's decision status nor any requirement or
   NOT turn unchanged parked work into a retry. Native work that genuinely changes the needed
   input MUST hand off its exact room progress after releasing physical ownership.
   The existing weak parked owner and its lifecycle/authority fences MUST be extended rather
-  than duplicated. It MUST retain no store, signer, secret, publication lease, room lock or
+  than duplicated; that extension is ADR-040 NW-3's per-node registry, into which the
+  key-package, rekey, own-key, governance, metadata-publication and construction waits are
+  folded. The private-drive waits and the other preserved owners of ADR-040 NW-1 keep their
+  owner. *(Amended 2026-11-13 by ADR-040.)* It MUST
+  retain no store, signer, secret, publication lease, room lock or
   native worker while parked. The narrow FX-61a exception permits an unpublished, unadmitted
   constructor to retain its own in-memory sealed room key and passphrase, without a secret lease,
   until synchronous drop on lock. Source review and a diagnostic spike MUST distinguish actual
@@ -1309,8 +1343,11 @@ lessons. It changes neither this record's decision status nor any requirement or
   by its own exclusive Computer transition or room reservation. Parked external waits MUST
   retain no physical publication/secret lease, store, signer, room lock or native worker.
   Actual supersession and permanent storage or mutation failures MUST retain their refusal
-  and retirement semantics. No generic error retry, second runner, polling or renewed deadline
-  is permitted.
+  and retirement semantics for the room in which they occur; supersession re-issues the work
+  under the new policy at its stage, never from the start (ADR-040 NW-3, NW-12). They MUST NOT
+  mark, reserve or terminalize any other room; a parked trust debt is rebased, never replayed,
+  when the keyring changes (ADR-048 TC-5, TC-6). *(Amended 2026-11-13 by ADR-040 and ADR-048.)*
+  No generic error retry, second runner, polling or renewed deadline is permitted.
 
   A correlated nonshipping `d06090651` run, based on product `67eb2367f`, established public,
   paired private and independent manual-Drive baselines before removal. Revision 14 committed
@@ -1443,7 +1480,8 @@ lessons. It changes neither this record's decision status nor any requirement or
   fresh pairing, never automatic merging. Removed, suspended, retired or faulted participation
   MUST NOT be treated as a fresh individual.
 
-  Pairing operation 3 MUST first authenticate the invitation and peer using a separate
+  Pairing operation 5 *(amended 2026-11-13 by ADR-043, formerly 3)* MUST first authenticate the
+  invitation and peer using a separate
   `vox/computer-auth/v1` CPace/PoP challenge bound to operation, persisted protocol, suite,
   invitation, identities and transport, before disclosing any group history or publishing an
   enrollment preview. Authenticated group offers MUST validate signed authority together with
@@ -1460,12 +1498,14 @@ lessons. It changes neither this record's decision status nor any requirement or
   Invitation claim and final recording MUST recheck expiry, cancellation, authority and the
   singular pending operation at their transaction boundaries. A claimed invitation survives
   restart for the same authenticated redeemer; a recorded operation survives with the same
-  grants, staged evidence and approvals. Cancellation cannot resurrect a late result or
+  grants, staged evidence and approvals. *Amended 2026-11-13 by ADR-043:* The claim and the
+  recorded operation are one fact (ADR-043 CJ-8); the inviter records whether the redeemer
+  confirmed saving the operation (CJ-5). Cancellation cannot resurrect a late result or
   withdraw a signature already held elsewhere. A changed group, sponsor, grant or operation
-  requires fresh review and approval, not rebasing a signature. Obsolete pairing operation 1
-  receives a truthful software-update refusal without secret or group disclosure; an
-  unexplained connection close MUST NOT be called a version mismatch. Ordinary exchange
-  operation 2 remains unchanged.
+  requires fresh review and approval, not rebasing a signature. Obsolete pairing operations 1
+  and 3 receive a truthful software-update refusal without secret or group disclosure *(amended
+  2026-11-13 by ADR-043)*; an unexplained connection close MUST NOT be called a version
+  mismatch. Ordinary exchange operation 2 remains unchanged.
 
   Acceptance MUST extend the three-computer journey with the fresh computer issuing the
   invitation and a grouped member redeeming while the other member is offline. It MUST show
@@ -1563,7 +1603,10 @@ lessons. It changes neither this record's decision status nor any requirement or
   obligation and resume on the current accepted policy, without an unrelated command or restart.
   Release stale authority/resources, coalesce requeue, preserve original replies and progress,
   revalidate current attachment/trust and retire replaced/removed rooms. Keep permanent and
-  malformed refusals terminal; no timer-driven generic retry or spin. Observe consumer post/read,
+  malformed refusals terminal; no timer-driven generic retry or spin. A key-package attempt held
+  in memory is not a malformed artifact: any not-yet abandons it and the selection runs again
+  from the durable cursor (ADR-040 NW-11). *(Amended 2026-11-13 by ADR-040.)* Observe consumer
+  post/read,
   service/activity and key delivery, not queue counts. The controlled diagnostic exercised both
   rejection paths but fresh posts still crossed both ways: this source hole is not established
   as the sole cause of the historical screenshot. “Only on this machine” means no acknowledged

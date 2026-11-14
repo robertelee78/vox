@@ -113,18 +113,26 @@ nodes on the Macs can drive its other nodes. No node is to be guessed to be pers
 - **CT-14.** Updates MUST be authenticated, ordered and applied idempotently. A stale roster or
   personal-node announcement MUST NOT restore removed membership or old drive privileges.
   Restarting either daemon MUST NOT undo the last accepted policy. Interrupted reconciliation
-  MUST be recoverable without requiring the person to repeat fingerprint-by-fingerprint trust.
+  MUST be recoverable without requiring the person to repeat fingerprint-by-fingerprint trust,
+  without another policy change and without a restart. A room the reconciliation cannot finish
+  yet holds its own trust debt: it encrypts no new content and releases no key of its chains
+  until the debt is paid, and it does not stop the other rooms or keep the node from becoming
+  current (ADR-048 TC-3, TC-5). *(Amended 2026-11-13 by ADR-048.)*
 - **CT-15.** The app MUST show which computers and nodes participate, which personal nodes have
   drive, and whether the requested changes have reached each computer. An unavailable computer
   MUST NOT be shown as having acknowledged an update. The operator CLI MUST expose the same
-  effective policy and pending state for a computer such as Beast.
+  effective policy and pending state for a computer such as Beast: the pending state and next
+  action first, in the words of ADR-043 CJ-1; the effective policy through `vox computer policy`
+  and `--details`. *(Amended 2026-11-13 by ADR-043.)*
 
 ### 4. Stop trusting a computer
 
 - **CT-16.** Removing a computer from My computers MUST remove all trust in its managed nodes
   across the remaining group, including individual node grants the person made before pairing.
   It MUST NOT preserve those earlier grants as exceptions. The confirmation MUST state this
-  effect plainly and name the affected computer and nodes.
+  effect plainly, name the affected computer and nodes, list the rooms where those nodes are
+  members with what will happen in each, and save the person's choices with the removal (ADR-043
+  CJ-10, CJ-12). *(Amended 2026-11-13 by ADR-043.)*
 - **CT-17.** A removed computer MUST NOT return through a stale roster, restart, reconnect or
   another existing member's old view. Including it again requires a new deliberate enrollment.
   Once computer trust is absent, the person MAY instead establish individual node trust again.

@@ -146,9 +146,13 @@ MUST be reproduced by the harness when its fix is reverted.
 
    An unlabelled red is a proof defect, and a verifier MUST reject it. A test whose red does not name
    its side MUST NOT block.
-2. **Optional proofs are fully optional.** Expensive user-facing proofs MUST sit behind the cargo
-   feature `optional-proofs` (heavy ones behind `heavy-proofs`, which implies it). An optional proof
-   MUST block nothing: not CI and not the release gate. Without the feature, each optional proof MUST
+2. **Optional proofs are fully optional.** The fleet journeys J1–J13 of ADR-045 are to block the
+   release through the `fleet` step of `scripts/release-gate.sh` (that step is to be added with
+   ADR-045's fleet stage 1) and never run in CI; no other proof joins them without an ADR naming
+   it. *(Amended 2026-11-13 by ADR-045.)* Every other expensive user-facing proof MUST sit behind
+   the cargo feature `optional-proofs` (heavy ones behind `heavy-proofs`, which implies it). An
+   optional proof MUST block nothing: not CI and not the release gate. Without the feature, each
+   optional proof MUST
    compile a stand-in (`not_run!`, `crates/vox-tui/tests/support/optional_proof.rs`), listed and ignored
    as `OPTIONAL PROOF NOT RUN`, which prints that when run. It MUST NOT read as a pass. CI MUST compile
    optional proofs without running them, and `docs/release/optional-proofs.md` MUST list them. The
@@ -179,10 +183,16 @@ MUST be reproduced by the harness when its fix is reverted.
 7. A new claim SHOULD extend an existing user-journey proof rather than add a test file. A new test file
    MUST justify itself.
 8. A fix MUST delete the tests it makes redundant, in the same change.
-9. **Run once.** A proof SHOULD be run once, in the profile CI uses. It MUST be repeated only on smoke
-   (a red, a flake someone has seen, a timing near its bound, or a claim that is itself a rate), and
+9. **Run once.** A proof SHOULD be run once, in the profile the release gate uses (the release
+   suite; for a fleet journey, the candidate assets). *(Amended 2026-11-13 by ADR-045.)* It MUST
+   be repeated only on smoke (a red, a flake someone has seen, a timing near its bound, or a claim
+   that is itself a rate), and
    whoever repeats it MUST say why. Callers' proofs MUST be run only where the diff plausibly reaches
-   them, in one profile. A verifier MUST NOT re-run the fixer's greens. After a clean re-merge, only what the conflict
+   them, in one profile. A verifier MUST NOT re-run the fixer's greens of in-tree proofs. A
+   reviewer of a fix MUST run the fleet journeys its item maps to himself, on the fix's assets,
+   and read their receipts, reusing a receipt that matches ADR-045 FG-1's key; the author's fleet
+   receipts are not the review's evidence (the decider, recorded 2026-11-12; ADR-045 FG-11).
+   *(Amended 2026-11-13 by ADR-045.)* After a clean re-merge, only what the conflict
    touched MUST be re-run. Nobody SHOULD run locally what CI already runs.
 10. **One mutant per claim.** Every proof MUST have, for each claim, a mutant: the product broken on
     purpose, under which the proof goes red on the assertion that makes that claim, labelled
@@ -195,7 +205,11 @@ MUST be reproduced by the harness when its fix is reverted.
     *Status:* built (V210-105).
 12. **Latency bounds hold under ordinary load.** A latency bound MUST hold on a machine doing ordinary
     work. A red under ordinary load is a product defect. A release gate MUST NOT require an idle
-    machine, and a red MUST NOT be explained away by the machine's load.
+    machine, and a red MUST NOT be explained away by the machine's load. *Amended 2026-11-13 by
+    ADR-045:* A release gate MUST measure the bounds a person feels under the load the operator
+    runs, and only after the run has shown that load and every other condition the claim names
+    (ADR-045 FG-4, FG-19). A bound missed while an injected fault is in flight toward the member
+    is measured against that fault's recovery interval; a miss outside one is a product red.
 13. **Choosing what to run.** *Accepted for v0.4.4 (the decider's Q&A, 2026-10-10; #685); not built.* One command
     MUST run, on demand only, either every proof or the proofs a diff from a given commit reaches,
     and MUST print what it selected and why. The decider: "we need a full test suite, but need to
@@ -210,7 +224,10 @@ MUST be reproduced by the harness when its fix is reverted.
 
 ### §11 Publish only what CI proved
 
-1. The gates MUST run once, in CI, on the commit that is published, on both ubuntu and macOS.
+1. CI MUST compile, format-check and lint the commit that is published, on both ubuntu and macOS,
+   and MUST run no proof (the decider, 2026-10-02). The blocking proofs and the fleet journeys MUST
+   run once, in `scripts/release-gate.sh`, on that commit and its candidate assets (ADR-045 FG-1,
+   FG-3). *(Amended 2026-11-13 by ADR-045.)*
    `release.yml` MUST run no proof. Its first job, `ci-passed`, MUST pass only if CI's `push` run on
    `main` succeeded for exactly the tagged SHA, and every build MUST depend on it.
 2. Every `cargo test` in CI MUST run `--no-fail-fast`.
