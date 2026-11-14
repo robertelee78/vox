@@ -55,6 +55,7 @@ primitive) precedes ADR-007 (consent, which is stored on the log) in build order
 | [043](ADR-043-adding-replacing-and-removing-a-computer.md) | Adding, Replacing and Removing a Computer (every pairing and computer surface starts with its state and the next action; an unfinished attempt closes at once; removal evicts the computer's nodes from rooms unless `--keep-rooms`; `binding` and `retire` under `vox computer advanced`) — accepted for v0.4.31 | 007, 018, 028, 033, 035, 038, 040, 041, 042, 044, 045, 046, 048, 049, 050 |
 | [044](ADR-044-the-daemon-stays-responsive-under-agent-load.md) | The Daemon Stays Responsive Under Agent Load (one save, one flush, off the actor; the view costs the same however much is unread; serving is a read, admitted without the actor; a post waits only for its own room; a restarted room opens in seconds; every post within 5 s, speed measured before a target is set; Linux gets its receive buffer) — accepted for v0.4.31 | 018, 026, 034, 036, 037, 038, 040, 041, 042, 045, 046, 047 |
 | [045](ADR-045-the-fleet-release-gate.md) | A Release Is Gated on a Fleet That Matches Real Use (fleet journeys J1–J13 in VMs block the release through the release gate; reviewers run them themselves; no minimal release) — accepted as the design for v0.4.31, acceptance measurements owed | 018, 034, 038, 039, 040, 041, 042, 043, 044, 046, 047 |
+| [046](ADR-046-sync-always-makes-progress.md) | Sync Always Makes Progress (per-author range reconciliation replaces flows and hints; a newcomer starts from the creator's latest fence post and the most recent chunk, older history only when a person pages back; control entries for all time; a join needs one member's check of the passphrase) — accepted as the design for v0.4.31, acceptance owed | 005, 006, 007, 008, 018, 023, 025, 034, 036, 037, 038, 040, 042, 044, 045, 047, 048, 049, 050 |
 | [047](ADR-047-store-only-what-is-needed.md) | Store Only What Is Needed (no derived proof rows; bounded sweeps and rewrites; a reserve so a full disk recovers in place; a store reported corrupt is left untouched) — accepted for v0.4.31 | 003, 005, 006, 008, 010, 018, 029, 031, 034, 036, 037, 038, 040, 041, 042, 043, 044, 045, 046, 048, 049, 050 |
 | [048](ADR-048-a-trust-change-stays-in-its-room-and-finishes.md) | A Trust Change Stays in Its Room and Finishes (a room that cannot finish a trust change holds its own trust debt and encrypts nothing until it is paid; the other rooms keep working; an interrupted pass runs again with no restart) — accepted for v0.4.31 | 006, 007, 016, 020, 029, 034, 035, 037, 038, 040, 042, 043, 046, 047, 049 |
 | [049](ADR-049-leaving-and-ending-a-room.md) | Leaving and Ending a Room (leaving hides the room at once and erases it when a member confirms, two days at most; a rejoin is a fresh join; an ended room is deleted) — accepted for v0.4.31 | 005, 007, 012, 018, 023, 025, 034, 037, 038, 040, 041, 042, 045, 046, 047, 048, 050 |
@@ -87,9 +88,10 @@ does not import that branch's unreleased command surface into the released manua
 - **Tier 12 — Stabilization (v0.4.31):** 040 (every not-yet is a named wait), 041 (a restart or
   update needs no human), 042 (status reports outcome), 043 (adding, replacing and removing a
   computer), 044 (the daemon stays responsive under agent load), 045 (a release is gated on a
-  fleet that matches real use), 047 (store only what is needed), 048 (a trust change stays in
-  its room and finishes), 049 (leaving and ending a room), 050 (an agent turn is finished or
-  declared uncertain), 051 (the Linux build runs where it installs).
+  fleet that matches real use), 046 (sync always makes progress), 047 (store only what is
+  needed), 048 (a trust change stays in its room and finishes), 049 (leaving and ending a room),
+  050 (an agent turn is finished or declared uncertain), 051 (the Linux build runs where it
+  installs).
 
 ## Status (integrate/v0.3.0)
 
@@ -137,6 +139,7 @@ planned. This is the roll-up.
 | 043 | accepted for v0.4.31 (the decider, 2026-11-13), **not built**, each requirement is to land with its proof; amends 028, 033, 035, 038 |
 | 044 | accepted for v0.4.31 (the decider, 2026-11-13), **not built**, each requirement is to land with its proof; amends 034, 036, 038 |
 | 045 | accepted as the design for v0.4.31 (the decider, 2026-11-13); its acceptance measurements are owed (E-7 in the VM, E-9 (b) and (c), the corrected B3 run, ADR-046's acceptance); **not built**, each requirement is to land with its proof; amends 018, 038; its AGENTS.md "Tests" amendment is to be applied when the fleet stage lands, with the decider's sight |
+| 046 | accepted as the design for v0.4.31 (the decider, 2026-11-13); its acceptance is owed: no sync change is built until the replacement prototype passes every B3 assertion (build-list B38); **not built**, each requirement is to land with its proof; amends 005, 007, 008, 025, 036, 037 |
 | 047 | accepted for v0.4.31 (the decider, 2026-11-13), **not built**, each requirement is to land with its proof; amends 005, 006, 031, 034, 036, 038 |
 | 048 | accepted for v0.4.31 (the decider, 2026-11-13), **not built**, each requirement is to land with its proof; amends 035, 038 |
 | 049 | accepted for v0.4.31 (the decider, 2026-11-13), **not built**, each requirement is to land with its proof; amends 023, 034 |

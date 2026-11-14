@@ -66,8 +66,9 @@ reconciliation for having no collision state.
 ### D1. One port per (room, peer)
 
 - **D1.1.** A node MUST keep one port per (room, peer). A port holds:
-  - at most one Public and one Background outbound attempt, and at most `INBOUND_PER_PORT` (3)
-    inbound attempts; Background is either recipient-key body work or Archive, never both;
+  - at most K (2) requests in flight, each a slot held only by a running exchange with a
+    deadline, and at most `INBOUND_PER_PORT` (3) inbound requests (ADR-046 SY-15, SY-24);
+    *(amended 2026-11-13 by ADR-046)*
   - independently queued service demand (D6), shared transport backoff and service backoff (D5);
   - a `poisoned` flag (D3);
   - Public requests and credit (`req_gen`, `req_done`, `done_gen`; D2), and each Background
@@ -86,25 +87,12 @@ reconciliation for having no collision state.
   demand MUST NOT manufacture Public inventory or consume Public credit.
   Automatic own-recovery producers MUST schedule Archive directly. A checked no-page/parked
   inspection may wait for a genuine producer, but a periodic Public request alone is not one.
-- **D1.5.** Per pair, per end, there MUST be at most one Public plus one Background outbound
-  session unfinished, and at most `INBOUND_PER_PORT` inbound sessions unfinished. The node's two
-  physical running positions MUST remain one Public opportunity and one Background opportunity;
-  Background MUST NOT borrow Public. Eligible Private and Archive work MUST alternate admitted
-  existing quanta fairly. Public arrivals MUST NOT cancel or restart a responsive Private owner.
-  Service classification MUST follow the authenticated operation root before a private Entry or
-  KeyBody starts, not its Control/Live/Archive budget lane. Public announcement prefixes MUST
-  attach only to Public owners. Running capacity remains two per fingerprint across active and
-  retiring actor generations; the daemon pool remains twice its distinct active-or-retiring
-  hosted identities. No outbound, worker, byte, staging or retained-Flow maximum is increased.
-  Admission waiters MUST be independent for each logical service and budget lane (twelve bounded
-  metadata records, not twelve workers). A newer Public request MUST NOT reset its retained fair
-  ticket. Under pool pressure, the existing exact continuation FIFO grants capacity; a service
-  without its matching promise is not yet capacity-eligible. The controller MUST NOT overtake that
-  FIFO by cancelling another service's ticket. An unusable granted promise MUST be withdrawn while
-  retaining the exact Flow and actual earlier-gate release waiter; only real Background installation
-  advances its arbitration cursor.
-  A terminal Background capacity release MUST reconsider a currently eligible opposite
-  Background service without minting Public credit or waiting for a periodic port sweep.
+- **D1.5.** Per pair, per end, at most K = 2 requests are in flight, each under its own 20 s
+  deadline, and a slow peer costs only its own requests. There are no physical positions and no
+  node-wide request count: the answer budget bounds the node, and a peer with nothing in flight
+  is admitted round-robin when the budget is exhausted (ADR-046 SY-15 rule 1). The order of
+  requests is ADR-046 SY-15's. *(Amended 2026-11-13 by ADR-046, which withdraws the two physical
+  running positions and the Public/Background admission text that went with them.)*
 
 ### D1a. Retirement is separate from ignoring a result
 
@@ -233,8 +221,9 @@ reconciliation for having no collision state.
 
 ### D6. Slots: queued, fair, bounded per peer
 
-- **D6.1.** There MUST be `OUTBOUND_SLOTS` (16) outbound slots, at most `OUTBOUND_PER_PEER` (4) per
-  peer. Inbound sessions take none.
+- **D6.1.** The `OUTBOUND_SLOTS` (16) and `OUTBOUND_PER_PEER` (4) caps are withdrawn: per pair,
+  per end, at most K = 2 requests are in flight, and the answer budget bounds the node (D1.5;
+  ADR-046 SY-15 rule 1). Inbound sessions take none. *(Amended 2026-11-13 by ADR-046.)*
 - **D6.2.** A port that needs a session and has no slot MUST be queued, never skipped. Queued ports
   are served round-robin across peers and FIFO within a peer. A queued port MUST re-check its need
   when its turn comes, and a port that still needs a session after its turn MUST go to the tail.

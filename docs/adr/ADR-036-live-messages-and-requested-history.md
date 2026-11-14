@@ -250,8 +250,13 @@ selections, room reconciliation and notices. Those reads MUST NOT initiate remot
 Pending remote work preserves cached rows and reports fetch/continuation status, rather than
 clearing a room or presenting missing history as an empty result.
 
-Completing one history page MUST NOT automatically request the next; a changed live tip is not
-permission to drain its older gap. Remove both public partial-session continuation and private
+Completing one history page MUST NOT automatically request the next. Below an author's join
+anchor a changed tip is not permission to drain the older gap; at and above it, every body is
+owed and asked for until held, expired or refused as not for this node (ADR-008 LS-33, ADR-046
+SY-4). An explicit page lives in memory: a restart forgets the page in flight and never a row
+held; `--history resume` after a restart says so (ADR-046 SY-9). A partly received body is
+staged with its binding and survives a restart (ADR-046 SY-18). *(Amended 2026-11-13 by
+ADR-046.)* Remove both public partial-session continuation and private
 Session `more`/periodic pull loops as sources of archive demand. New-port, periodic, reconnect
 and post-sync scheduling may request required current control/live work, not every owed body.
 Retry only the still-authorized bounded request; current key/control delivery remains distinct
@@ -484,36 +489,19 @@ prefix and HELLO. Mode bit `0x04` selects this format; failure cannot fall back 
 mode. The new preamble is `[2, room, current_epoch, scope, purpose, request_id]`, at most
 128 bytes. Purpose 0 is required control, 1 is live, and 2 is explicit history. The identifiable
 old two-field preamble does not authorize legacy conversion. A v2 stream serves one bounded
-request exchange; both directions count against the daemon's shared budgets. HAVE is a sorted
-list of at most 2,048 `[author, size, HeadID]` hints, not verified state.
-
-WANT (`0x03`) is `[request_id, query]`, where query is exactly one of:
-
-```text
-[0, author]                                      # head
-[1, context_hash]                                # context object
-[2, HeadID, proof_kind, from, to]                 # proof
-[3, HeadID, seq, offset]                          # one entry/body continuation
-[4, HeadID, lo, hi, entry_limit, wire_limit]       # bounded page
-[5, HeadID, seq]                                 # signed header only; no body
-[6]                                             # current head inventory; control purpose only
-```
+request exchange; both directions count against the daemon's shared budgets. The v2 sync
+requests are ADR-046 SY-12's: `Have` (per author a size, HeadID, control-complete position, up to
+16 held intervals and their total count; at most 2,048 authors; a hint, not verified state),
+`Head(author, since)`, `Range(author, since, from, to, bodies, offset, descending)`,
+`ControlRange(author, since, from, to)`, `Context(hash)` and `Probe(author, from, to)` and
+`Snapshot(hash)`, with the answers and bounds given there. *(Amended 2026-11-13 by ADR-046.)*
 
 Inventory is `WANT -> client HAVE -> server HAVE -> DONE`, with the full bidirectional
-exchange charged to the same 1 MiB wire quantum. Hints convey no body permission or authority.
-Only newly eligible, bounded exact head hints wake metadata verification; accepted/in-flight
-hints are deduplicated, and neither an inventory nor its completion requests archive bodies. A
-hint is redundant and MUST NOT enter the volatile inbox only when its exact head is already in
-that author's accepted consistency chain, the selected window for the current committed head is
-complete, and no selected-live missing position is eligible for retry. Size alone never makes a
-hint redundant: an unknown head, a newer head and a different same-size head remain eligible, as
-do exact departure receipts. Control-ready state is not part of this filter; ordinary content
-tails do not require control effects through their full size.
-Every in-flight hint MUST have one live flow owner. A normal result retires it; authorization
-change or controller abandonment while the room/peer scope remains live re-arms the exact hint;
-room/peer retirement removes it with that scope. An invalidated worker MUST NOT leave an
-in-flight hint that is skipped by selection, suppresses re-offer through deduplication or blocks
-settlement until daemon restart.
+exchange charged to the same 1 MiB wire quantum. A `Have` conveys no body permission, authority
+or size: it says where to ask. A size above the known size, or a HeadID not accepted at or below
+it (a same-size distinct head stays eligible, as before), raises one `Head` request and sets
+nothing else. There is no hint inbox and no flow owner. What a node wants is derived from what it
+holds and the signed heads it has accepted (ADR-046 SY-14). *(Amended 2026-11-13 by ADR-046.)*
 
 Hints are scalar successor state, not an ordered work log. Selection MUST NOT mutate an in-flight
 owner. Behind it, strictly older heads from the same `(room, advertising peer, author)` collapse
@@ -546,14 +534,19 @@ An addressed key-package is the exception only for its signed recipient: whichev
 first encounters that exact entry (live position, parent or control dependency) upgrades it to a
 body-bearing control operation before publishing its semantic effect or advancing the live
 window. The body is the delivered key, so a header-only effect cannot satisfy the recipient's
-durable key-body obligation. Every other member keeps only the authenticated public header and
-does not request or open the encrypted package body.
+durable key-body obligation. Every other member also keeps the sealed package body, received
+with the author's control entries (ADR-046 SY-12, SY-14), so an always-on member can carry it to
+an offline recipient (ADR-023 RL-4.5). No member but the recipient can open it, and a package is
+served to its recipient only under the recipient's body-eligibility cut (ADR-007 G-30; ADR-046
+SY-25). *(Amended 2026-11-13 by ADR-046.)*
 
 A head already verified as an exact prefix of the current committed head is accepted but does not
 roll back that current head. Its retained prefix descriptor must equal the signed older root. If
 that descriptor is not yet retained, request consistency from the older size to the current head;
-never construct a reverse interval from the current size to an older target. Persist the verified
-prefix range with its authenticated receipt so restart preserves the same decision. A same-size
+never construct a reverse interval from the current size to an older target. Keep the accepted
+signed head and, per held interval, the descriptors that tie it to that head, coalesced from each
+answer's witness; the proof itself is verified and dropped (ADR-046 SY-13, SY-18). *(Amended
+2026-11-13 by ADR-046.)* A same-size
 different descriptor remains a conflict candidate rather than being suppressed by size.
 
 The purpose also constrains the server before any body read: pages require the history
@@ -579,9 +572,10 @@ discovery; legacy classification and migration retain their contiguous scan or r
 recovery. Exact floor, membership, generation, continuity and Drive checks still apply after
 readiness.
 
-Selecting an author's newest live window MUST immediately drive both the authenticated
-control-source receipt and the applied control-effect receipt through that exact committed head,
-independently of and before its ordinary-body walk. Control proofs collapse subtrees without
+Every author's control entries from position 1 up to its known size MUST be fetched as one set,
+by control proof, with a bounded share of each peer's exchanges so that no author's bodies wait
+on another author's control backlog (ADR-046 SY-3, SY-15). A `seen` reference is never fetched
+for admission. *(Amended 2026-11-13 by ADR-046.)* Control proofs collapse subtrees without
 controls, so this does not request an omitted archive Content body. The effect receipt is published
 only after every enumerated control through the head has finished its ordinary typed effect
 (including an addressed key-package body); merely completing the 128-entry live cursor is not
@@ -684,8 +678,10 @@ A per-`(room, scope, author)` record must distinguish these states; they are not
 1. **Observed:** a valid author-signed head is a hint. It establishes no continuity or authority.
 2. **Committed:** valid consistency advances a previously accepted descriptor. This establishes
    append-only commitment, not semantic validity of all omitted leaves.
-3. **Control pending/ready:** exact-head interval coverage, parent receipts and control dependencies
-   are accumulated durably. Ready requires complete applicable evidence and existing deterministic
+3. **Control pending/ready:** the author's control-complete position is kept durably; there are
+   no parent receipts; a control entry naming a coordinate not yet held is pending in the fold
+   and blocks nothing (ADR-046 SY-3, SY-18). *(Amended 2026-11-13 by ADR-046.)* Ready requires
+   complete applicable evidence and existing deterministic
    governance checks. Exhausted budgets and missing bodies never count as completed denial.
 4. **Individually admitted:** exact inclusion, required control closure and existing entry/body
    checks pass. Such an entry may occupy a sparse position without changing the contiguous head.
@@ -698,40 +694,13 @@ author/branch. Reuse immutable proof results only under their exact authenticate
 recheck current local trust, fork restrictions, Drive generation and authority at action/use.
 Publish entry admission, derived control/render/order roots and obligation progress atomically.
 Unfinished work uses unpublished roots. A cancellation leaves already accepted cached rows intact.
-An owned bounded continuation or queued exact-head hint is itself port demand until it completes,
-is superseded under the hint coalescing rule, or is explicitly retired. A clean exchange may
-acknowledge the request generation it observed, but that scalar acknowledgement MUST NOT make an
-owned continuation or newer pending successor unschedulable.
-The in-flight owner is immutable while its bounded slice runs. At the slice boundary, a strictly
-newer queued head for the same room, source peer and author supersedes that owner's remaining
-transient continuation: retire its capabilities, keep every durable receipt/cursor/missing fact it
-already committed, discard the obsolete scalar and start the one retained successor. This is
-coalescing, not cancellation of durable recovery. Equal-size distinct heads never supersede one
-another because they may be attributable fork evidence.
-**The owner's turn (decider, 2026-11-12).** An owner that is progressing — not waiting on the
-peer, and with a receipt committed or a body moved since it started — keeps its turn against a
-strictly newer head for up to **1 s** from the owner's start (`HINT_TURN`); the newer head is
-retained and starts at the first slice boundary after that, or as soon as the owner stops
-progressing. A retained owner's next round — its board exchange included — is bounded by what
-remains of that second; what it published before that deadline is signalled as after a policy
-retirement, not discarded with the cut-short turn. Why:
-under sustained posting (20 posts/s from one node) a newer head exists at every slice boundary,
-so immediate supersession restarted the fetch about eight times a second, refetched head and
-proof each time and never reached a body (37 of 1,272 rows in 45 s, on v0.4.19 and v0.4.28
-alike). With the turn, a peer's count advanced every second and 200 of 200 claims reached a
-reader's board in under a second at p99. The cost accepted is that the newest message may follow
-a still-progressing older fetch by up to one second. #934's ruling that fresh messages never
-wait for old bodies is amended to this bound. Progress is judged over the turn, not over the
-owner's last slice alone: every wire exchange is followed by a local slice that commits nothing
-(it holds the header and builds the next query), and an owner judged on that slice was superseded
-at it, ~40 ms after it started, whenever the poster's next append had been announced — under a
-gapless 24 posts/s that was every time (1,411 supersessions for 1,472 posts; the reader held 24
-rows after 60 s, 458 once judged over the turn). A wait for a body slot or publication held by a
-sibling flow of this node, which has an exact release wake, is not the owner stopping: the owner
-resumes on that edge. Judged as stopping, a reader with three other readers (every one of which
-gossips the author's head, so four flows for one author contend for the one live body slot) lost
-the author's port's turn to the next head at every slot collision (90 times in 60 s) and held
-~100 rows where one reader held 478.
+A request in flight is never cancelled or replaced because a newer head exists; a newer head
+only raises the known size (ADR-046 SY-1). Equal-size distinct heads are fork evidence, recorded
+before any chain test (ADR-046 SY-13). *(Amended 2026-11-13 by ADR-046.)*
+There is no turn: no request is replaced by a newer head (ADR-046 SY-1). Fresh posts wait at
+most one exchange behind an older range of the same author, and every class of request gets one
+exchange in four (ADR-046 SY-15 rule 3). *(Amended 2026-11-13 by ADR-046, which withdraws "The
+owner's turn (decider, 2026-11-12)"; its measurements stay in the git history.)*
 After restart, an inventory head already committed with a complete live window MUST remain eligible
 until its exact control receipt is durable. Re-observing that same scalar reconstructs bounded
 control closure; it MUST NOT request omitted ordinary bodies or treat live-window completion as
@@ -749,11 +718,11 @@ ahead of effect completion is not the sole copy of the obligation. The live flow
 than waiting on a possibly permanent denial. Historical cursor draining does not requeue a
 permanently unreadable entry into a hot loop; a later consent/key event starts it again.
 
-Join settlement is a function only of durable exact facts, never volatile hint-inbox occupancy or
-a completion flag. A joined sparse room becomes writable only after a member's authenticated
-`Head(local_author)` answer has selected a complete live window naming the exact current committed
-local head, no higher observed own head or own-head conflict remains, the contiguous own feed is
-not behind that head, and governance is ready. Completion of another author's head is not local
+Join settlement is a function only of durable exact facts. A joined sparse room becomes writable
+once this node holds its own feed through the highest signed own head any connected member's
+`Head` answer has proved, no own-head conflict remains, and governance is ready (ADR-046 SY-11,
+SY-17). A member's `Have` sets no fence. *(Amended 2026-11-13 by ADR-046.)* Completion of
+another author's head is not local
 acknowledgement. Restart may discard scheduling state, but it neither creates nor erases this
 settlement evidence.
 

@@ -152,22 +152,28 @@ only room governance is who sets the room's retention. This builds on identity (
 
 ### Member cap
 
-- **G-22.** A room MUST NOT exceed its member cap (`MAX_AUTHORS` = 1024). A newcomer MUST be admitted only
-  once every member that is online has agreed (V030-30, #366). The member answering a join MUST, before it
-  sends `ACCEPTED`:
+- **G-22.** A room MUST NOT exceed its member cap (`MAX_AUTHORS` = 1024). A newcomer is admitted by the one
+  member that verified its passphrase (the decider, 2026-11-13: 'the join only requires a single member to
+  validate the passphrase was correct'). That member asks the others only when the room is near the cap:
+  when its authors, its outstanding promises, the members it is connected to and a margin of 16 together
+  exceed `MAX_AUTHORS` (ADR-046 SY-10). The member answering a join MUST, before it sends `ACCEPTED`:
   1. hold a place for the joiner, refusing with `FULL` when its authors reach the cap, or with `TAKEN`
      when its authors and the places promised and not yet settled fill it;
-  2. ask every other member of the room it holds a connection to, all at once, on a stream typed `seat`
-     (`StreamKind::Seat`), whether the joiner may take a place;
-  3. admit the joiner only if every one of them answered `YES`; otherwise send `ABORT` to each member that
-     said `YES`, free its own place, and refuse the joiner with `FULL`, `TAKEN`, or `NOT_AGREED` naming
-     the member that did not agree.
+  2. near the cap, ask every other member it holds a connection to, all at once, on the `seat` stream,
+     whether the joiner may take a place;
+  3. admit the joiner unless a member answered `FULL` or `TAKEN`; then send `ABORT` to each member that
+     said `YES`, free its own place, and refuse the joiner with `FULL` or `TAKEN` naming the member. A
+     member that did not answer is not counted. `NOT_AGREED` does not exist. *(Amended 2026-11-13 by
+     ADR-046.)*
 - **G-22a.** A member asked MUST count its authors and every place promised and not yet settled, its own
   and those it promised other members, other than the joiner's own, and answer `FULL` at the cap, `TAKEN`
   when promises fill what is left, or `YES`, promising the place. A promise MUST count until the joiner is
   an author on that member, an `ABORT` from the member that asked frees it, or `PROMISE_TTL` (120 s)
   passes. A stream that ends without `ABORT` MUST NOT free the place.
-- **G-22b.** A member that does not answer within `SEAT_ANSWER_WITHIN` (5 s) MUST fail the join, named.
+- **G-22b.** A member that does not answer within `SEAT_ANSWER_WITHIN` (5 s) MUST NOT fail the join: it is
+  not counted, named in the admitting member's log, and learns of the newcomer from a board. The overshoot
+  that silence allows is bounded by the number of silent members and absorbed by G-22d's rule for members
+  admitted elsewhere (ADR-046 SY-10). *(Amended 2026-11-13 by ADR-046.)*
   A member the answering member holds no connection to MUST NOT be asked and MUST NOT block the join; it
   learns of the newcomer when it returns. Anchors that are not members MUST NOT be asked.
 - **G-22c.** Two newcomers asking for the last place at the same moment MAY both be refused `TAKEN`, and

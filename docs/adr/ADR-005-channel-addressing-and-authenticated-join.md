@@ -91,8 +91,9 @@ readable: who reads whom is decided by trust (ADR-007).
   `NotAdmitted` does (ADR-047 SO-14).
 - **J-18.** The exchange MUST be ordered frames on a bi-stream typed `join` (ADR-016 M14.4):
   CHALLENGE → SOLVE → SHARE → PROOF → PROOF → INIT, then ACCEPTED, REJECTED, or, for a joiner the room
-  cannot take (ADR-007 G-22), FULL at its member cap, TAKEN when its last place went to another newcomer,
-  or NOT_AGREED naming a member online that did not agree.
+  cannot take (ADR-007 G-22 as amended by ADR-046), FULL at its member cap or TAKEN when its last place
+  went to another newcomer. No member's silence refuses a join; `NOT_AGREED` does not exist. *(Amended
+  2026-11-13 by ADR-046.)*
 - **J-19. (M14.7c)** A node MUST hold a room's passphrase live while the room is open, because a CPace
   responder needs it at handshake time and nothing derived from it can stand in. It MUST be held in a
   zeroizing buffer and wiped from memory on lock and on close (under ADR-026, on detach and on close). A daemon's set of open rooms keeps it
