@@ -268,8 +268,10 @@ recovery. The packaged release artifact MUST hold no knob.
 
 Each convergence gate MUST be re-armed by an event its own completion produces, or by the event
 that produces its missing piece. A periodic MAY run as a backstop; it MUST NOT be the only
-driver of a gate. A quiet room, with no traffic and no commands, MUST still converge through
-its gates.
+driver of a gate. *Amended 2026-11-13 by ADR-040:* Work that received a not-yet refusal is not
+a gate's backstop case: it is parked on its prerequisite and only that prerequisite's release
+runs it again (ADR-040 NW-3; ADR-038 FX-40). A quiet room, with no traffic and no commands, MUST
+still converge through its gates.
 
 An own append the peer has not been told of MUST be a reason for the port to run a round
 (`Port::needs`), not only an ordering of the round that happens to run. Measured: a Session

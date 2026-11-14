@@ -132,7 +132,9 @@ friction for this audience can be fixed later.
 - **R35.** `vox status` **must** show:
   - rooms, peers and their paths (direct or relayed);
   - tunnels and UDP flows;
-  - last sync, and anything unhealthy.
+  - for each room, whether it is receiving, how far behind it is as of the heads it has verified,
+    how many members have said what they hold, and when it last received an entry; and anything
+    unhealthy. *(Amended 2026-11-13 by ADR-042.)*
 - **R36.** Every failure **must** be logged with a specific cause.
 - **R37.** Unhealthy rooms or anchors **must** raise a desktop or phone notification.
 - **R38.** A metrics endpoint **must** expose node health for dashboards.

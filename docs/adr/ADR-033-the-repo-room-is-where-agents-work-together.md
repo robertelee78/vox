@@ -68,7 +68,9 @@ the general/main part of the room."
   does (ADR-029 DR-1.3), and MUST hold every new message of that room for them: no news and no wake
   until resume.
 - **PA-3.** Pausing is driving: it MUST apply only to nodes that trust the person's node with drive
-  (ADR-029 DR-2). A pause that covers other nodes MUST name each one it did not pause, and why.
+  (ADR-029 DR-2). A pause that covers other nodes MUST name each one it did not pause, why, and
+  which node can pause it, with the exact command (ADR-043 CJ-15). *(Amended 2026-11-13 by
+  ADR-043.)*
 - **PA-4.** Resuming MUST deliver the held messages as news at each session's next turn. It MUST
   NOT start a turn (ADR-020 1.5); an urgent message addressed to a session MAY wake it then, as
   ADR-020 6.2 allows.

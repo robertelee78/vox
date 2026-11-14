@@ -49,9 +49,14 @@ primitive) precedes ADR-007 (consent, which is stored on the log) in build order
 | [035](ADR-035-computer-trust-and-daemon-identities.md) | Computer Trust and Daemon Identities (pair once, all managed nodes, selected personal nodes get drive, individual node trust remains) — product requirements and technical contract revision 2 accepted for v0.4.5 | 002, 003, 010, 012, 018, 026, 028, 029, 031 |
 | [037](ADR-037-a-joined-room-converges-without-waiting.md) | A Joined Room Converges Without Waiting (Ready is a constant wait; one fast fold is the gate for everything irreversible and content never holds it; reads answer known data; own-authored state is durable; proofs with mutants) — accepted | 007, 008, 018, 026, 029, 031, 036 |
 | [038](ADR-038-daemons-trust-daemons-and-sessions-are-presence.md) | Daemons Trust Daemons, and Sessions Are Presence (daemon trust is the obvious path; presence is live Sessions; idle harness windows; idle Vox costs nothing and tells the truth; no legacy; small releases) — proposed after v0.4.6 | 018, 020, 026, 029, 031, 033, 034, 035, 036, 037 |
+| [040](ADR-040-every-not-yet-is-a-named-wait.md) | Every Not-Yet Is a Named Wait (a refusal that is not final names what it waits for; one per-node registry parks the work on that prerequisite and its release runs it again; two lanes per room, control and authored, taking turns; nothing waits for a room to fall quiet) — accepted for v0.4.31 | 018, 029, 034, 037, 038, 041, 042, 043, 044, 045, 046, 047, 048, 049, 050 |
 | [041](ADR-041-a-restart-needs-no-human.md) | A Restart or Update Brings the Daemon and Its Nodes Back by Itself (a remembered credential or a passphrase file unlocks after a restart; the client starts the daemon when the service manager refuses; `vox factory-reset`; the agent host's journeys) — accepted for v0.4.31 | 014, 018, 021, 026, 028, 029, 031, 034, 038, 040, 042, 043, 044, 045, 047, 050 |
 | [042](ADR-042-status-reports-outcome.md) | Status Reports Outcome, Not Activity (`offline, last seen`; sync counters in `vox status --sync`; no repair command; a bounded log; one contract for every line and field the other ADRs require) — accepted for v0.4.31 | 011, 018, 025, 026, 028, 034, 036, 037, 038, 040, 041, 043, 044, 045, 046, 047, 048, 049, 050 |
+| [043](ADR-043-adding-replacing-and-removing-a-computer.md) | Adding, Replacing and Removing a Computer (every pairing and computer surface starts with its state and the next action; an unfinished attempt closes at once; removal evicts the computer's nodes from rooms unless `--keep-rooms`; `binding` and `retire` under `vox computer advanced`) — accepted for v0.4.31 | 007, 018, 028, 033, 035, 038, 040, 041, 042, 044, 045, 046, 048, 049, 050 |
+| [044](ADR-044-the-daemon-stays-responsive-under-agent-load.md) | The Daemon Stays Responsive Under Agent Load (one save, one flush, off the actor; the view costs the same however much is unread; serving is a read, admitted without the actor; a post waits only for its own room; a restarted room opens in seconds; every post within 5 s, speed measured before a target is set; Linux gets its receive buffer) — accepted for v0.4.31 | 018, 026, 034, 036, 037, 038, 040, 041, 042, 045, 046, 047 |
+| [045](ADR-045-the-fleet-release-gate.md) | A Release Is Gated on a Fleet That Matches Real Use (fleet journeys J1–J13 in VMs block the release through the release gate; reviewers run them themselves; no minimal release) — accepted as the design for v0.4.31, acceptance measurements owed | 018, 034, 038, 039, 040, 041, 042, 043, 044, 046, 047 |
 | [047](ADR-047-store-only-what-is-needed.md) | Store Only What Is Needed (no derived proof rows; bounded sweeps and rewrites; a reserve so a full disk recovers in place; a store reported corrupt is left untouched) — accepted for v0.4.31 | 003, 005, 006, 008, 010, 018, 029, 031, 034, 036, 037, 038, 040, 041, 042, 043, 044, 045, 046, 048, 049, 050 |
+| [048](ADR-048-a-trust-change-stays-in-its-room-and-finishes.md) | A Trust Change Stays in Its Room and Finishes (a room that cannot finish a trust change holds its own trust debt and encrypts nothing until it is paid; the other rooms keep working; an interrupted pass runs again with no restart) — accepted for v0.4.31 | 006, 007, 016, 020, 029, 034, 035, 037, 038, 040, 042, 043, 046, 047, 049 |
 | [049](ADR-049-leaving-and-ending-a-room.md) | Leaving and Ending a Room (leaving hides the room at once and erases it when a member confirms, two days at most; a rejoin is a fresh join; an ended room is deleted) — accepted for v0.4.31 | 005, 007, 012, 018, 023, 025, 034, 037, 038, 040, 041, 042, 045, 046, 047, 048, 050 |
 | [050](ADR-050-an-agent-turn-is-finished-or-shown-again.md) | An Agent Turn Is Finished, or Declared Uncertain (a turn that carried room news is committed, or pending until a later request completes, or declared uncertain; news is never silently lost or shown twice) — accepted for v0.4.31 | 018, 020, 021, 028, 029, 031, 040, 041, 042, 044, 045, 046, 047, 048, 049 |
 | [051](ADR-051-the-linux-build-runs-where-it-installs.md) | The Linux Build Runs Where It Installs (the Linux asset is built for a stated floor; the installer and `vox update` run a candidate before they replace anything and say why it cannot run) — accepted for v0.4.31 | 014, 015, 018, 041, 044, 045 |
@@ -79,9 +84,12 @@ does not import that branch's unreleased command surface into the released manua
 - **Tier 10 — Using it every day (v0.4.4):** 031 (agents join a repo's room), 032 (anchors per
   machine), 033 (the repo room), 034 (nothing hangs or hides a failure).
 - **Tier 11 — Across your computers (v0.4.5):** 035 (computer trust and daemon identities).
-- **Tier 12 — Stabilization (v0.4.31):** 041 (a restart or update needs no human), 042 (status
-  reports outcome), 047 (store only what is needed), 049 (leaving and ending a room), 050 (an
-  agent turn is finished or declared uncertain), 051 (the Linux build runs where it installs).
+- **Tier 12 — Stabilization (v0.4.31):** 040 (every not-yet is a named wait), 041 (a restart or
+  update needs no human), 042 (status reports outcome), 043 (adding, replacing and removing a
+  computer), 044 (the daemon stays responsive under agent load), 045 (a release is gated on a
+  fleet that matches real use), 047 (store only what is needed), 048 (a trust change stays in
+  its room and finishes), 049 (leaving and ending a room), 050 (an agent turn is finished or
+  declared uncertain), 051 (the Linux build runs where it installs).
 
 ## Status (integrate/v0.3.0)
 
@@ -123,9 +131,14 @@ planned. This is the roll-up.
 | 034 | accepted for v0.4.4 (the decider, 2026-10-10), **not built**; amends 014, 026, 028 |
 | 035 | product requirements accepted for v0.4.5 (the decider, 2026-10-12); technical contract revision 2 independently accepted (GO), **not built**; narrowly amends 002, 010, 020, 026, 031 while preserving node identities and one daemon endpoint |
 | 037 | proposed for v0.4.6 (the decider, 2026-10-19); R1–R6 **not built**, each is to land with its proof; the pacing fixes R8–R11 are on PR #946's branch, unreleased; finishes ADR-036 H-1 on the first-use paths and keeps ADR-007's fold as the gate |
+| 040 | accepted for v0.4.31 (the decider, 2026-11-13), **not built**, each requirement is to land with its proof; amends 034, 037, 038 |
 | 041 | accepted for v0.4.31 (the decider, 2026-11-13), **not built**, each requirement is to land with its proof; amends 014, 021, 026, 028, 029, 031, 034, 038 |
-| 042 | accepted for v0.4.31 (the decider, 2026-11-13), **not built**, each requirement is to land with its proof; amends 011, 026, 028, 034, 038 |
+| 042 | accepted for v0.4.31 (the decider, 2026-11-13), **not built**, each requirement is to land with its proof; amends 011, 026, 028, 034, 038 and PRD-001 R35 |
+| 043 | accepted for v0.4.31 (the decider, 2026-11-13), **not built**, each requirement is to land with its proof; amends 028, 033, 035, 038 |
+| 044 | accepted for v0.4.31 (the decider, 2026-11-13), **not built**, each requirement is to land with its proof; amends 034, 036, 038 |
+| 045 | accepted as the design for v0.4.31 (the decider, 2026-11-13); its acceptance measurements are owed (E-7 in the VM, E-9 (b) and (c), the corrected B3 run, ADR-046's acceptance); **not built**, each requirement is to land with its proof; amends 018, 038; its AGENTS.md "Tests" amendment is to be applied when the fleet stage lands, with the decider's sight |
 | 047 | accepted for v0.4.31 (the decider, 2026-11-13), **not built**, each requirement is to land with its proof; amends 005, 006, 031, 034, 036, 038 |
+| 048 | accepted for v0.4.31 (the decider, 2026-11-13), **not built**, each requirement is to land with its proof; amends 035, 038 |
 | 049 | accepted for v0.4.31 (the decider, 2026-11-13), **not built**, each requirement is to land with its proof; amends 023, 034 |
 | 050 | accepted for v0.4.31 (the decider, 2026-11-13), **not built**, each requirement is to land with its proof; amends none (ADR-029 P420-OR-6 unchanged) |
 | 051 | accepted for v0.4.31 (the decider, 2026-11-13), **not built**, each requirement is to land with its proof; amends no accepted ADR |

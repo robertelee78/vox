@@ -88,10 +88,11 @@ each of these broke.
   request MUST finish after its Session registration and room binding are durable; it MUST NOT
   wait for history recovery, Session projection or attention preparation. Those operations
   continue as a coalesced idempotent obligation owned by the daemon, recover from the durable
-  registration after daemon restart, retry only the named transient projection-readiness
-  refusals after each bounded attempt, and retain WT-3's permanent failure on the daemon log and
-  the Session's next hook. A client timeout or one readiness deadline MUST NOT cancel an accepted
-  Session opening.
+  registration after daemon restart, park each not-yet refusal on its prerequisite and run it
+  again when that prerequisite is released (ADR-040 NW-1, NW-3; no refusal is recognised by its
+  text), and retain WT-3's permanent failure on the daemon log and the Session's next hook.
+  *(Amended 2026-11-13 by ADR-040.)* A client timeout or one readiness deadline MUST NOT cancel
+  an accepted Session opening.
 
 ### 3. Replies fit their frame
 
@@ -118,7 +119,9 @@ fits a frame is not enough: a history may be any length.
   position, at a cost that does not grow with the history's length: it MUST NOT read, decrypt or
   decode a whole history to answer for one page. The memory the daemon uses to answer a page, and
   the memory the app uses to show a Session or a room, MUST be bounded by the pages shown, not by
-  the history's length.
+  the history's length. *Amended 2026-11-13 by ADR-044:* The same holds for the view the daemon
+  publishes after each event: its cost MUST NOT grow with the history's length or with how much
+  of it is unread (ADR-044 RD-4).
 - **FR-6. Proof at scale.** FR-4 and FR-5 MUST be proved by real use of the shipped binary and the
   app's client on a Session of 100,000 entries: opening it MUST show the newest page in under one
   second, each older page down to the first MUST load in under one second, and the daemon's and the
@@ -164,7 +167,12 @@ we're working on hot fixes -- but this needs to be codified into ADRs, projects/
 ### 4. A room that cannot save
 
 - **SR-1.** A room whose store write failed MUST recover by itself once writes succeed again: it MUST
-  retry with backoff and reopen its store, with no restart and no command.
+  retry with backoff and reopen its store, with no restart and no command. *Amended 2026-11-13 by
+  ADR-040:* Only a store write failure reported by the operating system, a malformed artifact read
+  from disk, or the disk floor (ADR-047 SO-11) marks a room unable to save and starts this
+  recovery. A not-yet refusal, a released reservation and a refused trust or key step never do
+  (ADR-040 NW-2). The marked state is the wait `StoreRecovery(room)`; the recovery's completion
+  releases it (ADR-040 NW-1).
 - **SR-2.** While it cannot save, `vox status`, the room list in the TUI and the app, and the app's
   room MUST say so plainly, with the cause from the operating system, for example "repo-to-cve
   cannot save: the disk is full. It recovers by itself when space is freed." It MUST NOT be called
