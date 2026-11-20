@@ -1,6 +1,10 @@
 # ADR-043: Adding, Replacing and Removing a Computer
 
-- **Status**: Accepted (2026-11-13) after the eighth independent review by GPT-6.1-Sol
+- **Status**: Superseded for v0.4.31 by ADR-052 (the decider's rulings of 2026-11-20), except CJ-11,
+  CJ-12 and CJ-17, which ADR-052 RG-8 builds. Nothing else in this ADR is built or binding; it
+  is kept as the record of the failures found and the designs considered.
+- **Superseded-by**: ADR-052
+- **Status until 2026-11-20**: Accepted (2026-11-13) after the eighth independent review by GPT-6.1-Sol
   (`adr-043-sol-review-8`), under the decider's authorization of 2026-11-13 ("post review can
   accept them too"); revision 9 corrects experiments and cross-references found when the ADR was
   cut into tasks (`v0431-tasks-ADR-043`, its review), changes no design decision and none of the

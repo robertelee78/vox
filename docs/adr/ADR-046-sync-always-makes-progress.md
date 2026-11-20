@@ -2,7 +2,11 @@
 
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC 2119] [RFC 8174] when, and only when, they appear in all capitals, as shown here.
 
-**Status**: Accepted (2026-11-13) as the design for v0.4.31; its acceptance is owed: no sync
+**Status**: Superseded for v0.4.31 by ADR-052 (the decider's rulings of 2026-11-20). Nothing in
+this ADR is built, and a requirement of it binds only where ADR-052 names it; it is kept as
+the record of the failures found and the designs considered.
+**Superseded-by**: ADR-052
+**Status until 2026-11-20**: Accepted (2026-11-13) as the design for v0.4.31; its acceptance is owed: no sync
 change is built until the replacement prototype passes every B3 assertion (build-list B38). The
 fifteenth independent review by GPT-6.1-Sol passed revision 16 with no P1 under the decider's
 ledger row 83, under his authorization of 2026-11-13 ("post review can accept them too");

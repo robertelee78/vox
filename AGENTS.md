@@ -93,6 +93,13 @@ unreachable when it was reached. When an anchor is missing, say truthfully what 
   Current-version data integrity, restart behavior, trust and access rules still apply. This
   does not authorize deleting or resetting real data, or weakening unsupported-format refusal.
   Already-landed compatibility code need not be removed merely to satisfy this scope decision.
+- **KISS is the law.** "The current mess we are in is because we have a tendency to over engineer
+  things and turn Problems into worse problems with rube goldberg foot guns -- KISS is the law
+  now". Fix a cause that was reproduced, with the smallest change that removes it. Add no
+  registry, protocol, store format, ledger, journal, scheduler or framework unless a requirement
+  cannot be met without it, and say why in the task that adds it. Where a cause is unknown,
+  trace it and change nothing until it is known. One requirement carries one reproduced cause;
+  smaller faults found in the same code ride with it. (The decider, 2026-11-20; ADR-052 RG-0)
 
 ## Safety
 
