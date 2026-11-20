@@ -21,7 +21,9 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 - **Date**: 2026-11-13
 - **Deciders**: Robert E. Lee
 - **Tags**: linux, glibc, installer, updater, rollback, release, build
-- **Related**: ADR-014, ADR-015, ADR-018; in this release ADR-041, ADR-044, ADR-045
+- **Related**: ADR-014, ADR-015, ADR-018; in this release ADR-041, ADR-044, ADR-045; ADR-052,
+  whose RG-11 builds this ADR and whose RG-15 runs its proofs as the install journey, in place
+  of ADR-045's J7 and J11
 - **Source**: fix-list item 91 (the item's evidence folder under `/opt/vox-evidence/v0431/`,
   its `README.md`; cited below as "the evidence folder"); the published v0.4.30 Linux asset,
   read on this Mac (`vox-x86_64-unknown-linux-gnu`, SHA-256
