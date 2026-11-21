@@ -512,6 +512,7 @@ impl Node {
                     Ok(trust_save::ReconcileAction::Withdraw { target }) => {
                         maintenance_save::Work::Consent(consent_save::Work::Withdraw { target })
                     }
+                    #[cfg(feature = "test-knobs")]
                     Ok(trust_save::ReconcileAction::Progress) => {
                         self.governance_work.again = true;
                         return;

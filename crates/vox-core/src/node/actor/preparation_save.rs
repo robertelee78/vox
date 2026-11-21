@@ -1014,6 +1014,7 @@ impl Node {
                     prepared.save.request =
                         Some(Work::Consent(consent_save::Work::Withdraw { target }));
                 }
+                #[cfg(feature = "test-knobs")]
                 trust_save::ReconcileAction::Progress => {
                     prepared.progressed("narrowing its trust", now.get());
                     return Ok(false);
