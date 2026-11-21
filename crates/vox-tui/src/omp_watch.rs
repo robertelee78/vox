@@ -2,9 +2,15 @@
 use crate::omp_fence::{FenceError, Owner};
 use crate::wake::AttentionRoute;
 use std::io::{BufRead, Read, Write};
+use std::sync::{
+    atomic::{AtomicU32, Ordering},
+    Arc,
+};
 use std::time::Duration;
 use tokio::sync::mpsc;
-use vox_core::node::daemonipc::{DaemonClient, DaemonFrame, DaemonRequest, NodeState};
+use vox_core::node::daemonipc::{
+    DaemonClient, DaemonEvent, DaemonFrame, DaemonRequest, DetachCause, NodeState,
+};
 use vox_core::node::paths::{Account, NodeName};
 
 const DEADLINE: Duration = Duration::from_secs(2);
@@ -77,6 +83,7 @@ fn selected(
     client: &DaemonClient,
     node: &NodeName,
     fingerprint: &vox_core::hash::Digest32,
+    stopping_pid: &AtomicU32,
 ) -> Result<bool, ProbeError> {
     if client
         .attached
@@ -85,17 +92,22 @@ fn selected(
     {
         return Err(ProbeError::Attaching);
     }
-    Ok(client.attached.iter().any(|entry| {
+    let ready = client.attached.iter().any(|entry| {
         entry.name == *node
             && entry.state == NodeState::Attached
             && entry.fingerprint.as_ref() == Some(fingerprint)
-    }))
+    });
+    if !ready && stopping_pid.load(Ordering::Relaxed) == client.pid {
+        return Err(ProbeError::Stopping);
+    }
+    Ok(ready)
 }
 #[derive(Clone, Copy)]
 enum ProbeError {
     Unavailable,
     Mismatch,
     Attaching,
+    Stopping,
 }
 async fn open(account: &Account) -> Result<DaemonClient, ProbeError> {
     // The control protocol, not the release number, decides compatibility.
@@ -134,9 +146,10 @@ async fn snapshot(
     node: &NodeName,
     fp: &vox_core::hash::Digest32,
     subscription: &mut Option<Subscription>,
+    stopping_pid: &Arc<AtomicU32>,
 ) -> Result<bool, ProbeError> {
     let initial = open(account).await?;
-    if !selected(&initial, node, fp)? {
+    if !selected(&initial, node, fp, stopping_pid)? {
         *subscription = None;
         return Ok(false);
     }
@@ -147,8 +160,14 @@ async fn snapshot(
         match tokio::time::timeout(DEADLINE, sub.request(DaemonRequest::Subscribe)).await {
             Ok(Ok(DaemonFrame::Ok)) => {
                 let (tx, events) = mpsc::channel(1);
+                let stopping_pid = Arc::clone(stopping_pid);
+                let watched_node = node.clone();
                 let task = tokio::spawn(async move {
-                    while let Ok(Some(DaemonFrame::Event(_))) = sub.next().await {
+                    while let Ok(Some(DaemonFrame::Event(event))) = sub.next().await {
+                        if matches!(event, DaemonEvent::Detached { node, cause: DetachCause::DaemonStopping } if node == watched_node)
+                        {
+                            stopping_pid.store(pid, Ordering::Relaxed);
+                        }
                         let _ = tx.try_send(());
                     }
                 });
@@ -167,7 +186,7 @@ async fn snapshot(
         if subscription.as_ref().is_none_or(|sub| sub.pid != fresh.pid) {
             return Err(ProbeError::Unavailable);
         }
-        let ready = selected(&fresh, node, fp)?;
+        let ready = selected(&fresh, node, fp, stopping_pid)?;
         drop(fresh);
         let Some(sub) = subscription.as_mut() else {
             return Err(ProbeError::Unavailable);
@@ -236,6 +255,9 @@ pub(crate) async fn run(
     let mut observed = false;
     let mut last_command = 0u64;
     let mut subscription: Option<Subscription> = None;
+    // The stopping daemon can still answer after removing our node. Keep its pid
+    // across subscription teardown; a replacement may genuinely have a locked node.
+    let stopping_pid = Arc::new(AtomicU32::new(0));
     let mut pinned = None;
     let mut delay = 0u64;
     let mut backoff = 1u64;
@@ -295,7 +317,7 @@ pub(crate) async fn run(
                 }
                 if pinned.is_none() { pinned = pin_result.ok().flatten(); }
                 let result = match pinned {
-                    Some(fp) if pin_result == Ok(Some(fp)) => snapshot(&account, &node, &fp, &mut subscription).await,
+                    Some(fp) if pin_result == Ok(Some(fp)) => snapshot(&account, &node, &fp, &mut subscription, &stopping_pid).await,
                     _ => { subscription = None; match open(&account).await { Err(e) => Err(e), Ok(_) => Ok(false) } }
                 };
                 if !matches!(result, Err(ProbeError::Mismatch)) && !compatible {
@@ -338,7 +360,7 @@ pub(crate) async fn run(
                         let reason = match other {
                             Ok(false) => "node-not-ready",
                             Err(ProbeError::Mismatch) => "mismatch",
-                            Err(ProbeError::Attaching) => "reconnecting",
+                            Err(ProbeError::Attaching | ProbeError::Stopping) => "reconnecting",
                             _ => "unavailable",
                         };
                         if !output(serde_json::json!({"type":"unavailable","reason":reason})) { return 1; }

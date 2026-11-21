@@ -477,6 +477,8 @@ for await (const line of createInterface({input: process.stdin})) {
     }
 
     fn observed_frame_after(&self, before: usize, kind: &str) -> bool {
+        // The watcher caps its availability backoff at 30 s. Three capped intervals
+        // cover a probe already in flight and the replacement's next subscription.
         wait_until(Duration::from_secs(90), || {
             std::fs::read_to_string(&self.trace)
                 .unwrap_or_default()
@@ -505,15 +507,65 @@ impl Drop for OmpConversation {
 #[ignore = "native extension, real daemon and production Argon2id; run in release with test-knobs"]
 fn a_conversation_reports_one_reconnecting_line_when_its_daemon_restarts() {
     watchdog::arm();
+    test_knobs::require(&["VOX_TEST_STOP_HOLD_NODE", "VOX_TEST_STOP_HOLD_FILE"]);
     let a = Account::new();
     a.make_node("agent");
-    let daemon = Daemon::start(&a, &["--node", "agent"], &[]);
+    a.make_node("held");
+    let stop_hold = a._tmp.path().join("hold-second-node-stop");
+    std::fs::write(&stop_hold, "").expect("APPARATUS: second-node stop hold");
+    let mut daemon = Daemon::start(
+        &a,
+        &["--node", "agent"],
+        &[
+            ("VOX_TEST_STOP_HOLD_NODE", "held"),
+            ("VOX_TEST_STOP_HOLD_FILE", stop_hold.to_str().unwrap()),
+        ],
+    );
     daemon.expect("node agent is Ready", Duration::from_secs(30), |line| {
         line.contains("node agent is Ready")
     });
+    let (ok, out, err) = a.run(&["node", "attach", "held"], "");
+    assert!(ok, "APPARATUS: second node did not attach: {out}{err}");
     let mut conversation = OmpConversation::start(&a);
-    daemon.stop();
+    let before_stop = conversation.observations();
+    let signalled = Command::new("/bin/kill")
+        .args(["-TERM", &daemon.child.id().to_string()])
+        .status()
+        .expect("APPARATUS: signal the proof's daemon");
+    assert!(signalled.success(), "APPARATUS: daemon stop signal failed");
+    let mut stopping_nodes = String::new();
+    assert!(
+        wait_until(Duration::from_secs(15), || {
+            let (ok, out, err) = a.run(&["node", "list"], "");
+            let staged = ok
+                && out
+                    .lines()
+                    .any(|line| line.starts_with("agent ") && line.contains("Locked"))
+                && out
+                    .lines()
+                    .any(|line| line.starts_with("held ") && line.contains("Detaching"));
+            stopping_nodes = format!("{out}{err}");
+            staged
+        }),
+        "APPARATUS: daemon did not answer with agent detached and held still detaching: \
+         {stopping_nodes}; {}",
+        daemon.said()
+    );
+    println!("stopping daemon still answers:\n{stopping_nodes}");
+    assert!(
+        conversation.observed_frame_after(before_stop, "unavailable")
+            && daemon.child.try_wait().unwrap().is_none(),
+        "APPARATUS: watcher did not probe while the stopping daemon still answered:\n{}",
+        std::fs::read_to_string(&conversation.trace).unwrap_or_default()
+    );
     conversation.until(|frame| frame.get("notice").is_some());
+    std::fs::remove_file(&stop_hold).expect("APPARATUS: release second-node stop");
+    let stopped = daemon.child.wait().expect("APPARATUS: reap stopped daemon");
+    assert!(
+        stopped.success(),
+        "PRODUCT: daemon failed to finish stopping: {}",
+        daemon.said()
+    );
     let before_restart = conversation.observations();
     let daemon = Daemon::start(&a, &["--node", "agent"], &[]);
     daemon.expect("node agent is Ready", Duration::from_secs(30), |line| {
@@ -523,7 +575,8 @@ fn a_conversation_reports_one_reconnecting_line_when_its_daemon_restarts() {
     // replacement daemon. Counting its one notice without resumed readiness proves nothing.
     assert!(
         conversation.observed_frame_after(before_restart, "ready"),
-        "PRODUCT: watcher never became ready after the daemon restarted:\n{}",
+        "PRODUCT: watcher never became ready within 90 s after restart despite its 30 s \
+         backoff cap:\n{}",
         std::fs::read_to_string(&conversation.trace).unwrap_or_default()
     );
     conversation.prompt("after-restart");

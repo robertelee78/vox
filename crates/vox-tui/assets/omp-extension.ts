@@ -437,6 +437,7 @@ export default function vox(pi) {
           if (current() && generationRef && !confirmed && !retryTimer && refusal !== "permanent") void register()
         } else if (frame?.type === "unavailable") {
           const reconnecting = frame.reason !== "node-not-ready" && (readyNode || reconnectingNotice || frame.reason === "reconnecting")
+          const connection = readyNode || reconnectingNotice ? "reconnecting" : "connecting"
           readyNode = false; confirmed = false; availabilityEpoch++
           if (frame.reason === "mismatch") {
             if (refusal !== "mismatch") report("Vox update mismatch; update Vox and restart the daemon")
@@ -448,7 +449,7 @@ export default function vox(pi) {
           } else if (current()) {
             if (reconnecting && !reconnectingNotice) {
               reconnectingNotice = true
-              report("reconnecting to Vox; room news resumes when its node is ready. If the daemon stays down, restart it.")
+              report(`${connection} to Vox; room news is available when its node is ready. If the daemon stays down, restart it.`)
             } else if (!reconnecting && !unavailableNotice) {
               unavailableNotice = true
               report(`node ${VOX_NODE} is unavailable. If it has not been created, run \`vox node create -- ${VOX_NODE}\`; otherwise run \`vox node unlock -- ${VOX_NODE}\` in a terminal. If the daemon is not answering, restart it. Creating a node makes a new identity.`)
