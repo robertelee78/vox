@@ -74,10 +74,10 @@ jobs:
           echo "::error::CI on $SHA did not finish within this job's budget"
           exit 1
 
-  # The same Linux build serves tags and pre-tag candidates. Only candidates need preflight.
+  # The same Linux build serves tags and pre-tag candidates. It holds no credentials and rechecks
+  # a candidate's source itself, so it needs no preflight: a job that `needs` the preflight is
+  # counted as having a skipped ancestor on a tag run, and `publish` would then be skipped too.
   build-linux-x64:
-    needs: [candidate-preflight]
-    if: ${{ !cancelled() && (github.event_name != 'workflow_dispatch' || !inputs.candidate_only || needs.candidate-preflight.result == 'success') }}
     runs-on: ubuntu-latest
     container: quay.io/pypa/manylinux_2_28_x86_64@sha256:d086f64cddcace250ef0f0073583c51b8298159303290a730c9f59bd91edfd2c
     timeout-minutes: 45
