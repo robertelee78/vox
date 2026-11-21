@@ -938,10 +938,21 @@ impl Node {
         // Publish the room before work that needs restored membership or peer history.
         // Its normal governance/Drive owners retain and complete rotation and refresh;
         // closing it here would prevent the readmission or missing history from arriving.
+        // A saved trust withdrawal is settled by Stage::Trust below. Session refresh can
+        // author records, so defer it too rather than refusing the open at its egress fence.
+        let trust_withdrawal = if prepared.save.stage == Stage::Refresh {
+            let signer = self.profile.as_ref().ok_or(Error::AtRestLocked)?.signer()?;
+            crate::node::pending_lock::PendingLocks::load(&store, signer)?
+                .for_room(&id)
+                .any(|target| channel.is_author(&target))
+        } else {
+            false
+        };
         if prepared.save.stage == Stage::Refresh
             && (channel.is_member_removed(&store, &channel.me())?
                 || channel.room_removal_rotation_needed(&store)?
-                || channel.room_removal_drive_rotation_needed(&store)?)
+                || channel.room_removal_drive_rotation_needed(&store)?
+                || trust_withdrawal)
         {
             prepared.save.stage = Stage::Retention(Step::OwedCleanup);
         }

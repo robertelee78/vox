@@ -35,6 +35,9 @@ reconciliation, while failed work waits for a room change (transient faults use 
 existing retry deadline). Installing a keyring immediately refreshes service reachers,
 independent of room withdrawal. A new manual grant dials the requested member and
 waits for its existing owed-consent pass before acknowledging the command.
+A closed room with saved withdrawal debt defers authoring Session refresh until its
+preparation trust stage has withdrawn the old reader. It can then open, without
+weakening the record or key fences; the existing closed-room removal proof covers it.
 The post-race act uses the existing text-publication hold to change the durable
 revision before the original post is admitted; the same command must succeed and
 its shipped JSON read must show exactly one copy. At a held withdrawal, a pending
