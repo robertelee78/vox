@@ -335,6 +335,149 @@ fn connected(s: &Value, peer: &str) -> bool {
     })
 }
 
+/// A blocked desktop command must not prevent a recovery notice. A desktop service that
+/// repeatedly fails must cost only one diagnostic line.
+#[test]
+#[ignore = "an anchor and two real daemons, with a blocked desktop notifier; run on demand"]
+fn blocked_desktop_does_not_delay_recovery_and_missing_service_logs_once() {
+    use std::os::unix::fs::PermissionsExt;
+    struct BlockedChild(Option<String>);
+    impl Drop for BlockedChild {
+        fn drop(&mut self) {
+            if let Some(pid) = &self.0 {
+                let _ = Command::new("/bin/kill")
+                    .args(["-KILL", pid])
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        }
+    }
+
+    watchdog::arm();
+    let tmp = tempfile::tempdir().expect("APPARATUS: a tempdir");
+    let bin = tmp.path().join("desktop-bin");
+    std::fs::create_dir(&bin).expect("APPARATUS: create desktop command directory");
+    let block = tmp.path().join("block");
+    let fail = tmp.path().join("fail");
+    let pid = tmp.path().join("blocked-pid");
+    let attempts = tmp.path().join("failed-attempts");
+    let name = if cfg!(target_os = "macos") {
+        "osascript"
+    } else {
+        "notify-send"
+    };
+    let stub = bin.join(name);
+    std::fs::write(
+        &stub,
+        format!(
+            "#!/bin/sh\nif [ -f '{}' ]; then echo $$ > '{}'; exec /bin/sleep 300; fi\n\
+             if [ -f '{}' ]; then echo failed >> '{}'; echo 'service unavailable' >&2; exit 1; fi\n",
+            block.display(), pid.display(), fail.display(), attempts.display()
+        ),
+    )
+    .expect("APPARATUS: write desktop command");
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+        .expect("APPARATUS: make desktop command executable");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let Scene {
+        _anchor,
+        anchor,
+        mut alice,
+        alice_dir: _,
+        mut bob,
+        bob_dir,
+        bob_port,
+        bob_id,
+        pass_file,
+    } = scene(&tmp, &[("PATH", &path)], |_| {});
+    let bob_short: String = bob_id.chars().take(12).collect();
+    std::fs::write(&block, "").expect("APPARATUS: block the desktop command");
+    bob.child.kill().expect("APPARATUS: stop bob");
+    bob.child.wait().expect("APPARATUS: reap bob");
+    alice.expect_within(Duration::from_secs(150), "bob unreachable", |line| {
+        line.contains("vox daemon: Vox: needs attention")
+            && line.contains("unreachable")
+            && line.contains(&bob_short)
+    });
+    wait_until("the blocked desktop command to start", TIMEOUT, || {
+        pid.exists()
+    });
+    let blocked_pid = std::fs::read_to_string(&pid).expect("APPARATUS: read notifier PID");
+    let mut blocked_child = BlockedChild(Some(blocked_pid.trim().to_owned()));
+    let alive = || {
+        Command::new("/bin/kill")
+            .args(["-0", blocked_pid.trim()])
+            .status()
+            .expect("APPARATUS: check notifier PID")
+            .success()
+    };
+    assert!(alive(), "APPARATUS: the notifier did not remain blocked");
+    std::fs::remove_file(&block).expect("APPARATUS: unblock later desktop commands");
+    drop(bob);
+    port_free(bob_port);
+    let mut bob = daemon("bob", &bob_dir, bob_port, &anchor, &pass_file, &[]);
+    alice.expect_within(
+        TIMEOUT,
+        "recovery while the desktop command is blocked",
+        |line| line.contains("vox daemon: Vox: recovered") && line.contains(&bob_short),
+    );
+    assert!(
+        alive(),
+        "PRODUCT: recovery was not logged while the notifier was alive"
+    );
+
+    std::fs::write(&fail, "").expect("APPARATUS: make the desktop service unavailable");
+    alice.seen.clear();
+    bob.child.kill().expect("APPARATUS: stop bob again");
+    bob.child.wait().expect("APPARATUS: reap bob again");
+    alice.expect_within(Duration::from_secs(150), "bob unreachable again", |line| {
+        line.contains("vox daemon: Vox: needs attention")
+            && line.contains("unreachable")
+            && line.contains(&bob_short)
+    });
+    drop(bob);
+    port_free(bob_port);
+    let _bob = daemon("bob", &bob_dir, bob_port, &anchor, &pass_file, &[]);
+    alice.expect_within(TIMEOUT, "bob recovered again", |line| {
+        line.contains("vox daemon: Vox: recovered") && line.contains(&bob_short)
+    });
+    wait_until("two failing desktop calls", TIMEOUT, || {
+        notes(&attempts).len() >= 2
+    });
+    wait_until("one desktop failure diagnostic", TIMEOUT, || {
+        alice
+            .timed
+            .lock()
+            .expect("APPARATUS: daemon log")
+            .iter()
+            .any(|(_, line)| line.contains("desktop notification unavailable"))
+    });
+    let log = alice.timed.lock().expect("APPARATUS: daemon log");
+    let failures: Vec<_> = log
+        .iter()
+        .filter(|(_, line)| {
+            line.contains("desktop notification unavailable")
+                || line.contains("service unavailable")
+        })
+        .collect();
+    assert_eq!(
+        failures.len(),
+        1,
+        "PRODUCT: repeated missing service diagnostics: {failures:?}"
+    );
+    drop(log);
+    wait_until(
+        "the blocked desktop command to be reaped",
+        Duration::from_secs(130),
+        || !alive(),
+    );
+    blocked_child.0 = None;
+}
+
 #[test]
 #[ignore = "an anchor and two real daemons, one killed for three minutes; run on demand"]
 fn a_condition_notifies_once_when_it_starts_and_once_when_it_clears() {

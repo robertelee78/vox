@@ -11,7 +11,7 @@
 //!    as whichever node the dial names (the identity exchange), and neither binds a socket of its
 //!    own.
 //! 2. Once `b` is detached (`vox node detach b`), a second remote told the same is answered by `a`
-//!    at that address and told that nothing there answers as `b`.
+//!    at that address and told the daemon answered but `b` is not available (possibly not attached).
 //!
 //! A red is PRODUCT, quoting what the processes said; a daemon or remote that never got going is
 //! PRODUCT (staging).
@@ -147,7 +147,7 @@ fn two_nodes_answer_at_one_address_and_a_detach_leaves_the_other() {
     }
     drop(r1);
 
-    // 2. b detaches; a is still there, and nothing answers as b.
+    // 2. b detaches; a is still there, and the daemon answers without disclosing why b is absent.
     let (ok, out, err) = vox_once(&home, &args(&["node", "detach", "b"]));
     assert!(
         ok,
@@ -167,13 +167,18 @@ fn two_nodes_answer_at_one_address_and_a_detach_leaves_the_other() {
         r2.transcript(),
         daemon.transcript()
     );
-    let nothing = format!("nothing at 127.0.0.1:{port} answers as {}", short(&fb));
+    let nothing = format!("the daemon answered at 127.0.0.1:{port}, but node {} is not available there (it may not be attached)", short(&fb));
     let refused_b = r2.line_within(Duration::from_secs(60), |l| l.contains(&nothing));
     assert!(
         refused_b.is_some(),
-        "PRODUCT: after b detached, the remote was not told nothing at the address answers as b.\n\
+        "PRODUCT: after b detached, the remote was not told its daemon answered but b may not be attached.\n\
          remote:\n{}",
         r2.transcript()
+    );
+    let refused_b = refused_b.expect("PRODUCT: node-unavailable reply was required above");
+    assert!(
+        !refused_b.contains("unreachable") && !refused_b.contains("locked"),
+        "PRODUCT: a daemon answered but the node-unavailable reply invented a reachability or lock verdict: {refused_b}"
     );
     eprintln!(
         "[proof] after b detached: a reached, b refused, {:?} after the second remote started",

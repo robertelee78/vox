@@ -996,7 +996,7 @@ fn wait_reader_one_way_trust(dir: &Path, reader: &str, room: &str, member: &str)
     loop {
         let actual = trust_detail(dir, reader, room, member);
         match actual.as_str() {
-            "you trust it, but it has not trusted you: it cannot read you" => return,
+            "you trust it; your node has not received its trust for you, so cannot tell whether it trusts you" => return,
             "you have not trusted it: it cannot read you, and you do not read it" => {
                 std::thread::sleep(Duration::from_millis(100));
             }
@@ -5275,7 +5275,6 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         );
         std::thread::sleep(Duration::from_millis(200));
     }
-    let carol_bob_sync_before = member_last_sync(&carol, &room, &fps[1]);
     carol_daemon.stop();
     let before_private_suffix = room_own_feed_through(&alice, &room).unwrap_or_else(|| {
         panic!(
@@ -5810,13 +5809,14 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         "PRODUCT: Carol read Alice's marker while the confirmed package-installer hold remained \
          armed; the product installed or served the held key-package past its causal hold"
     );
+    let carol_bob_rounds_before = member_completed_rounds(&carol, &room, &fps[1]);
     std::fs::remove_file(&hold)
         .unwrap_or_else(|e| panic!("APPARATUS: could not release {}: {e}", hold.display()));
     let bob_only_deadline = Instant::now() + READY_WITHIN;
-    while member_last_sync(&carol, &room, &fps[1]) <= carol_bob_sync_before {
+    while member_completed_rounds(&carol, &room, &fps[1]) <= carol_bob_rounds_before {
         assert!(
             Instant::now() < bob_only_deadline,
-            "PRODUCT: Carol did not complete a sync with reachable Bob within \
+            "PRODUCT: Carol did not complete a transport round with reachable Bob within \
              {READY_WITHIN:?} while Alice was offline\ncarol said: {}\nbob said: {}",
             said(&carol, "carol-from-bob"),
             said(&bob, "bob-after-restart")
@@ -7114,7 +7114,7 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
                 if matches!(
                     consent.as_str(),
                     "you trust each other"
-                        | "you trust it, but it has not trusted you: it cannot read you"
+                        | "you trust it; your node has not received its trust for you, so cannot tell whether it trusts you"
                 ) {
                     break;
                 }
@@ -7867,7 +7867,7 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
     );
     assert_eq!(
         trust_detail(&bob, "bob", &rooms[0], "alice"),
-        "you trust it, but it has not trusted you: it cannot read you",
+        "you trust it; your node has not received its trust for you, so cannot tell whether it trusts you",
         "PRODUCT: after Bob retained Alice's exact post-revocation descendant {revoked_hash}, \
          `vox agent doctor` still answered from stale in-memory consent"
     );
@@ -8679,25 +8679,22 @@ fn member_holds_through(dir: &Path, room: &str, member: &str) -> Option<u64> {
         .find(|row| row["id"].as_str().is_some_and(|id| id.starts_with(room)))?["members"]
         .as_array()?
         .iter()
-        .find(|row| row["id"].as_str() == Some(member))?["holds_through"]
+        .find(|row| row["id"].as_str() == Some(member))?["verified_through"]
         .as_u64()
 }
 
-/// The last completed sync this profile reports for one exact room member. `None` is also the
-/// honest result before that pair has completed a session.
-fn member_last_sync(dir: &Path, room: &str, member: &str) -> Option<u64> {
+/// Clean transport rounds for one room/member, including empty rounds. These establish
+/// that the peer answered, not that a message arrived.
+fn member_completed_rounds(dir: &Path, room: &str, member: &str) -> Option<u64> {
     let (ok, out, _) = vox(dir, &["status", "--json"], None);
     if !ok {
         return None;
     }
     let value: serde_json::Value = serde_json::from_str(&out).ok()?;
-    value["rooms"]
-        .as_array()?
-        .iter()
-        .find(|row| row["id"].as_str().is_some_and(|id| id.starts_with(room)))?["members"]
-        .as_array()?
-        .iter()
-        .find(|row| row["id"].as_str() == Some(member))?["last_sync_ms"]
+    value["sync"].as_array()?.iter().find(|row| {
+        row["room"].as_str().is_some_and(|id| id.starts_with(room))
+            && row["peer"].as_str() == Some(member)
+    })?["fetched_completed"]
         .as_u64()
 }
 

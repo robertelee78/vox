@@ -1,17 +1,17 @@
-//! **A dial that reaches a different node than the one it was told to reach says nothing answers
-//! as that node, and names no one** (ADR-011 requirement 38a, ADR-012 N-47; it replaces V210-143's
-//! wording), driven through the shipped binary.
+//! **A dial that reaches a different node says the daemon answered but the requested node
+//! is not available, and names no other node** (ADR-011 requirement 38a, ADR-012 N-47),
+//! driven through the shipped binary.
 //!
 //! A host whose anchor listened dual-stack on `[::]:0` could be given a port another process held
 //! on IPv4 (macOS hands an ephemeral `[::]:0` such a port), so its IPv4 dial to the anchor reached
 //! that other, honest node instead. V210-143 had the dial name who answered. Since the identity
 //! exchange, the node at an address proves only the identity it is asked for, and refuses anything
-//! else with one refusal that names no one: so the dialler says "nothing at `<address>` answers as
-//! `<expected>`", and it cannot — and must not — name who is there (ADR-026 G-1).
+//! else with one refusal that names no one. The dialler says the daemon answered but the
+//! requested node is unavailable; it cannot name who is there or why (ADR-026 G-1).
 //!
 //! Staged with two real `vox node`s, A and B, each on `127.0.0.1:0`, and a host started with
 //! `vox serve --anchor <A's fingerprint>@<B's address>`: its dial to "A" reaches B. What must hold:
-//! - the host's report of that dial says nothing at B's address answers as A;
+//! - the host says the daemon at B's address answered but A is not available there;
 //! - it does not name B.
 //!
 //! **A silence is said as one.** Then the host is told to reach A at an address where something
@@ -20,7 +20,7 @@
 //! exchange, as an anchor paused mid-dial does (the anchor-restart proof's red, where such a dial
 //! was said as "nothing at … answers as", which reads as an impostor). What must hold:
 //! - the host says `<address> did not answer within <EXCHANGE_TIMEOUT> s as <A>`;
-//! - it does not say "answers as" or "did not prove", the words for a refusal and an impostor.
+//! - it does not say "daemon answered" or "did not prove", the words for a refusal and an impostor.
 //!
 //! A red is PRODUCT, quoting what the host said. A node that never printed its spec, or a host that
 //! never reported the dial, is PRODUCT (staging). The test-side listener failing to bind or run is
@@ -102,7 +102,10 @@ fn a_dial_that_reaches_another_node_names_no_one() {
         ["", "ip6", ip, "udp", port] => format!("[{ip}]:{port}"),
         _ => b_addr.to_owned(),
     };
-    let names = format!("nothing at {at} answers as {}", short(a_fp));
+    let names = format!(
+        "the daemon answered at {at}, but node {} is not available there (it may not be attached)",
+        short(a_fp)
+    );
     eprintln!("[proof] told to reach A at B's address, the host said: {said}");
     assert!(
         said.contains(&names),
@@ -145,7 +148,7 @@ fn a_dial_that_reaches_another_node_names_no_one() {
     eprintln!("[proof] told to reach A where nothing answers the exchange, the host said: {said}");
     assert!(
         said.contains(&timed_out)
-            && !said.contains("answers as")
+            && !said.contains("daemon answered")
             && !said.contains("did not prove"),
         "PRODUCT: a dial that got no answer must say {timed_out:?}, not a refusal or an impostor; \
          the host said: {said}\nits transcript:\n{}",

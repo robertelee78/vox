@@ -8757,13 +8757,36 @@ impl ChannelState {
         self.held.get(member).copied()
     }
 
-    /// Last authenticated, role-complete contiguous position this node holds in `member`'s feed:
-    /// the channel DAG's verified head. This is not the sparse-history receipt cursor returned by
-    /// `history_held_through`, which separately records durable effect settlement before a receipt
-    /// probe may be answered.
-    pub fn holds_through(&self, member: &Digest32) -> Option<u64> {
+    /// Authenticated header position, not a claim that any message can be shown.
+    pub(crate) fn verified_through(&self, member: &Digest32) -> Option<u64> {
         let through = self.dag.verified_head(member);
         (through != 0).then_some(through)
+    }
+
+    /// Latest message this node can show for each member. Authenticated headers and
+    /// missing-body placeholders are not in the rendered-message index.
+    pub(crate) fn holds_through(
+        &self,
+        store: &Store,
+        members: &[Digest32],
+    ) -> Result<Vec<(Digest32, u64)>> {
+        let rendered = self
+            .entries
+            .render_view(store, &self.sek, &self.channel_id)?;
+        let mut out = Vec::new();
+        for member in members {
+            if let Some((key, _)) = rendered.step(
+                Some(&entry_store::Filter::Author(*member)),
+                true,
+                None,
+                true,
+            )? {
+                if let Some((_, seq)) = rendered.order().author_position(&key.1)? {
+                    out.push((*member, seq));
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Record that `member`'s node said, in a sync, it holds this identity's feed here up to `seq`

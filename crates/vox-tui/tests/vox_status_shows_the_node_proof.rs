@@ -45,6 +45,10 @@ mod watchdog;
 #[path = "support/world.rs"]
 mod world;
 
+#[cfg(feature = "test-knobs")]
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
+
 use world::attach as local_attach;
 
 use std::io::{Read, Write};
@@ -358,7 +362,7 @@ fn ready_and_locked_are_the_states_a_person_sees() {
         &turn,
     );
     assert!(
-        hook.contains("private is Locked") && hook.contains("vox node unlock private"),
+        hook.contains("private is Locked") && hook.contains("vox node unlock -- private"),
         "PRODUCT: a hook on a Locked node must say Locked and how to unlock: {hook}"
     );
     let tui = StatusTui::start(dir, "free");
@@ -778,5 +782,189 @@ fn vox_status_shows_rooms_peers_tunnels_udp_flows_and_what_is_unhealthy() {
                 .any(|l| l.contains(&format!("trusted member {g} unreachable"))),
         "PRODUCT: the host's trusted guest {g} went away, yet in 120 s `vox status` never flagged \
          it unreachable:\n{text}"
+    );
+}
+
+/// RG-7: an answering member advertises twenty new posts but refuses its head evidence.
+/// Inventory rounds still finish; none of those rounds is receipt of a readable message.
+#[cfg(feature = "test-knobs")]
+#[test]
+#[ignore = "real binaries and production Argon2id; run in release with test-knobs"]
+fn status_names_a_connected_member_whose_posts_are_not_received() {
+    watchdog::arm();
+    test_knobs::require(&["VOX_TEST_UNAVAILABLE_HEAD_FILE"]);
+    let sink = UdpSocket::bind("127.0.0.1:0").expect("APPARATUS: service port");
+    let port = sink.local_addr().expect("APPARATUS: bound service").port();
+    let mut w = World::new(port, true);
+    local_attach::Root::at(&w.guest_dir, world::IDENTITY).attach("default");
+    let (ok, out, err) = vox_once(
+        &w.guest_dir,
+        &args(&["trust", "add", &w.host_fp, "--name", "author"]),
+    );
+    assert!(ok, "APPARATUS: trusting author failed: {out}{err}");
+    let run = |dir: &std::path::Path, argv: &[&str]| {
+        let (ok, out, err) = vox_once(dir, &args(argv));
+        assert!(ok, "APPARATUS: staging vox {argv:?} failed: {out}{err}");
+        out
+    };
+    drop(w.host.take());
+    world::reap_daemon(&w.host_dir);
+    let marker = w.tmp.path().join("unavailable-head");
+    let pass = w.tmp.path().join("daemon-passphrases");
+    std::fs::write(&pass, format!("{}\n{}\n", world::IDENTITY, w.passphrase))
+        .expect("APPARATUS: scratch passphrase file");
+    let mut author = world::VoxProc::spawn_env(
+        "withholding-author",
+        &w.host_dir,
+        &args(&[
+            "daemon",
+            "--passphrase-file",
+            &world::utf8(&pass),
+            "--anchor",
+            &w.host_anchor,
+            "--listen",
+            "127.0.0.1:0",
+        ]),
+        &[("VOX_TEST_UNAVAILABLE_HEAD_FILE", &world::utf8(&marker))],
+    );
+    author.expect_line("author's room open", |line| {
+        line.starts_with("vox daemon: holding room") && line.contains(&w.room)
+    });
+    run(
+        &w.host_dir,
+        &["room", "post", &w.room, "received-before-withholding"],
+    );
+    loop {
+        let read = run(&w.guest_dir, &["room", "read", &w.room, "--json"]);
+        if read.contains("received-before-withholding") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let completed = |v: &Value| -> u64 {
+        v["sync"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|lane| lane["peer"] == w.host_fp)
+            .filter_map(|lane| lane["completed"].as_u64())
+            .sum()
+    };
+    // Let all earlier nonempty rounds finish before the exact observation boundary.
+    let initial = status_json(&w.guest_dir, "reader");
+    let settled = completed(&initial) + 3;
+    let before = loop {
+        let current = status_json(&w.guest_dir, "reader");
+        if completed(&current) >= settled
+            && current["rooms"][0]["members"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["id"] == w.host_fp && m["connected"] == true)
+        {
+            break current;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    std::fs::write(&marker, format!("{} {}\n", w.host_fp, w.guest_fp))
+        .expect("APPARATUS: activate head refusal");
+    for number in 1..=20 {
+        run(
+            &w.host_dir,
+            &[
+                "room",
+                "post",
+                &w.room,
+                &format!("withheld-post-{number:02}"),
+            ],
+        );
+    }
+    let cycles = completed(&before);
+    let after = loop {
+        let current = status_json(&w.guest_dir, "reader");
+        if completed(&current) >= cycles + 3 {
+            break current;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let read = run(&w.guest_dir, &["room", "read", &w.room, "--json"]);
+    assert!(
+        !read.contains("withheld-post-"),
+        "APPARATUS: head-refusing member nevertheless served the withheld posts: {read}"
+    );
+    let text = status_text(&w.guest_dir, "reader");
+    eprintln!("[proof] after twenty advertised posts and three completed rounds:\n{text}\n{after}");
+    assert!(
+        text.contains("not receiving"),
+        "PRODUCT: connected author posted twenty messages, reader shows none, yet status \
+         does not say not receiving:\n{text}"
+    );
+    assert_eq!(
+        after["rooms"][0]["last_sync_ms"], before["rooms"][0]["last_sync_ms"],
+        "PRODUCT: empty rounds advanced the room's completed sync:\n{text}"
+    );
+    for member in after["rooms"][0]["members"].as_array().unwrap() {
+        let id = member["id"].as_str().unwrap();
+        if member["me"] == true {
+            assert!(
+                member["holds_through"].is_null(),
+                "PRODUCT: the reader authored no messages, but status counted its setup headers as shown messages:\n{text}"
+            );
+        }
+        assert!(
+            text.lines()
+                .any(|line| line.contains(&id[..12]) && line.contains("received through message")),
+            "PRODUCT: room status does not name received message coverage for {id}:\n{text}"
+        );
+    }
+    drop(author);
+}
+
+/// Absence of a received consent is a local observation, not a remote trust decision.
+#[test]
+#[ignore = "real binaries and production Argon2id; run in release"]
+fn status_journey_does_not_blame_missing_history_on_remote_trust() {
+    watchdog::arm();
+    let sink = UdpSocket::bind("127.0.0.1:0").expect("APPARATUS: service port");
+    let w = World::new(
+        sink.local_addr()
+            .expect("APPARATUS: service address")
+            .port(),
+        false,
+    );
+    local_attach::Root::at(&w.guest_dir, world::IDENTITY).attach("default");
+    let (ok, out, err) = vox_once(
+        &w.guest_dir,
+        &args(&["trust", "add", &w.host_fp, "--name", "author"]),
+    );
+    assert!(ok, "PRODUCT: reader could not trust author: {out}{err}");
+    let report = loop {
+        let (_, out, err) = vox_once(
+            &w.guest_dir,
+            &args(&["agent", "doctor", "--room", &w.room, "--json"]),
+        );
+        let report: Value = serde_json::from_str(&out)
+            .unwrap_or_else(|e| panic!("PRODUCT: doctor printed invalid JSON ({e}): {out}{err}"));
+        let ready = report["checks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|check| {
+                check["detail"]
+                    .as_str()
+                    .is_some_and(|detail| detail.starts_with("you trust it"))
+            });
+        if ready {
+            break report;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    eprintln!("[proof] doctor without received consent: {report}");
+    let text = report.to_string();
+    assert!(
+        text.contains("your node has not received its trust for you")
+            && !text.contains("has not trusted you")
+            && !text.contains("ask its operator to accept your fingerprint"),
+        "PRODUCT: doctor inferred a remote trust refusal from absent local consent: {report}"
     );
 }

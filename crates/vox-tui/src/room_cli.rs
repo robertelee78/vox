@@ -1254,7 +1254,7 @@ fn reach_of(
         if it_trusts {
             "it trusts you"
         } else {
-            "it has not trusted you"
+            "your node has not received its trust for you; check vox status before asking to change trust"
         }
         .to_owned(),
     );

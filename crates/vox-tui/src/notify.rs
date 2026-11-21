@@ -27,6 +27,7 @@
 //! scope: it needs a service to push through, and Vox runs none.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use vox_core::node::actor::NodeHandle;
@@ -129,40 +130,62 @@ pub fn command(paths: &Paths) -> Option<std::ffi::OsString> {
         .or_else(|| std::env::var_os("VOX_NOTIFY_COMMAND"))
 }
 
-/// Raise one notification. Never blocks the caller for long, and never fails it: a
-/// desktop that cannot show a notification is not a reason to stop watching.
+/// Raise one notification without letting a desktop command block indefinitely.
 fn raise(note: &Note, command: Option<&std::ffi::OsStr>) {
+    static DESKTOP_FAILURE_LOGGED: AtomicBool = AtomicBool::new(false);
     eprintln!("vox daemon: {} — {}", note.title, note.body);
-    if let Some(cmd) = command {
-        let _ = std::process::Command::new(cmd)
-            .arg(&note.title)
-            .arg(&note.body)
-            .status();
-        return;
-    }
-    if cfg!(target_os = "macos") {
-        // AppleScript string literals: backslash and double quote are the escapes.
+    let desktop = command.is_none();
+    let mut child = if let Some(cmd) = command {
+        let mut child = std::process::Command::new(cmd);
+        child.arg(&note.title).arg(&note.body);
+        child
+    } else if cfg!(target_os = "macos") {
         let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
         let script = format!(
             "display notification \"{}\" with title \"{}\"",
             esc(&note.body),
             esc(&note.title)
         );
-        let _ = std::process::Command::new("osascript")
-            .arg("-e")
-            .arg(script)
-            .status();
+        let mut child = std::process::Command::new("osascript");
+        child.arg("-e").arg(script);
+        child
     } else if cfg!(target_os = "linux") {
-        let _ = std::process::Command::new("notify-send")
-            .arg(&note.title)
-            .arg(&note.body)
-            .status();
+        let mut child = std::process::Command::new("notify-send");
+        child.arg(&note.title).arg(&note.body);
+        child
+    } else {
+        return;
+    };
+    let ok = match child
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(mut child) => {
+            let deadline = std::time::Instant::now() + Duration::from_secs(120);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => break status.success(),
+                    Ok(None) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    _ => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break false;
+                    }
+                }
+            }
+        }
+        Err(_) => false,
+    };
+    if desktop && !ok && !DESKTOP_FAILURE_LOGGED.swap(true, Ordering::Relaxed) {
+        eprintln!("vox daemon: desktop notification unavailable; notices remain in the daemon log");
     }
 }
 
-/// Raise one notification for the person at node `paths`'s machine, where the daemon's watcher
-/// raises its own (#666: a node that waits for its passphrase), unless the node has notifications
-/// off. Waits for the notification program, so it is for a moment that happens once.
+/// Raise one notification for the person at node `paths`'s machine, unless notifications are off.
 pub fn raise_for(paths: &Paths, title: &str, body: &str) {
     if disabled(paths) {
         return;
@@ -333,9 +356,11 @@ pub async fn watch(node: NodeHandle, paths: Paths) {
             return; // the node stopped
         };
         for note in tracker.observe(&report.unhealthy) {
-            // Off the runtime: a notification program is a child process to wait for.
+            // Each child is bounded and reaped independently of the next status check.
             let command = command.clone();
-            let _ = tokio::task::spawn_blocking(move || raise(&note, command.as_deref())).await;
+            drop(tokio::task::spawn_blocking(move || {
+                raise(&note, command.as_deref());
+            }));
         }
     }
 }

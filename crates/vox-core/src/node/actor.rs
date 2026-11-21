@@ -552,10 +552,15 @@ fn detail_of(
         .iter()
         .filter_map(|member| ch.held_through(member).map(|seq| (*member, seq)))
         .collect();
-    let holds_through = members
+    let verified_through = members
         .iter()
-        .filter_map(|member| ch.holds_through(member).map(|seq| (*member, seq)))
+        .filter_map(|member| ch.verified_through(member).map(|seq| (*member, seq)))
         .collect();
+    let holds_through =
+        match prev.filter(|p| ch.display_is_current(&p.display_stamp, &display_stamp)) {
+            Some(p) => p.holds_through.clone(),
+            None => ch.holds_through(store, &members)?,
+        };
     let mut key_delivery_pending = Vec::new();
     for target in &member_consent {
         if ch.key_delivery_pending(store, target)? {
@@ -613,6 +618,7 @@ fn detail_of(
         held,
         held_through,
         holds_through,
+        verified_through,
         unread,
         // The authors this node can answer for now; a refreshing author is named in each
         // listing's revision rather than holding the whole room's detail back (ADR-037 R4).
@@ -5023,7 +5029,7 @@ fn went_offline(conn: &VoxConnection) -> Option<String> {
                 .and_then(WireError::from_code)?
             {
                 WireError::ShuttingDown => Some("it stopped".to_owned()),
-                WireError::NotAvailable => Some("its node is not there (not available)".to_owned()),
+                WireError::NotAvailable => Some("its daemon answered, but this node is not available there (it may not be attached); ask its operator to check vox node list".to_owned()),
                 _ => None,
             }
         }
@@ -13689,9 +13695,9 @@ impl Node {
                     shared.lock().await.note_held(&store, peer, seq);
                 }
                 self.refresh_network_view().await;
-                if report.fail.is_none() {
-                    // When this room, and this peer, last completed a sync, for `vox status`
-                    // (PRD-001 R35).
+                if report.fail.is_none() && report.out.applied > 0 {
+                    // Only a round that brought entries is a completed sync.
+                    // Empty transport exchanges still clear their transport failure separately.
                     let now = self.now_ms().get();
                     self.status.room_synced.insert(channel_id, now);
                     self.status.member_synced.insert(peer, now);
@@ -22913,6 +22919,12 @@ impl Node {
                     me: Some(*m) == me,
                     trusted: trusted.contains(m),
                     connected: connected.contains(m),
+                    daemon_answered: crate::node::status::SyncBook::daemon_answered(
+                        &self.sync_book,
+                        room.channel_id,
+                        *m,
+                    ),
+                    advertised_through: self.history_hints.advertised_through(room.channel_id, *m),
                     last_seen: self.status.last_seen.get(m).copied(),
                     last_sync: self.status.member_synced.get(m).copied(),
                     key_waits: self.said_of(&room.channel_id, m),
@@ -22922,6 +22934,10 @@ impl Node {
                         .find_map(|(member, seq)| (*member == *m).then_some(*seq)),
                     holds_through: room
                         .holds_through
+                        .iter()
+                        .find_map(|(member, seq)| (*member == *m).then_some(*seq)),
+                    verified_through: room
+                        .verified_through
                         .iter()
                         .find_map(|(member, seq)| (*member == *m).then_some(*seq)),
                     key_delivery_pending: room.key_delivery_pending.contains(m)
