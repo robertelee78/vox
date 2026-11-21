@@ -333,6 +333,18 @@ impl Node {
         let saved = match result {
             Ok(saved) => saved,
             Err(error) => {
+                if matches!(&continuation.after, After::Trust { .. })
+                    && ChannelState::governance_refreshing(&error)
+                {
+                    self.continue_governance_save(
+                        room,
+                        maintenance_save::Work::Projection(ProjectionWork::Governance),
+                        continuation,
+                        reply,
+                    )
+                    .await;
+                    return;
+                }
                 if matches!(error, Error::ComputerPolicySuperseded)
                     && matches!(&continuation.after, After::Turn(_))
                 {
@@ -428,6 +440,27 @@ impl Node {
         match &mut continuation.after {
             After::Trust { state, generation } => {
                 let applied = match saved {
+                    maintenance_save::Saved::Projection(ProjectionProgress::Governance(
+                        progress,
+                    )) => {
+                        if !progress.ready && progress.pending {
+                            self.continue_governance_save(
+                                room,
+                                maintenance_save::Work::Projection(ProjectionWork::Governance),
+                                continuation,
+                                reply,
+                            )
+                            .await;
+                            return;
+                        }
+                        if progress.ready {
+                            Ok(())
+                        } else {
+                            Err(Error::Profile(
+                                "room governance projection stopped before readiness",
+                            ))
+                        }
+                    }
                     maintenance_save::Saved::Trust(saved) => state.saved(&saved),
                     maintenance_save::Saved::Consent(consent_save::Effect::Consent(saved)) => {
                         if let crate::node::channel::pending_text::consent::ConsentSaved::Withdrawn(
@@ -450,7 +483,9 @@ impl Node {
                 }
                 let action = {
                     let channel = continuation.instance.lock().await;
-                    state.action(&channel, &continuation.lifetime.store)
+                    channel
+                        .require_governance_ready(&continuation.lifetime.store, self.now_ms())
+                        .and_then(|_| state.action(&channel, &continuation.lifetime.store))
                 };
                 let work = match action {
                     Ok(trust_save::ReconcileAction::Trust(work)) => {
@@ -477,6 +512,11 @@ impl Node {
                         self.begin_owned_private_drive(room, false, None, None, None)
                             .await;
                         return;
+                    }
+                    Err(error) if ChannelState::governance_refreshing(&error) => {
+                        // Trust deletion/withdrawal can retire the projection. Refresh it without
+                        // restarting DeleteInitial and invalidating the same view again.
+                        maintenance_save::Work::Projection(ProjectionWork::Governance)
                     }
                     Err(error) => {
                         self.reject_owned_governance(room, error, continuation, reply);

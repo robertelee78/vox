@@ -7875,6 +7875,10 @@ impl Node {
                     .position(|(event, _)| self.seat_waits_for_install(event) == Some(false))
             };
             let receive_net = saved_events.iter().all(|(_, credit)| credit.is_some());
+            let publication_computer = self.computer.clone();
+            let publication_busy = publication_computer
+                .as_ref()
+                .is_some_and(|computer| computer.publication_writer_pending());
             let journal_busy = self.deferred_commands.front().is_some_and(|deferred| {
                 Self::command_needs_journal(&deferred.command.0)
                     && self
@@ -7882,8 +7886,21 @@ impl Node {
                         .as_ref()
                         .is_some_and(|computer| computer.writer_pending())
             });
-            let resume_command =
-                !self.store_save_pending() && !journal_busy && !self.deferred_commands.is_empty();
+            let authority_busy = self.deferred_commands.front().is_some_and(|deferred| {
+                matches!(
+                    deferred.command.0,
+                    NodeCommand::SendText { .. }
+                        | NodeCommand::SendTextAt { .. }
+                        | NodeCommand::SendTextAdmitted { .. }
+                ) && (publication_busy
+                    || self
+                        .computer_authority()
+                        .is_some_and(|authority| matches!(authority.superseded(), Ok(true))))
+            });
+            let resume_command = !self.store_save_pending()
+                && !journal_busy
+                && !authority_busy
+                && !self.deferred_commands.is_empty();
             let receive_command = resume_command
                 || self
                     .deferred_commands
@@ -7904,10 +7921,6 @@ impl Node {
                     std::future::pending::<()>().await;
                 }
             };
-            let publication_computer = self.computer.clone();
-            let publication_busy = publication_computer
-                .as_ref()
-                .is_some_and(|computer| computer.publication_writer_pending());
             let resume_publication = publication_busy || self.metadata_publication_waiting();
             let publication_ready = async move {
                 if let Some(computer) = publication_computer {

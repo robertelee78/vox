@@ -19,11 +19,17 @@ They are kept "at the ready for troubleshooting". When a user reports one of the
 
 ### Room-by-room computer trust (ADR-052 RG-3)
 
-The trust journey in `nodes_of_one_daemon_proof.rs` uses three scratch computers and
+The trust journey in `nodes_of_one_daemon_proof.rs` uses scratch computers and
 the real `vox` commands. A departed room must not strand the node's saved keyring;
-adding a paired node must not refuse another room's posts or link. A causally held
-withdrawal refuses only that room's posts and sender keys, then resumes without a
-restart or another policy event.
+adding a paired node must not refuse another room's posts or link. The held-room
+proofs pair the departing computer and trust the requester independently. A causally
+held withdrawal refuses only that room's posts and sender keys, then resumes without
+a restart or another policy event. Manual removal also retains its room's withdrawal
+stage while refreshing permissions, rather than repeatedly starting that withdrawal
+over; the existing manual-removal and through-log re-trust journeys cover this path.
+Posts that meet a new computer revision before native publication retain their
+original command queue credit until the saved keyring is current; their room's
+withdrawal fence still decides whether they may be written.
 
 Run each named proof separately, with exclusive build-slot ownership for the hold:
 
