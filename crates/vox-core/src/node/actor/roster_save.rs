@@ -237,6 +237,27 @@ impl Node {
                 return;
             }
         };
+        // A simultaneous answer may have yielded our own reservation to another responder.
+        // Recheck before selecting the save, and keep a selected admission from yielding.
+        {
+            let channel = instance.lock().await;
+            let joiner = identity.fingerprint();
+            if !channel.is_author(&joiner) {
+                let checked = self.seat_count(&channel, &room, &joiner).and_then(|()| {
+                    let held = self
+                        .seat_promises
+                        .get_mut(&(room, joiner))
+                        .filter(|held| held.from == channel.me())
+                        .ok_or(Error::SeatTaken)?;
+                    held.admitting = true;
+                    Ok(())
+                });
+                if let Err(error) = checked {
+                    let _ = ack.send(Err(error));
+                    return;
+                }
+            }
+        }
         let work = Work::Join {
             candidate: Box::new(pending_roster::JoinCandidate {
                 peer,

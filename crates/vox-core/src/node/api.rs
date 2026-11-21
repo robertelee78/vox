@@ -1661,9 +1661,8 @@ pub enum Fault {
     /// The room's last place went to another newcomer joining at the same moment: a member asked
     /// had already promised it (V030-30, #366). Nobody was admitted on this joiner's account.
     SeatTaken,
-    /// A member online did not agree to the newcomer within the bound, or does not yet count the
-    /// answering member a member (V030-30, #366): every member online must agree before the room
-    /// takes a newcomer. The reason names the member.
+    /// A member answered that it does not yet count the responder a member of the room.
+    /// The reason names that member; an unanswered seat question does not refuse a join.
     SeatNotAgreed,
     /// A member accepted the passphrase and then could not admit the joiner: it was locked or
     /// closing mid-join, or its store refused the write (V210-128). **Not [`Fault::Refused`]**,
@@ -1924,7 +1923,7 @@ impl Fault {
                 "another newcomer took the room's last place at the same moment, so you were not admitted\n       your passphrase was accepted; try again"
             }
             Fault::SeatNotAgreed => {
-                "a member of the room did not agree to take you in, so you were not admitted\n       every member online must agree before the room takes a newcomer; the member is named below\n       your passphrase was accepted; try again"
+                "a member of the room did not agree to take you in, so you were not admitted\n       the member that refused is named below\n       your passphrase was accepted; try again"
             }
             Fault::NotAdmittedAfterJoin => {
                 "a member accepted your passphrase, then could not admit you, so you were not admitted\n       the member may have been locking or closing; run the join again while it is running"
