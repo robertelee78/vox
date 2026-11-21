@@ -4,6 +4,9 @@
 //! connected members on [`StreamKind::Seat`]. An explicit full/taken answer refuses the join.
 //! With two responders reserving the last place at once, the lower responder fingerprint wins:
 //! the other yields only its own uncommitted reservation, never a promise made to another member.
+//! That admits exactly one newcomer when the two responders are the only members that answer.
+//! When a third member answers, it may have promised the place to the higher responder first;
+//! it cannot give that promise up, so both newcomers can still be refused and may join again.
 //! The responder rechecks its reservation and cap before selecting the admission save.
 //!
 //! A member that does not answer within [`SEAT_ANSWER_WITHIN`] does not block admission (ADR-052
