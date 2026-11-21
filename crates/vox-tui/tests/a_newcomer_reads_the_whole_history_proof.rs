@@ -10763,9 +10763,10 @@ except Exception as e: print(json.dumps({"kind":"apparatus","error":repr(e)}),fl
     }
 
     /// Needs the authenticated contiguous verified position, not every retained sparse copy.
-    /// RG-7 names this `verified_through`; only the paged read establishes showability.
+    /// That is `verified_through`; `holds_through` is the latest message the room can show, and
+    /// only the paged read establishes showability.
     fn held_position(status: &Value, author: &str) -> Option<u64> {
-        member(status, author)?["holds_through"].as_u64()
+        member(status, author)?["verified_through"].as_u64()
     }
 
     fn doctor(
