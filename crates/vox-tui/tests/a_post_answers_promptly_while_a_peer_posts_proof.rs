@@ -32,7 +32,13 @@
 
 #[path = "support/optional_proof.rs"]
 mod optional_proof;
-optional_proof::not_run!(a_post_answers_promptly_while_a_peer_posts);
+optional_proof::not_run!(
+    a_post_answers_promptly_while_a_peer_posts,
+    status_and_posts_answer_while_ten_sessions_step,
+);
+
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
 
 #[path = "support/world.rs"]
 mod world;
@@ -403,4 +409,294 @@ fn a_post_answers_promptly_while_a_peer_posts() {
         MAX_BOUND.as_millis()
     );
     drop((alice_d, bob_d, anchor));
+}
+
+/// These are latencies a person feels, not a timeout used to infer a causal wedge.
+/// The held transaction is staged explicitly; not reaching it is APPARATUS.
+/// Mutant: execute the admission worker's commit on the actor again.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "real vox daemon and ten native agent hooks; run in release with test-knobs"]
+fn status_and_posts_answer_while_ten_sessions_step() {
+    watchdog::arm();
+    test_knobs::require(&["VOX_TEST_HOLD_SESSION_FLUSH"]);
+    let mut tmp = tempfile::tempdir().expect("APPARATUS: scratch profile");
+    if std::env::var_os("VOX_PROOF_KEEP_DIRS").is_some() {
+        tmp.disable_cleanup(true);
+        eprintln!(
+            "[proof] retained daemon directory: {}",
+            tmp.path().display()
+        );
+    }
+    let data = tmp.path().join("rg12");
+    std::fs::create_dir_all(data.join("cfg")).expect("APPARATUS: scratch config");
+    let pass = tmp.path().join("identity.pass");
+    std::fs::write(&pass, IDENTITY).expect("APPARATUS: identity passphrase");
+    // An empty environment prevents agent hooks from inheriting the operator's wake
+    // sockets, pane or session. Every path the binary receives belongs to this proof.
+    let command = || {
+        let mut command = Command::new(VOX);
+        command
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", &data)
+            .env("VOX_DATA_DIR", &data)
+            .env("VOX_CONFIG_DIR", data.join("cfg"));
+        command
+    };
+    let run = |argv: &[&str], input: Option<&str>, hook: bool| {
+        let mut command = command();
+        command
+            .args(argv)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if hook {
+            command.env("CLAUDE_CODE_ENTRYPOINT", "cli");
+        }
+        command.stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
+        let mut child = command.spawn().expect("APPARATUS: start scratch vox");
+        if let Some(input) = input {
+            child
+                .stdin
+                .take()
+                .expect("APPARATUS: piped stdin")
+                .write_all(input.as_bytes())
+                .expect("APPARATUS: feed scratch vox");
+        }
+        let out = child
+            .wait_with_output()
+            .expect("APPARATUS: collect scratch vox");
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let identity = run(
+        &["id", "--identity-passphrase-file", pass.to_str().unwrap()],
+        None,
+        false,
+    );
+    assert!(identity.0, "APPARATUS: scratch identity: {identity:?}");
+    let arm = tmp.path().join("flush.arm");
+    let engaged = tmp.path().join("flush.engaged");
+    let release = tmp.path().join("flush.release");
+    let hold = format!(
+        "{}\t{}\t{}",
+        arm.display(),
+        engaged.display(),
+        release.display()
+    );
+    let _daemon = VoxProc::spawn_env(
+        "rg12",
+        &data,
+        &args(&[
+            "daemon",
+            "--listen",
+            "127.0.0.1:0",
+            "--anchor",
+            "",
+            "--passphrase-file",
+            pass.to_str().unwrap(),
+        ]),
+        &[("VOX_TEST_HOLD_SESSION_FLUSH", &hold)],
+    );
+    let deadline = Instant::now() + Duration::from_secs(240);
+    loop {
+        let listed = run(&["room", "list"], None, false);
+        if listed.0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "APPARATUS: scratch daemon not ready: {listed:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let created = run(
+        &[
+            "room",
+            "create",
+            "--name",
+            "stepping",
+            "--passphrase-file",
+            "-",
+        ],
+        Some("channel passphrase"),
+        false,
+    );
+    assert!(created.0, "APPARATUS: create the latency room: {created:?}");
+    let listed = run(&["room", "list"], None, false);
+    assert!(listed.0, "APPARATUS: list the latency room: {listed:?}");
+    let room = listed
+        .1
+        .split_whitespace()
+        .next()
+        .expect("APPARATUS: room id")
+        .to_owned();
+    let sessions: Vec<_> = (0..10).map(|n| format!("rg12-session-{n}")).collect();
+    for session in &sessions {
+        let transcript = tmp.path().join(format!("{session}.jsonl"));
+        std::fs::write(&transcript, "").expect("APPARATUS: empty agent transcript");
+        let event = serde_json::json!({
+            "session_id": session, "hook_event_name": "UserPromptSubmit",
+            "cwd": tmp.path(), "transcript_path": transcript, "prompt": "work",
+            "prompt_id": format!("{session}-prompt"),
+        });
+        let hook = run(
+            &["agent", "hook", "--node", "default", "--room", &room],
+            Some(&event.to_string()),
+            true,
+        );
+        assert!(hook.0, "APPARATUS: Session opening did not stage: {hook:?}");
+    }
+    let shown = run(&["room", "sessions", &room, "--json"], None, false);
+    assert!(
+        shown.0 && sessions.iter().all(|session| shown.1.contains(session)),
+        "APPARATUS: ten open Sessions were not shown: {shown:?}"
+    );
+    std::fs::write(&arm, &sessions[0]).expect("APPARATUS: arm the exact Session's flush");
+    let (status, posts, steps) = std::thread::scope(|scope| {
+        struct Release<'a>(&'a std::path::Path);
+        impl Drop for Release<'_> {
+            fn drop(&mut self) {
+                let _ = std::fs::write(self.0, "");
+            }
+        }
+        let _release = Release(&release);
+        let mut steps = Vec::new();
+        for session in &sessions {
+            let run = &run;
+            let room = &room;
+            let root = tmp.path();
+            steps.push(scope.spawn(move || {
+                let event = serde_json::json!({
+                    "session_id": session, "hook_event_name": "PreToolUse", "cwd": root,
+                    "transcript_path": root.join(format!("{session}.jsonl")),
+                    "tool_name": "Bash", "tool_use_id": format!("{session}-tool"),
+                    "tool_input": {"command": format!("echo {session}")},
+                });
+                run(
+                    &["agent", "hook", "--node", "default", "--room", room],
+                    Some(&event.to_string()),
+                    true,
+                )
+            }));
+        }
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !engaged.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Release before any assertion/unwind joins the ten hooks.
+        if !engaged.exists() {
+            std::fs::write(&release, "").expect("APPARATUS: release an unstaged hold");
+            panic!("APPARATUS: no Session step reached its armed durable flush");
+        }
+        assert_eq!(
+            std::fs::read_to_string(&engaged).expect("APPARATUS: flush receipt"),
+            sessions[0],
+            "APPARATUS: a different Session reached the held flush"
+        );
+        let held_at = Instant::now();
+        let poster = scope.spawn(|| {
+            (0..10)
+                .map(|n| {
+                    let start = Instant::now();
+                    let output = run(
+                        &["room", "post", &room, &format!("rg12-post-{n}")],
+                        None,
+                        false,
+                    );
+                    (start.elapsed(), output)
+                })
+                .collect::<Vec<_>>()
+        });
+        let mut command = command();
+        command
+            .args(["status", "--json"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let start = Instant::now();
+        let mut child = command.spawn().expect("APPARATUS: start vox status");
+        let answered = loop {
+            if child
+                .try_wait()
+                .expect("APPARATUS: observe vox status")
+                .is_some()
+            {
+                break start.elapsed() < Duration::from_secs(1);
+            }
+            if start.elapsed() >= Duration::from_secs(1) {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        let bound_observed_at = start.elapsed();
+        let mut answer_observed_at = answered.then_some(bound_observed_at);
+        // Keep the flush held four times longer than the bound. A baseline red therefore
+        // distinguishes waiting for this flush from missing the bound by a millisecond.
+        while held_at.elapsed() < Duration::from_secs(4) {
+            if answer_observed_at.is_none()
+                && child
+                    .try_wait()
+                    .expect("APPARATUS: observe status during held flush")
+                    .is_some()
+            {
+                answer_observed_at = Some(start.elapsed());
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let answered_before_release = answer_observed_at.is_some();
+        let released_at = Instant::now();
+        let flush_held = held_at.elapsed();
+        std::fs::write(&release, "").expect("APPARATUS: release the held flush");
+        let output = child
+            .wait_with_output()
+            .expect("APPARATUS: collect vox status");
+        let after_release = (!answered_before_release).then(|| released_at.elapsed());
+        let answer_observed_at = answer_observed_at.unwrap_or_else(|| start.elapsed());
+        let observation = format!(
+            "status within_1s={answered} bound_expired_without_answer={} bound_observed_at={bound_observed_at:?} \
+             flush_held={flush_held:?} answered_before_release={answered_before_release} \
+             answer_observed_at={answer_observed_at:?} answer_after_release={after_release:?} \
+             exit={:?} stdout={} stderr={}",
+            !answered, output.status.code(), String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        let posts = poster.join().expect("APPARATUS: post driver panicked");
+        let steps = steps
+            .into_iter()
+            .map(|step| step.join().expect("APPARATUS: hook driver panicked"))
+            .collect::<Vec<_>>();
+        (
+            (
+                answered && answered_before_release && output.status.success(),
+                observation,
+            ),
+            posts,
+            steps,
+        )
+    });
+    eprintln!("RG12 {}", status.1);
+    for (index, (latency, output)) in posts.iter().enumerate() {
+        eprintln!("RG12 post {index}: {latency:?} {output:?}");
+    }
+    assert!(
+        steps.iter().all(|step| step.0),
+        "PRODUCT: a Session step failed: {steps:?}"
+    );
+    assert!(
+        posts
+            .iter()
+            .all(|(latency, output)| output.0 && *latency < Duration::from_secs(5)),
+        "PRODUCT: a post did not return saved within 5s while ten Sessions stepped: {posts:?}"
+    );
+    assert!(
+        status.0,
+        "PRODUCT: vox status did not answer within 1s while a Session step's flush was held: {}",
+        status.1
+    );
 }

@@ -1398,6 +1398,8 @@ impl PendingSession {
             .take()
             .ok_or(Error::MalformedAtRest("Session refresh cursor missing"))?;
         let mut bytes = 0usize;
+        #[cfg(feature = "test-knobs")]
+        let mut walked = (0usize, 0usize);
         let progress = (|| -> Result<()> {
             for _ in 0..WORK_ROWS {
                 if work.stage == 0 {
@@ -1416,6 +1418,11 @@ impl PendingSession {
                         work.stage = 1;
                         continue;
                     };
+                    #[cfg(feature = "test-knobs")]
+                    {
+                        walked.0 += 1;
+                        walked.1 += usize::from(row.author != self.me);
+                    }
                     if bytes != 0 && bytes.saturating_add(row.text.len()) > WORK_BYTES {
                         break;
                     }
@@ -1463,6 +1470,13 @@ impl PendingSession {
                         work.stage = 2;
                         break;
                     };
+                    #[cfg(feature = "test-knobs")]
+                    {
+                        let candidate = self.private_at(store, sek, id)?;
+                        walked.0 += 1;
+                        walked.1 +=
+                            usize::from(candidate.record.message.header.author_id != self.me);
+                    }
                     if id < work.through {
                         let saved = self.private_at(store, sek, id)?;
                         let size = saved.record.message.ciphertext.len();
@@ -1506,6 +1520,26 @@ impl PendingSession {
             });
         }
         progress?;
+        #[cfg(feature = "test-knobs")]
+        if let Some(path) = std::env::var_os("VOX_TEST_SESSION_REFRESH_RECEIPT") {
+            use std::io::Write as _;
+            let receipt = || -> std::io::Result<()> {
+                writeln!(
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)?,
+                    "{}\t{}\t{}",
+                    crate::node::link::b32_encode(&self.room),
+                    walked.0,
+                    walked.1
+                )
+            };
+            receipt().map_err(|error| Error::Path {
+                op: "write Session refresh proof receipt",
+                detail: error.to_string(),
+            })?;
+        }
         work.private = private_index::lifecycle_revision(&store.snapshot()?, sek, &self.room)?;
         let complete = work.stage == 2 && work.grant == self.refresh_grant(store, sek, owed)?;
         self.refresh = Some(work);

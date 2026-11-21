@@ -12,7 +12,7 @@ use crate::atrest::store::{open_segment, seal_segment, SegmentKind};
 use crate::error::{Error, Result};
 use crate::hash::{sha256, Digest32};
 use crate::node::profile::Profile;
-use crate::node::store::{Batch, Snapshot};
+use crate::node::store::{Batch, Snapshot, Store};
 
 /// One admission is bounded independently of the retained backlog.
 pub const MAX_BATCH_BYTES: usize = 128 * 1024;
@@ -452,14 +452,21 @@ fn session_in(batch: &Batch<'_>, key: &Sek, scope: &Digest32, name: &str) -> Res
 
 /// Validate, number and commit an entire batch. Preparation errors accept no new sequence
 /// or body; source receipts committed by earlier calls remain authoritative.
-pub fn admit(profile: &Profile, room: Digest32, name: &str, bodies: &[String]) -> AdmissionResult {
-    admit_inner(profile, room, name, bodies, None)
+pub(crate) fn admit(
+    store: &Store,
+    signer: &dyn crate::identity::composite::RootSigner,
+    room: Digest32,
+    name: &str,
+    bodies: &[String],
+) -> AdmissionResult {
+    admit_inner(store, signer, room, name, bodies, None)
 }
 
 /// Admit an authenticated Drive operation and its exact opening in one transaction.
 /// Only the node actor may supply these coordinates after its authority checks.
 pub(crate) fn admit_drive(
-    profile: &Profile,
+    store: &Store,
+    signer: &dyn crate::identity::composite::RootSigner,
     room: Digest32,
     name: &str,
     drive: &DriveAdmission,
@@ -507,7 +514,8 @@ pub(crate) fn admit_drive(
         keyed.push(serde_json::Value::Object(object).to_string());
     }
     admit_inner(
-        profile,
+        store,
+        signer,
         room,
         name,
         &keyed,
@@ -516,7 +524,8 @@ pub(crate) fn admit_drive(
 }
 
 fn admit_inner(
-    profile: &Profile,
+    store: &Store,
+    signer: &dyn crate::identity::composite::RootSigner,
     room: Digest32,
     name: &str,
     bodies: &[String],
@@ -533,10 +542,10 @@ fn admit_inner(
     {
         return Err(Error::SizeLimitExceeded("Session ingress batch").into());
     }
-    let key = key(profile)?;
-    let node = profile.fingerprint();
-    let scope = scope(profile, name);
-    let mut batch = profile.store().batch()?;
+    let key = crate::atrest::seal::sek(signer, b"vox/session-ingress-sek/v1")?;
+    let node = signer.fingerprint();
+    let scope = scope_for(&node, name);
+    let mut batch = store.batch()?;
     let mut directory = directory(&batch, &key, &node)?;
     if directory.retiring.iter().any(|item| item.room == room) {
         return Err(Error::Profile("this room was removed; its Session cleanup is pending").into());
@@ -828,8 +837,38 @@ fn admit_inner(
         put(&mut batch, &key, &scope, HEADER, &session)?;
         put(&mut batch, &key, &node, HEADER, &directory)?;
     }
+    #[cfg(feature = "test-knobs")]
+    hold_flush_for_proof(name)?;
     batch.commit().map_err(AdmissionError::Unconfirmed)?;
     Ok(Committed { first, last, fresh })
+}
+
+/// Hold the durable Session transaction with its writer acquired, before its flush returns.
+#[cfg(feature = "test-knobs")]
+fn hold_flush_for_proof(session: &str) -> Result<()> {
+    let Ok(spec) = std::env::var("VOX_TEST_HOLD_SESSION_FLUSH") else {
+        return Ok(());
+    };
+    let mut paths = spec.split('\t');
+    let (Some(arm), Some(engaged), Some(release)) = (paths.next(), paths.next(), paths.next())
+    else {
+        return Err(Error::Profile("Session flush proof hold is malformed"));
+    };
+    if std::fs::read_to_string(arm).ok().as_deref() != Some(session) {
+        return Ok(());
+    }
+    std::fs::remove_file(arm).map_err(|error| Error::Path {
+        op: "consume Session flush proof arm",
+        detail: error.to_string(),
+    })?;
+    std::fs::write(engaged, session).map_err(|error| Error::Path {
+        op: "mark held Session flush",
+        detail: error.to_string(),
+    })?;
+    while !std::path::Path::new(release).exists() {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    Ok(())
 }
 
 /// Visit one indexed opening without scanning the profile or retaining other openings.

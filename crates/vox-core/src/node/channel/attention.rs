@@ -170,8 +170,8 @@ impl ChannelState {
             notice_id, route, ..
         } = &operation
         {
-            let mut batch = store.batch().map_err(|e| e.to_string())?;
-            let ledger = Ledger::open(&mut batch, &self.sek, self.channel_id, instance)
+            let snapshot = store.snapshot().map_err(|e| e.to_string())?;
+            let ledger = Ledger::snapshot(&snapshot, &self.sek, self.channel_id, instance)
                 .map_err(|e| e.to_string())?;
             Some(
                 ledger
@@ -203,8 +203,8 @@ impl ChannelState {
             operation,
             Operation::Prepare { .. } | Operation::Received { .. } | Operation::Observed(_)
         ) {
-            let mut batch = store.batch().map_err(|e| e.to_string())?;
-            let ledger = Ledger::open(&mut batch, &self.sek, self.channel_id, instance)
+            let snapshot = store.snapshot().map_err(|e| e.to_string())?;
+            let ledger = Ledger::snapshot(&snapshot, &self.sek, self.channel_id, instance)
                 .map_err(|e| e.to_string())?;
             sources
                 .iter()
@@ -379,9 +379,10 @@ impl ChannelState {
         use crate::node::attention::ledger::ThreadScan;
         use vox_agentcomms::envelope::Envelope;
         let (mut through, audience_turn, audience_work) = {
-            let mut batch = store.batch().map_err(|e| e.to_string())?;
-            let ledger = Ledger::open(&mut batch, &self.sek, self.channel_id, recipient.instance)
-                .map_err(|e| e.to_string())?;
+            let snapshot = store.snapshot().map_err(|e| e.to_string())?;
+            let ledger =
+                Ledger::snapshot(&snapshot, &self.sek, self.channel_id, recipient.instance)
+                    .map_err(|e| e.to_string())?;
             let (through, audience_turn) =
                 ledger.scan_state(recipient).map_err(|e| e.to_string())?;
             let work = if audience_turn {
@@ -594,8 +595,8 @@ impl ChannelState {
     ) -> std::result::Result<Reply, String> {
         use super::session_projection::{Query as Q, Reply as R};
         let (after, records) = {
-            let mut batch = store.batch().map_err(|e| e.to_string())?;
-            let ledger = Ledger::open(&mut batch, &self.sek, self.channel_id, instance)
+            let snapshot = store.snapshot().map_err(|e| e.to_string())?;
+            let ledger = Ledger::snapshot(&snapshot, &self.sek, self.channel_id, instance)
                 .map_err(|e| e.to_string())?;
             ledger.maintenance().map_err(|e| e.to_string())?
         };
