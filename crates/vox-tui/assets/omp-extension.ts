@@ -257,11 +257,13 @@ export default function vox(pi) {
       }
       if (!settled) fail(new Error("Vox prepare ended before its envelope"))
       if (op.decision === "commit" || op.decision === "cancel") {
-        const confirmed = enveloped && code === 0
-        if (op.record) op.record.state = confirmed ? (op.decision === "commit" ? "committed" : "cancelled") : "unknown"
-        if (!confirmed && enveloped) {
-          poisonSession(op.fence?.session)
-          if (op.fence?.session === session) publish({ type: "unavailable", error: "Vox context " + op.decision + " was not confirmed" })
+        const acknowledged = enveloped && code === 0
+        // The native decision is final; reacquisition finishes its saved bookkeeping.
+        if (op.record) op.record.state = op.decision === "commit" ? "committed" : "cancelled"
+        if (!acknowledged && enveloped) {
+          confirmed = false
+          report("finishing the saved context decision; reacquiring registration")
+          scheduleRetry()
         }
       } else if (!op.done) {
         if (!enveloped) {

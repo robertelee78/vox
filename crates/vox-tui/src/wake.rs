@@ -782,10 +782,8 @@ fn registration_lock_typed(paths: &Paths) -> Result<std::fs::File, RegistrationS
     let file = options
         .open(&path)
         .map_err(|e| RegistrationStoreError::Failed(e.to_string()))?;
-    file.try_lock().map_err(|e| match e {
-        std::fs::TryLockError::WouldBlock => RegistrationStoreError::Busy,
-        std::fs::TryLockError::Error(e) => RegistrationStoreError::Failed(e.to_string()),
-    })?;
+    file.lock()
+        .map_err(|e| RegistrationStoreError::Failed(e.to_string()))?;
     Ok(file)
 }
 
@@ -793,12 +791,9 @@ fn registration_lock(paths: &Paths) -> Result<std::fs::File, String> {
     registration_lock_typed(paths).map_err(|e| e.to_string())
 }
 
-/// A registration write was either contended or failed permanently.
+/// A registration could not be saved.
 #[derive(Debug, thiserror::Error)]
 pub enum RegistrationStoreError {
-    /// Another registration writer holds the node lock.
-    #[error("session registration is busy")]
-    Busy,
     /// The lock or registration could not be written.
     #[error("{0}")]
     Failed(String),
@@ -861,7 +856,7 @@ pub fn store(paths: &Paths, reg: &Session) {
 /// Store a registration before the daemon acknowledges that the session holds its node.
 ///
 /// # Errors
-/// Lock contention or a failed registration write leaves the request refused.
+/// A failed registration write leaves the request refused.
 pub fn store_checked(paths: &Paths, reg: &Session) -> Result<(), RegistrationStoreError> {
     let _lock = registration_lock_typed(paths)?;
     let mut reg = reg.clone();
@@ -931,9 +926,14 @@ pub fn store_name(paths: &Paths, session: &str, name: &str) -> Option<Session> {
     let _lock = registration_write(paths)?;
     let mut reg = load(paths, session)?;
     reg.name = Some(name.to_owned());
-    if let Ok(body) = serde_json::to_vec(&reg) {
-        let _ =
-            vox_core::node::paths::write_private_file_unique(&paths.session_file(session), &body);
+    let body = serde_json::to_vec(&reg).ok()?;
+    if let Err(error) =
+        vox_core::node::paths::write_private_file_unique(&paths.session_file(session), &body)
+    {
+        eprintln!(
+            "vox: Session name was not changed: {error}; correct the storage problem and retry"
+        );
+        return None;
     }
     Some(reg)
 }

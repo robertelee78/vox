@@ -641,9 +641,7 @@ impl Queue {
         verified: impl Fn(&Entry) -> Result<bool>,
         floor_context: (Digest32, u64, u64),
     ) -> Result<Progress> {
-        if self.attempt.is_some() {
-            return Err(Error::MalformedAtRest("key-package attempt unacknowledged"));
-        }
+        self.abandon_unopened();
         self.published = read.key_package_tip()?;
         self.refresh = false;
         let mut floor_changed = self.observe_floors(store, sek, room, floor_context)?;

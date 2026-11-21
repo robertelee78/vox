@@ -297,17 +297,18 @@ pub fn note(
     node: &str,
     session: Option<&str>,
 ) -> Option<String> {
-    if let Err(e) = read(data_root) {
-        return Some(format!("Vox: {e}\n"));
-    }
+    let entries = match read(data_root) {
+        Ok(entries) => entries,
+        Err(e) => return Some(format!("Vox: {e}\n")),
+    };
     if let Some(j) = joining {
         return Some(format!("Vox: {j}\n"));
     }
-    if !new || room.is_some() || declined(data_root, start) {
+    if !new || room.is_some() || resolve(&entries, start).is_some_and(|e| e.room == DECLINED) {
         return None;
     }
-    // As the map will hold it: the directory itself, a symlink to it resolved.
-    let dir = std::fs::canonicalize(start).unwrap_or_else(|_| start.to_path_buf());
+    // The offer answers for the repository, including a session in a linked worktree.
+    let dir = ask_directory(&entries, start);
     let create = vox_text::shell::node_command(
         &[
             "vox",

@@ -127,6 +127,20 @@ use thread_room::typed;
 #[path = "support/room.rs"]
 mod thread_room;
 
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+
+#[cfg(feature = "optional-proofs")]
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
+optional_proof::not_run!(
+    a_native_omp_conversation_survives_a_decided_turn_restart,
+    a_native_omp_turn_without_a_decision_stays_uncertain,
+    nine_restarted_sessions_wait_for_registration,
+    a_session_retries_when_a_sibling_installs_policy,
+    a_linked_worktree_gets_its_repository_offer_and_names_map_authority,
+);
+
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -5272,4 +5286,63 @@ fn on_pty_result(
         .success();
     std::thread::sleep(Duration::from_millis(200));
     (success, text())
+}
+
+#[cfg(feature = "optional-proofs")]
+fn rg4_journey(case: &str) {
+    watchdog::arm();
+    #[cfg(target_os = "macos")]
+    test_knobs::require(&["VOX_TEST_KEYCHAIN"]);
+    match case {
+        "extension" => test_knobs::require(&["VOX_TEST_DAEMON_SERVE_DELAY_MS"]),
+        "startup" => test_knobs::require(&["VOX_TEST_HOLD_IDENTITY_STARTUP"]),
+        _ => {}
+    }
+    let status = Command::new("python3")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/rg4_retry.py"
+        ))
+        .args([VOX, case])
+        .status()
+        .expect("APPARATUS: start the real-binary retry journey");
+    assert!(
+        status.success(),
+        "RG-4 {case} journey failed; its own PRODUCT or APPARATUS assertion is above"
+    );
+}
+
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "real native extension with the existing OMP host stand-in; no model"]
+fn a_native_omp_conversation_survives_a_decided_turn_restart() {
+    rg4_journey("extension");
+}
+
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "nine real hooks and a held kernel registration lock"]
+fn nine_restarted_sessions_wait_for_registration() {
+    rg4_journey("registration");
+}
+
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "two real nodes and causally held policy/room startup; test-knobs"]
+fn a_session_retries_when_a_sibling_installs_policy() {
+    rg4_journey("startup");
+}
+
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "real linked git worktree and hook room offer"]
+fn a_linked_worktree_gets_its_repository_offer_and_names_map_authority() {
+    rg4_journey("riders");
+}
+
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "real native extension without a model decision"]
+fn a_native_omp_turn_without_a_decision_stays_uncertain() {
+    rg4_journey("undecided");
 }
