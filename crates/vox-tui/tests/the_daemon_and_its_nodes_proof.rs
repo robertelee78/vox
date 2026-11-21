@@ -507,7 +507,12 @@ impl Drop for OmpConversation {
 #[ignore = "native extension, real daemon and production Argon2id; run in release with test-knobs"]
 fn a_conversation_reports_one_reconnecting_line_when_its_daemon_restarts() {
     watchdog::arm();
-    test_knobs::require(&["VOX_TEST_STOP_HOLD_NODE", "VOX_TEST_STOP_HOLD_FILE"]);
+    test_knobs::require(&[
+        "VOX_TEST_STOP_HOLD_NODE",
+        "VOX_TEST_STOP_HOLD_FILE",
+        "VOX_TEST_ATTACH_HOLD_NODE",
+        "VOX_TEST_ATTACH_HOLD_FILE",
+    ]);
     let a = Account::new();
     a.make_node("agent");
     a.make_node("held");
@@ -526,6 +531,12 @@ fn a_conversation_reports_one_reconnecting_line_when_its_daemon_restarts() {
     });
     let (ok, out, err) = a.run(&["node", "attach", "held"], "");
     assert!(ok, "APPARATUS: second node did not attach: {out}{err}");
+    // Keep agent too: the replacement must actually attach it from remembered credentials.
+    let (ok, out, err) = a.run(&["node", "attach", "agent"], "");
+    assert!(
+        ok,
+        "APPARATUS: agent was not remembered for restart: {out}{err}"
+    );
     let mut conversation = OmpConversation::start(&a);
     let before_stop = conversation.observations();
     let signalled = Command::new("/bin/kill")
@@ -567,7 +578,59 @@ fn a_conversation_reports_one_reconnecting_line_when_its_daemon_restarts() {
         daemon.said()
     );
     let before_restart = conversation.observations();
-    let daemon = Daemon::start(&a, &["--node", "agent"], &[]);
+    let attach_hold = a._tmp.path().join("hold-replacement-attach");
+    std::fs::write(&attach_hold, "").expect("APPARATUS: replacement attach hold");
+    let daemon = Daemon::start(
+        &a,
+        &["--no-node"],
+        &[
+            ("VOX_TEST_ATTACH_HOLD_NODE", "agent"),
+            ("VOX_TEST_ATTACH_HOLD_FILE", attach_hold.to_str().unwrap()),
+        ],
+    );
+    daemon.expect("serving", Duration::from_secs(30), |line| {
+        line.contains("serving")
+    });
+    let (ok, out, err) = a.run(&["node", "list"], "");
+    assert!(
+        ok && out
+            .lines()
+            .any(|line| line.starts_with("agent ") && line.contains("Attaching")),
+        "APPARATUS: replacement did not report agent Attaching: {out}{err}"
+    );
+    println!(
+        "replacement pid {} is still attaching:\n{out}",
+        daemon.child.id()
+    );
+    let before_attach_probe = conversation.observations();
+    assert!(
+        wait_until(Duration::from_secs(90), || {
+            std::fs::read_to_string(&conversation.trace)
+                .unwrap_or_default()
+                .lines()
+                .skip(before_attach_probe)
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .any(|frame| {
+                    frame["type"] == "unavailable"
+                        && frame["pid"] == daemon.child.id()
+                        && matches!(
+                            frame["reason"].as_str(),
+                            Some("reconnecting" | "node-not-ready")
+                        )
+                })
+        }),
+        "APPARATUS: no watcher frame from the attaching replacement pid {}:\n{}",
+        daemon.child.id(),
+        std::fs::read_to_string(&conversation.trace).unwrap_or_default()
+    );
+    conversation.prompt("replacement-attaching");
+    let during_attach = conversation.notices.join("\n");
+    assert!(
+        during_attach.lines().filter(|line| line.contains("reconnecting")).count() == 1
+            && !during_attach.contains("is unavailable") && !during_attach.contains("vox node create"),
+        "PRODUCT: an attaching replacement must keep one reconnecting line and never blame the node: {during_attach}"
+    );
+    std::fs::remove_file(&attach_hold).expect("APPARATUS: release replacement attach");
     daemon.expect("node agent is Ready", Duration::from_secs(30), |line| {
         line.contains("node agent is Ready")
     });

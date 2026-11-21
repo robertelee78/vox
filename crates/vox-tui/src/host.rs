@@ -4538,6 +4538,16 @@ impl Router {
 
     /// Attach kept node `node` from its keep `source`, as [`Self::attach_kept`] does each.
     async fn attach_one_kept(&self, node: &NodeName, source: Option<KeepSource>) {
+        // Keep the real startup state visible while a proof observes a replacement daemon.
+        #[cfg(feature = "test-knobs")]
+        if std::env::var("VOX_TEST_ATTACH_HOLD_NODE").as_deref() == Ok(node.as_str()) {
+            if let Some(path) = std::env::var_os("VOX_TEST_ATTACH_HOLD_FILE") {
+                let path = std::path::PathBuf::from(path);
+                while path.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        }
         let (passphrase, rooms) = match &source {
             None | Some(KeepSource::None) => (None, Vec::new()),
             // Off the runtime's workers: a Keychain that asks (locked, or the item made by
