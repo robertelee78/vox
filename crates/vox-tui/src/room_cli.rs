@@ -655,6 +655,7 @@ pub(crate) async fn post_structured(
     };
     for reserved in [
         vox_agentcomms::version::VOX_KEY,
+        vox_agentcomms::version::CLAIMS_KEY,
         vox_agentcomms::ops::OP_KEY,
         THREAD_TAGS_KEY,
     ] {

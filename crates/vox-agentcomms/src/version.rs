@@ -27,7 +27,7 @@ pub enum Stamp {
     Match,
     /// A valid claim-rules number that is not the reader's.
     Other(String),
-    /// No stamp at all — what every binary predating ADR-021 writes.
+    /// No claim-rules stamp, including package-only stamps other than v0.4.30.
     Missing,
     /// A stamp that is not a decimal claim-rules number.
     Unknown(String),

@@ -2563,8 +2563,7 @@ impl Daemon {
                 .await
                 .map_err(|e| match &e {
                     AppError::Core(vox_core::error::Error::Ipc(
-                        vox_core::error::IpcHandshake::Version { .. }
-                        | vox_core::error::IpcHandshake::Protocol { .. },
+                        vox_core::error::IpcHandshake::Protocol { .. },
                     )) => Unregistered::Version(one_line_reason(&e)),
                     AppError::Core(vox_core::error::Error::Ipc(
                         vox_core::error::IpcHandshake::Root,
@@ -2628,8 +2627,7 @@ impl Daemon {
                 if matches!(
                     &e,
                     vox_core::error::Error::Ipc(
-                        vox_core::error::IpcHandshake::Version { .. }
-                            | vox_core::error::IpcHandshake::Protocol { .. }
+                        vox_core::error::IpcHandshake::Protocol { .. }
                             | vox_core::error::IpcHandshake::Root
                     )
                 ) {
@@ -2703,9 +2701,6 @@ impl Daemon {
                         reason: reason.to_owned(),
                     })
                     .await;
-            }
-            Err(e @ vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Version { .. })) => {
-                eprintln!("vox agent hook: {e}");
             }
             Err(_) => crate::wake::end(paths, session),
         }

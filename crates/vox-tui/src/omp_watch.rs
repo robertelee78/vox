@@ -77,17 +77,25 @@ fn selected(
     client: &DaemonClient,
     node: &NodeName,
     fingerprint: &vox_core::hash::Digest32,
-) -> bool {
-    client.attached.iter().any(|entry| {
+) -> Result<bool, ProbeError> {
+    if client
+        .attached
+        .iter()
+        .any(|entry| entry.name == *node && entry.state == NodeState::Attaching)
+    {
+        return Err(ProbeError::Attaching);
+    }
+    Ok(client.attached.iter().any(|entry| {
         entry.name == *node
             && entry.state == NodeState::Attached
             && entry.fingerprint.as_ref() == Some(fingerprint)
-    })
+    }))
 }
 #[derive(Clone, Copy)]
 enum ProbeError {
     Unavailable,
     Mismatch,
+    Attaching,
 }
 async fn open(account: &Account) -> Result<DaemonClient, ProbeError> {
     // The control protocol, not the release number, decides compatibility.
@@ -97,18 +105,16 @@ async fn open(account: &Account) -> Result<DaemonClient, ProbeError> {
             return Err(ProbeError::Mismatch)
         }
         Ok(Ok(_)) => (),
-        Ok(Err(vox_core::error::Error::Ipc(
-            vox_core::error::IpcHandshake::Protocol { .. }
-            | vox_core::error::IpcHandshake::Version { .. },
-        ))) => return Err(ProbeError::Mismatch),
+        Ok(Err(vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Protocol {
+            ..
+        }))) => return Err(ProbeError::Mismatch),
         _ => return Err(ProbeError::Unavailable),
     }
     match tokio::time::timeout(DEADLINE, DaemonClient::open(&account.socket())).await {
         Ok(Ok(client)) => Ok(client),
-        Ok(Err(vox_core::error::Error::Ipc(
-            vox_core::error::IpcHandshake::Protocol { .. }
-            | vox_core::error::IpcHandshake::Version { .. },
-        ))) => Err(ProbeError::Mismatch),
+        Ok(Err(vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Protocol {
+            ..
+        }))) => Err(ProbeError::Mismatch),
         _ => Err(ProbeError::Unavailable),
     }
 }
@@ -130,7 +136,7 @@ async fn snapshot(
     subscription: &mut Option<Subscription>,
 ) -> Result<bool, ProbeError> {
     let initial = open(account).await?;
-    if !selected(&initial, node, fp) {
+    if !selected(&initial, node, fp)? {
         *subscription = None;
         return Ok(false);
     }
@@ -161,7 +167,7 @@ async fn snapshot(
         if subscription.as_ref().is_none_or(|sub| sub.pid != fresh.pid) {
             return Err(ProbeError::Unavailable);
         }
-        let ready = selected(&fresh, node, fp);
+        let ready = selected(&fresh, node, fp)?;
         drop(fresh);
         let Some(sub) = subscription.as_mut() else {
             return Err(ProbeError::Unavailable);
@@ -272,7 +278,13 @@ pub(crate) async fn run(
             }
             _ = &mut timer => {
                 // The saved pin survives helper succession. Never replace it with a rebuilt node.
-                let pin_result = pin(&owner, &account, &node);
+                let pin_result = match pinned {
+                    Some(fp) => match fingerprint(&account, &node) {
+                        Some(now) if now != fp => Err(FenceError::Invalid),
+                        now => Ok(now),
+                    },
+                    None => pin(&owner, &account, &node),
+                };
                 if matches!(pin_result, Err(FenceError::Invalid)) {
                     if owner.set_compatible(false).is_err() || owner.revoke().is_err() {
                         delay = 1;
@@ -323,7 +335,13 @@ pub(crate) async fn run(
                         }
                         if mismatch { saw_mismatch = true; }
                         if let Some(id) = snapshot_id.take() { if !ack(&id, Err("unavailable")) { return 1; } }
-                        if !output(serde_json::json!({"type":"unavailable","reason":if mismatch { "mismatch" } else { "unavailable" }})) { return 1; }
+                        let reason = match other {
+                            Ok(false) => "node-not-ready",
+                            Err(ProbeError::Mismatch) => "mismatch",
+                            Err(ProbeError::Attaching) => "reconnecting",
+                            _ => "unavailable",
+                        };
+                        if !output(serde_json::json!({"type":"unavailable","reason":reason})) { return 1; }
                         if mismatch && !mismatch_consumed { return 76; }
                         delay = backoff; backoff = (backoff * 2).min(30);
                     }

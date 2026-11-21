@@ -40,7 +40,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use support::{post_raw, resource, until, Out, Worker, VOX};
+use support::{post_raw, register_sending_session, resource, until, Out, Worker, VOX};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -64,28 +64,6 @@ fn claim_text(session: &str, res: &str, op: &str) -> String {
         "data": { "resource": res, "op": op, "vox": VERSION, "claims": vox_agentcomms::version::CLAIM_RULES }
     })
     .to_string()
-}
-
-fn register_sending_session(worker: &Worker, room: &str, session: &str) {
-    let registered = worker.vox(
-        None,
-        &[
-            "agent",
-            "hook",
-            "--node",
-            "default",
-            "--room",
-            room,
-            "--session",
-            session,
-            "--format",
-            "text",
-        ],
-    );
-    let doctor = worker.vox(None, &["agent", "doctor", "--node", "default", "--json"]);
-    assert!(registered.ok && doctor.json()["checks"].as_array().is_some_and(|checks|
-        checks.iter().any(|check| check["check"] == format!("session {session}"))),
-        "APPARATUS: sending session {session} was not registered; hook={registered:?}; doctor={doctor:?}");
 }
 
 /// A live `vox room tail --since … --json` on `w`, its lines collected as they come.

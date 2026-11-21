@@ -31,31 +31,9 @@ mod watchdog;
 
 use std::time::Duration;
 
-use support::{post_raw, resource, until, Out, Worker};
+use support::{post_raw, register_sending_session, resource, until, Out, Worker};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-fn register_sending_session(worker: &Worker, room: &str, session: &str) {
-    let registered = worker.vox(
-        None,
-        &[
-            "agent",
-            "hook",
-            "--node",
-            "default",
-            "--room",
-            room,
-            "--session",
-            session,
-            "--format",
-            "text",
-        ],
-    );
-    let doctor = worker.vox(None, &["agent", "doctor", "--node", "default", "--json"]);
-    assert!(registered.ok && doctor.json()["checks"].as_array().is_some_and(|checks|
-        checks.iter().any(|check| check["check"] == format!("session {session}"))),
-        "APPARATUS: sending session {session} was not registered; hook={registered:?}; doctor={doctor:?}");
-}
 
 fn board(w: &Worker, r: &str) -> serde_json::Value {
     let o = w.vox(None, &["room", "board", r, "--json"]);

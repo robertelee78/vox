@@ -2425,7 +2425,6 @@ pub fn unreached(socket: &std::path::Path, node: Option<&str>, e: crate::error::
             )
         }
         Error::Ipc(IpcHandshake::Refused { reason }) => reason,
-        Error::Ipc(h @ IpcHandshake::Version { .. }) => h.to_string(),
         Error::Ipc(h @ IpcHandshake::ClosedBeforeHello) => {
             format!("the daemon's socket at {path} accepted, but {h}: it may be stopping. Try again.")
         }

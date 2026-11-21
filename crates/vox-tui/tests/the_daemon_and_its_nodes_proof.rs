@@ -475,6 +475,17 @@ for await (const line of createInterface({input: process.stdin})) {
             "APPARATUS: no watcher snapshot after the staged node replacement"
         );
     }
+
+    fn observed_frame_after(&self, before: usize, kind: &str) -> bool {
+        wait_until(Duration::from_secs(90), || {
+            std::fs::read_to_string(&self.trace)
+                .unwrap_or_default()
+                .lines()
+                .skip(before)
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .any(|frame| frame["type"] == kind)
+        })
+    }
 }
 
 impl Drop for OmpConversation {
@@ -503,10 +514,18 @@ fn a_conversation_reports_one_reconnecting_line_when_its_daemon_restarts() {
     let mut conversation = OmpConversation::start(&a);
     daemon.stop();
     conversation.until(|frame| frame.get("notice").is_some());
+    let before_restart = conversation.observations();
     let daemon = Daemon::start(&a, &["--node", "agent"], &[]);
     daemon.expect("node agent is Ready", Duration::from_secs(30), |line| {
         line.contains("node agent is Ready")
     });
+    // PRODUCT, not apparatus: this already-ready conversation must reconnect to the
+    // replacement daemon. Counting its one notice without resumed readiness proves nothing.
+    assert!(
+        conversation.observed_frame_after(before_restart, "ready"),
+        "PRODUCT: watcher never became ready after the daemon restarted:\n{}",
+        std::fs::read_to_string(&conversation.trace).unwrap_or_default()
+    );
     conversation.prompt("after-restart");
     let notices = conversation.notices.join("\n");
     drop(conversation);
@@ -520,6 +539,52 @@ fn a_conversation_reports_one_reconnecting_line_when_its_daemon_restarts() {
             && !notices.contains("is unavailable")
             && !notices.contains("vox node create"),
         "PRODUCT: a daemon restart must say reconnecting once, not blame the node: {notices}"
+    );
+}
+
+#[test]
+#[ignore = "native extension and a node locked after restart; run in release with test-knobs"]
+fn a_conversation_explains_a_locked_node_after_its_daemon_restarts() {
+    watchdog::arm();
+    let a = Account::new();
+    a.make_node("agent");
+    let daemon = Daemon::start(&a, &["--node", "agent"], &[]);
+    daemon.expect("node agent is Ready", Duration::from_secs(30), |line| {
+        line.contains("node agent is Ready")
+    });
+    let mut conversation = OmpConversation::start(&a);
+    daemon.stop();
+    conversation.until(|frame| frame.get("notice").is_some());
+    // Start the replacement without unlocking a node, then lock through the public CLI.
+    // This stages the same answered-but-not-ready state as a missing restart credential.
+    let daemon = Daemon::start(&a, &["--no-node"], &[]);
+    daemon.expect("serving", Duration::from_secs(30), |line| {
+        line.contains("serving")
+    });
+    let (ok, out, err) = a.run(&["node", "lock", "agent"], "");
+    assert!(
+        ok,
+        "APPARATUS: could not lock the replacement's node: {out}{err}"
+    );
+    let (ok, out, err) = a.run(&["node", "list"], "");
+    assert!(
+        ok && out.contains("agent") && out.contains("Locked"),
+        "APPARATUS: replacement did not report its locked node: {out}{err}"
+    );
+    let before = conversation.observations();
+    assert!(
+        conversation.observed_frame_after(before, "unavailable"),
+        "PRODUCT: watcher did not report the replacement's locked node:\n{}",
+        std::fs::read_to_string(&conversation.trace).unwrap_or_default()
+    );
+    conversation.prompt("locked-after-restart");
+    let notices = conversation.notices.join("\n");
+    drop(conversation);
+    daemon.stop();
+    assert!(
+        notices.contains("vox node unlock -- agent"),
+        "PRODUCT: a daemon that answers with a locked node must explain how to unlock it, \
+         even after its reconnecting notice: {notices}"
     );
 }
 

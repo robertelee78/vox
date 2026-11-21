@@ -353,7 +353,9 @@ impl Snapshot {
                 p.author == self.me
                     && p.envelope.from == session
                     && (claim::is_claim_protocol(&p.envelope)
-                        || (p.envelope.kind == HELLO && p.envelope.data.get(VOX_KEY).is_some())
+                        || (p.envelope.kind == HELLO
+                            && (p.envelope.data.get(CLAIMS_KEY).is_some()
+                                || p.envelope.data.get(VOX_KEY).is_some()))
                         || p.envelope.kind == BYE)
             })
             .max_by_key(|p| (p.created_millis, p.entry_hash))
@@ -373,7 +375,9 @@ impl Snapshot {
         for p in self.posted.iter().filter(|p| {
             p.author == self.me
                 && (claim::is_claim_protocol(&p.envelope)
-                    || (p.envelope.kind == HELLO && p.envelope.data.get(VOX_KEY).is_some())
+                    || (p.envelope.kind == HELLO
+                        && (p.envelope.data.get(CLAIMS_KEY).is_some()
+                            || p.envelope.data.get(VOX_KEY).is_some()))
                     || p.envelope.kind == BYE)
         }) {
             let newer = |previous: &Posted| {

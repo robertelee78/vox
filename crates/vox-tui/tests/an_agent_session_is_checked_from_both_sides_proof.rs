@@ -516,7 +516,7 @@ fn an_agent_session_is_checked_from_both_sides() {
         &v,
         "version ",
         "warn",
-        "same vox",
+        "claim rules",
     );
 
     bob.vox(
