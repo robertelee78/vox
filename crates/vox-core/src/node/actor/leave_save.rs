@@ -780,7 +780,9 @@ impl Node {
         let me = channel.me();
         let ended = match &purpose {
             Some(LeftPurgePurpose::Join { .. }) => None,
-            Some(LeftPurgePurpose::Leave { .. }) => {
+            Some(LeftPurgePurpose::Leave { .. })
+                if channel.ended(self.now_ms().get()).is_none() =>
+            {
                 let now = self.now_ms().get();
                 Some(Box::new(crate::node::ended_rooms::EndedRoom {
                     channel_id: room,
@@ -790,7 +792,7 @@ impl Node {
                     noted_ms: now,
                 }))
             }
-            None => {
+            _ => {
                 let now = self.now_ms().get();
                 let (by, ended_ms) = self
                     .profile
@@ -1515,7 +1517,10 @@ impl Node {
                             Err(_) => self.wait_own_key_left_room(
                                 room, instance, owner, transition, purpose, _secret,
                             ),
-                            Ok(channel) if !channel.has_left(&channel.me()) => {
+                            Ok(channel)
+                                if !channel.has_left(&channel.me())
+                                    && channel.ended(self.now_ms().get()).is_none() =>
+                            {
                                 drop(channel);
                                 drop(transition);
                                 self.own_key_ended_pending.remove(&room);

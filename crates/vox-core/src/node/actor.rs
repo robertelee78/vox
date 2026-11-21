@@ -21666,6 +21666,18 @@ impl Node {
             self.begin_leave(room, reply, None, None, None).await;
             return;
         };
+        if instance.lock().await.ended(self.now_ms().get()).is_some() {
+            self.begin_own_key_left_purge(
+                room,
+                instance,
+                LeftPurgePurpose::Leave {
+                    replies: vec![reply],
+                    lifetimes: Vec::new(),
+                },
+            )
+            .await;
+            return;
+        }
         if self.own_key_leave_pending.contains_key(&room) {
             let _ = reply.send(Outcome::Failed(Fault::RoomChangePending));
             return;
