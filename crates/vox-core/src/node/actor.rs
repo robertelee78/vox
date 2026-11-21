@@ -3441,12 +3441,9 @@ const JOIN_ADDRESS_POLL: Duration = Duration::from_millis(250);
 /// once, is reported as before.
 const JOINER_SEAL_GRACE: Duration = Duration::from_secs(60);
 
-/// **The asker's round** (V030-30, #366): hold a place for `joiner` in `channel_id`, ask every
-/// member this node holds a connection to, all at once, and come back with the streams of those
-/// that promised a place, to commit or abort once the admission is known. Any member that does not
-/// agree ends the round: every promise made is aborted, this node's own place freed, and the
-/// joiner refused with the strongest reason heard (full, then a place lost to another newcomer,
-/// then a member that did not agree), which this node's log names member by member.
+/// Hold a place, then ask connected members for their seat promises. An unanswered member
+/// learns the admission from the board, like an offline member; an explicit refusal aborts
+/// every promise and frees this node's reservation before the joiner is told why.
 async fn seat_round(
     node_name: &str,
     tx: &mpsc::Sender<NetEvent>,
@@ -3468,6 +3465,8 @@ async fn seat_round(
         return Err(stopped());
     }
     let (epoch, members) = wait.await.unwrap_or_else(|_| Err(stopped()))?;
+    #[cfg(feature = "test-knobs")]
+    test_admission_gate(TEST_ADMISSION_GATE_ENV).await;
     let question = Ask {
         channel_id,
         epoch,
@@ -3519,13 +3518,15 @@ async fn seat_round(
             }
             Asked::Unanswered => {
                 said.push(format!(
-                    "{who}: no answer within {}s",
+                    "{who}: no answer within {}s, not counted",
                     crate::node::seatstream::SEAT_ANSWER_WITHIN.as_secs()
                 ));
-                unagreed.get_or_insert((member, true));
             }
         }
     }
+    // Keep both local reservations through both answers in the deterministic last-seat proof.
+    #[cfg(feature = "test-knobs")]
+    test_admission_gate(TEST_SEAT_RESULT_GATE_ENV).await;
     let refusal = match (full, taken, unagreed) {
         (Some(members), _, _) => Some(Error::RoomFull { members }),
         (None, true, _) => Some(Error::SeatTaken),
@@ -3538,7 +3539,7 @@ async fn seat_round(
         return Ok(promised);
     };
     eprintln!(
-        "vox: node {node_name}: a newcomer to room {} was not admitted — not every member agreed: {}",
+        "vox: node {node_name}: a newcomer to room {} was not admitted — a member refused its place: {}",
         crate::node::network::short_id(channel_id),
         said.join("; ")
     );
@@ -3565,6 +3566,8 @@ enum SeatEvent {
 struct SeatPromise {
     /// The member that asked; this node's own fingerprint for a place it holds itself.
     from: Digest32,
+    /// A selected admission cannot give its place to another member while its save runs.
+    admitting: bool,
     /// When it stops counting, unless the newcomer is an author by then.
     until: std::time::Instant,
 }
@@ -4960,11 +4963,18 @@ impl Joiner {
                         why.push(format!("{short}: exchange: {e}"));
                     }
                     if prepared.load(std::sync::atomic::Ordering::Acquire) {
-                        why.push(if accepted.load(std::sync::atomic::Ordering::Acquire) {
-                            "admission was accepted and retained; local completion remains pending".to_owned()
-                        } else {
-                            "remote admission may have occurred; retry requires a new authenticated exchange".to_owned()
-                        });
+                        // These typed refusals precede admission. NotAdmitted is not included:
+                        // completion can fail after its membership save has committed.
+                        if !matches!(
+                            &e,
+                            Error::RoomFull { .. } | Error::SeatTaken | Error::SeatNotAgreed { .. }
+                        ) {
+                            why.push(if accepted.load(std::sync::atomic::Ordering::Acquire) {
+                                "admission was accepted and retained; local completion remains pending".to_owned()
+                            } else {
+                                "remote admission may have occurred; retry requires a new authenticated exchange".to_owned()
+                            });
+                        }
                         return Err(JoinerLost {
                             fault: last_fault,
                             why,
@@ -14545,11 +14555,7 @@ impl Node {
                     // this task, so the actor is never the thing waiting — which is the whole point
                     // of the slot. See `NetEvent::JoinAdmit`.
                     |identity, witness| async move {
-                        #[cfg(feature = "test-knobs")]
-                        test_admission_gate().await;
-                        // **Every online member agrees first** (V030-30, #366): the place is held
-                        // here and promised by each member this node holds a connection to, or the
-                        // joiner is refused, saying why, before anything is admitted.
+                        // Hold the place and collect answering members' promises before admission.
                         let joiner = identity.fingerprint();
                         let promised = seat_round(&log_node, &admit_tx, channel_id, joiner).await?;
                         let (ack, wait) = tokio::sync::oneshot::channel();
@@ -18295,6 +18301,8 @@ impl Node {
                 members: authors as u64,
             });
         }
+        // Offline or unanswered members keep today's split semantics: the cap is not
+        // a global guarantee across a split; they learn witnessed admissions from boards.
         let promised = self
             .seat_promises
             .keys()
@@ -18398,6 +18406,7 @@ impl Node {
             (channel_id, joiner),
             SeatPromise {
                 from: me,
+                admitting: false,
                 until: std::time::Instant::now() + crate::node::seatstream::PROMISE_TTL,
             },
         );
@@ -18439,12 +18448,30 @@ impl Node {
                 } else if c.is_author(&ask.joiner) {
                     Answer::Yes
                 } else {
-                    match self.seat_count(&c, &ask.channel_id, &ask.joiner) {
+                    let mut available = self.seat_count(&c, &ask.channel_id, &ask.joiner);
+                    if matches!(available, Err(Error::SeatTaken)) && peer < c.me() {
+                        // Two responders reserved the last place: the lower fingerprint wins.
+                        // Only give up our own uncommitted place, never another member's promise.
+                        let own = self.seat_promises.iter().find_map(|(&(room, joiner), p)| {
+                            (room == ask.channel_id
+                                && p.from == c.me()
+                                && !p.admitting
+                                && joiner != ask.joiner
+                                && !c.is_author(&joiner))
+                            .then_some((room, joiner))
+                        });
+                        if let Some(own) = own {
+                            self.seat_promises.remove(&own);
+                            available = self.seat_count(&c, &ask.channel_id, &ask.joiner);
+                        }
+                    }
+                    match available {
                         Ok(()) => {
                             self.seat_promises.insert(
                                 (ask.channel_id, ask.joiner),
                                 SeatPromise {
                                     from: peer,
+                                    admitting: false,
                                     until: std::time::Instant::now()
                                         + crate::node::seatstream::PROMISE_TTL,
                                 },
@@ -25758,14 +25785,18 @@ pub const TEST_ADMISSION_FAILS_ENV: &str = "VOX_TEST_ADMISSION_FAILS";
 
 /// **Test-only**: a path. While no file is there, every joiner this node answers waits at its
 /// admission, with `<path>.reached.<pid>` written to say so, so a proof can hold joins answered by
-/// two members until both are about to admit, then let them go at once (V210-128's race). Bounded
+/// two members until both have reserved, then let them ask at once (V210-128's race). Bounded
 /// at a minute. Not compiled in without the `test-knobs` feature (V210-105).
 #[cfg(feature = "test-knobs")]
 pub const TEST_ADMISSION_GATE_ENV: &str = "VOX_TEST_ADMISSION_GATE";
 
+/// Test-only barrier after collecting seat answers, before releasing any reservation.
 #[cfg(feature = "test-knobs")]
-async fn test_admission_gate() {
-    let Some(gate) = std::env::var_os(TEST_ADMISSION_GATE_ENV).map(std::path::PathBuf::from) else {
+const TEST_SEAT_RESULT_GATE_ENV: &str = "VOX_TEST_SEAT_RESULT_GATE";
+
+#[cfg(feature = "test-knobs")]
+async fn test_admission_gate(env: &str) {
+    let Some(gate) = std::env::var_os(env).map(std::path::PathBuf::from) else {
         return;
     };
     if gate.exists() {
