@@ -1,33 +1,22 @@
-//! **A room never exceeds its member cap: every online member agrees before a newcomer is
-//! admitted** (V030-30, #366; the decider, 2026-10-02).
+//! **The member answering a join admits it; answering members keep the room's cap.**
 //!
-//! Each member used to check the cap against its own view, so members answering joins at the same
-//! moment could each give the last place away. Now the member answering a join (the *asker*)
-//! agrees the place with every other member it holds a connection to, before it admits the joiner:
+//! The responder reserves a place against its authors and outstanding promises, then asks its
+//! connected members on [`StreamKind::Seat`]. An explicit full/taken answer refuses the join.
+//! With two responders reserving the last place at once, the lower responder fingerprint wins:
+//! the other yields only its own uncommitted reservation, never a promise made to another member.
+//! That admits exactly one newcomer when the two responders are the only members that answer.
+//! When a third member answers, it may have promised the place to the higher responder first;
+//! it cannot give that promise up, so both newcomers can still be refused and may join again.
+//! The responder rechecks its reservation and cap before selecting the admission save.
 //!
-//! 1. **Reserve.** It counts its authors and every place promised and not yet settled, its own
-//!    promises and those it gave others. At the cap it refuses the join as full; otherwise it holds
-//!    a place for the joiner.
-//! 2. **Ask.** It asks every member it holds a connection to, all at once, on a
-//!    [`StreamKind::Seat`] stream: "may this newcomer take a place?" Each member counts the same way
-//!    and answers [`Answer::Yes`], promising the place, or [`Answer::Full`], or [`Answer::Taken`]
-//!    when the last place is promised to another newcomer.
-//! 3. **Commit or abort.** Every member said yes: the asker admits the joiner and tells it it is
-//!    in. Any other answer, or none within [`SEAT_ANSWER_WITHIN`]: the asker sends [`Abort`] to
-//!    every member that promised, frees its own place, and refuses the joiner, saying why.
+//! A member that does not answer within [`SEAT_ANSWER_WITHIN`] does not block admission (ADR-052
+//! RG-2). Like an offline member, it learns the newcomer's witnessed admission from a board.
+//! This retains the existing split-room rule: members keep witnessed admissions even if a split
+//! let both sides fill the room, and report when this takes them past the cap.
 //!
-//! A promise is kept until the newcomer is an author on the promising member (it arrives from a
-//! board, with the asker's witness), an [`Abort`] frees it, or [`PROMISE_TTL`] passes. A stream that
-//! ends with no abort keeps the promise: a commit that never arrived must not free a place early.
-//!
-//! **Online is what the asker observes**: a member it holds a connection to that is heard from. One
-//! that is not connected is not asked, and one whose connection carries nothing back for
-//! [`SILENT_IS_GONE`] (its process crashed or is stopped, its connection not yet known closed) is
-//! offline; neither blocks the join. Each learns of the newcomer from a board when it returns, and
-//! admits it past the cap only after a split let both sides fill the room, which it says
-//! (`ChannelState::admit_from_board`). Anchors that are not members are never asked. Only a
-//! member of the room may open this stream (`PeerPolicy::allows`), and only a member of the room
-//! asked about is answered.
+//! Promises stand until the newcomer becomes an author, an [`Abort`] frees them, or [`PROMISE_TTL`]
+//! passes. Closing a stream without an abort commits its promise. Anchors that are not members
+//! are never asked; only room members may open this stream (`PeerPolicy::allows`).
 
 use std::time::Duration;
 
@@ -40,11 +29,8 @@ use crate::transport::framing::{read_frame_within, write_frame};
 use crate::transport::quic::VoxConnection;
 use crate::transport::streams::{open_typed, StreamKind};
 
-/// **How long the asker waits for every member's answer** (#366), all asked at once. A member
-/// answers from its own state, without waiting on anything, in about a round trip; 5 s is that
-/// with ample margin on a slow link, and fits inside the 20 s the rest of a join may take
-/// (`joinstream::ADMISSION_PATIENCE`), so a member that does not answer fails the join with time
-/// left to say why.
+/// How long the responder collects connected members' answers, all asked at once. An unanswered
+/// member learns the admission from a board; the bound fits inside the join exchange's patience.
 pub const SEAT_ANSWER_WITHIN: Duration = Duration::from_secs(5);
 
 /// **How long a member keeps a place it promised** (#366) with no word of the newcomer and no
@@ -216,8 +202,8 @@ pub enum Asked {
     /// or does not count this node a member yet. It has promised nothing this node would miss, so
     /// it is not counted, like an offline member.
     Refused,
-    /// The connection is heard from, and no answer came within [`SEAT_ANSWER_WITHIN`]: a member
-    /// online that did not agree.
+    /// The connection is heard from, but no answer came within [`SEAT_ANSWER_WITHIN`].
+    /// Like an offline member, it learns the newcomer from a witnessed board admission.
     Unanswered,
 }
 

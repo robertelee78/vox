@@ -93,6 +93,8 @@ semver.workspace = true
 rustix = { workspace = true, features = ["net", "termios", "process"] }
 # ADR-021 §6: a minted operation id is 128 bits of OS randomness.
 getrandom.workspace = true
+# Safe SA_SIGINFO capture: daemon stop diagnostics include the sending process where available.
+signal-hook = { version = "0.3.18", features = ["extended-siginfo"] }
 
 # The family LAN's helper (`vox lan helper`, ADR-013 §"The family LAN"): the macOS `utun`
 # control socket (`SysControlAddr`, `UtunIfname`), `getpeereid` and `chown`, all through
