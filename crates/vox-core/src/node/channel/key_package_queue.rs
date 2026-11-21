@@ -487,11 +487,6 @@ impl Queue {
         self.attempt.is_some()
     }
 
-    /// A selected locator whose work must be reselected remains at its original cursor.
-    pub(super) fn abandon_unopened(&mut self) {
-        self.attempt = None;
-    }
-
     /// A physically available release slot and its bounded demand retry share the same
     /// transaction. The actor finishes a selected package before entering room maintenance.
     pub(super) fn capacity_retry(
@@ -641,9 +636,8 @@ impl Queue {
         verified: impl Fn(&Entry) -> Result<bool>,
         floor_context: (Digest32, u64, u64),
     ) -> Result<Progress> {
-        if self.attempt.is_some() {
-            return Err(Error::MalformedAtRest("key-package attempt unacknowledged"));
-        }
+        // Reselect an interrupted package from its unchanged durable cursor.
+        self.attempt = None;
         self.published = read.key_package_tip()?;
         self.refresh = false;
         let mut floor_changed = self.observe_floors(store, sek, room, floor_context)?;

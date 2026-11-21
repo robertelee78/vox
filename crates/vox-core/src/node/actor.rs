@@ -6797,8 +6797,6 @@ pub struct Node {
     key_package_rooms: BTreeMap<Digest32, bool>,
     /// Logged package work awaiting the room's governance-ready transition.
     key_package_governance_wait: BTreeSet<Digest32>,
-    /// A selected package whose opening was refused before execution.
-    key_package_unopened: BTreeSet<Digest32>,
     /// A room whose package was refused while its governance refreshed is not selected again
     /// before this instant. The refusal can wait on a member's records, which no local fold
     /// brings, so an unpaced retry repeats the same refusal at once (#1203).
@@ -7482,7 +7480,6 @@ impl Node {
             legacy_cleanup_due: std::time::Instant::now(),
             key_package_rooms: BTreeMap::new(),
             key_package_governance_wait: BTreeSet::new(),
-            key_package_unopened: BTreeSet::new(),
             key_package_retry_at: BTreeMap::new(),
             session_upgrade_retry_at: BTreeMap::new(),
             session_control_check_at: preparation_save::SessionControlChecks::default(),
@@ -19893,7 +19890,6 @@ impl Node {
         self.legacy_cleanup_due = std::time::Instant::now();
         self.key_package_rooms.clear();
         self.key_package_governance_wait.clear();
-        self.key_package_unopened.clear();
         self.key_package_retry_at.clear();
         self.session_upgrade_retry_at.clear();
         self.session_control_check_at.clear();
