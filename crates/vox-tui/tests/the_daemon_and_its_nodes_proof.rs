@@ -1466,6 +1466,191 @@ fn a_linux_typed_unlock_survives_another_sessions_daemon() {
     stop_pid(a.lock_pid().unwrap());
 }
 
+/// RG-9: a client arriving in a restart waits for its owner, even if the caller dies.
+#[cfg(feature = "test-knobs")]
+#[test]
+#[ignore = "real binaries with production Argon2id; run in release"]
+fn a_restart_owns_its_replacement_while_a_client_waits() {
+    struct Children(Vec<Child>);
+    impl Drop for Children {
+        fn drop(&mut self) {
+            for child in &mut self.0 {
+                if child.try_wait().ok().flatten().is_none() {
+                    let _ = Command::new("kill")
+                        .args(["-CONT", &child.id().to_string()])
+                        .status();
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+    }
+    watchdog::arm();
+    let a = Account::new();
+    a.make_node("default");
+    let pass = a._tmp.path().join("identity.pass");
+    let Daemon {
+        child,
+        out: foreground_output,
+    } = Daemon::start(
+        &a,
+        &[
+            "--node",
+            "default",
+            "--keep",
+            "--passphrase-file",
+            pass.to_str().unwrap(),
+        ],
+        &[("VOX_TEST_STOP_HOLD_MS", "3000")],
+    );
+    let mut children = Children(vec![child]);
+    assert!(
+        wait_until(Duration::from_secs(60), || std::fs::read_to_string(
+            &foreground_output
+        )
+        .unwrap_or_default()
+        .contains("Ready")),
+        "APPARATUS: foreground daemon never became Ready: {}",
+        std::fs::read_to_string(&foreground_output).unwrap_or_default()
+    );
+    let room = make_room(&a, "default");
+    let (ok, out, err) = a.run(&["room", "post", &room, "news across the restart"], "");
+    assert!(ok, "APPARATUS: post before restart: {out}{err}");
+
+    for killed in [false, true] {
+        let old = a
+            .lock_pid()
+            .expect("APPARATUS: serving daemon before restart");
+        let log_before = a.log().len();
+        let output = a._tmp.path().join(format!("restart-{killed}.out"));
+        let file = std::fs::File::create(&output).unwrap();
+        let caller = a
+            .cmd(&["daemon", "--restart"])
+            .env("VOX_TEST_DAEMON_SERVE_DELAY_MS", "5000")
+            .env("VOX_TEST_STOP_HOLD_MS", "3000")
+            .stdout(file.try_clone().unwrap())
+            .stderr(file)
+            .spawn()
+            .unwrap();
+        children.0.push(caller);
+        let caller_pid = children.0[1].id();
+        assert!(
+            wait_until(Duration::from_secs(30), || a
+                .log()
+                .get(log_before..)
+                .unwrap_or("")
+                .contains("shutting down")),
+            "APPARATUS: restart never reached the old daemon's shutdown: {}",
+            std::fs::read_to_string(&output).unwrap_or_default()
+        );
+        let signal = if killed { "-KILL" } else { "-STOP" };
+        assert!(
+            Command::new("kill")
+                .args([signal, &caller_pid.to_string()])
+                .status()
+                .unwrap()
+                .success(),
+            "APPARATUS: could not hold/kill the restarter we started"
+        );
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                if old == children.0[0].id() {
+                    children.0[0].try_wait().unwrap().is_some()
+                } else {
+                    !alive(old) || a.lock_pid() != Some(old)
+                }
+            }),
+            "APPARATUS: old daemon did not release its account: {}",
+            a.log()
+        );
+        let (client, hook) = std::thread::scope(|scope| {
+            let hook = scope.spawn(|| {
+                a.hook(
+                    "default",
+                    if killed {
+                        "restart-killed"
+                    } else {
+                        "restart-held"
+                    },
+                    "UserPromptSubmit",
+                )
+            });
+            let client = a.run(&["daemon", "--detach"], "");
+            (
+                client,
+                hook.join().expect("APPARATUS: hook worker panicked"),
+            )
+        });
+        let (client_ok, out, err) = client;
+        if !killed {
+            let _ = Command::new("kill")
+                .args(["-CONT", &caller_pid.to_string()])
+                .status();
+        }
+        let status = children.0[1].wait().unwrap();
+        children.0.pop();
+        let restart = std::fs::read_to_string(&output).unwrap_or_default();
+        eprintln!("restart killed={killed}, old={old}, status={status}: {restart}\nclient: {out}{err}\nhook: {}{}\n{}", hook.1, hook.2, a.log());
+        let replacement = a.lock_pid().expect("PRODUCT: no daemon after restart");
+        let (read_ok, news, read_err) = a.run(&["room", "read", &room], "");
+        // Clean up before a failed assertion; never leave a proof's daemon behind.
+        if killed
+            || !client_ok
+            || !out.contains("already running")
+            || !hook.0
+            || !err.contains("waiting for the daemon restart")
+            || !hook.2.contains("waiting for the daemon restart")
+        {
+            stop_pid(replacement);
+        }
+        assert!(client_ok && out.contains("already running"),
+            "PRODUCT: a client during restart started a competing daemon instead of waiting: {out}{err}; restart: {restart}");
+        assert!(
+            err.contains("waiting for the daemon restart"),
+            "APPARATUS: the client did not arrive during the restart: {out}{err}"
+        );
+        assert!(
+            hook.0,
+            "PRODUCT: a hook turn during restart failed: {}{}\n{}",
+            hook.1,
+            hook.2,
+            a.log()
+        );
+        assert!(
+            hook.2.contains("waiting for the daemon restart"),
+            "APPARATUS: the hook did not arrive during the restart: {}{}",
+            hook.1,
+            hook.2
+        );
+        assert!(
+            killed || status.success(),
+            "PRODUCT: restart failed: {restart}"
+        );
+        assert!(replacement != old && read_ok && news.contains("news across the restart"),
+            "PRODUCT: the replacement did not serve the kept room after caller killed={killed}: {news}{read_err}\n{}", a.log());
+        let generations = a
+            .log()
+            .get(log_before..)
+            .unwrap_or("")
+            .matches("vox daemon: serving (pid ")
+            .count();
+        assert_eq!(
+            generations,
+            1,
+            "PRODUCT: expected exactly one replacement generation, got {generations}:\n{}",
+            a.log()
+        );
+        assert!(
+            a.log()
+                .get(log_before..)
+                .unwrap_or("")
+                .contains(&format!("sender pid {replacement} ")),
+            "PRODUCT: the process that owned the stop did not become the serving replacement:\n{}",
+            a.log()
+        );
+    }
+}
+
 #[test]
 #[ignore = "real binaries; run in release"]
 fn two_clients_with_no_daemon_end_with_one_and_it_exits_when_idle() {

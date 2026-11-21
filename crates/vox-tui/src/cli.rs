@@ -738,6 +738,14 @@ pub struct DaemonArgs {
     /// exit once nothing is Ready and no client is connected.
     #[arg(long = "as-detached", hide = true)]
     pub as_detached: bool,
+    /// The authenticated old daemon this detached replacement takes over from.
+    #[arg(
+        long,
+        hide = true,
+        requires = "as_detached",
+        conflicts_with = "restart"
+    )]
+    pub replace_pid: Option<u32>,
     /// How the macOS app's login item runs it (launchd, which restarts it after a failed exit):
     /// a start refused for good (run as root, or a data root this version does not read) is
     /// written to `~/Library/Logs/Vox/login-item.log` and ends with status 0, so launchd does not
@@ -3417,6 +3425,21 @@ pub fn run() -> ExitCode {
             // **A hook makes no node directory** (#666): it may name a node that is not here,
             // and says so; its paths are resolved as they are.
             let paths = account.node_paths_as_they_are(&node);
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                // Ordinary hooks cannot fail a turn; registration-only callers need a truthful ACK.
+                return if args.attention_register
+                    || args.native_attention
+                    || args.omp_prepare
+                    || args.omp_check_uncertainty
+                {
+                    ExitCode::FAILURE
+                } else {
+                    ExitCode::SUCCESS
+                };
+            };
             if args.omp_check_uncertainty {
                 let session = args
                     .session
@@ -3425,10 +3448,10 @@ pub fn run() -> ExitCode {
                 if std::env::var("VOX_HARNESS").as_deref() != Ok("omp") || session.is_none() {
                     return ExitCode::FAILURE;
                 }
-                return match crate::agent_hook::omp_uncertainty_lock(
+                return match rt.block_on(crate::agent_hook::omp_uncertainty_lock(
                     &paths,
                     session.unwrap_or_default(),
-                ) {
+                )) {
                     Ok(_guard) => ExitCode::SUCCESS,
                     Err(error) => {
                         eprintln!("vox: {error}");
@@ -3448,17 +3471,6 @@ pub fn run() -> ExitCode {
                     eprintln!("vox: --format: {e}");
                     return ExitCode::FAILURE;
                 }
-            };
-            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            else {
-                // Ordinary hooks cannot fail a turn; registration-only callers need a truthful ACK.
-                return if args.attention_register || args.native_attention || args.omp_prepare {
-                    ExitCode::FAILURE
-                } else {
-                    ExitCode::SUCCESS
-                };
             };
             let result = rt.block_on(crate::agent_hook::run(
                 &paths,

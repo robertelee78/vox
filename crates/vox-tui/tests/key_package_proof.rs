@@ -53,6 +53,9 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
+
 #[path = "support/layout.rs"]
 mod layout;
 #[path = "support/typed.rs"]
@@ -104,6 +107,14 @@ impl Daemon {
     /// Start a daemon for `dir`, unlocking the identity and opening every room the room
     /// passphrase opens.
     fn start(name: &'static str, dir: &std::path::Path) -> Self {
+        Self::start_env(name, dir, &[])
+    }
+
+    fn start_env(
+        name: &'static str,
+        dir: &std::path::Path,
+        env: &[(&str, &std::ffi::OsStr)],
+    ) -> Self {
         let pass = dir.join("pass");
         std::fs::write(&pass, format!("{IDPASS}\n{ROOMPASS}\n")).unwrap();
         let mut cmd = Command::new(VOX);
@@ -115,6 +126,7 @@ impl Daemon {
         let mut child = cmd
             .env("VOX_DATA_DIR", dir)
             .env("VOX_CONFIG_DIR", dir.join("cfg"))
+            .envs(env.iter().copied())
             .env_remove("VOX_ROOM")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -737,4 +749,189 @@ fn a_key_through_the_log_releases_what_a_direct_one_does() {
         (0, 0),
         "PRODUCT: never wider: a post made before the trust stays unreadable, whichever path the key took"
     );
+}
+
+#[test]
+#[ignore = "real binary governance refusal and read recovery; run with test-knobs"]
+fn a_governance_refresh_is_a_retryable_read_refusal() {
+    watchdog::arm();
+    test_knobs::require(&["VOX_TEST_HOLD_GOVERNANCE_READ_FILE"]);
+    let k = cast();
+    let hold = k.c.join("governance-read-hold");
+    let _c = Daemon::start_env(
+        "c",
+        &k.c,
+        &[("VOX_TEST_HOLD_GOVERNANCE_READ_FILE", hold.as_os_str())],
+    );
+    ok(
+        &k.c,
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "refresh",
+        ],
+        &format!("{ROOMPASS}\n"),
+    );
+    let room = ok(&k.c, &["room", "list"], "")
+        .split_whitespace()
+        .next()
+        .expect("APPARATUS: created room")
+        .to_owned();
+    ok(&k.c, &["room", "post", &room, "after-refresh"], "");
+    std::fs::write(&hold, "hold").unwrap();
+    let (accepted, out) = vox(&k.c, &["room", "read", &room], "");
+    std::fs::remove_file(hold).unwrap();
+    assert!(
+        !accepted && out.contains("room governance is refreshing; try again when it is ready"),
+        "PRODUCT: a governance refresh must be the recognised retry refusal, not an internal \
+         failure or a different spelling: {out}"
+    );
+    assert!(
+        ok(&k.c, &["room", "read", &room], "").contains("after-refresh"),
+        "PRODUCT: releasing governance must make the same room readable"
+    );
+}
+
+#[test]
+#[ignore = "real offline key package with direct key sends held; run with test-knobs"]
+fn an_abandoned_key_request_is_selected_again() {
+    watchdog::arm();
+    test_knobs::require(&[
+        "VOX_TEST_ABANDON_KEY_PACKAGE_ONCE",
+        "VOX_TEST_HOLD_PAIRWISE_KEY_FILE",
+    ]);
+    let k = cast();
+    let direct_hold = k.a.join("hold-direct");
+    let a = Daemon::start_env(
+        "a",
+        &k.a,
+        &[("VOX_TEST_HOLD_PAIRWISE_KEY_FILE", direct_hold.as_os_str())],
+    );
+    ok(
+        &k.a,
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "abandon",
+        ],
+        &format!("{ROOMPASS}\n"),
+    );
+    let room = ok(&k.a, &["room", "list"], "")
+        .split_whitespace()
+        .next()
+        .expect("APPARATUS: created room")
+        .to_owned();
+    let link = ok(&k.a, &["room", "link", &room], "")
+        .lines()
+        .find(|line| line.starts_with("vox://"))
+        .expect("APPARATUS: the product's room link")
+        .to_owned();
+    let b = Daemon::start("b", &k.b);
+    ok(
+        &k.b,
+        &["room", "join", "--passphrase-file", "-", link.trim()],
+        &format!("{ROOMPASS}\n"),
+    );
+    ok(&k.b, &["trust", "add", &k.fps[0], "--name", "a"], "");
+    b.stop();
+    let stage_deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let status = ok(&k.a, &["status", "--json"], "");
+        let status: serde_json::Value =
+            serde_json::from_str(&status).expect("APPARATUS: shipped status JSON");
+        let disconnected = status["rooms"].as_array().is_some_and(|rooms| {
+            rooms.iter().any(|row| {
+                row["members"].as_array().is_some_and(|members| {
+                    members
+                        .iter()
+                        .any(|member| member["id"] == k.fps[1] && member["connected"] == false)
+                })
+            })
+        });
+        if disconnected {
+            break;
+        }
+        assert!(
+            Instant::now() < stage_deadline,
+            "APPARATUS: stopped recipient was never reported disconnected: {status}"
+        );
+        std::thread::yield_now();
+    }
+    std::fs::write(&direct_hold, &k.fps[1]).unwrap();
+    ok(&k.a, &["trust", "add", &k.fps[1], "--name", "b"], "");
+    eprintln!("[RG4] recipient stopped after joining; sender granted it read");
+    let stage_deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let status = ok(&k.a, &["status", "--json"], "");
+        let status: serde_json::Value =
+            serde_json::from_str(&status).expect("APPARATUS: shipped status JSON");
+        if status["lanes"]["offline_fallbacks"]
+            .as_array()
+            .is_some_and(|rows| {
+                rows.iter()
+                    .any(|row| row["peer"] == k.fps[1] && row["package_seq"].as_u64().is_some())
+            })
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < stage_deadline,
+            "APPARATUS: no logged key package was staged, so abandonment was not reached: \
+             {status}; sender log: {}",
+            a.stderr()
+        );
+        std::thread::yield_now();
+    }
+    let marker = "rg4-post-readable-only-through-the-logged-key";
+    ok(&k.a, &["room", "post", &room, marker], "");
+    let arm = k.b.join("abandon.arm");
+    std::fs::write(&arm, "abandon one real selection").unwrap();
+    let b = Daemon::start_env(
+        "b",
+        &k.b,
+        &[("VOX_TEST_ABANDON_KEY_PACKAGE_ONCE", arm.as_os_str())],
+    );
+    let selected = arm.with_extension("selected");
+    let stage_deadline = Instant::now() + Duration::from_secs(120);
+    while !selected.exists() {
+        let answer = vox(&k.b, &["room", "read", &room], "");
+        assert!(
+            Instant::now() < stage_deadline,
+            "APPARATUS: the logged package was not selected: {answer:?}; receiver: {}; sender: {}",
+            b.stderr(),
+            a.stderr()
+        );
+        std::thread::yield_now();
+    }
+    eprintln!("[RG4] a real selected package was abandoned before Open");
+    let stage_deadline = Instant::now() + Duration::from_secs(120);
+    let mut shown = false;
+    while Instant::now() < stage_deadline {
+        let (accepted, out) = vox(&k.b, &["room", "read", &room], "");
+        assert!(
+            !b.stderr().contains("key-package attempt unacknowledged"),
+            "PRODUCT: an abandoned key request permanently refused its next selection: {}",
+            b.stderr()
+        );
+        if accepted && out.contains(marker) {
+            shown = true;
+            break;
+        }
+        eprintln!("[RG4] answered history demand: {out}");
+        std::thread::yield_now();
+    }
+    assert!(
+        shown,
+        "APPARATUS: readable sender post was not observed after the abandoned key request; \
+         direct key sends remain held; receiver: {}",
+        b.stderr()
+    );
+    b.stop();
+    a.stop();
 }
