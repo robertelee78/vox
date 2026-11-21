@@ -10,6 +10,10 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(a_rollback_to_an_older_release_restarts_its_running_daemon);
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -235,6 +239,107 @@ fn an_interrupted_rollback_is_finished_by_the_next_one() {
         "PRODUCT: a rollback does not recover what a power loss left:\n{}",
         failures.join("\n")
     );
+}
+
+/// RG-9: a rollback target without --replace-pid still replaces the running daemon.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "optional: set VOX_PROOF_OLDER_BINARY to a published older release and run in release"]
+fn a_rollback_to_an_older_release_restarts_its_running_daemon() {
+    struct StopChild(std::process::Child);
+    impl Drop for StopChild {
+        fn drop(&mut self) {
+            if self.0.try_wait().ok().flatten().is_none() {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+    watchdog::arm();
+    for detached in [false, true] {
+        let tmp = tempfile::Builder::new()
+            .prefix("vrg9")
+            .tempdir_in("/private/tmp")
+            .expect("APPARATUS: short scratch install path");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).expect("APPARATUS: private HOME");
+        let dir = install_dir(tmp.path());
+        let binary = std::env::var_os("VOX_PROOF_OLDER_BINARY").expect(
+            "APPARATUS: set VOX_PROOF_OLDER_BINARY to a genuine published older release's vox",
+        );
+        let older = version_of(Path::new(&binary))
+            .expect("APPARATUS: older release binary does not report its version");
+        let older_version = older
+            .strip_prefix("vox ")
+            .expect("APPARATUS: older vox version");
+        assert!(
+            semver::Version::parse(older_version).unwrap()
+                < semver::Version::parse(VERSION).unwrap(),
+            "APPARATUS: VOX_PROOF_OLDER_BINARY must be older than this vox: {older}"
+        );
+        let previous = dir.join(".vox-previous");
+        std::fs::copy(binary, &previous).expect("APPARATUS: cannot stage the older release");
+        make_runnable(&previous);
+        let output = home.join("daemon.out");
+        // Detached startup imports its stdio into the log, as a real client's tempfile does.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&output)
+            .expect("APPARATUS: readable daemon startup output");
+        let mut command = Command::new(dir.join("vox"));
+        command
+            .env_clear()
+            .env("HOME", &home)
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .env("VOX_DATA_DIR", home.join("data"))
+            .env("VOX_CONFIG_DIR", home.join("config"))
+            .env("VOX_PROXY", "127.0.0.1:0")
+            .args(["daemon", "--no-node", "--listen", "127.0.0.1:0"])
+            .stdin(std::process::Stdio::null())
+            .stdout(file.try_clone().unwrap())
+            .stderr(file);
+        if detached {
+            command.arg("--as-detached");
+        }
+        let mut daemon = StopChild(command.spawn().expect("APPARATUS: start current daemon"));
+        let old_pid = daemon.0.id();
+        let log = home.join("data/.daemon/log");
+        let began = std::time::Instant::now();
+        while !std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains("control socket")
+        {
+            assert!(
+                began.elapsed() < std::time::Duration::from_secs(15),
+                "APPARATUS: current daemon did not serve: {}",
+                std::fs::read_to_string(&output).unwrap_or_default()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let (ok, said) = rollback(&dir, &home);
+        let active = version_of(&dir.join("vox"));
+        let pid = std::fs::read_to_string(home.join("data/.daemon/lock"))
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok());
+        let old_exited = daemon.0.try_wait().unwrap().is_some();
+        eprintln!("[proof] rollback detached={detached}: {old_pid} -> {pid:?}, active={active:?}, old_exited={old_exited}: {said}\n{}",
+            std::fs::read_to_string(&log).unwrap_or_default());
+        // This PID is the replacement started by our rollback, never an installed daemon.
+        if let Some(pid) = pid.filter(|pid| *pid != old_pid) {
+            let _ = Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .status();
+        }
+        assert!(
+            ok && active.as_deref() == Some(older.as_str()) && old_exited
+                && pid.is_some_and(|pid| pid != old_pid)
+                && said.contains(&format!("was restarted and runs vox {older_version}")),
+            "PRODUCT: rollback to an older release did not replace its running daemon (detached={detached}): {said}; active={active:?}; old_exited={old_exited}; replacement={pid:?}"
+        );
+    }
 }
 
 /// #247's verifier's gaps, each shown on the shipped binary:

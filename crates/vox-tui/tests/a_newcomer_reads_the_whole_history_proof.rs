@@ -74,6 +74,8 @@
 // history are optional: CI only compiles them, and without `--features optional-proofs` a stand-in
 // says each was not run (`support/optional_proof.rs`).
 #![cfg_attr(not(feature = "optional-proofs"), allow(dead_code))]
+// The existing room and relay apparatus each includes its own attachment/layout support.
+#![cfg_attr(feature = "optional-proofs", allow(clippy::duplicate_mod))]
 #![cfg(unix)]
 
 #[path = "support/optional_proof.rs"]
@@ -84,6 +86,9 @@ optional_proof::not_run!(
     hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port,
     a_quiet_room_costs_no_rounds_and_says_when_it_last_synced,
     retained_rows_render_once_their_key_and_consent_arrive,
+    a_busy_room_newcomer_reads_every_member_with_a_paused_member,
+    a_busy_room_newcomer_reads_every_member_with_a_delayed_path,
+    the_busy_room_reader_finds_the_first_of_five_thousand_rows,
 );
 
 #[path = "support/test_knobs.rs"]
@@ -9624,4 +9629,1928 @@ fn newcomer_reads_the_whole_history(
     drop(bob_daemon);
     drop(alice_daemon);
     (to_alice, to_bob)
+}
+
+/// ADR-052 RG-1 is optional until the admission, trust and delivery requirements land.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "four real daemons, three stepping Sessions and a paused member; optional"]
+fn a_busy_room_newcomer_reads_every_member_with_a_paused_member() {
+    rg1::journey(false);
+}
+
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "four real daemons, three stepping Sessions and a delayed relay path; optional"]
+fn a_busy_room_newcomer_reads_every_member_with_a_delayed_path() {
+    rg1::journey(true);
+}
+
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "five thousand CLI posts and one real daemon; optional"]
+fn the_busy_room_reader_finds_the_first_of_five_thousand_rows() {
+    rg1::paging_check();
+}
+
+#[cfg(feature = "optional-proofs")]
+#[path = "support/port_forward.rs"]
+mod port_forward;
+#[cfg(feature = "optional-proofs")]
+#[path = "support/relay.rs"]
+mod relay;
+#[cfg(feature = "optional-proofs")]
+#[path = "support/room.rs"]
+mod rg1_room;
+#[cfg(feature = "optional-proofs")]
+#[path = "support/world.rs"]
+mod world;
+
+/// Only apparatus lives here: every room, Session and observation belongs to a real binary.
+#[cfg(feature = "optional-proofs")]
+mod rg1 {
+    use super::{port_forward, rg1_room as room, world, Daemon};
+    use room::Worker;
+    use serde_json::{json, Value};
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::io::{BufRead, BufReader, Write};
+    use std::path::Path;
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    fn root() -> tempfile::TempDir {
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("rg1-");
+        let mut dir = match std::env::var_os("VOX_PROOF_RG1_EVIDENCE") {
+            Some(at) => builder.tempdir_in(at),
+            None => builder.tempdir(),
+        }
+        .expect("APPARATUS: create RG-1 scratch directory");
+        if std::env::var_os("VOX_PROOF_KEEP_DIRS").is_some() {
+            dir.disable_cleanup(true);
+        }
+        eprintln!("[RG-1] scratch={}", dir.path().display());
+        dir
+    }
+
+    fn binary() -> String {
+        std::env::var("VOX_PROOF_SHIPPED_BINARY").unwrap_or_else(|_| super::VOX.to_owned())
+    }
+
+    fn free_disk(at: &Path) {
+        let out = Command::new("df")
+            .args(["-Pk"])
+            .arg(at)
+            .output()
+            .expect("APPARATUS: measure free disk");
+        let text = String::from_utf8_lossy(&out.stdout);
+        let available = text
+            .lines()
+            .nth(1)
+            .and_then(|line| line.split_whitespace().nth(3))
+            .and_then(|n| n.parse::<u64>().ok());
+        assert!(
+            out.status.success() && available.is_some_and(|kb| kb >= 10 * 1024 * 1024),
+            "APPARATUS: RG-1 needs at least 10 GiB free disk: {text}"
+        );
+        eprintln!("[RG-1] free disk: {text}");
+    }
+
+    fn start(w: &Worker, listen: &str, anchor: Option<&str>) -> Daemon {
+        std::fs::create_dir_all(w.data.with_extension("home"))
+            .expect("APPARATUS: daemon scratch HOME");
+        // Headless `node create` can auto-start this scratch computer's daemon.
+        // Replace that owned setup service before taking ownership of the serving child.
+        room::reap_daemon(&w.data);
+        let mut cmd = Command::new(&w.exe);
+        room::strip_harness_env(&mut cmd);
+        cmd.args(["daemon", "--node"])
+            .arg(
+                w.paths
+                    .profile_dir
+                    .file_name()
+                    .expect("APPARATUS: daemon node"),
+            )
+            .args(["--listen", listen, "--passphrase-file"])
+            .arg(&w.pass)
+            .env("HOME", w.data.with_extension("home"))
+            .env("VOX_DATA_DIR", &w.data)
+            .env("VOX_CONFIG_DIR", &w.cfg)
+            .env("VOX_PROXY", "127.0.0.1:0")
+            .stdout(Stdio::from(
+                std::fs::File::create(w.data.with_extension("out"))
+                    .expect("APPARATUS: daemon stdout"),
+            ))
+            .stderr(Stdio::from(
+                std::fs::File::create(w.data.with_extension("err"))
+                    .expect("APPARATUS: daemon stderr"),
+            ));
+        if let Some(anchor) = anchor {
+            cmd.args(["--anchor", anchor]);
+        }
+        let mut daemon = Daemon(cmd.spawn().expect("APPARATUS: start RG-1 daemon"));
+        eprintln!(
+            "[RG-1] daemon {} pid={} binary={}",
+            w.name,
+            daemon.0.id(),
+            w.exe
+        );
+        let since = Instant::now();
+        // Do not run an auto-attaching verb before this daemon has its lock.
+        while !world::daemon_lock(&w.data).exists() {
+            assert!(
+                daemon
+                    .0
+                    .try_wait()
+                    .expect("APPARATUS: daemon wait")
+                    .is_none()
+                    && since.elapsed() < Duration::from_secs(240),
+                "APPARATUS: {}'s serving daemon did not start; see {}",
+                w.name,
+                w.data.with_extension("err").display()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        loop {
+            let out = w.vox(None, &["room", "list"]);
+            if out.ok {
+                assert_eq!(
+                    world::daemon_pid(&w.data),
+                    Some(daemon.0.id()),
+                    "APPARATUS: spawned pid is not {}'s serving daemon",
+                    w.name
+                );
+                return daemon;
+            }
+            assert!(
+                since.elapsed() < Duration::from_secs(240),
+                "APPARATUS: {} never attached for staging: {out:?}",
+                w.name
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn create(w: &Worker) -> String {
+        let out = w.vox_in(
+            None,
+            &[
+                "room",
+                "create",
+                "--name",
+                "repo-to-cve",
+                "--passphrase-file",
+                "-",
+            ],
+            Some(room::ROOM_PASS),
+        );
+        assert!(out.ok, "APPARATUS: room not created: {out:?}");
+        let out = w.vox(None, &["status", "--json"]);
+        assert!(out.ok, "APPARATUS: created room not reported: {out:?}");
+        out.json()["rooms"][0]["id"]
+            .as_str()
+            .expect("APPARATUS: created room id")
+            .to_owned()
+    }
+
+    fn post(w: &Worker, id: &str, text: &str, staging: bool) {
+        let out = w.vox(None, &["room", "post", id, text]);
+        assert!(
+            out.ok,
+            "RED PRODUCT: {} did not acknowledge {text:?} (staging={staging}): {out:?}",
+            w.name
+        );
+    }
+
+    /// The footer is on stderr. Its cursor, not a guessed row count, drives every older read.
+    /// `wanted=None` walks to the start for the final all-acknowledged-posts assertion.
+    fn read(
+        w: &Worker,
+        id: &str,
+        wanted: Option<&str>,
+    ) -> (BTreeSet<String>, usize, Option<String>) {
+        try_read(w, id, wanted, None).unwrap_or_else(|why| panic!("RED PRODUCT: {why}"))
+    }
+
+    fn check_observation_process(
+        name: &str,
+        command: &str,
+        code: Option<i32>,
+        stdout: &str,
+        stderr: &str,
+        state: Option<&Mutex<LoadState>>,
+    ) -> Result<(), String> {
+        if code.is_none()
+            || (code != Some(0) && stdout.trim().is_empty() && stderr.trim().is_empty())
+        {
+            let why = format!(
+                "{name}'s {command} process ended without a complete product answer \
+                (exit={code:?}); stdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+            if let Some(state) = state {
+                state
+                    .lock()
+                    .expect("APPARATUS: load state")
+                    .errors
+                    .push(why.clone());
+                return Err(why);
+            }
+            panic!("APPARATUS: {why}");
+        }
+        Ok(())
+    }
+
+    fn try_read(
+        w: &Worker,
+        id: &str,
+        wanted: Option<&str>,
+        state: Option<&Mutex<LoadState>>,
+    ) -> Result<(BTreeSet<String>, usize, Option<String>), String> {
+        let mut before = None::<String>;
+        let mut cursors = BTreeSet::new();
+        let mut texts = BTreeSet::new();
+        let mut pages = 0;
+        let mut oldest = None;
+        loop {
+            let mut args = vec!["room", "read", id, "--json", "--limit", "200"];
+            if let Some(cursor) = before.as_deref() {
+                args.extend(["--before", cursor]);
+            }
+            let out = w.vox(None, &args);
+            check_observation_process(
+                &w.name,
+                "room read",
+                out.code,
+                &out.stdout,
+                &out.stderr,
+                state,
+            )?;
+            if !out.ok {
+                return Err(format!("{}'s paging reader refused: {out:?}", w.name));
+            }
+            pages += 1;
+            let rows: Vec<Value> = out
+                .stdout
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(serde_json::from_str)
+                .collect::<Result<_, _>>()
+                .map_err(|error| format!("{}'s page is not NDJSON: {error}; {out:?}", w.name))?;
+            if let Some(hash) = rows.first().and_then(|row| row["entry_hash"].as_str()) {
+                oldest = Some(hash.to_owned());
+            }
+            for row in rows {
+                if let Some(text) = row["text"].as_str() {
+                    texts.insert(text.to_owned());
+                }
+            }
+            let next = out
+                .stderr
+                .lines()
+                .find(|line| line.contains("older messages not shown:"))
+                .map(|line| {
+                    line.split_whitespace()
+                        .collect::<Vec<_>>()
+                        .windows(2)
+                        .find(|pair| pair[0] == "--before")
+                        .map(|pair| pair[1].trim_matches(['\'', '"']).to_owned())
+                        .ok_or_else(|| format!("{}'s unpageable footer: {line}", w.name))
+                })
+                .transpose()?;
+            eprintln!(
+                "[RG-1 page] member={} page={pages} before={before:?} next={next:?}",
+                w.name
+            );
+            if wanted.is_some_and(|text| texts.contains(text))
+                || next.is_none()
+                || std::env::var_os("VOX_PROOF_RG1_NO_PAGING").is_some()
+            {
+                return Ok((texts, pages, oldest));
+            }
+            let next = next.expect("footer checked");
+            if !cursors.insert(next.clone()) {
+                return Err(format!("{}'s paging reader repeated cursor {next}", w.name));
+            }
+            before = Some(next);
+        }
+    }
+
+    /// Sampling records product answers, including refusals; it never decides the verdict.
+    fn sample_read(w: &Worker, id: &str) {
+        let mut before = None::<String>;
+        let mut cursors = BTreeSet::new();
+        for page in 1.. {
+            let mut args = vec!["room", "read", id, "--json", "--limit", "200"];
+            if let Some(cursor) = before.as_deref() {
+                args.extend(["--before", cursor]);
+            }
+            let out = w.vox(None, &args);
+            eprintln!(
+                "[RG-1 sample page] member={} page={page} before={before:?} result={out:?}",
+                w.name
+            );
+            if !out.ok {
+                return;
+            }
+            let Some(footer) = out
+                .stderr
+                .lines()
+                .find(|line| line.contains("older messages not shown:"))
+            else {
+                return;
+            };
+            let words: Vec<_> = footer.split_whitespace().collect();
+            let next = words
+                .windows(2)
+                .find(|pair| pair[0] == "--before")
+                .map(|pair| pair[1].trim_matches(['\'', '"']).to_owned());
+            let Some(next) = next else {
+                eprintln!(
+                    "[RG-1 sample page] member={} unpageable footer={footer:?}",
+                    w.name
+                );
+                return;
+            };
+            if !cursors.insert(next.clone()) {
+                eprintln!(
+                    "[RG-1 sample page] member={} repeated cursor={next}",
+                    w.name
+                );
+                return;
+            }
+            before = Some(next);
+        }
+    }
+
+    pub(super) fn paging_check() {
+        let root = root();
+        free_disk(root.path());
+        let w = room::worker_as(root.path(), "paging", &binary());
+        let _daemon = start(&w, "127.0.0.1:0", None);
+        let id = create(&w);
+        let started = Instant::now();
+        for n in 0..5000 {
+            post(&w, &id, &format!("RG1-paging-{n:04}"), true);
+        }
+        let (texts, pages, _) = read(&w, &id, Some("RG1-paging-0000"));
+        let mutant = std::env::var_os("VOX_PROOF_RG1_NO_PAGING").is_some();
+        assert!(
+            texts.contains("RG1-paging-0000"),
+            "RED {}: RG-1 paging self-check: first planted row absent after {pages} pages \
+             of a 5,000-row room; paging mutant={mutant}",
+            if mutant { "APPARATUS" } else { "PRODUCT" }
+        );
+        assert!(
+            pages >= 25,
+            "APPARATUS: 5,000-row staging did not require paging: {pages}"
+        );
+        eprintln!(
+            "GREEN: RG-1 first of 5,000 rows found in {pages} pages; run={:?}; daemons=1",
+            started.elapsed()
+        );
+    }
+
+    /// The prototype's OMP Session stand-in, with the same watcher ownership and bridge events.
+    struct Session {
+        process: Daemon,
+        lines: std::sync::mpsc::Receiver<String>,
+        id: String,
+        scratch: tempfile::TempDir,
+    }
+
+    impl Session {
+        fn ask(&mut self, command: &str) {
+            writeln!(
+                self.process
+                    .0
+                    .stdin
+                    .as_mut()
+                    .expect("APPARATUS: Session stdin"),
+                "{command}"
+            )
+            .expect("APPARATUS: write Session command");
+            let line = self
+                .lines
+                .recv_timeout(Duration::from_secs(180))
+                .unwrap_or_else(|e| panic!("APPARATUS: Session did not answer {command}: {e}"));
+            let reply: Value = serde_json::from_str(&line)
+                .unwrap_or_else(|e| panic!("APPARATUS: Session reply {line}: {e}"));
+            assert_ne!(
+                reply["kind"], "apparatus",
+                "APPARATUS: Session staging: {reply}"
+            );
+        }
+
+        fn start(w: &Worker, id: &str, index: usize) -> Self {
+            // This is the Sess wire conversation in arm-replace/rig.py:378-512, not a model.
+            const HOST: &str = r#"
+import atexit,json,os,secrets,socket,subprocess,sys,threading,time
+sid=sys.argv[1]; route=secrets.token_hex(32); token=secrets.token_hex(32)
+endpoint=os.path.join(os.environ["TMPDIR"],"bridge")
+assert len(os.fsencode(endpoint)) < 104, "Session socket path exceeds Unix socket limit"
+listener=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); listener.bind(endpoint)
+os.chmod(endpoint,0o600); listener.listen(8)
+state={"ready":False,"confirmed":False}; conns=[]; frames=[]; cv=threading.Condition()
+def serve(sock):
+    try:
+        reader=sock.makefile("rb")
+        auth=json.loads(reader.readline()); first=json.loads(reader.readline())
+        assert auth.get("type")=="auth" and auth.get("token")==token
+        if first.get("type")=="route":
+            sock.sendall((json.dumps({"outcome":"available","session":sid,"route":route,"client":route,"admission":True})+"\n").encode()); return
+        assert first.get("type")=="subscribe" and first.get("session")==sid
+        deadline=time.monotonic()+30
+        while not (state["ready"] and state["confirmed"]) and time.monotonic()<deadline: time.sleep(.1)
+        assert state["ready"] and state["confirmed"]
+        sock.sendall((json.dumps({"type":"subscribed","session":sid})+"\n"+json.dumps({"type":"event","event":{"type":"state","busy":False}})+"\n").encode())
+        conns.append(sock)
+        for _ in reader: pass
+    except Exception as e: print("bridge: "+repr(e),file=sys.stderr,flush=True)
+def accept():
+    while True:
+        sock,_=listener.accept(); threading.Thread(target=serve,args=(sock,),daemon=True).start()
+threading.Thread(target=accept,daemon=True).start()
+watch=subprocess.Popen([os.environ["VOX_BIN"],"agent","omp-watch","--node",os.environ["VOX_NODE"]],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=sys.stderr)
+def cleanup():
+    if watch.poll() is None: watch.kill()
+    watch.wait()
+atexit.register(cleanup)
+def receive():
+    for line in watch.stdout:
+        f=json.loads(line)
+        if f.get("type")=="ready": state["ready"]=True
+        if f.get("type")=="unavailable": state.update(ready=False,confirmed=False)
+        with cv: frames.append(f); cv.notify_all()
+threading.Thread(target=receive,daemon=True).start()
+def frame(match,within=120):
+    deadline=time.monotonic()+within
+    with cv:
+        while True:
+            for f in frames:
+                if match(f): return f
+            remaining=deadline-time.monotonic()
+            if remaining<=0: raise RuntimeError("no watcher frame: "+repr(frames[-5:]))
+            cv.wait(remaining)
+def command(i,**args):
+    watch.stdin.write((json.dumps(dict(id=i,**args))+"\n").encode()); watch.stdin.flush()
+    assert frame(lambda f:f.get("type")=="ack" and f.get("id")==i)["ok"]
+try:
+    instance=frame(lambda f:f.get("type")=="owner")["instance"]
+    frame(lambda f:f.get("type")=="ready"); generation=secrets.token_hex(32)
+    command("1",op="revoke")
+    command("2",op="install",generation=generation,session=sid,endpoint=endpoint,token=token,route=route)
+    env=dict(os.environ,VOX_HARNESS="omp",VOX_SESSION=sid,VOX_OPENCODE_WAKE_SOCKET=endpoint,VOX_OPENCODE_WAKE_TOKEN=token,
+        VOX_OPENCODE_MIRROR_SOCKET=endpoint,VOX_OPENCODE_ATTENTION_SOCKET=endpoint,VOX_OPENCODE_ATTENTION_TOKEN=token,
+        VOX_OPENCODE_ATTENTION_ROUTE=route,VOX_OMP_INSTANCE=instance,VOX_OMP_GENERATION=generation)
+    for option,extra in (("--attention-register",[]),("--omp-check-uncertainty",[]),("--omp-prepare",["--format","opencode"])):
+        p=subprocess.run([os.environ["VOX_BIN"],"agent","hook","--node",os.environ["VOX_NODE"],"--session",sid,*extra,option],
+            env=env,input="commit\n" if option=="--omp-prepare" else "",text=True,capture_output=True)
+        print(sid+" "+option+" rc="+str(p.returncode)+" "+p.stderr,file=sys.stderr,flush=True)
+        if option=="--omp-prepare": continue
+        assert p.returncode==0,(option,p.stdout,p.stderr)
+        if option=="--omp-check-uncertainty": state["confirmed"]=True
+    deadline=time.monotonic()+30
+    while not conns and time.monotonic()<deadline: time.sleep(.1)
+    assert conns,"no subscribed bridge"
+    for line in sys.stdin:
+        try:
+            if line.strip()=="register": pass
+            else:
+                k=int(line); assert conns and watch.poll() is None
+                text=sid+" step "+str(k)+" "+"y"*400
+                conns[-1].sendall((json.dumps({"type":"event","event":{"type":"user" if k%2==0 else "reply","text":text}})+"\n").encode())
+            print(json.dumps({"session":sid}),flush=True)
+        except Exception as e: print(json.dumps({"kind":"apparatus","error":repr(e)}),flush=True)
+except Exception as e: print(json.dumps({"kind":"apparatus","error":repr(e)}),flush=True)
+"#;
+            use std::os::unix::process::CommandExt as _;
+            let scratch = tempfile::Builder::new()
+                .prefix("rg1-omp-")
+                .tempdir_in("/tmp")
+                .expect("APPARATUS: short Session scratch");
+            assert!(
+                scratch
+                    .path()
+                    .join("bridge")
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .len()
+                    < 104,
+                "APPARATUS: Session socket path exceeds Unix socket limit"
+            );
+            let session_id = format!("trial-session-{index:04}");
+            let mut cmd = Command::new("python3");
+            room::strip_harness_env(&mut cmd);
+            cmd.process_group(0);
+            let mut child = cmd
+                .args(["-u", "-c", HOST, &session_id])
+                .env("HOME", w.data.with_extension("home"))
+                .env("TMPDIR", scratch.path())
+                .env("VOX_BIN", &w.exe)
+                .env("VOX_NODE", &w.name)
+                .env("VOX_DATA_DIR", &w.data)
+                .env("VOX_CONFIG_DIR", &w.cfg)
+                .env("VOX_ROOM", id)
+                .env("VOX_PROXY", "127.0.0.1:0")
+                .env("VOX_LISTEN", "127.0.0.1:0")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::from(
+                    std::fs::File::create(w.data.with_extension(format!("session-{index}.err")))
+                        .expect("APPARATUS: Session stderr"),
+                ))
+                .spawn()
+                .expect("APPARATUS: start OMP Session stand-in");
+            let stdout = child.stdout.take().expect("APPARATUS: Session stdout");
+            let (tx, lines) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                    if tx.send(line).is_err() {
+                        break;
+                    }
+                }
+            });
+            let mut session = Self {
+                process: Daemon(child),
+                lines,
+                id: session_id,
+                scratch,
+            };
+            session.ask("register");
+            session
+        }
+
+        fn step(&mut self, n: usize) -> String {
+            self.ask(&n.to_string());
+            // `room session` abbreviates long bodies, but retains this event identity.
+            format!("{} step {n} ", self.id)
+        }
+    }
+
+    impl Drop for Session {
+        fn drop(&mut self) {
+            // EOF lets the stand-in reap the omp-watch process it owns.
+            drop(self.process.0.stdin.take());
+            let started = Instant::now();
+            loop {
+                match self.process.0.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) if started.elapsed() < Duration::from_secs(10) => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    _ => {
+                        // The unreaped owned child reserves this private group: stand-in + watcher.
+                        let _ = Command::new("/bin/bash")
+                            .args([
+                                "-c",
+                                "kill -KILL -- \"-$1\"",
+                                "rg1",
+                                &self.process.0.id().to_string(),
+                            ])
+                            .status();
+                        let _ = self.process.0.kill();
+                        break;
+                    }
+                }
+            }
+            let _ = self.process.0.wait();
+            let _ = std::fs::remove_file(self.scratch.path().join("bridge"));
+        }
+    }
+
+    struct PostRefusal {
+        number: u64,
+        at: Instant,
+        words: String,
+    }
+
+    #[derive(Default)]
+    struct LoadState {
+        // The immutable flag belongs to the offer, even if a pre-join command answers later.
+        acknowledged: BTreeMap<String, Vec<(String, bool)>>,
+        errors: Vec<String>,
+        refused_posts: BTreeMap<String, Vec<PostRefusal>>,
+        refused_joins: Vec<String>,
+        refused_commands: Vec<String>,
+        newcomer_create_started: Option<Instant>,
+        offered: BTreeMap<String, Vec<u128>>,
+        joined: bool,
+        steps: BTreeMap<String, usize>,
+    }
+
+    fn record_refused_post(
+        state: &mut LoadState,
+        author: &str,
+        number: u64,
+        at: Instant,
+        code: Option<i32>,
+        stdout: &str,
+        stderr: &str,
+    ) {
+        let words = format!("stdout:\n{stdout}\nstderr:\n{stderr}");
+        if code.is_none() || (stdout.trim().is_empty() && stderr.trim().is_empty()) {
+            state.errors.push(format!(
+                "author {author} post {number} ended without a product refusal (exit={code:?}); {words}"
+            ));
+        } else {
+            eprintln!("RED PRODUCT: author {author} post {number} refused; {words}");
+            state
+                .refused_posts
+                .entry(author.to_owned())
+                .or_default()
+                .push(PostRefusal { number, at, words });
+        }
+    }
+
+    fn refusal_summary(state: &Mutex<LoadState>) -> String {
+        let state = state.lock().expect("APPARATUS: load state");
+        let posts: usize = state.refused_posts.values().map(Vec::len).sum();
+        if state.refused_joins.is_empty() && posts == 0 && state.refused_commands.is_empty() {
+            return "no product refusals recorded".to_owned();
+        }
+        format!(
+            "also RED PRODUCT already recorded: refused {} joins {:?}; {posts} posts; {} commands",
+            state.refused_joins.len(),
+            state.refused_joins,
+            state.refused_commands.len()
+        )
+    }
+
+    struct Load {
+        stop: Arc<AtomicBool>,
+        threads: Vec<std::thread::JoinHandle<()>>,
+    }
+
+    impl Load {
+        fn finish(&mut self) -> bool {
+            self.stop.store(true, Ordering::SeqCst);
+            let mut healthy = true;
+            for thread in self.threads.drain(..) {
+                healthy &= thread.join().is_ok();
+            }
+            healthy
+        }
+    }
+
+    impl Drop for Load {
+        fn drop(&mut self) {
+            let _ = self.finish();
+        }
+    }
+
+    fn sleep(stop: &AtomicBool, duration: Duration) {
+        let started = Instant::now();
+        while !stop.load(Ordering::SeqCst) && started.elapsed() < duration {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn report_post_refusals(state: &Mutex<LoadState>) -> usize {
+        let state = state.lock().expect("APPARATUS: load state");
+        let mut count = 0;
+        for (author, refusals) in &state.refused_posts {
+            count += refusals.len();
+            if let Some(first) = refusals.iter().min_by_key(|refusal| refusal.at) {
+                let since_create_ms = state.newcomer_create_started.map(|created| {
+                    first.at.checked_duration_since(created).map_or_else(
+                        || -(created.duration_since(first.at).as_millis() as i128),
+                        |after| after.as_millis() as i128,
+                    )
+                });
+                eprintln!("RED PRODUCT: author {author}: {} posts refused; first_post={} \
+                    first_refusal_ms_from_newcomer_create_start={since_create_ms:?}; product words:\n{}",
+                    refusals.len(), first.number, first.words);
+            }
+            for refusal in refusals {
+                eprintln!(
+                    "[RG-1 refused post] author={author} post={} product words:\n{}",
+                    refusal.number, refusal.words
+                );
+            }
+        }
+        count
+    }
+
+    fn report_command_refusals(state: &Mutex<LoadState>) -> usize {
+        let state = state.lock().expect("APPARATUS: load state");
+        for refusal in &state.refused_commands {
+            eprintln!("RED PRODUCT: {refusal}");
+        }
+        state.refused_commands.len()
+    }
+
+    fn check_errors(state: &Mutex<LoadState>, staging: bool) {
+        let errors = std::mem::take(&mut state.lock().expect("APPARATUS: load state").errors);
+        assert!(
+            errors.is_empty(),
+            "RED APPARATUS: posting processes failed (staging={staging}): {errors:?}; {}",
+            refusal_summary(state)
+        );
+    }
+
+    fn check_load(load: &Load, state: &Mutex<LoadState>, staging: bool) {
+        check_errors(state, staging);
+        assert!(
+            load.threads.iter().all(|thread| !thread.is_finished()),
+            "APPARATUS: a posting or Session thread stopped; {}",
+            refusal_summary(state)
+        );
+        check_cadence(state);
+    }
+
+    fn check_cadence(state: &Mutex<LoadState>) {
+        let bad = {
+            let state = state.lock().expect("APPARATUS: load state");
+            state
+                .offered
+                .iter()
+                .find(|(_, times)| {
+                    times
+                        .windows(2)
+                        .any(|pair| !(750..=1250).contains(&(pair[1] - pair[0])))
+                })
+                .map(|(author, times)| (author.clone(), times.clone()))
+        };
+        assert!(
+            bad.is_none(),
+            "APPARATUS: offered cadence was not one second: {bad:?}; {}",
+            refusal_summary(state)
+        );
+    }
+
+    fn post_count(state: &LoadState, author: &str) -> usize {
+        state
+            .acknowledged
+            .get(author)
+            .into_iter()
+            .flatten()
+            .filter(|(_, after_join)| *after_join)
+            .count()
+    }
+
+    fn poster(
+        w: Arc<Worker>,
+        id: String,
+        state: Arc<Mutex<LoadState>>,
+        stop: Arc<AtomicBool>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            std::thread::scope(|scope| {
+                let started = Instant::now();
+                let mut replies = Vec::new();
+                let mut n = 0;
+                while !stop.load(Ordering::SeqCst) {
+                    sleep(
+                        &stop,
+                        (started + Duration::from_secs(n))
+                            .saturating_duration_since(Instant::now()),
+                    );
+                    if stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    n += 1;
+                    let text = format!("load {} {n:05}", w.name);
+                    let after_join = state.lock().expect("APPARATUS: load state").joined;
+                    let node = w
+                        .paths
+                        .profile_dir
+                        .file_name()
+                        .expect("APPARATUS: posting node");
+                    let mut cmd = Command::new(&w.exe);
+                    room::strip_harness_env(&mut cmd);
+                    cmd.args(["room", "post", &id, &text, "--node"])
+                        .arg(node)
+                        .env("VOX_DATA_DIR", &w.data)
+                        .env("VOX_CONFIG_DIR", &w.cfg)
+                        .env("VOX_PROXY", "127.0.0.1:0")
+                        .env("HOME", w.data.with_extension("home"))
+                        .env("VOX_LISTEN", "127.0.0.1:0")
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped());
+                    let offered = Instant::now();
+                    let child = match cmd.spawn() {
+                        Ok(child) => child,
+                        Err(error) => {
+                            state
+                                .lock()
+                                .expect("APPARATUS: load state")
+                                .errors
+                                .push(format!("{} could not offer post {n}: {error}", w.name));
+                            break;
+                        }
+                    };
+                    let offered_ms = offered.duration_since(started).as_millis();
+                    state
+                        .lock()
+                        .expect("APPARATUS: load state")
+                        .offered
+                        .entry(w.name.clone())
+                        .or_default()
+                        .push(offered_ms);
+                    eprintln!(
+                        "[RG-1 offer] author={} post={n} pid={} offered_ms={offered_ms} \
+                    data={} config={} command={} room post {id} {text} --node {}",
+                        w.name,
+                        child.id(),
+                        w.data.display(),
+                        w.cfg.display(),
+                        w.exe,
+                        node.to_string_lossy()
+                    );
+                    let (w, state) = (Arc::clone(&w), Arc::clone(&state));
+                    // Waiting for one answer never holds up the next scheduled process.
+                    replies.push(scope.spawn(move || {
+                        let out = child.wait_with_output();
+                        let answered = Instant::now();
+                        let mut state = state.lock().expect("APPARATUS: load state");
+                        match out {
+                            Ok(out) => {
+                                eprintln!(
+                                    "[RG-1 ack] author={} post={n} offered_ms={offered_ms} \
+                                acknowledged_ms={} lag_ms={} exit={} stdout={} stderr={}",
+                                    w.name,
+                                    answered.duration_since(started).as_millis(),
+                                    answered.duration_since(offered).as_millis(),
+                                    out.status,
+                                    String::from_utf8_lossy(&out.stdout),
+                                    String::from_utf8_lossy(&out.stderr)
+                                );
+                                if out.status.success() {
+                                    state
+                                        .acknowledged
+                                        .entry(w.name.clone())
+                                        .or_default()
+                                        .push((text, after_join));
+                                } else {
+                                    record_refused_post(
+                                        &mut state,
+                                        &w.name,
+                                        n,
+                                        answered,
+                                        out.status.code(),
+                                        &String::from_utf8_lossy(&out.stdout),
+                                        &String::from_utf8_lossy(&out.stderr),
+                                    );
+                                }
+                            }
+                            Err(error) => state.errors.push(format!(
+                                "{} post {n} answer could not be collected: {error}",
+                                w.name
+                            )),
+                        }
+                    }));
+                }
+                let mut healthy = true;
+                for reply in replies {
+                    healthy &= reply.join().is_ok();
+                }
+                if !healthy {
+                    state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .errors
+                        .push(format!("{}'s post collector stopped", w.name));
+                }
+            })
+        })
+    }
+
+    fn load(
+        workers: &[Arc<Worker>],
+        slow: &Arc<Worker>,
+        id: &str,
+        state: Arc<Mutex<LoadState>>,
+    ) -> Load {
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut load = Load {
+            stop: Arc::clone(&stop),
+            threads: Vec::new(),
+        };
+        for w in workers {
+            load.threads.push(poster(
+                Arc::clone(w),
+                id.to_owned(),
+                Arc::clone(&state),
+                Arc::clone(&stop),
+            ));
+        }
+        for index in 0..3 {
+            let w = slow;
+            let mut session = Session::start(w, id, index);
+            let text = session.step(0);
+            let started = Instant::now();
+            loop {
+                let out = w.vox(None, &["room", "session", id, &session.id]);
+                if out.ok && out.stdout.contains(&text) {
+                    break;
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(120),
+                    "APPARATUS: {}'s Session did not step: {out:?}",
+                    w.name
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            eprintln!("[RG-1] Session {} step 0 shown by product", session.id);
+            let (state, stop) = (Arc::clone(&state), Arc::clone(&stop));
+            load.threads.push(std::thread::spawn(move || {
+                let mut n = 0;
+                while !stop.load(Ordering::SeqCst) {
+                    let at = Instant::now();
+                    n += 1;
+                    session.step(n);
+                    *state
+                        .lock()
+                        .expect("APPARATUS: load state")
+                        .steps
+                        .entry(session.id.clone())
+                        .or_default() += 1;
+                    sleep(&stop, Duration::from_secs(1).saturating_sub(at.elapsed()));
+                }
+            }));
+        }
+        load
+    }
+
+    struct Pauses {
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+        cycles: Arc<AtomicUsize>,
+        pid: u32,
+    }
+
+    fn signal(pid: u32, name: &str) {
+        let out = Command::new("kill")
+            .args([name, &pid.to_string()])
+            .output()
+            .expect("APPARATUS: signal owned daemon");
+        assert!(
+            out.status.success(),
+            "APPARATUS: {name} owned pid {pid}: {out:?}"
+        );
+    }
+
+    impl Pauses {
+        fn start(pid: u32) -> Self {
+            let stop = Arc::new(AtomicBool::new(false));
+            let cycles = Arc::new(AtomicUsize::new(0));
+            let (stopped, observed) = (Arc::clone(&stop), Arc::clone(&cycles));
+            let thread = std::thread::spawn(move || {
+                while !stopped.load(Ordering::SeqCst) {
+                    signal(pid, "-STOP");
+                    let out = Command::new("ps")
+                        .args(["-o", "stat=", "-p", &pid.to_string()])
+                        .output();
+                    let paused = out.as_ref().is_ok_and(|out| {
+                        out.status.success() && String::from_utf8_lossy(&out.stdout).contains('T')
+                    });
+                    if !paused {
+                        resume(pid);
+                    }
+                    assert!(
+                        paused,
+                        "APPARATUS: owned serving pid {pid} was not stopped: {out:?}"
+                    );
+                    let at = Instant::now();
+                    sleep(&stopped, Duration::from_millis(1500));
+                    signal(pid, "-CONT");
+                    if !stopped.load(Ordering::SeqCst) {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        eprintln!(
+                            "[RG-1 slow] serving_pid={pid} observed_state=T paused_ms={}",
+                            at.elapsed().as_millis()
+                        );
+                    }
+                    sleep(&stopped, Duration::from_millis(1500));
+                }
+            });
+            Self {
+                stop,
+                thread: Some(thread),
+                cycles,
+                pid,
+            }
+        }
+    }
+
+    impl Drop for Pauses {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+            resume(self.pid);
+        }
+    }
+
+    fn resume(pid: u32) {
+        // Cleanup must not panic while another verdict is unwinding.
+        let _ = Command::new("kill")
+            .args(["-CONT", &pid.to_string()])
+            .output();
+    }
+
+    fn check_slow(pauses: &Option<Pauses>, daemon: &mut Daemon, state: &Mutex<LoadState>) {
+        assert!(
+            pauses.as_ref().is_none_or(|pause| pause
+                .thread
+                .as_ref()
+                .is_some_and(|thread| !thread.is_finished())),
+            "APPARATUS: the slow-member pause thread stopped; {}",
+            refusal_summary(state)
+        );
+        let exited = daemon.0.try_wait().unwrap_or_else(|error| {
+            panic!(
+                "APPARATUS: observe slow serving daemon: {error}; {}",
+                refusal_summary(state)
+            )
+        });
+        assert!(
+            exited.is_none(),
+            "APPARATUS: slow serving daemon exited: {exited:?}; {}",
+            refusal_summary(state)
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn join(
+        w: &Worker,
+        link: &str,
+        via: &str,
+        pauses: &Option<Pauses>,
+        slow: &mut Daemon,
+        load: &Load,
+        state: &Mutex<LoadState>,
+    ) -> bool {
+        check_slow(pauses, slow, state);
+        check_load(load, state, true);
+        let started = Instant::now();
+        let suffix = w.name.strip_prefix("n-").unwrap_or(&w.name);
+        let bind = w
+            .data
+            .parent()
+            .expect("APPARATUS: computer root")
+            .join(format!("repo-{suffix}"));
+        std::fs::create_dir_all(&bind).expect("APPARATUS: join bind directory");
+        let out = w.vox_in(
+            None,
+            &[
+                "room",
+                "join",
+                "--bind",
+                bind.to_str().expect("APPARATUS: bind UTF-8"),
+                "--passphrase-file",
+                "-",
+                link,
+            ],
+            Some(room::ROOM_PASS),
+        );
+        if !out.ok {
+            state
+                .lock()
+                .expect("APPARATUS: load state")
+                .refused_joins
+                .push(w.name.clone());
+            eprintln!(
+                "RED PRODUCT: {}'s join through {via} was refused; join={:?}; \
+                product stdout:\n{}\nproduct stderr:\n{}",
+                w.name,
+                started.elapsed(),
+                out.stdout,
+                out.stderr
+            );
+        } else {
+            eprintln!("[RG-1 join] {} admitted in {:?}", w.name, started.elapsed());
+        }
+        check_slow(pauses, slow, state);
+        assert!(
+            load.threads.iter().all(|thread| !thread.is_finished()),
+            "APPARATUS: posting or Session thread stopped during {}'s join; {}",
+            w.name,
+            refusal_summary(state)
+        );
+        check_cadence(state);
+        out.ok
+    }
+
+    fn status(w: &Worker, id: &str) -> Value {
+        try_status(w, id, None).unwrap_or_else(|why| panic!("RED PRODUCT: {why}"))
+    }
+
+    fn try_status(w: &Worker, id: &str, state: Option<&Mutex<LoadState>>) -> Result<Value, String> {
+        let out = w.vox(None, &["status", "--json"]);
+        check_observation_process(&w.name, "status", out.code, &out.stdout, &out.stderr, state)?;
+        if !out.ok {
+            return Err(format!("{}'s status refused: {out:?}", w.name));
+        }
+        let report: Value = serde_json::from_str(&out.stdout)
+            .map_err(|error| format!("{}'s status is not JSON: {error}; {out:?}", w.name))?;
+        report["rooms"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["id"].as_str() == Some(id)))
+            .cloned()
+            .ok_or_else(|| format!("{} does not report joined room: {report}", w.name))
+    }
+
+    fn member<'a>(status: &'a Value, fp: &str) -> Option<&'a Value> {
+        status["members"]
+            .as_array()?
+            .iter()
+            .find(|row| row["id"].as_str() == Some(fp))
+    }
+
+    /// Needs the authenticated contiguous verified position, not every retained sparse copy.
+    /// RG-7 names this `verified_through`; only the paged read establishes showability.
+    fn held_position(status: &Value, author: &str) -> Option<u64> {
+        member(status, author)?["holds_through"].as_u64()
+    }
+
+    fn doctor(
+        w: &Worker,
+        id: &str,
+        name: &str,
+        state: &Mutex<LoadState>,
+    ) -> Result<(bool, Value), String> {
+        let out = w.vox(None, &["agent", "doctor", "--room", id, "--json"]);
+        check_observation_process(
+            &w.name,
+            "agent doctor",
+            out.code,
+            &out.stdout,
+            &out.stderr,
+            Some(state),
+        )?;
+        // A nonzero doctor exit can report unrelated failed harness hooks; its JSON still carries trust.
+        let report: Value = serde_json::from_str(&out.stdout)
+            .map_err(|error| format!("{}'s doctor is not JSON: {error}; {out:?}", w.name))?;
+        let trust = format!("trust {name}");
+        let applied = report["checks"].as_array().is_some_and(|checks| {
+            checks.iter().any(|row| {
+                row["check"].as_str() == Some(&trust)
+                    && row["detail"]
+                        .as_str()
+                        .is_some_and(|s| s.contains("you trust each other"))
+            })
+        });
+        Ok((applied, report))
+    }
+
+    #[derive(Default, Debug)]
+    struct Timeline {
+        held: Option<usize>,
+        grant: Option<usize>,
+        key: Option<usize>,
+        shown: Option<usize>,
+    }
+
+    /// A post's acknowledged feed fence and the exact displayed text identify each direction.
+    #[allow(clippy::too_many_arguments)]
+    fn observe(
+        source: &Worker,
+        target: &Worker,
+        id: &str,
+        marker: &str,
+        through: u64,
+        posted: usize,
+        timeline: &mut Timeline,
+        since: Instant,
+        state: &Mutex<LoadState>,
+    ) -> Result<(), String> {
+        let source_status = try_status(source, id, Some(state))?;
+        let target_status = try_status(target, id, Some(state))?;
+        let (grant, doctor) = doctor(source, id, &target.name, state)?;
+        let held = held_position(&target_status, &source.b32()).is_some_and(|n| n >= through);
+        let key = member(&source_status, &target.b32())
+            .is_some_and(|row| row["key_delivery_pending"] == false);
+        let (texts, pages, _) = try_read(target, id, Some(marker), Some(state))?;
+        // A later acknowledged post still proves this direction; convergence checks the anchor too.
+        let shown_post = if texts.contains(marker) {
+            Some(marker.to_owned())
+        } else {
+            state
+                .lock()
+                .expect("APPARATUS: load state")
+                .acknowledged
+                .get(&source.name)
+                .into_iter()
+                .flatten()
+                .find(|(text, after)| *after && texts.contains(text))
+                .map(|(text, _)| text.clone())
+        };
+        let shown = shown_post.is_some();
+        for (name, yes, slot) in [
+            ("contiguous_verified", held, &mut timeline.held),
+            ("mutual_room_trust", grant, &mut timeline.grant),
+            ("no_key_owed", key, &mut timeline.key),
+            ("shown", shown, &mut timeline.shown),
+        ] {
+            if yes && slot.is_none() {
+                *slot = Some(posted);
+                eprintln!(
+                    "[RG-1 FIRST] {}->{} {name} at_post={posted} join_ms={}",
+                    source.name,
+                    target.name,
+                    since.elapsed().as_millis()
+                );
+            }
+        }
+        eprintln!(
+            "[RG-1 timeline] {}",
+            json!({
+                "source": source.name, "target": target.name, "post": marker,
+                "feed_through": through, "posts_since_join": posted, "pages": pages,
+                "join_ms": since.elapsed().as_millis(), "source_status": source_status,
+                "target_status": target_status, "doctor": doctor,
+                "contiguous_verified": held, "mutual_room_trust": grant,
+                "no_key_owed": key, "shown": shown, "shown_post": shown_post
+            })
+        );
+        Ok(())
+    }
+
+    fn pair(inviter: &Worker, invitee: &Worker) {
+        let invite = inviter.vox(None, &["computer", "invite", "--json"]);
+        invite.expect_ok("computer invite");
+        let invitation = invite.json();
+        let link = invitation["invite_link"]
+            .as_str()
+            .expect("APPARATUS: computer invitation");
+        let paired = invitee.vox_in(None, &["computer", "pair", link, "--json"], Some("yes\n"));
+        paired.expect_ok("computer pair");
+        let paired = paired.json();
+        let op = paired["pairing"]["operation_id"]
+            .as_str()
+            .expect("APPARATUS: pairing operation");
+        inviter
+            .vox(None, &["computer", "approve", op, "--json"])
+            .expect_ok("computer approval");
+        let started = Instant::now();
+        loop {
+            let a = inviter.vox(None, &["computer", "status", "--json"]).json();
+            let b = invitee.vox(None, &["computer", "status", "--json"]).json();
+            eprintln!(
+                "[RG-1 pairing] {}={} {}={}",
+                inviter.name, a, invitee.name, b
+            );
+            if a["state"] == "confirmed" && b["state"] == "confirmed" {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(120),
+                "APPARATUS: pairing not confirmed"
+            );
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+
+    pub(super) fn journey(delayed: bool) {
+        let root = root();
+        free_disk(root.path());
+        let exe = binary();
+        let (_anchor, anchor) = room::spawn_anchor_as(root.path(), &exe, "127.0.0.1:0", "anchor");
+        let forward =
+            delayed.then(|| port_forward::PortForward::start(world::spec_addr(&anchor), true));
+        let olds: Vec<_> = (1..=6)
+            .map(|n| {
+                Arc::new(room::named_worker_as(
+                    root.path(),
+                    "X",
+                    &format!("n-old{n}"),
+                    &exe,
+                ))
+            })
+            .collect();
+        let sib = Arc::new(room::named_worker_as(root.path(), "X", "sib", &exe));
+        let x = start(&olds[0], "127.0.0.1:0", Some(&anchor));
+        let slow = Arc::new(room::named_worker_as(root.path(), "Y", "y1", &exe));
+        let slow_anchor = forward.as_ref().map(|f| world::respec(&anchor, f.public));
+        let y = start(
+            &slow,
+            if delayed { "[::1]:0" } else { "127.0.0.1:0" },
+            Some(slow_anchor.as_deref().unwrap_or(&anchor)),
+        );
+        let fast = Arc::new(room::named_worker_as(root.path(), "Z", "z1", &exe));
+        let z = start(&fast, "127.0.0.1:0", Some(&anchor));
+        let sibw = Arc::new(room::named_worker_as(root.path(), "W", "sibw", &exe));
+        let w = start(&sibw, "127.0.0.1:0", Some(&anchor));
+        let computers = [&sib, &slow, &fast, &sibw];
+        let mut workers = vec![Arc::clone(&fast), Arc::clone(&slow)];
+        workers.extend(olds.iter().map(Arc::clone));
+        let mut daemons = [x, y, z, w];
+        let ready = sib.vox(None, &["node", "list"]);
+        assert!(
+            ready.ok && ready.stdout.matches("Ready").count() == 7,
+            "APPARATUS: X's seven siblings are not Ready: {ready:?}"
+        );
+        for w in computers {
+            w.vox(None, &["computer", "personal", &w.name, "--json"])
+                .expect_ok("personal computer node");
+        }
+        for w in [&slow, &fast, &sibw] {
+            pair(&sib, w);
+        }
+        let id = create(&slow);
+        let link = slow.vox(None, &["room", "link", &id]);
+        link.expect_ok("slow member room link");
+        let link = link.stdout.trim().to_owned();
+        fast.vox_in(
+            None,
+            &["room", "join", "--passphrase-file", "-", &link],
+            Some(room::ROOM_PASS),
+        )
+        .expect_ok("initial fast member join");
+        let link = fast.vox(None, &["room", "link", &id]);
+        link.expect_ok("fast member room link");
+        let link = link.stdout.trim().to_owned();
+        let mut acknowledged = BTreeSet::new();
+        std::thread::scope(|scope| {
+            for (parity, w) in [(0, &fast), (1, &slow)] {
+                let id = &id;
+                scope.spawn(move || {
+                    for n in (parity..3000).step_by(2) {
+                        post(w, id, &format!("seed {n:05} {}", "x".repeat(120)), true);
+                    }
+                });
+            }
+        });
+        for n in 0..3000 {
+            acknowledged.insert(format!("seed {n:05} {}", "x".repeat(120)));
+        }
+        for (parity, w) in [(0, &fast), (1, &slow)] {
+            let (shown, pages, _) = read(w, &id, None);
+            assert!(
+                (parity..3000)
+                    .step_by(2)
+                    .all(|n| shown.contains(&format!("seed {n:05} {}", "x".repeat(120)))),
+                "APPARATUS: own half of 3,000 seeded posts not shown by {}",
+                w.name
+            );
+            eprintln!("[RG-1 seed] {} own1500 shown pages={pages}", w.name);
+        }
+        let state = Arc::new(Mutex::new(LoadState::default()));
+        let authors = [Arc::clone(&fast), Arc::clone(&slow)];
+        let mut load = load(&authors, &slow, &id, Arc::clone(&state));
+        std::thread::sleep(Duration::from_secs(3));
+        let no_pause = std::env::var("VOX_PROOF_RG1_NO_PAUSE").as_deref() == Ok("1");
+        if no_pause {
+            eprintln!("[RG-1 apparatus smoke] pause disabled; never a requirement verdict");
+        }
+        let pauses = if delayed {
+            let forward = forward.as_ref().expect("delayed forward");
+            forward.set_delay(Duration::from_millis(350));
+            let at = Instant::now();
+            forward.open_and_verify();
+            assert!(
+                at.elapsed() >= Duration::from_millis(300),
+                "APPARATUS: path delay below 300 ms"
+            );
+            let started = Instant::now();
+            loop {
+                let report = workers[1].vox(None, &["status", "--json"]).json();
+                let slow = report["peers"].as_array().is_some_and(|peers| {
+                    peers
+                        .iter()
+                        .any(|peer| peer["rtt_ms"].as_u64().is_some_and(|ms| ms >= 300))
+                });
+                if slow && forward.to_host() > 0 && forward.to_guest() > 0 {
+                    eprintln!("[RG-1 slow] delayed only path, 350ms/datagram; product={report}");
+                    break;
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(120),
+                    "APPARATUS: slow member's product RTT not attained: {report}"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            None
+        } else if no_pause {
+            None
+        } else {
+            let pauses = Pauses::start(daemons[1].0.id());
+            while pauses.cycles.load(Ordering::SeqCst) == 0 {
+                assert!(
+                    !pauses.thread.as_ref().expect("pause thread").is_finished(),
+                    "APPARATUS: serving-pid pause not attained"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Some(pauses)
+        };
+        let staging = Instant::now();
+        loop {
+            check_slow(&pauses, &mut daemons[1], &state);
+            check_load(&load, &state, true);
+            let ready = {
+                let state = state.lock().expect("APPARATUS: load state");
+                state.steps.len() == 3
+                    && state.steps.values().all(|n| *n > 0)
+                    && authors.iter().all(|w| {
+                        state
+                            .offered
+                            .get(&w.name)
+                            .is_some_and(|times| times.len() >= 3)
+                    })
+            };
+            if ready {
+                break;
+            }
+            assert!(
+                staging.elapsed() < Duration::from_secs(120),
+                "APPARATUS: three one-second authors with stepping Sessions not attained"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        for index in 0..3 {
+            let w = &slow;
+            let started = Instant::now();
+            let session = format!("trial-session-{index:04}");
+            let prefix = format!("{session} step ");
+            loop {
+                let out = w.vox(None, &["room", "session", &id, &session]);
+                let stepping = out.stdout.split(&prefix).skip(1).any(|tail| {
+                    tail.chars()
+                        .take_while(char::is_ascii_digit)
+                        .collect::<String>()
+                        .parse::<usize>()
+                        .is_ok_and(|n| n > 0)
+                });
+                if out.ok && stepping {
+                    eprintln!("[RG-1] {session} continued steps shown by product");
+                    break;
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(120),
+                    "APPARATUS: continuing Session steps not attained: {out:?}"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+        eprintln!("[RG-1 staged before late joins] 3000 entries; y1/z1 offer1/s; three OMP Sessions on y1; daemons=4 anchor_processes=1");
+        for (n, w) in olds.iter().enumerate() {
+            if join(w, &link, "fast z1", &pauses, &mut daemons[1], &load, &state) {
+                let hello = format!("hello from {}", w.name);
+                let out = w.vox(None, &["room", "post", &id, &hello]);
+                if out.ok {
+                    acknowledged.insert(hello);
+                } else {
+                    record_refused_post(
+                        &mut state.lock().expect("APPARATUS: load state"),
+                        &w.name,
+                        0,
+                        Instant::now(),
+                        out.code,
+                        &out.stdout,
+                        &out.stderr,
+                    );
+                }
+                if n == 0 {
+                    load.threads.push(poster(
+                        Arc::clone(w),
+                        id.clone(),
+                        Arc::clone(&state),
+                        Arc::clone(&load.stop),
+                    ));
+                }
+            }
+            if n < 5 {
+                std::thread::sleep(Duration::from_secs(10));
+            }
+        }
+        let refusals = state
+            .lock()
+            .expect("APPARATUS: load state")
+            .refused_joins
+            .clone();
+        std::thread::sleep(Duration::from_secs(30));
+        for w in workers.iter().filter(|w| !refusals.contains(&w.name)) {
+            eprintln!("[RG-1 before create] {} {}", w.name, status(w, &id));
+        }
+        eprintln!(
+            "[RG-1 before create doctor] {:?}",
+            olds[0].vox(None, &["agent", "doctor", "--room", &id, "--json"])
+        );
+        // Match the prototype's product polling load during creation and the join.
+        let newcomer = Arc::new(Mutex::new(None::<Arc<Worker>>));
+        let (sample_workers, sample_new, sample_id, sample_stop) = (
+            vec![Arc::clone(&slow), Arc::clone(&olds[0]), Arc::clone(&fast)],
+            Arc::clone(&newcomer),
+            id.clone(),
+            Arc::clone(&load.stop),
+        );
+        load.threads.push(std::thread::spawn(move || {
+            let mut round = 0;
+            while !sample_stop.load(Ordering::SeqCst) {
+                let at = Instant::now();
+                let mut observed = sample_workers.clone();
+                if let Some(w) = sample_new
+                    .lock()
+                    .expect("APPARATUS: sampler newcomer")
+                    .as_ref()
+                {
+                    observed.insert(0, Arc::clone(w));
+                }
+                for w in observed {
+                    let s = w.vox(None, &["status", "--json"]);
+                    eprintln!("[RG-1 admission sample] member={} status={s:?}", w.name);
+                    sample_read(&w, &sample_id);
+                    if round % 10 == 0 && (w.name == "y1" || w.name == "n-new") {
+                        eprintln!(
+                            "[RG-1 admission doctor] member={} {:?}",
+                            w.name,
+                            w.vox(None, &["agent", "doctor", "--room", &sample_id, "--json"])
+                        );
+                    }
+                }
+                round += 1;
+                sleep(
+                    &sample_stop,
+                    Duration::from_secs(1).saturating_sub(at.elapsed()),
+                );
+            }
+        }));
+        let created = Instant::now();
+        state
+            .lock()
+            .expect("APPARATUS: load state")
+            .newcomer_create_started = Some(created);
+        eprintln!("[RG-1 newcomer] node create started");
+        let new = Arc::new(room::named_worker_as(root.path(), "W", "n-new", &exe));
+        let newcomer_created = Instant::now();
+        eprintln!(
+            "[RG-1 newcomer] node create completed elapsed_ms={}",
+            created.elapsed().as_millis()
+        );
+        *newcomer.lock().expect("APPARATUS: sampler newcomer") = Some(Arc::clone(&new));
+        workers.push(Arc::clone(&new));
+        std::thread::sleep(Duration::from_secs(2));
+        for w in computers {
+            eprintln!(
+                "[RG-1 revisions after create] {} {:?}",
+                w.name,
+                w.vox(None, &["computer", "status", "--json"])
+            );
+        }
+        for w in [&slow, &new] {
+            eprintln!(
+                "[RG-1 trust after create] {} {:?}",
+                w.name,
+                w.vox(None, &["trust", "list"])
+            );
+        }
+        std::thread::sleep(Duration::from_secs(8).saturating_sub(created.elapsed()));
+        let fresh_link = fast.vox(None, &["room", "link", &id]);
+        let newcomer_link = if fresh_link.ok {
+            fresh_link.stdout.trim()
+        } else {
+            let words = format!(
+                "fresh room link from fast z1 refused; ms_from_newcomer_create_start={} \
+                 ms_after_newcomer_create_completed={}; product stdout:\n{}\nproduct stderr:\n{}",
+                created.elapsed().as_millis(),
+                newcomer_created.elapsed().as_millis(),
+                fresh_link.stdout,
+                fresh_link.stderr
+            );
+            let mut state = state.lock().expect("APPARATUS: load state");
+            if fresh_link.code.is_none()
+                || (fresh_link.stdout.trim().is_empty() && fresh_link.stderr.trim().is_empty())
+            {
+                state.errors.push(format!(
+                    "room-link process ended without a complete product refusal: {fresh_link:?}"
+                ));
+            } else {
+                eprintln!("RED PRODUCT: {words}");
+                state.refused_commands.push(words);
+            }
+            // Same admitting member, same already-successful link; the refused command is not retried.
+            link.as_str()
+        };
+        let join_started = Instant::now();
+        let newcomer_admitted = join(
+            &new,
+            newcomer_link,
+            "fast z1",
+            &pauses,
+            &mut daemons[1],
+            &load,
+            &state,
+        );
+        let refusals = state
+            .lock()
+            .expect("APPARATUS: load state")
+            .refused_joins
+            .clone();
+        check_slow(&pauses, &mut daemons[1], &state);
+        eprintln!(
+            "[RG-1 admission] refused {} of 7 joins: {refusals:?}",
+            refusals.len()
+        );
+        if !newcomer_admitted {
+            let healthy = load.finish();
+            let refused_posts = report_post_refusals(&state);
+            let refused_commands = report_command_refusals(&state);
+            check_slow(&pauses, &mut daemons[1], &state);
+            check_errors(&state, true);
+            assert!(
+                healthy,
+                "APPARATUS: admission collection stopped; {}",
+                refusal_summary(&state)
+            );
+            panic!(
+                "RED PRODUCT: apparatus_smoke={no_pause}; refused {} of 7 joins: {refusals:?}; {refused_posts} posts refused; \
+                {refused_commands} other commands refused; newcomer was refused; \
+                each member/author/post/command/refusal is quoted above",
+                refusals.len()
+            );
+        }
+        // Only admitted people are room members; their earlier refusals remain in the verdict.
+        workers.retain(|w| !refusals.contains(&w.name));
+        eprintln!(
+            "[RG-1 admission] newcomer admitted; continuing with {} members",
+            workers.len()
+        );
+        state.lock().expect("APPARATUS: load state").joined = true;
+        if no_pause {
+            eprintln!(
+                "[RG-1 apparatus smoke] post-admission path entered; never a requirement verdict"
+            );
+        }
+        // Every admitted person keeps offering posts, including after a refused post.
+        for w in &workers {
+            let posting = state
+                .lock()
+                .expect("APPARATUS: load state")
+                .offered
+                .contains_key(&w.name);
+            if !posting {
+                load.threads.push(poster(
+                    Arc::clone(w),
+                    id.clone(),
+                    Arc::clone(&state),
+                    Arc::clone(&load.stop),
+                ));
+            }
+        }
+        let joined = Instant::now();
+        let new_index = workers.len() - 1;
+        // Anchor each direction on its first acknowledged post, never on a refused marker.
+        let mut markers: Vec<Option<(String, u64)>> = vec![None; workers.len()];
+        let mut toward_new: Vec<Timeline> = (0..new_index).map(|_| Timeline::default()).collect();
+        let mut from_new: Vec<Timeline> = (0..new_index).map(|_| Timeline::default()).collect();
+        let mut tail_failure = None::<String>;
+        'timeline: loop {
+            check_slow(&pauses, &mut daemons[1], &state);
+            check_load(&load, &state, false);
+            for (n, w) in workers.iter().enumerate() {
+                if markers[n].is_none() {
+                    let (text, refused, total) = {
+                        let state = state.lock().expect("APPARATUS: load state");
+                        let text = state
+                            .acknowledged
+                            .get(&w.name)
+                            .and_then(|rows| rows.iter().find(|(_, after)| *after))
+                            .map(|(text, _)| text.clone());
+                        let refused = state
+                            .refused_posts
+                            .get(&w.name)
+                            .into_iter()
+                            .flatten()
+                            .filter(|refusal| refusal.at >= joined)
+                            .count();
+                        let total = post_count(&state, &w.name) + refused;
+                        (text, refused, total)
+                    };
+                    if text.is_none() && total >= 100 {
+                        tail_failure = Some(format!(
+                            "{}: {refused} of {total} posts since join refused, none acknowledged",
+                            w.name
+                        ));
+                        break 'timeline;
+                    }
+                    if let Some(text) = text {
+                        let report = match try_status(w, &id, Some(&state)) {
+                            Ok(report) => report,
+                            Err(why) => {
+                                tail_failure = Some(why);
+                                break 'timeline;
+                            }
+                        };
+                        let Some(through) = report["own_feed_through"].as_u64() else {
+                            tail_failure = Some(format!(
+                                "{}'s acknowledged post has no feed fence: {report}",
+                                w.name
+                            ));
+                            break 'timeline;
+                        };
+                        markers[n] = Some((text, through));
+                    }
+                }
+            }
+            let Some((new_marker, new_through)) = markers[new_index].as_ref() else {
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            };
+            for n in 0..new_index {
+                let Some((marker, through)) = markers[n].as_ref() else {
+                    continue;
+                };
+                let count = post_count(
+                    &state.lock().expect("APPARATUS: load state"),
+                    &workers[n].name,
+                );
+                let new_count =
+                    post_count(&state.lock().expect("APPARATUS: load state"), &new.name);
+                if let Err(why) = observe(
+                    &workers[n],
+                    &new,
+                    &id,
+                    marker,
+                    *through,
+                    count,
+                    &mut toward_new[n],
+                    joined,
+                    &state,
+                )
+                .and_then(|()| {
+                    observe(
+                        &new,
+                        &workers[n],
+                        &id,
+                        new_marker,
+                        *new_through,
+                        new_count,
+                        &mut from_new[n],
+                        joined,
+                        &state,
+                    )
+                }) {
+                    tail_failure = Some(why);
+                    break 'timeline;
+                }
+                for (source, target, marker, marks) in [
+                    (workers[n].as_ref(), new.as_ref(), marker, &toward_new[n]),
+                    (new.as_ref(), workers[n].as_ref(), new_marker, &from_new[n]),
+                ] {
+                    let count =
+                        post_count(&state.lock().expect("APPARATUS: load state"), &source.name);
+                    if count >= 100 {
+                        let shown = match try_read(target, &id, None, Some(&state)) {
+                            Ok((shown, _, _)) => shown,
+                            Err(why) => {
+                                tail_failure = Some(why);
+                                break 'timeline;
+                            }
+                        };
+                        let has_live_post = state
+                            .lock()
+                            .expect("APPARATUS: load state")
+                            .acknowledged
+                            .get(&source.name)
+                            .into_iter()
+                            .flatten()
+                            .any(|(text, after_join)| *after_join && shown.contains(text));
+                        check_slow(&pauses, &mut daemons[1], &state);
+                        if !shown.contains(marker) && !has_live_post {
+                            tail_failure = Some(format!(
+                                "{} acknowledged {count} posts since join; {} shows none; \
+                                observed/unobserved marks (independent, not prerequisites)={marks:?}",
+                                source.name, target.name));
+                            break 'timeline;
+                        }
+                    }
+                }
+            }
+            if toward_new
+                .iter()
+                .chain(&from_new)
+                .all(|t| t.shown.is_some())
+            {
+                break;
+            }
+            if markers[..new_index].iter().all(Option::is_none) {
+                // No direction is ready for an observation yet; avoid an all-refused busy loop.
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+        check_slow(&pauses, &mut daemons[1], &state);
+        assert!(
+            load.finish(),
+            "APPARATUS: a load thread stopped while final answers were collected; {}",
+            refusal_summary(&state)
+        );
+        drop(load);
+        check_errors(&state, false);
+        for texts in state
+            .lock()
+            .expect("APPARATUS: load state")
+            .acknowledged
+            .values()
+        {
+            acknowledged.extend(texts.iter().map(|(text, _)| text.clone()));
+        }
+        // Keep the slow condition in force through convergence; no elapsed-time verdict.
+        // Ten answered demands give repeated discovery/fetch opportunities without an
+        // unbounded wait. Only a new smallest missing count resets this budget.
+        const NO_PROGRESS_DEMANDS: usize = 10;
+        let mut convergence = BTreeMap::<String, (usize, usize)>::new();
+        if tail_failure.is_none() {
+            'convergence: loop {
+                check_slow(&pauses, &mut daemons[1], &state);
+                let mut complete = true;
+                for w in &workers {
+                    let (shown, pages, oldest) = match try_read(w, &id, None, Some(&state)) {
+                        Ok(page) => page,
+                        Err(why) => {
+                            tail_failure = Some(why);
+                            break 'convergence;
+                        }
+                    };
+                    let missing: BTreeSet<_> = acknowledged.difference(&shown).cloned().collect();
+                    eprintln!("[RG-1 stopped authors] member={} acknowledged={} pages={pages} missing={missing:?}",
+                        w.name, acknowledged.len());
+                    complete &= missing.is_empty();
+                    if !missing.is_empty() {
+                        let answered = match convergence.get_mut(&w.name) {
+                            Some((smallest, answered)) if missing.len() >= *smallest => {
+                                *answered += 1;
+                                *answered
+                            }
+                            _ => {
+                                convergence.insert(w.name.clone(), (missing.len(), 0));
+                                0
+                            }
+                        };
+                        check_slow(&pauses, &mut daemons[1], &state);
+                        if answered >= NO_PROGRESS_DEMANDS {
+                            tail_failure = Some(format!(
+                                "{} still misses {} acknowledged posts, including {:?}, after \
+                                {answered} answered --history older demands without progress",
+                                w.name,
+                                missing.len(),
+                                missing.first()
+                            ));
+                            break 'convergence;
+                        }
+                        let mut args = vec!["room", "read", &id, "--history", "older"];
+                        if let Some(oldest) = oldest.as_deref() {
+                            args.extend(["--before", oldest]);
+                        }
+                        let demand = w.vox(None, &args);
+                        if let Err(why) = check_observation_process(
+                            &w.name,
+                            "room read --history older",
+                            demand.code,
+                            &demand.stdout,
+                            &demand.stderr,
+                            Some(&state),
+                        ) {
+                            tail_failure = Some(why);
+                            break 'convergence;
+                        }
+                        if !demand.ok {
+                            tail_failure = Some(format!(
+                                "{} refused older history while missing post {:?}: {demand:?}",
+                                w.name,
+                                missing.first()
+                            ));
+                            break 'convergence;
+                        }
+                    }
+                }
+                check_slow(&pauses, &mut daemons[1], &state);
+                if complete {
+                    break;
+                }
+            }
+        }
+        check_slow(&pauses, &mut daemons[1], &state);
+        check_errors(&state, false);
+        drop(pauses);
+        free_disk(root.path());
+        let refused_posts = report_post_refusals(&state);
+        let refused_commands = report_command_refusals(&state);
+        let tail = tail_failure.as_deref().unwrap_or(
+            "every admitted member shown both ways; all acknowledged posts shown after authors stop");
+        if no_pause {
+            eprintln!("apparatus smoke: the post-admission code ran to a verdict; tail={tail}");
+        }
+        assert!(
+            refusals.is_empty()
+                && refused_posts == 0
+                && refused_commands == 0
+                && tail_failure.is_none(),
+            "RED PRODUCT: apparatus_smoke={no_pause}; refused {} of 7 joins: {refusals:?}; {refused_posts} posts refused; \
+             {refused_commands} other commands refused; tail={tail}; \
+             each member/author/post/command/refusal is quoted above",
+            refusals.len()
+        );
+        eprintln!(
+            "GREEN: RG-1 apparatus_smoke={no_pause}; every member shown both ways; all {} acknowledged posts shown \
+            on every member after authors stop; daemons=4 anchor_processes=1 run={:?}",
+            acknowledged.len(),
+            join_started.elapsed()
+        );
+    }
 }

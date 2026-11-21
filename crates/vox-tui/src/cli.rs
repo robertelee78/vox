@@ -738,6 +738,14 @@ pub struct DaemonArgs {
     /// exit once nothing is Ready and no client is connected.
     #[arg(long = "as-detached", hide = true)]
     pub as_detached: bool,
+    /// The authenticated old daemon this detached replacement takes over from.
+    #[arg(
+        long,
+        hide = true,
+        requires = "as_detached",
+        conflicts_with = "restart"
+    )]
+    pub replace_pid: Option<u32>,
     /// How the macOS app's login item runs it (launchd, which restarts it after a failed exit):
     /// a start refused for good (run as root, or a data root this version does not read) is
     /// written to `~/Library/Logs/Vox/login-item.log` and ends with status 0, so launchd does not

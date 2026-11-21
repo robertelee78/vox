@@ -11,6 +11,7 @@
 //! signal, and then lets the node go (unless `--keep`). One started by a client
 //! ([`crate::daemon_client`]) exits once it has no node and no client (L-8).
 
+use std::future::Future;
 use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -25,7 +26,7 @@ use zeroize::Zeroizing;
 
 use crate::app::{
     ask_without_echo, daemon_env_passphrase, daemon_passphrases, open_rooms_by_line, say,
-    shutdown_patience, stop_requested, AppError, Asked, SHUTDOWN_PATIENCE,
+    shutdown_patience, AppError, Asked, SHUTDOWN_PATIENCE,
 };
 use crate::cli::DaemonArgs;
 use crate::host::{Defaults, Router};
@@ -162,11 +163,65 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
     // with its terminal while it waited there died on the default action.
     let mut stop = Box::pin({
         let _in_runtime = rt.enter();
-        stop_requested("vox daemon")
+        daemon_stop_requested()?
     });
     let named = named_node(args)?;
+    // The new daemon, rather than the command that launched it, owns completion.
+    let restart = if let Some(old_pid) = args.replace_pid {
+        let file = crate::daemon_client::restart_lock(&account)?;
+        loop {
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) => {}
+                Err(std::fs::TryLockError::Error(e)) => {
+                    return Err(AppError::Usage(format!(
+                        "cannot own the daemon restart: {e}"
+                    )));
+                }
+            }
+            let signal = rt.block_on(async {
+                tokio::select! {
+                    signal = &mut stop => Some(signal),
+                    () = tokio::time::sleep(Duration::from_millis(250)) => None,
+                }
+            });
+            if let Some(signal) = signal {
+                say(format_args!(
+                    "vox daemon: stopped by {} while it waited for restart admission",
+                    signal.name()
+                ));
+                return Ok(());
+            }
+        }
+        let before = rt
+            .block_on(DaemonClient::observe(&account.socket()))
+            .map_err(|e| AppError::Usage(format!("cannot confirm the daemon to replace: {e}")))?;
+        if before.pid != old_pid {
+            return Err(AppError::Usage(
+                "the daemon changed before the restart; it was not stopped".into(),
+            ));
+        }
+        let pid = i32::try_from(old_pid)
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+            .ok_or_else(|| AppError::Usage("the daemon gave an invalid process id".into()))?;
+        eprintln!(
+            "vox daemon: replacement pid {} owns the restart of pid {old_pid}",
+            std::process::id()
+        );
+        rustix::process::kill_process(pid, rustix::process::Signal::TERM)
+            .map_err(|e| AppError::Usage(format!("the daemon could not be stopped: {e}")))?;
+        Some(file)
+    } else {
+        None
+    };
     let take = |rt: &tokio::runtime::Runtime| {
-        take_account(
+        let take = if args.replace_pid.is_some() {
+            take_account_unlocked
+        } else {
+            take_account
+        };
+        take(
             &account,
             rt,
             args.profile.listen,
@@ -177,16 +232,23 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
     let mut given = None;
     let (rt, serving) = match take(&rt)? {
         Some(serving) => (rt, serving),
-        None if args.no_node => {
+        None if args.no_node || args.replace_pid.is_some() => {
             // **A service manager's daemon waits its turn** (ADR-014 M-9): the login item's
             // launch agent restarts it only after a crash, so one that exited 0 because a daemon
             // a client started was running left nothing behind once that daemon went, and Vox.app,
             // waiting for the login item's daemon, found none until the next login. It waits for
             // the account instead, and serves once the running daemon stops.
-            eprintln!(
-                "vox daemon: a daemon is already running for {}; this one serves once it stops",
-                account.data_root.display()
-            );
+            if args.replace_pid.is_none() && crate::daemon_client::restarting(&account)? {
+                eprintln!(
+                    "vox daemon: a daemon restart is in progress for {}; this one waits for it",
+                    account.data_root.display()
+                );
+            } else {
+                eprintln!(
+                    "vox daemon: a daemon is already running for {}; this one serves once it stops",
+                    account.data_root.display()
+                );
+            }
             let serving = loop {
                 let signal = rt.block_on(async {
                     tokio::select! {
@@ -243,6 +305,8 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
         },
     };
     let _log = crate::daemon_log::Capture::start(&account.log_file(), !args.as_detached)?;
+    println!("vox daemon: serving (pid {})", std::process::id());
+    drop(restart);
     let router = serving.router.clone();
     router.attach_kept();
 
@@ -331,8 +395,14 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
         };
         tokio::select! {
             signal = &mut stop => Some(signal),
-            () = router.stop_asked() => None,
-            () = idle => None,
+            () = router.stop_asked() => {
+                say(format_args!("vox daemon: stop requested by the product's control client"));
+                None
+            },
+            () = idle => {
+                say(format_args!("vox daemon: stop requested by its idle policy"));
+                None
+            },
         }
     });
     stop_daemon(rt, &router, &serving.presence, signal)
@@ -397,6 +467,24 @@ pub(crate) struct Serving {
 /// # Errors
 /// The data root is not one this version reads, the lock fails, an `--anchor` is malformed, or the socket cannot be bound.
 pub(crate) fn take_account(
+    account: &Account,
+    rt: &tokio::runtime::Runtime,
+    listen: std::net::SocketAddr,
+    anchor_specs: &[String],
+    proxy: std::net::SocketAddr,
+) -> Result<Option<Serving>, AppError> {
+    let admission = crate::daemon_client::restart_lock(account)?;
+    match admission.try_lock_shared() {
+        Ok(()) => take_account_unlocked(account, rt, listen, anchor_specs, proxy),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(e)) => {
+            Err(AppError::Usage(format!("cannot admit a daemon start: {e}")))
+        }
+    }
+}
+
+/// The replacement already holds exclusive restart admission.
+fn take_account_unlocked(
     account: &Account,
     rt: &tokio::runtime::Runtime,
     listen: std::net::SocketAddr,
@@ -714,6 +802,50 @@ fn refusal_words(r: &Refusal, account: &Account, node: &NodeName) -> String {
     }
 }
 
+/// Keep SA_SIGINFO's sender without logging or process inspection in a signal handler.
+fn daemon_stop_requested() -> Result<impl Future<Output = crate::app::StopSignal>, AppError> {
+    use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
+    use signal_hook::iterator::{exfiltrator::WithOrigin, SignalsInfo};
+    let mut signals = SignalsInfo::<WithOrigin>::new([SIGINT, SIGTERM, SIGHUP, SIGQUIT])?;
+    struct Close(signal_hook::iterator::Handle);
+    impl Drop for Close {
+        fn drop(&mut self) {
+            self.0.close();
+        }
+    }
+    let close = Close(signals.handle());
+    let (send, receive) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        if let Some(origin) = signals.forever().next() {
+            let signal = match origin.signal {
+                SIGINT => crate::app::StopSignal::Interrupt,
+                SIGHUP => crate::app::StopSignal::Hangup,
+                SIGQUIT => crate::app::StopSignal::Quit,
+                _ => crate::app::StopSignal::Terminate,
+            };
+            match origin.process {
+                Some(sender) => say(format_args!(
+                    "vox daemon: stop requested by {}, sender pid {}",
+                    signal.name(),
+                    sender.pid
+                )),
+                None => say(format_args!(
+                    "vox daemon: stop requested by {}, sender unavailable",
+                    signal.name()
+                )),
+            }
+            let _ = send.send(signal);
+        }
+    });
+    Ok(async move {
+        let _close = close;
+        match receive.await {
+            Ok(signal) => signal,
+            Err(_) => std::future::pending().await,
+        }
+    })
+}
+
 /// Detach every node and end the daemon, with the exit rules `vox daemon` has always had: a stop
 /// that finished exits 0 saying which signal; one that gave up says so and fails (V210-93).
 pub(crate) fn stop_daemon(
@@ -819,6 +951,14 @@ fn already_running(
         }
     })?;
     if !answering {
+        if crate::daemon_client::restarting(account)? {
+            return Err(AppError::Usage(format!(
+                "a daemon restart is in progress for {}, but it did not answer within {} s; see {} and retry",
+                account.data_root.display(),
+                crate::daemon_client::START_WITHIN.as_secs(),
+                account.log_file().display()
+            )));
+        }
         return Err(AppError::Refused {
             code: 1,
             message: format!(
