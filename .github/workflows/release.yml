@@ -92,7 +92,11 @@ jobs:
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_only }}
         env:
           EXPECTED_SHA: ${{ inputs.candidate_sha }}
-        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+        # The job runs in a container as another user than the checkout's owner, and git refuses
+        # such a repository ("dubious ownership") unless it is named safe.
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
 
       - name: Build on the Linux floor and package release assets
         run: scripts/linux-release-steps.sh dist
