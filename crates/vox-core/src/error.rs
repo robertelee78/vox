@@ -451,11 +451,10 @@ pub enum Error {
     #[error("another newcomer took the room's last place at the same moment")]
     SeatTaken,
 
-    /// **A member online did not agree to the newcomer** (V030-30, #366): every member the
-    /// answering member holds a connection to must promise the joiner a place before it is
-    /// admitted, and `member` did not answer within `seatstream::SEAT_ANSWER_WITHIN`
-    /// (`unanswered`), or does not yet count the answering member a member of the room. The text
-    /// names `member` by its whole fingerprint, so a client can say it by its own name for it.
+    /// A member answered that it does not count the responder a member of the room.
+    /// The text names `member` by its whole fingerprint, so a client can use its local name.
+    /// `unanswered` distinguishes the seat refusal frames; an unanswered question no longer
+    /// produces this error in the responder's seat round (ADR-052 RG-2).
     #[error("{}", seat_not_agreed(.member, *.unanswered))]
     SeatNotAgreed {
         /// The member that did not agree.
@@ -757,7 +756,7 @@ fn seat_not_agreed(member: &crate::hash::Digest32, unanswered: bool) -> String {
         )
     } else {
         format!(
-            "member {who} does not yet count the member that answered the join a member of the room, and every member online must agree before the room takes a newcomer"
+            "member {who} does not yet count the member that answered the join a member of the room"
         )
     }
 }
