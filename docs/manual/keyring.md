@@ -32,9 +32,11 @@ is no backup of a node: its keys never leave the machine. If the machine is lost
 and ask everyone who trusted the old one to remove it and trust the new one.
 
 `vox node unlock` makes a node Ready. On a Mac, it remembers the passphrase in the login
-Keychain. On Linux, a typed unlock keeps it in the kernel keyring, so daemon restarts,
-updates and crashes need no input. Reboot clears that key: without a chosen passphrase file,
-the node is **Locked** and `vox status` prints its unlock command.
+Keychain. On Linux, a typed unlock keeps it in the kernel keyring, so daemon restarts and
+crashes need no input. Reboot clears that key: without a chosen passphrase file,
+the node is **Locked** and `vox status` prints its unlock command. Any process of the same
+user ID can read that key, including a same-UID container whose policy permits `keyctl`;
+this is broader access than the daemon's memory.
 
 For automatic recovery after reboot on Linux, choose a private persistent file and run
 `vox node unlock robertgpt --passphrase-file ~/.vox-robertgpt-passphrase`.

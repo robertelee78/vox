@@ -803,7 +803,6 @@ fn verify_apple_release(active: &Path, candidate: &Path, version: &str) -> Resul
     Err(not_running(&checked, active, Some(version), false))
 }
 
-#[cfg(not(target_os = "macos"))]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RunVerdict {
     Ran,
@@ -812,7 +811,6 @@ enum RunVerdict {
     DidNotRun,
 }
 
-#[cfg(not(target_os = "macos"))]
 struct RunCheck {
     verdict: RunVerdict,
     success: bool,
@@ -821,7 +819,6 @@ struct RunCheck {
 }
 
 /// Drain both pipes while the child runs, retaining only the bounded diagnostic.
-#[cfg(not(target_os = "macos"))]
 fn captured(mut pipe: impl std::io::Read, maximum: usize) -> Vec<u8> {
     let mut bytes = Vec::new();
     let _ = pipe.by_ref().take(maximum as u64).read_to_end(&mut bytes);
@@ -829,7 +826,6 @@ fn captured(mut pipe: impl std::io::Read, maximum: usize) -> Vec<u8> {
     bytes
 }
 
-#[cfg(not(target_os = "macos"))]
 fn run_check(path: &Path, expected: Option<&str>) -> RunCheck {
     use std::os::unix::process::CommandExt as _;
     use std::process::Stdio;
@@ -841,11 +837,6 @@ fn run_check(path: &Path, expected: Option<&str>) -> RunCheck {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    for key in ["PATH", "HOME", "VOX_DATA_DIR", "VOX_CONFIG_DIR"] {
-        if let Some(value) = std::env::var_os(key) {
-            command.env(key, value);
-        }
-    }
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -889,11 +880,11 @@ fn run_check(path: &Path, expected: Option<&str>) -> RunCheck {
         }
     };
     // Kill the group even after its leader exits: no child may keep the pipes open.
-    let _ = Command::new("/bin/kill")
-        .args(["-KILL", "--", &format!("-{}", child.id())])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    if let Ok(pid) = i32::try_from(child.id()) {
+        if let Some(pid) = rustix::process::Pid::from_raw(pid) {
+            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+        }
+    }
     if status.is_none() {
         let _ = child.kill();
     }
@@ -979,7 +970,7 @@ fn explain_not_running(
     } else if verdict == RunVerdict::DidNotAnswer {
         format!("a vox that does not answer `--version` is not installed. Vox supports {systems}; if this system is one of those, this is a defect in Vox: please report it with the lines above.")
     } else {
-        format!("the cause is not one this installer can name. Vox supports {systems}; if this system is one of those, this is a defect in Vox: please report it with the lines above.")
+        format!("the cause is not one this updater can name. Vox supports {systems}; if this system is one of those, this is a defect in Vox: please report it with the lines above.")
     }
 }
 
@@ -1593,63 +1584,10 @@ fn restart_onto(active: &Path) -> Result<Vec<vox_core::node::paths::NodeName>, A
     restart::restart_daemon(active, &now)
 }
 
-/// How long [`runs_as_vox`] waits for `--version` before it counts a binary as not running.
-const RUNS_WITHIN: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// Whether `path` is a `vox` that runs: `--version` exits 0 within [`RUNS_WITHIN`] and says
-/// exactly `vox <major>.<minor>.<patch>`, with an optional `-<pre-release>` (#247, verifier). A
-/// leftover a power loss may have cut short is installed only on this; one that hangs, fails, or
-/// answers anything else is not a `vox`.
-///
-/// **Bounded whatever it starts.** It runs in its own process group, and the whole group is
-/// killed on the timeout *and* once it has exited, before its output is read: a leftover that left
-/// a child holding stdout would otherwise keep the read open past the bound (a staged one took
-/// 12 s and was installed), and one that hung would leave its children behind.
+/// Whether an interrupted rollback's retained binary is a runnable vox.
 fn runs_as_vox(path: &Path) -> bool {
-    use std::os::unix::process::CommandExt as _;
-    let Ok(mut child) = Command::new(path)
-        .arg("--version")
-        .env_clear()
-        .process_group(0)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    else {
-        return false;
-    };
-    let kill_group = |pgid: u32| {
-        let _ = Command::new("/bin/kill")
-            .args(["-KILL", "--", &format!("-{pgid}")])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-    };
-    let started = std::time::Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if started.elapsed() < RUNS_WITHIN => {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            _ => {
-                kill_group(child.id());
-                let _ = child.kill();
-                let _ = child.wait();
-                return false;
-            }
-        }
-    };
-    // Whatever it started is gone before its output is read, so the read ends now.
-    kill_group(child.id());
-    let mut out = Vec::new();
-    if let Some(mut stdout) = child.stdout.take() {
-        let _ = stdout
-            .by_ref()
-            .take(MAX_VERSION_OUTPUT_BYTES as u64 + 1)
-            .read_to_end(&mut out);
-    }
-    status.success() && out.len() <= MAX_VERSION_OUTPUT_BYTES && says_vox_version(&out)
+    let checked = run_check(path, None);
+    checked.success && says_vox_version(&checked.stdout)
 }
 
 /// Whether `out` is exactly `vox <major>.<minor>.<patch>[-<pre-release>]` and a line end.

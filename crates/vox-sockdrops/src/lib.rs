@@ -62,13 +62,17 @@ pub mod kernel_key {
     }
 
     fn find(name: &str) -> io::Result<libc::c_long> {
+        find_in(USER_KEYRING, name)
+    }
+
+    fn find_in(keyring: libc::c_long, name: &str) -> io::Result<libc::c_long> {
         let name = description(name)?;
         // SAFETY: both strings are terminated and live for the call; no output pointer.
         checked(unsafe {
             libc::syscall(
                 libc::SYS_keyctl,
                 10,
-                USER_KEYRING,
+                keyring,
                 c"user".as_ptr(),
                 name.as_ptr(),
                 0,
@@ -78,9 +82,9 @@ pub mod kernel_key {
 
     /// Store `secret` under `name`, readable only by this uid until reboot or explicit removal.
     ///
-    /// Any process of this uid may read it without possessing the key (including another
-    /// login session's daemon); this is the same trust as the daemon's memory. Other uids
-    /// cannot read it, and reboot discards it. No expiry is set.
+    /// Any process of this uid may read it, including same-uid containers whose policy permits
+    /// `keyctl`; this is broader than access to the daemon's memory. Other uids cannot read it,
+    /// and reboot discards it. No expiry is set.
     ///
     /// # Errors
     /// The kernel's refusal (including a disabled keyring or a full per-user quota).
@@ -131,22 +135,32 @@ pub mod kernel_key {
         Ok(length)
     }
 
-    /// Revoke and unlink this uid's named secret; an absent or unavailable keyring is forgotten.
+    /// Revoke and unlink this uid's named secret; a missing key is already forgotten.
     ///
     /// # Errors
-    /// A kernel refusal to remove a key found in a working keyring.
+    /// The keyring is unavailable or the kernel refuses to search or remove the key.
     pub fn forget(name: &str) -> io::Result<()> {
-        let key = match find(name) {
+        // Resolve the ring first: ENOKEY from an unavailable ring is not an absent secret.
+        // SAFETY: GET_KEYRING_ID takes integer identifiers and does not write userspace memory.
+        let ring = match checked(unsafe { libc::syscall(libc::SYS_keyctl, 0, USER_KEYRING, 1) }) {
+            Ok(ring) => ring,
+            Err(error) if matches!(error.raw_os_error(), Some(libc::ENOSYS | libc::EOPNOTSUPP)) => {
+                return Ok(())
+            }
+            Err(error) => return Err(error),
+        };
+        let key = match find_in(ring, name) {
             Ok(key) => key,
-            Err(e)
-                if matches!(
-                    e.raw_os_error(),
-                    Some(
-                        libc::ENOKEY | libc::ENOSYS | libc::EPERM | libc::EACCES | libc::EOPNOTSUPP
-                    )
-                ) =>
-            {
-                return Ok(());
+            Err(e) if e.raw_os_error() == Some(libc::ENOKEY) => {
+                // Confirm that the same user keyring remains available after the search.
+                let current =
+                    checked(unsafe { libc::syscall(libc::SYS_keyctl, 0, USER_KEYRING, 0) })?;
+                if current == ring {
+                    return Ok(());
+                }
+                return Err(io::Error::other(
+                    "the user keyring changed while forgetting the key",
+                ));
             }
             Err(e) => return Err(e),
         };

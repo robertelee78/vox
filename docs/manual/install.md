@@ -89,8 +89,8 @@ nodes that were already Locked are not listed as a new interruption. Unlocking d
 that a passphrase will be remembered for another restart. A daemon started in a terminal ends;
 its replacement runs detached on the same configured address and anchors.
 
-On Linux, a typed unlock keeps the secret only in the kernel keyring, so daemon restarts,
-updates and crashes do not ask again. A reboot clears that keyring: the node is Locked and
+On Linux, a typed unlock keeps the secret only in the kernel keyring, so daemon restarts and
+crashes do not ask again. A reboot clears that keyring: the node is Locked and
 `vox status` names its unlock command. To recover without typing after a reboot, choose your
 own persistent passphrase file and run `vox node unlock NAME --passphrase-file /path/to/file`.
 Vox remembers that path, never writes a passphrase file itself, and uses no TPM credential.

@@ -1420,15 +1420,15 @@ pub async fn node_lock(args: &NodeArgs, name: &str) -> Result<(), AppError> {
     }
     ensure_daemon(&account, args.listen, &args.anchor_specs()).await?;
     let mut d = daemon(&account).await?;
-    match d
+    let forget_error = match d
         .request(DaemonRequest::Unkeep { node: name.clone() })
         .await
     {
-        Ok(DaemonFrame::Ok) => {}
-        Ok(DaemonFrame::Refused(r)) => return Err(AppError::Usage(r.to_string())),
+        Ok(DaemonFrame::Ok) => None,
+        Ok(DaemonFrame::Refused(r)) => Some(r.to_string()),
         Ok(other) => return Err(unexpected_daemon(&other)),
         Err(e) => return Err(AppError::Usage(format!("the daemon did not answer: {e}"))),
-    }
+    };
     // One request per control connection. Forget first, so a stopped node cannot return.
     let mut d = daemon(&account).await?;
     match d
@@ -1447,6 +1447,9 @@ pub async fn node_lock(args: &NodeArgs, name: &str) -> Result<(), AppError> {
                 n.name == name && n.status == Some(vox_core::node::daemonipc::NodeStatus::Ready)
             }) {
                 println!("vox: node {name} is Ready after the lock request; run `vox node list` to see its current remembered state");
+                if let Some(error) = &forget_error {
+                    eprintln!("vox: {error}");
+                }
                 return Ok(());
             }
             if !nodes.iter().any(|n| {
@@ -1456,13 +1459,23 @@ pub async fn node_lock(args: &NodeArgs, name: &str) -> Result<(), AppError> {
             }) {
                 return Err(AppError::Usage(format!("node {name}'s state changed after the lock request; run `vox node list` to see its current status")));
             }
-            println!(
-                "vox: node {name} is Locked and forgotten; its rooms and messages stay here; \
-                 `vox node unlock {name}` makes it Ready again"
-            );
+            if let Some(error) = &forget_error {
+                println!("vox: node {name} is Locked; its rooms and messages stay here; `vox node unlock {name}` makes it Ready again");
+                eprintln!("vox: {error}");
+            } else {
+                println!(
+                    "vox: node {name} is Locked and forgotten; its rooms and messages stay here; \
+                     `vox node unlock {name}` makes it Ready again"
+                );
+            }
             Ok(())
         }
-        Ok(DaemonFrame::Refused(r)) => Err(AppError::Usage(r.to_string())),
+        Ok(DaemonFrame::Refused(r)) => {
+            if let Some(error) = &forget_error {
+                eprintln!("vox: {error}");
+            }
+            Err(AppError::Usage(r.to_string()))
+        }
         Ok(other) => Err(unexpected_daemon(&other)),
         Err(e) => Err(AppError::Usage(format!("the daemon did not answer: {e}"))),
     }

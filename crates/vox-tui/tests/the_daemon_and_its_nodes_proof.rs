@@ -1128,11 +1128,12 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
     );
 }
 
-/// An unavailable user keyring never refuses typed unlock, lock or forgetting.
+/// A kernel without keyrings never refuses typed unlock, lock or forgetting.
 #[cfg(target_os = "linux")]
 #[test]
 #[ignore = "Linux namespace, seccomp or emulator with an unavailable user keyring; run in release"]
 fn a_linux_unavailable_keyring_keeps_unlock_ready_without_a_disk_secret() {
+    typed::require_disposable_keyring();
     watchdog::arm();
     let probe_name = format!("vox-rg11-unavailable-probe-{}", std::process::id());
     let probe = Command::new("keyctl")
@@ -1148,15 +1149,9 @@ fn a_linux_unavailable_keyring_keeps_unlock_ready_without_a_disk_secret() {
     eprintln!("Unavailable kernel keyring prerequisite: {refusal}");
     assert!(
         !probe.status.success()
-            && [
-                "Required key not available",
-                "Function not implemented",
-                "Operation not permitted",
-                "Permission denied",
-                "Operation not supported",
-            ]
-            .iter()
-            .any(|reason| refusal.contains(reason)),
+            && ["Function not implemented", "Operation not supported",]
+                .iter()
+                .any(|reason| refusal.contains(reason)),
         "APPARATUS: this preservation proof needs an unavailable user keyring: {refusal}"
     );
     let a = Account::new();
@@ -1254,6 +1249,7 @@ fn a_linux_unavailable_keyring_keeps_unlock_ready_without_a_disk_secret() {
 #[test]
 #[ignore = "Linux kernel keyring and real typed unlock; run in release"]
 fn a_linux_typed_unlock_survives_another_sessions_daemon() {
+    typed::require_disposable_keyring();
     fn fresh_session(a: &Account, args: &[&str]) -> Command {
         let base = a.cmd(args);
         let mut command = Command::new("/usr/bin/keyctl");

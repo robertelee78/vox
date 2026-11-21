@@ -1297,7 +1297,13 @@ fn linux_candidate_claims(claims: &mut Vec<Claim>) {
         std::fs::read_dir(bin)
             .staged()
             .filter_map(Result::ok)
-            .all(|entry| !entry.file_name().to_string_lossy().ends_with(".partial"))
+            .all(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                !name.ends_with(".partial")
+                    && !name.starts_with(".vox-candidate.")
+                    && !name.starts_with(".vox-previous.")
+            })
     };
     release_tree_of(tree.path(), "stable", SERVED, &dead, &|_| {});
     let (ok, text) = run_installer(&server, home.path(), "stable");
@@ -1406,87 +1412,172 @@ fn linux_candidate_claims(claims: &mut Vec<Claim>) {
         ));
     }
     release_tree(tree.path(), "stable", &|_| {});
-    let kernel = inputs.path().join("proc");
-    std::fs::create_dir_all(kernel.join("net/core")).staged();
-    let cap = kernel.join("net/core/rmem_max");
-    let settings = inputs.path().join("sysctl.d");
-    std::fs::create_dir(&settings).staged();
-    // PATH shims stage uid and kernel readback, not the installer's decision or publication.
-    std::fs::remove_file(shim.join("getconf")).staged();
-    for (id, uid, readback, status) in [
-        (
-            "install.non_root_prints_the_receive_buffer_commands",
-            "1000",
-            "212992",
-            "0",
-        ),
-        (
-            "install.root_persists_and_reads_back_the_receive_buffer",
-            "0",
-            "4194304",
-            "0",
-        ),
-        (
-            "install.a_short_readback_never_claims_the_buffer_was_set",
-            "0",
-            "212992",
-            "0",
-        ),
-        (
-            "install.a_failed_sysctl_reports_the_actual_readback",
-            "0",
-            "4194304",
-            "1",
-        ),
-    ] {
-        std::fs::write(&cap, "212992\n").staged();
-        std::fs::write(shim.join("id"), format!("#!/bin/sh\nprintf '{uid}\\n'\n")).staged();
-        std::fs::write(
-            shim.join("sysctl"),
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >'{}'\nprintf '{readback}\\n' >'{}'\nexit {status}\n",
-                inputs.path().join("sysctl-called").display(),
-                cap.display()
-            ),
-        )
-        .staged();
-        for executable in ["id", "sysctl"] {
-            std::fs::set_permissions(
-                shim.join(executable),
-                std::fs::Permissions::from_mode(0o755),
-            )
-            .staged();
-        }
-        let (ok, text) = run_installer_env(
-            &server,
-            home.path(),
-            "stable",
-            &[
-                ("PATH", shim.to_str().staged()),
-                ("VOX_SYSCTL_DIR", settings.to_str().staged()),
-                ("VOX_PROC_SYS", kernel.to_str().staged()),
-            ],
+    let stdin_fixture = inputs.path().join("stdin-candidate");
+    std::fs::write(&stdin_fixture, format!(
+        "#!/bin/sh\nif read line; then echo 'candidate consumed installer stdin' >&2; exit 1; fi\nprintf 'vox {}\\n'\n", SERVED
+    )).staged();
+    release_tree_of(tree.path(), "stable", SERVED, &stdin_fixture, &|_| {});
+    let mut piped_command = Command::new("sh");
+    piped_command
+        .arg(install_sh())
+        .env_clear()
+        .env("HOME", home.path())
+        .env("PATH", SYSTEM_PATH)
+        .env("VOX_DATA_DIR", home.path().join("data"))
+        .env("VOX_CONFIG_DIR", home.path().join("config"))
+        .env("VOX_RELEASE_BASE", &server.base)
+        .env("VOX_INSTALL_DIR", &bin)
+        .env("VOX_NO_SHELL_SETUP", "1")
+        .env("VOX_NO_SKILL_INSTALL", "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut piped = piped_command
+        .spawn()
+        .expect("APPARATUS: launch installer with piped stdin");
+    writeln!(
+        piped.stdin.take().expect("APPARATUS: installer stdin"),
+        "installer input"
+    )
+    .staged();
+    let piped = piped
+        .wait_with_output()
+        .expect("APPARATUS: collect piped installer");
+    let piped_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&piped.stdout),
+        String::from_utf8_lossy(&piped.stderr)
+    );
+    claims.push(claim(
+        "install.candidate_does_not_consume_installer_input",
+        piped.status.success() && !piped_text.contains("candidate consumed installer stdin"),
+        format!("exit={}; {piped_text}", piped.status),
+    ));
+    // Two real installers publish different checked bytes to the same directory.
+    let first = inputs.path().join("first-candidate");
+    let second = inputs.path().join("second-candidate");
+    let ready_pipe = inputs.path().join("candidate-ready");
+    let release_pipe = inputs.path().join("candidate-release");
+    for pipe in [&ready_pipe, &release_pipe] {
+        let status = Command::new("mkfifo").arg(pipe).status().staged();
+        assert!(status.success(), "APPARATUS: create installer hold pipe");
+    }
+    let done = inputs.path().join("first-checked");
+    let first_script = format!(
+        "#!/bin/sh\nif [ ! -e '{}' ]; then printf 'ready\\n' > '{}'; read ignored < '{}'; : > '{}'; fi\nprintf 'vox {}\\n'\n",
+        done.display(), ready_pipe.display(), release_pipe.display(), done.display(), SERVED
+    );
+    let second_script = format!(
+        "#!/bin/sh\n# second candidate\nprintf 'vox {}\\n'\n",
+        SERVED
+    );
+    std::fs::write(&first, &first_script).staged();
+    std::fs::write(&second, &second_script).staged();
+    release_tree_of(tree.path(), "stable", SERVED, &first, &|_| {});
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let ready = ready_pipe.clone();
+    std::thread::spawn(move || {
+        use std::io::BufRead as _;
+        let result = std::fs::File::open(ready).and_then(|file| {
+            let mut line = String::new();
+            std::io::BufReader::new(file).read_line(&mut line)?;
+            Ok(line)
+        });
+        let _ = ready_tx.send(result);
+    });
+    let (a, b) = std::thread::scope(|scope| {
+        let first_run = scope.spawn(|| run_installer(&server, home.path(), "stable"));
+        let ready = ready_rx.recv_timeout(std::time::Duration::from_secs(30));
+        assert!(
+            matches!(&ready, Ok(Ok(line)) if line == "ready\n"),
+            "APPARATUS: first installer did not reach its candidate check: {ready:?}"
         );
-        let success =
-            text.contains("net.core.rmem_max: set to 4194304 in /etc/sysctl.d/90-vox.conf");
-        let commands = text.contains("sysctl -w net.core.rmem_max=4194304")
-            && text.contains("echo 'net.core.rmem_max = 4194304' > /etc/sysctl.d/90-vox.conf");
-        let expected = if status == "0" && readback == "4194304" {
-            success
-                && !commands
-                && std::fs::read_to_string(settings.join("90-vox.conf")).unwrap_or_default()
-                    == "net.core.rmem_max = 4194304\n"
-                && std::fs::read_to_string(inputs.path().join("sysctl-called")).unwrap_or_default()
-                    == "--system\n"
-        } else {
-            !success
-                && commands
-                && text.contains(&format!("at {readback} bytes"))
-                && (uid != "1000"
-                    || (!settings.join("90-vox.conf").exists()
-                        && !inputs.path().join("sysctl-called").exists()))
-        };
-        claims.push(claim(id, ok && expected, text));
+        release_tree_of(tree.path(), "stable", SERVED, &second, &|_| {});
+        let second_run = run_installer(&server, home.path(), "stable");
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut release = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(nix::libc::O_NONBLOCK)
+            .open(&release_pipe)
+            .expect("APPARATUS: first installer left its check before release");
+        writeln!(release, "continue").staged();
+        (
+            first_run.join().expect("APPARATUS: first installer thread"),
+            second_run,
+        )
+    });
+    let installed = std::fs::read(bin.join("vox")).unwrap_or_default();
+    claims.push(claim(
+        "install.concurrent_checks_publish_their_own_candidate",
+        a.0 && b.0 && installed == first_script.as_bytes(),
+        format!(
+            "first={:?}; second={:?}; installed_first={}",
+            a,
+            b,
+            installed == first_script.as_bytes()
+        ),
+    ));
+    release_tree(tree.path(), "stable", &|_| {});
+    // Only the uid is staged. The value is the real kernel readback, never a product hook.
+    std::fs::remove_file(shim.join("getconf")).staged();
+    std::fs::write(shim.join("id"), "#!/bin/sh\nprintf '1000\\n'\n").staged();
+    std::fs::set_permissions(shim.join("id"), std::fs::Permissions::from_mode(0o755)).staged();
+    let cap = std::fs::read_to_string("/proc/sys/net/core/rmem_max")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    let (ok, text) = run_installer_env(
+        &server,
+        home.path(),
+        "stable",
+        &[("PATH", shim.to_str().staged())],
+    );
+    let commands = text.contains("sysctl -w net.core.rmem_max=4194304")
+        && text.contains("echo 'net.core.rmem_max = 4194304' > /etc/sysctl.d/90-vox.conf");
+    let expected = match cap {
+        Some(value) if value >= 4_194_304 => !commands,
+        Some(value) => commands && text.contains(&format!("at {value} bytes")),
+        None => commands && text.contains("an unknown number of bytes"),
+    };
+    claims.push(claim(
+        "install.non_root_reports_the_actual_receive_buffer",
+        ok && expected,
+        text,
+    ));
+    if std::env::var_os("VOX_PROOF_ROOT_SYSCTL").as_deref() == Some(std::ffi::OsStr::new("1")) {
+        assert!(
+            Path::new("/run/.containerenv").exists() || Path::new("/.dockerenv").exists(),
+            "APPARATUS: root sysctl scene requires a disposable container"
+        );
+        let uid = Command::new("/usr/bin/id").arg("-u").output().staged();
+        assert_eq!(
+            String::from_utf8_lossy(&uid.stdout).trim(),
+            "0",
+            "APPARATUS: root sysctl scene requires container root"
+        );
+        let before = std::fs::read_to_string("/proc/sys/net/core/rmem_max")
+            .expect("APPARATUS: container kernel receive buffer");
+        let value: u64 = before
+            .trim()
+            .parse()
+            .expect("APPARATUS: numeric receive buffer");
+        assert!(
+            value < 4_194_304,
+            "APPARATUS: container receive buffer already meets the target"
+        );
+        let (ok, text) = run_installer(&server, home.path(), "stable");
+        let after = std::fs::read_to_string("/proc/sys/net/core/rmem_max")
+            .expect("APPARATUS: container kernel readback");
+        let actual: u64 = after.trim().parse().expect("APPARATUS: numeric readback");
+        let persisted = std::fs::read_to_string("/etc/sysctl.d/90-vox.conf").unwrap_or_default();
+        claims.push(claim(
+            "install.root_reports_refused_receive_buffer",
+            ok && actual < 4_194_304
+                && persisted == "net.core.rmem_max = 4194304\n"
+                && !text.contains("net.core.rmem_max: set to 4194304")
+                && text.contains(&format!("at {actual} bytes"))
+                && text.contains("sysctl -w net.core.rmem_max=4194304"),
+            format!("before={value} after={actual} persisted={persisted:?}; {text}"),
+        ));
     }
 }
 

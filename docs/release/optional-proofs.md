@@ -17,6 +17,21 @@ They are kept "at the ready for troubleshooting". When a user reports one of the
   - A product failure fails as the product's verdict.
 - **CI compiles them on every run and never runs them.** The CI step is "Compile optional proofs (not run; troubleshooting kit)": `cargo test --release -p vox-tui --features optional-proofs --no-run`, with `-D warnings`. A change that breaks one is caught at once, not on the day it is needed.
 
+### Linux kernel-keyring proofs
+
+The dedicated typed-unlock, restart and unavailable-keyring journeys must run as a disposable
+container user, with `VOX_PROOF_DISPOSABLE_KEYRING=1` set by the container runner. Use a fresh
+UID and check `keyctl show @u` before and after each proof. A killed proof can leave a test key
+until reboot and use that UID's key quota; remove the container and its user after the run.
+For example, inside a disposable Linux build container as its fresh, dedicated UID:
+`keyctl show @u; VOX_PROOF_DISPOSABLE_KEYRING=1 cargo test --release -p vox-tui --features test-knobs --test the_daemon_and_its_nodes_proof a_linux_typed_unlock_survives_another_sessions_daemon -- --ignored --exact --nocapture; keyctl show @u`.
+The container runner must check the two keyring listings even if the proof fails.
+
+Other proofs that type a Linux unlock or setup can also store a test key in the user's keyring.
+They remove their own keys on normal exit, but a killed proof can leave one. Inspect with
+`keyctl list @u`; after identifying the exact `us.vox.node:<digest>` for the scratch node,
+remove only that serial with `keyctl unlink <serial> @u`. Do not clear the user's keyring.
+
 ### macOS update recovery (ADR-014 M-29a)
 
 For a newer release, `vox update` downloads and verifies its updater before transferring the

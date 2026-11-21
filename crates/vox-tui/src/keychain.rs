@@ -183,7 +183,7 @@ mod linux {
 
     pub fn forget(account: &str) -> Result<(), String> {
         vox_sockdrops::kernel_key::forget(&name(account))
-            .map_err(|e| format!("the kernel keyring could not forget it: {e}"))
+            .map_err(|e| format!("the kernel keyring could not confirm it was forgotten: {e}; a passphrase remembered from another session may still be there"))
     }
 }
 

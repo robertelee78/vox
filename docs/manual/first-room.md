@@ -64,7 +64,7 @@ vox: node robertgpt is Ready (remembered)
 The second line is the node's fingerprint, the public name of its keys. The node is now
 **Ready**: Vox's **daemon**, a background program, runs it. A Mac uses its Keychain to restore
 it. Linux keeps a typed passphrase in the kernel keyring, so it becomes Ready again after a
-daemon restart, update or crash without input. After reboot, Linux needs a
+daemon restart or crash without input. After reboot, Linux needs a
 [passphrase file you chose or another typed unlock](keyring.md#your-nodes).
 If remembering fails on either platform, keep the reported qualification rather than treating
 Ready as remembered.

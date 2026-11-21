@@ -959,6 +959,7 @@ fn an_update_restarts_its_daemon_and_refuses_a_different_local_version() {
 #[test]
 #[ignore = "real typed unlock and update, Linux kernel keyring; run in release with test-knobs"]
 fn a_linux_typed_unlock_stays_ready_after_update() {
+    typed::require_disposable_keyring();
     struct Cleanup(PathBuf);
     impl Drop for Cleanup {
         fn drop(&mut self) {
@@ -1407,7 +1408,7 @@ fn linux_download_refusal_claims(
         (
             "update.says_what_an_unexplained_candidate_said",
             Some("#!/bin/sh\necho 'boom: no such table' >&2\nexit 3\n"),
-            "the cause is not one this installer can name",
+            "the cause is not one this updater can name",
         ),
     ] {
         let fixture = if let Some(script) = source {

@@ -1796,7 +1796,7 @@ pub enum NodeCmd {
         #[command(flatten)]
         account: AccountArgs,
     },
-    /// Unlock a node and remember it for daemon restarts, updates and crashes.
+    /// Unlock a node and remember it for daemon restarts and crashes.
     /// A Mac stores its passphrase in the Keychain. Linux keeps it in the kernel keyring until
     /// reboot; choose --passphrase-file for recovery after reboot. Vox never writes that file.
     Unlock {

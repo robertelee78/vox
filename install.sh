@@ -136,8 +136,10 @@ fi
 # output file, which would then be read as the release record.
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/vox-install.XXXXXX")
 # Scratch belongs only to this invocation; updater recovery belongs to the target engine.
-trap 'rm -rf "$tmp"' EXIT
-trap 'exit 130' INT TERM
+candidate=
+previous_partial=
+trap 'rm -rf "$tmp"; [ -z "$candidate" ] || rm -f "$candidate"; [ -z "$previous_partial" ] || rm -f "$previous_partial"' EXIT
+trap 'exit 130' INT TERM HUP
 curl -fsSL $CURL_PROTO --max-filesize 4096 \
   -o "$tmp/record.json" "${BASE}/latest/download/${RECORD}" \
   || fail "could not fetch release record ${RECORD} (no ${CHANNEL} release for ${TARGET} yet?)"
@@ -178,10 +180,10 @@ run_check() { # <path> [expected version]
   run_status=0
   if [ "$have_timeout" = 1 ]; then
     env -i PATH="$PATH" HOME="$HOME" VOX_DATA_DIR="${VOX_DATA_DIR:-}" VOX_CONFIG_DIR="${VOX_CONFIG_DIR:-}" \
-      timeout --kill-after=2 20 "$1" --version >"$tmp/run-out" 2>"$tmp/run-err" || run_status=$?
+      timeout --kill-after=2 20 "$1" --version </dev/null >"$tmp/run-out" 2>"$tmp/run-err" || run_status=$?
   else
     env -i PATH="$PATH" HOME="$HOME" VOX_DATA_DIR="${VOX_DATA_DIR:-}" VOX_CONFIG_DIR="${VOX_CONFIG_DIR:-}" \
-      "$1" --version >"$tmp/run-out" 2>"$tmp/run-err" || run_status=$?
+      "$1" --version </dev/null >"$tmp/run-out" 2>"$tmp/run-err" || run_status=$?
   fi
   run_output=$(cat "$tmp/run-out")
   run_verdict="did not run"
@@ -469,31 +471,25 @@ else
   if [ -e "$INSTALL_DIR/vox" ] && [ ! -e "$INSTALL_DIR/$MARKER" ]; then
     fail "$INSTALL_DIR/vox exists but was not installed by this installer; remove it or set VOX_INSTALL_DIR"
   fi
-  # Written on the destination's own filesystem, so the final rename is atomic.
-  #
-  # **A partial left by a run that was cut short is removed first** (V210-117). A partial name only
-  # ever holds scratch, and one can be read-only: `vox update` before v0.2.10 left a 0555
-  # `.vox-candidate.partial` when interrupted, and `cp` cannot open that for writing, so every later
-  # run of this installer stopped at a bare "Permission denied". The previous binary is copied to a
-  # partial of its own and renamed into place, for the same reason: a rename replaces a file that
-  # cannot be written to, and a copy onto it does not.
-  rm -f "$INSTALL_DIR/.vox-candidate.partial" "$INSTALL_DIR/.vox-previous.partial"
-  cp "$tmp/$ASSET" "$INSTALL_DIR/.vox-candidate.partial"
-  chmod 0755 "$INSTALL_DIR/.vox-candidate.partial"
-  if ! run_check "$INSTALL_DIR/.vox-candidate.partial" "$version"; then
+  # Each invocation checks and publishes its own file on the destination filesystem.
+  candidate=$(mktemp "$INSTALL_DIR/.vox-candidate.XXXXXX")
+  cp "$tmp/$ASSET" "$candidate"
+  chmod 0755 "$candidate"
+  if ! run_check "$candidate" "$version"; then
     explain_not_running
-    rm -f "$INSTALL_DIR/.vox-candidate.partial"
+    rm -f "$candidate"
     exit 1
   fi
   if [ -e "$INSTALL_DIR/vox" ]; then
-    cp -p "$INSTALL_DIR/vox" "$INSTALL_DIR/.vox-previous.partial"
-    mv -f "$INSTALL_DIR/.vox-previous.partial" "$INSTALL_DIR/.vox-previous"
+    previous_partial=$(mktemp "$INSTALL_DIR/.vox-previous.XXXXXX")
+    cp -p "$INSTALL_DIR/vox" "$previous_partial"
+    mv -f "$previous_partial" "$INSTALL_DIR/.vox-previous"
   fi
   # The marker says "this install is ours" and names the channel `vox update` resolves the next
   # release on. Strict schema-1 JSON, the same shape the binary parses with deny_unknown_fields.
   printf '{"kind":"vox.install-channel","schema_version":1,"package":"vox","channel":"%s"}\n' \
     "$CHANNEL" >"$INSTALL_DIR/$MARKER"
-  mv -f "$INSTALL_DIR/.vox-candidate.partial" "$INSTALL_DIR/vox"
+  mv -f "$candidate" "$INSTALL_DIR/vox"
 
   if ! run_check "$INSTALL_DIR/vox" "$version"; then
     head -n 20 "$tmp/run-err" >&2
@@ -503,9 +499,8 @@ else
   say "installed: $INSTALL_DIR/vox ($installed)"
 
   # Persist only Vox's receive-buffer setting, and report the kernel's readback.
-  # Documented installer-proof hooks: a private sysctl directory and /proc/sys stand-in.
-  sysctl_dir=${VOX_SYSCTL_DIR:-/etc/sysctl.d}
-  proc_sys=${VOX_PROC_SYS:-/proc/sys}
+  sysctl_dir=/etc/sysctl.d
+  proc_sys=/proc/sys
   receive_cap=$(cat "$proc_sys/net/core/rmem_max" 2>/dev/null || true)
   case "$receive_cap" in ''|*[!0-9]*) receive_cap=unknown ;; esac
   if [ "$receive_cap" = unknown ] || [ "$receive_cap" -lt 4194304 ]; then
