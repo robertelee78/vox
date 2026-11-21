@@ -45,6 +45,330 @@ impl Drop for IngressWait {
     }
 }
 
+/// One original command owns the existing deferred-command credit until native completion.
+pub(super) struct Bookkeeping {
+    result: Arc<std::sync::Mutex<Option<bool>>>,
+    _task: tokio::task::JoinHandle<()>,
+}
+
+/// The caller retains the room and original Computer publication through this commit.
+pub(super) fn save_drive_admission(
+    channel: &mut ChannelState,
+    store: &Store,
+    signer: &dyn crate::identity::composite::RootSigner,
+    session: &str,
+    drive: &crate::node::session_ingress::DriveAdmission,
+    bodies: &[String],
+    now: u64,
+) -> crate::node::session_ingress::AdmissionResult {
+    use crate::node::channel::session_projection::{Query, Reply};
+    let refuse = || Error::Profile("Drive authority or Session opening changed; nothing was sent");
+    if channel.is_poisoned()
+        || !channel.is_member(&drive.author)
+        || channel.history_instance(store).map_err(|_| refuse())? != drive.instance
+    {
+        return Err(refuse().into());
+    }
+    let answer = channel
+        .session_query(
+            store,
+            Query::Exact {
+                node: channel.me(),
+                id: session.to_owned(),
+            },
+            crate::node::ipc::rows_budget(),
+            now,
+        )
+        .map_err(|_| refuse())?;
+    match answer {
+        Reply::Page { rows, revision, .. }
+            if !revision.provisional()
+                && rows
+                    .iter()
+                    .any(|row| row.open && row.opening == drive.opening) => {}
+        _ => return Err(refuse().into()),
+    }
+    crate::node::session_ingress::admit_drive(
+        store,
+        signer,
+        channel.channel_id(),
+        session,
+        drive,
+        bodies,
+    )
+}
+
+impl Node {
+    pub(super) fn complete_session_bookkeeping(&mut self) -> bool {
+        let Some(pending) = &self.pending_session_bookkeeping else {
+            return false;
+        };
+        let saved = pending
+            .result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(ingress) = saved {
+            self.pending_session_bookkeeping = None;
+            if ingress {
+                self.ingress_scan_wake();
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(super) fn begin_session_admission(
+        &mut self,
+        room: Digest32,
+        session: String,
+        bodies: Vec<String>,
+        drive: Option<crate::node::session_ingress::DriveAdmission>,
+        reply: oneshot::Sender<crate::node::session_ingress::OwnedAdmission>,
+    ) {
+        use crate::node::session_ingress::{AdmissionError, OwnedAdmission};
+        let prepared = (|| {
+            if self
+                .session_rooms_retiring
+                .iter()
+                .any(|item| item.room == room)
+            {
+                return Err(Error::Profile(
+                    "this room was removed; its Session activity was not accepted",
+                ));
+            }
+            let profile = self
+                .profile
+                .as_ref()
+                .filter(|p| p.is_unlocked())
+                .ok_or(Error::Profile("the node is locked"))?;
+            let drive_room = if let Some(drive) = &drive {
+                let refuse =
+                    Error::Profile("Drive authority or Session opening changed; nothing was sent");
+                if (drive.author != profile.fingerprint()
+                    && (!self.trust.is_trusted(&drive.author)
+                        || !self.trust.has_drive(&drive.author)))
+                    || self.store_save_pending()
+                    || self.failed_post_reads.contains_key(&room)
+                {
+                    return Err(refuse);
+                }
+                Some(self.channels.get(&room).ok_or(refuse)?.clone())
+            } else {
+                None
+            };
+            let secret = self.secret_work.clone().try_read_owned().map_err(|_| {
+                Error::Profile("the node is locking; Session activity was not accepted")
+            })?;
+            let authority = if drive.is_some() {
+                Some(
+                    self.computer_authority()
+                        .ok_or(Error::Profile("Drive authority changed; nothing was sent"))?,
+                )
+            } else {
+                None
+            };
+            Ok((
+                profile.store_handle(),
+                profile.signer_arc()?,
+                secret,
+                authority,
+                drive_room,
+            ))
+        })();
+        let (store, signer, secret, authority, drive_room) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let _ = reply.send(OwnedAdmission::NotCommitted { error, bodies });
+                return;
+            }
+        };
+        let epoch = self.delivery_epoch;
+        let clock = Arc::clone(&self.millis_clock);
+        let attachment = self.pairwise_epoch.subscribe();
+        let result = Arc::new(std::sync::Mutex::new(None));
+        let output = Arc::clone(&result);
+        let wake = Arc::clone(&self.post_save_wake);
+        let task = tokio::spawn(async move {
+            let publication = match authority {
+                Some(authority) => match authority.acquire_publication().await {
+                    Some(publication) => Some(publication),
+                    None => {
+                        let _ = reply.send(OwnedAdmission::NotCommitted {
+                            error: Error::Profile("Drive authority changed; nothing was sent"),
+                            bodies,
+                        });
+                        *output
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(false);
+                        wake.notify_one();
+                        return;
+                    }
+                },
+                None => None,
+            };
+            let mut drive_room = match drive_room {
+                Some(channel) => Some(channel.lock_owned().await),
+                None => None,
+            };
+            let saved = tokio::task::spawn_blocking(move || {
+                let _secret = secret;
+                let _publication = publication;
+                let saved = if *attachment.borrow() != epoch {
+                    Err(
+                        Error::Profile("the node changed; Session activity was not accepted")
+                            .into(),
+                    )
+                } else if let Some(drive) = drive {
+                    match drive_room.as_mut() {
+                        Some(channel) => save_drive_admission(
+                            channel,
+                            &store,
+                            signer.as_ref(),
+                            &session,
+                            &drive,
+                            &bodies,
+                            clock(),
+                        ),
+                        None => Err(Error::Profile("the room is not open").into()),
+                    }
+                } else {
+                    crate::node::session_ingress::admit(
+                        &store,
+                        signer.as_ref(),
+                        room,
+                        &session,
+                        &bodies,
+                    )
+                };
+                let committed = saved.is_ok();
+                let receipt = match saved {
+                    Ok(saved) => OwnedAdmission::Committed(saved),
+                    Err(AdmissionError::NotCommitted(error)) => {
+                        OwnedAdmission::NotCommitted { error, bodies }
+                    }
+                    Err(AdmissionError::Unconfirmed(error)) => OwnedAdmission::Unconfirmed(error),
+                };
+                let _ = reply.send(receipt);
+                committed
+            })
+            .await
+            .unwrap_or(false);
+            *output
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(saved);
+            wake.notify_one();
+        });
+        self.pending_session_bookkeeping = Some(Bookkeeping {
+            result,
+            _task: task,
+        });
+    }
+
+    pub(super) fn begin_attention(
+        &mut self,
+        room: Digest32,
+        by: Digest32,
+        expected_instance: Option<[u8; 16]>,
+        operation: crate::node::attention::Operation,
+        reply: oneshot::Sender<Result<crate::node::attention::Reply, String>>,
+    ) {
+        let page = matches!(&operation, crate::node::attention::Operation::Page(_));
+        let prepared = (|| {
+            let profile = self
+                .profile
+                .as_ref()
+                .filter(|p| p.is_unlocked())
+                .ok_or("this node is locked")?;
+            let owner = profile.fingerprint();
+            if by != owner && (!page || !self.trust.has_drive(&by) || !self.trust.is_trusted(&by)) {
+                return Err("attention requires current drive permission");
+            }
+            let authority = self
+                .computer_authority()
+                .filter(|authority| authority.current())
+                .ok_or("attention waits for current computer trust")?;
+            let channel = self
+                .channels
+                .get(&room)
+                .ok_or("the room is not open")?
+                .clone();
+            let secret = self
+                .secret_work
+                .clone()
+                .try_read_owned()
+                .map_err(|_| "the node is locking; attention was not saved")?;
+            Ok((profile.store_handle(), owner, channel, authority, secret))
+        })();
+        let (store, owner, channel, authority, secret) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let _ = reply.send(Err(error.into()));
+                return;
+            }
+        };
+        let clock = Arc::clone(&self.millis_clock);
+        let epoch = self.delivery_epoch;
+        let attachment = self.pairwise_epoch.subscribe();
+        let result = Arc::new(std::sync::Mutex::new(None));
+        let output = Arc::clone(&result);
+        let wake = Arc::clone(&self.post_save_wake);
+        let task = tokio::spawn(async move {
+            let publication = if page {
+                None
+            } else {
+                authority.acquire_publication().await
+            };
+            let mut channel = channel.lock_owned().await;
+            let saved = tokio::task::spawn_blocking(move || {
+                let _secret = secret;
+                if *attachment.borrow() != epoch {
+                    return Err("the node changed; attention was not saved".into());
+                }
+                if by != owner && !channel.is_member(&by) {
+                    return Err("attention requires current room membership".into());
+                }
+                if (page && !authority.current()) || (!page && publication.is_none()) {
+                    return Err("attention waits for current computer trust".into());
+                }
+                if !page {
+                    if let Some(expected) = expected_instance {
+                        if channel
+                            .history_instance(&store)
+                            .map_err(|error| error.to_string())?
+                            != expected
+                        {
+                            return Err("the selected room changed; refresh and retry".into());
+                        }
+                    }
+                }
+                let saved = channel.attention(&store, owner, expected_instance, operation, clock());
+                if page && !authority.current() {
+                    Err("attention waits for current computer trust".into())
+                } else {
+                    saved
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                Err("attention operation could not be confirmed; refresh before retrying".into())
+            });
+            let _ = reply.send(saved);
+            *output
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(false);
+            wake.notify_one();
+        });
+        if !page {
+            self.pending_session_bookkeeping = Some(Bookkeeping {
+                result,
+                _task: task,
+            });
+        }
+    }
+}
+
 impl Node {
     pub(super) fn ingress_publication_ready(&mut self, room: Digest32, token: u64) {
         let key = self.session_ingress_waits.iter().find_map(|(key, wait)| {

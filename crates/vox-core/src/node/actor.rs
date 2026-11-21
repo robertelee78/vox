@@ -471,16 +471,12 @@ fn detail_of(
             None => sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         };
     let read_summary_stamp = publication.read_summary_stamp;
-    let (read_by, held, unread) = match prev.filter(|p| {
+    let (read_by, held) = match prev.filter(|p| {
         ch.display_is_current(&p.display_stamp, &display_stamp)
             && p.read_summary_stamp == read_summary_stamp
     }) {
-        Some(p) => (p.read_by.clone(), p.held.clone(), p.unread.clone()),
-        None => (
-            ch.read_by_own(store)?,
-            ch.held_own(store)?,
-            ch.unread(store)?,
-        ),
+        Some(p) => (p.read_by.clone(), p.held.clone()),
+        None => (ch.read_by_own(store)?, ch.held_own(store)?),
     };
     // Who trusts each member (ADR-028 K-7), once: this identity's own entry is `consenting`.
     // The trust picture (who reads whom, who consented, the offer bases, where drive comes
@@ -613,7 +609,6 @@ fn detail_of(
         held,
         held_through,
         holds_through,
-        unread,
         // The authors this node can answer for now; a refreshing author is named in each
         // listing's revision rather than holding the whole room's detail back (ADR-037 R4).
         drive_from,
@@ -7144,6 +7139,7 @@ pub struct Node {
     session_ingress_scan: usize,
     drive_receipt_cursor: u64,
     session_ingress_waits: BTreeMap<(Digest32, String), session_save::IngressWait>,
+    pending_session_bookkeeping: Option<session_save::Bookkeeping>,
     /// An empty inbox clears a recovery failure, not delivery or room cleanup failures.
     /// Separate health keeps successful reads/appends from hiding unresolved cleanup.
     session_ingress_recovery_error: Option<String>,
@@ -7609,6 +7605,7 @@ impl Node {
             session_ingress_scan: 0,
             drive_receipt_cursor: 0,
             session_ingress_waits: BTreeMap::new(),
+            pending_session_bookkeeping: None,
             session_ingress_recovery_error: None,
             session_ingress_error: None,
             session_retirement_error: None,
@@ -7958,6 +7955,9 @@ impl Node {
                 () = post_save_wake.notified() => {
                     self.complete_identity_startup().await;
                     self.complete_pending_posts().await;
+                    if self.complete_session_bookkeeping() {
+                        self.publish().await;
+                    }
                     self.complete_pending_policies().await;
                     self.complete_pending_metadata().await;
                     self.start_own_key_computer_drain();
@@ -8080,6 +8080,15 @@ impl Node {
                     // is published or scheduled for it.
                     if matches!(command, NodeCommand::Ping) {
                         let _ = reply.send(Outcome::Done);
+                        continue;
+                    }
+                    if self.pending_session_bookkeeping.is_some()
+                        && !matches!(&command, NodeCommand::PreparePost { .. }
+                            | NodeCommand::Attention {
+                                operation: crate::node::attention::Operation::Page(_), ..
+                            })
+                    {
+                        self.retain_store_command(command, reply);
                         continue;
                     }
                     if (self.store_save_pending() && Self::command_waits_for_save(&command))
@@ -8636,10 +8645,7 @@ impl Node {
                 operation,
                 reply,
             } => {
-                let result = self
-                    .attention(&channel_id, by, expected_instance, operation)
-                    .await;
-                let _ = reply.send(result);
+                self.begin_attention(channel_id, by, expected_instance, operation, reply);
                 Outcome::Done
             }
             NodeCommand::RoomPause {
@@ -8754,47 +8760,7 @@ impl Node {
                 drive,
                 reply,
             } => {
-                let result = if self
-                    .session_rooms_retiring
-                    .iter()
-                    .any(|item| item.room == channel_id)
-                {
-                    Err(crate::error::Error::Profile(
-                        "this room was removed; its Session activity was not accepted",
-                    )
-                    .into())
-                } else if let Some(drive) = drive {
-                    self.admit_session_drive(channel_id, &session_id, &bodies, drive)
-                        .await
-                } else {
-                    self.profile
-                        .as_ref()
-                        .ok_or_else(|| {
-                            crate::node::session_ingress::AdmissionError::from(
-                                crate::error::Error::Profile("the node is locked"),
-                            )
-                        })
-                        .and_then(|profile| {
-                            crate::node::session_ingress::admit(
-                                profile,
-                                channel_id,
-                                &session_id,
-                                &bodies,
-                            )
-                        })
-                };
-                if result.is_ok() {
-                    self.ingress_scan_wake();
-                }
-                use crate::node::session_ingress::{AdmissionError, OwnedAdmission};
-                let receipt = match result {
-                    Ok(saved) => OwnedAdmission::Committed(saved),
-                    Err(AdmissionError::NotCommitted(error)) => {
-                        OwnedAdmission::NotCommitted { error, bodies }
-                    }
-                    Err(AdmissionError::Unconfirmed(error)) => OwnedAdmission::Unconfirmed(error),
-                };
-                let _ = reply.send(receipt);
+                self.begin_session_admission(channel_id, session_id, bodies, drive, reply);
                 Outcome::Done
             }
             NodeCommand::DeliverSessionDrive {
@@ -19828,6 +19794,8 @@ impl Node {
     /// node is *locking* ([`NodeView::locking`]). The returned receiver fires once it has settled.
     async fn lock_all(&mut self) -> oneshot::Receiver<()> {
         self.session_ingress_waits.clear();
+        // The worker retains its original secret guard through physical completion.
+        self.pending_session_bookkeeping = None;
         self.session_ingress_scan = 0;
         self.retire_parked_construction(Fault::Locked);
         self.retire_parked_private_drives(Fault::Locked);
@@ -23313,141 +23281,6 @@ impl Node {
         let now_ms = self.now_ms();
         self.refresh_node_retention(now_ms);
         self.node_retention.for_room(channel_id)
-    }
-
-    async fn attention(
-        &self,
-        channel_id: &Digest32,
-        by: Digest32,
-        expected_instance: Option<[u8; 16]>,
-        operation: crate::node::attention::Operation,
-    ) -> Result<crate::node::attention::Reply, String> {
-        let profile = self
-            .profile
-            .as_ref()
-            .filter(|p| p.is_unlocked())
-            .ok_or("this node is locked")?;
-        let owner = profile.fingerprint();
-        if by != owner && !self.computer_authority_current() {
-            return Err("attention waits for current computer trust".into());
-        }
-        if by != owner
-            && (!matches!(operation, crate::node::attention::Operation::Page(_))
-                || !self.trust.has_drive(&by)
-                || !self.trust.is_trusted(&by))
-        {
-            return Err("attention requires current drive permission".into());
-        }
-        let shared = self
-            .channels
-            .get(channel_id)
-            .ok_or("the room is not open")?;
-        let mut channel = shared.lock().await;
-        if by != owner && !channel.is_member(&by) {
-            return Err("attention requires current room membership".into());
-        }
-        if !matches!(&operation, crate::node::attention::Operation::Page(_)) {
-            if let Some(expected) = expected_instance {
-                if channel
-                    .history_instance(profile.store())
-                    .map_err(|error| error.to_string())?
-                    != expected
-                {
-                    return Err("the selected room changed; refresh and retry".into());
-                }
-            }
-        }
-        if matches!(&operation, crate::node::attention::Operation::Page(_)) {
-            // Reading already-committed attention takes no physical publication lease.
-            // A policy transition waiting for a save must not block the old committed
-            // selection; a completed transition still invalidates it before release.
-            if !self.computer_authority_current() {
-                return Err("attention waits for current computer trust".into());
-            }
-            let result = channel.attention(
-                profile.store(),
-                owner,
-                expected_instance,
-                operation,
-                (self.millis_clock)(),
-            );
-            return if self.computer_authority_current() {
-                result
-            } else {
-                Err("attention waits for current computer trust".into())
-            };
-        }
-        let write = || {
-            channel.attention(
-                profile.store(),
-                owner,
-                expected_instance,
-                operation,
-                (self.millis_clock)(),
-            )
-        };
-        self.with_current_computer_authority(write)
-            .ok_or_else(|| "attention waits for current computer trust".to_owned())?
-    }
-
-    async fn admit_session_drive(
-        &self,
-        channel_id: Digest32,
-        session: &str,
-        bodies: &[String],
-        drive: crate::node::session_ingress::DriveAdmission,
-    ) -> crate::node::session_ingress::AdmissionResult {
-        use crate::error::Error;
-        use crate::node::channel::session_projection::{Query, Reply};
-        let refuse =
-            || Error::Profile("Drive authority or Session opening changed; nothing was sent");
-        let profile = self
-            .profile
-            .as_ref()
-            .filter(|p| p.is_unlocked())
-            .ok_or_else(refuse)?;
-        if drive.author != profile.fingerprint()
-            && (!self.trust.is_trusted(&drive.author) || !self.trust.has_drive(&drive.author))
-        {
-            return Err(refuse().into());
-        }
-        if self.store_save_pending() || self.failed_post_reads.contains_key(&channel_id) {
-            return Err(refuse().into());
-        }
-        let shared = self.channels.get(&channel_id).ok_or_else(refuse)?.clone();
-        let mut room = shared.lock().await;
-        if room.is_poisoned()
-            || !room.is_member(&drive.author)
-            || room
-                .history_instance(profile.store())
-                .map_err(|_| refuse())?
-                != drive.instance
-        {
-            return Err(refuse().into());
-        }
-        let answer = room
-            .session_query(
-                profile.store(),
-                Query::Exact {
-                    node: profile.fingerprint(),
-                    id: session.to_owned(),
-                },
-                crate::node::ipc::rows_budget(),
-                self.now_ms().get(),
-            )
-            .map_err(|_| refuse())?;
-        match answer {
-            Reply::Page { rows, revision, .. }
-                if !revision.provisional()
-                    && rows
-                        .iter()
-                        .any(|row| row.open && row.opening == drive.opening) => {}
-            _ => return Err(refuse().into()),
-        }
-        self.with_current_computer_authority(|| {
-            crate::node::session_ingress::admit_drive(profile, channel_id, session, &drive, bodies)
-        })
-        .ok_or_else(refuse)?
     }
 
     async fn deliver_session_drive(

@@ -621,6 +621,7 @@ impl Node {
 
     pub(super) fn store_save_pending(&self) -> bool {
         !self.pending_posts.is_empty()
+            || self.pending_session_bookkeeping.is_some()
             || self.policy_save_pending()
             || self.metadata_save_pending()
             || self.pending_startup.is_some()

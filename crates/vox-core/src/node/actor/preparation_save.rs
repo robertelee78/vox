@@ -826,6 +826,7 @@ impl Node {
                     }
                     SessionRefresh::Progressed => {
                         prepared.progressed("refreshing its Session records", now.get());
+                        prepared.legacy_cleanup_due = Some(std::time::Instant::now());
                         return Ok(false);
                     }
                     SessionRefresh::Waiting(what) => {

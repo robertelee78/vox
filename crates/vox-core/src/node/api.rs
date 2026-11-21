@@ -739,9 +739,6 @@ pub struct ChannelDetail {
     pub held_through: Vec<(Digest32, u64)>,
     /// Last authenticated, role-complete position this node holds in each member's feed.
     pub holds_through: Vec<(Digest32, u64)>,
-    /// What this node's person has not read here, oldest first
-    /// ([`crate::node::channel::ChannelState::unread`]): what a client counts at its start.
-    pub unread: Vec<Digest32>,
     /// The nodes whose Sessions this node can read inside here (ADR-029 SC-2), sorted: itself, and
     /// each node whose drive key it holds. What a Session's `can_drive` is said from.
     pub drive_from: Vec<Digest32>,
