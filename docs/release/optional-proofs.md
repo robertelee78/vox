@@ -261,6 +261,38 @@ The Linux form runs unprivileged in a network namespace and is an ordinary proof
 
 `update_proof`'s other test, `vox_update_replaces_an_install_it_owns_and_refuses_the_rest`, measures this build's refusals, record lookup, `--check` and `--rollback`, and is not optional.
 
+### Rollback to a published older CLI (macOS, RG-9)
+
+`a_rollback_survives_a_power_loss_proof::a_rollback_to_an_older_release_restarts_its_running_daemon`
+proves that a scratch standalone `vox update --rollback` replaces both hand-started and
+client-started daemons when the older release lacks `--replace-pid`. It needs a genuine
+published binary older than this build, so it is optional and blocks neither CI nor release.
+`VOX_PROOF_OLDER_BINARY` is separate from the newer `VOX_PROOF_NEXT_BINARY` fixture.
+Without `optional-proofs`, its stand-in prints `OPTIONAL PROOF NOT RUN`.
+
+For example, download and check the published Apple Silicon v0.4.29 CLI, then run only this act:
+
+```sh
+set -e
+older=$(mktemp -d)
+curl --fail --location --max-time 120 \
+  -o "$older/vox-aarch64-apple-darwin" \
+  https://github.com/robertelee78/vox/releases/download/v0.4.29/vox-aarch64-apple-darwin
+curl --fail --location --max-time 120 \
+  -o "$older/vox-aarch64-apple-darwin.sha256" \
+  https://github.com/robertelee78/vox/releases/download/v0.4.29/vox-aarch64-apple-darwin.sha256
+(cd "$older" && shasum -a 256 -c vox-aarch64-apple-darwin.sha256)
+chmod +x "$older/vox-aarch64-apple-darwin"
+VOX_PROOF_OLDER_BINARY="$older/vox-aarch64-apple-darwin" \
+cargo test --release -p vox-tui --features test-knobs,optional-proofs \
+  --test a_rollback_survives_a_power_loss_proof \
+  a_rollback_to_an_older_release_restarts_its_running_daemon \
+  -- --ignored --exact --nocapture
+```
+
+Every product process uses the proof's scratch HOME and data/config roots; no installed app
+or login item is involved. A fixture that is not older is an `APPARATUS` refusal.
+
 ### Computer convergence journeys
 
 | Proof | Helps troubleshoot | Run | Needs | Time |

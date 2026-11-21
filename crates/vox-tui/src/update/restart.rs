@@ -508,23 +508,44 @@ async fn restart_checked(
     let by_unit = matches!(started, Started::UserUnit(_));
     #[cfg(not(target_os = "linux"))]
     let by_unit = false;
-    if !by_unit {
-        let pid = i32::try_from(before.pid)
-            .ok()
-            .and_then(rustix::process::Pid::from_raw)
-            .ok_or_else(|| AppError::Usage("the daemon gave an invalid process id".into()))?;
-        rustix::process::kill_process(pid, rustix::process::Signal::TERM)
-            .map_err(|e| AppError::Usage(format!("the daemon could not be stopped: {e}")))?;
-        if !gone_within(before.pid, STOP_WITHIN).await {
-            return Err(AppError::Usage(format!(
-                "the daemon (pid {}) did not stop within {} s; it still runs vox {}",
-                before.pid,
-                STOP_WITHIN.as_secs(),
-                before.version,
-            )));
+    // This binary and newer releases understand --replace-pid. An older rollback target may
+    // not. A development build paired with an unmodified release of the same version is not
+    // supported by this comparison; release versions change when the feature ships.
+    let can_replace = semver::Version::parse(now)
+        .and_then(|target| {
+            semver::Version::parse(env!("CARGO_PKG_VERSION")).map(|current| target >= current)
+        })
+        .unwrap_or(false);
+    if matches!(started, Started::ByClient | Started::ByHand) && can_replace {
+        crate::daemon_client::replace_daemon(
+            helper,
+            account,
+            listen,
+            &anchors,
+            now,
+            before.pid,
+            STOP_WITHIN + crate::daemon_client::START_WITHIN,
+        )
+        .await?;
+    } else {
+        if !by_unit {
+            let pid = i32::try_from(before.pid)
+                .ok()
+                .and_then(rustix::process::Pid::from_raw)
+                .ok_or_else(|| AppError::Usage("the daemon gave an invalid process id".into()))?;
+            rustix::process::kill_process(pid, rustix::process::Signal::TERM)
+                .map_err(|e| AppError::Usage(format!("the daemon could not be stopped: {e}")))?;
+            if !gone_within(before.pid, STOP_WITHIN).await {
+                return Err(AppError::Usage(format!(
+                    "the daemon (pid {}) did not stop within {} s; it still runs vox {}",
+                    before.pid,
+                    STOP_WITHIN.as_secs(),
+                    before.version,
+                )));
+            }
         }
+        start_selected(account, helper, listen, &anchors, &started, now).await?;
     }
-    start_selected(account, helper, listen, &anchors, &started, now).await?;
     let after = wait_for_replacement(account, now, Some(before.pid), &kept).await?;
     let ended = match (held.is_empty(), attached.is_empty()) {
         (false, _) => format!(
