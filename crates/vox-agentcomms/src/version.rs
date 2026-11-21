@@ -1,54 +1,35 @@
-//! Workers must run the same Vox version, enforced (ADR-021 §5).
+//! Claims use a claim-rules number, not the Vox package version (ADR-052 RG-10).
 //!
-//! Mixed-version work coordination is **not supported**. The deployment this serves
-//! is one operator who controls every worker and upgrades them together, so
-//! correctness is bought by *refusing to coordinate across versions* rather than by
-//! engineering compatibility between them.
-//!
-//! Two mechanisms, and both are needed:
-//!
-//! 1. **The fold applies only operations stamped with the folding worker's own
-//!    version** ([`crate::claim::fold`]). Workers on one version therefore fold
-//!    identically, and an operation from any other version — or with no stamp,
-//!    which is what every binary before ADR-021 produces — changes nothing.
-//! 2. **A worker refuses to participate while any participant does not match**
-//!    ([`VersionTable::refused`]). Without this, an upgraded worker would claim work
-//!    that an old worker, folding under old rules, believes it still holds.
-//!
-//! ## Who participates
-//!
-//! A worker (an author fingerprint) participates if it is in the room's roster, its
-//! latest claim-protocol operation or work `hello` is not superseded by a `bye`, and
-//! either that message is within the **participation horizon** or it holds, or is
-//! the target of, a resource under this worker's fold. Its version is the stamp on
-//! that latest message.
-//!
-//! The horizon is what lets the check work in both directions: a newly upgraded
-//! worker sees an older worker that is still active before its own first operation,
-//! and a worker retired without being upgraded stops blocking the room one horizon
-//! after its last message, with nobody acting.
+//! Change [`CLAIM_RULES`] only when the fold or participation rules change. Operations
+//! under other rules are ignored, and a participating worker under other rules blocks
+//! coordination. The v0.4.30 package stamp names these same rules and remains readable.
 
 use std::collections::BTreeSet;
 
 use crate::claim::{self, Posted, State};
 use crate::envelope::{Envelope, BYE, HELLO};
 
-/// The `data` key that carries a worker's Vox version.
+/// Decimal claim-rules number. Independent of the client/daemon control protocol.
+pub const CLAIM_RULES: &str = "1";
+/// The `data` key carrying the decimal claim-rules number.
+pub const CLAIMS_KEY: &str = "claims";
+
+/// The `data` key that carries the informational Vox package version.
 pub const VOX_KEY: &str = "vox";
 
 /// How long after its last message a worker still counts as participating.
 pub const PARTICIPATION_HORIZON_MILLIS: u64 = 24 * 3600 * 1_000;
 
-/// What a message's version stamp says, relative to the reading worker's version.
+/// What a message's claim-rules stamp says relative to the reading worker's rules.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Stamp {
-    /// Exactly the reader's version.
+    /// Exactly the reader's claim rules.
     Match,
-    /// A valid version that is not the reader's.
+    /// A valid claim-rules number that is not the reader's.
     Other(String),
-    /// No stamp at all — what every binary predating ADR-021 writes.
+    /// No claim-rules stamp, including package-only stamps other than v0.4.30.
     Missing,
-    /// A stamp that is not a semantic version.
+    /// A stamp that is not a decimal claim-rules number.
     Unknown(String),
 }
 
@@ -59,11 +40,11 @@ impl Stamp {
         match self {
             Stamp::Match => mine.to_owned(),
             Stamp::Other(v) => crate::envelope::shown(v, crate::envelope::SHOWN_NAME),
-            Stamp::Missing => "no version (a vox older than v0.2.9, which stamps none)".to_owned(),
+            Stamp::Missing => "no claim-rules number".to_owned(),
             // Quoted and cut: the stamp is the author's text, printed into every
             // coordinating session's context (V210-123).
             Stamp::Unknown(v) => format!(
-                "{}, which is not a version",
+                "{}, which is not a claim-rules number",
                 crate::envelope::shown(&format!("{v:?}"), crate::envelope::SHOWN_NAME)
             ),
         }
@@ -91,40 +72,25 @@ impl Stamp {
     }
 }
 
-/// Whether `s` is a semantic version: `MAJOR.MINOR.PATCH`, each a number without a
-/// leading zero, optionally followed by `-prerelease` and/or `+build`.
-#[must_use]
-pub fn is_semver(s: &str) -> bool {
-    let core = s.split(['-', '+']).next().unwrap_or("");
-    if core.len() != s.len() {
-        let rest = &s[core.len()..];
-        let ok = rest.len() > 1
-            && rest
-                .chars()
-                .skip(1)
-                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+');
-        if !ok {
-            return false;
-        }
-    }
-    let parts: Vec<&str> = core.split('.').collect();
-    parts.len() == 3
-        && parts.iter().all(|p| {
-            !p.is_empty()
-                && p.bytes().all(|b| b.is_ascii_digit())
-                && (p.len() == 1 || !p.starts_with('0'))
-        })
-}
-
-/// What `env`'s stamp says relative to `mine`. **Exact string equality** is the
-/// rule; development builds between two tags share a version, and that is accepted
-/// because the operator upgrades together.
+/// What `env`'s claim-rules stamp says relative to `mine`.
+/// Only v0.4.30's package-only stamp is recognized as the original rules.
 #[must_use]
 pub fn stamp_of(env: &Envelope, mine: &str) -> Stamp {
-    match env.data.get(VOX_KEY) {
+    if env.data.get(CLAIMS_KEY).is_none()
+        && env.data.get(VOX_KEY).and_then(serde_json::Value::as_str) == Some("0.4.30")
+    {
+        return if mine == "1" {
+            Stamp::Match
+        } else {
+            Stamp::Other("1".into())
+        };
+    }
+    match env.data.get(CLAIMS_KEY) {
         None | Some(serde_json::Value::Null) => Stamp::Missing,
         Some(serde_json::Value::String(v)) if v == mine => Stamp::Match,
-        Some(serde_json::Value::String(v)) if is_semver(v) => Stamp::Other(v.clone()),
+        Some(serde_json::Value::String(v)) if !v.starts_with('0') && v.parse::<u32>().is_ok() => {
+            Stamp::Other(v.clone())
+        }
         Some(serde_json::Value::String(v)) => Stamp::Unknown(v.clone()),
         Some(other) => Stamp::Unknown(other.to_string()),
     }
@@ -134,7 +100,8 @@ pub fn stamp_of(env: &Envelope, mine: &str) -> Stamp {
 /// a *work* `hello` (one carrying a stamp), or a `bye`.
 fn counts(env: &Envelope) -> bool {
     claim::is_claim_protocol(env)
-        || (env.kind == HELLO && env.data.get(VOX_KEY).is_some())
+        || (env.kind == HELLO
+            && (env.data.get(CLAIMS_KEY).is_some() || env.data.get(VOX_KEY).is_some()))
         || env.kind == BYE
 }
 
@@ -180,7 +147,7 @@ impl VersionTable {
     }
 }
 
-/// Build the version table for the worker `me`, running `mine`, as of `now_millis`.
+/// Build the table for worker `me`, using claim rules `mine`, as of `now_millis`.
 ///
 /// `roster` is the room's current membership: a worker removed from the room stops
 /// participating. `me` is excluded, because this worker's version is by definition

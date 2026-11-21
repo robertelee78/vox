@@ -5364,3 +5364,10 @@ fn a_native_omp_conversation_finishes_a_decision_after_a_room_move() {
 fn a_native_omp_conversation_finishes_a_decision_after_a_session_resume() {
     rg4_journey("resumed");
 }
+
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "real native extension, decided turn and rebuilt identity; no model"]
+fn a_native_omp_decided_turn_does_not_retry_a_permanently_refused_identity() {
+    rg4_journey("identity");
+}

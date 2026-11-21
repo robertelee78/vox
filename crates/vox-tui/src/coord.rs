@@ -11,10 +11,9 @@
 //!   session is working in, read from Git rather than trusted to a caller;
 //! - **the operation id** (`data.op`) — supplied by the caller for a real retry, or
 //!   minted as a convenience;
-//! - **the version stamp** (`data.vox`) — always this binary's own, never the
-//!   caller's;
-//! - **the version gate** — a worker refuses to coordinate while any participant in
-//!   the room runs another version (ADR-021 §5).
+//! - **the claim-rules stamp** (`data.claims`) — independent of the package version;
+//! - **the version gate** — a worker refuses to coordinate while any participant uses
+//!   different claim rules (ADR-052 RG-10).
 //!
 //! It holds no work state. `data.work` is carried and never interpreted: this is a
 //! transport for a tracker's observations, not a tracker (ADR-021 §1).
@@ -24,7 +23,7 @@ use vox_agentcomms::envelope::{
     is_valid_name, shown, Context, Envelope, BYE, HELLO, MAX_NAME, SHOWN_NAME, WORK_KEY,
 };
 use vox_agentcomms::ops::{self, OpIndex, Verdict};
-use vox_agentcomms::version::{self, Stamp, VersionTable, VOX_KEY};
+use vox_agentcomms::version::{self, Stamp, VersionTable, CLAIMS_KEY, CLAIM_RULES, VOX_KEY};
 use vox_core::hash::Digest32;
 use vox_core::node::api::MessageRow;
 use vox_core::node::ipc::{Frame, IpcClient, Request};
@@ -32,7 +31,7 @@ use vox_core::node::link::b32_encode;
 
 use crate::app::AppError;
 
-/// This binary's version: the stamp it writes and the only one its fold applies.
+/// This binary's package version, for display.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Exit status of a verb refused because a participant runs another version.
@@ -354,7 +353,9 @@ impl Snapshot {
                 p.author == self.me
                     && p.envelope.from == session
                     && (claim::is_claim_protocol(&p.envelope)
-                        || (p.envelope.kind == HELLO && p.envelope.data.get(VOX_KEY).is_some())
+                        || (p.envelope.kind == HELLO
+                            && (p.envelope.data.get(CLAIMS_KEY).is_some()
+                                || p.envelope.data.get(VOX_KEY).is_some()))
                         || p.envelope.kind == BYE)
             })
             .max_by_key(|p| (p.created_millis, p.entry_hash))
@@ -374,7 +375,9 @@ impl Snapshot {
         for p in self.posted.iter().filter(|p| {
             p.author == self.me
                 && (claim::is_claim_protocol(&p.envelope)
-                    || (p.envelope.kind == HELLO && p.envelope.data.get(VOX_KEY).is_some())
+                    || (p.envelope.kind == HELLO
+                        && (p.envelope.data.get(CLAIMS_KEY).is_some()
+                            || p.envelope.data.get(VOX_KEY).is_some()))
                     || p.envelope.kind == BYE)
         }) {
             let newer = |previous: &Posted| {
@@ -385,7 +388,7 @@ impl Snapshot {
             }
             if p.envelope.from == session {
                 hello |= p.envelope.kind == HELLO
-                    && version::stamp_of(&p.envelope, VERSION) == Stamp::Match;
+                    && version::stamp_of(&p.envelope, CLAIM_RULES) == Stamp::Match;
                 if latest_session.is_none_or(newer) {
                     latest_session = Some(p);
                 }
@@ -393,7 +396,8 @@ impl Snapshot {
         }
         let current = |record: Option<&Posted>| {
             record.is_some_and(|p| {
-                p.envelope.kind != BYE && version::stamp_of(&p.envelope, VERSION) == Stamp::Match
+                p.envelope.kind != BYE
+                    && version::stamp_of(&p.envelope, CLAIM_RULES) == Stamp::Match
             })
         };
         hello && current(latest_author) && current(latest_session)
@@ -770,8 +774,8 @@ pub async fn snapshot(client: &mut IpcClient, channel_id: Digest32) -> Result<Sn
     let posted = posted_of(&rows);
     drop(rows);
     let now = now_millis();
-    let fold = claim::fold(&posted, VERSION, now);
-    let table = version::version_table(&posted, me, &roster, VERSION, now, &fold);
+    let fold = claim::fold(&posted, CLAIM_RULES, now);
+    let table = version::version_table(&posted, me, &roster, CLAIM_RULES, now, &fold);
     Ok(Snapshot {
         me,
         posted,
@@ -790,7 +794,7 @@ pub fn refusal(room: &str, table: &VersionTable) -> AppError {
     );
     for p in table.mismatched() {
         msg.push_str(&format!(
-            "\n  worker {} session {} last announced vox {} at {}; required {}",
+            "\n  worker {} session {} last announced claim rules {} at {}; required {}",
             crate::ident::name_of(&p.author),
             if p.session.is_empty() {
                 "(none)".to_owned()
@@ -803,9 +807,9 @@ pub fn refusal(room: &str, table: &VersionTable) -> AppError {
         ));
     }
     msg.push_str(
-        "\n  every worker in a coordinating room must run the same vox version; a worker \
-         announces the version it runs on its next turn once that is the required one; an \
-         announcement older than a day no longer counts, nor does a worker that left the room",
+        "\n  every worker in a coordinating room must use the same claim rules; update incompatible \
+         workers and let them announce on their next turn; an announcement older than a day no \
+         longer counts, nor does a worker that left the room",
     );
     AppError::Refused {
         code: EXIT_VERSION,
@@ -878,6 +882,7 @@ fn envelope(draft: &Draft, session: &str, op: &str) -> Envelope {
     let mut data = draft.data.clone();
     data.insert(ops::OP_KEY.into(), op.into());
     data.insert(VOX_KEY.into(), VERSION.into());
+    data.insert(CLAIMS_KEY.into(), CLAIM_RULES.into());
     env.data = serde_json::Value::Object(data);
     env
 }

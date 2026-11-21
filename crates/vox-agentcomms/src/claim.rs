@@ -8,7 +8,7 @@
 //!
 //! ## The property that matters
 //!
-//! Every node on one Vox version **must** reach the same state, having possibly
+//! Every node on one claim-rules number **must** reach the same state, having possibly
 //! received the operations in a different order. That is achieved the only way it
 //! reliably can be: the operations are sorted into a canonical order before they are
 //! folded, so the answer is a function of the *set* of operations, not of arrival
@@ -29,9 +29,9 @@
 //! Nothing here reserves anything. Posting a claim is posting a message; **the
 //! state is whatever [`fold`] computes from the room's log**, and an agent that has
 //! not caught up computes it from a smaller set. Two agents can be **behind**; they
-//! cannot permanently **disagree** — provided they run the same version, which is
-//! why an operation stamped with any other version changes nothing here (ADR-021
-//! §5) rather than being folded under rules its author did not use.
+//! cannot permanently **disagree** — provided they use the same claim rules, which is
+//! why an operation stamped with other rules changes nothing here (ADR-052 RG-10)
+//! rather than being folded under rules its author did not use.
 //!
 //! ## The protocol (ADR-021 §4)
 //!
@@ -185,10 +185,8 @@ pub fn is_claim_protocol(env: &Envelope) -> bool {
 
 /// Read a claim-protocol message, or say exactly why it is not a valid operation.
 ///
-/// Every operation MUST carry a resource, a session (`from`), an operation id and a
-/// version stamp (ADR-021 §4). The stamp is checked here only for presence; whether
-/// it *matches* is the fold's question, answered against the folding worker's own
-/// version.
+/// Every operation carries a resource, a session (`from`), an operation id and a
+/// claim-rules stamp. The fold checks the stamp before parsing.
 ///
 /// # Errors
 ///
@@ -362,7 +360,7 @@ pub struct Fold {
 }
 
 /// Fold a room's claim-protocol messages into one state per resource, as of
-/// `now_millis`, under the rules of version `mine`.
+/// `now_millis`, under claim rules `mine`.
 ///
 /// Deterministic in the set of messages: the same set in any order yields the same
 /// [`Fold`]. Non-claim messages are ignored.
