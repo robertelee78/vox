@@ -1812,7 +1812,11 @@ impl Controller {
             .iter()
             .flatten()
             .chain(self.deferred.iter())
-            .chain(self.retiring.iter())
+            .chain(
+                self.retiring
+                    .iter()
+                    .filter(|flow| !self.retirement_failed.contains(&retirement_key(flow))),
+            )
             .any(|flow| flow.service.slot() != service.slot())
             || self
                 .running

@@ -358,7 +358,7 @@ fn storage<E: std::fmt::Display>(op: &'static str) -> impl FnOnce(E) -> Error {
     move |e| {
         let mut detail = e.to_string();
         if detail.contains("No space left on device") {
-            detail.insert_str(0, "the disk is full; free disk space and Vox will retry: ");
+            detail.insert_str(0, "the disk is full; free disk space: ");
         }
         Error::Storage { op, detail }
     }
@@ -574,7 +574,7 @@ fn open_error(path: &Path, e: redb::DatabaseError) -> Error {
         {
             "the disk is full; free disk space and try again"
         } else {
-            "check that the file is readable and undamaged"
+            "restore it from a backup, or move it aside to start a new node"
         };
         Error::Storage {
             op: "open",
@@ -628,7 +628,7 @@ impl Store {
         } else {
             Err(Error::Storage {
                 op: "read schema",
-                detail: format!("the store could not be read at {}: its schema or tables are missing; the file was not changed", path.display()),
+                detail: format!("the store could not be read at {}: its schema or tables are missing; the file was not changed; restore it from a backup, or move it aside to start a new node", path.display()),
             })
         }
     }

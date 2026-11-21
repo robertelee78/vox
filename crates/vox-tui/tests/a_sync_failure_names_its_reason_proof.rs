@@ -593,6 +593,8 @@ fn signal_and_confirm(pid: &str, sig: &str) {
 }
 
 /// RG-14: two real ENOSPC/recovery cycles must not strand another room or a leave.
+/// If detaching fails or this process is killed, the image may remain mounted at
+/// `<temporary directory>/rg14-*/disk`; the rg14 evidence runner also cleans up its own images.
 #[cfg(target_os = "macos")]
 #[test]
 #[ignore = "real daemons and a disposable 64 MiB macOS disk image; run in release"]
@@ -629,10 +631,12 @@ fn a_full_disk_recovers_without_stranding_sync_or_leave() {
                     .args(["detach", "-force"])
                     .arg(&self.0)
                     .output();
-                assert!(
-                    out.is_ok_and(|out| out.status.success()),
-                    "APPARATUS: disk image could not be detached"
-                );
+                if !out.is_ok_and(|out| out.status.success()) {
+                    eprintln!(
+                        "APPARATUS: disk image could not be detached; possible leftover mount: {}",
+                        self.0.display()
+                    );
+                }
             }
         }
     }

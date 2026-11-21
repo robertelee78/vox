@@ -7324,6 +7324,7 @@ pub fn print_identity(
 /// reached — the node holds the room hidden for that, named only by `vox status` as leaving —
 /// and stop listing this identity in the room's roster. Joining again later is an ordinary
 /// join.
+/// An already ended room is deleted locally; no new departure or withdrawal is queued.
 ///
 /// # Errors
 /// If the node cannot be reached, or the room is unknown or closed.
@@ -7336,11 +7337,11 @@ pub async fn leave(paths: &Paths, room: &str) -> Result<(), AppError> {
             Err(_) => return Err(error),
         },
     };
-    let name = rooms_of(&mut client)
+    let (name, ended) = rooms_of(&mut client)
         .await?
         .into_iter()
         .find(|(id, ..)| *id == channel_id)
-        .map(|(_, name, ..)| name)
+        .map(|(_, name, _, over, ..)| (name, !over.is_empty()))
         .unwrap_or_default();
     let which = if name.is_empty() {
         format!("room {}", b32_encode(&channel_id))
@@ -7349,11 +7350,15 @@ pub async fn leave(paths: &Paths, room: &str) -> Result<(), AppError> {
     };
     // What it is to do, said before it is done (ADR-028 E-5).
     let services = offered_in(&mut client, channel_id).await;
-    println!(
-        "vox: about to leave {which}, or cancel its retained pending admission: this node will \
-         delete the local room, tell its members as they are reached and queue its own member \
-         withdrawal"
-    );
+    if ended {
+        println!("vox: about to delete this node's copy of {which}, which has already ended");
+    } else {
+        println!(
+            "vox: about to leave {which}, or cancel its retained pending admission: this node will \
+             delete the local room, tell its members as they are reached and queue its own member \
+             withdrawal"
+        );
+    }
     if !services.is_empty() {
         println!(
             "     your services offered there go with it: {}",
@@ -7364,6 +7369,10 @@ pub async fn leave(paths: &Paths, room: &str) -> Result<(), AppError> {
         Ok(Frame::Ok) => {
             if pending_only {
                 println!("vox: cancelled the pending admission for {which}; its member withdrawal is queued");
+            } else if ended {
+                println!(
+                    "vox: left {which}; it had already ended, and this node's copy is deleted"
+                );
             } else {
                 println!(
                     "vox: left {which}; members are told as they are reached, and its member \

@@ -2385,10 +2385,11 @@ fn an_ended_room_can_be_left_at_once() {
         started.elapsed() < Duration::from_secs(5),
         "PRODUCT: leaving an ended room waited instead of finishing locally"
     );
-    let list = alice.vox(None, &["room", "list"]);
     assert!(
-        list.ok && !list.stdout.contains(&room.id),
-        "PRODUCT: ended room still listed after leave: {list:?}"
+        left.stdout.contains("had already ended")
+            && left.stdout.contains("this node's copy is deleted")
+            && !left.stdout.contains("withdrawal is queued"),
+        "PRODUCT: ended-room leave described a departure instead of local deletion: {left:?}"
     );
     erased(alice, &room.id, &room.cid, false);
 }
@@ -2446,9 +2447,11 @@ fn an_unreadable_store_is_left_exactly_as_it_is() {
             || !out
                 .stderr
                 .contains(path.to_str().expect("APPARATUS: store path"))
+            || !out.stderr.contains("restore it from a backup")
+            || !out.stderr.contains("move it aside to start a new node")
         {
             problems.push(format!(
-                "{name}: refusal did not say what failed and where: {out:?}"
+                "{name}: refusal did not say what failed, where, and what to do: {out:?}"
             ));
         }
     }
