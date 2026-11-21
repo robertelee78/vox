@@ -1,6 +1,6 @@
 # Commands and local state
 
-Applies to Vox v0.4.22.
+Applies to Vox v0.4.31.
 
 This page lists the terms this manual uses, Vox's commands, how a command picks its node, the files Vox keeps, how
 passphrases are given, and the terminal interface's keys. `vox --help`, and `--help` on any
@@ -218,8 +218,9 @@ Vox refuses a passphrase on the command line, because other processes can read i
 `VOX_ROOM_PASSPHRASE` too. `VOX_IDENTITY_PASSPHRASE` works for unlocking, but other processes of
 your user can read it.
 
-On a Mac, `vox node unlock` remembers the passphrase in the Keychain. On Linux, remember a node with a
-file instead, readable only by you:
+On a Mac, `vox node unlock` remembers the passphrase in the Keychain. On Linux, a typed unlock
+keeps it in the kernel keyring until reboot. For automatic recovery after reboot, choose a
+persistent file readable only by you:
 
 ```sh
 vox node unlock robertgpt --passphrase-file ~/.vox-robertgpt-passphrase

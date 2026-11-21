@@ -1,11 +1,11 @@
-//! A kept node's identity passphrase in the macOS login keychain (ADR-028 K-10, ADR-014 M-6).
+//! A kept node's passphrase in the macOS login Keychain or Linux's boot-scoped kernel keyring.
 //!
 //! Only the daemon touches it: it stores the passphrase when a client (`vox node unlock`, `vox
 //! node create`, `vox setup`, `vox agent setup`, Vox.app) asks it to keep a node it has just
 //! attached with that passphrase (#666), reads it to attach the node again when it starts, and
-//! removes it when the node is detached by hand or its passphrase is forgotten. One generic-password item per node, under the
-//! service [`SERVICE`] and the node's directory as its account; the item's access is the daemon's
-//! own, so reading it back at login asks nothing.
+//! removes it when the node is detached by hand or its passphrase is forgotten. On a Mac, one
+//! generic-password item per node uses [`SERVICE`] and its directory as the account. Linux
+//! keeps a uid-readable user key under a digest of that directory, until reboot or forgetting.
 
 /// The keychain service every kept node's passphrase is stored under.
 pub const SERVICE: &str = "us.vox.node";
@@ -152,7 +152,45 @@ mod mac {
 #[cfg(target_os = "macos")]
 pub use mac::{forget, read, store};
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+mod linux {
+    use sha2::{Digest as _, Sha256};
+    use zeroize::Zeroizing;
+
+    fn name(account: &str) -> String {
+        format!("us.vox.node:{:x}", Sha256::digest(account.as_bytes()))
+    }
+
+    pub fn store(account: &str, passphrase: &str) -> Result<(), String> {
+        vox_sockdrops::kernel_key::store(&name(account), passphrase.as_bytes())
+            .map_err(|e| format!("the kernel keyring could not remember it: {e}; unlock again, or choose --passphrase-file for recovery after reboot"))
+    }
+    pub fn read(account: &str) -> Result<Zeroizing<String>, String> {
+        // Linux user-key payloads are at most 32767 bytes. Move the one wiped allocation into
+        // the returned string, rather than leave another secret copy behind.
+        let mut bytes = Zeroizing::new(vec![0_u8; 32767]);
+        let length = vox_sockdrops::kernel_key::read(&name(account), &mut bytes).map_err(|e| {
+            format!("the kernel keyring has no readable passphrase: {e}; run vox node unlock")
+        })?;
+        bytes.truncate(length);
+        String::from_utf8(std::mem::take(&mut *bytes))
+            .map(Zeroizing::new)
+            .map_err(|e| {
+                drop(Zeroizing::new(e.into_bytes()));
+                "the kernel keyring's passphrase is not text; unlock the node again".to_owned()
+            })
+    }
+
+    pub fn forget(account: &str) -> Result<(), String> {
+        vox_sockdrops::kernel_key::forget(&name(account))
+            .map_err(|e| format!("the kernel keyring could not forget it: {e}"))
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub use linux::{forget, read, store};
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 const NOT_HERE: &str = "this system has no Keychain Vox can store it in, so after the daemon \
                         restarts unlock the node again by hand; to remember it, use `vox node unlock` \
                         with --passphrase-file naming the file that holds its passphrase";
@@ -161,7 +199,7 @@ const NOT_HERE: &str = "this system has no Keychain Vox can store it in, so afte
 ///
 /// # Errors
 /// Always.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn store(_account: &str, _passphrase: &str) -> Result<(), String> {
     Err(NOT_HERE.to_owned())
 }
@@ -170,13 +208,13 @@ pub fn store(_account: &str, _passphrase: &str) -> Result<(), String> {
 ///
 /// # Errors
 /// Always.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn read(_account: &str) -> Result<zeroize::Zeroizing<String>, String> {
     Err(NOT_HERE.to_owned())
 }
 
 /// Nothing is stored on this platform.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn forget(_account: &str) -> Result<(), String> {
     Ok(())
 }

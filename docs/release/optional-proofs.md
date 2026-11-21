@@ -532,3 +532,117 @@ Seventy shipped nodes share one scratch daemon, join a room, trust each other an
 messages read. The app client must expose all69 readers on every message and every trust
 relationship. The terminal must open the room and show every reader and peer's trust (#792).
 This expensive proof is optional and blocks neither CI nor release.
+
+### Linux release installation (ADR-051, RG-11)
+
+Build the Linux dist with `scripts/build-linux-release.sh /absolute/path/to/linux-dist`.
+The release workflow and this wrapper run `scripts/linux-release-steps.sh` in the same
+digest-pinned manylinux glibc 2.28 x86_64 image. Add the release's own `install.sh` to that
+dist before running the asset proof. All container starts, builds and proof runs on the
+shared proof host go through its build slot.
+
+The release workflow's `workflow_dispatch` candidate-only mode runs that same Linux job
+after checking the requested commit, alongside the signed Mac candidates. Its
+`vox-candidate-normal-x86_64-unknown-linux-gnu` artifact includes the six Linux release
+files and that commit's `install.sh`; candidate-only mode publishes no release.
+
+```sh
+for proof in the_linux_release_asset_installs_only_where_it_runs \
+  the_linux_release_installer_refuses_below_its_floor \
+  the_linux_release_installer_names_a_missing_loader; do
+  VOX_PROOF_DIST=/absolute/path/to/release-assets cargo test --release -p vox-tui \
+    --features optional-proofs,test-knobs --test install_sh_proof \
+    "$proof" -- --ignored --exact --nocapture
+done
+```
+
+These optional proofs drive the supplied installer and asset as an ordinary user in five
+disposable `linux/amd64` container acts, each limited to four CPUs and 8 GiB. Digests are
+pinned inline: AlmaLinux 8 is the glibc 2.28 floor; Ubuntu 22.04 (2.35) is one supported
+system above it and matches the reported install failure; Ubuntu 18.04 (2.27) is below
+the floor, once with working `getconf` and once with it unavailable; Alpine 3.20 has no
+GNU loader. It records image, architecture, kernel, libc, command output and wall time,
+and removes its containers and images it pulled. A remote Podman connection must be the
+already-running `podman-machine-default`; the proof forwards only its loopback release
+server port into that VM. No profile or home directory is mounted. Without
+`optional-proofs`, the usual loud `OPTIONAL PROOF NOT RUN` stand-in is compiled instead.
+Under amd64 emulation, `/proc/<pid>/exe` can name QEMU rather than Vox. The asset
+proof records that symlink without treating it as the guest program's identity, and
+checks the launched Vox path in the daemon's kernel argv.
+
+Arm (f), a shipped asset updating from a stand-in release server, is not run: shipped
+Vox takes releases from GitHub only and contains no release-source test knob.
+Arm (e) proves the same updater code on a `test-knobs` build and blocks; the real release
+source is exercised only when a later release exists.
+
+The blocking source journeys run as x86_64 Linux in an emulated container on an arm64
+host, not natively as arm64 (which has no Linux release target). The emulated harness is
+release-built: a debug harness run under QEMU was interrupted after 46 minutes without
+a verdict, and release mode avoids unoptimized fixture hashing. This apparatus choice does
+not change the real x86_64 product, installer or release floor.
+Emulated executions use shared slots only; time-bound arms are not judged under emulation.
+Measure the smallest arm first and keep holds near 20 minutes. A longer single arm needs
+its measured apparatus cost reported before another run, not a false product-time verdict.
+
+```sh
+cargo test --release -p vox-tui --features test-knobs --test install_sh_proof \
+  install_sh_installs_what_it_verified_and_refuses_what_it_could_not -- --exact --nocapture
+VOX_PROOF_NEXT_BINARY=/absolute/path/to/9.x/vox cargo test --release -p vox-tui \
+  --features test-knobs --test update_proof \
+  an_update_restarts_its_daemon_and_refuses_a_different_local_version -- --ignored --exact --nocapture
+```
+
+Build the fixture from a copy of the same tree with the workspace version's first
+character changed to `9` (0.4.31 becomes 9.4.31), using
+`cargo build --release --bin vox --features vox-tui/test-knobs`. Record the image digest,
+`uname -m`, VM kernel and build wall times with both journeys' claim lists.
+
+The Linux kernel-keyring proof crosses login-session boundaries and also checks a lost
+boot credential and a chosen persistent passphrase file:
+
+```sh
+cargo test --release -p vox-tui --features test-knobs --test the_daemon_and_its_nodes_proof \
+  a_linux_typed_unlock_survives_another_sessions_daemon -- --ignored --exact --nocapture
+```
+
+For a typed unlock across the actual Linux update, use the same compiled `9.x` fixture:
+
+```sh
+VOX_PROOF_NEXT_BINARY=/absolute/path/to/9.x/vox cargo test --release -p vox-tui \
+  --features test-knobs --test update_proof a_linux_typed_unlock_stays_ready_after_update \
+  -- --ignored --exact --nocapture
+```
+
+It needs `python3` (the existing typed-terminal driver) and `keyctl`. In a container,
+`--security-opt seccomp=unconfined` permits `add_key` and `keyctl`, which the default
+container profile refuses; this changes syscall access, not keyring lifetime, uid
+permissions, cross-session visibility or the user-visible Ready/Locked assertions.
+It clears only a newly created session keyring and removes only its scratch node's
+boot credential, never another user's or another node's key.
+
+Rootless Linux user namespaces can refuse the per-user keyring with `ENOKEY`, even with
+seccomp disabled. The Ready-after-restart proof needs an ordinary uid in the initial user
+namespace and a successful `keyctl add user <scratch-name> <scratch-value> @u` precondition.
+An existing rootful Podman connection to the authorized machine can supply that container;
+do not change the machine's rootful setting or default connection.
+
+The Linux store creates its key in a temporary thread keyring while setting uid-only
+permissions, then links it into the user keyring and drops the thread reference. Creating
+it directly in an unpossessed user keyring does not grant the caller permission to change
+the key's default permissions.
+
+Run this preservation proof where `@u` is unavailable: a rootless namespace, an ordinary
+container's default seccomp profile, or QEMU returning `ENOSYS`:
+
+```sh
+cargo test --release -p vox-tui --features test-knobs --test the_daemon_and_its_nodes_proof \
+  a_linux_unavailable_keyring_keeps_unlock_ready_without_a_disk_secret -- --ignored --exact --nocapture
+```
+
+It checks successful typed unlock with the actual not-remembered reason, Ready for that
+daemon's lifetime, no plaintext fallback, Locked with the unlock command after restart,
+and successful lock and forget-passphrase. An unavailable keyring (`ENOKEY`, `ENOSYS`,
+`EPERM`, `EACCES` or `EOPNOTSUPP` while finding a key) has nothing this process can
+remember or forget. A failure to revoke or unlink a key found in a working keyring
+remains an error. Retention itself cannot be judged under QEMU's missing keyring syscalls;
+run its typed-update triplet natively with both genuinely compiled native versions.

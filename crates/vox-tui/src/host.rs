@@ -1642,7 +1642,7 @@ impl Router {
             } else {
                 format!(
                     "node {node} is Ready, but not remembered: its passphrase could not be stored \
-                     in the Keychain: {e}"
+                     by this system: {e}"
                 )
             });
         }
@@ -4557,8 +4557,8 @@ impl Router {
                 Ok(p) => (Some(p), Vec::new()),
                 Err(e) => {
                     eprintln!(
-                        "vox daemon: could not make remembered node {node} Ready: its passphrase in the \
-                         Keychain: {e}"
+                        "vox daemon: could not make remembered node {node} Ready: its saved \
+                         passphrase: {e}"
                     );
                     self.needs_passphrase(node).await;
                     return;

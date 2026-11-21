@@ -7,9 +7,12 @@
 # VOX_INSTALL_DIR). On macOS it installs Vox.app instead, to /Applications when that is writable
 # and ~/Applications otherwise (VOX_APPLICATIONS_DIR overrides /Applications), and makes
 # ~/.local/bin/vox a link to the vox inside it: the CLI, the daemon and the app are one binary of
-# one version (ADR-014 M-28). macOS needs Apple Silicon and macOS 13 or later (M-26a). Fetches the per-target release record through GitHub's
-# releases/latest/download redirect, downloads the matching binary from that exact
-# release, verifies size and SHA-256 before anything is put in place, installs it
+# one version (ADR-014 M-28). macOS needs Apple Silicon and macOS 13 or later (M-26a).
+# On Linux, Vox needs glibc 2.28 or newer: Ubuntu 20.04, Debian 10, RHEL 8,
+# and everything newer. On an older system the installer says so and installs nothing; where it
+# can tell before downloading, it downloads nothing.
+# Fetches the per-target release record through GitHub's releases/latest/download redirect,
+# downloads the binary from that exact release, verifies size and SHA-256, installs it
 # atomically, then runs `vox shell-setup` so PATH and tab completion work in your next
 # shell (one marker-delimited block at the end of your rc; VOX_NO_SHELL_SETUP=1 skips it).
 #
@@ -26,6 +29,8 @@ REPO="robertelee78/vox"
 APPLE_TEAM_ID="3T2D2YNTVW"
 APPLE_IDENTIFIER="us.vox.cli"
 APPLE_APP_IDENTIFIER="us.vox.app"
+LINUX_GLIBC_FLOOR=2.28
+LINUX_SYSTEMS="glibc $LINUX_GLIBC_FLOOR or newer (Ubuntu 20.04, Debian 10, RHEL 8 and newer)"
 # VOX_RELEASE_BASE exists for the installer's own end-to-end test against a local
 # stand-in server; the origin check below still applies to redirects from it.
 BASE="${VOX_RELEASE_BASE:-https://github.com/${REPO}/releases}"
@@ -84,6 +89,26 @@ ASSET="vox-${TARGET}"
 RECORD="${CHANNEL}-${TARGET}.json"
 APP_RECORD="app-${CHANNEL}-${TARGET}.json"
 
+# Numeric components, padded with zeros: 2.28 is newer than 2.2.5.
+version_above() {
+  awk -v a="$1" -v b="$2" 'BEGIN {
+    n=split(a,x,"."); m=split(b,y,".");
+    for(i=1;i<=n || i<=m;i++) {
+      if(x[i]+0 > y[i]+0) exit 0;
+      if(x[i]+0 < y[i]+0) exit 1;
+    }
+    exit 1;
+  }'
+}
+system_glibc=
+if [ "$os" = Linux ]; then
+  libc=$(getconf GNU_LIBC_VERSION 2>/dev/null || true)
+  system_glibc=$(printf '%s\n' "$libc" | sed -n 's/^glibc \([0-9][0-9]*\.[0-9][0-9]*\)$/\1/p')
+  if [ -n "$system_glibc" ] && version_above "$LINUX_GLIBC_FLOOR" "$system_glibc"; then
+    fail "this Linux is not supported: Vox needs $LINUX_SYSTEMS, and this system has glibc $system_glibc. Nothing was downloaded or installed."
+  fi
+fi
+
 # --- tools --------------------------------------------------------------------------
 command -v curl >/dev/null 2>&1 || fail "curl is required"
 if command -v sha256sum >/dev/null 2>&1; then
@@ -92,6 +117,14 @@ elif command -v shasum >/dev/null 2>&1; then
   sha() { shasum -a 256 "$1" | cut -d' ' -f1; }
 else
   fail "need sha256sum or shasum to verify the download"
+fi
+have_timeout=0
+if [ "$os" = Linux ]; then
+  if timeout --kill-after=1 5 true >/dev/null 2>&1; then
+    have_timeout=1
+  else
+    say "vox install: this system has no GNU timeout; the check of the downloaded vox is not time-limited."
+  fi
 fi
 
 # --- release record ------------------------------------------------------------------
@@ -138,6 +171,87 @@ fetch_asset() { # <asset name> <size> <sha256> <output>
   [ "$got_size" = "$2" ] || fail "size mismatch: expected $2, got $got_size"
   got_sha=$(sha "$4")
   [ "$got_sha" = "$3" ] || fail "sha256 mismatch: expected $3, got $got_sha"
+}
+
+# Every Linux --version has the same clean environment, output capture and bound.
+run_check() { # <path> [expected version]
+  run_status=0
+  if [ "$have_timeout" = 1 ]; then
+    env -i PATH="$PATH" HOME="$HOME" VOX_DATA_DIR="${VOX_DATA_DIR:-}" VOX_CONFIG_DIR="${VOX_CONFIG_DIR:-}" \
+      timeout --kill-after=2 20 "$1" --version >"$tmp/run-out" 2>"$tmp/run-err" || run_status=$?
+  else
+    env -i PATH="$PATH" HOME="$HOME" VOX_DATA_DIR="${VOX_DATA_DIR:-}" VOX_CONFIG_DIR="${VOX_CONFIG_DIR:-}" \
+      "$1" --version >"$tmp/run-out" 2>"$tmp/run-err" || run_status=$?
+  fi
+  run_output=$(cat "$tmp/run-out")
+  run_verdict="did not run"
+  case "$run_status" in
+    124|137) run_verdict="did not answer" ;;
+    126|127) run_verdict="could not start" ;;
+    0)
+      if [ -n "${2:-}" ]; then
+        printf 'vox %s\n' "$2" >"$tmp/expected"
+      else
+        case "$run_output" in
+          "vox "?*)
+            case "${run_output#vox }" in *[![:graph:]]*) return 1 ;; esac
+            printf '%s\n' "$run_output" >"$tmp/expected" ;;
+          *) return 1 ;;
+        esac
+      fi
+      if cmp -s "$tmp/expected" "$tmp/run-out"; then run_verdict=ran; return 0; fi ;;
+  esac
+  return 1
+}
+
+explain_not_running() {
+  if [ "$run_verdict" = "did not answer" ]; then
+    printf 'vox install: vox %s did not answer `--version` within 20 seconds and was stopped. Before that it said:\n' "$version" >&2
+  else
+    printf 'vox install: vox %s did not run on this machine. It said:\n' "$version" >&2
+  fi
+  if [ -s "$tmp/run-err" ]; then
+    head -n 20 "$tmp/run-err" | sed 's/^/  /' >&2
+  elif [ -s "$tmp/run-out" ]; then
+    printf '  it printed: ' >&2
+    head -c 256 "$tmp/run-out" >&2
+    printf '\n' >&2
+  else
+    printf '  (nothing)\n' >&2
+  fi
+  need=
+  for name in $(sed -n "s/.*version \`GLIBC_\([0-9][0-9.]*\)' not found.*/\1/p" "$tmp/run-err"); do
+    case "$name" in *.|*..*) continue ;; esac
+    if [ -z "$need" ] || version_above "$name" "$need"; then need=$name; fi
+  done
+  if [ -n "$need" ]; then
+    if [ -n "$system_glibc" ]; then
+      system="and this system has glibc $system_glibc"
+    else
+      system="and this system's glibc version could not be read"
+    fi
+    if version_above "$need" "$LINUX_GLIBC_FLOOR"; then
+      reason="a release that needs more than that is a defect in Vox, not in this machine: please report it."
+    else
+      reason="this system is older than that."
+    fi
+    printf 'vox install: this build needs glibc %s %s. Vox supports %s; %s\n' "$need" "$system" "$LINUX_SYSTEMS" "$reason" >&2
+  elif [ "$run_verdict" = "could not start" ] && [ ! -e /lib64/ld-linux-x86-64.so.2 ]; then
+    printf 'vox install: the program loader this build needs, /lib64/ld-linux-x86-64.so.2, is not on this system. Vox supports %s.\n' "$LINUX_SYSTEMS" >&2
+  elif [ "$run_verdict" = "did not answer" ]; then
+    printf 'vox install: a vox that does not answer `--version` is not installed. Vox supports %s; if this system is one of those, this is a defect in Vox: please report it with the lines above.\n' "$LINUX_SYSTEMS" >&2
+  else
+    printf 'vox install: the cause is not one this installer can name. Vox supports %s; if this system is one of those, this is a defect in Vox: please report it with the lines above.\n' "$LINUX_SYSTEMS" >&2
+  fi
+  if [ -e "$INSTALL_DIR/vox" ]; then
+    if run_check "$INSTALL_DIR/vox"; then
+      printf 'vox install: nothing was changed: %s/vox is still %s.\n' "$INSTALL_DIR" "$run_output" >&2
+    else
+      printf 'vox install: nothing was changed: %s/vox is still the vox that was there.\n' "$INSTALL_DIR" >&2
+    fi
+  else
+    printf 'vox install: nothing was installed.\n' >&2
+  fi
 }
 
 # --- Apple Developer ID + notarization (macOS) -------------------------------------------
@@ -346,7 +460,7 @@ INITIAL
   [ "$installed" = "vox $version" ] \
     || fail "$INSTALL_DIR/vox reports ${installed:-nothing}, not vox $version"
 else
-  # --- vox (Linux, unchanged by ADR-014) -----------------------------------------------------
+  # --- vox (Linux) -------------------------------------------------------------------------
   fetch_asset "$ASSET" "$size" "$sha256" "$tmp/$ASSET"
   chmod 0755 "$tmp/$ASSET"
 
@@ -366,6 +480,11 @@ else
   rm -f "$INSTALL_DIR/.vox-candidate.partial" "$INSTALL_DIR/.vox-previous.partial"
   cp "$tmp/$ASSET" "$INSTALL_DIR/.vox-candidate.partial"
   chmod 0755 "$INSTALL_DIR/.vox-candidate.partial"
+  if ! run_check "$INSTALL_DIR/.vox-candidate.partial" "$version"; then
+    explain_not_running
+    rm -f "$INSTALL_DIR/.vox-candidate.partial"
+    exit 1
+  fi
   if [ -e "$INSTALL_DIR/vox" ]; then
     cp -p "$INSTALL_DIR/vox" "$INSTALL_DIR/.vox-previous.partial"
     mv -f "$INSTALL_DIR/.vox-previous.partial" "$INSTALL_DIR/.vox-previous"
@@ -376,9 +495,40 @@ else
     "$CHANNEL" >"$INSTALL_DIR/$MARKER"
   mv -f "$INSTALL_DIR/.vox-candidate.partial" "$INSTALL_DIR/vox"
 
-  installed=$("$INSTALL_DIR/vox" --version 2>/dev/null || true)
-  [ -n "$installed" ] || fail "the installed binary did not run"
+  if ! run_check "$INSTALL_DIR/vox" "$version"; then
+    head -n 20 "$tmp/run-err" >&2
+    fail "the installed binary did not run; see its output above"
+  fi
+  installed=$run_output
   say "installed: $INSTALL_DIR/vox ($installed)"
+
+  # Persist only Vox's receive-buffer setting, and report the kernel's readback.
+  # Documented installer-proof hooks: a private sysctl directory and /proc/sys stand-in.
+  sysctl_dir=${VOX_SYSCTL_DIR:-/etc/sysctl.d}
+  proc_sys=${VOX_PROC_SYS:-/proc/sys}
+  receive_cap=$(cat "$proc_sys/net/core/rmem_max" 2>/dev/null || true)
+  case "$receive_cap" in ''|*[!0-9]*) receive_cap=unknown ;; esac
+  if [ "$receive_cap" = unknown ] || [ "$receive_cap" -lt 4194304 ]; then
+    configured=0
+    if [ "$(id -u)" = 0 ] && [ -w "$sysctl_dir" ]; then
+      if printf 'net.core.rmem_max = 4194304\n' >"$sysctl_dir/90-vox.conf"; then
+        sysctl_ok=1
+        sysctl --system || sysctl_ok=0
+        receive_cap=$(cat "$proc_sys/net/core/rmem_max" 2>/dev/null || true)
+        case "$receive_cap" in ''|*[!0-9]*) receive_cap=unknown ;; esac
+        if [ "$sysctl_ok" = 1 ] && [ "$receive_cap" != unknown ] && [ "$receive_cap" -ge 4194304 ]; then
+          say "net.core.rmem_max: set to 4194304 in /etc/sysctl.d/90-vox.conf (Vox's UDP receive buffer)"
+          configured=1
+        fi
+      fi
+    fi
+    if [ "$configured" = 0 ]; then
+      [ "$receive_cap" != unknown ] || receive_cap="an unknown number of"
+      say "This host caps Vox's UDP receive buffer at $receive_cap bytes; Vox needs 4194304. As root, run:"
+      say "  sysctl -w net.core.rmem_max=4194304"
+      say "  echo 'net.core.rmem_max = 4194304' > /etc/sysctl.d/90-vox.conf"
+    fi
+  fi
 fi
 
 # --- shell integration (PATH first, then tab completion), and the agent skill pack ----------

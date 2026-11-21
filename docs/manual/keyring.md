@@ -1,6 +1,6 @@
 # Identity and keyring
 
-Applies to Vox v0.4.5.
+Applies to Vox v0.4.31.
 
 For several computers you own, start with [My computers](#my-computers): enrollment manages
 trust between their nodes after approval on both machines. The individual-node steps below are
@@ -31,16 +31,17 @@ Locked; a node with no passphrase becomes Ready immediately. There
 is no backup of a node: its keys never leave the machine. If the machine is lost, make a new node,
 and ask everyone who trusted the old one to remove it and trust the new one.
 
-`vox node unlock` makes a node Ready and always remembers it for daemon restarts, updates and
-reboots. On a Mac its passphrase is stored in the Keychain, whether typed or supplied through a
-file or environment variable. A node with no passphrase needs no secret stored. On a system
-without a Keychain, a protected node needs a private persistent passphrase file:
+`vox node unlock` makes a node Ready. On a Mac, it remembers the passphrase in the login
+Keychain. On Linux, a typed unlock keeps it in the kernel keyring, so daemon restarts,
+updates and crashes need no input. Reboot clears that key: without a chosen passphrase file,
+the node is **Locked** and `vox status` prints its unlock command.
+
+For automatic recovery after reboot on Linux, choose a private persistent file and run
 `vox node unlock robertgpt --passphrase-file ~/.vox-robertgpt-passphrase`.
-Keep that file in place: the daemon reads it again at each start. Stdin (`-`) and an environment
-variable cannot supply a remembered file. There is no option to unlock without remembering.
-If remembering fails, unlock returns a failure and describes the resulting state. A previous
-remembered entry may remain; if Vox cannot read it, it reports that uncertainty. Correct the
-reported problem and retry.
+Keep that file in place: the daemon reads it again at each start. Vox remembers the path,
+never writes a passphrase file itself, and uses no TPM credential. A node with no passphrase
+needs no secret stored. If remembering fails, the output says that the node is Ready but
+not remembered; correct the reported storage problem and unlock it again.
 
 `vox node list` shows each node as **Ready** or **Locked**, with its fingerprint, and
 `(remembered)` when Vox has saved how to start it again. A progress mark appears while work is

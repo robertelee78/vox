@@ -47,6 +47,10 @@ pub(crate) mod restart;
 /// The repository releases are published from.
 const REPO: &str = "robertelee78/vox";
 
+// Keep equal to install.sh's LINUX_GLIBC_FLOOR (ADR-051).
+#[cfg(not(target_os = "macos"))]
+const LINUX_GLIBC_FLOOR: &str = "2.28";
+
 /// Record identity. A file that does not say exactly this is not a vox release record.
 const RECORD_KIND: &str = "vox.standalone-release";
 /// The app's record identity (ADR-014 M-27): `app-<channel>-<triple>.json`, the same schema.
@@ -786,22 +790,262 @@ fn verify_apple_release(active: &Path, candidate: &Path, version: &str) -> Resul
 /// On Linux there is no Apple trust service, so an update rests on TLS to GitHub and the
 /// record's digest alone. Stated here rather than silently skipped — see the module docs.
 #[cfg(not(target_os = "macos"))]
-fn verify_apple_release(_active: &Path, candidate: &Path, version: &str) -> Result<(), AppError> {
-    let output = Command::new(candidate)
-        .arg("--version")
-        .env_clear()
-        .output()
-        .map_err(AppError::Io)?;
-    if !output.status.success()
-        || output.stdout.len() > MAX_VERSION_OUTPUT_BYTES
-        || !output.stderr.is_empty()
-        || output.stdout != format!("vox {version}\n").into_bytes()
-    {
+fn verify_apple_release(active: &Path, candidate: &Path, version: &str) -> Result<(), AppError> {
+    let checked = run_check(candidate, Some(version));
+    if checked.verdict == RunVerdict::Ran {
+        return Ok(());
+    }
+    if checked.success && checked.stderr.is_empty() && says_vox_version(&checked.stdout) {
         return Err(usage(
             "release trust check failed: the candidate's version is not the one the record named",
         ));
     }
-    Ok(())
+    Err(not_running(&checked, active, Some(version), false))
+}
+
+#[cfg(not(target_os = "macos"))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RunVerdict {
+    Ran,
+    DidNotAnswer,
+    CouldNotStart,
+    DidNotRun,
+}
+
+#[cfg(not(target_os = "macos"))]
+struct RunCheck {
+    verdict: RunVerdict,
+    success: bool,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// Drain both pipes while the child runs, retaining only the bounded diagnostic.
+#[cfg(not(target_os = "macos"))]
+fn captured(mut pipe: impl std::io::Read, maximum: usize) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let _ = pipe.by_ref().take(maximum as u64).read_to_end(&mut bytes);
+    let _ = std::io::copy(&mut pipe, &mut std::io::sink());
+    bytes
+}
+
+#[cfg(not(target_os = "macos"))]
+fn run_check(path: &Path, expected: Option<&str>) -> RunCheck {
+    use std::os::unix::process::CommandExt as _;
+    use std::process::Stdio;
+    let mut command = Command::new(path);
+    command
+        .arg("--version")
+        .env_clear()
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for key in ["PATH", "HOME", "VOX_DATA_DIR", "VOX_CONFIG_DIR"] {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            return RunCheck {
+                verdict: if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                ) {
+                    RunVerdict::CouldNotStart
+                } else {
+                    RunVerdict::DidNotRun
+                },
+                success: false,
+                stdout: Vec::new(),
+                stderr: error.to_string().into_bytes(),
+            }
+        }
+    };
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let out = std::thread::spawn(move || {
+        stdout.map_or_else(Vec::new, |pipe| {
+            captured(pipe, MAX_VERSION_OUTPUT_BYTES + 1)
+        })
+    });
+    let err =
+        std::thread::spawn(move || stderr.map_or_else(Vec::new, |pipe| captured(pipe, 64 * 1024)));
+    let started = std::time::Instant::now();
+    let mut expired = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if started.elapsed() < Duration::from_secs(20) => {
+                std::thread::sleep(Duration::from_millis(20))
+            }
+            Ok(None) => {
+                expired = true;
+                break None;
+            }
+            Err(_) => break None,
+        }
+    };
+    // Kill the group even after its leader exits: no child may keep the pipes open.
+    let _ = Command::new("/bin/kill")
+        .args(["-KILL", "--", &format!("-{}", child.id())])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    if status.is_none() {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    let stdout = out.join().unwrap_or_default();
+    let stderr = err.join().unwrap_or_default();
+    let success = status.is_some_and(|status| status.success());
+    let answer = expected.map_or_else(
+        || {
+            std::str::from_utf8(&stdout)
+                .ok()
+                .and_then(|s| s.strip_suffix('\n'))
+                .and_then(|s| s.strip_prefix("vox "))
+                .is_some_and(|v| !v.is_empty() && !v.chars().any(char::is_whitespace))
+        },
+        |version| stdout == format!("vox {version}\n").as_bytes(),
+    );
+    RunCheck {
+        verdict: if expired {
+            RunVerdict::DidNotAnswer
+        } else if success && answer {
+            RunVerdict::Ran
+        } else {
+            RunVerdict::DidNotRun
+        },
+        success,
+        stdout,
+        stderr,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn version_components(version: &str) -> impl Iterator<Item = u64> + '_ {
+    version.split('.').map(|n| n.parse().unwrap_or(u64::MAX))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn version_above(left: &str, right: &str) -> bool {
+    let mut left = version_components(left);
+    let mut right = version_components(right);
+    loop {
+        let (a, b) = (left.next(), right.next());
+        if a.is_none() && b.is_none() {
+            return false;
+        }
+        match a.unwrap_or(0).cmp(&b.unwrap_or(0)) {
+            std::cmp::Ordering::Greater => return true,
+            std::cmp::Ordering::Less => return false,
+            std::cmp::Ordering::Equal => {}
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn explain_not_running(
+    verdict: RunVerdict,
+    stderr: &[u8],
+    system_glibc: Option<&str>,
+    floor: &str,
+) -> String {
+    let systems = format!("glibc {floor} or newer (Ubuntu 20.04, Debian 10, RHEL 8 and newer)");
+    let text = String::from_utf8_lossy(stderr);
+    let need = text
+        .split("version `GLIBC_")
+        .skip(1)
+        .filter_map(|s| s.split_once("' not found").map(|(name, _)| name))
+        .filter(|name| {
+            name.split('.')
+                .all(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .reduce(|a, b| if version_above(a, b) { a } else { b });
+    if let Some(need) = need {
+        let system = system_glibc.map_or_else(
+            || "and this system's glibc version could not be read".to_owned(),
+            |version| format!("and this system has glibc {version}"),
+        );
+        let reason = if version_above(need, floor) {
+            "a release that needs more than that is a defect in Vox, not in this machine: please report it."
+        } else {
+            "this system is older than that."
+        };
+        format!("this build needs glibc {need} {system}. Vox supports {systems}; {reason}")
+    } else if verdict == RunVerdict::DidNotAnswer {
+        format!("a vox that does not answer `--version` is not installed. Vox supports {systems}; if this system is one of those, this is a defect in Vox: please report it with the lines above.")
+    } else {
+        format!("the cause is not one this installer can name. Vox supports {systems}; if this system is one of those, this is a defect in Vox: please report it with the lines above.")
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn not_running(check: &RunCheck, active: &Path, version: Option<&str>, rollback: bool) -> AppError {
+    let first = if rollback {
+        format!("the retained previous vox ({}) does not run on this machine; it is not put back. It said:", active.with_file_name(PREVIOUS_NAME).display())
+    } else if check.verdict == RunVerdict::DidNotAnswer {
+        format!("vox {} did not answer `--version` within 20 seconds and was stopped. Before that it said:", version.unwrap_or("unknown"))
+    } else {
+        format!(
+            "vox {} did not run on this machine. It said:",
+            version.unwrap_or("unknown")
+        )
+    };
+    let mut message = format!("vox update: {first}\n");
+    if !check.stderr.is_empty() {
+        for line in String::from_utf8_lossy(&check.stderr).lines().take(20) {
+            message.push_str(&format!("  {line}\n"));
+        }
+    } else if !check.stdout.is_empty() {
+        message.push_str(&format!(
+            "  it printed: {}\n",
+            String::from_utf8_lossy(&check.stdout[..check.stdout.len().min(256)])
+        ));
+    } else {
+        message.push_str("  (nothing)\n");
+    }
+    let mut getconf = Command::new("getconf");
+    getconf.arg("GNU_LIBC_VERSION").env_clear();
+    for key in ["PATH", "HOME", "VOX_DATA_DIR", "VOX_CONFIG_DIR"] {
+        if let Some(value) = std::env::var_os(key) {
+            getconf.env(key, value);
+        }
+    }
+    let system = getconf
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok());
+    let glibc = system
+        .as_deref()
+        .and_then(|s| s.trim().strip_prefix("glibc "))
+        .filter(|v| {
+            v.split('.').count() == 2
+                && v.split('.')
+                    .all(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        });
+    message.push_str("vox update: ");
+    message.push_str(&explain_not_running(
+        check.verdict,
+        &check.stderr,
+        glibc,
+        LINUX_GLIBC_FLOOR,
+    ));
+    let current = binary_version(active).unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned());
+    message.push_str(&format!(
+        "\nvox update: nothing was changed: {} is still vox {current}{}",
+        active.display(),
+        if rollback {
+            "; there is nothing to roll back to."
+        } else {
+            "."
+        }
+    ));
+    usage(message)
 }
 
 // ---------------------------------------------------------------- local publication
@@ -1317,6 +1561,13 @@ fn do_rollback(install_dir: &Path) -> Result<(), AppError> {
             install_dir.display()
         )));
     }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let checked = run_check(&previous, None);
+        if checked.verdict != RunVerdict::Ran {
+            return Err(not_running(&checked, &active, None, true));
+        }
+    }
     // Durably, step by step (V210-56): the copy of the active binary is on disk before either
     // rename, and each rename is on disk before the next — so a power loss anywhere leaves a
     // runnable `vox` under that name, and the other binary under one of the two others.
@@ -1427,18 +1678,31 @@ fn says_vox_version(out: &[u8]) -> bool {
 
 /// What `vox --version` on `path` reports, as a bare version string.
 fn binary_version(path: &Path) -> Option<String> {
-    let out = Command::new(path)
-        .arg("--version")
-        .env_clear()
-        .output()
-        .ok()?;
-    if !out.status.success() || out.stdout.len() > MAX_VERSION_OUTPUT_BYTES {
-        return None;
+    #[cfg(not(target_os = "macos"))]
+    {
+        let checked = run_check(path, None);
+        (checked.verdict == RunVerdict::Ran).then(|| {
+            String::from_utf8_lossy(&checked.stdout)
+                .trim()
+                .trim_start_matches("vox ")
+                .to_owned()
+        })
     }
-    String::from_utf8_lossy(&out.stdout)
-        .split_whitespace()
-        .nth(1)
-        .map(str::to_owned)
+    #[cfg(target_os = "macos")]
+    {
+        let out = Command::new(path)
+            .arg("--version")
+            .env_clear()
+            .output()
+            .ok()?;
+        if !out.status.success() || out.stdout.len() > MAX_VERSION_OUTPUT_BYTES {
+            return None;
+        }
+        String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .nth(1)
+            .map(str::to_owned)
+    }
 }
 
 /// Completions are generated from the CLI model, and the agent skill pack is the CLI's, so both

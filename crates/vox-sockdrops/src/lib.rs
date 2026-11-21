@@ -39,6 +39,124 @@ use std::io;
 #[cfg(unix)]
 use std::os::fd::RawFd;
 
+/// Store, replace, read and forget a boot-scoped secret in Linux's per-user kernel keyring.
+/// No session keyring, userspace service or file holds the payload.
+#[cfg(target_os = "linux")]
+pub mod kernel_key {
+    use std::ffi::CString;
+    use std::io;
+
+    const USER_KEYRING: libc::c_long = -4;
+    const THREAD_KEYRING: libc::c_long = -1;
+
+    fn description(name: &str) -> io::Result<CString> {
+        CString::new(name).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
+    }
+
+    fn checked(value: libc::c_long) -> io::Result<libc::c_long> {
+        if value == -1 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(value)
+        }
+    }
+
+    fn find(name: &str) -> io::Result<libc::c_long> {
+        let name = description(name)?;
+        // SAFETY: both strings are terminated and live for the call; no output pointer.
+        checked(unsafe {
+            libc::syscall(
+                libc::SYS_keyctl,
+                10,
+                USER_KEYRING,
+                c"user".as_ptr(),
+                name.as_ptr(),
+                0,
+            )
+        })
+    }
+
+    /// Store `secret` under `name`, readable only by this uid until reboot or explicit removal.
+    ///
+    /// Any process of this uid may read it without possessing the key (including another
+    /// login session's daemon); this is the same trust as the daemon's memory. Other uids
+    /// cannot read it, and reboot discards it. No expiry is set.
+    ///
+    /// # Errors
+    /// The kernel's refusal (including a disabled keyring or a full per-user quota).
+    pub fn store(name: &str, secret: &[u8]) -> io::Result<()> {
+        let name = description(name)?;
+        // SAFETY: the terminated strings and payload remain live; the exact payload length is
+        // supplied, and the kernel copies it during the call.
+        let key = checked(unsafe {
+            libc::syscall(
+                libc::SYS_add_key,
+                c"user".as_ptr(),
+                name.as_ptr(),
+                secret.as_ptr(),
+                secret.len(),
+                THREAD_KEYRING,
+            )
+        })?;
+        // A fresh login session need not possess the user keyring. Create the key in this
+        // thread's possessed ring so its default possessor rights permit SETPERM, then give
+        // only this uid rights and publish it to the boot-scoped user ring.
+        // SAFETY: SETPERM and LINK take only integer key identifiers and permissions.
+        let stored = checked(unsafe { libc::syscall(libc::SYS_keyctl, 5, key, 0x003f_0000_u32) })
+            .and_then(|_| checked(unsafe { libc::syscall(libc::SYS_keyctl, 8, key, USER_KEYRING) }))
+            .map(|_| ());
+        // SAFETY: UNLINK takes integer identifiers. Drop the temporary reference even when
+        // setting permissions or linking the user ring failed.
+        let unlinked =
+            checked(unsafe { libc::syscall(libc::SYS_keyctl, 9, key, THREAD_KEYRING) }).map(|_| ());
+        stored.and(unlinked)
+    }
+
+    /// Read the named secret into a caller-owned buffer; no payload is persisted.
+    ///
+    /// # Errors
+    /// No key, a kernel refusal, or a payload larger than the buffer. On success the returned
+    /// length is at most `buffer.len()`; the caller owns wiping it after use.
+    pub fn read(name: &str, buffer: &mut [u8]) -> io::Result<usize> {
+        let key = find(name)?;
+        // SAFETY: READ is passed the writable buffer's exact length and cannot write beyond it.
+        let length = checked(unsafe {
+            libc::syscall(libc::SYS_keyctl, 11, key, buffer.as_mut_ptr(), buffer.len())
+        })?;
+        let length =
+            usize::try_from(length).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
+        if length > buffer.len() {
+            return Err(io::Error::from(io::ErrorKind::InvalidData));
+        }
+        Ok(length)
+    }
+
+    /// Revoke and unlink this uid's named secret; an absent or unavailable keyring is forgotten.
+    ///
+    /// # Errors
+    /// A kernel refusal to remove a key found in a working keyring.
+    pub fn forget(name: &str) -> io::Result<()> {
+        let key = match find(name) {
+            Ok(key) => key,
+            Err(e)
+                if matches!(
+                    e.raw_os_error(),
+                    Some(
+                        libc::ENOKEY | libc::ENOSYS | libc::EPERM | libc::EACCES | libc::EOPNOTSUPP
+                    )
+                ) =>
+            {
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+        // SAFETY: REVOKE and UNLINK take integer key identifiers, never userspace pointers.
+        checked(unsafe { libc::syscall(libc::SYS_keyctl, 3, key) })?;
+        checked(unsafe { libc::syscall(libc::SYS_keyctl, 9, key, USER_KEYRING) })?;
+        Ok(())
+    }
+}
+
 /// The socket's cumulative count of datagrams the kernel dropped on receive — its buffer was
 /// full, or a filter refused them — since the socket was made. It wraps at `u32::MAX`, so take
 /// differences with `wrapping_sub`. `None` where the kernel keeps no such count.

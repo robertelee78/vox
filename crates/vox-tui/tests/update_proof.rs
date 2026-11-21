@@ -41,6 +41,13 @@ mod release_server;
 
 #[path = "support/test_knobs.rs"]
 mod test_knobs;
+
+#[path = "support/typed.rs"]
+mod typed;
+
+#[cfg(target_os = "linux")]
+#[path = "support/dead_candidate.rs"]
+mod dead_candidate;
 optional_proof::not_run!(
     an_older_release_updates_itself_and_refuses_a_bad_download,
     an_update_and_rollback_leave_one_launchable_vox,
@@ -944,6 +951,101 @@ fn an_update_restarts_its_daemon_and_refuses_a_different_local_version() {
     dispose("daemon update proof", &claims, &receipts, false);
 }
 
+/// RG-11's typed credential is independent of the updater's rejection/rollback arms, so its
+/// missing-secret mutant cannot prevent those arms from reaching their own assertions.
+/// It runs natively on either Linux architecture: QEMU's x86_64 keyring calls can be absent
+/// even when the native kernel supports them. Candidate/rollback asset arms stay x86_64.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "real typed unlock and update, Linux kernel keyring; run in release with test-knobs"]
+fn a_linux_typed_unlock_stays_ready_after_update() {
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            for pid in holders(&self.0) {
+                let _ = Command::new("/bin/kill").arg(pid).status();
+            }
+            use sha2::{Digest as _, Sha256};
+            let account = self.0.join("nodes/typed").to_string_lossy().into_owned();
+            let name = format!("us.vox.node:{:x}", Sha256::digest(account.as_bytes()));
+            if let Ok(found) = Command::new("keyctl")
+                .args(["search", "@u", "user", &name])
+                .output()
+            {
+                if found.status.success() {
+                    let key = String::from_utf8_lossy(&found.stdout).trim().to_owned();
+                    let _ = Command::new("keyctl").args(["revoke", &key]).status();
+                    let _ = Command::new("keyctl").args(["unlink", &key, "@u"]).status();
+                }
+            }
+        }
+    }
+    watchdog::arm();
+    test_knobs::require(&["VOX_TEST_RELEASE_BASE"]);
+    let work = tmpdir();
+    let next: String = std::iter::once('9')
+        .chain(VERSION.chars().skip(1))
+        .collect();
+    let helper = vox_saying(work.path(), &next)
+        .unwrap_or_else(|why| panic!("APPARATUS: next release: {why}"));
+    let tree = tmpdir();
+    standalone_release_of(tree.path(), &next, &helper);
+    let server =
+        release_server::serve(tree.path()).unwrap_or_else(|why| panic!("APPARATUS: {why}"));
+    let home = tmpdir();
+    let link = install_dir(home.path(), "stable").join("vox");
+    let _cleanup = Cleanup(home.path().join("data"));
+    let env = [
+        ("VOX_TEST_RELEASE_BASE", server.base.as_str()),
+        ("VOX_NO_SHELL_SETUP", "1"),
+        ("VOX_NO_SKILL_INSTALL", "1"),
+        ("VOX_LISTEN", "127.0.0.1:0"),
+    ];
+    let pass = home.path().join("one-time-input");
+    write(&pass, "Linux update passphrase\n");
+    let out = vox(
+        &link,
+        home.path(),
+        &[
+            "node",
+            "create",
+            "typed",
+            "--passphrase-file",
+            pass.to_str().expect("APPARATUS: passphrase path"),
+        ],
+        &env,
+    );
+    assert!(
+        out.status.success(),
+        "APPARATUS: create protected node: {}",
+        said(&out)
+    );
+    std::fs::remove_file(pass).expect("APPARATUS: remove one-time input");
+    let (ok, text) = typed::typed(
+        &vox_command(&link, home.path(), &["node", "unlock", "typed"], &env),
+        "Linux update passphrase",
+    );
+    assert!(
+        ok && text.contains("Ready"),
+        "APPARATUS: typed unlock: {text}"
+    );
+    let updated = vox(&link, home.path(), &["update"], &env);
+    let status = vox(
+        &link,
+        home.path(),
+        &["status", "--node", "typed", "--json"],
+        &env,
+    );
+    let ready = status.status.success()
+        && serde_json::from_slice::<serde_json::Value>(&status.stdout)
+            .ok()
+            .is_some_and(|value| value["status"] == "Ready");
+    assert!(updated.status.success() && ready && reports(&link) == format!("vox {next}"),
+        "PRODUCT: a typed Linux unlock must remain Ready after update without input: update={}; status={}", said(&updated), said(&status));
+    eprintln!("PASS linux.typed_unlock_survives_update: {}", said(&status));
+    let _ = vox(&link, home.path(), &["node", "lock", "typed"], &env);
+}
+
 /// Decider 2026-10-07: once `vox update` has put the new vox in place (Vox.app when `bundle`, the
 /// standalone binary otherwise), it restarts the running daemon onto the new version. A node it
 /// keeps the passphrase of is attached again; any other attached node is detached, and the update
@@ -953,6 +1055,10 @@ fn daemon_restart_claim(
     receipts: &mut BTreeMap<String, String>,
     bundle: bool,
 ) {
+    if cfg!(all(target_os = "linux", not(target_arch = "x86_64"))) {
+        claims.push(blocked("update.linux_candidate_arms", "CANNOT MEASURE: ADR-051's Linux arms run as x86_64 in an emulated container; this is aarch64"));
+        return;
+    }
     let id = if bundle {
         "bundle.update_restarts_the_daemon_onto_the_new_version"
     } else {
@@ -1161,6 +1267,10 @@ fn daemon_restart_claim(
             said(&mismatch)
         ),
     ));
+    #[cfg(target_os = "linux")]
+    if !bundle {
+        linux_download_refusal_claims(claims, &link, home, tree.path(), &helper, &next, &env);
+    }
 
     let out = vox(&link, home, &["update"], &env);
     let text = said(&out);
@@ -1218,6 +1328,37 @@ fn daemon_restart_claim(
         ),
     ));
     receipts.insert("update.rollback".into(), rolled_text);
+    #[cfg(target_os = "linux")]
+    if !bundle {
+        let dead = work.path().join("dead-previous");
+        let need = dead_candidate::stage(Path::new(VOX), &dead);
+        let previous = link.with_file_name(".vox-previous");
+        copy(&dead, &previous);
+        let planted = std::fs::read(&previous).expect("APPARATUS: dead previous");
+        let daemon = std::fs::read(data.join(".daemon/lock")).unwrap_or_default();
+        let (out, timely, leaked) = dead_candidate::bounded(&mut vox_command(
+            &link,
+            home,
+            &["update", "--rollback"],
+            &env,
+        ));
+        let text = said(&out);
+        claims.push(claim(
+            "rollback.refuses_a_previous_that_does_not_run",
+            timely
+                && leaked.is_empty()
+                && !out.status.success()
+                && reports(&link) == format!("vox {VERSION}")
+                && std::fs::read(&previous).unwrap_or_default() == planted
+                && !link.with_file_name(".vox-rollback.partial").exists()
+                && std::fs::read(data.join(".daemon/lock")).unwrap_or_default() == daemon
+                && text.contains("the retained previous vox")
+                && text.contains("it is not put back")
+                && text.contains(&format!("version `{need}' not found"))
+                && text.contains("there is nothing to roll back to"),
+            text,
+        ));
+    }
 
     // Every vox this left running is stopped, by its pid: whichever holds the account's files.
     for pid in holders(&data) {
@@ -1235,6 +1376,75 @@ fn daemon_restart_claim(
         ),
     ));
     receipts.insert(id.into(), text);
+}
+
+#[cfg(target_os = "linux")]
+fn linux_download_refusal_claims(
+    claims: &mut Vec<Claim>,
+    link: &Path,
+    home: &Path,
+    tree: &Path,
+    helper: &Path,
+    next: &str,
+    env: &[(&str, &str)],
+) {
+    let work = tmpdir();
+    let dead = work.path().join("dead");
+    let need = dead_candidate::stage(helper, &dead);
+    let active = std::fs::read(link).expect("APPARATUS: active binary snapshot");
+    let daemon = std::fs::read(home.join("data/.daemon/lock")).expect("APPARATUS: daemon snapshot");
+    for (id, source, wanted) in [
+        (
+            "update.refuses_a_candidate_that_does_not_run_and_says_why",
+            None,
+            "a release that needs more than that is a defect in Vox, not in this machine",
+        ),
+        (
+            "update.stops_a_candidate_that_does_not_answer",
+            Some("#!/bin/sh\necho starting >&2\ntrap '' TERM; exec sleep 600\n"),
+            "did not answer `--version` within 20 seconds and was stopped. Before that it said:",
+        ),
+        (
+            "update.says_what_an_unexplained_candidate_said",
+            Some("#!/bin/sh\necho 'boom: no such table' >&2\nexit 3\n"),
+            "the cause is not one this installer can name",
+        ),
+    ] {
+        let fixture = if let Some(script) = source {
+            let path = work.path().join("script");
+            write(&path, script);
+            path
+        } else {
+            dead.clone()
+        };
+        standalone_release_of(tree, next, &fixture);
+        let (out, timely, leaked) =
+            dead_candidate::bounded(&mut vox_command(link, home, &["update"], env));
+        let text = said(&out);
+        let specific = if source.is_none() {
+            text.contains(&format!("version `{need}' not found"))
+                && text.contains(&format!(
+                    "needs glibc {}",
+                    need.trim_start_matches("GLIBC_")
+                ))
+        } else if id.contains("stops") {
+            text.contains("  starting")
+        } else {
+            text.contains("  boom: no such table") && !text.contains("this build needs glibc")
+        };
+        let preserved = std::fs::read(link).unwrap_or_default() == active
+            && std::fs::read(home.join("data/.daemon/lock")).unwrap_or_default() == daemon
+            && !link.with_file_name(".vox-previous").exists()
+            && std::fs::read_dir(link.parent().expect("APPARATUS: install directory"))
+                .expect("APPARATUS: install listing")
+                .filter_map(Result::ok)
+                .all(|entry| !entry.file_name().to_string_lossy().ends_with(".partial"));
+        claims.push(claim(id, timely && leaked.is_empty() && !out.status.success() && preserved && specific
+            && text.contains(wanted) && text.contains("vox update: nothing was changed:")
+            && text.contains(&format!("is still vox {VERSION}.")),
+            format!("timely={timely}, sleep children still running={leaked:?}, installation and daemon preserved={preserved}; {text}")));
+    }
+    standalone_release_of(tree, next, helper);
 }
 
 /// **Optional** (the `optional-proofs` feature): the published previous release updates itself
