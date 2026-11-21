@@ -293,6 +293,15 @@ impl Daemon {
     }
 }
 
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
 /// A room on `node`, made through the daemon that holds it: its id.
 fn make_room(a: &Account, node: &str) -> String {
     let (ok, out, err) = a.run(
@@ -314,6 +323,244 @@ fn make_room(a: &Account, node: &str) -> String {
     list.lines()
         .find_map(|l| l.split_whitespace().next().map(str::to_owned))
         .unwrap_or_else(|| panic!("APPARATUS: no room listed on {node}: {list}"))
+}
+
+/// The generated extension runs in a small native-event driver, using real hooks and watcher.
+/// Its notifications are exactly the strings OMP's UI receives.
+struct OmpConversation {
+    child: Child,
+    frames: std::sync::mpsc::Receiver<serde_json::Value>,
+    notices: Vec<String>,
+    trace: PathBuf,
+}
+
+impl OmpConversation {
+    fn start(a: &Account) -> Self {
+        let (ok, extension, err) = a.run(&["agent", "plugin", "omp", "--node", "agent"], "");
+        assert!(ok, "APPARATUS: generated native extension: {err}");
+        std::fs::write(a._tmp.path().join("extension.mjs"), extension).unwrap();
+        let wrapper = a._tmp.path().join("vox-traced");
+        std::fs::write(&wrapper, "#!/bin/bash\nset -o pipefail\nif [[ \"$1 $2\" == 'agent omp-watch' ]]; then\n  \"$VOX_PROOF_BINARY\" \"$@\" | tee -a \"$VOX_PROOF_WATCH_TRACE\"\nelse\n  exec \"$VOX_PROOF_BINARY\" \"$@\"\nfi\n").unwrap();
+        std::fs::set_permissions(
+            &wrapper,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .unwrap();
+        let trace = a._tmp.path().join("watcher.jsonl");
+        let driver = a._tmp.path().join("conversation.mjs");
+        std::fs::write(
+            &driver,
+            r#"
+import extension from "./extension.mjs";
+import { createInterface } from "node:readline";
+const events = new Map();
+const say = value => console.log(JSON.stringify(value));
+const pi = {
+  on: (name, handler) => events.set(name, handler),
+  getSessionName: () => "identity-proof",
+  sendMessage: () => {}, appendEntry: () => {}
+};
+const context = {
+  mode: "tui", agent: {kind: "main"}, cwd: process.cwd(),
+  isIdle: () => true,
+  getAsyncJobSnapshot: () => ({running: [], recent: []}),
+  sessionManager: {getSessionId: () => "identity-proof", getLeafId: () => null,
+    getBranch: () => [], getEntries: () => []},
+  ui: {notify: text => say({notice: text})}
+};
+extension(pi);
+await events.get("session_start")({}, context);
+say({started: true});
+for await (const line of createInterface({input: process.stdin})) {
+  if (line === "quit") {
+    await events.get("session_shutdown")();
+    process.exit(0);
+  }
+  await events.get("before_agent_start")({reason: "prompt"});
+  say({barrier: line});
+}
+"#,
+        )
+        .unwrap();
+        let environment = a.cmd(&[]);
+        let mut command = Command::new("node");
+        command.env_clear();
+        for (key, value) in environment.get_envs() {
+            if let Some(value) = value {
+                command.env(key, value);
+            }
+        }
+        let mut child = command
+            .arg(driver)
+            .env("VOX_BIN", wrapper)
+            .env("VOX_PROOF_BINARY", VOX)
+            .env("VOX_PROOF_WATCH_TRACE", &trace)
+            .current_dir(a._tmp.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("APPARATUS: native event driver (node)");
+        let stdout = child.stdout.take().unwrap();
+        let (tx, frames) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::BufRead as _;
+            for line in std::io::BufReader::new(stdout).lines() {
+                let line = line.expect("APPARATUS: native driver output");
+                let value = serde_json::from_str(&line)
+                    .unwrap_or_else(|_| panic!("APPARATUS: native driver said {line}"));
+                if tx.send(value).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut conversation = Self {
+            child,
+            frames,
+            notices: Vec::new(),
+            trace,
+        };
+        conversation.until(|frame| frame["started"] == true);
+        assert!(
+            wait_until(Duration::from_secs(30), || std::fs::read_to_string(
+                &conversation.trace
+            )
+            .unwrap_or_default()
+            .contains("\"type\":\"ready\"")),
+            "APPARATUS: conversation never observed its attached node"
+        );
+        assert!(
+            a.data
+                .join("nodes/agent/sessions/identity-proof.json")
+                .is_file(),
+            "APPARATUS: native conversation was not registered before the transition"
+        );
+        conversation
+    }
+
+    fn until(&mut self, done: impl Fn(&serde_json::Value) -> bool) {
+        loop {
+            let frame = self
+                .frames
+                .recv_timeout(Duration::from_secs(45))
+                .expect("APPARATUS: native event driver did not reach its requested observation");
+            if let Some(text) = frame["notice"].as_str() {
+                println!("OMP notification: {text}");
+                self.notices.push(text.into());
+            }
+            if done(&frame) {
+                break;
+            }
+        }
+    }
+
+    fn prompt(&mut self, id: &str) {
+        writeln!(self.child.stdin.as_mut().unwrap(), "{id}").unwrap();
+        self.until(|frame| frame["barrier"] == id);
+    }
+
+    fn observations(&self) -> usize {
+        std::fs::read_to_string(&self.trace)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    }
+
+    fn observe_after(&self, before: usize) {
+        assert!(
+            wait_until(Duration::from_secs(45), || self.observations() > before
+                || std::fs::read_to_string(&self.trace)
+                    .unwrap_or_default()
+                    .contains("identity-changed")),
+            "APPARATUS: no watcher snapshot after the staged node replacement"
+        );
+    }
+}
+
+impl Drop for OmpConversation {
+    fn drop(&mut self) {
+        if let Some(stdin) = self.child.stdin.as_mut() {
+            let _ = writeln!(stdin, "quit");
+        }
+        let _ = self.child.wait();
+        println!(
+            "watcher observations:\n{}",
+            std::fs::read_to_string(&self.trace).unwrap_or_default()
+        );
+    }
+}
+
+#[test]
+#[ignore = "native extension, real daemon and production Argon2id; run in release with test-knobs"]
+fn a_conversation_reports_one_reconnecting_line_when_its_daemon_restarts() {
+    watchdog::arm();
+    let a = Account::new();
+    a.make_node("agent");
+    let daemon = Daemon::start(&a, &["--node", "agent"], &[]);
+    daemon.expect("node agent is Ready", Duration::from_secs(30), |line| {
+        line.contains("node agent is Ready")
+    });
+    let mut conversation = OmpConversation::start(&a);
+    daemon.stop();
+    conversation.until(|frame| frame.get("notice").is_some());
+    let daemon = Daemon::start(&a, &["--node", "agent"], &[]);
+    daemon.expect("node agent is Ready", Duration::from_secs(30), |line| {
+        line.contains("node agent is Ready")
+    });
+    conversation.prompt("after-restart");
+    let notices = conversation.notices.join("\n");
+    drop(conversation);
+    daemon.stop();
+    assert!(
+        notices
+            .lines()
+            .filter(|line| line.contains("reconnecting"))
+            .count()
+            == 1
+            && !notices.contains("is unavailable")
+            && !notices.contains("vox node create"),
+        "PRODUCT: a daemon restart must say reconnecting once, not blame the node: {notices}"
+    );
+}
+
+#[test]
+#[ignore = "native extension, real daemon and rebuilt node; run in release with test-knobs"]
+fn a_conversation_refuses_a_rebuilt_node_under_the_same_name() {
+    watchdog::arm();
+    let a = Account::new();
+    let original = a.make_node("agent");
+    let daemon = Daemon::start(&a, &["--node", "agent"], &[]);
+    daemon.expect("node agent is Ready", Duration::from_secs(30), |line| {
+        line.contains("node agent is Ready")
+    });
+    let mut conversation = OmpConversation::start(&a);
+    daemon.stop();
+    conversation.until(|frame| frame.get("notice").is_some());
+    // No daemon is left on the old directory: this is identity fencing, not store rewriting.
+    std::fs::rename(a.data.join("nodes/agent"), a.data.join("nodes/original")).unwrap();
+    let rebuilt = a.make_node("agent");
+    assert_ne!(
+        original, rebuilt,
+        "APPARATUS: rebuilt node did not get a fresh identity"
+    );
+    let daemon = Daemon::start(&a, &["--node", "agent"], &[]);
+    daemon.expect("node agent is Ready", Duration::from_secs(30), |line| {
+        line.contains("node agent is Ready")
+    });
+    let before = conversation.observations();
+    conversation.observe_after(before);
+    conversation.prompt("rebuilt");
+    conversation.prompt("refused-again");
+    let notices = conversation.notices.join("\n");
+    let registered = a
+        .data
+        .join("nodes/agent/sessions/identity-proof.json")
+        .exists();
+    drop(conversation);
+    daemon.stop();
+    assert!(notices.contains("identity changed") && notices.contains("conversation is refused")
+        && notices.contains("new OMP conversation") && !registered,
+        "PRODUCT: a rebuilt node must not adopt the old conversation; registered={registered}; {notices}");
 }
 
 #[cfg(feature = "test-knobs")]

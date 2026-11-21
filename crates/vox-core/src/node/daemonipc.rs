@@ -2274,12 +2274,6 @@ impl DaemonClient {
                 theirs: daemon.protocol,
             }));
         }
-        if daemon.version != env!("CARGO_PKG_VERSION") {
-            return Err(Error::Ipc(crate::error::IpcHandshake::Version {
-                mine: env!("CARGO_PKG_VERSION").into(),
-                theirs: daemon.version,
-            }));
-        }
         Ok(Self {
             stream: daemon.stream,
             version: daemon.version,

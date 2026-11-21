@@ -595,3 +595,38 @@ fn an_agent_session_is_checked_from_both_sides() {
          tell apart, exit 1: {ping:?}"
     );
 }
+
+/// The claim-rules act is independent of Claude wiring and process-provenance checks.
+#[test]
+#[ignore = "two real nodes and the public agent doctor; run in release"]
+fn the_doctor_explains_incompatible_claim_rules() {
+    watchdog::arm();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("APPARATUS: doctor runtime");
+    let temporary = tempfile::tempdir().expect("APPARATUS: doctor profiles");
+    let room = runtime.block_on(support::room(temporary.path(), &["alice", "bob"]));
+    let (alice, bob) = (&room.workers[0], &room.workers[1]);
+    let home = Home {
+        root: temporary.path().join("doctor-home"),
+    };
+    std::fs::create_dir_all(&home.root).expect("APPARATUS: private doctor home");
+    let hello = r#"{"v":1,"type":"hello","from":"old-alice","body":"MISSING-CLAIM-RULES","data":{"vox":"0.0.1"}}"#;
+    runtime.block_on(support::post_raw(alice, room.cid, hello));
+    until(
+        bob,
+        None,
+        "the old package-only hello to arrive",
+        &["room", "read", &room.id],
+        |out| out.ok && out.stdout.contains("MISSING-CLAIM-RULES"),
+    );
+    let (out, report) = doctor(bob, &home, &room.id);
+    println!("claim-rules doctor: {out:?}");
+    let version = check(&report, "version ");
+    assert!(version["status"] == "warn"
+        && version["detail"].as_str().is_some_and(|text| text.contains("no claim-rules number"))
+        && version["fix"].as_str().is_some_and(|text| text.contains("claim rules")),
+        "PRODUCT: an unstamped worker must be refused with claim-rules advice, not package-version advice: {version}");
+}

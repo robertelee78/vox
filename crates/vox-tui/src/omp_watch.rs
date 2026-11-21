@@ -90,13 +90,10 @@ enum ProbeError {
     Mismatch,
 }
 async fn open(account: &Account) -> Result<DaemonClient, ProbeError> {
-    // Observe the authenticated pid/version before applying the strict open check.
+    // The control protocol, not the release number, decides compatibility.
     let greeting = tokio::time::timeout(DEADLINE, DaemonClient::observe(&account.socket())).await;
     match greeting {
-        Ok(Ok(g))
-            if g.protocol != vox_core::node::ipc::PROTOCOL_VERSION
-                || g.version != env!("CARGO_PKG_VERSION") =>
-        {
+        Ok(Ok(g)) if g.protocol != vox_core::node::ipc::PROTOCOL_VERSION => {
             return Err(ProbeError::Mismatch)
         }
         Ok(Ok(_)) => (),
@@ -233,7 +230,7 @@ pub(crate) async fn run(
     let mut observed = false;
     let mut last_command = 0u64;
     let mut subscription: Option<Subscription> = None;
-    let mut pinned = pin(&owner, &account, &node).ok().flatten();
+    let mut pinned = None;
     let mut delay = 0u64;
     let mut backoff = 1u64;
     let mut snapshot_id: Option<String> = None;
@@ -271,12 +268,22 @@ pub(crate) async fn run(
                 }
             }
             event = async { match subscription.as_mut() { Some(sub) => sub.events.recv().await, None => std::future::pending().await } } => {
-                match event { Some(()) => delay = 0, None => { subscription = None; delay = backoff; backoff = (backoff * 2).min(30); if !output(serde_json::json!({"type":"unavailable","reason":"unavailable"})) { return 1; } } }
+                match event { Some(()) => delay = 0, None => { subscription = None; delay = backoff; backoff = (backoff * 2).min(30); if !output(serde_json::json!({"type":"unavailable","reason":"reconnecting"})) { return 1; } } }
             }
             _ = &mut timer => {
-                if pinned.is_none() { pinned = pin(&owner, &account, &node).ok().flatten(); }
+                // The saved pin survives helper succession. Never replace it with a rebuilt node.
+                let pin_result = pin(&owner, &account, &node);
+                if matches!(pin_result, Err(FenceError::Invalid)) {
+                    if owner.set_compatible(false).is_err() || owner.revoke().is_err() {
+                        delay = 1;
+                        continue;
+                    }
+                    output(serde_json::json!({"type":"unavailable","reason":"identity-changed"}));
+                    return 77;
+                }
+                if pinned.is_none() { pinned = pin_result.ok().flatten(); }
                 let result = match pinned {
-                    Some(fp) if fingerprint(&account, &node) == Some(fp) => snapshot(&account, &node, &fp, &mut subscription).await,
+                    Some(fp) if pin_result == Ok(Some(fp)) => snapshot(&account, &node, &fp, &mut subscription).await,
                     _ => { subscription = None; match open(&account).await { Err(e) => Err(e), Ok(_) => Ok(false) } }
                 };
                 if !matches!(result, Err(ProbeError::Mismatch)) && !compatible {

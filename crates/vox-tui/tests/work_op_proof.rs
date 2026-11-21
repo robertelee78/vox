@@ -61,9 +61,31 @@ fn rows_with_op(w: &Worker, r: &str, op: &str) -> Vec<serde_json::Value> {
 fn claim_text(session: &str, res: &str, op: &str) -> String {
     serde_json::json!({
         "v": 1, "type": "claim", "from": session, "body": "a racing retry",
-        "data": { "resource": res, "op": op, "vox": VERSION }
+        "data": { "resource": res, "op": op, "vox": VERSION, "claims": vox_agentcomms::version::CLAIM_RULES }
     })
     .to_string()
+}
+
+fn register_sending_session(worker: &Worker, room: &str, session: &str) {
+    let registered = worker.vox(
+        None,
+        &[
+            "agent",
+            "hook",
+            "--node",
+            "default",
+            "--room",
+            room,
+            "--session",
+            session,
+            "--format",
+            "text",
+        ],
+    );
+    let doctor = worker.vox(None, &["agent", "doctor", "--node", "default", "--json"]);
+    assert!(registered.ok && doctor.json()["checks"].as_array().is_some_and(|checks|
+        checks.iter().any(|check| check["check"] == format!("session {session}"))),
+        "APPARATUS: sending session {session} was not registered; hook={registered:?}; doctor={doctor:?}");
 }
 
 /// A live `vox room tail --since … --json` on `w`, its lines collected as they come.
@@ -175,6 +197,7 @@ fn a_retry_is_one_operation_and_a_conflict_is_explicit() {
     let room = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
     let (alice, bob) = (&room.workers[0], &room.workers[1]);
     let r = room.id.as_str();
+    register_sending_session(alice, r, "a1");
 
     // ---- (1) the same op, the same content: one entry ----
     let args = [
@@ -450,6 +473,7 @@ fn a_conflict_that_lands_after_the_lookup_is_found_by_the_read_back() {
     let room = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
     let alice = &room.workers[0];
     let r = room.id.as_str();
+    register_sending_session(alice, r, "a1");
     let op = "op-held-conflict-5";
     let args = |n: u32| {
         vec![

@@ -35,6 +35,28 @@ use support::{post_raw, resource, until, Out, Worker};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+fn register_sending_session(worker: &Worker, room: &str, session: &str) {
+    let registered = worker.vox(
+        None,
+        &[
+            "agent",
+            "hook",
+            "--node",
+            "default",
+            "--room",
+            room,
+            "--session",
+            session,
+            "--format",
+            "text",
+        ],
+    );
+    let doctor = worker.vox(None, &["agent", "doctor", "--node", "default", "--json"]);
+    assert!(registered.ok && doctor.json()["checks"].as_array().is_some_and(|checks|
+        checks.iter().any(|check| check["check"] == format!("session {session}"))),
+        "APPARATUS: sending session {session} was not registered; hook={registered:?}; doctor={doctor:?}");
+}
+
 fn board(w: &Worker, r: &str) -> serde_json::Value {
     let o = w.vox(None, &["room", "board", r, "--json"]);
     assert!(
@@ -99,7 +121,7 @@ fn claim(w: &Worker, session: &str, r: &str, res: &str, ttl: u64) -> (String, u6
 fn renew_text(session: &str, res: &str, acquisition: &str, op: &str) -> String {
     serde_json::json!({
         "v": 1, "type": "renew", "from": session, "body": format!("renewing {res}"),
-        "data": { "resource": res, "acquisition": acquisition, "op": op, "vox": VERSION }
+        "data": { "resource": res, "acquisition": acquisition, "op": op, "vox": VERSION, "claims": vox_agentcomms::version::CLAIM_RULES }
     })
     .to_string()
 }
@@ -134,6 +156,9 @@ fn a_renewal_extends_exactly_one_acquisition() {
     let room = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
     let (alice, bob) = (&room.workers[0], &room.workers[1]);
     let r = room.id.as_str();
+    for session in ["a1", "a2"] {
+        register_sending_session(alice, r, session);
+    }
 
     // ---- (1) renewed outlives its TTL; unrenewed lapses ----
     let (acq_kept, kept_was) = claim(alice, "a1", r, "kept", TTL);
