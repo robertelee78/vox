@@ -807,11 +807,13 @@ impl RoomRetirement {
             }
         }
         let mut result = self.drain().await;
-        // A failed slice must not leave a second physical cleanup in an occupied actor slot.
+        // Join physical workers before lifecycle admission. A failed local cleanup
+        // stays owed, but cannot veto leaving, closing, or deleting its room.
         if let Err(error) = self.driver.join_cleanup().await {
-            if result.is_ok() {
-                result = Err(error);
-            }
+            result = Err(error);
+        }
+        if result.is_err() && !self.driver.retirement_failed.is_empty() {
+            result = Ok(());
         }
         if result.is_ok() {
             for (_, _, fence, abort) in &self.inbound {
@@ -1010,6 +1012,13 @@ impl Controller {
 
     pub(super) fn recover_node_retirements(&self, node: Digest32) {
         resume_owed_retirements(&self.retirement_ledger, node);
+    }
+
+    pub(super) fn recover_room_retirements(&mut self, room: Digest32) {
+        self.retirement_waiting
+            .retain(|key, _| key.room != room || !self.retirement_failed.contains(key));
+        self.retirement_failed.retain(|key| key.room != room);
+        self.poll_cleanup();
     }
 
     fn owns_archive_room(&self, room: Digest32) -> bool {
@@ -1771,13 +1780,16 @@ impl Controller {
         );
         Ok(())
     }
-    /// Retiring work stays inside the same twelve-flow limit and retains its charge/lease.
-    /// Other rooms may progress while one room waits for its next bounded cleanup slice.
+    /// Failed cleanups retain their room's debt, not another room's admission.
     fn local_flow_count(&self) -> usize {
         self.ready.iter().flatten().count()
             + self.running.iter().flatten().count()
             + self.deferred.len()
-            + self.retiring.len()
+            + self
+                .retiring
+                .iter()
+                .filter(|flow| !self.retirement_failed.contains(&retirement_key(flow)))
+                .count()
             + usize::from(self.cleanup.is_some())
     }
     fn flow_count(&self) -> usize {
@@ -1797,7 +1809,11 @@ impl Controller {
             .iter()
             .flatten()
             .chain(self.deferred.iter())
-            .chain(self.retiring.iter())
+            .chain(
+                self.retiring
+                    .iter()
+                    .filter(|flow| !self.retirement_failed.contains(&retirement_key(flow))),
+            )
             .any(|flow| flow.service.slot() != service.slot())
             || self
                 .running

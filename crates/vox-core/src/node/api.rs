@@ -1830,7 +1830,7 @@ impl Fault {
                 })
             }
             Fault::Storage => {
-                "the node's store could not be read or written\n       check free disk space, and that the data directory is writable and its files undamaged"
+                "the node's store could not be read or written\n       check free disk space, and that the data directory is writable and its files undamaged; then run the command again"
             }
             Fault::ProfileBusy => {
                 "another vox holds this node open, and only one at a time may write it\n       run this again once that one is done; a `vox daemon` or `vox tui` holds it until stopped, and the `vox room …` verbs ask it instead"
