@@ -357,22 +357,42 @@ async fn omp_finish_decision(paths: &Paths, session: &str) -> Result<(), AppErro
         serde_json::from_value(saved["receipts"].take())
             .map_err(|e| AppError::Usage(e.to_string()))?;
     if !receipts.is_empty() {
+        let retry = |reason: String| AppError::Refused {
+            code: 75,
+            message: format!("Vox is finishing the saved OMP decision; retry: {reason}"),
+        };
         let owner = b32_decode(saved["node"].as_str().unwrap_or_default(), "OMP node")?;
         let at = crate::client::one_shot(paths)?;
         for (recipient, sources, ticket) in receipts {
             let room = recipient.room;
-            // A moved conversation cannot settle its old room's receipt. A Session that
-            // is merely reopening after restart still belongs to this room and retries.
+            // A moved conversation cannot settle its old room's receipt.
             if crate::wake::pause_registration(paths, session)
-                .map_err(|reason| AppError::Refused {
-                    code: 75,
-                    message: format!("Vox is finishing the saved OMP decision; retry: {reason}"),
-                })?
+                .map_err(retry)?
                 .and_then(|registration| registration.room)
                 != Some(b32_encode(&room))
             {
                 continue;
             }
+            // Metadata refresh may replace the opening hash without replacing the Session.
+            // A genuinely new Session cannot accept the saved receipt; its identity differs.
+            let recipient = match local(
+                &at,
+                owner,
+                room,
+                None,
+                Operation::Resolve {
+                    session: session.to_owned(),
+                },
+            )
+            .await
+            .map_err(retry)?
+            {
+                Reply::Resolved {
+                    recipient: current, ..
+                } if current.identity == recipient.identity => current,
+                Reply::Resolved { .. } => continue,
+                _ => return Err(retry("unexpected current OMP recipient answer".into())),
+            };
             let instance = recipient.instance;
             let operation = if commit {
                 Operation::Received {
@@ -389,10 +409,7 @@ async fn omp_finish_decision(paths: &Paths, session: &str) -> Result<(), AppErro
             };
             let reply = local(&at, owner, room, Some(instance), operation)
                 .await
-                .map_err(|reason| AppError::Refused {
-                    code: 75,
-                    message: format!("Vox is finishing the saved OMP decision; retry: {reason}"),
-                })?;
+                .map_err(retry)?;
             if !matches!(reply, Reply::Done) {
                 return Err(AppError::Usage("unexpected OMP receipt answer".into()));
             }

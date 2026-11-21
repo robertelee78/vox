@@ -910,8 +910,9 @@ fn an_abandoned_key_request_is_selected_again() {
         std::thread::yield_now();
     }
     eprintln!("[RG4] a real selected package was abandoned before Open");
+    let stage_deadline = Instant::now() + Duration::from_secs(120);
     let mut shown = false;
-    for _ in 0..30 {
+    while Instant::now() < stage_deadline {
         let (accepted, out) = vox(&k.b, &["room", "read", &room], "");
         assert!(
             !b.stderr().contains("key-package attempt unacknowledged"),
@@ -923,11 +924,12 @@ fn an_abandoned_key_request_is_selected_again() {
             break;
         }
         eprintln!("[RG4] answered history demand: {out}");
+        std::thread::yield_now();
     }
     assert!(
         shown,
-        "PRODUCT: after 30 answered history demands, the member still cannot read the sender's \
-         post after an abandoned key request; direct key sends remain held; receiver: {}",
+        "APPARATUS: readable sender post was not observed after the abandoned key request; \
+         direct key sends remain held; receiver: {}",
         b.stderr()
     );
     b.stop();

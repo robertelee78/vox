@@ -195,6 +195,7 @@ def startup():
     # Record what the shipped product answers at both boundaries, not a read-count timer.
     run(["status", "--node", "agent", "--json"])
     policy_answer = run(["room", "post", gate_room, "--node", "agent", "rg4-policy-held"], check=False)
+    assert policy_answer.returncode != 0, "APPARATUS: the policy hold did not stage a real publication refusal"
     assert opening_session not in open_sessions(r), "PRODUCT: Session opening bypassed the held policy installation"
     release(base, "policy")
     wait(lambda: base.with_suffix(".rooms.selected").exists(), "sibling has installed policy")
@@ -209,7 +210,6 @@ def startup():
     assert p.returncode == 0, f"PRODUCT: sibling failed to attach: {attach_out}{attach_err}"
     wait(lambda: opening_session in open_sessions(r), "the original registered Session opens with no new hook")
     assert gate_answer.returncode == 0, "PRODUCT: policy is installed but the sibling's room operation was refused: " + gate_answer.stdout + gate_answer.stderr
-    assert policy_answer.returncode != 0, "APPARATUS: the policy hold did not stage a real publication refusal"
     print("VERDICT GREEN: installed policy no longer gates the sibling's room operation; the original Session opens without another hook", flush=True)
 
 class Host:
@@ -248,7 +248,7 @@ class Host:
         self.await_line("turn-end: prompt", mark)
         return mark
 
-def extension(moved=False):
+def extension(moved=False, resumed=False):
     r = room()
     create("person")
     link = run(["room", "link", r, "--node", "agent"]).stdout.strip()
@@ -329,13 +329,18 @@ def extension(moved=False):
         run(["agent", "room", second, "--node", "agent", "--session", host.session])
         wait(lambda: any(row.get("id") == host.session and row.get("open") is False for row in session_rows(r)),
              "the move closes the old room's Session before the next hook")
+        if resumed:
+            # End A through the real move, then resume this same conversation in A.
+            run(["agent", "room", r, "--node", "agent", "--session", host.session])
+            wait(lambda: host.session in open_sessions(r), "the conversation resumes a new Session in its original room")
         probe = run(["agent", "hook", "--node", "agent", "--session", host.session, "--omp-check-uncertainty"],
                     extra={"VOX_HARNESS": "omp"}, check=False)
-        assert probe.returncode == 0, f"PRODUCT: the next hook could not finish the saved decision after a room move: {probe.returncode} {probe.stderr}"
+        changed = "a same-room Session resume" if resumed else "a room move"
+        assert probe.returncode == 0, f"PRODUCT: the next hook could not finish the saved decision after {changed}: {probe.returncode} {probe.stderr}"
         os.kill(host.p.pid, signal.SIGCONT)
         paused.remove(host.p.pid)
-    post_room = second if moved else r
-    marker = "rg4-after-room-move" if moved else "rg4-after-restart"
+    post_room = r if resumed else second if moved else r
+    marker = "rg4-after-session-resume" if resumed else "rg4-after-room-move" if moved else "rg4-after-restart"
     run(["room", "post", post_room, "--node", "person", marker])
     wait(lambda: marker in run(["room", "read", post_room, "--node", "agent"], check=False).stdout,
          "later post reaches the native conversation's node")
@@ -353,7 +358,7 @@ def extension(moved=False):
     if moved:
         host.send("quit")
         host.p.wait()
-        print("VERDICT GREEN: the next hook finished the saved decision after a room move; new-room news was shown once", flush=True)
+        print(f"VERDICT GREEN: the next hook finished the saved decision after {changed}; later news was shown once", flush=True)
         return
     # A new undecided publication must retain the old fail-closed meaning.
     host.hold.with_suffix(".arm").write_text("hold")
@@ -417,6 +422,8 @@ try:
         extension()
     elif CASE == "moved":
         extension(moved=True)
+    elif CASE == "resumed":
+        extension(moved=True, resumed=True)
     elif CASE == "riders":
         riders()
     elif CASE == "undecided":

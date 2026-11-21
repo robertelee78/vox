@@ -202,8 +202,11 @@ Each process uses scratch data and config roots. Run one exact act in release wi
 - `a_native_omp_conversation_finishes_a_decision_after_a_room_move`: holds a real saved
   attention receipt across an operator room move; the next hook finishes it and new-room news
   is shown once. The old Session must be reported ended before that hook.
+- `a_native_omp_conversation_finishes_a_decision_after_a_session_resume`: ends and resumes the conversation's
+  Session in its original room while a decided receipt is pending; the next hook finishes and
+  later news is shown once.
 - `nine_restarted_sessions_wait_for_registration`: nine real hooks contend on the kernel lock.
-- `a_session_retries_when_a_sibling_installs_policy`: holds real sibling startup across policy
+- `a_sibling_room_post_is_accepted_after_policy_installation`: holds real sibling startup across policy
   installation and the room-startup boundary. A sibling room operation is accepted after
   policy installation, and the pending native Session opens after release without another hook.
   Its verdict uses the product's response, not a count of status polls.
