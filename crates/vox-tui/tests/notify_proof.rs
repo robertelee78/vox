@@ -335,6 +335,371 @@ fn connected(s: &Value, peer: &str) -> bool {
     })
 }
 
+/// A blocked desktop command must not prevent a recovery notice. A desktop service that
+/// repeatedly fails must cost only one diagnostic line.
+#[test]
+#[ignore = "an anchor and two real daemons, with a blocked desktop notifier; run on demand"]
+fn blocked_desktop_does_not_delay_recovery() {
+    use std::os::unix::fs::PermissionsExt;
+    struct BlockedChild(Option<String>);
+    impl Drop for BlockedChild {
+        fn drop(&mut self) {
+            if let Some(pid) = &self.0 {
+                let _ = Command::new("/bin/kill")
+                    .args(["-KILL", pid])
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        }
+    }
+
+    watchdog::arm();
+    let tmp = tempfile::tempdir().expect("APPARATUS: a tempdir");
+    let bin = tmp.path().join("desktop-bin");
+    std::fs::create_dir(&bin).expect("APPARATUS: create desktop command directory");
+    let block = tmp.path().join("block");
+    let pid = tmp.path().join("blocked-pid");
+    let calls = tmp.path().join("desktop-calls");
+    let name = if cfg!(target_os = "macos") {
+        "osascript"
+    } else {
+        "notify-send"
+    };
+    let stub = bin.join(name);
+    std::fs::write(
+        &stub,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ -f '{}' ]; then echo $$ > '{}'; exec /bin/sleep 300; fi\n",
+            calls.display(), block.display(), pid.display()
+        ),
+    )
+    .expect("APPARATUS: write desktop command");
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+        .expect("APPARATUS: make desktop command executable");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let Scene {
+        _anchor,
+        anchor,
+        mut alice,
+        alice_dir: _,
+        mut bob,
+        bob_dir,
+        bob_port,
+        bob_id,
+        pass_file,
+    } = scene(&tmp, &[("PATH", &path)], |_| {});
+    let bob_short: String = bob_id.chars().take(12).collect();
+    std::fs::write(&block, "").expect("APPARATUS: block the desktop command");
+    bob.child.kill().expect("APPARATUS: stop bob");
+    bob.child.wait().expect("APPARATUS: reap bob");
+    alice.expect_within(Duration::from_secs(150), "bob unreachable", |line| {
+        line.contains("vox daemon: Vox: needs attention")
+            && line.contains("unreachable")
+            && line.contains(&bob_short)
+    });
+    wait_until("the blocked desktop command to start", TIMEOUT, || {
+        pid.exists()
+    });
+    let blocked_pid = std::fs::read_to_string(&pid).expect("APPARATUS: read notifier PID");
+    let mut blocked_child = BlockedChild(Some(blocked_pid.trim().to_owned()));
+    let alive = || {
+        Command::new("/bin/kill")
+            .args(["-0", blocked_pid.trim()])
+            .status()
+            .expect("APPARATUS: check notifier PID")
+            .success()
+    };
+    assert!(alive(), "APPARATUS: the notifier did not remain blocked");
+    let calls_before = notes(&calls).len();
+    std::fs::remove_file(&block).expect("APPARATUS: unblock later desktop commands");
+    drop(bob);
+    port_free(bob_port);
+    let _bob = daemon("bob", &bob_dir, bob_port, &anchor, &pass_file, &[]);
+    loop {
+        let recovered = notes(&calls)
+            .iter()
+            .any(|line| line.contains("Vox: recovered") && line.contains(&bob_short));
+        let running = alive();
+        if recovered || !running {
+            assert!(
+                recovered && running,
+                "PRODUCT: recovery did not reach the desktop while the first notifier was alive: {}",
+                alice.transcript()
+            );
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        notes(&calls).len() > calls_before,
+        "PRODUCT: the next desktop call was lost behind the blocked notifier"
+    );
+    assert!(
+        alice
+            .child
+            .try_wait()
+            .expect("APPARATUS: check daemon")
+            .is_none(),
+        "PRODUCT: daemon stopped while the desktop notifier was blocked"
+    );
+
+    let _ = Command::new("/bin/kill")
+        .args(["-KILL", blocked_pid.trim()])
+        .status()
+        .expect("APPARATUS: stop blocked notifier");
+    wait_until(
+        "the blocked desktop command to be reaped",
+        Duration::from_secs(130),
+        || !alive(),
+    );
+    blocked_child.0 = None;
+}
+
+#[test]
+#[ignore = "five real rooms and blocked desktop calls; run in release"]
+fn desktop_notification_calls_are_bounded_and_overflow_is_explicit() {
+    use std::os::unix::fs::PermissionsExt;
+    struct Children(PathBuf);
+    impl Drop for Children {
+        fn drop(&mut self) {
+            for pid in notes(&self.0) {
+                let _ = Command::new("/bin/kill")
+                    .args(["-KILL", &pid])
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        }
+    }
+    watchdog::arm();
+    let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
+    let calls = tmp.path().join("desktop-pids");
+    let _children = Children(calls.clone());
+    let script = tmp.path().join("blocked-desktop");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\necho $$ >> '{}'\nexec /bin/sleep 300\n",
+            calls.display()
+        ),
+    )
+    .expect("APPARATUS: desktop stub");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+        .expect("APPARATUS: executable desktop stub");
+    let Scene {
+        _anchor,
+        mut alice,
+        alice_dir,
+        mut bob,
+        bob_dir,
+        bob_id,
+        ..
+    } = scene(
+        &tmp,
+        &[(
+            "VOX_NOTIFY_COMMAND",
+            script.to_str().expect("APPARATUS: script path"),
+        )],
+        |_| {},
+    );
+    for number in 1..5 {
+        let (ok, out, err) = vox_in(
+            &alice_dir,
+            &[
+                "room",
+                "create",
+                "--passphrase-file",
+                "-",
+                "--name",
+                &format!("cap-{number}"),
+            ],
+            ROOM_PASS,
+        );
+        assert!(ok, "APPARATUS: create cap room: {out}{err}");
+        let rooms = status(&alice_dir);
+        let room = rooms["rooms"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == format!("cap-{number}"))
+            .unwrap()["id"]
+            .as_str()
+            .unwrap();
+        let (ok, link, err) = vox_once(&alice_dir, &args(&["room", "link", room]));
+        assert!(ok, "APPARATUS: cap room link: {link}{err}");
+        let (ok, out, err) = vox_in(
+            &bob_dir,
+            &["room", "join", "--passphrase-file", "-", link.trim()],
+            ROOM_PASS,
+        );
+        assert!(ok, "APPARATUS: join cap room: {out}{err}");
+    }
+    wait_until("five rooms to list the connected member", SETUP, || {
+        let snapshot = status(&alice_dir);
+        snapshot["rooms"].as_array().is_some_and(|rooms| {
+            rooms.len() == 5
+                && rooms.iter().all(|room| {
+                    room["members"].as_array().is_some_and(|members| {
+                        members
+                            .iter()
+                            .any(|m| m["id"] == bob_id && m["connected"] == true)
+                    })
+                })
+        })
+    });
+    assert!(
+        notes(&calls).is_empty(),
+        "APPARATUS: desktop calls started before disconnection"
+    );
+    bob.child.kill().expect("APPARATUS: stop cap member");
+    bob.child.wait().expect("APPARATUS: reap cap member");
+    let short: String = bob_id.chars().take(12).collect();
+    loop {
+        let count = notes(&calls).len();
+        assert!(
+            count <= 4,
+            "PRODUCT: {count} desktop calls started despite a four-call cap"
+        );
+        let transcript = alice.transcript();
+        if transcript.contains("desktop notification not shown:")
+            && transcript.contains("4 desktop notifications still waiting")
+            && count == 4
+        {
+            assert_eq!(
+                count, 4,
+                "APPARATUS: cap notice preceded its four child records"
+            );
+            assert!(
+                transcript.contains(&short),
+                "PRODUCT: overflow notice did not identify the affected member: {transcript}"
+            );
+            break;
+        }
+        if notes(&calls).first().is_some_and(|pid| {
+            !Command::new("/bin/kill")
+                .args(["-0", pid])
+                .stderr(Stdio::null())
+                .status()
+                .expect("APPARATUS: check desktop child")
+                .success()
+        }) {
+            panic!("PRODUCT: blocked calls ended without an explicit desktop overflow notice: {transcript}");
+        }
+        assert!(
+            alice
+                .child
+                .try_wait()
+                .expect("APPARATUS: check daemon")
+                .is_none(),
+            "PRODUCT: daemon stopped during desktop overflow"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+#[ignore = "real daemons and a missing desktop service; run in release"]
+fn a_missing_desktop_service_logs_once() {
+    use std::os::unix::fs::PermissionsExt;
+    watchdog::arm();
+    let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
+    let bin = tmp.path().join("desktop-bin");
+    std::fs::create_dir(&bin).expect("APPARATUS: desktop directory");
+    let name = if cfg!(target_os = "macos") {
+        "osascript"
+    } else {
+        "notify-send"
+    };
+    let attempts = tmp.path().join("failed-attempts");
+    let fail = tmp.path().join("fail");
+    let stub = bin.join(name);
+    std::fs::write(
+        &stub,
+        format!(
+            "#!/bin/sh\nif [ -f '{}' ]; then echo failed >> '{}'; exit 1; fi\n",
+            fail.display(),
+            attempts.display()
+        ),
+    )
+    .expect("APPARATUS: desktop stub");
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+        .expect("APPARATUS: executable desktop stub");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let Scene {
+        _anchor,
+        anchor,
+        mut alice,
+        mut bob,
+        bob_dir,
+        bob_port,
+        bob_id,
+        pass_file,
+        ..
+    } = scene(&tmp, &[("PATH", &path)], |_| {});
+    let bob_short: String = bob_id.chars().take(12).collect();
+    assert!(
+        !alice
+            .transcript()
+            .contains("desktop notification unavailable"),
+        "APPARATUS: desktop failed before the missing-service stage"
+    );
+    std::fs::write(&fail, "").expect("APPARATUS: make the desktop service unavailable");
+    let fail_started = Instant::now();
+    alice.seen.clear();
+    bob.child.kill().expect("APPARATUS: stop bob again");
+    bob.child.wait().expect("APPARATUS: reap bob again");
+    alice.expect_within(Duration::from_secs(150), "bob unreachable again", |line| {
+        line.contains("vox daemon: Vox: needs attention")
+            && line.contains("unreachable")
+            && line.contains(&bob_short)
+    });
+    drop(bob);
+    port_free(bob_port);
+    let mut bob = daemon("bob", &bob_dir, bob_port, &anchor, &pass_file, &[]);
+    alice.expect_within(TIMEOUT, "bob recovered again", |line| {
+        line.contains("vox daemon: Vox: recovered") && line.contains(&bob_short)
+    });
+    wait_until("two failing desktop calls", TIMEOUT, || {
+        notes(&attempts).len() >= 2
+    });
+    // Count the product's own missing-service line, never the stub's stderr.
+    // These short failing calls are separated by real disconnect/reconnect transitions.
+    alice.seen.clear();
+    bob.child
+        .kill()
+        .expect("APPARATUS: stop bob for the third notice");
+    bob.child
+        .wait()
+        .expect("APPARATUS: reap bob for the third notice");
+    alice.expect_within(Duration::from_secs(150), "third failing notice", |line| {
+        line.contains("vox daemon: Vox: needs attention") && line.contains(&bob_short)
+    });
+    wait_until("three failing desktop calls", TIMEOUT, || {
+        notes(&attempts).len() >= 3
+    });
+    let log = alice.timed.lock().expect("APPARATUS: daemon log");
+    let failures: Vec<_> = log
+        .iter()
+        .filter(|(_, line)| line.contains("desktop notification unavailable"))
+        .collect();
+    assert!(
+        failures.iter().all(|(at, _)| *at >= fail_started),
+        "PRODUCT: missing-service diagnostic preceded the failing service: {failures:?}"
+    );
+    assert_eq!(
+        failures.len(),
+        1,
+        "PRODUCT: repeated missing service diagnostics: {failures:?}"
+    );
+}
+
 #[test]
 #[ignore = "an anchor and two real daemons, one killed for three minutes; run on demand"]
 fn a_condition_notifies_once_when_it_starts_and_once_when_it_clears() {
@@ -738,12 +1103,10 @@ fn an_unreachable_anchor_notifies_once_and_once_when_it_is_back() {
 mod optional_proof;
 optional_proof::not_run!(a_room_that_cannot_sync_notifies_once_and_once_when_it_syncs_again);
 
-/// **A room that has not synced** (PRD-001 R37), optional because the condition takes
-/// `STALE_SYNC_SECS` (ten minutes) to start. bob, alice's only other member, is killed, and so is
-/// the anchor: an anchor holds the room's log for whoever is away and syncs it, so with the anchor
-/// up the room is not stale, which is right. Once the room has gone ten minutes with no completed
-/// sync, exactly one notification names the room; the anchor back on its port, the room syncs
-/// again and exactly one "recovered" names it.
+/// **A disconnected room with no new sync entries** (PRD-001 R37), optional because the
+/// condition takes ten minutes to start. Kill bob and the anchor so nobody can connect.
+/// Exactly one desktop notification names the stale room. Bob reconnects and posts a new
+/// message; Alice reads that message and receives exactly one desktop recovery notification.
 #[cfg(feature = "optional-proofs")]
 #[test]
 #[ignore = "optional: an anchor and two daemons, one killed for over ten minutes; run in release"]
@@ -771,7 +1134,7 @@ fn a_room_that_cannot_sync_notifies_once_and_once_when_it_syncs_again() {
         .chars()
         .take(12)
         .collect();
-    let stale = |lines: &[String]| count(lines, "no completed sync", &room);
+    let stale = |lines: &[String]| count(lines, "no new sync entries", &room);
 
     let killed = Instant::now();
     for p in [&mut bob, &mut the_anchor] {
@@ -784,8 +1147,8 @@ fn a_room_that_cannot_sync_notifies_once_and_once_when_it_syncs_again() {
         assert!(
             Instant::now() < until,
             "PRODUCT: no notification for room {room} {:?} after its only other member and the \
-             anchor were killed; alice's room last synced at {} (now {}); her status says {}; \
-             notifications: {:?}",
+             anchor were killed; alice last received new sync entries at {} (now {}); \
+             her status says {}; notifications: {:?}",
             killed.elapsed(),
             s["rooms"][0]["last_sync_ms"],
             s["now_ms"],
@@ -823,24 +1186,43 @@ fn a_room_that_cannot_sync_notifies_once_and_once_when_it_syncs_again() {
     bob_again.expect_within(TIMEOUT, "bob's daemon to hold the room", |l| {
         l.contains("holding room")
     });
+    let (ok, out, err) = vox_once(
+        &bob_dir,
+        &args(&["room", "post", &room, "received-after-disconnection"]),
+    );
+    assert!(ok, "APPARATUS: returning member could not post: {out}{err}");
+    let mut observed_receipt = false;
     let back = Instant::now();
     let cleared = |lines: &[String]| {
         lines
             .iter()
             .filter(|l| {
-                l.contains("recovered") && l.contains("no completed sync") && l.contains(&room)
+                l.contains("recovered") && l.contains("no new sync entries") && l.contains(&room)
             })
             .count()
     };
     let until = back + Duration::from_secs(120);
-    while cleared(&notes(&file)) == 0 {
-        assert!(
-            Instant::now() < until,
-            "PRODUCT: no \"recovered\" for room {room} {:?} after the anchor and bob were back; \
-             notifications: {:?}",
-            back.elapsed(),
-            notes(&file)
-        );
+    while cleared(&notes(&file)) == 0 || !observed_receipt {
+        let (ok, out, _) = vox_once(&alice_dir, &args(&["room", "read", &room, "--json"]));
+        observed_receipt |= ok && out.contains("received-after-disconnection");
+        let snapshot = status(&alice_dir);
+        if Instant::now() >= until {
+            if observed_receipt && cleared(&notes(&file)) == 0 {
+                panic!(
+                    "PRODUCT: room stale alarm did not clear after a new entry was received; \
+                     status {snapshot}; notifications {:?}",
+                    notes(&file)
+                );
+            }
+            if !observed_receipt {
+                panic!(
+                    "PRODUCT: recovery post was accepted but never received; status {snapshot}; \
+                 returning member said {}; notifications {:?}",
+                    bob_again.transcript(),
+                    notes(&file)
+                );
+            }
+        }
         std::thread::sleep(Duration::from_millis(250));
     }
     std::thread::sleep(Duration::from_secs(11));

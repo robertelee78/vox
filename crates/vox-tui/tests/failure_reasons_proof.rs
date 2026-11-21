@@ -12,8 +12,8 @@
 //! What it asserts, per case, is the **specific** cause in the message, and for every output
 //! that no `Failed(` enum token reaches a person at all.
 //!
-//! 1. `vox room join` with the wrong room passphrase → the member refused, and the likely cause
-//!    is the passphrase;
+//! 1. `vox room join` with the wrong room passphrase → a member did not accept the join;
+//!    the generic refusal does not establish a passphrase or trust cause;
 //! 2. `vox room join` of a room already held → not a failure: it says the room is already held,
 //!    reaches a member at the address, and keeps it as where the host is now (V210-167);
 //! 3. `vox daemon --listen` on a UDP port something else holds → that port, in use;
@@ -397,7 +397,12 @@ fn every_common_failure_names_its_cause() {
     assert_says(
         "join, wrong passphrase",
         &said,
-        &["refused the join", "room passphrase is wrong"],
+        &[
+            "a member answered but did not accept the join",
+            "check the room passphrase you typed as one possible cause",
+            "ask that member to check its disk, vox status and daemon log",
+            "this refusal does not establish a passphrase or trust cause",
+        ],
     );
 
     // ---- (2) join a room already held ----

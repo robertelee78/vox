@@ -270,11 +270,12 @@ fn render(v: &Value) -> Result<String, AppError> {
                 "the node's report room {index} has no boolean render_backfill_pending"
             ))
         })?;
-        let _ = writeln!(
+        let _ = write!(
             o,
-            "  {} {}  epoch {}  last sync {}  rows {}  log entries {}  sender keys held {}, received {}; governance revision {}, render backfill {}",
+            "  {} {}  {}  epoch {}  last sync {}  rows {}  log entries {}  sender keys held {}, received {}; governance revision {}, render backfill {}",
             short(s(r, "id")),
             s(r, "name"),
+            if r["not_receiving"] == true { "not receiving" } else { "no advertised feed gap of 20 entries" },
             r.get("epoch").and_then(Value::as_u64).unwrap_or(0),
             ago(now, &r["last_sync_ms"]),
             r.get("entries").and_then(Value::as_u64).unwrap_or(0),
@@ -292,6 +293,19 @@ fn render(v: &Value) -> Result<String, AppError> {
                 "idle"
             }
         );
+        for member in r["members"].as_array().into_iter().flatten() {
+            let _ = write!(
+                o,
+                "; {} latest shown message at feed entry ",
+                short(s(member, "id"))
+            );
+            if let Some(through) = member["holds_through"].as_u64() {
+                let _ = write!(o, "{through}");
+            } else {
+                o.push_str("none shown");
+            }
+        }
+        let _ = writeln!(o, " (latest shown; earlier gaps may remain)");
         let _ = writeln!(
             o,
             "    messages: {}; Session steps: {}",
@@ -325,7 +339,7 @@ fn render(v: &Value) -> Result<String, AppError> {
             let flag = |k: &str| m.get(k).and_then(Value::as_bool) == Some(true);
             let _ = writeln!(
                 o,
-                "    {}{}{}  {}  last seen {}  last sync {}",
+                "    {}{}{}  {}  last seen {}  last sync {}  latest shown message at feed entry {}",
                 short(s(m, "id")),
                 if flag("me") { " (this node)" } else { "" },
                 if flag("trusted") { " trusted" } else { "" },
@@ -333,20 +347,28 @@ fn render(v: &Value) -> Result<String, AppError> {
                     ""
                 } else if flag("connected") {
                     "connected"
+                } else if flag("daemon_answered") {
+                    "daemon answered; node unavailable (it may not be attached)"
                 } else {
                     "not connected"
                 },
                 ago(now, &m["last_seen_ms"]),
-                ago(now, &m["last_sync_ms"])
+                ago(now, &m["last_sync_ms"]),
+                m["holds_through"]
+                    .as_u64()
+                    .map_or_else(|| "none shown".to_owned(), |seq| seq.to_string()),
             );
             if let Some(said) = m.get("key_waits").and_then(Value::as_str) {
                 let _ = writeln!(o, "      {said}");
             }
             if let Some(through) = m.get("held_through").and_then(Value::as_u64) {
-                let _ = writeln!(o, "      holds this node's room feed through {through}");
+                let _ = writeln!(
+                    o,
+                    "      last authenticated receipt of this node's feed through {through}"
+                );
             }
-            if let Some(through) = m.get("holds_through").and_then(Value::as_u64) {
-                let _ = writeln!(o, "      this node holds their room feed through {through}");
+            if let Some(through) = m.get("advertised_through").and_then(Value::as_u64) {
+                let _ = writeln!(o, "      member advertised feed through {through}; this is not a received message");
             }
             if flag("key_delivery_pending") {
                 let _ = writeln!(

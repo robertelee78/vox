@@ -2133,9 +2133,7 @@ fn root_is_told_at_once_that_it_cannot_use_the_daemon() {
     }
 }
 
-/// ADR-034 LG-1–LG-3: a real daemon replaces an old unbounded log and counts repeat lifecycle
-/// messages in place. Mutants: remove Log::open's old-file bound, or append repeated lines
-/// instead of updating their count; each fails its own PRODUCT assertion below.
+/// ADR-052 RG-7: daemon logs survive restart, retain 24 MiB, and date the last repeat.
 #[test]
 #[ignore = "real daemon and encrypted node profiles; run in release"]
 fn the_daemons_log_is_bounded_counted_and_named_in_status() {
@@ -2144,14 +2142,15 @@ fn the_daemons_log_is_bounded_counted_and_named_in_status() {
     a.make_node("default");
     let log_path = a.data.join(".daemon/log");
     std::fs::create_dir_all(log_path.parent().unwrap()).expect("APPARATUS: make daemon directory");
-    std::fs::write(&log_path, vec![b'x'; 3 * 1024 * 1024])
-        .expect("APPARATUS: stage a previous version's oversized daemon log");
+    let legacy = "older log format must survive restart\n";
+    std::fs::write(&log_path, legacy).expect("APPARATUS: stage an older-format daemon log");
     let pass = a.data.with_extension("log-pass");
     std::fs::write(&pass, format!("{PASS}\n")).expect("APPARATUS: passphrase file");
     let d = Daemon::start(&a, &["--no-node"], &[]);
     d.expect("its control socket", Duration::from_secs(30), |l| {
         l.contains("control socket")
     });
+    let mut first_stamp = String::new();
     for turn in 0..3 {
         let (ok, out, err) = a.run(
             &[
@@ -2182,14 +2181,31 @@ fn the_daemons_log_is_bounded_counted_and_named_in_status() {
         }
         let (ok, out, err) = a.run(&["node", "detach", "default"], "");
         assert!(ok, "PRODUCT: detach {turn} failed: {out}{err}");
+        if turn == 0 {
+            assert!(
+                wait_until(Duration::from_secs(30), || {
+                    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+                    if let Some(line) = log
+                        .lines()
+                        .find(|l| l.contains("node default finished its work"))
+                    {
+                        first_stamp = line[..24].to_owned();
+                        true
+                    } else {
+                        false
+                    }
+                }),
+                "PRODUCT: the first detach was not recorded in the daemon log"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
     d.stop();
     let log =
         std::fs::read_to_string(&log_path).expect("PRODUCT: the named daemon log was not readable");
     assert!(
-        log.len() <= 1024 * 1024,
-        "PRODUCT: daemon log exceeded one MiB: {} bytes",
-        log.len()
+        log.starts_with(legacy),
+        "PRODUCT: opening the daemon log cut or rewrote its older-format contents"
     );
     let detached: Vec<_> = log
         .lines()
@@ -2204,17 +2220,70 @@ fn the_daemons_log_is_bounded_counted_and_named_in_status() {
         detached[0].ends_with("[count=00000000000000000003]"),
         "PRODUCT: the repeated line did not count its three occurrences:\n{log}"
     );
+    assert!(
+        &detached[0][..24] > first_stamp.as_str(),
+        "PRODUCT: repeated detach kept the first occurrence time {first_stamp}: {}",
+        detached[0]
+    );
     // Room/peer context is exercised with an actual failing peer in the sync-health journey.
-    for line in log.lines() {
+    for line in log.lines().skip(1) {
         let stamp = line.split_whitespace().next().unwrap_or_default();
         assert!(
             stamp.len() == 24 && stamp.as_bytes()[10] == b'T' && stamp.ends_with('Z'),
             "PRODUCT: a daemon log line has no UTC timestamp: {line}"
         );
     }
-    // The next real daemon output must cross the bound, not just trim a legacy log.
+    let restarted = Daemon::start(&a, &["--no-node"], &[]);
+    restarted.expect("its control socket", Duration::from_secs(30), |l| {
+        l.contains("control socket")
+    });
+    restarted.stop();
+    let after_restart = std::fs::read_to_string(&log_path)
+        .expect("PRODUCT: daemon log was not readable after restart");
+    assert!(
+        after_restart.starts_with(&log),
+        "PRODUCT: daemon restart cut or rewrote its existing log"
+    );
+
+    // An oversized, older-format log must survive the first write as the predecessor.
+    let mut oversized = b"older oversized log begins\n".to_vec();
+    oversized.resize(13 * 1024 * 1024, b'x');
+    oversized.extend_from_slice(b"\nolder oversized log ends\n");
+    std::fs::write(&log_path, &oversized).expect("APPARATUS: stage oversized log");
+    let oversized_daemon = Daemon::start(&a, &["--no-node"], &[]);
+    oversized_daemon.expect("its control socket", Duration::from_secs(30), |l| {
+        l.contains("control socket")
+    });
+    oversized_daemon.stop();
+    let previous_path = log_path.with_extension("log.1");
+    let kept = std::fs::read(&previous_path)
+        .expect("PRODUCT: oversized daemon log was not kept on restart");
+    assert!(
+        kept == oversized,
+        "PRODUCT: restarting with an oversized log cut or rewrote it ({} of {} bytes kept)",
+        kept.len(),
+        oversized.len()
+    );
+
+    // A 2 MiB log must not rotate under the former 1 MiB limit.
+    let mut below_bound = b"2026-10-10T00:00:00.000Z ".to_vec();
+    below_bound.resize(2 * 1024 * 1024 - 1, b'x');
+    below_bound.push(b'\n');
+    std::fs::write(&log_path, &below_bound).expect("APPARATUS: stage log below the new bound");
+    let below_daemon = Daemon::start(&a, &["--no-node"], &[]);
+    below_daemon.expect("its control socket", Duration::from_secs(30), |l| {
+        l.contains("control socket")
+    });
+    below_daemon.stop();
+    let below = std::fs::read(&log_path).expect("PRODUCT: daemon log unreadable after restart");
+    assert!(
+        below.starts_with(&below_bound),
+        "PRODUCT: daemon rotated a 2 MiB log before reaching the 12 MiB file limit"
+    );
+
+    // The next real daemon output crosses the 12 MiB per-file bound.
     let mut near_bound = b"2026-10-10T00:00:00.000Z ".to_vec();
-    near_bound.resize(1024 * 1024 - 1, b'x');
+    near_bound.resize(12 * 1024 * 1024 - 1, b'x');
     near_bound.push(b'\n');
     std::fs::write(&log_path, near_bound).expect("APPARATUS: stage rotation boundary");
     let port: u16 = std::fs::read_to_string(a.data.join(".daemon/port"))
@@ -2249,7 +2318,7 @@ fn the_daemons_log_is_bounded_counted_and_named_in_status() {
     let previous = std::fs::metadata(log_path.with_extension("log.1"))
         .expect("PRODUCT: daemon output crossed the bound without keeping a predecessor");
     assert!(
-        current.len() <= 1024 * 1024 && previous.len() <= 1024 * 1024,
+        current.len() <= 12 * 1024 * 1024 && previous.len() <= 12 * 1024 * 1024,
         "PRODUCT: rotation exceeded its bounds: current {}, predecessor {}",
         current.len(),
         previous.len()

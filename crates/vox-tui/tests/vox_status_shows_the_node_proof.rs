@@ -45,6 +45,10 @@ mod watchdog;
 #[path = "support/world.rs"]
 mod world;
 
+#[cfg(feature = "test-knobs")]
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
+
 use world::attach as local_attach;
 
 use std::io::{Read, Write};
@@ -358,7 +362,7 @@ fn ready_and_locked_are_the_states_a_person_sees() {
         &turn,
     );
     assert!(
-        hook.contains("private is Locked") && hook.contains("vox node unlock private"),
+        hook.contains("private is Locked") && hook.contains("vox node unlock -- private"),
         "PRODUCT: a hook on a Locked node must say Locked and how to unlock: {hook}"
     );
     let tui = StatusTui::start(dir, "free");
@@ -779,4 +783,704 @@ fn vox_status_shows_rooms_peers_tunnels_udp_flows_and_what_is_unhealthy() {
         "PRODUCT: the host's trusted guest {g} went away, yet in 120 s `vox status` never flagged \
          it unreachable:\n{text}"
     );
+}
+
+/// RG-7: an answering member advertises twenty new posts but refuses its head evidence.
+/// Inventory rounds still finish; none of those rounds is receipt of a readable message.
+#[cfg(feature = "test-knobs")]
+#[test]
+#[ignore = "real binaries and production Argon2id; run in release with test-knobs"]
+fn status_names_a_connected_member_whose_posts_are_not_received() {
+    watchdog::arm();
+    test_knobs::require(&["VOX_TEST_UNAVAILABLE_HEAD_FILE"]);
+    let sink = UdpSocket::bind("127.0.0.1:0").expect("APPARATUS: service port");
+    let port = sink.local_addr().expect("APPARATUS: bound service").port();
+    let mut w = World::new(port, true);
+    local_attach::Root::at(&w.guest_dir, world::IDENTITY).attach("default");
+    let (ok, out, err) = vox_once(
+        &w.guest_dir,
+        &args(&["trust", "add", &w.host_fp, "--name", "author"]),
+    );
+    assert!(ok, "APPARATUS: trusting author failed: {out}{err}");
+    let run = |dir: &std::path::Path, argv: &[&str]| {
+        let (ok, out, err) = vox_once(dir, &args(argv));
+        assert!(ok, "APPARATUS: staging vox {argv:?} failed: {out}{err}");
+        out
+    };
+    drop(w.host.take());
+    world::reap_daemon(&w.host_dir);
+    let marker = w.tmp.path().join("unavailable-head");
+    let pass = w.tmp.path().join("daemon-passphrases");
+    std::fs::write(&pass, format!("{}\n{}\n", world::IDENTITY, w.passphrase))
+        .expect("APPARATUS: scratch passphrase file");
+    let mut author = world::VoxProc::spawn_env(
+        "withholding-author",
+        &w.host_dir,
+        &args(&[
+            "daemon",
+            "--passphrase-file",
+            &world::utf8(&pass),
+            "--anchor",
+            &w.host_anchor,
+            "--listen",
+            "127.0.0.1:0",
+        ]),
+        &[("VOX_TEST_UNAVAILABLE_HEAD_FILE", &world::utf8(&marker))],
+    );
+    author.expect_line("author's room open", |line| {
+        line.starts_with("vox daemon: holding room") && line.contains(&w.room)
+    });
+    run(
+        &w.host_dir,
+        &["room", "post", &w.room, "received-before-withholding"],
+    );
+    loop {
+        let read = run(&w.guest_dir, &["room", "read", &w.room, "--json"]);
+        if read.contains("received-before-withholding") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let completed = |v: &Value| -> u64 {
+        v["sync"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|lane| lane["peer"] == w.host_fp)
+            .filter_map(|lane| lane["completed"].as_u64())
+            .sum()
+    };
+    // Let all earlier nonempty rounds finish before the exact observation boundary.
+    let initial = status_json(&w.guest_dir, "reader");
+    let settled = completed(&initial) + 3;
+    let before = loop {
+        let current = status_json(&w.guest_dir, "reader");
+        if completed(&current) >= settled
+            && current["rooms"][0]["members"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["id"] == w.host_fp && m["connected"] == true)
+        {
+            break current;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    std::fs::write(&marker, format!("{} {}\n", w.host_fp, w.guest_fp))
+        .expect("APPARATUS: activate head refusal");
+    for number in 1..=20 {
+        run(
+            &w.host_dir,
+            &[
+                "room",
+                "post",
+                &w.room,
+                &format!("withheld-post-{number:02}"),
+            ],
+        );
+    }
+    let cycles = completed(&before);
+    let after = loop {
+        let current = status_json(&w.guest_dir, "reader");
+        if completed(&current) >= cycles + 3 {
+            break current;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let read = run(&w.guest_dir, &["room", "read", &w.room, "--json"]);
+    assert!(
+        !read.contains("withheld-post-"),
+        "APPARATUS: head-refusing member nevertheless served the withheld posts: {read}"
+    );
+    let text = status_text(&w.guest_dir, "reader");
+    eprintln!("[proof] after twenty advertised posts and three completed rounds:\n{text}\n{after}");
+    assert!(
+        text.contains("not receiving"),
+        "PRODUCT: connected author posted twenty messages, reader shows none, yet status \
+         does not say not receiving:\n{text}"
+    );
+    assert_eq!(
+        after["rooms"][0]["last_sync_ms"], before["rooms"][0]["last_sync_ms"],
+        "PRODUCT: empty rounds advanced the room's completed sync:\n{text}"
+    );
+    for member in after["rooms"][0]["members"].as_array().unwrap() {
+        let id = member["id"].as_str().unwrap();
+        if member["me"] == true {
+            assert!(
+                member["holds_through"].is_null(),
+                "PRODUCT: the reader authored no messages, but status counted its setup headers as shown messages:\n{text}"
+            );
+        }
+        assert!(
+            text.lines().any(|line| line.contains(&id[..12])
+                && line.contains("latest shown message at feed entry")),
+            "PRODUCT: room status does not name received message coverage for {id}:\n{text}"
+        );
+    }
+    drop(author);
+}
+
+/// Absence of a received consent is a local observation, not a remote trust decision.
+#[cfg(feature = "test-knobs")]
+#[test]
+#[ignore = "real binaries and production Argon2id; run in release"]
+fn status_journey_does_not_blame_missing_history_on_remote_trust() {
+    watchdog::arm();
+    let sink = UdpSocket::bind("127.0.0.1:0").expect("APPARATUS: service port");
+    test_knobs::require(&["VOX_TEST_UNAVAILABLE_HEAD_FILE"]);
+    let mut w = World::new(
+        sink.local_addr()
+            .expect("APPARATUS: service address")
+            .port(),
+        false,
+    );
+    local_attach::Root::at(&w.guest_dir, world::IDENTITY).attach("default");
+    let (ok, out, err) = vox_once(
+        &w.guest_dir,
+        &args(&["trust", "add", &w.host_fp, "--name", "author"]),
+    );
+    assert!(ok, "PRODUCT: reader could not trust author: {out}{err}");
+    let report = loop {
+        let (_, out, err) = vox_once(
+            &w.guest_dir,
+            &args(&["agent", "doctor", "--room", &w.room, "--json"]),
+        );
+        let report: Value = serde_json::from_str(&out)
+            .unwrap_or_else(|e| panic!("PRODUCT: doctor printed invalid JSON ({e}): {out}{err}"));
+        let ready = report["checks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|check| {
+                check["detail"]
+                    .as_str()
+                    .is_some_and(|detail| detail.starts_with("you trust it"))
+            });
+        if ready {
+            break report;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    eprintln!("[proof] doctor without received consent: {report}");
+    let text = report.to_string();
+    assert!(
+        text.contains("your node has not received its trust for you")
+            && !text.contains("has not trusted you")
+            && text.contains("if its operator has not accepted your fingerprint")
+            && text.contains("ask its operator to accept your fingerprint"),
+        "PRODUCT: doctor must offer acceptance for a never-trusted reader without inventing a remote decision: {report}"
+    );
+
+    // Accept on the author's real daemon while it refuses to serve its new consent to
+    // the reader. Local trust and received room consent are deliberately distinct.
+    drop(w.host.take());
+    world::reap_daemon(&w.host_dir);
+    let marker = w.tmp.path().join("withheld-consent");
+    std::fs::write(&marker, format!("{} {}\n", w.host_fp, w.guest_fp))
+        .expect("APPARATUS: withhold consent history");
+    let pass = w.tmp.path().join("consent-passphrases");
+    std::fs::write(&pass, format!("{}\n{}\n", world::IDENTITY, w.passphrase))
+        .expect("APPARATUS: daemon passphrase file");
+    let mut author = world::VoxProc::spawn_env(
+        "accepting-author",
+        &w.host_dir,
+        &args(&[
+            "daemon",
+            "--passphrase-file",
+            &world::utf8(&pass),
+            "--anchor",
+            &w.host_anchor,
+            "--listen",
+            "127.0.0.1:0",
+        ]),
+        &[("VOX_TEST_UNAVAILABLE_HEAD_FILE", &world::utf8(&marker))],
+    );
+    author.expect_line("author's room open", |line| {
+        line.starts_with("vox daemon: holding room") && line.contains(&w.room)
+    });
+    let (ok, out, err) = vox_once(
+        &w.host_dir,
+        &args(&["trust", "add", &w.guest_fp, "--name", "accepted-reader"]),
+    );
+    assert!(ok, "APPARATUS: author could not accept reader: {out}{err}");
+    let (ok, accepted, err) = vox_once(&w.host_dir, &args(&["trust", "list"]));
+    assert!(
+        ok && accepted.contains(&w.guest_fp),
+        "APPARATUS: author's accepted reader was not listed: {accepted}{err}"
+    );
+    let completions = |v: &Value| -> u64 {
+        v["sync"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|lane| lane["peer"] == w.host_fp)
+            .filter_map(|lane| lane["fetched_completed"].as_u64())
+            .sum()
+    };
+    let before = completions(&status_json(&w.guest_dir, "reader"));
+    loop {
+        if completions(&status_json(&w.guest_dir, "reader")) >= before + 3 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let (_, out, err) = vox_once(
+        &w.guest_dir,
+        &args(&["agent", "doctor", "--room", &w.room, "--json"]),
+    );
+    let pending: Value = serde_json::from_str(&out)
+        .unwrap_or_else(|e| panic!("PRODUCT: pending-consent doctor JSON ({e}): {out}{err}"));
+    eprintln!("[proof] author accepted reader, consent not received: {pending}");
+    let text = pending.to_string();
+    assert!(
+        text.contains("your node has not received its trust for you")
+            && !text.contains("has not trusted you")
+            && text.contains("otherwise check vox status"),
+        "PRODUCT: doctor blamed an operator who already accepted the reader instead of separating missing consent from trust: {pending}"
+    );
+    drop(author);
+}
+
+/// A feed can advance without a message: reading, key/policy changes and expiry are not loss.
+#[test]
+#[ignore = "real daemons and read receipts; run in release"]
+fn non_message_feed_entries_and_expired_messages_do_not_report_missing_history() {
+    use vox_core::node::ipc::{Frame, Request};
+    watchdog::arm();
+    let sink = UdpSocket::bind("127.0.0.1:0").expect("APPARATUS: service socket");
+    let w = World::new(
+        sink.local_addr()
+            .expect("APPARATUS: service address")
+            .port(),
+        true,
+    );
+    local_attach::Root::at(&w.guest_dir, world::IDENTITY).attach("default");
+    let (ok, out, err) = vox_once(
+        &w.guest_dir,
+        &args(&["trust", "add", &w.host_fp, "--name", "author"]),
+    );
+    assert!(ok, "APPARATUS: reader trusts author: {out}{err}");
+    let cid = vox_core::node::link::b32_decode(&w.room, "proof room").expect("APPARATUS: room id");
+    let rt = tokio::runtime::Runtime::new().expect("APPARATUS: IPC runtime");
+    rt.block_on(async {
+        let mut poster = local_attach::node_client(&w.host_dir, "default")
+            .await
+            .expect("APPARATUS: author's socket");
+        let mut reader = local_attach::node_client(&w.guest_dir, "default")
+            .await
+            .expect("APPARATUS: reader's socket");
+        for n in 0..25 {
+            let text = format!("read-only-receipt-{n:02}");
+            let reply = poster
+                .request(&Request::Post {
+                    channel_id: cid,
+                    text: text.clone(),
+                    card: false,
+                })
+                .await;
+            assert!(
+                matches!(reply, Ok(Frame::Ok)),
+                "APPARATUS: author could not post receipt staging: {reply:?}"
+            );
+            let entry = loop {
+                let reply = reader
+                    .request(&Request::RoomPage {
+                        channel_id: cid,
+                        before: None,
+                        limit: 0,
+                    })
+                    .await;
+                if let Ok(Frame::RoomPage { rows, .. }) = reply {
+                    if let Some(row) = rows.iter().find(|r| r.text == text) {
+                        break row.entry_hash;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            };
+            let current = status_json(&w.guest_dir, "reader");
+            let member = current["rooms"][0]["members"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["me"] == true)
+                .unwrap();
+            // Before RG-7 this same header fact was serialized as holds_through.
+            let before = member["verified_through"]
+                .as_u64()
+                .or_else(|| member["holds_through"].as_u64())
+                .unwrap_or(0);
+            let reply = reader
+                .request(&Request::MarkRead {
+                    channel_id: cid,
+                    entries: vec![entry],
+                })
+                .await;
+            assert!(
+                matches!(reply, Ok(Frame::Ok)),
+                "APPARATUS: mark a shown message read: {reply:?}"
+            );
+            loop {
+                let current = status_json(&w.guest_dir, "reader");
+                let member = current["rooms"][0]["members"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|m| m["me"] == true)
+                    .unwrap();
+                let head = member["verified_through"]
+                    .as_u64()
+                    .or_else(|| member["holds_through"].as_u64())
+                    .unwrap_or(0);
+                if head > before {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    });
+    let current = status_json(&w.guest_dir, "reader");
+    let member = current["rooms"][0]["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["me"] == true)
+        .unwrap();
+    let reader_head = member["verified_through"]
+        .as_u64()
+        .or_else(|| member["holds_through"].as_u64())
+        .expect("APPARATUS: reader feed head");
+    loop {
+        let current = status_json(&w.host_dir, "poster");
+        let member = current["rooms"][0]["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == w.guest_fp)
+            .unwrap();
+        if member["connected"] == true
+            && member["verified_through"]
+                .as_u64()
+                .or_else(|| member["holds_through"].as_u64())
+                .unwrap_or(0)
+                >= reader_head
+            && member["advertised_through"].as_u64().unwrap_or(reader_head) >= reader_head
+        {
+            assert!(member["holds_through"].is_null(),
+                "PRODUCT: read-only member authored no messages, but status calls its receipt feed a shown message: {member}");
+            assert!(
+                reader_head >= 25,
+                "APPARATUS: fewer than twenty receipt entries: {current}"
+            );
+            let text = status_text(&w.host_dir, "poster");
+            eprintln!(
+                "[proof] twenty-five received read receipts, zero reader posts:\n{text}\n{current}"
+            );
+            assert!(!text.contains("not receiving") && text.contains("healthy: nothing needs attention"),
+                "PRODUCT: a connected member only read; every feed entry is held, but status called it unhealthy:\n{text}");
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // Governance entries have no shown message position either.
+    let change = |argv: &[&str]| loop {
+        let (ok, out, err) = vox_once(&w.host_dir, &args(argv));
+        if ok {
+            break;
+        }
+        // A refused, unchanged request is safe to stage again after the earlier change.
+        assert!(
+            (out.contains("a previous change to this room is still being applied")
+                || err.contains("a previous change to this room is still being applied"))
+                && (out.contains("this request made no change")
+                    || err.contains("this request made no change")),
+            "APPARATUS: staging room change {argv:?} failed: {out}{err}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    for n in 0..25 {
+        change(&["room", "rename", &w.room, &format!("policy-only-{n:02}")]);
+    }
+    change(&["room", "retention", &w.room, "1"]);
+    loop {
+        let current = status_json(&w.guest_dir, "reader");
+        let member = current["rooms"][0]["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == w.host_fp)
+            .unwrap();
+        let advertised = member["advertised_through"].as_u64().unwrap_or(0);
+        let verified = member["verified_through"].as_u64().unwrap_or(0);
+        let shown = member["holds_through"].as_u64().unwrap_or(0);
+        if member["connected"] == true && advertised >= shown + 20 && verified >= advertised {
+            let text = status_text(&w.guest_dir, "reader");
+            eprintln!("[proof] governance/expired feed entries all held:\n{text}\n{current}");
+            assert!(!text.contains("not receiving"),
+                "PRODUCT: twenty-five policy entries were all held, but status reports missing history:\n{text}");
+            if current["rooms"][0]["retention"] == 1 && member["holds_through"].is_null() {
+                let read = vox_once(&w.guest_dir, &args(&["room", "read", &w.room, "--json"])).1;
+                assert!(
+                    !read.contains("read-only-receipt-"),
+                    "APPARATUS: messages not expired: {read}"
+                );
+                assert!(text.contains("healthy: nothing needs attention"),
+                    "PRODUCT: a quiet connected member with expired messages reads unhealthy:\n{text}");
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+#[ignore = "real binaries and a sparse 180-post room; run in release"]
+fn a_newcomer_with_the_live_window_does_not_owe_the_archive_in_status() {
+    sparse_live_window_reads_healthy(false, false);
+}
+
+#[test]
+#[ignore = "real binaries and an offline reader across 180 posts; run in release"]
+fn an_offline_reader_caught_up_to_the_live_window_reads_healthy() {
+    sparse_live_window_reads_healthy(true, false);
+}
+
+#[cfg(feature = "test-knobs")]
+#[test]
+#[ignore = "real binaries and a newcomer filling a sparse live window; run in release"]
+fn a_newcomer_receiving_its_live_window_does_not_raise_a_missing_history_alarm() {
+    sparse_live_window_reads_healthy(false, true);
+}
+
+/// The archive is deliberately never requested. The verdict is the reader's real status,
+/// after it shows every post in the newest 128 feed positions and completes three more
+/// room exchanges. The catch-up case also observes a partial read before letting it finish.
+fn sparse_live_window_reads_healthy(offline: bool, catching_up: bool) {
+    use vox_core::node::ipc::{Frame, Request};
+    struct ReaderDaemon<'a>(&'a std::path::Path);
+    impl Drop for ReaderDaemon<'_> {
+        fn drop(&mut self) {
+            world::reap_daemon(self.0);
+        }
+    }
+    watchdog::arm();
+    let sink = UdpSocket::bind("127.0.0.1:0").expect("APPARATUS: service socket");
+    let w = World::new(sink.local_addr().expect("APPARATUS: address").port(), true);
+    let reader = if offline {
+        w.guest_dir.clone()
+    } else {
+        let dir = w.tmp.path().join("newcomer");
+        std::fs::create_dir_all(dir.join("cfg")).expect("APPARATUS: newcomer profile");
+        dir
+    };
+    let _reader_daemon = ReaderDaemon(&reader);
+    let (ok, out, err) = vox_once(&reader, &args(&["id"]));
+    assert!(ok, "APPARATUS: reader identity: {out}{err}");
+    let reader_id = out.trim().to_owned();
+    local_attach::Root::at(&reader, world::IDENTITY).attach("default");
+    for (dir, peer, name) in [
+        (&reader, &w.host_fp, "author"),
+        (&w.host_dir, &reader_id, "reader"),
+    ] {
+        let (ok, out, err) = vox_once(dir, &args(&["trust", "add", peer, "--name", name]));
+        assert!(ok, "APPARATUS: prepare reader trust: {out}{err}");
+    }
+    world::reap_daemon(&reader);
+    let cid = vox_core::node::link::b32_decode(&w.room, "proof room").expect("APPARATUS: room id");
+    let rt = tokio::runtime::Runtime::new().expect("APPARATUS: runtime");
+    rt.block_on(async {
+        let mut author = local_attach::node_client(&w.host_dir, "default")
+            .await
+            .expect("APPARATUS: author's socket");
+        for number in 0..180 {
+            let reply = author
+                .request(&Request::Post {
+                    channel_id: cid,
+                    text: format!("live-window-post-{number:03}"),
+                    card: false,
+                })
+                .await;
+            assert!(
+                matches!(reply, Ok(Frame::Ok)),
+                "APPARATUS: author could not post {number}: {reply:?}"
+            );
+        }
+    });
+    let source = status_json(&w.host_dir, "author");
+    let head = source["rooms"][0]["own_feed_through"]
+        .as_u64()
+        .expect("APPARATUS: author's feed head");
+    assert!(
+        head > 149,
+        "APPARATUS: feed does not cross the sparse window: {source}"
+    );
+    let hold = w.tmp.path().join("hold-live-window");
+    let entered = hold.with_extension("entered");
+    let notices = w.tmp.path().join("reader-notices");
+    let script = w.tmp.path().join("reader-notify");
+    if catching_up {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(&hold, format!("{} 96\n", w.host_fp)).expect("APPARATUS: catch-up barrier");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s|%s\\n' \"$1\" \"$2\" >> '{}'\n",
+                notices.display()
+            ),
+        )
+        .expect("APPARATUS: notification recorder");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("APPARATUS: executable notification recorder");
+    }
+    let mut restarted = None;
+    if offline || catching_up {
+        let pass = w.tmp.path().join("offline-reader-passphrases");
+        std::fs::write(&pass, format!("{}\n{}\n", world::IDENTITY, w.passphrase))
+            .expect("APPARATUS: reader passphrases");
+        let hold_path = world::utf8(&hold);
+        let notify_path = world::utf8(&script);
+        let env = if catching_up {
+            vec![
+                ("VOX_TEST_HOLD_LIVE_WINDOW_FILE", hold_path.as_str()),
+                ("VOX_NOTIFY_COMMAND", notify_path.as_str()),
+            ]
+        } else {
+            Vec::new()
+        };
+        let mut process = world::VoxProc::spawn_env(
+            "returned-reader",
+            &reader,
+            &args(&[
+                "daemon",
+                "--passphrase-file",
+                &world::utf8(&pass),
+                "--anchor",
+                &w.guest_anchor,
+                "--listen",
+                "127.0.0.1:0",
+            ]),
+            &env,
+        );
+        process.expect_line("reader daemon ready", |line| {
+            if offline {
+                line.contains("holding room") && line.contains(&w.room)
+            } else {
+                line.starts_with("vox daemon: control socket")
+            }
+        });
+        restarted = Some(process);
+    }
+    if !offline {
+        let (ok, _, out, err) = w.join(&reader);
+        assert!(ok, "APPARATUS: newcomer did not join: {out}{err}");
+    }
+    local_attach::Root::at(&reader, world::IDENTITY).attach("default");
+    if catching_up {
+        while !entered.exists() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let (ok, read, err) = vox_once(&reader, &args(&["room", "read", &w.room, "--json"]));
+        assert!(ok, "PRODUCT: catch-up read failed: {read}{err}");
+        let snapshot = status_json(&reader, "catching-up newcomer");
+        let member = snapshot["rooms"][0]["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|member| member["id"] == w.host_fp)
+            .expect("APPARATUS: catching-up author");
+        let shown = (52..180)
+            .filter(|number| read.contains(&format!("live-window-post-{number:03}")))
+            .count();
+        assert!(
+            member["connected"] == true
+                && member["advertised_through"].as_u64().unwrap_or(0) >= head
+                && read.contains("live-window-post-179")
+                && (1..=108).contains(&shown),
+            "APPARATUS: did not observe a connected, advertised live window with at least 20 posts still absent: shown={shown}; {snapshot}; {read}"
+        );
+        let text = status_text(&reader, "catching-up newcomer");
+        let notes = std::fs::read_to_string(&notices).unwrap_or_default();
+        eprintln!("[proof] newcomer is receiving: newest post visible, {shown}/128 newest posts shown, author head={head}; status:\n{text}\n{snapshot}\nnotices:\n{notes}");
+        assert!(
+            !text.contains("not receiving") && !notes.contains("not receiving"),
+            "PRODUCT: newcomer is receiving its advertised live window, but status or desktop raised not receiving:\n{text}\n{notes}"
+        );
+        // Keep the observed partial window for two desktop observation intervals (5s each).
+        // The verdict below counts real notices/status, not whether the held pull finishes.
+        std::thread::sleep(Duration::from_secs(11));
+        let text = status_text(&reader, "catch-up desktop observation");
+        let notes = std::fs::read_to_string(&notices).unwrap_or_default();
+        eprintln!("[proof] partial-window desktop observation:\n{text}\nnotices:\n{notes}");
+        assert!(
+            text.contains("healthy: nothing needs attention") && !notes.contains("not receiving"),
+            "PRODUCT: receiving newcomer raised a status or desktop alarm while its live window was incomplete:\n{text}\n{notes}"
+        );
+        std::fs::remove_file(&hold).expect("APPARATUS: release catch-up");
+    }
+    let completed = |snapshot: &Value| -> u64 {
+        snapshot["sync"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|lane| lane["peer"] == w.host_fp)
+            .filter_map(|lane| lane["completed"].as_u64())
+            .sum()
+    };
+    let mut after_shown = None;
+    let snapshot = loop {
+        let (ok, read, err) = vox_once(&reader, &args(&["room", "read", &w.room, "--json"]));
+        assert!(ok, "PRODUCT: live-window read failed: {read}{err}");
+        let snapshot = status_json(&reader, "sparse reader");
+        let advertised = snapshot["rooms"][0]["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|member| member["id"] == w.host_fp)
+            .and_then(|member| member["advertised_through"].as_u64())
+            .unwrap_or(head);
+        // The 180 consecutive posts end at `head`: post 52 starts its newest 128 entries.
+        // A newcomer can make the author append a key package, moving that floor forward.
+        let first_post = 52 + advertised.saturating_sub(head) as usize;
+        let shown =
+            (first_post..180).all(|number| read.contains(&format!("live-window-post-{number:03}")));
+        if catching_up {
+            let text = status_text(&reader, "progressing newcomer");
+            let notes = std::fs::read_to_string(&notices).unwrap_or_default();
+            assert!(
+                !text.contains("not receiving") && !notes.contains("not receiving"),
+                "PRODUCT: progressing newcomer raised a missing-history alarm:\n{text}\n{notes}"
+            );
+        }
+        if shown {
+            assert!(
+                !read.contains("live-window-post-000"),
+                "APPARATUS: the on-demand archive was fetched without being requested: {read}"
+            );
+            let cycles = *after_shown.get_or_insert_with(|| completed(&snapshot));
+            let member = snapshot["rooms"][0]["members"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|member| member["id"] == w.host_fp)
+                .expect("APPARATUS: author member");
+            if member["connected"] == true && completed(&snapshot) >= cycles + 3 {
+                break snapshot;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let member = snapshot["rooms"][0]["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|member| member["id"] == w.host_fp)
+        .unwrap();
+    assert!(
+        member["verified_through"].as_u64().unwrap_or(0) < head.saturating_sub(128),
+        "APPARATUS: the reader has no deliberate contiguous archive gap: {member}"
+    );
+    let text = status_text(&reader, "sparse reader");
+    eprintln!("[proof] offline={offline}, author's feed head={head}, newest live-window posts shown, archive absent:\n{text}\n{snapshot}");
+    assert!(!text.contains("not receiving") && text.contains("healthy: nothing needs attention"),
+        "PRODUCT: reader offline={offline} holds its live window, but status counts the unrequested archive as missing:\n{text}");
+    drop(restarted);
 }

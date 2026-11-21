@@ -273,7 +273,7 @@ pub enum Error {
     /// rung is always the slowest and so always wins that race — the operator is then
     /// told about a timeout while the rung that knew the real answer is discarded
     /// (ADR-018 §8b: whatever knows why must say why).
-    #[error("peer unreachable — {0}")]
+    #[error("connection not established — {0}")]
     LadderExhausted(String),
 
     /// A QUIC handshake failed for a reason other than authentication: the peer refused or

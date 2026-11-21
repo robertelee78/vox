@@ -2590,6 +2590,21 @@ impl Flow {
                     self.push(root)?;
                     return Ok(());
                 }
+                // Proof-only pause after visible progress, outside the room/store locks.
+                #[cfg(feature = "test-knobs")]
+                if let Some(path) = std::env::var_os("VOX_TEST_HOLD_LIVE_WINDOW_FILE") {
+                    let path = std::path::PathBuf::from(path);
+                    let remaining = window.next.saturating_add(1).saturating_sub(window.from);
+                    let selection =
+                        format!("{} {remaining}\n", crate::node::link::b32_encode(&author));
+                    if std::fs::read_to_string(&path).ok().as_deref() == Some(selection.as_str()) {
+                        std::fs::write(path.with_extension("entered"), &selection)
+                            .map_err(|_| Error::Profile("proof live-window marker failed"))?;
+                        while path.exists() {
+                            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        }
+                    }
+                }
                 let instance = self.instance;
                 let generation = self.generation;
                 let node = self.node;

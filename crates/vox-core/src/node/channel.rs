@@ -8757,13 +8757,68 @@ impl ChannelState {
         self.held.get(member).copied()
     }
 
-    /// Last authenticated, role-complete contiguous position this node holds in `member`'s feed:
-    /// the channel DAG's verified head. This is not the sparse-history receipt cursor returned by
-    /// `history_held_through`, which separately records durable effect settlement before a receipt
-    /// probe may be answered.
-    pub fn holds_through(&self, member: &Digest32) -> Option<u64> {
-        let through = self.dag.verified_head(member);
-        (through != 0).then_some(through)
+    /// Read the existing sparse live-window basis alongside the contiguous prefix.
+    /// Explicit archive pages do not select a live window, so old gaps stay out of demand.
+    pub(crate) fn feed_coverage(
+        &self,
+        store: &Store,
+        members: &[Digest32],
+    ) -> Result<Vec<crate::node::api::FeedCoverage>> {
+        let read = self.entries.read(store, &self.sek, &self.channel_id)?;
+        let me = self.me();
+        let mut coverage = Vec::with_capacity(members.len());
+        for member in members {
+            let verified = self.dag.verified_head(member);
+            let live = if *member == me {
+                None
+            } else {
+                read.sparse_author(member, crate::log::history::LogScope::Public)?
+                    .and_then(|state| state.live)
+            };
+            let (live_window_through, live_window_pending) = live.map_or((verified, 0), |window| {
+                (
+                    window.through,
+                    if window.complete() {
+                        0
+                    } else {
+                        window.next - window.from + 1
+                    },
+                )
+            });
+            coverage.push(crate::node::api::FeedCoverage {
+                member: *member,
+                verified_through: (verified != 0).then_some(verified),
+                live_window_through,
+                live_window_pending,
+            });
+        }
+        Ok(coverage)
+    }
+
+    /// Latest message this node can show for each member. Authenticated headers and
+    /// missing-body placeholders are not in the rendered-message index.
+    pub(crate) fn holds_through(
+        &self,
+        store: &Store,
+        members: &[Digest32],
+    ) -> Result<Vec<(Digest32, u64)>> {
+        let rendered = self
+            .entries
+            .render_view(store, &self.sek, &self.channel_id)?;
+        let mut out = Vec::new();
+        for member in members {
+            if let Some((key, _)) = rendered.step(
+                Some(&entry_store::Filter::Author(*member)),
+                true,
+                None,
+                true,
+            )? {
+                if let Some((_, seq)) = rendered.order().author_position(&key.1)? {
+                    out.push((*member, seq));
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Record that `member`'s node said, in a sync, it holds this identity's feed here up to `seq`

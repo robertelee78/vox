@@ -1254,7 +1254,7 @@ fn reach_of(
         if it_trusts {
             "it trusts you"
         } else {
-            "it has not trusted you"
+            "your node has not received its trust for you; if its operator has not accepted your fingerprint from that node's trust offers, ask its operator to accept your fingerprint; otherwise check vox status and ask them to check their status and daemon log"
         }
         .to_owned(),
     );

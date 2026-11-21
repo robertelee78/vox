@@ -552,10 +552,12 @@ fn detail_of(
         .iter()
         .filter_map(|member| ch.held_through(member).map(|seq| (*member, seq)))
         .collect();
-    let holds_through = members
-        .iter()
-        .filter_map(|member| ch.holds_through(member).map(|seq| (*member, seq)))
-        .collect();
+    let feed_coverage = ch.feed_coverage(store, &members)?;
+    let holds_through =
+        match prev.filter(|p| ch.display_is_current(&p.display_stamp, &display_stamp)) {
+            Some(p) => p.holds_through.clone(),
+            None => ch.holds_through(store, &members)?,
+        };
     let mut key_delivery_pending = Vec::new();
     for target in &member_consent {
         if ch.key_delivery_pending(store, target)? {
@@ -613,6 +615,7 @@ fn detail_of(
         held,
         held_through,
         holds_through,
+        feed_coverage,
         unread,
         // The authors this node can answer for now; a refreshing author is named in each
         // listing's revision rather than holding the whole room's detail back (ADR-037 R4).
@@ -5033,7 +5036,7 @@ fn went_offline(conn: &VoxConnection) -> Option<String> {
                 .and_then(WireError::from_code)?
             {
                 WireError::ShuttingDown => Some("it stopped".to_owned()),
-                WireError::NotAvailable => Some("its node is not there (not available)".to_owned()),
+                WireError::NotAvailable => Some("its daemon answered, but this node is not available there (it may not be attached); ask its operator to check vox node list and whether the address is wrong or stale".to_owned()),
                 _ => None,
             }
         }
@@ -12284,6 +12287,7 @@ impl Node {
                     .and_then(|net| net.manager().existing(&peer));
                 if let Some(conn) = &conn {
                     self.note_peer_endpoint(conn);
+                    crate::node::status::SyncBook::note_connected(&self.sync_book, peer);
                     self.rearm_routed_origin(peer, conn.serial());
                     self.pull_presentation(peer);
                 }
@@ -13697,11 +13701,16 @@ impl Node {
                 }
                 self.refresh_network_view().await;
                 if report.fail.is_none() {
-                    // When this room, and this peer, last completed a sync, for `vox status`
-                    // (PRD-001 R35).
-                    let now = self.now_ms().get();
-                    self.status.room_synced.insert(channel_id, now);
-                    self.status.member_synced.insert(peer, now);
+                    let brought = report.out.applied > 0;
+                    self.status
+                        .last_round_brought
+                        .insert((channel_id, peer), brought);
+                    if brought {
+                        // Empty exchanges do not move the received-entry clock.
+                        let now = self.now_ms().get();
+                        self.status.room_synced.insert(channel_id, now);
+                        self.status.member_synced.insert(peer, now);
+                    }
                 }
                 let o = report.out;
                 if current && (report.fail.is_none() || o.applied > 0) {
@@ -22943,24 +22952,48 @@ impl Node {
             let members = room
                 .members
                 .iter()
-                .map(|m| MemberStatus {
-                    id: *m,
-                    me: Some(*m) == me,
-                    trusted: trusted.contains(m),
-                    connected: connected.contains(m),
-                    last_seen: self.status.last_seen.get(m).copied(),
-                    last_sync: self.status.member_synced.get(m).copied(),
-                    key_waits: self.said_of(&room.channel_id, m),
-                    held_through: room
-                        .held_through
+                .map(|m| {
+                    let coverage = room
+                        .feed_coverage
                         .iter()
-                        .find_map(|(member, seq)| (*member == *m).then_some(*seq)),
-                    holds_through: room
-                        .holds_through
-                        .iter()
-                        .find_map(|(member, seq)| (*member == *m).then_some(*seq)),
-                    key_delivery_pending: room.key_delivery_pending.contains(m)
-                        || self.key_delivery_active(room.channel_id, *m),
+                        .find(|coverage| coverage.member == *m);
+                    MemberStatus {
+                        id: *m,
+                        me: Some(*m) == me,
+                        trusted: trusted.contains(m),
+                        connected: connected.contains(m),
+                        daemon_answered: crate::node::status::SyncBook::daemon_answered(
+                            &self.sync_book,
+                            room.channel_id,
+                            *m,
+                        ),
+                        advertised_through: self
+                            .history_hints
+                            .advertised_through(room.channel_id, *m),
+                        last_seen: self.status.last_seen.get(m).copied(),
+                        last_sync: self.status.member_synced.get(m).copied(),
+                        key_waits: self.said_of(&room.channel_id, m),
+                        held_through: room
+                            .held_through
+                            .iter()
+                            .find_map(|(member, seq)| (*member == *m).then_some(*seq)),
+                        holds_through: room
+                            .holds_through
+                            .iter()
+                            .find_map(|(member, seq)| (*member == *m).then_some(*seq)),
+                        verified_through: coverage.and_then(|coverage| coverage.verified_through),
+                        live_window_through: coverage
+                            .map_or(0, |coverage| coverage.live_window_through),
+                        live_window_pending: coverage
+                            .map_or(0, |coverage| coverage.live_window_pending),
+                        last_round_brought: self
+                            .status
+                            .last_round_brought
+                            .get(&(room.channel_id, *m))
+                            .copied(),
+                        key_delivery_pending: room.key_delivery_pending.contains(m)
+                            || self.key_delivery_active(room.channel_id, *m),
+                    }
                 })
                 .collect();
             // From the room as last published, never its lock: a sync session holds that lock
