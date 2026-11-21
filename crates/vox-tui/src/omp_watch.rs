@@ -93,6 +93,9 @@ async fn selected(
     fingerprint: &vox_core::hash::Digest32,
     stopping_pid: &AtomicU32,
 ) -> Result<bool, ProbeError> {
+    if stopping_pid.load(Ordering::Relaxed) != client.pid {
+        stopping_pid.store(0, Ordering::Relaxed);
+    }
     let entry = client.attached.iter().find(|entry| entry.name == *node);
     if entry.is_some_and(|entry| {
         entry.state == NodeState::Attached && entry.fingerprint.as_ref() == Some(fingerprint)

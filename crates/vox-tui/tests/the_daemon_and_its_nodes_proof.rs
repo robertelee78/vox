@@ -550,6 +550,7 @@ fn reconnect_with_held_stop(held_node: &str, phase: &str) {
         "APPARATUS: agent was not remembered for restart: {out}{err}"
     );
     let mut conversation = OmpConversation::start(&a);
+    let stop_started = Instant::now();
     let signalled = Command::new("/bin/kill")
         .args(["-TERM", &daemon.child.id().to_string()])
         .status()
@@ -610,6 +611,13 @@ fn reconnect_with_held_stop(held_node: &str, phase: &str) {
     );
     conversation.until(|frame| frame.get("notice").is_some());
     conversation.prompt("while-stopping");
+    std::fs::remove_file(&stop_hold).expect("APPARATUS: release node stop");
+    let held_for = stop_started.elapsed();
+    assert!(
+        held_for < Duration::from_secs(5),
+        "APPARATUS: hold {held_node} at {phase} released after {held_for:?}, beyond the \
+         daemon's five-second shutdown patience; its exit is not a product verdict"
+    );
     let during_stop = conversation.notices.join("\n");
     assert!(
         during_stop
@@ -623,7 +631,6 @@ fn reconnect_with_held_stop(held_node: &str, phase: &str) {
          {phase}), the stopping daemon must give exactly one reconnecting line and never blame \
          the node: {during_stop}"
     );
-    std::fs::remove_file(&stop_hold).expect("APPARATUS: release node stop");
     let stopped = daemon.child.wait().expect("APPARATUS: reap stopped daemon");
     assert!(
         stopped.success(),
