@@ -1235,18 +1235,26 @@ fn non_message_feed_entries_and_expired_messages_do_not_report_missing_history()
 #[test]
 #[ignore = "real binaries and a sparse 180-post room; run in release"]
 fn a_newcomer_with_the_live_window_does_not_owe_the_archive_in_status() {
-    sparse_live_window_reads_healthy(false);
+    sparse_live_window_reads_healthy(false, false);
 }
 
 #[test]
 #[ignore = "real binaries and an offline reader across 180 posts; run in release"]
 fn an_offline_reader_caught_up_to_the_live_window_reads_healthy() {
-    sparse_live_window_reads_healthy(true);
+    sparse_live_window_reads_healthy(true, false);
+}
+
+#[cfg(feature = "test-knobs")]
+#[test]
+#[ignore = "real binaries and a newcomer filling a sparse live window; run in release"]
+fn a_newcomer_receiving_its_live_window_does_not_raise_a_missing_history_alarm() {
+    sparse_live_window_reads_healthy(false, true);
 }
 
 /// The archive is deliberately never requested. The verdict is the reader's real status,
-/// after it shows the newest 120 posts and completes three more room exchanges.
-fn sparse_live_window_reads_healthy(offline: bool) {
+/// after it shows every post in the newest 128 feed positions and completes three more
+/// room exchanges. The catch-up case also observes a partial read before letting it finish.
+fn sparse_live_window_reads_healthy(offline: bool, catching_up: bool) {
     use vox_core::node::ipc::{Frame, Request};
     struct ReaderDaemon<'a>(&'a std::path::Path);
     impl Drop for ReaderDaemon<'_> {
@@ -1305,12 +1313,40 @@ fn sparse_live_window_reads_healthy(offline: bool) {
         head > 149,
         "APPARATUS: feed does not cross the sparse window: {source}"
     );
+    let hold = w.tmp.path().join("hold-live-window");
+    let entered = hold.with_extension("entered");
+    let notices = w.tmp.path().join("reader-notices");
+    let script = w.tmp.path().join("reader-notify");
+    if catching_up {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(&hold, format!("{} 96\n", w.host_fp)).expect("APPARATUS: catch-up barrier");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s|%s\\n' \"$1\" \"$2\" >> '{}'\n",
+                notices.display()
+            ),
+        )
+        .expect("APPARATUS: notification recorder");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("APPARATUS: executable notification recorder");
+    }
     let mut restarted = None;
-    if offline {
+    if offline || catching_up {
         let pass = w.tmp.path().join("offline-reader-passphrases");
         std::fs::write(&pass, format!("{}\n{}\n", world::IDENTITY, w.passphrase))
             .expect("APPARATUS: reader passphrases");
-        let mut process = world::VoxProc::spawn(
+        let hold_path = world::utf8(&hold);
+        let notify_path = world::utf8(&script);
+        let env = if catching_up {
+            vec![
+                ("VOX_TEST_HOLD_LIVE_WINDOW_FILE", hold_path.as_str()),
+                ("VOX_NOTIFY_COMMAND", notify_path.as_str()),
+            ]
+        } else {
+            Vec::new()
+        };
+        let mut process = world::VoxProc::spawn_env(
             "returned-reader",
             &reader,
             &args(&[
@@ -1322,16 +1358,64 @@ fn sparse_live_window_reads_healthy(offline: bool) {
                 "--listen",
                 "127.0.0.1:0",
             ]),
+            &env,
         );
-        process.expect_line("returned reader's room", |line| {
-            line.contains("holding room") && line.contains(&w.room)
+        process.expect_line("reader daemon ready", |line| {
+            if offline {
+                line.contains("holding room") && line.contains(&w.room)
+            } else {
+                line.starts_with("vox daemon: control socket")
+            }
         });
         restarted = Some(process);
-    } else {
+    }
+    if !offline {
         let (ok, _, out, err) = w.join(&reader);
         assert!(ok, "APPARATUS: newcomer did not join: {out}{err}");
     }
     local_attach::Root::at(&reader, world::IDENTITY).attach("default");
+    if catching_up {
+        while !entered.exists() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let (ok, read, err) = vox_once(&reader, &args(&["room", "read", &w.room, "--json"]));
+        assert!(ok, "PRODUCT: catch-up read failed: {read}{err}");
+        let snapshot = status_json(&reader, "catching-up newcomer");
+        let member = snapshot["rooms"][0]["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|member| member["id"] == w.host_fp)
+            .expect("APPARATUS: catching-up author");
+        let shown = (52..180)
+            .filter(|number| read.contains(&format!("live-window-post-{number:03}")))
+            .count();
+        assert!(
+            member["connected"] == true
+                && member["advertised_through"].as_u64().unwrap_or(0) >= head
+                && read.contains("live-window-post-179")
+                && (1..=108).contains(&shown),
+            "APPARATUS: did not observe a connected, advertised live window with at least 20 posts still absent: shown={shown}; {snapshot}; {read}"
+        );
+        let text = status_text(&reader, "catching-up newcomer");
+        let notes = std::fs::read_to_string(&notices).unwrap_or_default();
+        eprintln!("[proof] newcomer is receiving: newest post visible, {shown}/128 newest posts shown, author head={head}; status:\n{text}\n{snapshot}\nnotices:\n{notes}");
+        assert!(
+            !text.contains("not receiving") && !notes.contains("not receiving"),
+            "PRODUCT: newcomer is receiving its advertised live window, but status or desktop raised not receiving:\n{text}\n{notes}"
+        );
+        // Keep the observed partial window for two desktop observation intervals (5s each).
+        // The verdict below counts real notices/status, not whether the held pull finishes.
+        std::thread::sleep(Duration::from_secs(11));
+        let text = status_text(&reader, "catch-up desktop observation");
+        let notes = std::fs::read_to_string(&notices).unwrap_or_default();
+        eprintln!("[proof] partial-window desktop observation:\n{text}\nnotices:\n{notes}");
+        assert!(
+            text.contains("healthy: nothing needs attention") && !notes.contains("not receiving"),
+            "PRODUCT: receiving newcomer raised a status or desktop alarm while its live window was incomplete:\n{text}\n{notes}"
+        );
+        std::fs::remove_file(&hold).expect("APPARATUS: release catch-up");
+    }
     let completed = |snapshot: &Value| -> u64 {
         snapshot["sync"]
             .as_array()
@@ -1345,8 +1429,27 @@ fn sparse_live_window_reads_healthy(offline: bool) {
     let snapshot = loop {
         let (ok, read, err) = vox_once(&reader, &args(&["room", "read", &w.room, "--json"]));
         assert!(ok, "PRODUCT: live-window read failed: {read}{err}");
-        let shown = (60..180).all(|number| read.contains(&format!("live-window-post-{number:03}")));
         let snapshot = status_json(&reader, "sparse reader");
+        let advertised = snapshot["rooms"][0]["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|member| member["id"] == w.host_fp)
+            .and_then(|member| member["advertised_through"].as_u64())
+            .unwrap_or(head);
+        // The 180 consecutive posts end at `head`: post 52 starts its newest 128 entries.
+        // A newcomer can make the author append a key package, moving that floor forward.
+        let first_post = 52 + advertised.saturating_sub(head) as usize;
+        let shown =
+            (first_post..180).all(|number| read.contains(&format!("live-window-post-{number:03}")));
+        if catching_up {
+            let text = status_text(&reader, "progressing newcomer");
+            let notes = std::fs::read_to_string(&notices).unwrap_or_default();
+            assert!(
+                !text.contains("not receiving") && !notes.contains("not receiving"),
+                "PRODUCT: progressing newcomer raised a missing-history alarm:\n{text}\n{notes}"
+            );
+        }
         if shown {
             assert!(
                 !read.contains("live-window-post-000"),
@@ -1359,12 +1462,7 @@ fn sparse_live_window_reads_healthy(offline: bool) {
                 .iter()
                 .find(|member| member["id"] == w.host_fp)
                 .expect("APPARATUS: author member");
-            // Older builds have no live-window basis field; their quiescent exchange/read
-            // observations above still stage the same user-visible missing-archive case.
-            let live_complete = member.get("live_held_through").is_none_or(|basis| {
-                basis.as_u64().unwrap_or(0) >= member["advertised_through"].as_u64().unwrap_or(head)
-            });
-            if member["connected"] == true && completed(&snapshot) >= cycles + 3 && live_complete {
+            if member["connected"] == true && completed(&snapshot) >= cycles + 3 {
                 break snapshot;
             }
         }
@@ -1381,7 +1479,7 @@ fn sparse_live_window_reads_healthy(offline: bool) {
         "APPARATUS: the reader has no deliberate contiguous archive gap: {member}"
     );
     let text = status_text(&reader, "sparse reader");
-    eprintln!("[proof] offline={offline}, author's feed head={head}, newest 120 posts shown, archive absent:\n{text}\n{snapshot}");
+    eprintln!("[proof] offline={offline}, author's feed head={head}, newest live-window posts shown, archive absent:\n{text}\n{snapshot}");
     assert!(!text.contains("not receiving") && text.contains("healthy: nothing needs attention"),
         "PRODUCT: reader offline={offline} holds its live window, but status counts the unrequested archive as missing:\n{text}");
     drop(restarted);

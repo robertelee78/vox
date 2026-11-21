@@ -13703,12 +13703,17 @@ impl Node {
                     shared.lock().await.note_held(&store, peer, seq);
                 }
                 self.refresh_network_view().await;
-                if report.fail.is_none() && report.out.applied > 0 {
-                    // Only a round that brought entries is a completed sync.
-                    // Empty transport exchanges still clear their transport failure separately.
-                    let now = self.now_ms().get();
-                    self.status.room_synced.insert(channel_id, now);
-                    self.status.member_synced.insert(peer, now);
+                if report.fail.is_none() {
+                    let brought = report.out.applied > 0;
+                    self.status
+                        .last_round_brought
+                        .insert((channel_id, peer), brought);
+                    if brought {
+                        // Empty exchanges do not move the received-entry clock.
+                        let now = self.now_ms().get();
+                        self.status.room_synced.insert(channel_id, now);
+                        self.status.member_synced.insert(peer, now);
+                    }
                 }
                 let o = report.out;
                 if current && (report.fail.is_none() || o.applied > 0) {
@@ -22969,8 +22974,15 @@ impl Node {
                             .iter()
                             .find_map(|(member, seq)| (*member == *m).then_some(*seq)),
                         verified_through: coverage.and_then(|coverage| coverage.verified_through),
-                        live_held_through: coverage
-                            .map_or(0, |coverage| coverage.live_held_through),
+                        live_window_through: coverage
+                            .map_or(0, |coverage| coverage.live_window_through),
+                        live_window_pending: coverage
+                            .map_or(0, |coverage| coverage.live_window_pending),
+                        last_round_brought: self
+                            .status
+                            .last_round_brought
+                            .get(&(room.channel_id, *m))
+                            .copied(),
                         key_delivery_pending: room.key_delivery_pending.contains(m)
                             || self.key_delivery_active(room.channel_id, *m),
                     }

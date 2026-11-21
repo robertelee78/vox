@@ -4,18 +4,19 @@
 //!
 //! Every fact here is **read** from state the node already keeps — the published view,
 //! the connection manager, the sync schedules, the app layer and each connection's
-//! datagram router — plus three small ledgers this module keeps for the purpose
-//! ([`StatusBook`]): when each room last received new sync entries, when each peer was last seen
-//! connected, and which tunnels are being served right now. Nothing here decides
-//! anything, and nothing the node does waits on it.
+//! datagram router — plus small observations kept by [`StatusBook`]: received-entry times,
+//! the latest completed pull's receipt fact, and when peers were last seen connected.
+//! Nothing here schedules work, and nothing the node does waits on it.
 //!
 //! ## What "unhealthy" means
 //!
 //! A line in [`StatusReport::unhealthy`] is something an operator should look at:
 //!
 //! - a room with other members and no new sync entries in [`STALE_SYNC_MS`] while nobody is
-//!   connected or a connected member advertises at least twenty feed entries not held here;
-//! - a connected member advertising at least twenty entries beyond its current live-window receipt basis;
+//!   connected or a connected member is missing at least twenty live entries, regardless
+//!   of whether any exchange completed;
+//! - a connected member missing at least twenty live entries whose latest completed
+//!   pull brought no entries (a progressing catch-up is not "not receiving");
 //! - a **trusted** member of an open room this node was connected to and no longer is;
 //! - an **anchor** this node keeps that it has not reached for [`ANCHOR_UNREACHABLE_MS`], while
 //!   this node needs one. An anchor only bridges hosts that cannot otherwise find each other
@@ -88,6 +89,8 @@ pub struct StatusBook {
     pub room_synced: BTreeMap<Digest32, u64>,
     /// Peer → when a sync with it last brought new entries, in any room.
     pub member_synced: BTreeMap<Digest32, u64>,
+    /// (Room, peer) → whether its latest completed Public pull brought entries here.
+    pub last_round_brought: BTreeMap<(Digest32, Digest32), bool>,
     /// Peer → when this node last saw a live connection to it.
     pub last_seen: BTreeMap<Digest32, u64>,
     /// When the node started: a room that has not synced *yet*
@@ -124,23 +127,36 @@ pub struct MemberStatus {
     pub holds_through: Option<u64>,
     /// Authenticated header position only; it may have no showable message body.
     pub verified_through: Option<u64>,
-    /// Receipt basis in this member's current live window, excluding on-demand archive gaps.
-    pub live_held_through: u64,
+    /// Upper bound of the selected live window, or the verified prefix before selection.
+    pub live_window_through: u64,
+    /// Positions still to walk in that live window; older archive gaps are excluded.
+    pub live_window_pending: u64,
+    /// Whether the latest completed Public pull from this member in this room brought entries.
+    pub last_round_brought: Option<bool>,
     /// Whether this member is still owed, or is actively being sent, any generation of this
     /// node's sender key in this room.
     pub key_delivery_pending: bool,
 }
 
 impl MemberStatus {
-    /// Count advertised feed positions not held in the selected live window, not older
-    /// on-demand history. Held bodies that cannot be decrypted are instead named by
-    /// `key_waits` (and `key_delivery_pending`) per member; this adds no message counter.
+    /// At least 20 live entries are missing and the latest completed Public pull brought none.
+    /// This excludes older on-demand history and bodies marked owed after a peer reported
+    /// them unavailable; held but undecryptable bodies are named by `key_waits` and
+    /// `key_delivery_pending`, not a new message counter.
     fn not_receiving(&self) -> bool {
-        !self.me
-            && self.connected
-            && self
-                .advertised_through
-                .is_some_and(|advertised| advertised.saturating_sub(self.live_held_through) >= 20)
+        self.behind() && self.last_round_brought == Some(false)
+    }
+
+    fn missing_live_entries(&self) -> u64 {
+        self.advertised_through.map_or(0, |advertised| {
+            advertised
+                .saturating_sub(self.live_window_through)
+                .saturating_add(self.live_window_pending)
+        })
+    }
+
+    fn behind(&self) -> bool {
+        !self.me && self.connected && self.missing_live_entries() >= 20
     }
 }
 
@@ -414,22 +430,22 @@ impl StatusReport {
                 out.push(Unhealthy {
                     key: format!("room-not-receiving:{}", b32_encode(&room.id)),
                     message: format!(
-                        "room {} ({}): not receiving from connected member {}; live-window receipt basis through entry {}, member advertised through entry {} (at least {} live entries not held); check that member's vox status and daemon log",
+                        "room {} ({}): not receiving from connected member {}; member advertised through entry {} (at least {} live entries not held), latest completed pull brought no entries; check that member's vox status and daemon log",
                         short(&room.id), room.name, short(&member.id),
-                        member.live_held_through,
                         member.advertised_through.unwrap_or(0),
-                        member.advertised_through.unwrap_or(0).saturating_sub(member.live_held_through),
+                        member.missing_live_entries(),
                     ),
                 });
             }
-            // Measured from the last new sync entries, or from this node's start. A quiet
-            // connected room is not stale merely because its clean rounds bring nothing.
+            // After ten minutes without new entries, disconnected rooms and connected
+            // members with a 20-entry deficit alarm even if no round has ever completed.
+            // A quiet connected room with no deficit is not stale.
             let since = room.last_sync.unwrap_or(self.started);
             let stale = self.now.saturating_sub(since) > STALE_SYNC_MS;
             let retained_by_pool = retained_pool_rooms.contains(&room.id);
             let retained_cause = retained_by_pool.then_some(RETAINED_POOL_HEALTH);
             if stale
-                && (room.not_receiving()
+                && (room.members.iter().any(MemberStatus::behind)
                     || !room
                         .members
                         .iter()
@@ -560,7 +576,7 @@ impl StatusReport {
         let rooms = self.rooms.iter().map(|r| {
             let members = r.members.iter().map(|m| {
                 format!(
-                    "{{\"id\":{},\"me\":{},\"trusted\":{},\"connected\":{},\"daemon_answered\":{},\"advertised_through\":{},\"last_seen_ms\":{},\"last_sync_ms\":{},\"key_waits\":{},\"held_through\":{},\"holds_through\":{},\"verified_through\":{},\"live_held_through\":{},\"key_delivery_pending\":{}}}",
+                    "{{\"id\":{},\"me\":{},\"trusted\":{},\"connected\":{},\"daemon_answered\":{},\"advertised_through\":{},\"last_seen_ms\":{},\"last_sync_ms\":{},\"key_waits\":{},\"held_through\":{},\"holds_through\":{},\"verified_through\":{},\"key_delivery_pending\":{}}}",
                     q(&b32_encode(&m.id)),
                     m.me,
                     m.trusted,
@@ -573,7 +589,6 @@ impl StatusReport {
                     opt(m.held_through),
                     opt(m.holds_through),
                     opt(m.verified_through),
-                    m.live_held_through,
                     m.key_delivery_pending
                 )
             });

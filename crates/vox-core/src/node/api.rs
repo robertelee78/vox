@@ -630,8 +630,10 @@ pub struct FeedCoverage {
     pub member: Digest32,
     /// The contiguous-from-entry-one prefix; older on-demand gaps stop it.
     pub verified_through: Option<u64>,
-    /// Receipt basis in the current live window, excluding older on-demand gaps.
-    pub live_held_through: u64,
+    /// Upper bound of the live window, or the verified prefix before selection.
+    pub live_window_through: u64,
+    /// Positions still to walk in the live window, excluding older on-demand gaps.
+    pub live_window_pending: u64,
 }
 
 /// An open channel's full state for display.

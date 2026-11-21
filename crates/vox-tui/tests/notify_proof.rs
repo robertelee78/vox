@@ -1216,7 +1216,7 @@ fn a_room_that_cannot_sync_notifies_once_and_once_when_it_syncs_again() {
             }
             if !observed_receipt {
                 panic!(
-                    "APPARATUS: recovery receipt was not staged; status {snapshot}; \
+                    "PRODUCT: recovery post was accepted but never received; status {snapshot}; \
                  returning member said {}; notifications {:?}",
                     bob_again.transcript(),
                     notes(&file)

@@ -8775,17 +8775,21 @@ impl ChannelState {
                 read.sparse_author(member, crate::log::history::LogScope::Public)?
                     .and_then(|state| state.live)
             };
-            let live_held_through = live.map_or(verified, |window| {
-                if window.complete() {
-                    window.through
-                } else {
-                    verified.max(window.from.saturating_sub(1))
-                }
+            let (live_window_through, live_window_pending) = live.map_or((verified, 0), |window| {
+                (
+                    window.through,
+                    if window.complete() {
+                        0
+                    } else {
+                        window.next - window.from + 1
+                    },
+                )
             });
             coverage.push(crate::node::api::FeedCoverage {
                 member: *member,
                 verified_through: (verified != 0).then_some(verified),
-                live_held_through,
+                live_window_through,
+                live_window_pending,
             });
         }
         Ok(coverage)

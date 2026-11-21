@@ -4421,6 +4421,14 @@ impl Node {
                         }
                     },
                 );
+                // Announcements and routed dependency turns can complete empty while
+                // this retained pull is still receiving. Only its final Public completion
+                // can say the pull brought nothing.
+                if work.service == OutboundService::Public {
+                    self.status
+                        .last_round_brought
+                        .insert((work.room, work.peer), brought);
+                }
                 self.note_lane_sync(work.room, work.peer, brought);
             } else {
                 let waiting = flow.waiting;
