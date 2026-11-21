@@ -189,6 +189,67 @@ run** for the paging change, and blocks neither CI nor release. CI compiles it. 
 CARGO_BUILD_JOBS=2 cargo test --release -p vox-tui --features optional-proofs --test a_large_room_reads_whole_proof a_hundred_thousand_entry_session_opens_in_one_second_with_bounded_memory -- --ignored --exact --nocapture
 ```
 
+## Busy-room newcomer and paging (ADR-052 RG-1, #1315)
+
+`a_newcomer_reads_the_whole_history_proof` includes two variants of the same busy-room
+journey. They are optional while RG-2 through RG-4 remove the reproduced admission, trust
+and key-delivery failures; an optional red is not a release waiver. They use ten scratch
+member daemons, one anchor process, and three Sessions hosted by the existing OpenCode
+stand-in under Node.js (no model or real harness session). The paused variant checks the
+serving daemon's PID against its held daemon lock, observes its stopped process state,
+and pauses it for 1.5 seconds in every 3 seconds. The delayed variant isolates the slow
+member on IPv6 loopback, with its IPv4 anchor reached through the existing userspace
+forward; its only outgoing path delays each datagram 350 ms. It requires both the
+forward's probe and a product-reported RTT of at least 300 ms before the newcomer joins.
+
+The 300-row seed belongs to the creator. All six earlier late joiners join that backlog;
+then `fast`, `third`, and `old1` post and step Sessions. The deliberately slow member is
+separate from these three authors, so pausing its service cannot reduce their offered
+posting rate by blocking one of their synchronous CLI commands.
+The shared room apparatus strips inherited `PI_` and `OMP` session variables as well as
+the other harness markers; each stand-in supplies only its own Session environment.
+
+Run one named variant, in release, without `test-knobs`:
+
+```sh
+cargo test --release -p vox-tui --features optional-proofs \
+  --test a_newcomer_reads_the_whole_history_proof -- --ignored --exact \
+  a_busy_room_newcomer_reads_every_member_with_a_paused_member --nocapture
+
+cargo test --release -p vox-tui --features optional-proofs \
+  --test a_newcomer_reads_the_whole_history_proof -- --ignored --exact \
+  a_busy_room_newcomer_reads_every_member_with_a_delayed_path --nocapture
+```
+
+Set `VOX_PROOF_SHIPPED_BINARY` to the absolute path of an untouched release helper to
+drive that asset instead of Cargo's helper. Every process still gets scratch
+`VOX_DATA_DIR` and `VOX_CONFIG_DIR`. `VOX_PROOF_RG1_EVIDENCE` selects the existing
+directory under which scratch profiles are created; `VOX_PROOF_KEEP_DIRS=1` retains them.
+Capture stdout and stderr: receipts include every command, status and doctor snapshot,
+first-event marks counted in acknowledged posts, and every paging cursor. The grant mark
+is the author's doctor reporting mutual room trust; the key mark is that author's status
+reporting no sender-key delivery owed to the recipient, after the grant. A displayed
+exact post independently establishes that the recipient can decrypt it. No aggregate
+key-generation count is treated as evidence for one particular member's key.
+
+The reader follows the **stderr** `older messages not shown` footer until it finds the
+requested row or reaches the room's start. Its own real-binary self-check plants the
+first row in a 5,000-row room:
+
+```sh
+cargo test --release -p vox-tui --features optional-proofs \
+  --test a_newcomer_reads_the_whole_history_proof -- --ignored --exact \
+  the_busy_room_reader_finds_the_first_of_five_thousand_rows --nocapture
+```
+
+The named reader mutant is the same command with `VOX_PROOF_RG1_NO_PAGING=1`: it removes
+older-page reads in the proof, not the product, and must turn the first-row assertion red.
+The busy-room journey's staging failures say APPARATUS. A refused newcomer join quotes
+the product as RED PRODUCT. After admission, an author's 100 acknowledged post-join
+posts with none displayed is RED PRODUCT, naming its first missing timeline step.
+GREEN additionally requires every member's post both ways and every acknowledged post
+on every member after the authors stop. No elapsed watchdog decides a product verdict.
+
 ## The proofs
 
 ### Live model (needs `opencode` on PATH, logged in: `~/.local/share/opencode/auth.json`)
