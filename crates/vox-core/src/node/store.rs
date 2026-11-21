@@ -569,12 +569,18 @@ fn open_error(path: &Path, e: redb::DatabaseError) -> Error {
     if matches!(e, redb::DatabaseError::DatabaseAlreadyOpen) {
         Error::ProfileBusy
     } else {
-        let action = if matches!(&e, redb::DatabaseError::Storage(redb::StorageError::Io(error))
-            if error.kind() == std::io::ErrorKind::StorageFull)
-        {
-            "the disk is full; free disk space and try again"
-        } else {
-            "restore it from a backup, or move it aside to start a new node"
+        let action = match &e {
+            redb::DatabaseError::Storage(redb::StorageError::Io(error))
+                if error.kind() == std::io::ErrorKind::StorageFull =>
+            {
+                "the disk is full; free disk space and try again"
+            }
+            redb::DatabaseError::Storage(redb::StorageError::Io(error))
+                if error.kind() != std::io::ErrorKind::InvalidData =>
+            {
+                "check the file's permissions and the disk, then try again"
+            }
+            _ => "restore it from a backup, or move it aside to start a new node",
         };
         Error::Storage {
             op: "open",

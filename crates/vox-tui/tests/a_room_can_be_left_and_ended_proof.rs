@@ -2394,11 +2394,13 @@ fn an_ended_room_can_be_left_at_once() {
     erased(alice, &room.id, &room.cid, false);
 }
 
-/// RG-14: normal crash repair remains enabled; genuinely invalid files are preserved.
+/// RG-14: invalid stores are preserved; inaccessible good stores keep their identity and rooms.
 /// Positive crash recovery is covered by a_daemon_reopens_its_rooms_proof.rs.
 #[test]
-#[ignore = "real vox opens invalid, truncated and empty scratch stores; run in release"]
+#[ignore = "real vox opens invalid stores and a permission-denied good store; run in release"]
 fn an_unreadable_store_is_left_exactly_as_it_is() {
+    use std::os::unix::fs::PermissionsExt as _;
+
     watchdog::arm();
     let tmp = support::diagnostic_tempdir();
     let mut problems = Vec::new();
@@ -2455,5 +2457,87 @@ fn an_unreadable_store_is_left_exactly_as_it_is() {
             ));
         }
     }
+    let rt = runtime();
+    let mut room = room_of(&rt, tmp.path(), &["alice", "bob"]);
+    let alice = &mut room.workers[0];
+    let marker = "the good store still holds this room after permissions are restored";
+    setup(alice, &["room", "post", &room.id, marker]);
+    let before = setup(alice, &["room", "read", &room.id]);
+    assert!(
+        before.stdout.contains(marker),
+        "APPARATUS: the good store did not hold the staged room post: {before:?}"
+    );
+    alice.stop_daemon_cleanly();
+    let path = alice.paths.store_file();
+    let bytes = std::fs::read(&path).expect("APPARATUS: snapshot the good store");
+    struct RestoreMode {
+        path: std::path::PathBuf,
+        mode: u32,
+    }
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            if let Err(error) =
+                std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(self.mode))
+            {
+                eprintln!(
+                    "APPARATUS: could not restore permissions on {}: {error}",
+                    self.path.display()
+                );
+            }
+        }
+    }
+    let original_mode = std::fs::metadata(&path)
+        .expect("APPARATUS: good store metadata")
+        .permissions()
+        .mode();
+    let restore = RestoreMode {
+        path: path.clone(),
+        mode: original_mode,
+    };
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))
+        .expect("APPARATUS: deny access to the good scratch store");
+    assert!(
+        std::fs::File::open(&path)
+            .err()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied),
+        "APPARATUS: chmod did not deny read access to the good store"
+    );
+    let refused = alice.vox(None, &["id"]);
+    drop(restore);
+    assert_eq!(
+        std::fs::metadata(&path)
+            .expect("APPARATUS: restored store metadata")
+            .permissions()
+            .mode(),
+        original_mode,
+        "APPARATUS: the scratch store's original permissions were not restored"
+    );
+    if refused.ok
+        || !refused
+            .stderr
+            .contains("check the file's permissions and the disk, then try again")
+        || refused.stderr.contains("restore it from a backup")
+        || refused.stderr.contains("start a new node")
+        || !refused
+            .stderr
+            .contains(path.to_str().expect("APPARATUS: store path"))
+        || !refused.stderr.contains("Permission denied")
+    {
+        problems.push(format!(
+            "permission-denied good store did not get safe retry advice: {refused:?}"
+        ));
+    }
+    if std::fs::read(&path).expect("APPARATUS: read the permission-refused store") != bytes {
+        problems.push("vox changed the permission-denied good store's bytes".to_owned());
+    }
+    setup(alice, &["id"]);
+    alice.restart_daemon(&tmp.path().join("permissions-restored.daemon.err"));
+    support::until(
+        alice,
+        None,
+        "the held room post after restoring permissions",
+        &["room", "read", &room.id],
+        |out| out.ok && out.stdout.contains(marker),
+    );
     assert!(problems.is_empty(), "PRODUCT: {}", problems.join("\n"));
 }
