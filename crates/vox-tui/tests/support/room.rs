@@ -87,17 +87,20 @@ pub const HARNESS_SESSION_VARS: [&str; 11] = [
 
 /// Take out of `cmd`'s environment everything that names a harness session or a terminal this
 /// proof did not make: [`HARNESS_SESSION_VARS`], and every inherited variable whose name starts
-/// with `TMUX`, `CLAUDE`, `CODEX` or `OPENCODE` (walked from this process's environment, not a
-/// fixed list). A proof run from inside a real session inherits that session's tmux pane and
-/// sockets; a `vox` given them could bind a test session to the real pane (2026-10-07: a proof's
-/// line was typed into the operator's Claude Code session).
+/// with `TMUX`, `CLAUDE`, `CODEX`, `OPENCODE`, `PI_` or `OMP` (walked from this process's
+/// environment, not a fixed list). A proof run from inside a real session inherits that
+/// session's tmux pane and sockets; a `vox` given them could bind a test session to the real
+/// pane (2026-10-07: a proof's line was typed into the operator's Claude Code session).
+/// An OMP-hosted proof also handed the real session's ID to a scratch `vox`, which refused
+/// its posts as an unregistered sender (2026-11-21). A staged Session sets its own variables
+/// after this strip.
 pub fn strip_harness_env(cmd: &mut Command) {
     for v in HARNESS_SESSION_VARS {
         cmd.env_remove(v);
     }
     for (k, _) in std::env::vars_os() {
         let name = k.to_string_lossy();
-        if ["TMUX", "CLAUDE", "CODEX", "OPENCODE"]
+        if ["TMUX", "CLAUDE", "CODEX", "OPENCODE", "PI_", "OMP"]
             .iter()
             .any(|p| name.starts_with(p))
         {
@@ -212,6 +215,8 @@ pub struct Worker {
     /// The `vox` this worker runs: the one under test, or a published release
     /// ([`room_as`]).
     pub exe: String,
+    /// A sibling Worker shares the data and config of one serving daemon.
+    node: Option<String>,
 }
 
 impl Drop for Worker {
@@ -308,6 +313,12 @@ impl Worker {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         strip_harness_env(&mut cmd);
+        if let Some(node) = &self.node {
+            cmd.env("VOX_NODE", node)
+                .env("HOME", self.data.with_extension("home"))
+                .env("VOX_PROXY", "127.0.0.1:0")
+                .env("VOX_LISTEN", "127.0.0.1:0");
+        }
         if let Some(s) = session {
             cmd.env("VOX_SESSION", s);
         }
@@ -661,6 +672,7 @@ pub fn worker_as(tmp: &std::path::Path, name: &str, exe: &str) -> Worker {
         daemon: None,
         anchor: String::new(),
         exe: exe.to_owned(),
+        node: None,
     };
     // `vox id` creates the identity on first use and prints its fingerprint.
     let o = w.vox(None, &["id", "--identity-passphrase-file", utf8(&w.pass)]);
@@ -677,6 +689,39 @@ pub fn worker_as(tmp: &std::path::Path, name: &str, exe: &str) -> Worker {
                 w.data.display()
             )
         });
+    w
+}
+
+/// Make a named, headless sibling on one scratch computer, without creating a default node.
+pub fn named_worker_as(tmp: &std::path::Path, computer: &str, name: &str, exe: &str) -> Worker {
+    let data = tmp.join(computer).join("data");
+    let cfg = tmp.join(computer).join("cfg");
+    mkdir(&cfg);
+    mkdir(&data.with_extension("home"));
+    let pass = tmp.join(computer).join("empty.pass");
+    std::fs::write(&pass, "\n").expect("APPARATUS: empty headless passphrase");
+    let paths = Paths::resolve(name, Some(&data), Some(&cfg)).expect("APPARATUS: sibling paths");
+    let mut w = Worker {
+        name: name.to_owned(),
+        data,
+        cfg,
+        paths,
+        fp: [0; 32],
+        pass,
+        daemon: None,
+        anchor: String::new(),
+        exe: exe.to_owned(),
+        node: Some(name.to_owned()),
+    };
+    w.vox(
+        None,
+        &["node", "create", name, "--passphrase-file", utf8(&w.pass)],
+    )
+    .expect_ok("create headless sibling");
+    let out = w.vox(None, &["id"]);
+    out.expect_ok("headless sibling fingerprint");
+    w.fp = vox_core::node::link::b32_decode(out.stdout.trim(), "fingerprint")
+        .expect("PRODUCT: sibling fingerprint");
     w
 }
 

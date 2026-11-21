@@ -76,6 +76,16 @@ pub async fn ensure_daemon(
         }
         Err(_) => {}
     }
+    if restarting(account)? {
+        if wait_for_restart(account, START_WITHIN).await? {
+            return Ok(Daemon::Running);
+        }
+        return Err(AppError::Usage(format!(
+            "the restarting daemon did not answer within {} s; see {} and retry",
+            START_WITHIN.as_secs(),
+            account.log_file().display()
+        )));
+    }
     start_daemon(
         &std::env::current_exe()?,
         account,
@@ -123,6 +133,13 @@ pub async fn ensure_daemon_for_hook(
         Ok(Err(_)) => {}
     }
     let remaining = HOOK_WITHIN.saturating_sub(began.elapsed());
+    if restarting(account)? {
+        return Ok(if wait_for_restart(account, remaining).await? {
+            HookDaemon::Ready
+        } else {
+            HookDaemon::Starting
+        });
+    }
     start_daemon_bounded(
         &std::env::current_exe()?,
         account,
@@ -130,7 +147,7 @@ pub async fn ensure_daemon_for_hook(
         anchors,
         env!("CARGO_PKG_VERSION"),
         remaining,
-        true,
+        Start::Hook,
     )
     .await
     .map(|answer| answer.map_or(HookDaemon::Starting, |_| HookDaemon::Ready))
@@ -157,13 +174,94 @@ pub async fn start_daemon(
         anchors,
         expected_version,
         START_WITHIN,
-        false,
+        Start::Client,
     )
     .await
     .map(Option::unwrap)
 }
 
-/// Start the daemon and wait up to `within` for its socket. When `pending_ok`, an otherwise healthy
+/// The replacement owns the handoff before it signals the old daemon.
+pub(crate) async fn replace_daemon(
+    exe: &Path,
+    account: &Account,
+    listen: std::net::SocketAddr,
+    anchors: &[String],
+    expected_version: &str,
+    old_pid: u32,
+    within: Duration,
+) -> Result<(), AppError> {
+    start_daemon_bounded(
+        exe,
+        account,
+        listen,
+        anchors,
+        expected_version,
+        within,
+        Start::Replacement(old_pid),
+    )
+    .await?;
+    Ok(())
+}
+
+/// This flock is held by the replacement until it serves, not by its mortal caller.
+pub(crate) fn restart_lock(account: &Account) -> Result<std::fs::File, AppError> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    vox_core::node::layout::refuse_old_layout(account)
+        .map_err(|e| AppError::Usage(e.to_string()))?;
+    vox_core::node::paths::create_private_dir(&account.daemon_dir())
+        .map_err(|e| AppError::Usage(e.to_string()))?;
+    Ok(std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(account.restart_lock_file())?)
+}
+
+pub(crate) fn restarting(account: &Account) -> Result<bool, AppError> {
+    let file = restart_lock(account)?;
+    match file.try_lock_shared() {
+        Ok(()) => Ok(false),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(true),
+        Err(std::fs::TryLockError::Error(e)) => Err(AppError::Usage(format!(
+            "cannot check the daemon restart: {e}"
+        ))),
+    }
+}
+
+async fn wait_for_restart(account: &Account, within: Duration) -> Result<bool, AppError> {
+    eprintln!("vox: waiting for the daemon restart");
+    let began = Instant::now();
+    loop {
+        match tokio::time::timeout(
+            within.saturating_sub(began.elapsed()),
+            DaemonClient::open(&account.socket()),
+        )
+        .await
+        {
+            Ok(Ok(_)) => return Ok(true),
+            Ok(Err(vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Unreachable {
+                ..
+            }))) => {}
+            Ok(Err(error)) => return Err(AppError::Core(error)),
+            Err(_) => return Ok(false),
+        }
+        if began.elapsed() >= within {
+            return Ok(false);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Start {
+    Client,
+    Hook,
+    Replacement(u32),
+}
+
+/// Start the daemon and wait up to `within` for its socket. For a hook, an otherwise healthy
 /// child still starting at that bound is `Ok(None)`. The child moves to its reaper immediately, so
 /// returning early can neither abandon an unreaped child nor stop the daemon.
 async fn start_daemon_bounded(
@@ -173,8 +271,13 @@ async fn start_daemon_bounded(
     anchors: &[String],
     expected_version: &str,
     within: Duration,
-    pending_ok: bool,
+    start: Start,
 ) -> Result<Option<Daemon>, AppError> {
+    let pending_ok = matches!(start, Start::Hook);
+    let replacing = match start {
+        Start::Replacement(pid) => Some(pid),
+        Start::Client | Start::Hook => None,
+    };
     let socket = account.socket();
     let log_path = account.log_file();
     vox_core::node::paths::create_private_dir(&account.daemon_dir())
@@ -192,6 +295,9 @@ async fn start_daemon_bounded(
         .arg(&account.data_root)
         .arg("--config-dir")
         .arg(&account.config_dir);
+    if let Some(pid) = replacing {
+        cmd.arg("--replace-pid").arg(pid.to_string());
+    }
     for a in anchors {
         cmd.arg("--anchor").arg(a);
     }
@@ -227,6 +333,7 @@ async fn start_daemon_bounded(
             && matches!(
                 tokio::time::timeout(remaining, DaemonClient::observe(&socket)).await,
                 Ok(Ok(daemon)) if daemon.version == expected_version
+                    && Some(daemon.pid) != replacing
                     && (expected_version != env!("CARGO_PKG_VERSION")
                         || daemon.protocol == vox_core::node::ipc::PROTOCOL_VERSION)
             )
@@ -244,6 +351,7 @@ async fn start_daemon_bounded(
                         && matches!(
                             tokio::time::timeout(remaining, DaemonClient::observe(&socket)).await,
                             Ok(Ok(daemon)) if daemon.version == expected_version
+                                && Some(daemon.pid) != replacing
                                 && (expected_version != env!("CARGO_PKG_VERSION")
                                     || daemon.protocol == vox_core::node::ipc::PROTOCOL_VERSION)
                         )
