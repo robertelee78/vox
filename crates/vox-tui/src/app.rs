@@ -734,6 +734,12 @@ pub fn run_node(
         crate::daemon_proxy::configured()?,
     )?
     else {
+        if crate::daemon_client::restarting(&account)? {
+            return Err(AppError::Usage(format!(
+                "a daemon restart is in progress for {}; wait for it, then retry vox node",
+                account.data_root.display()
+            )));
+        }
         return Err(AppError::Refused {
             code: 1,
             message: format!(

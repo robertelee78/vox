@@ -79,6 +79,8 @@ pub const NODE_CONFIG_DIR: &str = "config";
 pub const DAEMON_SOCKET_FILE: &str = "vox.sock";
 /// The daemon's lock, in `.daemon/` (ADR-026 D-1): held for the daemon's whole life.
 pub const DAEMON_LOCK_FILE: &str = "lock";
+/// Restart admission, held by the replacement until it serves.
+pub const DAEMON_RESTART_LOCK_FILE: &str = "restart-lock";
 /// The daemon's log, in `.daemon/` (ADR-026 S-2).
 pub const DAEMON_LOG_FILE: &str = "log";
 /// The nodes the daemon attaches when it starts, in `.daemon/` (ADR-026 L-4).
@@ -185,6 +187,12 @@ impl Account {
     #[must_use]
     pub fn lock_file(&self) -> PathBuf {
         self.daemon_dir().join(DAEMON_LOCK_FILE)
+    }
+
+    /// `<data root>/.daemon/restart-lock`: admission while a daemon is replaced.
+    #[must_use]
+    pub fn restart_lock_file(&self) -> PathBuf {
+        self.daemon_dir().join(DAEMON_RESTART_LOCK_FILE)
     }
 
     /// `<data root>/.daemon/port`: the one UDP port of this data root (ADR-026 D-3).
