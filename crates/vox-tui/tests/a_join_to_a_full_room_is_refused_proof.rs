@@ -35,23 +35,18 @@
 //! **Every red says which it is:** `PRODUCT:` quotes what `vox` said or did; `CANNOT MEASURE:`
 //! names staging that was not achieved (a `vox` without the knob, a room not full when asked).
 //!
-//! **A room never exceeds its cap: every member online agrees** (V030-30, #366; the decider,
-//! 2026-10-02). The member answering a join holds a place, asks every member it holds a connection
-//! to, and admits only once each has promised it (`node::seatstream`).
+//! **Answering members keep the cap; an unanswered member learns from the board** (ADR-052 RG-2).
 //!
-//! - **Strict** ([`three_members_answering_at_once_never_take_the_room_past_its_cap`]): the cap at
-//!   [`STRICT_CAP`], three members at the cap less one, three newcomers each joining by a different
-//!   member's invite, each held by `VOX_TEST_ADMISSION_GATE` until all three members are about to
-//!   decide, then let go together. Asserted: at most one is told it joined; each other is told the
-//!   room is full or that its last place went to another newcomer; every member's roster is the same
-//!   and within the cap; and a refused newcomer that tries again gets the place if nobody took it
-//!   (an aborted promise frees it), or is told the room is full. Fewer than three members at the
-//!   gate: CANNOT MEASURE.
-//! - **Bound** ([`a_member_online_that_does_not_answer_fails_the_join_and_is_named`]): bob, whom
-//!   the host holds a connection to and hears from (checked in the host's `vox status`), never
-//!   answers a seat question (`VOX_TEST_SEAT_SILENT`); a newcomer the host answers is refused, told
-//!   "member bob did not answer within 5s", bob named by the newcomer's own name for him, and is
-//!   not on the host's roster. A member whose process is gone is offline and blocks nothing (RP-02).
+//! - **Strict** ([`three_members_answering_at_once_never_take_the_room_past_its_cap`]): three
+//!   members at the cap less one, three newcomers held after reserving and released together.
+//!   At most one is admitted and all rosters agree within the cap.
+//! - **Last seat**: two responsive members reserve before either asks. The lower fingerprint
+//!   wins, whether it started first or second; exactly one newcomer is admitted, the loser is
+//!   told the last place was taken, and all three members' rosters agree at the cap.
+//! - **Unanswered** ([`a_member_online_that_does_not_answer_learns_the_admitted_newcomer`]): bob
+//!   is connected but never answers a seat question (`VOX_TEST_SEAT_SILENT`). A join through the
+//!   host succeeds. With the newcomer then offline, bob learns its witnessed admission from the
+//!   host's board, without a restart.
 //! - **Split** ([`a_split_room_keeps_both_newcomers_and_says_it_passed_its_cap`]): no anchor between
 //!   them; the host admits a newcomer while bob is down, and bob one while the host is down, each
 //!   checked from its own `vox status` to hold no connection to the other, and each at the cap less
@@ -61,14 +56,10 @@
 //!   so (the decider's ruling (a)): bob learns of x, offline, from the admission notice the host
 //!   keeps (#520).
 //!
-//! **Mutations that must turn it red:** the admission's result dropped again (in
-//! `NetEvent::JoinAdmit`, the ack answered `Ok(())` whatever `admit_author` returned): the
-//! newcomer is told it joined. A failed admission answered with `JoinReject::Refused` again (in
-//! `run_responder`): the second arm's joiner is told its passphrase is likely wrong. The seat round
-//! skipped, so the answering member admits on its own view (`seat_round` not run): the strict arm's
-//! three newcomers are all told they joined, `PRODUCT:`. The admitting member keeping no admission
-//! notice (#520, in `NetEvent::JoinAdmit` and `admit_from_board`): the split arm's bob never lists
-//! x, offline, `PRODUCT:`.
+//! **RG-2 mutants:** `unanswered-veto` refuses the silent-member join again;
+//! `ignore-promises-and-trust-held-seat` bypasses outstanding promises and the commit cap checks,
+//! so both ordered newcomers are admitted; `definite-refusal-is-uncertain` wraps a typed full-room
+//! refusal in the false uncertainty sentence again. Each fails its own user-facing assertion.
 #![cfg(unix)]
 
 #[path = "support/sync_pair.rs"]
@@ -94,6 +85,8 @@ const KNOB: &str = "VOX_TEST_MAX_AUTHORS";
 const CONVERGE_WITHIN: std::time::Duration = std::time::Duration::from_secs(90);
 /// The knob that holds a member's admissions until a file appears.
 const GATE: &str = "VOX_TEST_ADMISSION_GATE";
+/// Holds completed seat rounds before either releases its local reservation.
+const RESULT_GATE: &str = "VOX_TEST_SEAT_RESULT_GATE";
 /// The knob that fails every joiner's admission on the member answering it.
 const FAILS: &str = "VOX_TEST_ADMISSION_FAILS";
 /// What a member logs when it admits a member past the room's cap ([`CAP`] = 3).
@@ -168,6 +161,10 @@ fn a_join_to_a_full_room_is_refused() {
             "PRODUCT: the refused join did not say {want:?}:\n{said}"
         );
     }
+    assert!(
+        !said.contains("remote admission may have occurred"),
+        "PRODUCT: a definite full-room refusal was also called an uncertain admission:\n{said}"
+    );
     let (ok, list, err) = late.vox(&["room", "list"], None);
     assert!(ok, "PRODUCT: the newcomer's `vox room list` failed: {err}");
     let prefix = &room[..room.len().min(12)];
@@ -291,9 +288,7 @@ fn all_know(members: &[&Member], room: &str, want: usize) {
     }
 }
 
-/// **A room never exceeds its cap: every member online agrees** (V030-30, #366). Three members at
-/// the cap less one, each answering its own newcomer, all held at the admission gate and let go
-/// together.
+/// Three responders reserving together cannot give away more than the last place.
 #[test]
 #[ignore = "real binaries and production Argon2id: the release gate runs it"]
 fn three_members_answering_at_once_never_take_the_room_past_its_cap() {
@@ -443,15 +438,187 @@ fn three_members_answering_at_once_never_take_the_room_past_its_cap() {
     }
 }
 
-/// **A member online that does not answer fails the join, named** (V030-30, #366): bob, whom the
-/// host holds a connection to and hears from, reads the seat question and never answers
-/// (`VOX_TEST_SEAT_SILENT`, test-knobs only, as a member whose node is stuck); a newcomer the host
-/// answers is refused within the bound, and told which member by its own name for it. (A member
-/// whose process is gone, crashed or stopped, is offline and blocks nothing: RP-02,
-/// `a_join_is_not_hostage_to_one_member_proof`.)
+/// Await both test-only reservations, not an arbitrary scheduling delay.
+fn held_at_gate(root: &std::path::Path, prefix: &str, want: usize) {
+    let start = std::time::Instant::now();
+    loop {
+        let held = std::fs::read_dir(root)
+            .expect("APPARATUS: list admission markers")
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with(prefix))
+            .count();
+        if held == want {
+            return;
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(50),
+            "APPARATUS: {held}, not {want}, responders reached their reserved-seat gate"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// Each answered older-history demand gives the running members another chance to learn the
+/// witnessed admission. A red counts answered demands, not elapsed silence.
+fn members_list(members: &[&Member], room: &str, want: &[String]) {
+    let mut listed = Vec::new();
+    for _ in 0..100 {
+        listed = members
+            .iter()
+            .map(|m| {
+                let mut members = roster(m, room);
+                members.sort();
+                members
+            })
+            .collect::<Vec<_>>();
+        if listed.iter().all(|r| r == want) {
+            return;
+        }
+        for member in members {
+            let (ok, out, err) = member.vox(&["room", "read", room, "--history", "older"], None);
+            assert!(
+                ok,
+                "PRODUCT: {}'s history demand failed: {out}{err}",
+                member.name
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    panic!(
+        "PRODUCT: after 100 answered history demands the rosters do not list the admitted members \
+         {want:?}: {listed:?}"
+    );
+}
+
+fn two_responsive_members_race(lower_starts_first: bool) {
+    watchdog::arm();
+    test_knobs::require(&[KNOB, GATE, RESULT_GATE]);
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
+    let root = tmp.path();
+    let (_anchor, spec) = anchor(root);
+    let gate = root.join("gate");
+    let result_gate = root.join("answered");
+    std::fs::write(&result_gate, b"").expect("APPARATUS: open result gate");
+    let result_s = result_gate.to_str().expect("APPARATUS: UTF-8 result gate");
+    std::fs::write(&gate, b"").expect("APPARATUS: open admission gate");
+    let gate_s = gate.to_str().expect("APPARATUS: UTF-8 gate path");
+    let cap = CAP.to_string();
+    let knob = [
+        (KNOB, cap.as_str()),
+        (GATE, gate_s),
+        (RESULT_GATE, result_s),
+    ];
+    let host = Member::new(root, "host");
+    let _host_d = host.daemon_with_anchor(Some(&spec), &knob);
+    let room = host.create("last-seat");
+    let host_link = host.invite(&room);
+    let bob = Member::new(root, "bob");
+    let _bob_d = bob.daemon_with_anchor(Some(&spec), &knob);
+    bob.join(&host_link, "last-seat");
+    all_know(&[&host, &bob], &room, CAP - 1);
+    let start = std::time::Instant::now();
+    while !connected(&host, &bob) || !connected(&bob, &host) {
+        assert!(
+            start.elapsed() < CONVERGE_WITHIN,
+            "APPARATUS: the responders are not connected"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let decode = |m: &Member| {
+        vox_core::node::link::b32_decode(&m.fp, "responder fingerprint")
+            .expect("APPARATUS: product fingerprint")
+    };
+    let (lower, higher) = if decode(&host) < decode(&bob) {
+        (&host, &bob)
+    } else {
+        (&bob, &host)
+    };
+    let (first, second) = if lower_starts_first {
+        (lower, higher)
+    } else {
+        (higher, lower)
+    };
+    let first_link = first.invite(&room);
+    let second_link = second.invite(&room);
+    let x = Member::new(root, "x");
+    let y = Member::new(root, "y");
+    let _x_d = x.daemon_with_anchor(Some(&spec), &knob);
+    let _y_d = y.daemon_with_anchor(Some(&spec), &knob);
+    std::fs::remove_file(&gate).expect("APPARATUS: close admission gate");
+    std::fs::remove_file(&result_gate).expect("APPARATUS: close result gate");
+    let (a, b) = std::thread::scope(|s| {
+        let first_join = s.spawn(|| join(&x, &first_link));
+        held_at_gate(root, "gate.reached.", 1);
+        let second_join = s.spawn(|| join(&y, &second_link));
+        held_at_gate(root, "gate.reached.", 2);
+        println!(
+            "[proof] both responders reserved the last seat; lower={}, higher={}, first={}",
+            lower.fp, higher.fp, first.fp
+        );
+        std::fs::write(&gate, b"").expect("APPARATUS: release both reserved-seat gates");
+        held_at_gate(root, "answered.reached.", 2);
+        std::fs::write(&result_gate, b"").expect("APPARATUS: release both completed seat rounds");
+        (
+            first_join
+                .join()
+                .unwrap_or_else(|e| std::panic::resume_unwind(e)),
+            second_join
+                .join()
+                .unwrap_or_else(|e| std::panic::resume_unwind(e)),
+        )
+    });
+    println!("[proof] first newcomer's join ok={}:\n{}", a.0, a.1);
+    println!("[proof] second newcomer's join ok={}:\n{}", b.0, b.1);
+    assert!(
+        usize::from(a.0) + usize::from(b.0) == 1,
+        "PRODUCT: two responsive members reserved the last seat, but {} newcomers were admitted: \
+         first:\n{}\nsecond:\n{}",
+        usize::from(a.0) + usize::from(b.0),
+        a.1,
+        b.1
+    );
+    assert!(
+        a.0 == lower_starts_first,
+        "PRODUCT: the lower responder did not win its simultaneous last-seat admission"
+    );
+    let (winner, loser, refused) = if a.0 { (&x, &y, &b.1) } else { (&y, &x, &a.1) };
+    assert!(
+        refused.contains("took the room's last place") || refused.contains("the room is full"),
+        "PRODUCT: the loser was not told in plain words why it was not admitted:\n{refused}"
+    );
+    assert!(
+        refused.contains("so you were not admitted")
+            && !refused.contains("remote admission may have occurred"),
+        "PRODUCT: the definite last-seat refusal was called an uncertain admission:\n{refused}"
+    );
+    let (ok, out, err) = loser.vox(&["room", "list"], None);
+    assert!(
+        ok && !out.contains("last-seat"),
+        "PRODUCT: refused newcomer lists the room: {out}{err}"
+    );
+    let mut want = vec![host.fp.clone(), bob.fp.clone(), winner.fp.clone()];
+    want.sort();
+    members_list(&[&host, &bob, winner], &room, &want);
+    println!("[proof] GREEN: exactly one of two joins admitted; all 3 members list the same 3 (cap 3); lower_starts_first={lower_starts_first}");
+}
+
+#[test]
+#[ignore = "real binaries and production Argon2id"]
+fn the_lower_responder_starting_first_wins_the_last_seat() {
+    two_responsive_members_race(true);
+}
+
+#[test]
+#[ignore = "real binaries and production Argon2id"]
+fn the_lower_responder_starting_second_wins_the_last_seat() {
+    two_responsive_members_race(false);
+}
+
+/// A connected member's unanswered question cannot veto admission (ADR-052 RG-2).
+/// After the joiner goes offline, bob learns its witnessed admission from the host.
 #[test]
 #[ignore = "real binaries and production Argon2id: the release gate runs it"]
-fn a_member_online_that_does_not_answer_fails_the_join_and_is_named() {
+fn a_member_online_that_does_not_answer_learns_the_admitted_newcomer() {
     watchdog::arm();
     test_knobs::require(&[KNOB, SILENT]);
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
@@ -467,9 +634,7 @@ fn a_member_online_that_does_not_answer_fails_the_join_and_is_named() {
     let _bob_d = bob.daemon_with_anchor(Some(&spec), &[(KNOB, cap.as_str()), (SILENT, "1")]);
     bob.join(&link, "bound");
     let late = Member::new(root, "late");
-    // The newcomer's own name for bob, which it is to be told.
-    late.trust(&bob);
-    let _late_d = late.daemon_with_anchor(Some(&spec), &knob);
+    let late_d = late.daemon_with_anchor(Some(&spec), &knob);
 
     // ---- staged, from the host's own view: it holds a connection to bob --------------------------
     let t0 = std::time::Instant::now();
@@ -486,19 +651,19 @@ fn a_member_online_that_does_not_answer_fails_the_join_and_is_named() {
     let took = t1.elapsed();
     println!("[proof] the join with bob not answering exited ok={ok} after {took:?}:\n{said}");
     assert!(
-        !ok,
-        "PRODUCT: a member online (bob) never answered, so it never agreed, and the newcomer was \
-         told it joined:\n{said}"
+        ok,
+        "PRODUCT: bob is connected but did not answer the seat question, and the host refused \
+         the newcomer instead of admitting it:\n{said}"
     );
     assert!(
-        said.contains("member bob did not answer within 5s"),
-        "PRODUCT: the refused join did not name bob, by the newcomer's own name for him, as the \
-         member that did not answer within 5s:\n{said}"
+        roster(&host, &room).contains(&late.fp),
+        "PRODUCT: the admitted newcomer is absent from the host's roster"
     );
-    assert!(
-        !roster(&host, &room).contains(&late.fp),
-        "PRODUCT: the refused newcomer is on the host's roster"
-    );
+    drop(late_d);
+    let mut want = vec![host.fp.clone(), bob.fp.clone(), late.fp.clone()];
+    want.sort();
+    members_list(&[&host, &bob], &room, &want);
+    println!("[proof] GREEN: join admitted with connected bob unanswered; bob learned the offline newcomer's admission without restarting");
 }
 
 /// **The only way past the cap is a split, and it is said** (V030-30, #366; the decider's ruling
