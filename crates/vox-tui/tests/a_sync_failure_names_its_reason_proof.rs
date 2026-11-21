@@ -38,12 +38,18 @@
 //! an unreachable peer breaks (4).
 
 #![cfg(unix)]
+// Both harness supports carry their own copies of the data-root helpers.
+#![cfg_attr(target_os = "macos", allow(clippy::duplicate_mod))]
 
 #[path = "support/world.rs"]
 mod world;
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
+
+#[cfg(target_os = "macos")]
+#[path = "support/room.rs"]
+mod disk_room;
 
 use std::io::Write as _;
 use std::path::Path;
@@ -584,4 +590,218 @@ fn signal_and_confirm(pid: &str, sig: &str) {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// RG-14: two real ENOSPC/recovery cycles must not strand another room or a leave.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "real daemons and a disposable 64 MiB macOS disk image; run in release"]
+fn a_full_disk_recovers_without_stranding_sync_or_leave() {
+    watchdog::arm();
+    let tmp = tempfile::Builder::new()
+        .prefix("rg14-")
+        .tempdir_in(std::env::temp_dir())
+        .expect("APPARATUS: scratch directory");
+    let mount = tmp.path().join("disk");
+    std::fs::create_dir(&mount).expect("APPARATUS: mount directory");
+    let image = tmp.path().join("scratch.sparseimage");
+    let created = Command::new("/usr/bin/hdiutil")
+        .args([
+            "create", "-size", "64m", "-fs", "HFS+", "-volname", "VoxRG14", "-type", "SPARSE",
+        ])
+        .arg(&image)
+        .output()
+        .expect("APPARATUS: hdiutil create");
+    assert!(
+        created.status.success(),
+        "APPARATUS: image creation: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    struct Disk(std::path::PathBuf);
+    impl Drop for Disk {
+        fn drop(&mut self) {
+            let detached = Command::new("/usr/bin/hdiutil")
+                .arg("detach")
+                .arg(&self.0)
+                .output();
+            if !detached.is_ok_and(|out| out.status.success()) {
+                let out = Command::new("/usr/bin/hdiutil")
+                    .args(["detach", "-force"])
+                    .arg(&self.0)
+                    .output();
+                assert!(
+                    out.is_ok_and(|out| out.status.success()),
+                    "APPARATUS: disk image could not be detached"
+                );
+            }
+        }
+    }
+    let attached = Command::new("/usr/bin/hdiutil")
+        .args(["attach", "-nobrowse", "-mountpoint"])
+        .arg(&mount)
+        .arg(&image)
+        .output()
+        .expect("APPARATUS: hdiutil attach");
+    assert!(
+        attached.status.success(),
+        "APPARATUS: image attach: {}",
+        String::from_utf8_lossy(&attached.stderr)
+    );
+    let _disk = Disk(mount.clone());
+    std::fs::create_dir(mount.join("bob")).expect("APPARATUS: disk profile directory");
+    std::os::unix::fs::symlink(mount.join("bob"), tmp.path().join("bob"))
+        .expect("APPARATUS: place only Bob's profile on the small disk");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("APPARATUS: runtime");
+    let room = rt.block_on(disk_room::room(tmp.path(), &["alice", "bob"]));
+    let alice = &room.workers[0];
+    let bob = &room.workers[1];
+    let mut rooms = vec![room.id.clone()];
+    for name in ["second", "third"] {
+        alice
+            .vox_in(
+                None,
+                &["room", "create", "--name", name, "--passphrase-file", "-"],
+                Some(disk_room::ROOM_PASS),
+            )
+            .expect_ok("create another room");
+        let list = alice.vox(None, &["room", "list"]);
+        list.expect_ok("list rooms");
+        let id = list
+            .stdout
+            .lines()
+            .find(|line| line.contains(name))
+            .and_then(|line| line.split_whitespace().next())
+            .expect("APPARATUS: new room id")
+            .to_owned();
+        let link = alice.vox(None, &["room", "link", &id]);
+        link.expect_ok("room link");
+        bob.vox_in(
+            None,
+            &["room", "join", "--passphrase-file", "-", link.stdout.trim()],
+            Some(disk_room::ROOM_PASS),
+        )
+        .expect_ok("join another room");
+        rooms.push(id);
+    }
+    let mut problems = Vec::new();
+    for cycle in 0..2 {
+        let filler = mount.join("filler");
+        let mut file = std::fs::File::create(&filler).expect("APPARATUS: create filler");
+        let block = vec![0x5a; 1024 * 1024];
+        for size in [block.len(), 4096] {
+            loop {
+                match file.write_all(&block[..size]) {
+                    Ok(()) => {}
+                    Err(error) => {
+                        assert_eq!(
+                            error.raw_os_error(),
+                            Some(28),
+                            "APPARATUS: filling disk: {error}"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+        drop(file);
+        let mut failure = String::new();
+        for n in 0..128 {
+            let out = bob.vox(
+                None,
+                &[
+                    "room",
+                    "post",
+                    &rooms[0],
+                    &format!("disk write {cycle}/{n} {}", "x".repeat(60_000)),
+                ],
+            );
+            if !out.ok {
+                failure = format!("{}{}", out.stdout, out.stderr);
+                break;
+            }
+        }
+        assert!(
+            !failure.is_empty(),
+            "APPARATUS: no write failed on the full disk"
+        );
+        // Generate failed inbound/outbound cleanup in all three rooms, as in C-12.
+        for n in 0..24 {
+            for id in &rooms {
+                alice
+                    .vox(
+                        None,
+                        &["room", "post", id, &format!("while full {cycle}/{n}")],
+                    )
+                    .expect_ok("post from the member with free disk");
+            }
+        }
+        let status = bob.vox(None, &["status"]);
+        let named_full = format!("{}{}{}", failure, status.stdout, status.stderr);
+        std::fs::remove_file(&filler).expect("APPARATUS: free the disk");
+        // A prior cycle's recovery notice can coexist with a fresh write failure.
+        // All rooms must be writable before fresh reception or leave is judged.
+        disk_room::until(bob, None, "store writable again", &["status"], |out| {
+            out.ok && out.stdout.contains("recovered") && !out.stdout.contains("cannot save")
+        });
+        if !named_full.contains("disk is full") {
+            problems.push(format!(
+                "cycle {cycle}: full disk was not named: {named_full}"
+            ));
+        }
+        let marker = format!("after freeing cycle {cycle}");
+        alice
+            .vox(None, &["room", "post", &rooms[1], &marker])
+            .expect_ok("post after freeing");
+        let mut received = false;
+        for n in 0..100 {
+            let out = bob.vox(None, &["room", "read", &rooms[1]]);
+            if out.ok
+                && (out.stdout.contains(&marker)
+                    || out.stdout.contains(&format!("recovery progress {cycle}/")))
+            {
+                received = true;
+                break;
+            }
+            alice
+                .vox(
+                    None,
+                    &[
+                        "room",
+                        "post",
+                        &rooms[1],
+                        &format!("recovery progress {cycle}/{n}"),
+                    ],
+                )
+                .expect_ok("post counted recovery progress");
+        }
+        if !received {
+            problems.push(format!(
+                "cycle {cycle}: Bob reported recovery but received none of 100 further posts"
+            ));
+        }
+        if std::fs::read_dir(&bob.paths.profile_dir)
+            .expect("APPARATUS: profile directory")
+            .any(|entry| {
+                entry
+                    .expect("APPARATUS: profile entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".failed")
+            })
+        {
+            problems.push(format!("cycle {cycle}: recovery kept a .failed store copy"));
+        }
+    }
+    let left = bob.vox(None, &["room", "leave", &rooms[0]]);
+    if !left.ok {
+        problems.push(format!("leave after two disk failures: {left:?}"));
+    }
+    let list = bob.vox(None, &["room", "list"]);
+    if !list.ok || list.stdout.contains(&rooms[0][..12]) {
+        problems.push(format!("left room still listed: {list:?}"));
+    }
+    assert!(problems.is_empty(), "PRODUCT: {}", problems.join("\n"));
 }
