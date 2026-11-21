@@ -668,6 +668,9 @@ impl Node {
                                 }
                             };
                         }
+                        channel
+                            .require_trust_withdrawn(&worker_store, signer.as_ref())
+                            .map_err(|error| fault_of(&error))?;
                         let now_millis = millis_clock();
                         match channel.prepare_pending_text(
                             &worker_store,

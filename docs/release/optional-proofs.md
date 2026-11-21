@@ -17,6 +17,28 @@ They are kept "at the ready for troubleshooting". When a user reports one of the
   - A product failure fails as the product's verdict.
 - **CI compiles them on every run and never runs them.** The CI step is "Compile optional proofs (not run; troubleshooting kit)": `cargo test --release -p vox-tui --features optional-proofs --no-run`, with `-D warnings`. A change that breaks one is caught at once, not on the day it is needed.
 
+### Room-by-room computer trust (ADR-052 RG-3)
+
+The trust journey in `nodes_of_one_daemon_proof.rs` uses three scratch computers and
+the real `vox` commands. A departed room must not strand the node's saved keyring;
+adding a paired node must not refuse another room's posts or link. A causally held
+withdrawal refuses only that room's posts and sender keys, then resumes without a
+restart or another policy event.
+
+Run each named proof separately, with exclusive build-slot ownership for the hold:
+
+```sh
+cargo test --release -p vox-tui --features test-knobs,optional-proofs \
+  --test nodes_of_one_daemon_proof \
+  a_trust_change_skips_a_left_room_and_additions_refuse_no_posts -- --ignored --exact --nocapture
+cargo test --release -p vox-tui --features test-knobs,optional-proofs \
+  --test nodes_of_one_daemon_proof \
+  an_unfinished_room_refuses_only_its_own_posts_then_finishes -- --ignored --exact --nocapture
+cargo test --release -p vox-tui --features test-knobs,optional-proofs \
+  --test nodes_of_one_daemon_proof \
+  an_unfinished_room_releases_no_key_until_its_withdrawal_finishes -- --ignored --exact --nocapture
+```
+
 ### macOS update recovery (ADR-014 M-29a)
 
 For a newer release, `vox update` downloads and verifies its updater before transferring the

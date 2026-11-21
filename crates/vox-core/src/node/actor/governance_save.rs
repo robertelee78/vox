@@ -114,6 +114,10 @@ enum CleanupTurn {
 
 enum After {
     Turn(Turn),
+    Trust {
+        state: trust_save::Reconcile,
+        generation: u64,
+    },
     Sweep(Sweep),
     Admin(governance::Removal),
     Cleanup {
@@ -138,6 +142,23 @@ impl Continuation {
             }),
         }
     }
+    pub(super) fn trust(
+        instance: SharedChannel,
+        attachment: u64,
+        trusted: BTreeSet<Digest32>,
+        generation: u64,
+    ) -> Self {
+        Self {
+            instance,
+            attachment,
+            lifetime: None,
+            after: After::Trust {
+                state: trust_save::Reconcile::new(trusted, trust_save::ReconcileScope::Preparation),
+                generation,
+            },
+        }
+    }
+
     pub(super) fn admin(
         instance: SharedChannel,
         attachment: u64,
@@ -210,6 +231,9 @@ impl Node {
     ) {
         if continuation.attached(self, &room) {
             match continuation.after {
+                After::Trust { .. } => {
+                    self.governance_work.again = true;
+                }
                 After::Sweep(sweep) => {
                     if matches!(
                         sweep.stage,
@@ -402,6 +426,66 @@ impl Node {
             }
         };
         match &mut continuation.after {
+            After::Trust { state, generation } => {
+                let applied = match saved {
+                    maintenance_save::Saved::Trust(saved) => state.saved(&saved),
+                    maintenance_save::Saved::Consent(consent_save::Effect::Consent(saved)) => {
+                        if let crate::node::channel::pending_text::consent::ConsentSaved::Withdrawn(
+                            Some(revocation),
+                        ) = &saved
+                        {
+                            self.note_completed_untrust(
+                                room,
+                                revocation.body.target_id,
+                                revocation.body.new_chain_id,
+                            );
+                        }
+                        state.withdrawn(&saved)
+                    }
+                    _ => Err(Error::Profile("unexpected room trust completion")),
+                };
+                if let Err(error) = applied {
+                    self.reject_owned_governance(room, error, continuation, reply);
+                    return;
+                }
+                let action = {
+                    let channel = continuation.instance.lock().await;
+                    state.action(&channel, &continuation.lifetime.store)
+                };
+                let work = match action {
+                    Ok(trust_save::ReconcileAction::Trust(work)) => {
+                        maintenance_save::Work::Trust(work)
+                    }
+                    Ok(trust_save::ReconcileAction::Withdraw { target }) => {
+                        maintenance_save::Work::Consent(consent_save::Work::Withdraw { target })
+                    }
+                    Ok(trust_save::ReconcileAction::Progress) => {
+                        self.governance_work.again = true;
+                        return;
+                    }
+                    Ok(trust_save::ReconcileAction::Complete) => {
+                        let mut channel = continuation.instance.lock().await;
+                        channel.mark_trust_reconciled(*generation);
+                        channel.release_held_packages();
+                        drop(channel);
+                        self.ingress_room_progress(room, session_save::IngressProgress::Authority);
+                        self.key_package_rooms.entry(room).or_insert(false);
+                        self.governance_work.wake_room(room);
+                        self.redeliver_now = true;
+                        drop(continuation);
+                        let _ = self.refresh_reachers_causal(None, Some(room)).await;
+                        self.begin_owned_private_drive(room, false, None, None, None)
+                            .await;
+                        return;
+                    }
+                    Err(error) => {
+                        self.reject_owned_governance(room, error, continuation, reply);
+                        return;
+                    }
+                };
+                self.continue_governance_save(room, work, continuation, reply)
+                    .await;
+            }
             After::Admin(_) => {
                 self.finish_governance_admin(room, saved, continuation, reply)
                     .await

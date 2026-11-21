@@ -110,7 +110,6 @@ pub(super) enum Saved {
 
 pub(super) enum Continuation {
     Session(session_save::SessionContinuation),
-    Trust(trust_save::TrustContinuation),
     Private(private_save::Continuation),
     Governance(governance_save::Continuation),
     Preparation(preparation_save::Continuation),
@@ -135,7 +134,6 @@ impl Continuation {
     fn instance(&self) -> &SharedChannel {
         match self {
             Self::Session(next) => next.instance(),
-            Self::Trust(next) => next.instance(),
             Self::Private(next) => next.instance(),
             Self::Governance(next) => next.instance(),
             Self::Preparation(next) => next.instance(),
@@ -153,7 +151,6 @@ impl Continuation {
     fn lifetime(&self) -> Option<Arc<Lifetime>> {
         match self {
             Self::Session(next) => next.lifetime(),
-            Self::Trust(next) => next.lifetime().save.as_ref().map(Arc::clone),
             Self::Private(next) => next.lifetime(),
             Self::Governance(next) => next.lifetime(),
             Self::Preparation(next) => next.lifetime(),
@@ -171,7 +168,6 @@ impl Continuation {
     fn is_preparation(&self) -> bool {
         match self {
             Self::Session(_) => false,
-            Self::Trust(next) => next.is_preparation(),
             Self::Private(next) => next.is_preparation(),
             Self::Governance(next) => next.is_preparation(),
             Self::Preparation(next) => next.is_preparation(),
@@ -549,9 +545,6 @@ impl Pending {
         };
         let (continuation, result, _) = self.continuation.completed(result);
         match continuation {
-            Continuation::Trust(next) => {
-                trust_save::retire_detached(room, result, next, self.reply).await
-            }
             Continuation::Governance(next) => {
                 governance_save::retire_detached(result, next, self.reply)
             }
@@ -727,10 +720,6 @@ impl Node {
             );
             return false;
         }
-        let prior_owner = match &continuation {
-            Continuation::Trust(next) => next.policy_reservation_owner(),
-            _ => None,
-        };
         let owner = Arc::new(());
         let result = Arc::new(std::sync::Mutex::new(post_save::Completion::new()));
         let worker_result = Arc::clone(&result);
@@ -814,7 +803,6 @@ impl Node {
             };
             let held = Arc::clone(&lifetime);
             let saved = tokio::task::spawn_blocking(move || {
-                let mut prior_owner = prior_owner;
                 let input_owner = Arc::clone(&worker_owner);
                 let (prepared, input_epoch, input_instance) = loop {
                     let mut channel = worker_instance.blocking_lock();
@@ -823,9 +811,6 @@ impl Node {
                     }
                     if *attachment.borrow() != epoch {
                         return Err(Error::AtRestLocked);
-                    }
-                    if let Some(prior) = prior_owner.take() {
-                        channel.release_pending_text(&prior, false);
                     }
                     if !channel.post_pending() {
                         let input_epoch = channel.epoch();
@@ -1089,10 +1074,6 @@ impl Node {
         let (continuation, result, migrated) = pending.continuation.completed(result);
         if !current || (!installable && result.is_ok()) {
             match continuation {
-                Continuation::Trust(next) => {
-                    self.retire_owned_trust(room, result, next, pending.reply)
-                        .await
-                }
                 Continuation::Governance(next) => {
                     governance_save::retire_detached(result, next, pending.reply)
                 }
@@ -1187,10 +1168,6 @@ impl Node {
                 self.finish_owned_session(room, saved, lifetime, next, pending.reply)
                     .await;
             }
-            Continuation::Trust(next) => {
-                self.resume_owned_trust(room, result, next, pending.reply)
-                    .await
-            }
             Continuation::Private(next) => {
                 self.finish_owned_private(room, result, lifetime, next, pending.reply)
                     .await
@@ -1251,7 +1228,6 @@ impl Node {
     ) {
         match continuation {
             Continuation::Session(next) => self.reject_owned_session(room, error, next, reply),
-            Continuation::Trust(next) => self.reject_owned_trust(room, error, next, reply),
             Continuation::Private(next) => self.reject_owned_private(room, error, next, reply),
             Continuation::Governance(next) => {
                 self.reject_owned_governance(room, error, next, reply)

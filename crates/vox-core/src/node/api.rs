@@ -792,7 +792,7 @@ impl RoomRemovalGuard {
             return Some(step());
         }
         self.resource
-            .with_removal_fence(&self.room, self.generation, step)
+            .with_removal_fence(&self.room, self.generation, None, step)
     }
 }
 
@@ -1852,7 +1852,7 @@ impl Fault {
                 "a previous change to this room is still being applied; this request made no change\n       wait for its answer before changing the room again"
             }
             Fault::TrustRemovalIncomplete => {
-                "trust was removed, but at least one room could not finish its withdrawal; its saved work remains pending\n       restart the node to finish narrowing before using that room"
+                "this room's trust withdrawal is incomplete; nothing was posted or released\n       wait for the room to finish withdrawing trust, then try again"
             }
             Fault::PostBusy => {
                 "this node already has too many posts waiting; this message was not posted\n       wait for those posts to finish, then try again"

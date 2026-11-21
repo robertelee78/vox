@@ -1167,8 +1167,7 @@ pub(super) enum Ready {
     Untrust {
         _secret: own_keys::SecretLease,
         owner: Arc<()>,
-        rooms: Vec<(Digest32, SharedChannel)>,
-        transitions: Option<Vec<crate::node::channel::own_writer_gate::Transition>>,
+        admitted: bool,
         journal: Option<crate::node::computer::ComputerJournalWriter>,
         command: NodeCommand,
         reply: oneshot::Sender<Outcome>,
@@ -1290,8 +1289,7 @@ impl Node {
             Ready::Untrust {
                 _secret,
                 owner,
-                rooms,
-                transitions,
+                admitted,
                 journal,
                 command,
                 reply,
@@ -1304,24 +1302,13 @@ impl Node {
                     let _ = reply.send(Outcome::Failed(Fault::RoomChangePending));
                 } else {
                     self.own_key_untrust_pending = None;
-                    let current = rooms.len() == self.channels.len()
-                        && rooms.iter().all(|(room, instance)| {
-                            self.channels
-                                .get(room)
-                                .is_some_and(|current| Arc::ptr_eq(current, instance))
-                        });
-                    if reply.is_closed() {
-                        drop(transitions);
-                    } else if current {
-                        if let Some(transitions) = transitions {
-                            self.begin_owned_untrust(command, reply, _secret, journal, transitions)
+                    if !reply.is_closed() {
+                        if admitted {
+                            self.begin_owned_untrust(command, reply, _secret, journal)
                                 .await;
                         } else {
                             let _ = reply.send(Outcome::Failed(Fault::RoomChangePending));
                         }
-                    } else {
-                        drop(transitions);
-                        self.begin_own_key_untrust(command, reply);
                     }
                 }
             }

@@ -1,43 +1,22 @@
 //! Node-global native policy work. One retained owner uses the existing post-save wake;
 //! there is no fake room id, second command queue, timer or result-channel credit dependency.
-use super::trust_save::{
-    Lifetime, Next, Policy, PolicyCompleted, PolicyContinuation, PolicyResume, PolicyRoom,
-    Reconcile, ReconcileAction, ReconcileScope, TrustCompletion, TrustContinuation, TrustResume,
-};
+use super::trust_save::{Lifetime, Policy, PolicyCompleted, PolicyContinuation, PolicyResume};
 use super::*;
-use crate::node::channel::pending_trust::{TrustSaved, TrustWrite};
-use crate::node::channel::session_projection::{ProjectionProgress, ProjectionWork};
 use crate::node::store::Store;
 
 mod grant;
-pub(super) use grant::{GrantSource, GrantTurn};
+pub(super) use grant::GrantSource;
 mod headless;
 
 type Reply = Option<oneshot::Sender<Outcome>>;
 struct Returned {
     continuation: PolicyContinuation,
-    completed: NativeOutcome,
-    rooms: Vec<PolicyRoom>,
+    completed: crate::error::Result<PolicyCompleted>,
 }
 
-// Keep the existing completion inline rather than allocating on every native policy result.
-#[allow(clippy::large_enum_variant)]
-enum NativeOutcome {
-    Completed(crate::error::Result<PolicyCompleted>),
-    Blocked(trust_save::PolicyPublicationBlocked),
-}
-
-pub(super) struct PublicationWaiting {
-    work: computer::OwnKeyPolicyWork,
-    task: tokio::task::JoinHandle<()>,
-    ready: Arc<std::sync::atomic::AtomicBool>,
-    sparse: bool,
-}
 pub(super) struct NativePending {
     store: Arc<Store>,
     epoch: u64,
-    owner: Arc<()>,
-    instances: Vec<(Digest32, SharedChannel)>,
     result: Arc<std::sync::Mutex<Option<Returned>>>,
     task: tokio::task::JoinHandle<()>,
     reply: Reply,
@@ -45,139 +24,21 @@ pub(super) struct NativePending {
 
 pub(super) enum Pending {
     Native(NativePending),
-    Publication(PublicationWaiting),
-    TrustProgress {
-        room: Digest32,
-        continuation: TrustContinuation,
-        reply: Reply,
-    },
-    ManagedTrust(ManagedWaiting),
-    ManagedDrive(ManagedDrive),
-    GrantMarks(grant::GrantWaiting),
-    GrantDelivery(grant::GrantDelivery),
     Leave(leave_save::Pending),
     Headless(headless::HeadlessPending),
     Construction(construction_save::Pending),
     PeerBook(peer_book_save::Pending),
 }
 
-pub(super) struct ManagedWaiting {
-    receiver: oneshot::Receiver<crate::error::Result<ManagedNotice>>,
-    reply: oneshot::Sender<crate::error::Result<()>>,
-}
-
-pub(super) struct ManagedReady {
-    lifetime: Lifetime,
-    guard: computer::ComputerPolicyGuard,
-    rooms: Vec<PolicyRoom>,
-    revision: u64,
-    expired: bool,
-}
-
-enum ManagedNotice {
-    Ready(ManagedReady),
-    Progress {
-        turn: ManagedTurn,
-        receiver: oneshot::Receiver<crate::error::Result<ManagedNotice>>,
-    },
-}
-
-enum ManagedRoomStage {
-    Marks,
-    Reconcile(Reconcile),
-}
-pub(super) struct ManagedTurn {
-    pub(super) lifetime: Lifetime,
-    pub(super) rooms: Vec<PolicyRoom>,
-    pub(super) cursor: usize,
-    guard: computer::ComputerPolicyGuard,
-    revision: u64,
-    expired: bool,
-    stage: ManagedRoomStage,
-    governance_prerequisite: bool,
-    terminal: oneshot::Sender<crate::error::Result<ManagedNotice>>,
-}
-
-enum DriveStage {
-    Begin,
-    Packages {
-        cursor: usize,
-        result: Option<oneshot::Receiver<Outcome>>,
-    },
-    Consents(oneshot::Receiver<crate::error::Result<()>>),
-}
-pub(super) struct ManagedDrive {
-    ready: ManagedReady,
-    stage: DriveStage,
-    reply: oneshot::Sender<crate::error::Result<()>>,
-}
-
 impl Pending {
     pub(super) async fn retire(self) {
         match self {
-            Self::Publication(pending) => {
-                pending.task.abort();
-                let _ = pending.work.reply.send(Err(Error::AtRestLocked));
-            }
             Self::Native(pending) => pending.retire().await,
-            Self::TrustProgress {
-                room,
-                continuation,
-                reply,
-            } => {
-                retire_detached(
-                    room,
-                    Err(Error::Profile("trust continuation retired")),
-                    continuation,
-                    reply,
-                )
-                .await
-            }
-            Self::ManagedTrust(mut pending) => {
-                match (&mut pending.receiver).await {
-                    Ok(Ok(ManagedNotice::Ready(ready))) => release_rooms(&ready.rooms, true).await,
-                    Ok(Ok(ManagedNotice::Progress { turn, .. })) => {
-                        release_rooms(&turn.rooms, true).await
-                    }
-                    _ => {}
-                }
-                let _ = pending
-                    .reply
-                    .send(Err(Error::Profile("managed policy continuation retired")));
-            }
-            Self::ManagedDrive(pending) => {
-                release_rooms(&pending.ready.rooms, true).await;
-                let _ = pending
-                    .reply
-                    .send(Err(Error::Profile("managed policy continuation retired")));
-            }
-            Self::GrantMarks(pending) => pending.retire().await,
-            Self::GrantDelivery(pending) => pending.retire().await,
             Self::Leave(pending) => pending.retire().await,
             Self::Headless(pending) => pending.retire().await,
             Self::Construction(pending) => pending.retire().await,
             Self::PeerBook(pending) => pending.retire().await,
         }
-    }
-}
-
-fn outcome(result: &crate::error::Result<maintenance_save::Saved>) -> Outcome {
-    match result {
-        Ok(maintenance_save::Saved::Unavailable) => Outcome::Failed(Fault::RoomChangePending),
-        Ok(_) => Outcome::Done,
-        Err(error) => Outcome::Failed(fault_of(error)),
-    }
-}
-
-async fn release_rooms(rooms: &[PolicyRoom], poison: bool) {
-    for room in rooms {
-        let mut channel = room.instance.lock().await;
-        if poison {
-            channel.poison(&Error::Profile(
-                "trust withdrawal is incomplete; reopen this room",
-            ));
-        }
-        channel.release_pending_text(&room.owner, poison);
     }
 }
 
@@ -194,12 +55,6 @@ impl NativePending {
         if let Some(returned) = returned {
             finish_detached_policy(returned, self.reply).await;
         } else {
-            for (_, instance) in &self.instances {
-                instance
-                    .lock()
-                    .await
-                    .release_pending_text(&self.owner, true);
-            }
             if let Some(reply) = self.reply {
                 let _ = reply.send(Outcome::Failed(Fault::Internal));
             }
@@ -214,13 +69,8 @@ fn finish_rejected_policy(continuation: PolicyContinuation, error: Error, reply:
         } => {
             let _ = blacklist.send(Err(error));
         }
-        PolicyContinuation::Managed {
-            work,
-            reservations,
-            lifetime,
-        } => {
+        PolicyContinuation::Managed { work, lifetime } => {
             tokio::spawn(async move {
-                release_rooms(&reservations, true).await;
                 let _ = work.reply.send(Err(error));
                 drop(lifetime);
             });
@@ -239,16 +89,6 @@ impl Node {
             || self.own_key_untrust_pending.is_some()
             || self.own_key_computer_flight.is_some()
             || !self.own_key_computer_pending.is_empty()
-    }
-
-    pub(super) fn cancel_policy_publication(&mut self, owner: &Arc<()>) {
-        if matches!(&self.pending_policy, Some(Pending::Publication(waiting))
-            if Arc::ptr_eq(&waiting.work.owner, owner))
-        {
-            if let Some(Pending::Publication(waiting)) = self.pending_policy.take() {
-                waiting.task.abort();
-            }
-        }
     }
 
     pub(super) fn policy_work_already_current(&self, work: &computer::OwnKeyPolicyWork) -> bool {
@@ -279,101 +119,9 @@ impl Node {
             && work.guard.active(self.computer.as_ref()).is_ok()
     }
 
-    fn park_policy_until(
-        &mut self,
-        work: computer::OwnKeyPolicyWork,
-        prerequisite: impl std::future::Future<Output = ()> + Send + 'static,
-        sparse: bool,
-    ) {
-        let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let signal = Arc::clone(&ready);
-        let wake = Arc::clone(&self.post_save_wake);
-        let mut rooms_changed = self.own_key_room_set_changed.subscribe();
-        let mut epoch_changed = self.pairwise_epoch.subscribe();
-        let task = tokio::spawn(async move {
-            tokio::select! {
-                _ = prerequisite => {}
-                _ = rooms_changed.changed() => {}
-                _ = epoch_changed.changed() => {}
-            }
-            signal.store(true, std::sync::atomic::Ordering::Release);
-            wake.notify_one();
-        });
-        self.pending_policy = Some(Pending::Publication(PublicationWaiting {
-            work,
-            task,
-            ready,
-            sparse,
-        }));
-    }
-
-    pub(super) async fn wait_policy_publication(
-        &mut self,
-        work: computer::OwnKeyPolicyWork,
-        mut blocked: trust_save::PolicyPublicationBlocked,
-    ) {
-        if work.reply.is_closed() {
-            return;
-        }
-        let Some(computer) = self.computer.clone() else {
-            let _ = work.reply.send(Err(Error::AtRestLocked));
-            return;
-        };
-        let Some(journal) = computer.try_journal_writer() else {
-            self.park_policy_until(work, async move { computer.wait_writer().await }, false);
-            return;
-        };
-        if let Err(error) = work.guard.active(Some(&computer)) {
-            drop(journal);
-            let _ = work.reply.send(Err(error));
-            return;
-        }
-        if self.policy_work_already_current(&work) {
-            drop(journal);
-            let _ = work.reply.send(Ok(()));
-            return;
-        }
-        if let Err(error) = computer.storage_ready() {
-            drop(journal);
-            let _ = work.reply.send(Err(error));
-            return;
-        }
-        if !self
-            .channels
-            .get(&blocked.room)
-            .is_some_and(|room| Arc::ptr_eq(room, &blocked.instance))
-        {
-            drop(journal);
-            self.own_key_computer_pending.push_front(work);
-            self.start_own_key_computer_drain();
-            return;
-        }
-        let retirement = blocked.sparse.map(|(request, root)| {
-            self.retire_policy_publication(blocked.room, blocked.history_instance, request, root)
-        });
-        drop(journal);
-        if let Some(Err(error)) = retirement {
-            let released = std::future::poll_fn(|cx| {
-                std::task::Poll::Ready(
-                    std::future::Future::poll(blocked.wake.as_mut(), cx).is_ready(),
-                )
-            })
-            .await;
-            if released {
-                self.own_key_computer_pending.push_front(work);
-                self.start_own_key_computer_drain();
-            } else {
-                let _ = work.reply.send(Err(error));
-            }
-            return;
-        }
-        let sparse = blocked.sparse.is_some();
-        self.park_policy_until(work, blocked.wake, sparse);
-    }
-
     pub(super) async fn begin_pending_policy(
         &mut self,
-        mut policy: Policy,
+        policy: Policy,
         mut continuation: PolicyContinuation,
         reply: Reply,
     ) -> bool {
@@ -435,32 +183,13 @@ impl Node {
         let store = Arc::clone(&save.store);
         let epoch = self.delivery_epoch;
         let attachment = self.pairwise_epoch.subscribe();
-        let grant_decision =
-            matches!(&policy, Policy::Grant { change, .. } if change.needs_decision(&self.trust));
-        let reserves_rooms =
-            matches!(&policy, Policy::Untrust { .. } | Policy::Managed(_)) || grant_decision;
         let managed = matches!(&policy, Policy::Managed(_));
         let needs_publication = matches!(&policy, Policy::Untrust { .. } | Policy::Grant { .. });
-        let require_append = matches!(&policy, Policy::Untrust { .. });
         let choice_target = match &policy {
             Policy::Untrust { target } => Some(*target),
             Policy::Grant { change, .. } if change.individual_choice() => Some(change.target()),
             _ => None,
         };
-        let instances: Vec<_> = if reserves_rooms
-            || matches!(&policy, Policy::Grant { change, .. }
-            if !matches!(change, trust_save::GrantChange::Capability { .. }))
-        {
-            self.channels
-                .iter()
-                .map(|(room, instance)| (*room, Arc::clone(instance)))
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let worker_instances = instances.clone();
-        let owner = Arc::new(());
-        let worker_owner = Arc::clone(&owner);
         let computer = self.computer.clone();
         let node = self.profile.as_ref().map(Profile::fingerprint);
         let result = Arc::new(std::sync::Mutex::new(None));
@@ -489,10 +218,9 @@ impl Node {
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Returned {
                             continuation,
-                            completed: NativeOutcome::Completed(Err(Error::Profile(
+                            completed: Err(Error::Profile(
                                 "computer policy changed before policy admission",
-                            ))),
-                            rooms: Vec::new(),
+                            )),
                         });
                         wake.notify_one();
                         return;
@@ -503,12 +231,6 @@ impl Node {
             };
             continuation.lifetime_mut().save = Some(Arc::clone(&save));
             let saved = tokio::task::spawn_blocking(move || {
-                let mut rooms = match &mut continuation {
-                    PolicyContinuation::Managed { reservations, .. } => {
-                        std::mem::take(reservations)
-                    }
-                    _ => Vec::new(),
-                };
                 let completed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     if *attachment.borrow() != epoch {
                         return Err(Error::AtRestLocked);
@@ -532,35 +254,12 @@ impl Node {
                             )?;
                         }
                     }
-                    if reserves_rooms && rooms.is_empty() {
-                        match trust_save::reserve_policy_rooms(
-                            worker_instances,
-                            &save.store,
-                            worker_owner,
-                            require_append,
-                            managed,
-                        )? {
-                            trust_save::PolicyRooms::Reserved(held) => rooms = held,
-                            trust_save::PolicyRooms::Blocked(blocked) => {
-                                return Ok(NativeOutcome::Blocked(blocked));
-                            }
-                        }
-                    }
-                    if let Policy::Grant { floor, .. } = &mut policy {
-                        for room in &rooms {
-                            *floor = (*floor).max(room.instance.blocking_lock().newest_mint_seq());
-                        }
-                    }
-                    Ok(NativeOutcome::Completed(Ok(
-                        policy.run(&save.store, save.signer.as_ref())
-                    )))
+                    Ok(policy.run(&save.store, save.signer.as_ref()))
                 }))
-                .unwrap_or_else(|_| Err(Error::Profile("native policy worker stopped")))
-                .unwrap_or_else(|error| NativeOutcome::Completed(Err(error)));
+                .unwrap_or_else(|_| Err(Error::Profile("native policy worker stopped")));
                 Returned {
                     continuation,
                     completed,
-                    rooms,
                 }
             })
             .await;
@@ -574,8 +273,6 @@ impl Node {
         self.pending_policy = Some(Pending::Native(NativePending {
             store,
             epoch,
-            owner,
-            instances,
             result,
             task,
             reply,
@@ -589,65 +286,6 @@ impl Node {
         };
         let pending = match pending {
             Pending::Native(pending) => pending,
-            Pending::Publication(pending) => {
-                if pending.work.reply.is_closed() {
-                    pending.task.abort();
-                } else if let Err(error) = pending.work.guard.active(self.computer.as_ref()) {
-                    pending.task.abort();
-                    let _ = pending.work.reply.send(Err(error));
-                } else if pending.ready.load(std::sync::atomic::Ordering::Acquire) {
-                    self.own_key_computer_pending.push_front(pending.work);
-                    self.start_own_key_computer_drain();
-                } else if pending.sparse && self.policy_publication_retirement_failed() {
-                    pending.task.abort();
-                    let _ = pending.work.reply.send(Err(Error::Profile(
-                        "history publication retirement requires recovery",
-                    )));
-                } else {
-                    self.pending_policy = Some(Pending::Publication(pending));
-                }
-                return;
-            }
-            Pending::TrustProgress {
-                room,
-                continuation,
-                reply,
-            } => {
-                let instance = Arc::clone(continuation.instance());
-                let Some(save) = continuation.lifetime().save.as_ref().map(Arc::clone) else {
-                    self.fail_trust_continuation(continuation, Error::AtRestLocked, reply)
-                        .await;
-                    return;
-                };
-                let channel = instance.lock().await;
-                let result = self.continue_owned_trust(room, &channel, continuation, &save.store);
-                drop(channel);
-                match result {
-                    Ok(resume) => self.schedule_trust_resume(resume, reply).await,
-                    Err(failed) => {
-                        let (continuation, error) = *failed;
-                        self.fail_trust_continuation(continuation, error, reply)
-                            .await
-                    }
-                }
-                return;
-            }
-            Pending::ManagedTrust(pending) => {
-                self.poll_managed_trust(pending).await;
-                return;
-            }
-            Pending::ManagedDrive(pending) => {
-                self.poll_managed_drive(pending).await;
-                return;
-            }
-            Pending::GrantMarks(pending) => {
-                self.poll_grant_marks(pending).await;
-                return;
-            }
-            Pending::GrantDelivery(pending) => {
-                self.poll_grant_delivery(pending).await;
-                return;
-            }
             Pending::Leave(pending) => {
                 self.complete_leave_save(pending).await;
                 return;
@@ -693,44 +331,127 @@ impl Node {
             finish_detached_policy(returned, pending.reply).await;
             return;
         }
-        let completed = match returned.completed {
-            NativeOutcome::Completed(completed) => completed,
-            NativeOutcome::Blocked(blocked) => {
-                match returned.continuation {
-                    PolicyContinuation::Managed {
-                        lifetime,
-                        work,
-                        reservations,
-                    } => {
-                        release_rooms(&reservations, false).await;
-                        drop(lifetime);
-                        self.wait_policy_publication(work, blocked).await;
-                    }
-                    continuation => finish_rejected_policy(
-                        continuation,
-                        Error::Profile("unexpected policy publication blocker"),
-                        pending.reply,
-                    ),
-                }
-                return;
-            }
-        };
+        let completed = returned.completed;
         let resume = match completed {
-            Ok(completed) => {
-                self.finish_owned_policy(completed, returned.continuation, returned.rooms)
-            }
+            Ok(completed) => self.finish_owned_policy(completed, returned.continuation),
             Err(error) => PolicyResume::Failed {
                 continuation: returned.continuation,
                 error,
-                rooms: returned.rooms,
             },
         };
         self.resume_policy_result(resume, pending.reply).await;
     }
 
+    /// The command keeps its old success meaning without retaining the node's policy owner.
+    /// Only the room currently observed is waited for; ordinary governance owns all writes.
+    fn reply_after_room_trust(&mut self, reply: Reply) {
+        let Some(mut reply) = reply else {
+            return;
+        };
+        let generation = self.trust_generation;
+        let cancelled = &mut self.own_key_room_cancel;
+        let rooms: Vec<_> = self
+            .channels
+            .iter()
+            .map(|(room, instance)| {
+                let retired = cancelled
+                    .entry(*room)
+                    .or_insert_with(|| tokio::sync::watch::channel(false).0)
+                    .subscribe();
+                (Arc::clone(instance), retired)
+            })
+            .collect();
+        let mut attachment = self.pairwise_epoch.subscribe();
+        tokio::spawn(async move {
+            for (instance, mut retired) in rooms {
+                loop {
+                    let channel = tokio::select! {
+                        _ = reply.closed() => return,
+                        _ = attachment.changed() => {
+                            let _ = reply.send(Outcome::Failed(Fault::Locked));
+                            return;
+                        }
+                        _ = retired.changed() => break,
+                        channel = instance.lock() => channel,
+                    };
+                    let changed = channel.history_publication_wake();
+                    if channel.trust_reconciled(generation) {
+                        break;
+                    }
+                    if channel.is_poisoned() {
+                        let _ = reply.send(Outcome::Failed(Fault::TrustRemovalIncomplete));
+                        return;
+                    }
+                    drop(channel);
+                    tokio::select! {
+                        _ = reply.closed() => return,
+                        _ = attachment.changed() => {
+                            let _ = reply.send(Outcome::Failed(Fault::Locked));
+                            return;
+                        }
+                        _ = retired.changed() => break,
+                        _ = changed => {}
+                    }
+                }
+            }
+            let _ = reply.send(Outcome::Done);
+        });
+    }
+
+    async fn finish_untrust_save(
+        &mut self,
+        lifetime: Lifetime,
+        operation: trust_save::Untrust,
+        reply: Reply,
+    ) {
+        self.publish().await;
+        let bases = self
+            .view_tx
+            .borrow()
+            .open_channels
+            .iter()
+            .flat_map(|room| {
+                room.offer_bases
+                    .iter()
+                    .filter(|basis| basis.member == operation.target)
+                    .map(|basis| (room.channel_id, *basis))
+            })
+            .collect();
+        let decision = operation.alias.as_ref().map(|alias| {
+            (
+                self.decisions.clone(),
+                (self.millis_clock)(),
+                crate::node::decisions::Decision {
+                    asked: "to remove a member from the keyring",
+                    by: operation.target,
+                    alias: Some(alias.clone()),
+                    decided: crate::node::decisions::Decided::Untrusted,
+                    why: "this node's person removed them from the keyring: they read \
+                      nothing new from it and reach none of its services"
+                        .to_owned(),
+                    room: None,
+                },
+            )
+        });
+        self.begin_pending_policy(
+            Policy::DismissOffers { bases, decision },
+            PolicyContinuation::FinishUntrust {
+                lifetime,
+                operation,
+            },
+            reply,
+        )
+        .await;
+    }
+
     async fn resume_policy_result(&mut self, resume: PolicyResume, reply: Reply) {
         match resume {
-            PolicyResume::Trust(resume) => self.schedule_trust_resume(resume, reply).await,
+            PolicyResume::Untrusted {
+                lifetime,
+                operation,
+            } => {
+                self.finish_untrust_save(lifetime, operation, reply).await;
+            }
             PolicyResume::Blacklist => {}
             PolicyResume::LocalTrust {
                 lifetime,
@@ -745,20 +466,14 @@ impl Node {
                 lifetime,
                 source,
                 grant,
-                rooms,
-            } => {
-                self.begin_grant_marks(lifetime, source, grant, rooms, reply)
-                    .await
-            }
+            } => self.finish_grant_save(lifetime, source, grant, reply).await,
             PolicyResume::GrantFinished {
                 lifetime,
                 source,
                 grant,
             } => {
-                if let Some(reply) = reply {
-                    let _ = reply.send(Outcome::Done);
-                }
                 drop((lifetime, source, grant));
+                self.reply_after_room_trust(reply);
             }
             PolicyResume::Dismissed { lifetime, result } => {
                 if matches!(&result, Ok(true)) {
@@ -780,279 +495,26 @@ impl Node {
                 if dismissed {
                     self.publish().await;
                 }
-                if let Some(reply) = reply {
-                    let _ = reply.send(Outcome::Done);
-                }
                 drop((lifetime, operation));
+                self.reply_after_room_trust(reply);
             }
             PolicyResume::Managed {
                 lifetime,
                 work,
                 result,
-                rooms,
                 revision,
                 expired,
             } => {
-                self.begin_managed_trust_continuation(
-                    lifetime, work, result, rooms, revision, expired,
-                )
-                .await;
+                self.begin_managed_trust_continuation(lifetime, work, result, revision, expired)
+                    .await;
             }
             PolicyResume::Failed {
                 continuation,
                 error,
-                rooms,
             } => {
-                release_rooms(&rooms, false).await;
                 finish_rejected_policy(continuation, error, reply);
             }
         }
-    }
-
-    pub(super) async fn resume_owned_trust(
-        &mut self,
-        room: Digest32,
-        result: crate::error::Result<maintenance_save::Saved>,
-        continuation: TrustContinuation,
-        reply: Reply,
-    ) {
-        if let TrustContinuation::Managed(turn) = continuation {
-            self.resume_managed_trust(room, result, turn, reply).await;
-            return;
-        }
-        if let TrustContinuation::Grant(turn) = continuation {
-            self.resume_grant_marks(result, turn).await;
-            return;
-        }
-        let saved = result.and_then(|saved| match saved {
-            maintenance_save::Saved::Trust(saved) => Ok(TrustCompletion::Trust(saved)),
-            maintenance_save::Saved::Consent(consent_save::Effect::Consent(saved)) => {
-                Ok(TrustCompletion::Withdraw(saved))
-            }
-            _ => Err(Error::Profile("unexpected trust save completion")),
-        });
-        let instance = Arc::clone(continuation.instance());
-        let save = continuation.lifetime().save.as_ref().map(Arc::clone);
-        let Some(save) = save else {
-            self.reject_owned_trust(room, Error::AtRestLocked, continuation, reply);
-            return;
-        };
-        let channel = instance.lock().await;
-        let resumed = self.finish_owned_trust(room, &channel, continuation, saved, &save.store);
-        drop(channel);
-        match resumed {
-            Ok(resume) => self.schedule_trust_resume(resume, reply).await,
-            Err(failed) => {
-                let (continuation, error) = *failed;
-                self.fail_trust_continuation(continuation, error, reply)
-                    .await
-            }
-        }
-    }
-
-    async fn schedule_trust_resume(&mut self, resume: TrustResume, reply: Reply) {
-        match resume {
-            TrustResume::Next {
-                room,
-                work,
-                continuation,
-            } => {
-                let work = match work {
-                    Next::Trust(work) => maintenance_save::Work::Trust(work),
-                    Next::Withdraw { target } => {
-                        maintenance_save::Work::Consent(consent_save::Work::Withdraw { target })
-                    }
-                };
-                self.begin_pending_maintenance(
-                    room,
-                    work,
-                    maintenance_save::Continuation::Trust(continuation),
-                    reply,
-                )
-                .await;
-            }
-            TrustResume::Progress { room, continuation } => {
-                self.pending_policy = Some(Pending::TrustProgress {
-                    room,
-                    continuation,
-                    reply,
-                });
-                // This is an actual bounded-page progress edge, serviced by the SAME retained
-                // policy book on the common wake. No fake write, polling timer or second queue.
-                self.post_save_wake.notify_one();
-            }
-            TrustResume::Finished { continuation } => {
-                self.finish_trust_continuation(continuation, reply).await
-            }
-        }
-    }
-
-    async fn finish_trust_continuation(&mut self, continuation: TrustContinuation, reply: Reply) {
-        match continuation {
-            TrustContinuation::Untrust {
-                mut lifetime,
-                operation,
-                ..
-            } => {
-                for (room, target, generation) in &operation.completed {
-                    self.note_completed_untrust(*room, *target, *generation);
-                }
-                lifetime.own_transitions.clear();
-                self.refresh_reachers().await;
-                self.publish().await;
-                let bases = self
-                    .view_tx
-                    .borrow()
-                    .open_channels
-                    .iter()
-                    .flat_map(|room| {
-                        room.offer_bases
-                            .iter()
-                            .filter(|basis| basis.member == operation.target)
-                            .map(|basis| (room.channel_id, *basis))
-                    })
-                    .collect();
-                let decision = operation.alias.as_ref().map(|alias| {
-                    (
-                        self.decisions.clone(),
-                        (self.millis_clock)(),
-                        crate::node::decisions::Decision {
-                            asked: "to remove a member from the keyring",
-                            by: operation.target,
-                            alias: Some(alias.clone()),
-                            decided: crate::node::decisions::Decided::Untrusted,
-                            why: "this node's person removed them from the keyring: they read \
-                              nothing new from it and reach none of its services"
-                                .to_owned(),
-                            room: None,
-                        },
-                    )
-                });
-                self.begin_pending_policy(
-                    Policy::DismissOffers { bases, decision },
-                    PolicyContinuation::FinishUntrust {
-                        lifetime,
-                        operation,
-                    },
-                    reply,
-                )
-                .await;
-            }
-            other => {
-                self.fail_trust_continuation(
-                    other,
-                    Error::Profile("unexpected terminal trust continuation"),
-                    reply,
-                )
-                .await
-            }
-        }
-    }
-
-    async fn fail_trust_continuation(
-        &mut self,
-        continuation: TrustContinuation,
-        error: Error,
-        reply: Reply,
-    ) {
-        match continuation {
-            TrustContinuation::Untrust {
-                lifetime,
-                operation,
-                ..
-            } => {
-                release_rooms(&operation.rooms, true).await;
-                for (room, target, generation) in &operation.completed {
-                    self.note_completed_untrust(*room, *target, *generation);
-                }
-                self.refresh_reachers().await;
-                self.publish().await;
-                if let Some(reply) = reply {
-                    let _ = reply.send(Outcome::Failed(fault_of(&error)));
-                }
-                drop((lifetime, operation, error));
-            }
-            other => {
-                let room = other.instance().lock().await.channel_id();
-                retire_detached(room, Err(error), other, reply).await;
-                self.post_save_wake.notify_one();
-            }
-        }
-    }
-
-    pub(super) fn reject_owned_trust(
-        &mut self,
-        room: Digest32,
-        error: Error,
-        continuation: TrustContinuation,
-        reply: Reply,
-    ) {
-        let result = Err(error);
-        // This is finite exact-owner retirement, not a command/result queue. No disk transaction
-        // is started, and the original lifetime/pins remain owned until every release finishes.
-        let wake = Arc::clone(&self.post_save_wake);
-        tokio::spawn(async move {
-            retire_detached(room, result, continuation, reply).await;
-            wake.notify_one();
-        });
-    }
-    pub(super) async fn retire_owned_trust(
-        &mut self,
-        room: Digest32,
-        result: crate::error::Result<maintenance_save::Saved>,
-        continuation: TrustContinuation,
-        reply: Reply,
-    ) {
-        retire_detached(room, result, continuation, reply).await;
-        self.post_save_wake.notify_one();
-    }
-}
-
-pub(super) async fn retire_detached(
-    _room: Digest32,
-    result: crate::error::Result<maintenance_save::Saved>,
-    continuation: TrustContinuation,
-    reply: Reply,
-) {
-    match continuation {
-        TrustContinuation::Untrust {
-            lifetime,
-            operation,
-            ..
-        } => {
-            release_rooms(&operation.rooms, true).await;
-            if let Some(reply) = reply {
-                // A real committed prefix is not an aggregate Untrust completion. Preserve a
-                // real failure; an interrupted successful prefix retains honest room debt.
-                let answer = match &result {
-                    Err(_) => outcome(&result),
-                    Ok(_) => Outcome::Failed(Fault::TrustRemovalIncomplete),
-                };
-                let _ = reply.send(answer);
-            }
-            drop((lifetime, operation));
-        }
-        TrustContinuation::Managed(turn) => {
-            release_rooms(&turn.rooms, true).await;
-            let error = result.err().unwrap_or(Error::Profile(
-                "managed trust committed a prefix before retirement",
-            ));
-            let _ = turn.terminal.send(Err(error));
-            drop(turn.lifetime);
-        }
-        TrustContinuation::Grant(turn) => {
-            turn.retire(result.err().unwrap_or(Error::Profile(
-                "trust decision committed a prefix before retirement",
-            )))
-            .await;
-        }
-    }
-}
-
-impl ManagedTurn {
-    pub(super) fn policy_reservation_owner(&self) -> Option<Arc<()>> {
-        matches!(self.stage, ManagedRoomStage::Marks)
-            .then(|| Arc::clone(&self.rooms[self.cursor].owner))
     }
 }
 
@@ -1060,16 +522,14 @@ impl Node {
     async fn begin_managed_trust_continuation(
         &mut self,
         mut lifetime: Lifetime,
-        mut work: computer::OwnKeyPolicyWork,
+        work: computer::OwnKeyPolicyWork,
         result: crate::error::Result<computer::KeyringApplication>,
-        rooms: Vec<PolicyRoom>,
         revision: u64,
         expired: bool,
     ) {
         let application = match result {
             Ok(application) => application,
             Err(error) => {
-                release_rooms(&rooms, true).await;
                 let _ = work.reply.send(Err(error));
                 return;
             }
@@ -1085,18 +545,6 @@ impl Node {
                 let plan = computer
                     .plan(node)?
                     .ok_or(Error::ComputerPolicySuperseded)?;
-                let removed: Vec<_> = plan
-                    .denied
-                    .iter()
-                    .copied()
-                    .filter(|peer| self.trust.is_trusted(peer))
-                    .collect();
-                if removed
-                    .iter()
-                    .any(|peer| work.targets.binary_search(peer).is_err())
-                {
-                    return Err(Error::OwnKeyWriterDrainRequired(removed));
-                }
                 let aliases = plan
                     .grants
                     .iter()
@@ -1130,468 +578,52 @@ impl Node {
                 })
             })();
             match next {
-                Ok(mut next) => {
-                    for room in &rooms {
-                        next.floor = next.floor.max(room.instance.lock().await.newest_mint_seq());
-                    }
+                Ok(next) => {
                     self.begin_pending_policy(
                         Policy::Managed(next),
-                        PolicyContinuation::Managed {
-                            lifetime,
-                            work,
-                            reservations: rooms,
-                        },
+                        PolicyContinuation::Managed { lifetime, work },
                         None,
                     )
                     .await;
                 }
-                Err(Error::OwnKeyWriterDrainRequired(targets)) => {
-                    release_rooms(&rooms, false).await;
-                    work.targets = targets;
-                    self.own_key_computer_pending.push_front(work);
-                    self.post_save_wake.notify_one();
-                }
                 Err(error) => {
-                    release_rooms(&rooms, true).await;
                     let _ = work.reply.send(Err(error));
                 }
             }
             return;
         }
         if let Err(error) = work.guard.active(self.computer.as_ref()) {
-            release_rooms(&rooms, true).await;
             let _ = work.reply.send(Err(error));
             return;
         }
-        self.owe_private_support_in_open_rooms().await;
-        let (terminal, receiver) = oneshot::channel();
-        let guard = work.guard;
-        self.pending_policy = Some(Pending::ManagedTrust(ManagedWaiting {
-            receiver,
-            reply: work.reply,
-        }));
-        if rooms.is_empty() {
-            let _ = terminal.send(Ok(ManagedNotice::Ready(ManagedReady {
-                lifetime,
-                guard,
-                rooms,
-                revision,
-                expired,
-            })));
-            self.post_save_wake.notify_one();
-            return;
-        }
-        let room = rooms[0].room;
-        let turn = ManagedTurn {
-            lifetime,
-            rooms,
-            cursor: 0,
-            guard,
-            revision,
-            expired,
-            stage: ManagedRoomStage::Marks,
-            governance_prerequisite: false,
-            terminal,
-        };
-        // Mark this exact room BEFORE any withdrawal rotates its sender. All other rooms still
-        // own their original global reservation, so their decision positions cannot advance.
-        self.begin_pending_maintenance(
-            room,
-            maintenance_save::Work::Trust(trust_save::Work(TrustWrite::MarkDecisions)),
-            maintenance_save::Continuation::Trust(TrustContinuation::Managed(turn)),
-            None,
-        )
-        .await;
-    }
-
-    async fn resume_managed_trust(
-        &mut self,
-        room: Digest32,
-        result: crate::error::Result<maintenance_save::Saved>,
-        mut turn: ManagedTurn,
-        _reply: Reply,
-    ) {
-        let saved = match result {
-            Ok(saved) => saved,
-            Err(error) => {
-                self.fail_managed_turn(turn, error).await;
-                return;
-            }
-        };
-        if turn.governance_prerequisite {
-            if let Err(error) = turn.guard.active(self.computer.as_ref()) {
-                self.fail_managed_turn(turn, error).await;
-                return;
-            }
-            match saved {
-                maintenance_save::Saved::Projection(ProjectionProgress::Governance(progress)) => {
-                    if !progress.ready && progress.pending {
-                        self.begin_pending_maintenance(
-                            room,
-                            maintenance_save::Work::Projection(ProjectionWork::Governance),
-                            maintenance_save::Continuation::Trust(TrustContinuation::Managed(turn)),
-                            None,
-                        )
-                        .await;
-                        return;
-                    }
-                    if !progress.ready {
-                        self.fail_managed_turn(
-                            turn,
-                            Error::Profile(
-                                "managed governance projection stopped before readiness",
-                            ),
-                        )
-                        .await;
-                        return;
-                    }
-                    turn.governance_prerequisite = false;
-                    self.continue_managed_trust(turn).await;
-                }
-                _ => {
-                    self.fail_managed_turn(
-                        turn,
-                        Error::Profile("unexpected managed governance completion"),
-                    )
-                    .await;
-                }
-            }
-            return;
-        }
-        let applied = match (&mut turn.stage, saved) {
-            (ManagedRoomStage::Marks, maintenance_save::Saved::Trust(TrustSaved::Marked)) => {
-                turn.stage = ManagedRoomStage::Reconcile(Reconcile::new(
-                    self.trust.trusted(),
-                    ReconcileScope::Preparation,
-                ));
-                Ok(())
-            }
-            (ManagedRoomStage::Reconcile(state), maintenance_save::Saved::Trust(saved)) => {
-                state.saved(&saved)
-            }
-            (
-                ManagedRoomStage::Reconcile(state),
-                maintenance_save::Saved::Consent(consent_save::Effect::Consent(saved)),
-            ) => {
-                let result = state.withdrawn(&saved);
-                if result.is_ok() {
-                    if let crate::node::channel::pending_text::consent::ConsentSaved::Withdrawn(
-                        Some(revocation),
-                    ) = saved
-                    {
-                        self.note_completed_untrust(
-                            room,
-                            revocation.body.target_id,
-                            revocation.body.new_chain_id,
-                        );
-                    }
-                }
-                result
-            }
-            _ => Err(Error::Profile("unexpected managed trust completion")),
-        };
-        if let Err(error) = applied {
-            self.fail_managed_turn(turn, error).await;
-            return;
-        }
-        self.continue_managed_trust(turn).await;
-    }
-
-    async fn continue_managed_trust(&mut self, mut turn: ManagedTurn) {
-        if let Err(error) = turn.guard.active(self.computer.as_ref()) {
-            self.fail_managed_turn(turn, error).await;
-            return;
-        }
-        let Some(save) = turn.lifetime.save.as_ref().map(Arc::clone) else {
-            self.fail_managed_turn(turn, Error::AtRestLocked).await;
-            return;
-        };
-        let room = turn.rooms[turn.cursor].room;
-        let action = match &mut turn.stage {
-            ManagedRoomStage::Marks => Ok(ReconcileAction::Trust(trust_save::Work(
-                TrustWrite::MarkDecisions,
-            ))),
-            ManagedRoomStage::Reconcile(state) => {
-                let instance = Arc::clone(&turn.rooms[turn.cursor].instance);
-                let channel = instance.lock().await;
-                state.action(&channel, &save.store)
-            }
-        };
-        match action {
-            Ok(ReconcileAction::Trust(work)) => {
-                self.begin_pending_maintenance(
-                    room,
-                    maintenance_save::Work::Trust(work),
-                    maintenance_save::Continuation::Trust(TrustContinuation::Managed(turn)),
-                    None,
-                )
-                .await;
-            }
-            Ok(ReconcileAction::Withdraw { target }) => {
-                self.begin_pending_maintenance(
-                    room,
-                    maintenance_save::Work::Consent(consent_save::Work::Withdraw { target }),
-                    maintenance_save::Continuation::Trust(TrustContinuation::Managed(turn)),
-                    None,
-                )
-                .await;
-            }
-            Ok(ReconcileAction::Progress) => {
-                let (sender, receiver) = oneshot::channel();
-                let terminal = std::mem::replace(&mut turn.terminal, sender);
-                let _ = terminal.send(Ok(ManagedNotice::Progress { turn, receiver }));
-                self.post_save_wake.notify_one();
-            }
-            Ok(ReconcileAction::Complete) => {
-                turn.cursor += 1;
-                if turn.cursor == turn.rooms.len() {
-                    let mut lifetime = turn.lifetime;
-                    lifetime.own_transitions.clear();
-                    let _ = turn.terminal.send(Ok(ManagedNotice::Ready(ManagedReady {
-                        lifetime,
-                        guard: turn.guard,
-                        rooms: turn.rooms,
-                        revision: turn.revision,
-                        expired: turn.expired,
-                    })));
-                    self.post_save_wake.notify_one();
-                } else {
-                    turn.stage = ManagedRoomStage::Marks;
-                    let room = turn.rooms[turn.cursor].room;
-                    self.begin_pending_maintenance(
-                        room,
-                        maintenance_save::Work::Trust(trust_save::Work(TrustWrite::MarkDecisions)),
-                        maintenance_save::Continuation::Trust(TrustContinuation::Managed(turn)),
-                        None,
-                    )
-                    .await;
-                }
-            }
-            Err(error) if ChannelState::governance_refreshing(&error) => {
-                turn.governance_prerequisite = true;
-                self.begin_pending_maintenance(
-                    room,
-                    maintenance_save::Work::Projection(ProjectionWork::Governance),
-                    maintenance_save::Continuation::Trust(TrustContinuation::Managed(turn)),
-                    None,
-                )
-                .await;
-            }
-            Err(error) => self.fail_managed_turn(turn, error).await,
-        }
-    }
-
-    async fn fail_managed_turn(&mut self, turn: ManagedTurn, error: Error) {
-        release_rooms(&turn.rooms, true).await;
-        let _ = turn.terminal.send(Err(error));
-        drop(turn.lifetime);
-        self.post_save_wake.notify_one();
-    }
-
-    async fn poll_managed_trust(&mut self, mut pending: ManagedWaiting) {
-        match pending.receiver.try_recv() {
-            Ok(Ok(ManagedNotice::Ready(ready))) => {
-                self.poll_managed_drive(ManagedDrive {
-                    ready,
-                    stage: DriveStage::Begin,
-                    reply: pending.reply,
-                })
-                .await;
-            }
-            Ok(Ok(ManagedNotice::Progress { turn, receiver })) => {
-                self.pending_policy = Some(Pending::ManagedTrust(ManagedWaiting {
-                    receiver,
-                    reply: pending.reply,
-                }));
-                self.continue_managed_trust(turn).await;
-            }
-            Ok(Err(error)) => {
-                let _ = pending.reply.send(Err(error));
-            }
-            Err(oneshot::error::TryRecvError::Empty) => {
-                self.pending_policy = Some(Pending::ManagedTrust(pending))
-            }
-            Err(oneshot::error::TryRecvError::Closed) => {
-                let _ = pending.reply.send(Err(Error::Profile(
-                    "managed trust completion owner stopped",
-                )));
-            }
-        }
-    }
-
-    async fn poll_managed_drive(&mut self, mut pending: ManagedDrive) {
-        let Some(save) = pending.ready.lifetime.save.as_ref().map(Arc::clone) else {
-            release_rooms(&pending.ready.rooms, true).await;
-            let _ = pending.reply.send(Err(Error::AtRestLocked));
-            return;
-        };
-        let next = match &mut pending.stage {
-            DriveStage::Begin => {
-                if let Err(error) = pending.ready.guard.active(self.computer.as_ref()) {
-                    let _ = pending.reply.send(Err(error));
-                    return;
-                }
-                if pending.ready.expired {
-                    self.publish().await;
-                    drop(save);
-                    self.finish_managed_policy(pending).await;
-                    return;
-                }
-                if let Err(error) = self.refresh_reachers_guarded(&pending.ready.guard).await {
-                    let _ = pending.reply.send(Err(error));
-                    return;
-                }
-                for prepared in self.preparing_rooms.values_mut() {
-                    prepared.channel.lock().await.release_held_packages();
-                }
-                pending.stage = DriveStage::Packages {
-                    cursor: 0,
-                    result: None,
-                };
-                true
-            }
-            DriveStage::Packages { cursor, result } => {
-                if let Some(receiver) = result {
-                    match receiver.try_recv() {
-                        Ok(Outcome::Done) => {
-                            *cursor += 1;
-                            *result = None;
-                        }
-                        Ok(inner) => {
-                            let _ = pending.reply.send(Err(Error::AppRefused(format!(
-                                "room {} managed key-package continuation: {inner}",
-                                crate::node::link::b32_encode(&pending.ready.rooms[*cursor].room),
-                            ))));
-                            return;
-                        }
-                        Err(oneshot::error::TryRecvError::Empty) => {
-                            self.pending_policy = Some(Pending::ManagedDrive(pending));
-                            return;
-                        }
-                        Err(oneshot::error::TryRecvError::Closed) => {
-                            let _ = pending.reply.send(Err(Error::Profile(
-                                "managed key-package completion owner stopped",
-                            )));
-                            return;
-                        }
-                    }
-                }
-                if let Err(error) = pending.ready.guard.active(self.computer.as_ref()) {
-                    let _ = pending.reply.send(Err(error));
-                    return;
-                }
-                if *cursor == pending.ready.rooms.len() {
-                    let (sender, receiver) = oneshot::channel();
-                    self.begin_managed_owed_consents(
-                        Arc::clone(&save),
-                        pending.ready.guard.clone(),
-                        sender,
-                    )
-                    .await;
-                    pending.stage = DriveStage::Consents(receiver);
-                } else {
-                    let room = &pending.ready.rooms[*cursor];
-                    if !self
-                        .channels
-                        .get(&room.room)
-                        .is_some_and(|current| Arc::ptr_eq(current, &room.instance))
-                    {
-                        let _ = pending.reply.send(Err(Error::Profile(
-                            "managed room changed before key-package continuation",
-                        )));
-                        return;
-                    }
-                    room.instance.lock().await.release_held_packages();
-                    let (sender, receiver) = oneshot::channel();
-                    *result = Some(receiver);
-                    self.begin_owned_package_turn(room.room, Some(Arc::clone(&save)), Some(sender))
-                        .await;
-                }
-                false
-            }
-            DriveStage::Consents(receiver) => match receiver.try_recv() {
-                Ok(Ok(())) => {
-                    drop(save);
-                    self.finish_managed_policy(pending).await;
-                    return;
-                }
-                Ok(Err(error)) => {
-                    let _ = pending.reply.send(Err(error));
-                    return;
-                }
-                Err(oneshot::error::TryRecvError::Empty) => {
-                    self.pending_policy = Some(Pending::ManagedDrive(pending));
-                    return;
-                }
-                Err(oneshot::error::TryRecvError::Closed) => {
-                    let _ = pending.reply.send(Err(Error::Profile(
-                        "managed consent completion owner stopped",
-                    )));
-                    return;
-                }
-            },
-        };
-        self.pending_policy = Some(Pending::ManagedDrive(pending));
-        // A stage transition or immediate terminal refusal is a real causal edge. Native
-        // completions use this SAME wake; no timer or elapsed-time refresh is introduced.
-        if next {
-            self.post_save_wake.notify_one();
-        }
-    }
-
-    async fn finish_managed_policy(&mut self, pending: ManagedDrive) {
-        let result = pending.ready.guard.active(self.computer.as_ref());
-        if result.is_ok() {
-            self.computer_expired = pending.ready.expired;
-            self.computer_revision
-                .store(pending.ready.revision, std::sync::atomic::Ordering::Release);
-            self.publish_computer_trust_projection();
-            self.publish().await;
-            self.governance_work.resume_after_computer_policy();
-            self.resume_interrupted_governance();
-            self.resume_own_key_interruptions();
-            self.resume_own_key_donor_busy();
-            self.resume_own_key_policy_waiting();
-            self.ready_parked_construction();
-        }
-        let rooms = pending
-            .ready
-            .rooms
-            .iter()
-            .map(|room| (room.room, Arc::clone(&room.instance)))
-            .collect::<Vec<_>>();
-        let guard = pending.ready.guard.clone();
-        let expired = pending.ready.expired;
-        release_rooms(&pending.ready.rooms, result.is_err()).await;
-        drop(pending.ready);
-        let applied = result.is_ok();
-        if applied && !expired {
-            for (room, instance) in rooms {
-                if self
-                    .channels
-                    .get(&room)
-                    .is_some_and(|current| Arc::ptr_eq(current, &instance))
-                {
-                    self.ingress_room_progress(room, session_save::IngressProgress::Authority);
-                    self.begin_owned_private_drive(room, false, Some(guard.clone()), None, None)
-                        .await;
-                }
-            }
-        }
-        let _ = pending.reply.send(result);
+        // Room withdrawals keep their existing durable PendingLocks and run independently.
+        drop(lifetime);
+        self.computer_expired = expired;
+        self.computer_revision
+            .store(revision, std::sync::atomic::Ordering::Release);
+        self.publish_computer_trust_projection();
+        self.governance_work.pending = true;
+        self.governance_work.again = true;
+        self.redeliver_now = true;
+        self.governance_work.resume_after_computer_policy();
+        self.resume_interrupted_governance();
+        self.resume_own_key_interruptions();
+        self.resume_own_key_donor_busy();
+        self.resume_own_key_policy_waiting();
+        self.ready_parked_construction();
+        self.publish().await;
+        let _ = work.reply.send(Ok(()));
     }
 }
 
 impl Node {
-    /// Called from the existing OwnKeyUntrustReady branch AFTER its exact room-set and send-gate
-    /// drain check. It consumes the ORIGINAL command, proof, secret lease and journal admission.
+    /// Consume the original command, proof, secret lease and journal admission.
     pub(super) async fn begin_owned_untrust(
         &mut self,
         command: NodeCommand,
         reply: oneshot::Sender<Outcome>,
         secret: own_keys::SecretLease,
         journal: Option<crate::node::computer::ComputerJournalWriter>,
-        transitions: Vec<crate::node::channel::own_writer_gate::Transition>,
     ) {
         if self.computer_change_refused(&command) {
             let _ = reply.send(Outcome::Failed(Fault::ComputerPolicy));
@@ -1650,7 +682,6 @@ impl Node {
             })),
             transition: None,
             journal,
-            own_transitions: transitions,
         };
         self.begin_pending_policy(
             Policy::Untrust { target },
@@ -1690,7 +721,6 @@ impl Node {
                     save: None,
                     transition: None,
                     journal: None,
-                    own_transitions: Vec::new(),
                 },
                 reply,
             },
@@ -1735,7 +765,6 @@ impl Node {
                     save: None,
                     transition: None,
                     journal: None,
-                    own_transitions: Vec::new(),
                 },
                 Some(reply),
             )
@@ -1751,7 +780,6 @@ impl Node {
                     save: None,
                     transition: None,
                     journal: None,
-                    own_transitions: Vec::new(),
                 },
                 fingerprint,
                 name,
@@ -1762,14 +790,12 @@ impl Node {
         .await;
     }
 
-    /// The original accepted Computer work, send-gate drain and exclusive transition are moved
-    /// here from apply_owned_computer_policy. No binding/journal/keyring fsync occurs on actor.
+    /// Move the accepted Computer work and exclusive transition to the native worker.
     pub(super) async fn begin_owned_computer_policy(
         &mut self,
-        mut work: computer::OwnKeyPolicyWork,
+        work: computer::OwnKeyPolicyWork,
         secret: own_keys::SecretLease,
         transition: crate::node::computer::ComputerPublicationTransition,
-        transitions: Vec<crate::node::channel::own_writer_gate::Transition>,
     ) {
         if self
             .computer
@@ -1780,7 +806,7 @@ impl Node {
             return;
         }
         if self.profile.is_none() && self.headless.is_some() {
-            self.begin_headless_policy(work, secret, transition, transitions);
+            self.begin_headless_policy(work, secret, transition);
             return;
         }
         let transition = Arc::new(transition);
@@ -1797,18 +823,6 @@ impl Node {
             let plan = computer
                 .plan(node)?
                 .ok_or(Error::ComputerPolicySuperseded)?;
-            let removed: Vec<_> = plan
-                .denied
-                .iter()
-                .copied()
-                .filter(|peer| self.trust.is_trusted(peer))
-                .collect();
-            if removed
-                .iter()
-                .any(|peer| work.targets.binary_search(peer).is_err())
-            {
-                return Err(Error::OwnKeyWriterDrainRequired(removed));
-            }
             let aliases = plan
                 .grants
                 .iter()
@@ -1854,30 +868,17 @@ impl Node {
                 })),
                 transition: None,
                 journal: None,
-                own_transitions: transitions,
             };
             Ok((native, lifetime))
         })();
         match prepared {
-            Ok((mut native, lifetime)) => {
-                for room in self.channels.values() {
-                    native.floor = native.floor.max(room.lock().await.newest_mint_seq());
-                }
+            Ok((native, lifetime)) => {
                 self.begin_pending_policy(
                     Policy::Managed(native),
-                    PolicyContinuation::Managed {
-                        lifetime,
-                        work,
-                        reservations: Vec::new(),
-                    },
+                    PolicyContinuation::Managed { lifetime, work },
                     None,
                 )
                 .await;
-            }
-            Err(Error::OwnKeyWriterDrainRequired(targets)) => {
-                work.targets = targets;
-                self.own_key_computer_pending.push_front(work);
-                self.post_save_wake.notify_one();
             }
             Err(error) => {
                 let _ = work.reply.send(Err(error));
@@ -1922,7 +923,6 @@ impl Node {
                     save: None,
                     transition: None,
                     journal: None,
-                    own_transitions: Vec::new(),
                 },
             },
             Some(reply),
@@ -1932,14 +932,7 @@ impl Node {
 }
 
 async fn finish_detached_policy(returned: Returned, reply: Reply) {
-    release_rooms(&returned.rooms, true).await;
-    let completed = match returned.completed {
-        NativeOutcome::Completed(completed) => completed,
-        NativeOutcome::Blocked(_) => {
-            finish_rejected_policy(returned.continuation, Error::AtRestLocked, reply);
-            return;
-        }
-    };
+    let completed = returned.completed;
     match (completed, returned.continuation) {
         (
             Ok(PolicyCompleted::Recorded),
@@ -1987,13 +980,8 @@ async fn finish_detached_policy(returned: Returned, reply: Reply) {
         }
         (
             Ok(PolicyCompleted::Managed(completed)),
-            PolicyContinuation::Managed {
-                work,
-                lifetime,
-                reservations,
-            },
+            PolicyContinuation::Managed { work, lifetime },
         ) => {
-            release_rooms(&reservations, true).await;
             let error = completed.result.err().unwrap_or(Error::Profile(
                 "managed policy committed a prefix before retirement",
             ));

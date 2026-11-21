@@ -1361,6 +1361,7 @@ pub struct ChannelState {
     legacy_preparation: entry_store::Preparation,
     /// Current local trust used only to filter accepted-cache recovery reads.
     legacy_cache_trusted: Option<BTreeSet<Digest32>>,
+    trust_reconciled_generation: u64,
     /// Bounded cursors over retained key-package log rows and admitted-author drive hints.
     /// The actor opens one returned package at a time using its prekey ring.
     key_packages: key_package_queue::Queue,
@@ -2315,6 +2316,7 @@ impl ChannelState {
             entries,
             legacy_preparation: entry_store::Preparation::Ready,
             legacy_cache_trusted: None,
+            trust_reconciled_generation: 0,
             key_packages: key_package_queue::Queue::new(1),
             receivers: BTreeMap::new(),
             services: BTreeMap::new(),
@@ -2957,6 +2959,7 @@ impl ChannelState {
             entries,
             legacy_preparation,
             legacy_cache_trusted: None,
+            trust_reconciled_generation: 0,
             key_packages,
             receivers,
             services,
@@ -3449,6 +3452,7 @@ impl ChannelState {
             entries,
             legacy_preparation: entry_store::Preparation::Ready,
             legacy_cache_trusted: None,
+            trust_reconciled_generation: 0,
             key_packages: key_package_queue::Queue::new(1),
             receivers: BTreeMap::new(),
             services: BTreeMap::new(),
@@ -4403,6 +4407,7 @@ impl ChannelState {
     /// before enqueueing its delivery over a `pairwise` stream
     /// ([`crate::node::pairwise_stream`]).
     pub fn skdm_for_consent(&self, profile: &Profile) -> Result<Skdm> {
+        self.require_trust_withdrawn(profile.store(), profile.signer()?)?;
         self.require_legacy_current(profile.store())?;
         if self.poisoned {
             return Err(self.save_failure());
@@ -4780,6 +4785,7 @@ impl ChannelState {
     /// unrecoverable and the only honest release is the current position, exactly as
     /// [`ChannelState::skdm_for_consent`] does.
     pub fn rekey_skdm(&self, profile: &Profile) -> Result<Skdm> {
+        self.require_trust_withdrawn(profile.store(), profile.signer()?)?;
         self.require_legacy_current(profile.store())?;
         if self.poisoned {
             return Err(self.save_failure());
@@ -5360,6 +5366,7 @@ impl ChannelState {
         chain_id: u64,
         iteration: u64,
     ) -> Result<Skdm> {
+        self.require_trust_withdrawn(profile.store(), profile.signer()?)?;
         self.require_legacy_current(profile.store())?;
         if self.poisoned {
             return Err(self.save_failure());
@@ -5400,6 +5407,7 @@ impl ChannelState {
     /// # Errors
     /// No signer, or a generation that cannot be released.
     pub fn rekey_skdm_for(&self, profile: &Profile, target: &Digest32) -> Result<Skdm> {
+        self.require_trust_withdrawn(profile.store(), profile.signer()?)?;
         self.require_legacy_current(profile.store())?;
         if self.poisoned {
             return Err(self.save_failure());

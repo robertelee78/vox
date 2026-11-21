@@ -496,6 +496,16 @@ impl Node {
             self.wait_owned_consent(room, continuation, reply).await;
             return;
         }
+        let checked = continuation
+            .instance
+            .lock()
+            .await
+            .require_trust_withdrawn(&lifetime.store, lifetime.signer.as_ref());
+        if let Err(error) = checked {
+            self.fail_owned_consent(room, error, continuation, reply)
+                .await;
+            return;
+        }
         let before = self.snapshot_legacy_session((room, continuation.target), true);
         let Some((frames, hello, session)) =
             self.frame_owned_legacy_key(room, continuation.target, &skdm, true)

@@ -334,10 +334,41 @@ impl Node {
             pending.owe_governance(&shared, self.delivery_epoch);
             return;
         }
-        let Ok(channel) = shared.try_lock() else {
+        let Ok(mut channel) = shared.try_lock() else {
             self.governance_work.again = true;
             return;
         };
+        let generation = self.trust_generation;
+        if !channel.trust_reconciled(generation)
+            && self.profile.as_ref().is_some_and(|profile| {
+                channel
+                    .require_governance_ready(profile.store(), self.now_ms())
+                    .is_ok()
+            })
+        {
+            let trusted = self.trust.trusted();
+            channel.owe_private_support();
+            drop(channel);
+            let continuation = governance_save::Continuation::trust(
+                shared,
+                self.delivery_epoch,
+                trusted.clone(),
+                generation,
+            );
+            self.begin_pending_maintenance(
+                room,
+                maintenance_save::Work::Trust(trust_save::Work(
+                    crate::node::channel::pending_trust::TrustWrite::Delete {
+                        trusted,
+                        withdrawn: None,
+                    },
+                )),
+                maintenance_save::Continuation::Governance(continuation),
+                None,
+            )
+            .await;
+            return;
+        }
         drop(channel);
         let continuation = governance_save::Continuation::turn(shared, self.delivery_epoch);
         self.begin_pending_maintenance(

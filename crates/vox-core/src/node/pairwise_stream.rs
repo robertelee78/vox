@@ -355,6 +355,7 @@ pub async fn write_pairwise(
 /// Immutable authorization captured before a room-key delivery was queued.
 pub(crate) struct RoomSendFence {
     pub resource: std::sync::Arc<crate::node::channel::history::ReadResource>,
+    pub signer: std::sync::Weak<crate::atrest::vault::VaultRootSigner>,
     #[cfg(feature = "test-knobs")]
     pub store: std::sync::Arc<crate::node::store::Store>,
     pub room: crate::hash::Digest32,
@@ -417,10 +418,15 @@ pub(crate) async fn write_pairwise_fenced(
                         Err(error) => Poll::Ready(Err(error)),
                     };
                 }
-                match fence
-                    .resource
-                    .with_removal_fence(&fence.room, fence.generation, || write.as_mut().poll(cx))
-                {
+                let Some(signer) = fence.signer.upgrade() else {
+                    return Poll::Ready(Err(Error::AtRestLocked));
+                };
+                match fence.resource.with_removal_fence(
+                    &fence.room,
+                    fence.generation,
+                    Some(signer.as_ref()),
+                    || write.as_mut().poll(cx),
+                ) {
                     Some(result) => result,
                     None => Poll::Ready(Err(Error::StreamRefused("room authorization changed"))),
                 }

@@ -41,6 +41,9 @@ optional_proof::not_run!(
     computer_pairing_uses_an_anchor_without_room_membership_and_reconnects,
     computer_preview_and_approval_survive_a_crash,
     two_paired_computers_that_are_idle_exchange_nothing,
+    a_trust_change_skips_a_left_room_and_additions_refuse_no_posts,
+    an_unfinished_room_refuses_only_its_own_posts_then_finishes,
+    an_unfinished_room_releases_no_key_until_its_withdrawal_finishes,
 );
 
 use std::io::{Read as _, Write as _};
@@ -4342,6 +4345,449 @@ fn a_kept_node_is_reached_again_at_its_address_after_a_restart() {
         m_read && a_read,
         "PRODUCT: after the restart the member read the node = {m_read}, the node read the \
          member = {a_read}\nlog:\n{log}"
+    );
+}
+
+/// RG-3 uses the ordinary three-computer trust journey, with only one room's withdrawal held.
+#[cfg(feature = "optional-proofs")]
+struct RoomTrustJourney {
+    a: Account,
+    b: Account,
+    c: Account,
+    _daemons: Vec<Daemon>,
+    beta: String,
+    beta_computer: String,
+    room: String,
+    healthy: String,
+    link: String,
+    hold: PathBuf,
+}
+
+#[cfg(feature = "optional-proofs")]
+impl RoomTrustJourney {
+    fn new(pair_gamma: bool) -> Self {
+        let a = Account::new();
+        let b = Account::new();
+        let c = Account::new();
+        let alpha = a.make_node("alpha");
+        let beta = b.make_node("beta");
+        let gamma = c.make_node("gamma");
+        let hold = a.data.join("rg3-withdrawal");
+        let daemons = vec![
+            Daemon::start(
+                &a,
+                &[],
+                &[("VOX_TEST_RG3_HOLD_WITHDRAWAL", hold.to_str().unwrap())],
+            ),
+            Daemon::start(&b, &[], &[]),
+            Daemon::start(&c, &[], &[]),
+        ];
+        for (account, node) in [(&a, "alpha"), (&b, "beta"), (&c, "gamma")] {
+            let (ok, out, err) =
+                account.run(&["node", "unlock", node, "--passphrase-file", "-"], PASS);
+            assert!(ok, "APPARATUS: unlock {node}: {out}{err}");
+            computer(account, &["personal", node]);
+        }
+        for peer in [&b].into_iter().chain(pair_gamma.then_some(&c)) {
+            let offer = computer(&a, &["invite"]);
+            let preview = computer(
+                peer,
+                &["pair", offer["invite_link"].as_str().unwrap(), "--preview"],
+            );
+            let operation = preview["pairing"]["operation_id"].as_str().unwrap();
+            computer(peer, &["approve", operation]);
+            computer(&a, &["approve", operation]);
+            assert!(
+                wait_until(CHANGE_SHOWN_WITHIN, || {
+                    computer(&a, &["status"])["state"] == "confirmed"
+                        && computer(peer, &["status"])["state"] == "confirmed"
+                }),
+                "APPARATUS: paired-computer enrollment did not settle: {} / {}",
+                computer(&a, &["status"]),
+                computer(peer, &["status"])
+            );
+        }
+        if !pair_gamma {
+            // The held-room claims need a trusted requester, not a third policy writer that
+            // can replace the just-saved revision while its withdrawal is intentionally held.
+            for (account, node, peer, name) in [
+                (&a, "alpha", &gamma, "gamma"),
+                (&c, "gamma", &alpha, "alpha"),
+            ] {
+                let (ok, out, err) =
+                    account.run(&["trust", "add", peer, "--name", name, "--node", node], "");
+                assert!(ok, "APPARATUS: trust independent key requester: {out}{err}");
+            }
+        }
+        let room = make_room(&a, "alpha");
+        let (ok, out, err) = a.run(&["room", "link", &room, "--node", "alpha"], "");
+        assert!(ok, "APPARATUS: room link: {out}{err}");
+        let link = out
+            .lines()
+            .find(|line| line.starts_with("vox://"))
+            .unwrap()
+            .to_owned();
+        let (ok, out, err) = b.run(
+            &[
+                "room",
+                "join",
+                &link,
+                "--node",
+                "beta",
+                "--passphrase-file",
+                "-",
+            ],
+            ROOM_PASS,
+        );
+        assert!(ok, "APPARATUS: beta joins before withdrawal: {out}{err}");
+        let (ok, out, err) = a.run(
+            &[
+                "room",
+                "create",
+                "--node",
+                "alpha",
+                "--name",
+                "healthy",
+                "--passphrase-file",
+                "-",
+            ],
+            ROOM_PASS,
+        );
+        assert!(ok, "APPARATUS: second room create: {out}{err}");
+        let (ok, out, err) = a.run(&["room", "list", "--node", "alpha"], "");
+        assert!(ok, "APPARATUS: list second room: {out}{err}");
+        let healthy = out
+            .lines()
+            .find(|line| line.contains("healthy"))
+            .and_then(|line| line.split_whitespace().next())
+            .expect("APPARATUS: healthy room missing from room list")
+            .to_owned();
+        let beta_computer = computer_id(&b);
+        // A settled delivery proves beta really has alpha's pre-withdrawal sender key.
+        let before = "rg3-before-withdrawal";
+        let (ok, out, err) = a.run(&["room", "post", &room, before, "--node", "alpha"], "");
+        assert!(ok, "APPARATUS: pre-withdrawal post: {out}{err}");
+        assert!(
+            wait_until(RETURN_WITHIN, || {
+                b.run(&["room", "read", &room, "--node", "beta"], "")
+                    .1
+                    .contains(before)
+            }),
+            "APPARATUS: beta never obtained the pre-withdrawal sender key"
+        );
+        Self {
+            a,
+            b,
+            c,
+            _daemons: daemons,
+            beta,
+            beta_computer,
+            room,
+            healthy,
+            link,
+            hold,
+        }
+    }
+
+    fn remove_beta(&self) {
+        let frontier = computer(&self.a, &["status"])["frontier"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        computer(
+            &self.a,
+            &["remove", &self.beta_computer, "--confirm", &frontier],
+        );
+        assert!(
+            wait_until(CHANGE_SHOWN_WITHIN, || {
+                grant_words(&self.a, "alpha", &self.beta).is_none()
+            }),
+            "APPARATUS: the removal never reached alpha's saved keyring"
+        );
+    }
+
+    fn hold_withdrawal(&self) {
+        std::fs::write(&self.hold, full_room_id(&self.link, &self.room)).unwrap();
+        self.remove_beta();
+        let engaged = self.hold.with_extension("engaged");
+        read_daemon_marker(
+            &engaged,
+            self.a.lock_pid().expect("APPARATUS: alpha daemon PID"),
+            "RG-3 withdrawal hold",
+        );
+        self.assert_current();
+    }
+
+    fn assert_current(&self) {
+        loop {
+            let status = computer(&self.a, &["status"]);
+            let local = &status["this_computer"]["fingerprint"];
+            let current = status["applications"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|application| {
+                    application["computer"]["fingerprint"] == *local
+                        && application["confirmed"] == true
+                });
+            if current {
+                return;
+            }
+            // The group-wide state also waits for other computers. Judge this node at its
+            // held room boundary, or its reported left-room failure, not remote convergence.
+            let left_failed = status["pending_nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|pending| {
+                    pending.as_str().is_some_and(|words| {
+                        words.starts_with("alpha:") && words.contains("has left the room")
+                    })
+                });
+            assert!(
+                !self.hold.with_extension("engaged").is_file() && !left_failed,
+                "PRODUCT: alpha's saved keyring is not current at its unfinished-room boundary: {status}"
+            );
+        }
+    }
+
+    fn assert_healthy_posts(&self, text: &str) {
+        let (ok, out, err) = self.a.run(
+            &["room", "post", &self.healthy, text, "--node", "alpha"],
+            "",
+        );
+        assert!(
+            ok,
+            "PRODUCT: a different room was refused by trust withdrawal: {out}{err}"
+        );
+        let (ok, shown, err) = self
+            .a
+            .run(&["room", "read", &self.healthy, "--node", "alpha"], "");
+        assert!(
+            ok && shown.contains(text),
+            "PRODUCT: the accepted other-room post was not readable: {shown}{err}"
+        );
+    }
+}
+
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "three real computers; release with test-knobs,optional-proofs"]
+fn a_trust_change_skips_a_left_room_and_additions_refuse_no_posts() {
+    watchdog::arm();
+    let journey = RoomTrustJourney::new(true);
+    // Keep the departed room hidden until beta can acknowledge the departure.
+    stop_pid(journey._daemons[1].child.id());
+    let (ok, out, err) = journey
+        .a
+        .run(&["room", "leave", &journey.room, "--node", "alpha"], "");
+    assert!(
+        ok,
+        "APPARATUS: alpha leaves the room holding beta: {out}{err}"
+    );
+    journey.remove_beta();
+    journey.assert_current();
+    // The removed computer's node is still an admitted member of the retained left room.
+    let delta = journey.c.make_node("delta");
+    let (ok, out, err) = journey
+        .c
+        .run(&["node", "unlock", "delta", "--passphrase-file", "-"], PASS);
+    assert!(
+        ok,
+        "APPARATUS: create a new node on the other paired computer: {out}{err}"
+    );
+    assert!(
+        wait_until(CHANGE_SHOWN_WITHIN, || {
+            grant_words(&journey.a, "alpha", &delta).is_some()
+        }),
+        "PRODUCT: the saved keyring never adopted the new paired node"
+    );
+    journey.assert_current();
+    journey.assert_healthy_posts("rg3-left-room-does-not-block");
+    for index in 0..3 {
+        let node = format!("plain-{index}");
+        journey.c.make_node(&node);
+        let mut attach = journey
+            .c
+            .cmd(&["node", "unlock", &node, "--passphrase-file", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        attach
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(PASS.as_bytes())
+            .unwrap();
+        journey.assert_healthy_posts(&format!("rg3-grant-only-{index}"));
+        let output = attach.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "PRODUCT: paired node attach failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let (ok, out, err) = journey
+            .a
+            .run(&["room", "link", &journey.healthy, "--node", "alpha"], "");
+        assert!(
+            ok,
+            "PRODUCT: grant-only policy left permissions unavailable: {out}{err}"
+        );
+    }
+    eprintln!("RG-3 GREEN: departed room owes nothing; paired-node additions refuse no posts or room link");
+}
+
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "causally held withdrawal; release with test-knobs,optional-proofs"]
+fn an_unfinished_room_refuses_only_its_own_posts_then_finishes() {
+    watchdog::arm();
+    test_knobs::require(&["VOX_TEST_RG3_HOLD_WITHDRAWAL"]);
+    let journey = RoomTrustJourney::new(false);
+    journey.hold_withdrawal();
+    journey.assert_healthy_posts("rg3-other-room-during-withdrawal");
+    let text = "rg3-must-not-be-posted-before-withdrawal";
+    let (ok, out, err) = journey.a.run(
+        &["room", "post", &journey.room, text, "--node", "alpha"],
+        "",
+    );
+    assert!(!ok && format!("{out}{err}").contains("this room's trust withdrawal is incomplete"),
+        "PRODUCT: unfinished room did not refuse its own post with its withdrawal reason: ok={ok}; {out}{err}");
+    let (ok, out, err) = journey
+        .b
+        .run(&["room", "read", &journey.room, "--node", "beta"], "");
+    assert!(
+        ok && !out.contains(text),
+        "PRODUCT: withdrawn node read a post made during unfinished withdrawal: {out}{err}"
+    );
+    std::fs::remove_file(&journey.hold).unwrap();
+    let after = "rg3-after-room-withdrawal";
+    let mut last = (false, String::new(), String::new());
+    assert!(wait_until(RETURN_WITHIN, || {
+        last = journey.a.run(&["room", "post", &journey.room, after, "--node", "alpha"], "");
+        last.0
+    }), "PRODUCT: releasing the room did not finish its existing withdrawal without another policy event: {}{}",
+        last.1, last.2);
+    let (ok, shown, err) = journey
+        .b
+        .run(&["room", "read", &journey.room, "--node", "beta"], "");
+    assert!(
+        ok && !shown.contains(after),
+        "PRODUCT: removed computer read a post encrypted after withdrawal: {shown}{err}"
+    );
+    eprintln!("RG-3 GREEN: only the unfinished room refused posts; withdrawal resumed without restart or policy event");
+}
+
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "causally held withdrawal; release with test-knobs,optional-proofs"]
+fn an_unfinished_room_releases_no_key_until_its_withdrawal_finishes() {
+    watchdog::arm();
+    test_knobs::require(&["VOX_TEST_RG3_HOLD_WITHDRAWAL"]);
+    let journey = RoomTrustJourney::new(false);
+    // Gamma was trusted before the marker but has never joined or received a sender key.
+    journey.hold_withdrawal();
+    journey.assert_healthy_posts("rg3-key-request-does-not-block-other-room");
+    let (ok, out, err) = journey.c.run(
+        &[
+            "room",
+            "join",
+            &journey.link,
+            "--node",
+            "gamma",
+            "--passphrase-file",
+            "-",
+        ],
+        ROOM_PASS,
+    );
+    assert!(
+        ok,
+        "APPARATUS: trusted member could not join the held room to request its key: {out}{err}"
+    );
+    // Ten completed room exchanges prove the member keeps asking, rather than treating one
+    // empty immediate read as a key refusal. Each author acknowledgement is a product read.
+    for index in 0..10 {
+        let probe = format!("rg3-gamma-key-request-{index}");
+        let (ok, out, err) = journey.c.run(
+            &["room", "post", &journey.room, &probe, "--node", "gamma"],
+            "",
+        );
+        assert!(
+            ok,
+            "APPARATUS: key-requesting member could not post its probe: {out}{err}"
+        );
+        loop {
+            let (ok, shown, err) = journey
+                .a
+                .run(&["room", "read", &journey.room, "--node", "alpha"], "");
+            assert!(
+                ok,
+                "APPARATUS: author could not acknowledge the member's probe: {shown}{err}"
+            );
+            if shown.contains(&probe) {
+                break;
+            }
+        }
+        let (ok, shown, err) = journey
+            .c
+            .run(&["room", "read", &journey.room, "--node", "gamma"], "");
+        assert!(ok && !shown.contains("rg3-before-withdrawal"),
+            "PRODUCT: unfinished room released its sender key before withdrawal finished: {shown}{err}");
+    }
+    std::fs::remove_file(&journey.hold).unwrap();
+    let mut received = false;
+    let mut last = (false, String::new(), String::new());
+    let mut last_post = (false, String::new(), String::new());
+    let mut accepted_posts = 0;
+    let after = "rg3-after-withdrawal-key-marker";
+    for index in 0..100 {
+        // Keep alpha's head fixed once its first post is accepted: this proves key delivery,
+        // not the separate moving-head history-fetch claim. Count completed room exchanges.
+        if accepted_posts == 0 {
+            last_post = journey.a.run(
+                &["room", "post", &journey.room, after, "--node", "alpha"],
+                "",
+            );
+            accepted_posts += usize::from(last_post.0);
+        }
+        let probe = format!("rg3-after-withdrawal-key-request-{index}");
+        let (ok, out, err) = journey.c.run(
+            &["room", "post", &journey.room, &probe, "--node", "gamma"],
+            "",
+        );
+        assert!(ok, "APPARATUS: key request probe was refused: {out}{err}");
+        loop {
+            let (ok, shown, err) = journey
+                .a
+                .run(&["room", "read", &journey.room, "--node", "alpha"], "");
+            assert!(
+                ok,
+                "APPARATUS: key request acknowledgement refused: {shown}{err}"
+            );
+            if shown.contains(&probe) {
+                break;
+            }
+        }
+        last = journey
+            .c
+            .run(&["room", "read", &journey.room, "--node", "gamma"], "");
+        if last.0 && last.1.contains("rg3-before-withdrawal") && last.1.contains(after) {
+            received = true;
+            break;
+        }
+    }
+    if !received {
+        for (index, daemon) in journey._daemons.iter().enumerate() {
+            eprintln!("[RG-3 key failure] daemon {index}: {}", daemon.said());
+        }
+    }
+    assert!(received,
+        "PRODUCT: 100 room requests after release did not finish the withdrawal and deliver the owed key: accepted_posts={accepted_posts}; last_post={last_post:?}; reader={}{}",
+        last.1, last.2);
+    eprintln!(
+        "RG-3 GREEN: member received no key while withdrawal was held, then received its owed key"
     );
 }
 
