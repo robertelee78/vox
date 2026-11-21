@@ -87,3 +87,35 @@ This composition does not inherit unchanged fingerprints blindly: newer Ready/Lo
 behavior and app menu apparatus change relevant inputs. Those differences are reported,
 not concealed by rebinding old observations as new runtime evidence. No integration-only
 fixer-green replay is required or claimed.
+
+## Version and conversation identity proofs (ADR-052 RG-10)
+
+The targeted release proofs use private profiles and the shipped `vox` executable.
+`update_proof` takes `VOX_PROOF_NEXT_BINARY`, a genuinely compiled `test-knobs`
+`vox` with the workspace version's first character replaced by `9`; binary string
+patches are not a release fixture. Its two selected functions are:
+
+- `a_client_uses_another_package_version_with_the_same_control_protocol`
+- `a_claim_is_still_held_after_the_package_version_changes`
+
+`the_daemon_and_its_nodes_proof` runs the generated native extension through a
+Node.js event driver, with real Vox hooks and its availability watcher:
+
+- `a_conversation_refuses_a_rebuilt_node_under_the_same_name`
+- `a_conversation_reports_one_reconnecting_line_when_its_daemon_restarts`
+
+Run each explicitly with
+`cargo test --release -p vox-tui --features test-knobs --test FILE FUNCTION -- --ignored --exact --nocapture`
+under the execution environment's required build slot. The node-rebuild proof stops
+the old daemon before replacing the node directory; it does not prove safety of
+store rewriting across a replaced directory (RG-10 item 3).
+
+The former package-version refusal acts in `work_version_proof` are removed.
+`claims_use_their_rules_and_keep_the_v0430_package_stamp` reads the actual board
+after differently stamped signed claims: other claim rules have no effect, while
+the package-only `0.4.30` stamp still holds its claim. Operation/retry and renewal
+wire fixtures now carry the same `claims` stamp as the CLI. Their sending sessions
+are registered through the public hook before the operation acts. The separate
+`an_agent_session_is_checked_from_both_sides_proof::the_doctor_explains_incompatible_claim_rules`
+act expects advice about matching claim rules, not matching package versions; it
+does not depend on the full journey's Claude wiring or process-provenance staging.
