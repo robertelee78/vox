@@ -189,6 +189,116 @@ run** for the paging change, and blocks neither CI nor release. CI compiles it. 
 CARGO_BUILD_JOBS=2 cargo test --release -p vox-tui --features optional-proofs --test a_large_room_reads_whole_proof a_hundred_thousand_entry_session_opens_in_one_second_with_bounded_memory -- --ignored --exact --nocapture
 ```
 
+## Busy-room newcomer and paging (ADR-052 RG-1, #1315)
+
+`a_newcomer_reads_the_whole_history_proof` includes two variants of the same busy-room
+journey. They are optional while RG-2 through RG-4 remove the reproduced admission, trust
+and key-delivery failures; an optional red is not a release waiver. They use four scratch
+computer daemons (X hosts six earlier joiners and its personal sibling; Y hosts slow
+author `y1`; Z hosts fast author `z1`; W hosts a personal sibling and later `n-new`),
+one anchor process, and three OMP Session stand-ins, all on `y1` (no model). The paused
+variant checks the serving daemon's PID against its held daemon lock, observes its stopped process state,
+and pauses it for 1.5 seconds in every 3 seconds. The delayed variant isolates the slow
+member on IPv6 loopback, with its IPv4 anchor reached through the existing userspace
+forward; its only outgoing path delays each datagram 350 ms. It requires both the
+forward's probe and a product-reported RTT of at least 300 ms before the newcomer joins.
+
+The 3,000-row seed is split concurrently between `y1` and `z1`. X's personal node pairs
+its computer with Y, Z and W before the room is created on Y; no explicit all-pair trust
+is added. The three authors are `y1`, `z1`, and `n-old1` (the latter starts after its
+join). Three OMP Sessions on `y1` alternate 400-character user/reply steps at one per second.
+Every post is a separately started process, offered on a one-second schedule without
+waiting for the previous answer. Several posts can therefore be in flight against the slow
+member at once: this is a heavier load than the old rig, which waited for each answer,
+not merely a cadence difference. Offered times and acknowledged times are recorded
+separately; offered gaps must stay within 750–1250 ms. The slow author's acknowledgement
+lag is measured, not bounded. The slow condition is active before six earlier joins
+through fast `z1`, with ten seconds between the first five and thirty seconds after the sixth.
+W creates `n-new` only then; computer revisions and trust are sampled after two seconds,
+and it joins after eight seconds through a fresh fast-`z1` link. A refused join of any
+joiner is immediately recorded as RED PRODUCT, never a staging failure, and is not retried.
+Before ending, the proof attempts each remaining joiner once where the staging allows,
+including the newcomer, and reports `refused k of 7 joins` with every refusal's words.
+After admission every earlier member and the newcomer offers one post per second. The
+100-acknowledged-post red applies from each member to the newcomer and back to each member.
+The shared room apparatus strips inherited `PI_` and `OMP` session variables as well as
+the other harness markers; each stand-in supplies only its own Session environment.
+
+A recorded through-slow-member run refused `n-old2` after 44.5 seconds: the member paused
+1.5 seconds in every 3 seconds did not complete its exchange (`peer sent no complete frame
+in time`). Receipt: `/opt/vox-evidence/v0431/rg-1/review-r1/faithful-paused.log:13101-13108`.
+That observation is not the five-second seat-question veto RG-2 changes. The journey
+routes all earlier joiners and the newcomer through fast `z1` to exercise that distinct rule.
+On today's product the journey has also shown posts refused with `computer trust changed
+while this command was being applied` after the newcomer's node is created on a paired
+computer; this is RG-3's red on the journey.
+
+Run one named variant, in release, without `test-knobs`:
+
+```sh
+cargo test --release -p vox-tui --features optional-proofs \
+  --test a_newcomer_reads_the_whole_history_proof -- --ignored --exact \
+  a_busy_room_newcomer_reads_every_member_with_a_paused_member --nocapture
+
+cargo test --release -p vox-tui --features optional-proofs \
+  --test a_newcomer_reads_the_whole_history_proof -- --ignored --exact \
+  a_busy_room_newcomer_reads_every_member_with_a_delayed_path --nocapture
+```
+
+Set `VOX_PROOF_SHIPPED_BINARY` to the absolute path of an untouched release helper to
+drive that asset instead of Cargo's helper. Every process still gets scratch
+`VOX_DATA_DIR` and `VOX_CONFIG_DIR`. `VOX_PROOF_RG1_EVIDENCE` selects the existing
+directory under which scratch profiles are created; `VOX_PROOF_KEEP_DIRS=1` retains them.
+Capture stdout and stderr: receipts include every command, status and doctor snapshot,
+first-event marks counted in acknowledged posts, and every paging cursor. These marks are
+independent observations, not an assumed sequence of prerequisites:
+
+- `contiguous_verified`: status reports the author's verified contiguous position past
+  the marker's acknowledged feed fence. It can be false while a sparse copy is retained,
+  and says nothing about decryption or showability.
+- `mutual_room_trust`: the author's doctor reports mutual room trust. This is sufficient
+  evidence of the room grant being applied, but is not a prerequisite for a shown post.
+- `no_key_owed`: the author's status reports no sender-key delivery owed. This can mean
+  the room is unsettled or a package was committed but not fetched. It does **not**
+  establish that the recipient holds the key.
+- `shown`: the exact post is present in the recipient's real paged read. Only this mark
+  establishes that the person can read it.
+
+The red prints all observed and unobserved marks rather than choosing a “first missing”
+step from an assumed order. Both-ways completion depends on `shown` only; a lagging doctor
+or delivery report cannot keep an otherwise complete room from finishing.
+
+The reader follows the **stderr** `older messages not shown` footer until it finds the
+requested row or reaches the room's start. Its own real-binary self-check plants the
+first row in a 5,000-row room:
+
+```sh
+cargo test --release -p vox-tui --features optional-proofs \
+  --test a_newcomer_reads_the_whole_history_proof -- --ignored --exact \
+  the_busy_room_reader_finds_the_first_of_five_thousand_rows --nocapture
+```
+
+The named reader mutant is the same command with `VOX_PROOF_RG1_NO_PAGING=1`: it removes
+older-page reads in the proof, not the product, and must turn the first-row assertion red.
+The busy-room journey's apparatus failures say APPARATUS. A refused join quotes the
+product as RED PRODUCT and names the joining member; the final verdict counts refused joins.
+After admission, 100 acknowledged
+post-join posts with none displayed is RED PRODUCT in either direction, with all marks
+reported. The acknowledged post set is fixed by each offer's join phase, not a sliding
+newest-post window. GREEN additionally requires every member's post shown both ways and
+every acknowledged post on every member after the authors stop; errors from the final
+in-flight commands are checked after those commands finish. Pause-thread and serving-daemon
+liveness are checked before join verdicts, during the timeline and during convergence.
+After authors stop, ten answered `--history older` demands without a smaller missing-post
+set produce RED PRODUCT naming the member and a missing post. Sampler pages record even
+refused reads without deciding the verdict or stopping the sampler.
+No elapsed watchdog decides a product verdict.
+
+For the shipped-v0.4.30 admission reproduction, add `VOX_PROOF_STEP=admission`. A refused
+join is still RED PRODUCT; if all six earlier joiners and the newcomer are admitted, that
+run stops with `NO RESULT` and its receipt must be reported for an owner decision. Omit
+that selector for the full post-admission journey on a candidate.
+
 ## The proofs
 
 ### Live model (needs `opencode` on PATH, logged in: `~/.local/share/opencode/auth.json`)
