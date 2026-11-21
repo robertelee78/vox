@@ -15,7 +15,7 @@
 //!
 //! - a room with other members and no new sync entries in [`STALE_SYNC_MS`] while nobody is
 //!   connected or a connected member advertises at least twenty feed entries not held here;
-//! - a connected member advertising at least twenty feed entries beyond its verified head here;
+//! - a connected member advertising at least twenty entries beyond its current live-window receipt basis;
 //! - a **trusted** member of an open room this node was connected to and no longer is;
 //! - an **anchor** this node keeps that it has not reached for [`ANCHOR_UNREACHABLE_MS`], while
 //!   this node needs one. An anchor only bridges hosts that cannot otherwise find each other
@@ -124,18 +124,23 @@ pub struct MemberStatus {
     pub holds_through: Option<u64>,
     /// Authenticated header position only; it may have no showable message body.
     pub verified_through: Option<u64>,
+    /// Receipt basis in this member's current live window, excluding on-demand archive gaps.
+    pub live_held_through: u64,
     /// Whether this member is still owed, or is actively being sent, any generation of this
     /// node's sender key in this room.
     pub key_delivery_pending: bool,
 }
 
 impl MemberStatus {
+    /// Count advertised feed positions not held in the selected live window, not older
+    /// on-demand history. Held bodies that cannot be decrypted are instead named by
+    /// `key_waits` (and `key_delivery_pending`) per member; this adds no message counter.
     fn not_receiving(&self) -> bool {
         !self.me
             && self.connected
-            && self.advertised_through.is_some_and(|advertised| {
-                advertised.saturating_sub(self.verified_through.unwrap_or(0)) >= 20
-            })
+            && self
+                .advertised_through
+                .is_some_and(|advertised| advertised.saturating_sub(self.live_held_through) >= 20)
     }
 }
 
@@ -204,7 +209,7 @@ pub struct RoomStatus {
 }
 
 impl RoomStatus {
-    /// A connected member advertises at least twenty feed entries beyond what this node holds.
+    /// A connected member advertises at least twenty entries beyond its current live-window receipt basis.
     #[must_use]
     pub fn not_receiving(&self) -> bool {
         self.members.iter().any(MemberStatus::not_receiving)
@@ -409,11 +414,11 @@ impl StatusReport {
                 out.push(Unhealthy {
                     key: format!("room-not-receiving:{}", b32_encode(&room.id)),
                     message: format!(
-                        "room {} ({}): not receiving from connected member {}; holds verified feed through entry {}, member advertised through entry {} (at least {} entries not held); check that member's vox status and daemon log",
+                        "room {} ({}): not receiving from connected member {}; live-window receipt basis through entry {}, member advertised through entry {} (at least {} live entries not held); check that member's vox status and daemon log",
                         short(&room.id), room.name, short(&member.id),
-                        member.verified_through.unwrap_or(0),
+                        member.live_held_through,
                         member.advertised_through.unwrap_or(0),
-                        member.advertised_through.unwrap_or(0).saturating_sub(member.verified_through.unwrap_or(0)),
+                        member.advertised_through.unwrap_or(0).saturating_sub(member.live_held_through),
                     ),
                 });
             }
@@ -555,7 +560,7 @@ impl StatusReport {
         let rooms = self.rooms.iter().map(|r| {
             let members = r.members.iter().map(|m| {
                 format!(
-                    "{{\"id\":{},\"me\":{},\"trusted\":{},\"connected\":{},\"daemon_answered\":{},\"advertised_through\":{},\"last_seen_ms\":{},\"last_sync_ms\":{},\"key_waits\":{},\"held_through\":{},\"holds_through\":{},\"verified_through\":{},\"key_delivery_pending\":{}}}",
+                    "{{\"id\":{},\"me\":{},\"trusted\":{},\"connected\":{},\"daemon_answered\":{},\"advertised_through\":{},\"last_seen_ms\":{},\"last_sync_ms\":{},\"key_waits\":{},\"held_through\":{},\"holds_through\":{},\"verified_through\":{},\"live_held_through\":{},\"key_delivery_pending\":{}}}",
                     q(&b32_encode(&m.id)),
                     m.me,
                     m.trusted,
@@ -568,6 +573,7 @@ impl StatusReport {
                     opt(m.held_through),
                     opt(m.holds_through),
                     opt(m.verified_through),
+                    m.live_held_through,
                     m.key_delivery_pending
                 )
             });

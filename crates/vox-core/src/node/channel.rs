@@ -8757,10 +8757,38 @@ impl ChannelState {
         self.held.get(member).copied()
     }
 
-    /// Authenticated header position, not a claim that any message can be shown.
-    pub(crate) fn verified_through(&self, member: &Digest32) -> Option<u64> {
-        let through = self.dag.verified_head(member);
-        (through != 0).then_some(through)
+    /// Read the existing sparse live-window basis alongside the contiguous prefix.
+    /// Explicit archive pages do not select a live window, so old gaps stay out of demand.
+    pub(crate) fn feed_coverage(
+        &self,
+        store: &Store,
+        members: &[Digest32],
+    ) -> Result<Vec<crate::node::api::FeedCoverage>> {
+        let read = self.entries.read(store, &self.sek, &self.channel_id)?;
+        let me = self.me();
+        let mut coverage = Vec::with_capacity(members.len());
+        for member in members {
+            let verified = self.dag.verified_head(member);
+            let live = if *member == me {
+                None
+            } else {
+                read.sparse_author(member, crate::log::history::LogScope::Public)?
+                    .and_then(|state| state.live)
+            };
+            let live_held_through = live.map_or(verified, |window| {
+                if window.complete() {
+                    window.through
+                } else {
+                    verified.max(window.from.saturating_sub(1))
+                }
+            });
+            coverage.push(crate::node::api::FeedCoverage {
+                member: *member,
+                verified_through: (verified != 0).then_some(verified),
+                live_held_through,
+            });
+        }
+        Ok(coverage)
     }
 
     /// Latest message this node can show for each member. Authenticated headers and

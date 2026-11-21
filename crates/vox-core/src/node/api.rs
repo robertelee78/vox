@@ -623,6 +623,17 @@ pub enum GovernancePage {
     },
 }
 
+/// Feed positions already kept for one member, projected together for status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeedCoverage {
+    /// The member whose feed these positions describe.
+    pub member: Digest32,
+    /// The contiguous-from-entry-one prefix; older on-demand gaps stop it.
+    pub verified_through: Option<u64>,
+    /// Receipt basis in the current live window, excluding older on-demand gaps.
+    pub live_held_through: u64,
+}
+
 /// An open channel's full state for display.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelDetail {
@@ -739,8 +750,8 @@ pub struct ChannelDetail {
     pub held_through: Vec<(Digest32, u64)>,
     /// Latest rendered message position this node can show for each member.
     pub holds_through: Vec<(Digest32, u64)>,
-    /// Authenticated header positions, without a claim that their messages can be shown.
-    pub verified_through: Vec<(Digest32, u64)>,
+    /// Contiguous-prefix and current-live-window receipt positions, not message counts.
+    pub feed_coverage: Vec<FeedCoverage>,
     /// What this node's person has not read here, oldest first
     /// ([`crate::node::channel::ChannelState::unread`]): what a client counts at its start.
     pub unread: Vec<Digest32>,

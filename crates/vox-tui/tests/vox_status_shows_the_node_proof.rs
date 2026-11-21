@@ -1182,15 +1182,25 @@ fn non_message_feed_entries_and_expired_messages_do_not_report_missing_history()
         std::thread::sleep(Duration::from_millis(100));
     }
     // Governance entries have no shown message position either.
-    for n in 0..25 {
-        let (ok, out, err) = vox_once(
-            &w.host_dir,
-            &args(&["room", "rename", &w.room, &format!("policy-only-{n:02}")]),
+    let change = |argv: &[&str]| loop {
+        let (ok, out, err) = vox_once(&w.host_dir, &args(argv));
+        if ok {
+            break;
+        }
+        // A refused, unchanged request is safe to stage again after the earlier change.
+        assert!(
+            (out.contains("a previous change to this room is still being applied")
+                || err.contains("a previous change to this room is still being applied"))
+                && (out.contains("this request made no change")
+                    || err.contains("this request made no change")),
+            "APPARATUS: staging room change {argv:?} failed: {out}{err}"
         );
-        assert!(ok, "APPARATUS: rename room: {out}{err}");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    for n in 0..25 {
+        change(&["room", "rename", &w.room, &format!("policy-only-{n:02}")]);
     }
-    let (ok, out, err) = vox_once(&w.host_dir, &args(&["room", "retention", &w.room, "1"]));
-    assert!(ok, "APPARATUS: set retention: {out}{err}");
+    change(&["room", "retention", &w.room, "1"]);
     loop {
         let current = status_json(&w.guest_dir, "reader");
         let member = current["rooms"][0]["members"]
@@ -1220,4 +1230,159 @@ fn non_message_feed_entries_and_expired_messages_do_not_report_missing_history()
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+#[test]
+#[ignore = "real binaries and a sparse 180-post room; run in release"]
+fn a_newcomer_with_the_live_window_does_not_owe_the_archive_in_status() {
+    sparse_live_window_reads_healthy(false);
+}
+
+#[test]
+#[ignore = "real binaries and an offline reader across 180 posts; run in release"]
+fn an_offline_reader_caught_up_to_the_live_window_reads_healthy() {
+    sparse_live_window_reads_healthy(true);
+}
+
+/// The archive is deliberately never requested. The verdict is the reader's real status,
+/// after it shows the newest 120 posts and completes three more room exchanges.
+fn sparse_live_window_reads_healthy(offline: bool) {
+    use vox_core::node::ipc::{Frame, Request};
+    struct ReaderDaemon<'a>(&'a std::path::Path);
+    impl Drop for ReaderDaemon<'_> {
+        fn drop(&mut self) {
+            world::reap_daemon(self.0);
+        }
+    }
+    watchdog::arm();
+    let sink = UdpSocket::bind("127.0.0.1:0").expect("APPARATUS: service socket");
+    let w = World::new(sink.local_addr().expect("APPARATUS: address").port(), true);
+    let reader = if offline {
+        w.guest_dir.clone()
+    } else {
+        let dir = w.tmp.path().join("newcomer");
+        std::fs::create_dir_all(dir.join("cfg")).expect("APPARATUS: newcomer profile");
+        dir
+    };
+    let _reader_daemon = ReaderDaemon(&reader);
+    let (ok, out, err) = vox_once(&reader, &args(&["id"]));
+    assert!(ok, "APPARATUS: reader identity: {out}{err}");
+    let reader_id = out.trim().to_owned();
+    local_attach::Root::at(&reader, world::IDENTITY).attach("default");
+    for (dir, peer, name) in [
+        (&reader, &w.host_fp, "author"),
+        (&w.host_dir, &reader_id, "reader"),
+    ] {
+        let (ok, out, err) = vox_once(dir, &args(&["trust", "add", peer, "--name", name]));
+        assert!(ok, "APPARATUS: prepare reader trust: {out}{err}");
+    }
+    world::reap_daemon(&reader);
+    let cid = vox_core::node::link::b32_decode(&w.room, "proof room").expect("APPARATUS: room id");
+    let rt = tokio::runtime::Runtime::new().expect("APPARATUS: runtime");
+    rt.block_on(async {
+        let mut author = local_attach::node_client(&w.host_dir, "default")
+            .await
+            .expect("APPARATUS: author's socket");
+        for number in 0..180 {
+            let reply = author
+                .request(&Request::Post {
+                    channel_id: cid,
+                    text: format!("live-window-post-{number:03}"),
+                    card: false,
+                })
+                .await;
+            assert!(
+                matches!(reply, Ok(Frame::Ok)),
+                "APPARATUS: author could not post {number}: {reply:?}"
+            );
+        }
+    });
+    let source = status_json(&w.host_dir, "author");
+    let head = source["rooms"][0]["own_feed_through"]
+        .as_u64()
+        .expect("APPARATUS: author's feed head");
+    assert!(
+        head > 149,
+        "APPARATUS: feed does not cross the sparse window: {source}"
+    );
+    let mut restarted = None;
+    if offline {
+        let pass = w.tmp.path().join("offline-reader-passphrases");
+        std::fs::write(&pass, format!("{}\n{}\n", world::IDENTITY, w.passphrase))
+            .expect("APPARATUS: reader passphrases");
+        let mut process = world::VoxProc::spawn(
+            "returned-reader",
+            &reader,
+            &args(&[
+                "daemon",
+                "--passphrase-file",
+                &world::utf8(&pass),
+                "--anchor",
+                &w.guest_anchor,
+                "--listen",
+                "127.0.0.1:0",
+            ]),
+        );
+        process.expect_line("returned reader's room", |line| {
+            line.contains("holding room") && line.contains(&w.room)
+        });
+        restarted = Some(process);
+    } else {
+        let (ok, _, out, err) = w.join(&reader);
+        assert!(ok, "APPARATUS: newcomer did not join: {out}{err}");
+    }
+    local_attach::Root::at(&reader, world::IDENTITY).attach("default");
+    let completed = |snapshot: &Value| -> u64 {
+        snapshot["sync"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|lane| lane["peer"] == w.host_fp)
+            .filter_map(|lane| lane["completed"].as_u64())
+            .sum()
+    };
+    let mut after_shown = None;
+    let snapshot = loop {
+        let (ok, read, err) = vox_once(&reader, &args(&["room", "read", &w.room, "--json"]));
+        assert!(ok, "PRODUCT: live-window read failed: {read}{err}");
+        let shown = (60..180).all(|number| read.contains(&format!("live-window-post-{number:03}")));
+        let snapshot = status_json(&reader, "sparse reader");
+        if shown {
+            assert!(
+                !read.contains("live-window-post-000"),
+                "APPARATUS: the on-demand archive was fetched without being requested: {read}"
+            );
+            let cycles = *after_shown.get_or_insert_with(|| completed(&snapshot));
+            let member = snapshot["rooms"][0]["members"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|member| member["id"] == w.host_fp)
+                .expect("APPARATUS: author member");
+            // Older builds have no live-window basis field; their quiescent exchange/read
+            // observations above still stage the same user-visible missing-archive case.
+            let live_complete = member.get("live_held_through").is_none_or(|basis| {
+                basis.as_u64().unwrap_or(0) >= member["advertised_through"].as_u64().unwrap_or(head)
+            });
+            if member["connected"] == true && completed(&snapshot) >= cycles + 3 && live_complete {
+                break snapshot;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let member = snapshot["rooms"][0]["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|member| member["id"] == w.host_fp)
+        .unwrap();
+    assert!(
+        member["verified_through"].as_u64().unwrap_or(0) < head.saturating_sub(128),
+        "APPARATUS: the reader has no deliberate contiguous archive gap: {member}"
+    );
+    let text = status_text(&reader, "sparse reader");
+    eprintln!("[proof] offline={offline}, author's feed head={head}, newest 120 posts shown, archive absent:\n{text}\n{snapshot}");
+    assert!(!text.contains("not receiving") && text.contains("healthy: nothing needs attention"),
+        "PRODUCT: reader offline={offline} holds its live window, but status counts the unrequested archive as missing:\n{text}");
+    drop(restarted);
 }

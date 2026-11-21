@@ -669,8 +669,8 @@ fn a_missing_desktop_service_logs_once() {
     wait_until("two failing desktop calls", TIMEOUT, || {
         notes(&attempts).len() >= 2
     });
-    // A third invocation cannot start until the preceding call returned and its diagnostic
-    // was handled. Count the product's own missing-service line, never the stub's stderr.
+    // Count the product's own missing-service line, never the stub's stderr.
+    // These short failing calls are separated by real disconnect/reconnect transitions.
     alice.seen.clear();
     bob.child
         .kill()
@@ -1105,8 +1105,8 @@ optional_proof::not_run!(a_room_that_cannot_sync_notifies_once_and_once_when_it_
 
 /// **A disconnected room with no new sync entries** (PRD-001 R37), optional because the
 /// condition takes ten minutes to start. Kill bob and the anchor so nobody can connect.
-/// Exactly one notification names the stale room; reconnecting clears it even if the
-/// first completed round has no new entries. Empty rounds must not reset last_sync_ms.
+/// Exactly one desktop notification names the stale room. Bob reconnects and posts a new
+/// message; Alice reads that message and receives exactly one desktop recovery notification.
 #[cfg(feature = "optional-proofs")]
 #[test]
 #[ignore = "optional: an anchor and two daemons, one killed for over ten minutes; run in release"]
@@ -1206,13 +1206,23 @@ fn a_room_that_cannot_sync_notifies_once_and_once_when_it_syncs_again() {
         let (ok, out, _) = vox_once(&alice_dir, &args(&["room", "read", &room, "--json"]));
         observed_receipt |= ok && out.contains("received-after-disconnection");
         let snapshot = status(&alice_dir);
-        assert!(
-            Instant::now() < until,
-            "APPARATUS: recovery staging did not finish; receipt observed {observed_receipt}, \
-             status {snapshot}; returning member said {}; notifications {:?}",
-            bob_again.transcript(),
-            notes(&file)
-        );
+        if Instant::now() >= until {
+            if observed_receipt && cleared(&notes(&file)) == 0 {
+                panic!(
+                    "PRODUCT: room stale alarm did not clear after a new entry was received; \
+                     status {snapshot}; notifications {:?}",
+                    notes(&file)
+                );
+            }
+            if !observed_receipt {
+                panic!(
+                    "APPARATUS: recovery receipt was not staged; status {snapshot}; \
+                 returning member said {}; notifications {:?}",
+                    bob_again.transcript(),
+                    notes(&file)
+                );
+            }
+        }
         std::thread::sleep(Duration::from_millis(250));
     }
     std::thread::sleep(Duration::from_secs(11));

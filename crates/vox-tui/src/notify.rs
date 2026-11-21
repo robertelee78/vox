@@ -375,9 +375,16 @@ pub async fn watch(node: NodeHandle, paths: Paths) {
             }
             let command = command.clone();
             let in_flight = std::sync::Arc::clone(&in_flight);
+            struct InFlight(std::sync::Arc<AtomicUsize>);
+            impl Drop for InFlight {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::Release);
+                }
+            }
+            let in_flight = InFlight(in_flight);
             drop(tokio::task::spawn_blocking(move || {
+                let _in_flight = in_flight;
                 raise_desktop(&note, command.as_deref());
-                in_flight.fetch_sub(1, Ordering::Release);
             }));
         }
     }
