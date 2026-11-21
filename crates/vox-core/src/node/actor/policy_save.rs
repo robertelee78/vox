@@ -383,7 +383,7 @@ impl Node {
                     if channel.trust_reconciled(generation) {
                         break;
                     }
-                    if channel.is_poisoned() {
+                    if channel.is_poisoned() || channel.trust_failed(generation) {
                         let _ = reply.send(Outcome::Failed(Fault::TrustRemovalIncomplete));
                         return;
                     }
@@ -400,7 +400,16 @@ impl Node {
                 }
             }
             if let Some(consents) = consents {
-                match consents.await {
+                let consent_result = tokio::select! {
+                    biased;
+                    _ = reply.closed() => return,
+                    _ = attachment.changed() => {
+                        let _ = reply.send(Outcome::Failed(Fault::Locked));
+                        return;
+                    }
+                    result = consents => result,
+                };
+                match consent_result {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => {
                         let _ = reply.send(Outcome::Failed(fault_of(&error)));

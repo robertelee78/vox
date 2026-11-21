@@ -31,8 +31,9 @@ Posts that meet a new computer revision before native publication retain their
 original command queue credit until the saved keyring is current; their room's
 withdrawal fence still decides whether they may be written.
 The consent cursor survives every page. A newer trust list restarts only that room's
-reconciliation, while failed work waits for a room change (transient faults use the
-existing retry deadline). Installing a keyring immediately refreshes service reachers,
+reconciliation. Every failed trust turn uses the existing one-second retry while
+ordinary room governance continues; the saved manual command reports incomplete
+withdrawal rather than waiting for a permanent fault. Installing a keyring refreshes service reachers,
 independent of room withdrawal. A new manual grant dials the requested member and
 waits for its existing owed-consent pass before acknowledging the command.
 A closed room with saved withdrawal debt defers authoring Session refresh until its
@@ -44,7 +45,8 @@ its shipped JSON read must show exactly one copy. At a held withdrawal, a pendin
 computer application receipt is judged by other-room post/read progress until the
 receipt is consumed, not by which independent task publishes its marker first.
 The post proof first shows that both removed and surviving readers could read, then
-waits for the surviving reader and ten completed exchanges before checking that the
+counts completed other-room exchanges until its own post is accepted, then waits for
+the surviving reader and ten completed exchanges before checking that the
 removed reader sees no post after withdrawal. To stage a key queued before withdrawal,
 set `VOX_PROOF_RG3_QUEUED_KEY=1` for the held-key proof; it uses the existing pairwise
 key hold and retains the same user-facing no-key assertion.
