@@ -85,12 +85,16 @@ impl ChannelState {
     }
 
     pub(crate) fn trust_failed(&self, generation: u64) -> bool {
-        self.trust_failed_generation == Some(generation)
+        self.trust_failed_generation
+            .is_some_and(|failed| failed >= generation)
     }
 
     pub(crate) fn mark_trust_failed(&mut self, generation: u64) {
         if !self.trust_reconciled(generation) {
-            self.trust_failed_generation = Some(generation);
+            self.trust_failed_generation = Some(
+                self.trust_failed_generation
+                    .map_or(generation, |failed| failed.max(generation)),
+            );
             self.history_publication_changed.notify_waiters();
         }
     }
