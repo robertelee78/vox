@@ -9646,14 +9646,14 @@ fn newcomer_reads_the_whole_history(
 /// ADR-052 RG-1 is optional until the admission, trust and delivery requirements land.
 #[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "ten real daemons, three stepping Sessions and a paused member; optional"]
+#[ignore = "four real daemons, three stepping Sessions and a paused member; optional"]
 fn a_busy_room_newcomer_reads_every_member_with_a_paused_member() {
     rg1::journey(false);
 }
 
 #[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "ten real daemons, three stepping Sessions and a delayed relay path; optional"]
+#[ignore = "four real daemons, three stepping Sessions and a delayed relay path; optional"]
 fn a_busy_room_newcomer_reads_every_member_with_a_delayed_path() {
     rg1::journey(true);
 }
@@ -9691,10 +9691,6 @@ mod rg1 {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
-
-    const NAMES: [&str; 10] = [
-        "fast", "slow", "third", "old1", "old2", "old3", "old4", "old5", "old6", "new",
-    ];
 
     fn root() -> tempfile::TempDir {
         let mut builder = tempfile::Builder::new();
@@ -9735,10 +9731,23 @@ mod rg1 {
     }
 
     fn start(w: &Worker, listen: &str, anchor: Option<&str>) -> Daemon {
+        std::fs::create_dir_all(w.data.with_extension("home"))
+            .expect("APPARATUS: daemon scratch HOME");
+        // Headless `node create` can auto-start this scratch computer's daemon.
+        // Replace that owned setup service before taking ownership of the serving child.
+        room::reap_daemon(&w.data);
         let mut cmd = Command::new(&w.exe);
         room::strip_harness_env(&mut cmd);
-        cmd.args(["daemon", "--listen", listen, "--passphrase-file"])
+        cmd.args(["daemon", "--node"])
+            .arg(
+                w.paths
+                    .profile_dir
+                    .file_name()
+                    .expect("APPARATUS: daemon node"),
+            )
+            .args(["--listen", listen, "--passphrase-file"])
             .arg(&w.pass)
+            .env("HOME", w.data.with_extension("home"))
             .env("VOX_DATA_DIR", &w.data)
             .env("VOX_CONFIG_DIR", &w.cfg)
             .env("VOX_PROXY", "127.0.0.1:0")
@@ -9799,7 +9808,14 @@ mod rg1 {
     fn create(w: &Worker) -> String {
         let out = w.vox_in(
             None,
-            &["room", "create", "--name", "busy", "--passphrase-file", "-"],
+            &[
+                "room",
+                "create",
+                "--name",
+                "repo-to-cve",
+                "--passphrase-file",
+                "-",
+            ],
             Some(room::ROOM_PASS),
         );
         assert!(out.ok, "APPARATUS: room not created: {out:?}");
@@ -9914,7 +9930,7 @@ mod rg1 {
         );
     }
 
-    /// The existing OpenCode stand-in hosts the shipped plugin; no model or real session runs.
+    /// The prototype's OMP Session stand-in, with the same watcher ownership and bridge events.
     struct Session {
         process: Daemon,
         lines: std::sync::mpsc::Receiver<String>,
@@ -9934,7 +9950,7 @@ mod rg1 {
             .expect("APPARATUS: write Session command");
             let line = self
                 .lines
-                .recv_timeout(Duration::from_secs(120))
+                .recv_timeout(Duration::from_secs(180))
                 .unwrap_or_else(|e| panic!("APPARATUS: Session did not answer {command}: {e}"));
             let reply: Value = serde_json::from_str(&line)
                 .unwrap_or_else(|e| panic!("APPARATUS: Session reply {line}: {e}"));
@@ -9944,46 +9960,108 @@ mod rg1 {
             );
         }
 
-        fn start(w: &Worker, id: &str) -> Self {
-            let node = w
-                .paths
-                .profile_dir
-                .file_name()
-                .and_then(|name| name.to_str())
-                .expect("APPARATUS: resolved node name");
-            let plugin = w.vox(None, &["agent", "plugin", "opencode", "--node", node]);
-            assert!(
-                plugin.ok,
-                "APPARATUS: Session plugin not staged: {plugin:?}"
-            );
-            let plugin_path = w.data.with_extension("mjs");
-            std::fs::write(&plugin_path, &plugin.stdout).expect("APPARATUS: write shipped plugin");
-            let home = w.data.with_extension("home");
-            std::fs::create_dir_all(&home).expect("APPARATUS: Session scratch HOME");
-            let host = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/support/opencode_plugin_host.mjs");
-            let mut cmd = Command::new("node");
+        fn start(w: &Worker, id: &str, index: usize) -> Self {
+            // This is the Sess wire conversation in arm-replace/rig.py:378-512, not a model.
+            const HOST: &str = r#"
+import atexit,json,os,secrets,socket,subprocess,sys,tempfile,threading,time
+sid=sys.argv[1]; route=secrets.token_hex(32); token=secrets.token_hex(32)
+directory=tempfile.TemporaryDirectory(prefix="rg1-omp-"); endpoint=directory.name+"/bridge"
+listener=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); listener.bind(endpoint)
+os.chmod(endpoint,0o600); listener.listen(8)
+state={"ready":False,"confirmed":False}; conns=[]; frames=[]; cv=threading.Condition()
+def serve(sock):
+    try:
+        reader=sock.makefile("rb")
+        auth=json.loads(reader.readline()); first=json.loads(reader.readline())
+        assert auth.get("type")=="auth" and auth.get("token")==token
+        if first.get("type")=="route":
+            sock.sendall((json.dumps({"outcome":"available","session":sid,"route":route,"client":route,"admission":True})+"\n").encode()); return
+        assert first.get("type")=="subscribe" and first.get("session")==sid
+        deadline=time.monotonic()+30
+        while not (state["ready"] and state["confirmed"]) and time.monotonic()<deadline: time.sleep(.1)
+        assert state["ready"] and state["confirmed"]
+        sock.sendall((json.dumps({"type":"subscribed","session":sid})+"\n"+json.dumps({"type":"event","event":{"type":"state","busy":False}})+"\n").encode())
+        conns.append(sock)
+        for _ in reader: pass
+    except Exception as e: print("bridge: "+repr(e),file=sys.stderr,flush=True)
+def accept():
+    while True:
+        sock,_=listener.accept(); threading.Thread(target=serve,args=(sock,),daemon=True).start()
+threading.Thread(target=accept,daemon=True).start()
+watch=subprocess.Popen([os.environ["VOX_BIN"],"agent","omp-watch","--node",os.environ["VOX_NODE"]],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=sys.stderr)
+def cleanup():
+    if watch.poll() is None: watch.kill()
+    watch.wait()
+atexit.register(cleanup)
+def receive():
+    for line in watch.stdout:
+        f=json.loads(line)
+        if f.get("type")=="ready": state["ready"]=True
+        if f.get("type")=="unavailable": state.update(ready=False,confirmed=False)
+        with cv: frames.append(f); cv.notify_all()
+threading.Thread(target=receive,daemon=True).start()
+def frame(match,within=120):
+    deadline=time.monotonic()+within
+    with cv:
+        while True:
+            for f in frames:
+                if match(f): return f
+            remaining=deadline-time.monotonic()
+            if remaining<=0: raise RuntimeError("no watcher frame: "+repr(frames[-5:]))
+            cv.wait(remaining)
+def command(i,**args):
+    watch.stdin.write((json.dumps(dict(id=i,**args))+"\n").encode()); watch.stdin.flush()
+    assert frame(lambda f:f.get("type")=="ack" and f.get("id")==i)["ok"]
+try:
+    instance=frame(lambda f:f.get("type")=="owner")["instance"]
+    frame(lambda f:f.get("type")=="ready"); generation=secrets.token_hex(32)
+    command("1",op="revoke")
+    command("2",op="install",generation=generation,session=sid,endpoint=endpoint,token=token,route=route)
+    env=dict(os.environ,VOX_HARNESS="omp",VOX_SESSION=sid,VOX_OPENCODE_WAKE_SOCKET=endpoint,VOX_OPENCODE_WAKE_TOKEN=token,
+        VOX_OPENCODE_MIRROR_SOCKET=endpoint,VOX_OPENCODE_ATTENTION_SOCKET=endpoint,VOX_OPENCODE_ATTENTION_TOKEN=token,
+        VOX_OPENCODE_ATTENTION_ROUTE=route,VOX_OMP_INSTANCE=instance,VOX_OMP_GENERATION=generation)
+    for option,extra in (("--attention-register",[]),("--omp-check-uncertainty",[]),("--omp-prepare",["--format","opencode"])):
+        p=subprocess.run([os.environ["VOX_BIN"],"agent","hook","--node",os.environ["VOX_NODE"],"--session",sid,*extra,option],
+            env=env,input="commit\n" if option=="--omp-prepare" else "",text=True,capture_output=True)
+        print(sid+" "+option+" rc="+str(p.returncode)+" "+p.stderr,file=sys.stderr,flush=True)
+        if option=="--omp-prepare": continue
+        assert p.returncode==0,(option,p.stdout,p.stderr)
+        if option=="--omp-check-uncertainty": state["confirmed"]=True
+    deadline=time.monotonic()+30
+    while not conns and time.monotonic()<deadline: time.sleep(.1)
+    assert conns,"no subscribed bridge"
+    for line in sys.stdin:
+        try:
+            if line.strip()=="register": pass
+            else:
+                k=int(line); assert conns and watch.poll() is None
+                text=sid+" step "+str(k)+" "+"y"*400
+                conns[-1].sendall((json.dumps({"type":"event","event":{"type":"user" if k%2==0 else "reply","text":text}})+"\n").encode())
+            print(json.dumps({"session":sid}),flush=True)
+        except Exception as e: print(json.dumps({"kind":"apparatus","error":repr(e)}),flush=True)
+except Exception as e: print(json.dumps({"kind":"apparatus","error":repr(e)}),flush=True)
+"#;
+            let session_id = format!("trial-session-{index:04}");
+            let mut cmd = Command::new("python3");
             room::strip_harness_env(&mut cmd);
             let mut child = cmd
-                .arg(host)
-                .arg(plugin_path)
-                .arg(format!("rg1-{}", w.name))
-                .env("HOME", home)
+                .args(["-u", "-c", HOST, &session_id])
+                .env("HOME", w.data.with_extension("home"))
                 .env("VOX_BIN", &w.exe)
+                .env("VOX_NODE", &w.name)
                 .env("VOX_DATA_DIR", &w.data)
                 .env("VOX_CONFIG_DIR", &w.cfg)
                 .env("VOX_ROOM", id)
                 .env("VOX_PROXY", "127.0.0.1:0")
-                .env("VOX_IDENTITY_PASSPHRASE", room::ID_PASS)
-                .current_dir(&w.data)
+                .env("VOX_LISTEN", "127.0.0.1:0")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::from(
-                    std::fs::File::create(w.data.with_extension("session.err"))
+                    std::fs::File::create(w.data.with_extension(format!("session-{index}.err")))
                         .expect("APPARATUS: Session stderr"),
                 ))
                 .spawn()
-                .expect("APPARATUS: start existing OpenCode Session stand-in");
+                .expect("APPARATUS: start OMP Session stand-in");
             let stdout = child.stdout.take().expect("APPARATUS: Session stdout");
             let (tx, lines) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
@@ -9996,32 +10074,34 @@ mod rg1 {
             let mut session = Self {
                 process: Daemon(child),
                 lines,
-                id: format!("rg1-{}", w.name),
+                id: session_id,
             };
-            session.ask("turn RG-1 busy-room Session");
+            session.ask("register");
             session
         }
 
         fn step(&mut self, n: usize) -> String {
-            let text = format!("RG1-session-{}-{n}", self.id);
-            self.ask(&format!(
-                "event {}",
-                json!({
-                    "type": "session.inbox.delivered",
-                    "data": {"sessionID": self.id, "inboxID": format!("u{n}"),
-                        "item": {"type": "user", "payload": {"text": text}, "delivery": "queue"}}
-                })
-            ));
-            text
+            self.ask(&n.to_string());
+            // `room session` abbreviates long bodies, but retains this event identity.
+            format!("{} step {n} ", self.id)
+        }
+    }
+
+    impl Drop for Session {
+        fn drop(&mut self) {
+            // EOF lets the stand-in reap the omp-watch process it owns.
+            drop(self.process.0.stdin.take());
+            let _ = self.process.0.wait();
         }
     }
 
     #[derive(Default)]
     struct LoadState {
-        acknowledged: BTreeMap<String, Vec<String>>,
-        errors: Vec<String>,
+        // The immutable flag belongs to the offer, even if a pre-join command answers later.
+        acknowledged: BTreeMap<String, Vec<(String, bool)>>,
+        errors: Vec<(bool, String)>,
+        offered: BTreeMap<String, Vec<u128>>,
         joined: bool,
-        after_join: BTreeMap<String, usize>,
         steps: BTreeMap<String, usize>,
     }
 
@@ -10030,12 +10110,20 @@ mod rg1 {
         threads: Vec<std::thread::JoinHandle<()>>,
     }
 
+    impl Load {
+        fn finish(&mut self) -> bool {
+            self.stop.store(true, Ordering::SeqCst);
+            let mut healthy = true;
+            for thread in self.threads.drain(..) {
+                healthy &= thread.join().is_ok();
+            }
+            healthy
+        }
+    }
+
     impl Drop for Load {
         fn drop(&mut self) {
-            self.stop.store(true, Ordering::SeqCst);
-            for thread in self.threads.drain(..) {
-                let _ = thread.join();
-            }
+            let _ = self.finish();
         }
     }
 
@@ -10046,15 +10134,195 @@ mod rg1 {
         }
     }
 
-    fn load(workers: &[Arc<Worker>], id: &str, state: Arc<Mutex<LoadState>>) -> Load {
+    fn check_errors(state: &Mutex<LoadState>, staging: bool) {
+        let errors = std::mem::take(&mut state.lock().expect("APPARATUS: load state").errors);
+        let side = if !staging && errors.iter().all(|(product, _)| *product) {
+            "PRODUCT"
+        } else {
+            "APPARATUS"
+        };
+        assert!(
+            errors.is_empty(),
+            "RED {side}: posting load failed: {errors:?}"
+        );
+    }
+
+    fn check_load(load: &Load, state: &Mutex<LoadState>, staging: bool) {
+        check_errors(state, staging);
+        assert!(
+            load.threads.iter().all(|thread| !thread.is_finished()),
+            "APPARATUS: a posting or Session thread stopped"
+        );
+        check_cadence(state);
+    }
+
+    fn check_cadence(state: &Mutex<LoadState>) {
+        let state = state.lock().expect("APPARATUS: load state");
+        for (author, times) in &state.offered {
+            assert!(
+                times
+                    .windows(2)
+                    .all(|pair| (750..=1250).contains(&(pair[1] - pair[0]))),
+                "APPARATUS: {author}'s offered cadence was not one second: {times:?}"
+            );
+        }
+    }
+
+    fn post_count(state: &LoadState, author: &str) -> usize {
+        1 + state
+            .acknowledged
+            .get(author)
+            .into_iter()
+            .flatten()
+            .filter(|(_, after_join)| *after_join)
+            .count()
+    }
+
+    fn poster(
+        w: Arc<Worker>,
+        id: String,
+        state: Arc<Mutex<LoadState>>,
+        stop: Arc<AtomicBool>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            std::thread::scope(|scope| {
+                let started = Instant::now();
+                let mut replies = Vec::new();
+                let mut n = 0;
+                while !stop.load(Ordering::SeqCst) {
+                    sleep(
+                        &stop,
+                        (started + Duration::from_secs(n))
+                            .saturating_duration_since(Instant::now()),
+                    );
+                    if stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    n += 1;
+                    let text = format!("load {} {n:05}", w.name);
+                    let after_join = state.lock().expect("APPARATUS: load state").joined;
+                    let node = w
+                        .paths
+                        .profile_dir
+                        .file_name()
+                        .expect("APPARATUS: posting node");
+                    let mut cmd = Command::new(&w.exe);
+                    room::strip_harness_env(&mut cmd);
+                    cmd.args(["room", "post", &id, &text, "--node"])
+                        .arg(node)
+                        .env("VOX_DATA_DIR", &w.data)
+                        .env("VOX_CONFIG_DIR", &w.cfg)
+                        .env("VOX_PROXY", "127.0.0.1:0")
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped());
+                    let offered = Instant::now();
+                    let child = match cmd.spawn() {
+                        Ok(child) => child,
+                        Err(error) => {
+                            state.lock().expect("APPARATUS: load state").errors.push((
+                                false,
+                                format!("{} could not offer post {n}: {error}", w.name),
+                            ));
+                            break;
+                        }
+                    };
+                    let offered_ms = offered.duration_since(started).as_millis();
+                    state
+                        .lock()
+                        .expect("APPARATUS: load state")
+                        .offered
+                        .entry(w.name.clone())
+                        .or_default()
+                        .push(offered_ms);
+                    eprintln!(
+                        "[RG-1 offer] author={} post={n} pid={} offered_ms={offered_ms} \
+                    data={} config={} command={} room post {id} {text} --node {}",
+                        w.name,
+                        child.id(),
+                        w.data.display(),
+                        w.cfg.display(),
+                        w.exe,
+                        node.to_string_lossy()
+                    );
+                    let (w, state) = (Arc::clone(&w), Arc::clone(&state));
+                    // Waiting for one answer never holds up the next scheduled process.
+                    replies.push(scope.spawn(move || {
+                        let out = child.wait_with_output();
+                        let answered = Instant::now();
+                        let mut state = state.lock().expect("APPARATUS: load state");
+                        match out {
+                            Ok(out) => {
+                                eprintln!(
+                                    "[RG-1 ack] author={} post={n} offered_ms={offered_ms} \
+                                acknowledged_ms={} lag_ms={} exit={} stdout={} stderr={}",
+                                    w.name,
+                                    answered.duration_since(started).as_millis(),
+                                    answered.duration_since(offered).as_millis(),
+                                    out.status,
+                                    String::from_utf8_lossy(&out.stdout),
+                                    String::from_utf8_lossy(&out.stderr)
+                                );
+                                if out.status.success() {
+                                    state
+                                        .acknowledged
+                                        .entry(w.name.clone())
+                                        .or_default()
+                                        .push((text, after_join));
+                                } else {
+                                    state.errors.push((
+                                        after_join,
+                                        format!("{} post {n}: {out:?}", w.name),
+                                    ));
+                                }
+                            }
+                            Err(error) => state.errors.push((
+                                false,
+                                format!(
+                                    "{} post {n} answer could not be collected: {error}",
+                                    w.name
+                                ),
+                            )),
+                        }
+                    }));
+                }
+                let mut healthy = true;
+                for reply in replies {
+                    healthy &= reply.join().is_ok();
+                }
+                if !healthy {
+                    state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .errors
+                        .push((false, format!("{}'s post collector stopped", w.name)));
+                }
+            })
+        })
+    }
+
+    fn load(
+        workers: &[Arc<Worker>],
+        slow: &Arc<Worker>,
+        id: &str,
+        state: Arc<Mutex<LoadState>>,
+    ) -> Load {
         let stop = Arc::new(AtomicBool::new(false));
         let mut load = Load {
             stop: Arc::clone(&stop),
             threads: Vec::new(),
         };
         for w in workers {
-            let mut session = Session::start(w, id);
-            // A sent event is not proof that a Session stepped: read the actual Session.
+            load.threads.push(poster(
+                Arc::clone(w),
+                id.to_owned(),
+                Arc::clone(&state),
+                Arc::clone(&stop),
+            ));
+        }
+        for index in 0..3 {
+            let w = slow;
+            let mut session = Session::start(w, id, index);
             let text = session.step(0);
             let started = Instant::now();
             loop {
@@ -10070,48 +10338,19 @@ mod rg1 {
                 std::thread::sleep(Duration::from_millis(100));
             }
             eprintln!("[RG-1] Session {} step 0 shown by product", session.id);
-            let (w, id, state, stop) = (
-                Arc::clone(w),
-                id.to_owned(),
-                Arc::clone(&state),
-                Arc::clone(&stop),
-            );
+            let (state, stop) = (Arc::clone(&state), Arc::clone(&stop));
             load.threads.push(std::thread::spawn(move || {
-                let started = Instant::now();
                 let mut n = 0;
                 while !stop.load(Ordering::SeqCst) {
                     let at = Instant::now();
                     n += 1;
-                    let text = format!("RG1-live-{}-{n}", w.name);
-                    let out = w.vox(None, &["room", "post", &id, &text]);
-                    {
-                        let mut state = state.lock().expect("APPARATUS: load state");
-                        if !out.ok {
-                            state.errors.push(format!("{}: {out:?}", w.name));
-                            return;
-                        }
-                        state
-                            .acknowledged
-                            .entry(w.name.clone())
-                            .or_default()
-                            .push(text);
-                        if state.joined {
-                            *state.after_join.entry(w.name.clone()).or_default() += 1;
-                        }
-                    }
                     session.step(n);
                     *state
                         .lock()
                         .expect("APPARATUS: load state")
                         .steps
-                        .entry(w.name.clone())
+                        .entry(session.id.clone())
                         .or_default() += 1;
-                    eprintln!(
-                        "[RG-1 cadence] author={} post={n} offered_ms={} work_ms={}",
-                        w.name,
-                        at.duration_since(started).as_millis(),
-                        at.elapsed().as_millis()
-                    );
                     sleep(&stop, Duration::from_secs(1).saturating_sub(at.elapsed()));
                 }
             }));
@@ -10147,10 +10386,15 @@ mod rg1 {
                     signal(pid, "-STOP");
                     let out = Command::new("ps")
                         .args(["-o", "stat=", "-p", &pid.to_string()])
-                        .output()
-                        .expect("APPARATUS: observe serving pid stopped");
+                        .output();
+                    let paused = out.as_ref().is_ok_and(|out| {
+                        out.status.success() && String::from_utf8_lossy(&out.stdout).contains('T')
+                    });
+                    if !paused {
+                        resume(pid);
+                    }
                     assert!(
-                        String::from_utf8_lossy(&out.stdout).contains('T'),
+                        paused,
                         "APPARATUS: owned serving pid {pid} was not stopped: {out:?}"
                     );
                     let at = Instant::now();
@@ -10181,8 +10425,85 @@ mod rg1 {
             if let Some(thread) = self.thread.take() {
                 let _ = thread.join();
             }
-            signal(self.pid, "-CONT");
+            resume(self.pid);
         }
+    }
+
+    fn resume(pid: u32) {
+        // Cleanup must not panic while another verdict is unwinding.
+        let _ = Command::new("kill")
+            .args(["-CONT", &pid.to_string()])
+            .output();
+    }
+
+    fn check_slow(pauses: &Option<Pauses>, daemon: &mut Daemon) {
+        assert!(
+            pauses.as_ref().is_none_or(|pause| pause
+                .thread
+                .as_ref()
+                .is_some_and(|thread| !thread.is_finished())),
+            "APPARATUS: the slow-member pause thread stopped"
+        );
+        let exited = daemon
+            .0
+            .try_wait()
+            .expect("APPARATUS: observe slow serving daemon");
+        assert!(
+            exited.is_none(),
+            "APPARATUS: slow serving daemon exited: {exited:?}"
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn join(
+        w: &Worker,
+        link: &str,
+        via: &str,
+        pauses: &Option<Pauses>,
+        slow: &mut Daemon,
+        load: &Load,
+        state: &Mutex<LoadState>,
+    ) {
+        check_slow(pauses, slow);
+        check_load(load, state, true);
+        let started = Instant::now();
+        let suffix = w.name.strip_prefix("n-").unwrap_or(&w.name);
+        let bind = w
+            .data
+            .parent()
+            .expect("APPARATUS: computer root")
+            .join(format!("repo-{suffix}"));
+        std::fs::create_dir_all(&bind).expect("APPARATUS: join bind directory");
+        let out = w.vox_in(
+            None,
+            &[
+                "room",
+                "join",
+                "--bind",
+                bind.to_str().expect("APPARATUS: bind UTF-8"),
+                "--passphrase-file",
+                "-",
+                link,
+            ],
+            Some(room::ROOM_PASS),
+        );
+        check_slow(pauses, slow);
+        assert!(
+            load.threads.iter().all(|thread| !thread.is_finished()),
+            "APPARATUS: posting or Session thread stopped during {}'s join",
+            w.name
+        );
+        check_cadence(state);
+        assert!(
+            out.ok,
+            "RED PRODUCT: {}'s join through {via} was refused; join={:?}; \
+             product stdout:\n{}\nproduct stderr:\n{}",
+            w.name,
+            started.elapsed(),
+            out.stdout,
+            out.stderr
+        );
+        eprintln!("[RG-1 join] {} admitted in {:?}", w.name, started.elapsed());
     }
 
     fn status(w: &Worker, id: &str) -> Value {
@@ -10203,8 +10524,8 @@ mod rg1 {
             .find(|row| row["id"].as_str() == Some(fp))
     }
 
-    /// Needs the authenticated retained feed position before decryption, not a showable message.
-    /// RG-7 names this `verified_through`; the displayed-post step uses the real paged reader.
+    /// Needs the authenticated contiguous verified position, not every retained sparse copy.
+    /// RG-7 names this `verified_through`; only the paged read establishes showability.
     fn held_position(status: &Value, author: &str) -> Option<u64> {
         member(status, author)?["holds_through"].as_u64()
     }
@@ -10232,22 +10553,6 @@ mod rg1 {
         shown: Option<usize>,
     }
 
-    impl Timeline {
-        fn first_missing(&self) -> &'static str {
-            if self.held.is_none() {
-                "post held"
-            } else if self.grant.is_none() {
-                "recipient grant applied by author"
-            } else if self.key.is_none() {
-                "author key delivered"
-            } else if self.shown.is_none() {
-                "post shown"
-            } else {
-                "none"
-            }
-        }
-    }
-
     /// A post's acknowledged feed fence and the exact displayed text identify each direction.
     #[allow(clippy::too_many_arguments)]
     fn observe(
@@ -10264,17 +10569,14 @@ mod rg1 {
         let target_status = status(target, id);
         let (grant, doctor) = doctor(source, id, &target.name);
         let held = held_position(&target_status, &source.b32()).is_some_and(|n| n >= through);
-        let key = grant
-            && member(&source_status, &target.b32())
-                .is_some_and(|row| row["key_delivery_pending"] == false);
+        let key = member(&source_status, &target.b32())
+            .is_some_and(|row| row["key_delivery_pending"] == false);
         let (texts, pages, _) = read(target, id, Some(marker));
         let shown = texts.contains(marker);
-        // Displaying this exact plaintext is also direct evidence that its body is held.
-        let held = held || shown;
         for (name, yes, slot) in [
-            ("held", held, &mut timeline.held),
-            ("grant_applied", grant, &mut timeline.grant),
-            ("key_delivered", key, &mut timeline.key),
+            ("contiguous_verified", held, &mut timeline.held),
+            ("mutual_room_trust", grant, &mut timeline.grant),
+            ("no_key_owed", key, &mut timeline.key),
             ("shown", shown, &mut timeline.shown),
         ] {
             if yes && slot.is_none() {
@@ -10294,114 +10596,135 @@ mod rg1 {
                 "feed_through": through, "posts_since_join": posted, "pages": pages,
                 "join_ms": since.elapsed().as_millis(), "source_status": source_status,
                 "target_status": target_status, "doctor": doctor,
-                "held": held, "grant_applied": grant, "key_delivered": key, "shown": shown
+                "contiguous_verified": held, "mutual_room_trust": grant,
+                "no_key_owed": key, "shown": shown
             })
         );
+    }
+
+    fn pair(inviter: &Worker, invitee: &Worker) {
+        let invite = inviter.vox(None, &["computer", "invite", "--json"]);
+        invite.expect_ok("computer invite");
+        let invitation = invite.json();
+        let link = invitation["invite_link"]
+            .as_str()
+            .expect("APPARATUS: computer invitation");
+        let paired = invitee.vox_in(None, &["computer", "pair", link, "--json"], Some("yes\n"));
+        paired.expect_ok("computer pair");
+        let paired = paired.json();
+        let op = paired["pairing"]["operation_id"]
+            .as_str()
+            .expect("APPARATUS: pairing operation");
+        inviter
+            .vox(None, &["computer", "approve", op, "--json"])
+            .expect_ok("computer approval");
+        let started = Instant::now();
+        loop {
+            let a = inviter.vox(None, &["computer", "status", "--json"]).json();
+            let b = invitee.vox(None, &["computer", "status", "--json"]).json();
+            eprintln!(
+                "[RG-1 pairing] {}={} {}={}",
+                inviter.name, a, invitee.name, b
+            );
+            if a["state"] == "confirmed" && b["state"] == "confirmed" {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(120),
+                "APPARATUS: pairing not confirmed"
+            );
+            std::thread::sleep(Duration::from_secs(1));
+        }
     }
 
     pub(super) fn journey(delayed: bool) {
         let root = root();
         free_disk(root.path());
         let exe = binary();
-        let workers: Vec<_> = NAMES
-            .iter()
-            .map(|name| Arc::new(room::worker_as(root.path(), name, &exe)))
-            .collect();
         let (_anchor, anchor) = room::spawn_anchor_as(root.path(), &exe, "127.0.0.1:0", "anchor");
         let forward =
             delayed.then(|| port_forward::PortForward::start(world::spec_addr(&anchor), true));
-        let mut daemons = Vec::new();
-        for (n, w) in workers.iter().enumerate() {
-            let slow_anchor = forward.as_ref().map(|f| world::respec(&anchor, f.public));
-            daemons.push(start(
-                w,
-                if delayed && n == 1 {
-                    "[::1]:0"
-                } else {
-                    "127.0.0.1:0"
-                },
-                Some(if n == 1 {
-                    slow_anchor.as_deref().unwrap_or(&anchor)
-                } else {
-                    &anchor
-                }),
-            ));
+        let olds: Vec<_> = (1..=6)
+            .map(|n| {
+                Arc::new(room::named_worker_as(
+                    root.path(),
+                    "X",
+                    &format!("n-old{n}"),
+                    &exe,
+                ))
+            })
+            .collect();
+        let sib = Arc::new(room::named_worker_as(root.path(), "X", "sib", &exe));
+        let x = start(&olds[0], "127.0.0.1:0", Some(&anchor));
+        let slow = Arc::new(room::named_worker_as(root.path(), "Y", "y1", &exe));
+        let slow_anchor = forward.as_ref().map(|f| world::respec(&anchor, f.public));
+        let y = start(
+            &slow,
+            if delayed { "[::1]:0" } else { "127.0.0.1:0" },
+            Some(slow_anchor.as_deref().unwrap_or(&anchor)),
+        );
+        let fast = Arc::new(room::named_worker_as(root.path(), "Z", "z1", &exe));
+        let z = start(&fast, "127.0.0.1:0", Some(&anchor));
+        let sibw = Arc::new(room::named_worker_as(root.path(), "W", "sibw", &exe));
+        let w = start(&sibw, "127.0.0.1:0", Some(&anchor));
+        let computers = [&sib, &slow, &fast, &sibw];
+        let mut workers = vec![Arc::clone(&fast), Arc::clone(&slow)];
+        workers.extend(olds.iter().map(Arc::clone));
+        let mut daemons = [x, y, z, w];
+        let ready = sib.vox(None, &["node", "list"]);
+        assert!(
+            ready.ok && ready.stdout.matches("Ready").count() == 7,
+            "APPARATUS: X's seven siblings are not Ready: {ready:?}"
+        );
+        for w in computers {
+            w.vox(None, &["computer", "personal", &w.name, "--json"])
+                .expect_ok("personal computer node");
         }
-        // Decide full-history consent before any post; do not change trust during the load.
-        for w in &workers {
-            for peer in &workers {
-                if w.name == peer.name {
-                    continue;
-                }
-                let out = w.vox_env(
-                    None,
-                    &[("VOX_IDENTITY_PASSPHRASE", room::ID_PASS)],
-                    &[
-                        "trust",
-                        "add",
-                        &peer.b32(),
-                        "--name",
-                        &peer.name,
-                        "--history",
-                        "full",
-                        "--drive",
-                    ],
-                    None,
-                );
-                assert!(out.ok, "APPARATUS: mutual trust not staged: {out:?}");
-            }
+        for w in [&slow, &fast, &sibw] {
+            pair(&sib, w);
         }
-        let id = create(&workers[0]);
-        let link = workers[0].vox(None, &["room", "link", &id]);
-        assert!(link.ok, "APPARATUS: no fast-member link: {link:?}");
+        let id = create(&slow);
+        let link = slow.vox(None, &["room", "link", &id]);
+        link.expect_ok("slow member room link");
         let link = link.stdout.trim().to_owned();
-        for w in &workers[1..3] {
-            let out = w.vox_in(
-                None,
-                &["room", "join", "--passphrase-file", "-", &link],
-                Some(room::ROOM_PASS),
-            );
-            assert!(out.ok, "APPARATUS: initial author did not join: {out:?}");
-        }
+        fast.vox_in(
+            None,
+            &["room", "join", "--passphrase-file", "-", &link],
+            Some(room::ROOM_PASS),
+        )
+        .expect_ok("initial fast member join");
+        let link = fast.vox(None, &["room", "link", &id]);
+        link.expect_ok("fast member room link");
+        let link = link.stdout.trim().to_owned();
         let mut acknowledged = BTreeSet::new();
-        for n in 0..300 {
-            let text = format!("RG1-seed-{n:03}");
-            post(&workers[0], &id, &text, true);
-            acknowledged.insert(text);
-        }
-        let seeding = Instant::now();
-        loop {
-            let (seed, _, _) = read(&workers[0], &id, None);
-            if acknowledged.is_subset(&seed) {
-                break;
+        std::thread::scope(|scope| {
+            for (parity, w) in [(0, &fast), (1, &slow)] {
+                let id = &id;
+                scope.spawn(move || {
+                    for n in (parity..3000).step_by(2) {
+                        post(w, id, &format!("seed {n:05} {}", "x".repeat(120)), true);
+                    }
+                });
             }
+        });
+        for n in 0..3000 {
+            acknowledged.insert(format!("seed {n:05} {}", "x".repeat(120)));
+        }
+        for (parity, w) in [(0, &fast), (1, &slow)] {
+            let (shown, pages, _) = read(w, &id, None);
             assert!(
-                seeding.elapsed() < Duration::from_secs(120),
-                "APPARATUS: 300-entry room not attained"
+                (parity..3000)
+                    .step_by(2)
+                    .all(|n| shown.contains(&format!("seed {n:05} {}", "x".repeat(120)))),
+                "APPARATUS: own half of 3,000 seeded posts not shown by {}",
+                w.name
             );
-            std::thread::sleep(Duration::from_millis(100));
+            eprintln!("[RG-1 seed] {} own1500 shown pages={pages}", w.name);
         }
         let state = Arc::new(Mutex::new(LoadState::default()));
-        // All six late joins must be reached before introducing the deliberately slow member.
-        for w in &workers[3..9] {
-            let out = w.vox_in(
-                None,
-                &["room", "join", "--passphrase-file", "-", &link],
-                Some(room::ROOM_PASS),
-            );
-            assert!(
-                out.ok,
-                "APPARATUS: six earlier late joiners not attained: {out:?}"
-            );
-        }
-        // Keep the paused member separate from the three 1/s authors: stopping an author
-        // would also slow its synchronous posting CLI, rather than just its service to peers.
-        let authors = [
-            Arc::clone(&workers[0]),
-            Arc::clone(&workers[2]),
-            Arc::clone(&workers[3]),
-        ];
-        let load = load(&authors, &id, Arc::clone(&state));
+        let authors = [Arc::clone(&fast), Arc::clone(&slow)];
+        let mut load = load(&authors, &slow, &id, Arc::clone(&state));
+        std::thread::sleep(Duration::from_secs(3));
         let pauses = if delayed {
             let forward = forward.as_ref().expect("delayed forward");
             forward.set_delay(Duration::from_millis(350));
@@ -10441,17 +10764,35 @@ mod rg1 {
             }
             Some(pauses)
         };
-        {
-            let state = state.lock().expect("APPARATUS: load state");
-            assert!(state.errors.is_empty() && state.steps.len() == 3
-                && state.steps.values().all(|n| *n > 0),
-                "APPARATUS: three posting authors with stepping Sessions not attained: errors={:?} steps={:?}",
-                state.errors, state.steps);
+        let staging = Instant::now();
+        loop {
+            check_slow(&pauses, &mut daemons[1]);
+            check_load(&load, &state, true);
+            let ready = {
+                let state = state.lock().expect("APPARATUS: load state");
+                state.steps.len() == 3
+                    && state.steps.values().all(|n| *n > 0)
+                    && authors.iter().all(|w| {
+                        state
+                            .offered
+                            .get(&w.name)
+                            .is_some_and(|times| times.len() >= 3)
+                    })
+            };
+            if ready {
+                break;
+            }
+            assert!(
+                staging.elapsed() < Duration::from_secs(120),
+                "APPARATUS: three one-second authors with stepping Sessions not attained"
+            );
+            std::thread::sleep(Duration::from_millis(20));
         }
-        for w in &authors {
+        for index in 0..3 {
+            let w = &slow;
             let started = Instant::now();
-            let session = format!("rg1-{}", w.name);
-            let prefix = format!("RG1-session-{session}-");
+            let session = format!("trial-session-{index:04}");
+            let prefix = format!("{session} step ");
             loop {
                 let out = w.vox(None, &["room", "session", &id, &session]);
                 let stepping = out.stdout.split(&prefix).skip(1).any(|tail| {
@@ -10472,40 +10813,128 @@ mod rg1 {
                 std::thread::sleep(Duration::from_millis(100));
             }
         }
-        eprintln!(
-            "[RG-1 staged] 300 entries; three 1/s authors; three product-read Sessions; \
-            six earlier late joiners; slow member attained; daemons=10 anchor_processes=1"
-        );
-        let join_started = Instant::now();
-        let out = workers[9].vox_in(
-            None,
-            &["room", "join", "--passphrase-file", "-", &link],
-            Some(room::ROOM_PASS),
-        );
-        if !out.ok {
-            for w in &workers[..9] {
-                eprintln!(
-                    "[RG-1 timeline] {}",
-                    json!({
-                        "member": w.name, "toward": "new", "first_missing": "join",
-                        "held": null, "grant_applied": null, "key_delivered": null,
-                        "shown": null, "reverse": "not reached: newcomer join refused"
-                    })
-                );
+        eprintln!("[RG-1 staged before late joins] 3000 entries; y1/z1 offer1/s; three OMP Sessions on y1; daemons=4 anchor_processes=1");
+        for (n, w) in olds.iter().enumerate() {
+            join(w, &link, "fast z1", &pauses, &mut daemons[1], &load, &state);
+            let hello = format!("hello from {}", w.name);
+            post(w, &id, &hello, true);
+            acknowledged.insert(hello);
+            if n == 0 {
+                load.threads.push(poster(
+                    Arc::clone(w),
+                    id.clone(),
+                    Arc::clone(&state),
+                    Arc::clone(&load.stop),
+                ));
+            }
+            if n < 5 {
+                std::thread::sleep(Duration::from_secs(10));
             }
         }
+        std::thread::sleep(Duration::from_secs(30));
+        for w in &workers {
+            eprintln!("[RG-1 before create] {} {}", w.name, status(w, &id));
+        }
+        eprintln!(
+            "[RG-1 before create doctor] {:?}",
+            olds[0].vox(None, &["agent", "doctor", "--room", &id, "--json"])
+        );
+        // Match the prototype's product polling load during creation and the join.
+        let newcomer = Arc::new(Mutex::new(None::<Arc<Worker>>));
+        let (sample_workers, sample_new, sample_id, sample_stop) = (
+            vec![Arc::clone(&slow), Arc::clone(&olds[0]), Arc::clone(&fast)],
+            Arc::clone(&newcomer),
+            id.clone(),
+            Arc::clone(&load.stop),
+        );
+        load.threads.push(std::thread::spawn(move || {
+            let mut round = 0;
+            while !sample_stop.load(Ordering::SeqCst) {
+                let at = Instant::now();
+                let mut observed = sample_workers.clone();
+                if let Some(w) = sample_new
+                    .lock()
+                    .expect("APPARATUS: sampler newcomer")
+                    .as_ref()
+                {
+                    observed.insert(0, Arc::clone(w));
+                }
+                for w in observed {
+                    let s = w.vox(None, &["status", "--json"]);
+                    let has_room = s.ok
+                        && s.json()["rooms"].as_array().is_some_and(|rows| {
+                            rows.iter()
+                                .any(|row| row["id"].as_str() == Some(sample_id.as_str()))
+                        });
+                    if has_room {
+                        let (texts, pages, _) = read(&w, &sample_id, None);
+                        eprintln!(
+                            "[RG-1 admission sample] member={} status={s:?} pages={pages} rows={}",
+                            w.name,
+                            texts.len()
+                        );
+                    } else {
+                        let r = w.vox(
+                            None,
+                            &["room", "read", &sample_id, "--json", "--limit", "200"],
+                        );
+                        eprintln!(
+                            "[RG-1 admission sample] member={} status={s:?} read={r:?}",
+                            w.name
+                        );
+                    }
+                    if round % 10 == 0 && (w.name == "y1" || w.name == "n-new") {
+                        eprintln!(
+                            "[RG-1 admission doctor] member={} {:?}",
+                            w.name,
+                            w.vox(None, &["agent", "doctor", "--room", &sample_id, "--json"])
+                        );
+                    }
+                }
+                round += 1;
+                sleep(
+                    &sample_stop,
+                    Duration::from_secs(1).saturating_sub(at.elapsed()),
+                );
+            }
+        }));
+        let created = Instant::now();
+        let new = Arc::new(room::named_worker_as(root.path(), "W", "n-new", &exe));
+        *newcomer.lock().expect("APPARATUS: sampler newcomer") = Some(Arc::clone(&new));
+        workers.push(Arc::clone(&new));
+        std::thread::sleep(Duration::from_secs(2));
+        for w in computers {
+            eprintln!(
+                "[RG-1 revisions after create] {} {:?}",
+                w.name,
+                w.vox(None, &["computer", "status", "--json"])
+            );
+        }
+        for w in [&slow, &new] {
+            eprintln!(
+                "[RG-1 trust after create] {} {:?}",
+                w.name,
+                w.vox(None, &["trust", "list"])
+            );
+        }
+        std::thread::sleep(Duration::from_secs(8).saturating_sub(created.elapsed()));
+        let link = fast.vox(None, &["room", "link", &id]);
+        link.expect_ok("fresh fast-member link");
+        let join_started = Instant::now();
+        join(
+            &new,
+            link.stdout.trim(),
+            "fast z1",
+            &pauses,
+            &mut daemons[1],
+            &load,
+            &state,
+        );
+        eprintln!("[RG-1 admission] all six earlier joiners and the newcomer were admitted");
         assert!(
-            out.ok,
-            "RED PRODUCT: newcomer's join through fast member failed; first missing timeline \
-             step=join; slow_variant={}; join={:?}; product stdout:\n{}\nproduct stderr:\n{}",
-            if delayed {
-                "delayed-path"
-            } else {
-                "paused-serving-pid"
-            },
-            join_started.elapsed(),
-            out.stdout,
-            out.stderr
+            std::env::var("VOX_PROOF_STEP").as_deref() != Ok("admission"),
+            "NO RESULT: every join was admitted with the specified loaded slow author; \
+             stop this admission reproduction and report the receipt to the owner"
         );
         state.lock().expect("APPARATUS: load state").joined = true;
         let joined = Instant::now();
@@ -10519,32 +10948,27 @@ mod rg1 {
             acknowledged.insert(text.clone());
             markers.push((text, through));
         }
-        let mut toward_new: Vec<Timeline> = (0..9).map(|_| Timeline::default()).collect();
-        let mut from_new: Vec<Timeline> = (0..9).map(|_| Timeline::default()).collect();
+        load.threads.push(poster(
+            Arc::clone(&new),
+            id.clone(),
+            Arc::clone(&state),
+            Arc::clone(&load.stop),
+        ));
+        let mut toward_new: Vec<Timeline> = (0..8).map(|_| Timeline::default()).collect();
+        let mut from_new: Vec<Timeline> = (0..8).map(|_| Timeline::default()).collect();
         loop {
-            assert!(
-                !state
-                    .lock()
-                    .expect("APPARATUS: load state")
-                    .errors
-                    .is_empty()
-                    || load.threads.iter().all(|thread| !thread.is_finished()),
-                "APPARATUS: a posting Session stopped before the journey's verdict"
-            );
-            let (counts, errors) = {
-                let mut state = state.lock().expect("APPARATUS: load state");
-                (state.after_join.clone(), std::mem::take(&mut state.errors))
-            };
-            assert!(
-                errors.is_empty(),
-                "RED PRODUCT: an author stopped acknowledging posts: {errors:?}"
-            );
-            for n in 0..9 {
-                let live_count = counts.get(&workers[n].name).copied().unwrap_or(0);
-                let count = live_count + 1; // Each member also acknowledged its post-join marker.
+            check_slow(&pauses, &mut daemons[1]);
+            check_load(&load, &state, false);
+            for n in 0..8 {
+                let count = post_count(
+                    &state.lock().expect("APPARATUS: load state"),
+                    &workers[n].name,
+                );
+                let new_count =
+                    post_count(&state.lock().expect("APPARATUS: load state"), &new.name);
                 observe(
                     &workers[n],
-                    &workers[9],
+                    &new,
                     &id,
                     &markers[n].0,
                     markers[n].1,
@@ -10553,57 +10977,74 @@ mod rg1 {
                     joined,
                 );
                 observe(
-                    &workers[9],
+                    &new,
                     &workers[n],
                     &id,
-                    &markers[9].0,
-                    markers[9].1,
-                    1,
+                    &markers[8].0,
+                    markers[8].1,
+                    new_count,
                     &mut from_new[n],
                     joined,
                 );
-                if count >= 100 {
-                    let (shown, _, _) = read(&workers[9], &id, None);
-                    let prefix = format!("RG1-live-{}-", workers[n].name);
-                    let state = state.lock().expect("APPARATUS: load state");
-                    let has_live_post = state
-                        .acknowledged
-                        .get(&workers[n].name)
-                        .into_iter()
-                        .flatten()
-                        .rev()
-                        .take(live_count)
-                        .any(|text| text.starts_with(&prefix) && shown.contains(text));
-                    drop(state);
-                    assert!(
-                        shown.contains(&markers[n].0) || has_live_post,
-                        "RED PRODUCT: {} acknowledged {count} posts since join; newcomer shows \
-                         none; first missing timeline step={}; timeline={:?}",
-                        workers[n].name,
-                        toward_new[n].first_missing(),
-                        toward_new[n]
-                    );
+                for (source, target, marker, marks) in [
+                    (
+                        workers[n].as_ref(),
+                        new.as_ref(),
+                        &markers[n].0,
+                        &toward_new[n],
+                    ),
+                    (
+                        new.as_ref(),
+                        workers[n].as_ref(),
+                        &markers[8].0,
+                        &from_new[n],
+                    ),
+                ] {
+                    let count =
+                        post_count(&state.lock().expect("APPARATUS: load state"), &source.name);
+                    if count >= 100 {
+                        let (shown, _, _) = read(target, &id, None);
+                        let has_live_post = state
+                            .lock()
+                            .expect("APPARATUS: load state")
+                            .acknowledged
+                            .get(&source.name)
+                            .into_iter()
+                            .flatten()
+                            .any(|(text, after_join)| *after_join && shown.contains(text));
+                        check_slow(&pauses, &mut daemons[1]);
+                        assert!(shown.contains(marker) || has_live_post,
+                            "RED PRODUCT: {} acknowledged {count} posts since join; {} shows none; \
+                             observed/unobserved marks (independent, not prerequisites)={marks:?}",
+                            source.name, target.name);
+                    }
                 }
             }
             if toward_new
                 .iter()
                 .chain(&from_new)
-                .all(|t| t.first_missing() == "none")
+                .all(|t| t.shown.is_some())
             {
                 break;
             }
         }
+        assert!(
+            load.finish(),
+            "APPARATUS: a load thread stopped while final answers were collected"
+        );
         drop(load);
+        check_errors(&state, false);
         for texts in state
             .lock()
             .expect("APPARATUS: load state")
             .acknowledged
             .values()
         {
-            acknowledged.extend(texts.iter().cloned());
+            acknowledged.extend(texts.iter().map(|(text, _)| text.clone()));
         }
         // Keep the slow condition in force through convergence; no elapsed-time verdict.
         loop {
+            check_slow(&pauses, &mut daemons[1]);
             let mut complete = true;
             for w in &workers {
                 let (shown, pages, oldest) = read(w, &id, None);
@@ -10629,6 +11070,7 @@ mod rg1 {
                     }
                 }
             }
+            check_slow(&pauses, &mut daemons[1]);
             if complete {
                 break;
             }
@@ -10637,7 +11079,7 @@ mod rg1 {
         free_disk(root.path());
         eprintln!(
             "GREEN: RG-1 every member shown both ways; all {} acknowledged posts shown \
-            on every member after authors stop; daemons=10 anchor_processes=1 run={:?}",
+            on every member after authors stop; daemons=4 anchor_processes=1 run={:?}",
             acknowledged.len(),
             join_started.elapsed()
         );
