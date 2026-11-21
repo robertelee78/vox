@@ -1022,7 +1022,6 @@ impl Node {
         }
         self.key_package_rooms.remove(room);
         self.key_package_governance_wait.remove(room);
-        self.key_package_unopened.remove(room);
         self.key_package_retry_at.remove(room);
         self.session_upgrade_retry_at.remove(room);
         self.session_control_check_at.remove(room);
@@ -1090,7 +1089,6 @@ impl Node {
         self.leave_waiters.retain(|waiter| waiter.room != *room);
         self.key_package_rooms.remove(room);
         self.key_package_governance_wait.remove(room);
-        self.key_package_unopened.remove(room);
         self.key_package_retry_at.remove(room);
         self.session_upgrade_retry_at.remove(room);
         self.session_control_check_at.remove(room);
