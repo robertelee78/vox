@@ -989,8 +989,7 @@ async fn trust(client: &mut IpcClient, channel_id: Digest32) -> Vec<Check> {
 
 // ---------------------------------------------------------------- versions
 
-/// Every other working session's version stamp against this vox's: work coordination is refused
-/// across versions (ADR-021 §5).
+/// Other working sessions must use the same claim rules (ADR-052 RG-10).
 async fn versions(client: &mut IpcClient, channel_id: Digest32) -> Vec<Check> {
     let snap = match crate::coord::snapshot(client, channel_id).await {
         Ok(s) => s,
@@ -1007,7 +1006,7 @@ async fn versions(client: &mut IpcClient, channel_id: Digest32) -> Vec<Check> {
         return vec![ok(
             "versions",
             format!(
-                "no other session has announced a version here; this is vox {}",
+                "no other session has announced claim rules here; this uses claim rules {}",
                 table.mine
             ),
         )];
@@ -1025,7 +1024,7 @@ async fn versions(client: &mut IpcClient, channel_id: Digest32) -> Vec<Check> {
                 vox_agentcomms::version::Stamp::Match => ok(
                     id,
                     format!(
-                        "last announced vox {} at {}",
+                        "last announced claim rules {} at {}",
                         table.mine,
                         crate::room_cli::millis_as_time(p.last_millis)
                     ),
@@ -1033,12 +1032,12 @@ async fn versions(client: &mut IpcClient, channel_id: Digest32) -> Vec<Check> {
                 other => warn(
                     id,
                     format!(
-                        "last announced vox {} at {}, this is vox {}: work coordination is refused until they match",
+                        "last announced claim rules {} at {}, this uses claim rules {}: work coordination is refused until they match",
                         other.describe(&table.mine),
                         crate::room_cli::millis_as_time(p.last_millis),
                         table.mine
                     ),
-                    "run the same vox on every machine in the room",
+                    "update workers that use different claim rules and let them announce again",
                 ),
             }
         })
