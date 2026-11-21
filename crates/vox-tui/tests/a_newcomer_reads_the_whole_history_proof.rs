@@ -10523,7 +10523,11 @@ mod rg1 {
         let mut from_new: Vec<Timeline> = (0..9).map(|_| Timeline::default()).collect();
         loop {
             assert!(
-                !state.lock().expect("APPARATUS: load state").errors.is_empty()
+                !state
+                    .lock()
+                    .expect("APPARATUS: load state")
+                    .errors
+                    .is_empty()
                     || load.threads.iter().all(|thread| !thread.is_finished()),
                 "APPARATUS: a posting Session stopped before the journey's verdict"
             );
