@@ -1395,10 +1395,10 @@ fn a_restart_owns_its_replacement_while_a_client_waits() {
     let a = Account::new();
     a.make_node("default");
     let pass = a._tmp.path().join("identity.pass");
-    let Daemon {
-        child,
-        out: foreground_output,
-    } = Daemon::start(
+    // `Daemon` ends its own child when it is dropped, so it is kept whole here; `children` holds
+    // only the restart callers, which may be stopped and must be continued before they are killed.
+    // Declared first, the daemon is dropped last.
+    let mut daemon = Daemon::start(
         &a,
         &[
             "--node",
@@ -1409,7 +1409,8 @@ fn a_restart_owns_its_replacement_while_a_client_waits() {
         ],
         &[("VOX_TEST_STOP_HOLD_MS", "3000")],
     );
-    let mut children = Children(vec![child]);
+    let foreground_output = daemon.out.clone();
+    let mut children = Children(Vec::new());
     assert!(
         wait_until(Duration::from_secs(60), || std::fs::read_to_string(
             &foreground_output
@@ -1439,7 +1440,7 @@ fn a_restart_owns_its_replacement_while_a_client_waits() {
             .spawn()
             .unwrap();
         children.0.push(caller);
-        let caller_pid = children.0[1].id();
+        let caller_pid = children.0[0].id();
         assert!(
             wait_until(Duration::from_secs(30), || a
                 .log()
@@ -1460,8 +1461,8 @@ fn a_restart_owns_its_replacement_while_a_client_waits() {
         );
         assert!(
             wait_until(Duration::from_secs(30), || {
-                if old == children.0[0].id() {
-                    children.0[0].try_wait().unwrap().is_some()
+                if old == daemon.child.id() {
+                    daemon.child.try_wait().unwrap().is_some()
                 } else {
                     !alive(old) || a.lock_pid() != Some(old)
                 }
@@ -1493,7 +1494,7 @@ fn a_restart_owns_its_replacement_while_a_client_waits() {
                 .args(["-CONT", &caller_pid.to_string()])
                 .status();
         }
-        let status = children.0[1].wait().unwrap();
+        let status = children.0[0].wait().unwrap();
         children.0.pop();
         let restart = std::fs::read_to_string(&output).unwrap_or_default();
         eprintln!("restart killed={killed}, old={old}, status={status}: {restart}\nclient: {out}{err}\nhook: {}{}\n{}", hook.1, hook.2, a.log());
