@@ -1801,19 +1801,10 @@ impl Router {
             crate::omp_fence::FenceError::Invalid => invalid(),
         })
     }
-    fn registration_store_refusal(
-        node: &NodeName,
-        error: crate::wake::RegistrationStoreError,
-    ) -> Refusal {
-        match error {
-            crate::wake::RegistrationStoreError::Busy => Refusal::RegistrationRetryable {
-                node: node.clone(),
-                reason: vox_core::node::daemonipc::RegistrationRetryReason::LockBusy,
-            },
-            crate::wake::RegistrationStoreError::Failed(why) => Refusal::Failed {
-                node: node.clone(),
-                why: format!("session was not registered: {why}"),
-            },
+    fn registration_store_refusal(node: &NodeName, why: String) -> Refusal {
+        Refusal::Failed {
+            node: node.clone(),
+            why: format!("session was not registered: {why}"),
         }
     }
 
@@ -1872,8 +1863,7 @@ impl Router {
             let lifecycle = self.session_lifecycle(node, &session.session);
             let _lifecycle = lifecycle.lock().await;
             self.settle_session_head(node, &session.session).await;
-            // The reply says attachment is pending, but registration itself must already
-            // be saved. A busy registration lock is a refusal, not a queued success.
+            // Attachment may be pending, but the registration is saved before its reply.
             let paths = self
                 .inner
                 .account
