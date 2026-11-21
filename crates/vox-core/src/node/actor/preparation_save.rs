@@ -701,7 +701,6 @@ impl Node {
                                 // publication.
                                 Some(Stage::Packages) => {
                                     self.key_package_governance_wait.insert(room);
-                                    self.key_package_unopened.insert(room);
                                     prepared.save.resume_after_governance = Some(Stage::Legacy);
                                 }
                                 // Likewise a legacy Session row whose causal past has not
@@ -1045,9 +1044,6 @@ impl Node {
                     Some(Work::Packages(package_save::Work::Select {
                         trust_digest: crate::hash::sha256(&self.trust.to_bytes()),
                         replay: false,
-                        // The prior chain finished or was rejected before this turn.
-                        // Retry an interrupted package from its unchanged durable cursor.
-                        abandon_unopened: true,
                     }))
                 }
                 _ => return Err(Error::Profile("unexpected preparation stage")),
