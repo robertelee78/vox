@@ -208,16 +208,19 @@ its computer with Y, Z and W before the room is created on Y; no explicit all-pa
 is added. The three authors are `y1`, `z1`, and `n-old1` (the latter starts after its
 join). Three OMP Sessions on `y1` alternate 400-character user/reply steps at one per second.
 Every post is a separately started process, offered on a one-second schedule without
-waiting for the previous answer. Offered times and acknowledged times are recorded
+waiting for the previous answer. Several posts can therefore be in flight against the slow
+member at once: this is a heavier load than the old rig, which waited for each answer,
+not merely a cadence difference. Offered times and acknowledged times are recorded
 separately; offered gaps must stay within 750–1250 ms. The slow author's acknowledgement
 lag is measured, not bounded. The slow condition is active before six earlier joins
 through fast `z1`, with ten seconds between the first five and thirty seconds after the sixth.
 W creates `n-new` only then; computer revisions and trust are sampled after two seconds,
-and it joins after eight seconds through a fresh fast-`z1` link. Any refused earlier join
-is a named PRODUCT red too: no retry skips the refusal to reach the newcomer.
-After admission the newcomer also offers one post per second. The 100-acknowledged-post
-red applies from every author (including `y1`) to the newcomer, and from the newcomer
-to each member.
+and it joins after eight seconds through a fresh fast-`z1` link. A refused join of any
+joiner is immediately recorded as RED PRODUCT, never a staging failure, and is not retried.
+Before ending, the proof attempts each remaining joiner once where the staging allows,
+including the newcomer, and reports `refused k of 7 joins` with every refusal's words.
+After admission every earlier member and the newcomer offers one post per second. The
+100-acknowledged-post red applies from each member to the newcomer and back to each member.
 The shared room apparatus strips inherited `PI_` and `OMP` session variables as well as
 the other harness markers; each stand-in supplies only its own Session environment.
 
@@ -226,6 +229,9 @@ A recorded through-slow-member run refused `n-old2` after 44.5 seconds: the memb
 in time`). Receipt: `/opt/vox-evidence/v0431/rg-1/review-r1/faithful-paused.log:13101-13108`.
 That observation is not the five-second seat-question veto RG-2 changes. The journey
 routes all earlier joiners and the newcomer through fast `z1` to exercise that distinct rule.
+On today's product the journey has also shown posts refused with `computer trust changed
+while this command was being applied` after the newcomer's node is created on a paired
+computer; this is RG-3's red on the journey.
 
 Run one named variant, in release, without `test-knobs`:
 
@@ -275,13 +281,17 @@ cargo test --release -p vox-tui --features optional-proofs \
 The named reader mutant is the same command with `VOX_PROOF_RG1_NO_PAGING=1`: it removes
 older-page reads in the proof, not the product, and must turn the first-row assertion red.
 The busy-room journey's apparatus failures say APPARATUS. A refused join quotes the
-product as RED PRODUCT and names the joining member. After admission, 100 acknowledged
+product as RED PRODUCT and names the joining member; the final verdict counts refused joins.
+After admission, 100 acknowledged
 post-join posts with none displayed is RED PRODUCT in either direction, with all marks
 reported. The acknowledged post set is fixed by each offer's join phase, not a sliding
 newest-post window. GREEN additionally requires every member's post shown both ways and
 every acknowledged post on every member after the authors stop; errors from the final
 in-flight commands are checked after those commands finish. Pause-thread and serving-daemon
 liveness are checked before join verdicts, during the timeline and during convergence.
+After authors stop, ten answered `--history older` demands without a smaller missing-post
+set produce RED PRODUCT naming the member and a missing post. Sampler pages record even
+refused reads without deciding the verdict or stopping the sampler.
 No elapsed watchdog decides a product verdict.
 
 For the shipped-v0.4.30 admission reproduction, add `VOX_PROOF_STEP=admission`. A refused
