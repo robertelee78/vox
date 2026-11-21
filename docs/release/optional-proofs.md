@@ -239,10 +239,10 @@ through fast `z1`, with ten seconds between the first five and thirty seconds af
 W creates `n-new` only then; computer revisions and trust are sampled after two seconds,
 and it joins after eight seconds through a fresh fast-`z1` link. A refused join of any
 joiner is immediately recorded as RED PRODUCT, never a staging failure, and is not retried.
-Before ending, the proof attempts each remaining joiner once where the staging allows,
-including the newcomer, and reports `refused k of 7 joins` with every refusal's words.
-After admission every earlier member and the newcomer offers one post per second. The
-100-acknowledged-post red applies from each member to the newcomer and back to each member.
+The proof attempts every remaining joiner once where staging allows, including the newcomer,
+and records `refused k of 7 joins` with every refusal's words.
+After admission every admitted earlier member and the newcomer offers one post per second.
+Only acknowledged posts count toward the 100-post red in either direction and convergence.
 The shared room apparatus strips inherited `PI_` and `OMP` session variables as well as
 the other harness markers; each stand-in supplies only its own Session environment.
 
@@ -253,7 +253,8 @@ That observation is not the five-second seat-question veto RG-2 changes. The jou
 routes all earlier joiners and the newcomer through fast `z1` to exercise that distinct rule.
 On today's product the journey has also shown posts refused with `computer trust changed
 while this command was being applied` after the newcomer's node is created on a paired
-computer; this is RG-3's red on the journey.
+computer: these are the words ADR-052 records for C-3, but which rule refused them here has
+not been traced (this journey removes nobody).
 
 Run one named variant, in release, without `test-knobs`:
 
@@ -304,9 +305,10 @@ The named reader mutant is the same command with `VOX_PROOF_RG1_NO_PAGING=1`: it
 older-page reads in the proof, not the product, and must turn the first-row assertion red.
 The busy-room journey's apparatus failures say APPARATUS. A refused join quotes the
 product as RED PRODUCT and names the joining member; the final verdict counts refused joins.
-After admission, 100 acknowledged
-post-join posts with none displayed is RED PRODUCT in either direction, with all marks
-reported. The acknowledged post set is fixed by each offer's join phase, not a sliding
+After admission, 100 acknowledged post-join posts with none displayed is RED PRODUCT in
+either direction, with all marks reported. If a member has no acknowledged post, 100 answered
+offers (acknowledged plus refused since join) produce a red saying how many were refused
+and that none was acknowledged. The acknowledged post set is fixed by each offer's join phase, not a sliding
 newest-post window. GREEN additionally requires every member's post shown both ways and
 every acknowledged post on every member after the authors stop; errors from the final
 in-flight commands are checked after those commands finish. Pause-thread and serving-daemon
@@ -316,10 +318,27 @@ set produce RED PRODUCT naming the member and a missing post. Sampler pages reco
 refused reads without deciding the verdict or stopping the sampler.
 No elapsed watchdog decides a product verdict.
 
-For the shipped-v0.4.30 admission reproduction, add `VOX_PROOF_STEP=admission`. A refused
-join is still RED PRODUCT; if all six earlier joiners and the newcomer are admitted, that
-run stops with `NO RESULT` and its receipt must be reported for an owner decision. Omit
-that selector for the full post-admission journey on a candidate.
+After all admission attempts, a refused newcomer ends the run with every recorded failure;
+an admitted newcomer continues into the timeline and convergence with only admitted members,
+while refused posts remain recorded and their authors keep offering posts.
+The final verdict is RED PRODUCT for any refused join, post or command, or failing tail observation,
+and GREEN only when none occurred and every acknowledged post is shown on every admitted member.
+If refreshing the fast member's link is refused, retain that refusal and use its already-successful
+link for the newcomer; do not retry the refused command or change the admitting member.
+
+For an **apparatus smoke only**, add `VOX_PROOF_RG1_NO_PAUSE=1` to the paused-variant
+command. It disables the serving-process pause so the
+post-admission code can run on the shipped helper. Its product red or green is never a
+verdict on an ADR requirement; record which post-admission branches it actually reaches.
+
+Coverage remains limited: no direction has ever become shown, so the `shown`/`shown_post`
+success paths, the all-directions-shown loop end, the stopped-authors loop (including its
+demand-count and refusal branches), and GREEN have never run. Neither have the
+refused-newcomer branch under this code, the refused-link fallback, the tail's error
+branches, a tail with a member refused at admission, or the all-posts-refused bound.
+The first candidate that gets past the 100-post red is these shown-dependent branches'
+first run; an APPARATUS fault or a hang there is a defect of this proof to fix, not the
+candidate's failure.
 
 ## The proofs
 
