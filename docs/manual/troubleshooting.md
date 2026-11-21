@@ -199,12 +199,16 @@ mistakes. If it is right, ask the room's creator whether you have the right room
   line naming the member
 - `that room has ended — a member or its board said so — so it takes nobody in`
 
-**Meaning:** in the first three, your passphrase was accepted. A room holds up to 1,024 members,
-and every member online must agree to a newcomer. An ended room takes no one, and your passphrase
-was never checked.
+**Meaning:** in the first three, your passphrase was accepted. A room holds up to 1,024 members.
+The member you join through admits you; it asks the members it is connected to whether a place
+is free, and a member that does not answer does not refuse you. The second message means two
+newcomers went for the last place at once; when more than two members answered, it can happen
+that neither was admitted. The third means a member named in the `said:` line does not yet
+count the member that answered you as a member of the room. An ended room takes no one, and
+your passphrase was never checked.
 
-**Fix:** after the second or third, join again: a member that was busy usually answers next time.
-For a full or ended room, ask the creator for a new room.
+**Fix:** after the second or third, join again. For a full or ended room, ask the creator for a
+new room.
 
 ### No board or no member answered
 
