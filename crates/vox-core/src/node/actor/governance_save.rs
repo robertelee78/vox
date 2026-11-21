@@ -232,7 +232,27 @@ impl Node {
         if continuation.attached(self, &room) {
             match continuation.after {
                 After::Trust { .. } => {
-                    self.governance_work.again = true;
+                    self.governance_work.trust_waiting.insert(room);
+                    if ChannelState::governance_refreshing(&error)
+                        || ChannelState::legacy_classification_refreshing(&error)
+                        || matches!(
+                            error,
+                            Error::ComputerPolicySuperseded
+                                | Error::Profile("current computer trust is unavailable")
+                                | Error::Profile("room publication is busy; retry this operation")
+                        )
+                    {
+                        let retry = self
+                            .now_ms()
+                            .0
+                            .saturating_add(ROOM_RETRY.as_millis() as u64);
+                        let next = self
+                            .governance_work
+                            .deadlines
+                            .get(&room)
+                            .map_or(retry, |at| (*at).min(retry));
+                        self.governance_work.set_deadline(room, Some(next));
+                    }
                 }
                 After::Sweep(sweep) => {
                     if matches!(
@@ -479,6 +499,10 @@ impl Node {
                 };
                 if let Err(error) = applied {
                     self.reject_owned_governance(room, error, continuation, reply);
+                    return;
+                }
+                if !state.matches_trust(&self.trust.trusted()) {
+                    self.governance_work.again = true;
                     return;
                 }
                 let action = {

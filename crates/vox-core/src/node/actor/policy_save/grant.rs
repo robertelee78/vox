@@ -230,7 +230,19 @@ impl Node {
             .await;
         } else {
             drop(lifetime);
-            self.reply_after_room_trust(reply);
+            self.finish_grant_reply(grant, reply).await;
         }
+    }
+
+    pub(super) async fn finish_grant_reply(&mut self, grant: GrantSaved, reply: Reply) {
+        let consents = if grant.newly {
+            let (terminal, finished) = oneshot::channel();
+            self.begin_owned_consent_pass(Some(grant.target), None, Some(terminal), None)
+                .await;
+            Some(finished)
+        } else {
+            None
+        };
+        self.reply_after_room_trust(reply, consents);
     }
 }

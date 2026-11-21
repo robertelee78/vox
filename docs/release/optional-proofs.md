@@ -30,6 +30,24 @@ over; the existing manual-removal and through-log re-trust journeys cover this p
 Posts that meet a new computer revision before native publication retain their
 original command queue credit until the saved keyring is current; their room's
 withdrawal fence still decides whether they may be written.
+The consent cursor survives every page. A newer trust list restarts only that room's
+reconciliation, while failed work waits for a room change (transient faults use the
+existing retry deadline). Installing a keyring immediately refreshes service reachers,
+independent of room withdrawal. A new manual grant dials the requested member and
+waits for its existing owed-consent pass before acknowledging the command.
+The post-race act uses the existing text-publication hold to change the durable
+revision before the original post is admitted; the same command must succeed and
+its shipped JSON read must show exactly one copy. At a held withdrawal, a pending
+computer application receipt is judged by other-room post/read progress until the
+receipt is consumed, not by which independent task publishes its marker first.
+The post proof first shows that both removed and surviving readers could read, then
+waits for the surviving reader and ten completed exchanges before checking that the
+removed reader sees no post after withdrawal. To stage a key queued before withdrawal,
+set `VOX_PROOF_RG3_QUEUED_KEY=1` for the held-key proof; it uses the existing pairwise
+key hold and retains the same user-facing no-key assertion.
+The focused manual-removal act counts accepted/read other-room posts while the saved
+removal finishes; it judges the terminal result after at most 100 such observations,
+not after an elapsed wait. Its projection-stage mutant must fail that counted claim.
 
 Run each named proof separately, with exclusive build-slot ownership for the hold:
 
@@ -43,6 +61,12 @@ cargo test --release -p vox-tui --features test-knobs,optional-proofs \
 cargo test --release -p vox-tui --features test-knobs,optional-proofs \
   --test nodes_of_one_daemon_proof \
   an_unfinished_room_releases_no_key_until_its_withdrawal_finishes -- --ignored --exact --nocapture
+cargo test --release -p vox-tui --features test-knobs,optional-proofs \
+  --test nodes_of_one_daemon_proof \
+  a_post_racing_a_trust_revision_is_saved_once -- --ignored --exact --nocapture
+cargo test --release -p vox-tui --features test-knobs,optional-proofs \
+  --test nodes_of_one_daemon_proof \
+  a_saved_manual_removal_finishes_while_another_room_posts -- --ignored --exact --nocapture
 ```
 
 ### macOS update recovery (ADR-014 M-29a)

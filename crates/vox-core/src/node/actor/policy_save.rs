@@ -339,12 +339,17 @@ impl Node {
                 error,
             },
         };
+        self.refresh_reachers().await;
         self.resume_policy_result(resume, pending.reply).await;
     }
 
-    /// The command keeps its old success meaning without retaining the node's policy owner.
-    /// Only the room currently observed is waited for; ordinary governance owns all writes.
-    fn reply_after_room_trust(&mut self, reply: Reply) {
+    /// The reply observes room completion and the original requested consent pass without
+    /// retaining the node's policy owner.
+    fn reply_after_room_trust(
+        &mut self,
+        reply: Reply,
+        consents: Option<oneshot::Receiver<crate::error::Result<()>>>,
+    ) {
         let Some(mut reply) = reply else {
             return;
         };
@@ -391,6 +396,19 @@ impl Node {
                         }
                         _ = retired.changed() => break,
                         _ = changed => {}
+                    }
+                }
+            }
+            if let Some(consents) = consents {
+                match consents.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        let _ = reply.send(Outcome::Failed(fault_of(&error)));
+                        return;
+                    }
+                    Err(_) => {
+                        let _ = reply.send(Outcome::Failed(Fault::Internal));
+                        return;
                     }
                 }
             }
@@ -472,8 +490,8 @@ impl Node {
                 source,
                 grant,
             } => {
-                drop((lifetime, source, grant));
-                self.reply_after_room_trust(reply);
+                drop((lifetime, source));
+                self.finish_grant_reply(grant, reply).await;
             }
             PolicyResume::Dismissed { lifetime, result } => {
                 if matches!(&result, Ok(true)) {
@@ -496,7 +514,7 @@ impl Node {
                     self.publish().await;
                 }
                 drop((lifetime, operation));
-                self.reply_after_room_trust(reply);
+                self.reply_after_room_trust(reply, None);
             }
             PolicyResume::Managed {
                 lifetime,

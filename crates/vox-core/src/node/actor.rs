@@ -6547,7 +6547,6 @@ pub struct Node {
     own_key_leave_pending: BTreeMap<Digest32, Arc<()>>,
     own_key_ended_pending: BTreeMap<Digest32, Arc<()>>,
     own_key_untrust_pending: Option<Arc<()>>,
-    own_key_room_set_changed: watch::Sender<()>,
     own_key_computer_pending: std::collections::VecDeque<computer::OwnKeyPolicyWork>,
     own_key_computer_flight: Option<OwnKeyPolicyFlight>,
     /// Peers' acknowledgements of this node's own feed reported by lane rounds, applied on
@@ -7388,7 +7387,6 @@ impl Node {
             own_key_leave_pending: BTreeMap::new(),
             own_key_ended_pending: BTreeMap::new(),
             own_key_untrust_pending: None,
-            own_key_room_set_changed: watch::channel(()).0,
             own_key_computer_pending: std::collections::VecDeque::new(),
             own_key_computer_flight: None,
             held_notes: Vec::new(),
@@ -19907,7 +19905,6 @@ impl Node {
         // Retire queued scanner admission and its wake before dropping room ownership. A
         // physical blocking read retains its own secret guard until it actually exits.
         self.key_body_scan = key_body_scan::Controller::default();
-        self.own_key_room_set_changed.send_replace(());
         let busy: Vec<_> = self.own_key_donor_busy.keys().copied().collect();
         for key in busy {
             self.retire_own_key_donor_busy(key);
@@ -20240,9 +20237,6 @@ impl Node {
         self.own_recovery_rooms.remove(channel_id);
         self.own_recovery_body_debts.remove(channel_id);
         self.own_readable_effects.remove(channel_id);
-        if self.channels.contains_key(channel_id) {
-            self.own_key_room_set_changed.send_replace(());
-        }
         self.retire_parked_private_drive(channel_id, Fault::ChannelNotOpen);
         self.session_ingress_waits
             .retain(|(room, _), _| room != channel_id);
@@ -20853,7 +20847,6 @@ impl Node {
         crate::node::status::SyncBook::note_set_aside(&self.sync_book, channel_id, ch.set_aside());
         let install = || {
             self.role_wake.install(channel_id, &ch.role_owed());
-            self.own_key_room_set_changed.send_replace(());
             if let Some(net) = self.net.as_ref() {
                 net.forget_board_exchange_room(&channel_id);
             }
