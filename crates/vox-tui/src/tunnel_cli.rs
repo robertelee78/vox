@@ -949,7 +949,7 @@ pub(crate) fn join_advice(fault: Option<Fault>) -> &'static str {
         // A generic refusal includes remote save failures. It establishes neither a bad
         // passphrase nor a trust decision.
         Some(Fault::Refused) => {
-            "a member answered but did not accept the join; no specific cause was received\n       ask that member to check vox status and its daemon log, then retry\n       this refusal does not establish a passphrase or trust cause"
+            "a member answered but did not accept the join; no specific cause was received\n       check the room passphrase you typed as one possible cause\n       ask that member to check its disk, vox status and daemon log, then retry\n       this refusal does not establish a passphrase or trust cause"
         }
         Some(Fault::NotNetworked) => {
             "this node is not networked, or its identity is locked\n       nothing about the room is in question"

@@ -5,7 +5,7 @@
 //! Every fact here is **read** from state the node already keeps — the published view,
 //! the connection manager, the sync schedules, the app layer and each connection's
 //! datagram router — plus three small ledgers this module keeps for the purpose
-//! ([`StatusBook`]): when each room last completed a sync, when each peer was last seen
+//! ([`StatusBook`]): when each room last received new sync entries, when each peer was last seen
 //! connected, and which tunnels are being served right now. Nothing here decides
 //! anything, and nothing the node does waits on it.
 //!
@@ -13,7 +13,9 @@
 //!
 //! A line in [`StatusReport::unhealthy`] is something an operator should look at:
 //!
-//! - a room with other members that has not completed a sync in [`STALE_SYNC_MS`];
+//! - a room with other members and no new sync entries in [`STALE_SYNC_MS`] while nobody is
+//!   connected or a connected member advertises at least twenty feed entries not held here;
+//! - a connected member advertising at least twenty feed entries beyond its verified head here;
 //! - a **trusted** member of an open room this node was connected to and no longer is;
 //! - an **anchor** this node keeps that it has not reached for [`ANCHOR_UNREACHABLE_MS`], while
 //!   this node needs one. An anchor only bridges hosts that cannot otherwise find each other
@@ -61,7 +63,7 @@ use crate::node::ipc::{read_frame, write_frame, Frame};
 use crate::node::link::b32_encode;
 use crate::transport::router::DatagramStats;
 
-/// A room with other members and no completed sync for this long is flagged.
+/// The no-new-entry threshold for a room cut off from members or measurably not receiving.
 pub const STALE_SYNC_MS: u64 = 10 * 60 * 1_000;
 
 /// The stale threshold in the unit a person reads: minutes, or seconds under a minute.
@@ -82,9 +84,9 @@ pub const ANCHOR_UNREACHABLE_MS: u64 = 60_000;
 /// milliseconds.
 #[derive(Debug, Default)]
 pub struct StatusBook {
-    /// Room → when a sync this node ran there last completed.
+    /// Room → when a sync last brought new entries to this node there.
     pub room_synced: BTreeMap<Digest32, u64>,
-    /// Peer → when a sync session with it last completed, in any room.
+    /// Peer → when a sync with it last brought new entries, in any room.
     pub member_synced: BTreeMap<Digest32, u64>,
     /// Peer → when this node last saw a live connection to it.
     pub last_seen: BTreeMap<Digest32, u64>,
@@ -111,7 +113,7 @@ pub struct MemberStatus {
     pub advertised_through: Option<u64>,
     /// When this node last saw it connected (now, if it is), unix milliseconds.
     pub last_seen: Option<u64>,
-    /// When a sync session with it last ran, unix milliseconds.
+    /// When a sync with it last brought new entries, unix milliseconds.
     pub last_sync: Option<u64>,
     /// What is said of it about this identity's key in this room, after its name, if anything
     /// (ADR-030 D-5, W-4): that the key waits, and why, or that it runs an older Vox.
@@ -132,7 +134,7 @@ impl MemberStatus {
         !self.me
             && self.connected
             && self.advertised_through.is_some_and(|advertised| {
-                advertised.saturating_sub(self.holds_through.unwrap_or(0)) >= 20
+                advertised.saturating_sub(self.verified_through.unwrap_or(0)) >= 20
             })
     }
 }
@@ -157,7 +159,7 @@ pub struct RoomStatus {
     pub name: String,
     /// Its epoch.
     pub epoch: u64,
-    /// When a sync this node ran there last completed, unix milliseconds.
+    /// When a sync last brought new entries to this node here, unix milliseconds.
     pub last_sync: Option<u64>,
     /// The retention this node applies here, seconds (`0` forever): the shorter of the room's
     /// and the node's own (ADR-023 decision 2).
@@ -202,7 +204,7 @@ pub struct RoomStatus {
 }
 
 impl RoomStatus {
-    /// A connected member advertises at least twenty feed positions past its latest shown message.
+    /// A connected member advertises at least twenty feed entries beyond what this node holds.
     #[must_use]
     pub fn not_receiving(&self) -> bool {
         self.members.iter().any(MemberStatus::not_receiving)
@@ -377,9 +379,9 @@ pub struct AnchorStatus {
 /// One condition that needs looking at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unhealthy {
-    /// A stable name for the condition — `peer-unreachable:<room>:<peer>`, `room-stale:<room>`
-    /// or `anchor-unreachable:<anchor>` — the same for as long as the condition holds, so a notifier
-    /// can tell it starting from it continuing (PRD-001 R37).
+    /// A stable name for the condition — including `room-not-receiving:<room>`,
+    /// `peer-unreachable:<room>:<peer>`, `room-stale:<room>` and `anchor-unreachable:<anchor>` —
+    /// so a notifier can tell it starting from it continuing (PRD-001 R37).
     pub key: String,
     /// What a person reads. May change while the condition holds ("last seen 12s ago").
     pub message: String,
@@ -407,25 +409,31 @@ impl StatusReport {
                 out.push(Unhealthy {
                     key: format!("room-not-receiving:{}", b32_encode(&room.id)),
                     message: format!(
-                        "room {} ({}): not receiving from connected member {}; received through message {} (latest shown), member advertised feed through {}; check that member's vox status and daemon log",
+                        "room {} ({}): not receiving from connected member {}; holds verified feed through entry {}, member advertised through entry {} (at least {} entries not held); check that member's vox status and daemon log",
                         short(&room.id), room.name, short(&member.id),
-                        member.holds_through.map_or_else(|| "none shown".to_owned(), |seq| seq.to_string()),
+                        member.verified_through.unwrap_or(0),
                         member.advertised_through.unwrap_or(0),
+                        member.advertised_through.unwrap_or(0).saturating_sub(member.verified_through.unwrap_or(0)),
                     ),
                 });
             }
-            // Measured from the last completed sync, or from the node's start when there
-            // has been none: a daemon that has just started is not unhealthy for not
-            // having synced in its first seconds, and would otherwise alarm on every start.
+            // Measured from the last new sync entries, or from this node's start. A quiet
+            // connected room is not stale merely because its clean rounds bring nothing.
             let since = room.last_sync.unwrap_or(self.started);
             let stale = self.now.saturating_sub(since) > STALE_SYNC_MS;
             let retained_by_pool = retained_pool_rooms.contains(&room.id);
             let retained_cause = retained_by_pool.then_some(RETAINED_POOL_HEALTH);
-            if stale && room.not_receiving() {
+            if stale
+                && (room.not_receiving()
+                    || !room
+                        .members
+                        .iter()
+                        .any(|member| !member.me && member.connected))
+            {
                 out.push(Unhealthy {
                     key: format!("room-stale:{}", b32_encode(&room.id)),
                     message: format!(
-                        "room {} ({}): no completed sync in {}{}",
+                        "room {} ({}): no new sync entries in {}{}",
                         short(&room.id),
                         room.name,
                         stale_words(STALE_SYNC_MS),
@@ -458,7 +466,7 @@ impl StatusReport {
                             room.name,
                             short(&m.id),
                             if m.daemon_answered {
-                                "daemon answered, but node is not available there (it may not be attached); ask its operator to check vox node list"
+                                "daemon answered, but node is not available there (it may not be attached); ask its operator to check vox node list and whether the address is wrong or stale"
                             } else {
                                 "unreachable"
                             },
@@ -794,7 +802,7 @@ impl StatusReport {
         );
         gauge(
             "vox_room_last_sync_seconds",
-            "When a sync this node ran in the room last completed (0: never).",
+            "When a sync last brought new entries to this node in the room (0: never).",
             self.rooms
                 .iter()
                 .map(|r| {
@@ -1641,6 +1649,21 @@ impl SyncBook {
             .get(&(room, peer))
             .and_then(|port| port.last_failure.as_deref())
             .is_some_and(|why| why.contains("the daemon answered at"))
+    }
+
+    /// An authenticated connection supersedes an earlier node-unavailable dial.
+    pub(crate) fn note_connected(book: &SharedSyncBook, peer: Digest32) {
+        let mut book = book.lock().unwrap_or_else(PoisonError::into_inner);
+        for ((_, member), counts) in &mut book.ports {
+            if *member == peer
+                && counts
+                    .last_failure
+                    .as_deref()
+                    .is_some_and(|why| why.contains("the daemon answered at"))
+            {
+                counts.last_failure = None;
+            }
+        }
     }
 
     /// Read, at each status request, which connection `manager` holds for each peer.

@@ -399,7 +399,8 @@ fn every_common_failure_names_its_cause() {
         &said,
         &[
             "a member answered but did not accept the join",
-            "ask that member to check vox status",
+            "check the room passphrase you typed as one possible cause",
+            "ask that member to check its disk, vox status and daemon log",
             "this refusal does not establish a passphrase or trust cause",
         ],
     );

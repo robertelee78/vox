@@ -770,7 +770,7 @@ impl DialFailed {
         match self {
             Self::NotAnswered => {
                 Error::HandshakeAuth(format!(
-                    "the daemon answered at {addr}, but node {} is not available there (it may not be attached); ask its operator to check vox node list",
+                    "the daemon answered at {addr}, but node {} is not available there (it may not be attached); ask its operator to check vox node list, or check whether the address is wrong or no longer belongs to that node",
                     short(expected)
                 ))
             }

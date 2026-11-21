@@ -167,8 +167,14 @@ fn two_nodes_answer_at_one_address_and_a_detach_leaves_the_other() {
         r2.transcript(),
         daemon.transcript()
     );
-    let nothing = format!("the daemon answered at 127.0.0.1:{port}, but node {} is not available there (it may not be attached)", short(&fb));
-    let refused_b = r2.line_within(Duration::from_secs(60), |l| l.contains(&nothing));
+    let answered = format!(
+        "the daemon answered at 127.0.0.1:{port}, but node {}",
+        short(&fb)
+    );
+    let old_refusal = format!("nothing at 127.0.0.1:{port} answers as {}", short(&fb));
+    let refused_b = r2.line_within(Duration::from_secs(60), |l| {
+        l.contains(&answered) || l.contains(&old_refusal)
+    });
     assert!(
         refused_b.is_some(),
         "PRODUCT: after b detached, the remote was not told its daemon answered but b may not be attached.\n\
@@ -177,8 +183,13 @@ fn two_nodes_answer_at_one_address_and_a_detach_leaves_the_other() {
     );
     let refused_b = refused_b.expect("PRODUCT: node-unavailable reply was required above");
     assert!(
-        !refused_b.contains("unreachable") && !refused_b.contains("locked"),
+        refused_b.contains("the daemon answered at") && !refused_b.contains("unreachable") && !refused_b.contains("locked"),
         "PRODUCT: a daemon answered but the node-unavailable reply invented a reachability or lock verdict: {refused_b}"
+    );
+    assert!(
+        refused_b.contains("check vox node list")
+            && refused_b.contains("address is wrong or no longer belongs to that node"),
+        "PRODUCT: the node-unavailable reply did not suggest checking the node and its address: {refused_b}"
     );
     eprintln!(
         "[proof] after b detached: a reached, b refused, {:?} after the second remote started",

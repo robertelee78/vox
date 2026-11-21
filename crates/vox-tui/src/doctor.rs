@@ -973,7 +973,7 @@ async fn trust(client: &mut IpcClient, channel_id: Digest32) -> Vec<Check> {
                 (true, false) => warn(
                     id,
                     "you trust it; your node has not received its trust for you, so cannot tell whether it trusts you",
-                    "check vox status for this room and ask its operator to check theirs; missing room history is not a reason to change trust",
+                    "if its operator has not accepted your fingerprint from that node's trust offers, ask its operator to accept your fingerprint; otherwise check vox status for this room and ask them to check their status and daemon log",
                 ),
             }
         })

@@ -5029,7 +5029,7 @@ fn went_offline(conn: &VoxConnection) -> Option<String> {
                 .and_then(WireError::from_code)?
             {
                 WireError::ShuttingDown => Some("it stopped".to_owned()),
-                WireError::NotAvailable => Some("its daemon answered, but this node is not available there (it may not be attached); ask its operator to check vox node list".to_owned()),
+                WireError::NotAvailable => Some("its daemon answered, but this node is not available there (it may not be attached); ask its operator to check vox node list and whether the address is wrong or stale".to_owned()),
                 _ => None,
             }
         }
@@ -12283,6 +12283,7 @@ impl Node {
                     .and_then(|net| net.manager().existing(&peer));
                 if let Some(conn) = &conn {
                     self.note_peer_endpoint(conn);
+                    crate::node::status::SyncBook::note_connected(&self.sync_book, peer);
                     self.rearm_routed_origin(peer, conn.serial());
                     self.pull_presentation(peer);
                 }

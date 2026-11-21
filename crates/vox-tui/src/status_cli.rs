@@ -275,7 +275,7 @@ fn render(v: &Value) -> Result<String, AppError> {
             "  {} {}  {}  epoch {}  last sync {}  rows {}  log entries {}  sender keys held {}, received {}; governance revision {}, render backfill {}",
             short(s(r, "id")),
             s(r, "name"),
-            if r["not_receiving"] == true { "not receiving" } else { "received coverage below; newer posts unknown" },
+            if r["not_receiving"] == true { "not receiving" } else { "no advertised feed gap of 20 entries" },
             r.get("epoch").and_then(Value::as_u64).unwrap_or(0),
             ago(now, &r["last_sync_ms"]),
             r.get("entries").and_then(Value::as_u64).unwrap_or(0),
@@ -294,7 +294,11 @@ fn render(v: &Value) -> Result<String, AppError> {
             }
         );
         for member in r["members"].as_array().into_iter().flatten() {
-            let _ = write!(o, "; {} received through message ", short(s(member, "id")));
+            let _ = write!(
+                o,
+                "; {} latest shown message at feed entry ",
+                short(s(member, "id"))
+            );
             if let Some(through) = member["holds_through"].as_u64() {
                 let _ = write!(o, "{through}");
             } else {
@@ -335,7 +339,7 @@ fn render(v: &Value) -> Result<String, AppError> {
             let flag = |k: &str| m.get(k).and_then(Value::as_bool) == Some(true);
             let _ = writeln!(
                 o,
-                "    {}{}{}  {}  last seen {}  last sync {}  received through message {} (latest shown)",
+                "    {}{}{}  {}  last seen {}  last sync {}  latest shown message at feed entry {}",
                 short(s(m, "id")),
                 if flag("me") { " (this node)" } else { "" },
                 if flag("trusted") { " trusted" } else { "" },
@@ -350,7 +354,9 @@ fn render(v: &Value) -> Result<String, AppError> {
                 },
                 ago(now, &m["last_seen_ms"]),
                 ago(now, &m["last_sync_ms"]),
-                m["holds_through"].as_u64().map_or_else(|| "none shown".to_owned(), |seq| seq.to_string()),
+                m["holds_through"]
+                    .as_u64()
+                    .map_or_else(|| "none shown".to_owned(), |seq| seq.to_string()),
             );
             if let Some(said) = m.get("key_waits").and_then(Value::as_str) {
                 let _ = writeln!(o, "      {said}");

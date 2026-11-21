@@ -114,6 +114,11 @@ fn a_dial_that_reaches_another_node_names_no_one() {
         host.transcript()
     );
     assert!(
+        said.contains("check vox node list")
+            && said.contains("address is wrong or no longer belongs to that node"),
+        "PRODUCT: the refusal did not suggest checking the node and its address: {said}"
+    );
+    assert!(
         !said.contains(&short(b_fp)),
         "PRODUCT: the dial named the node that is at the address ({}); a refusal names no one: \
          {said}",

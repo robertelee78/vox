@@ -9385,8 +9385,8 @@ fn cpu_time(pid: u32) -> Duration {
     Duration::from_secs_f64(hours * 3600.0 + mins * 60.0 + secs)
 }
 
-/// `vox status --json` of one profile: completed sync rounds summed over its ports, whether the
-/// room and every other member carry a last completed sync, and the raw status for a red.
+/// `vox status --json` of one profile: completed sync rounds summed over its ports,
+/// whether each room has received new entries, and the raw status for a red.
 fn synced(dir: &Path) -> (u64, bool, String) {
     let (ok, out, err) = vox(dir, &["status", "--json"], None);
     assert!(ok, "PRODUCT: `vox status --json` failed: {err}");
@@ -9402,16 +9402,7 @@ fn synced(dir: &Path) -> (u64, bool, String) {
         })
         .unwrap_or(0);
     let recorded = v["rooms"].as_array().is_some_and(|rooms| {
-        !rooms.is_empty()
-            && rooms.iter().all(|r| {
-                !r["last_sync_ms"].is_null()
-                    && r["members"].as_array().is_some_and(|members| {
-                        members
-                            .iter()
-                            .filter(|m| m["me"] != serde_json::Value::Bool(true))
-                            .all(|m| !m["last_sync_ms"].is_null())
-                    })
-            })
+        !rooms.is_empty() && rooms.iter().all(|r| !r["last_sync_ms"].is_null())
     });
     (completed, recorded, out)
 }

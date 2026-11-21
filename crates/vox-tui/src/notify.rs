@@ -27,7 +27,7 @@
 //! scope: it needs a service to push through, and Vox runs none.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use vox_core::node::actor::NodeHandle;
@@ -132,8 +132,12 @@ pub fn command(paths: &Paths) -> Option<std::ffi::OsString> {
 
 /// Raise one notification without letting a desktop command block indefinitely.
 fn raise(note: &Note, command: Option<&std::ffi::OsStr>) {
-    static DESKTOP_FAILURE_LOGGED: AtomicBool = AtomicBool::new(false);
     eprintln!("vox daemon: {} — {}", note.title, note.body);
+    raise_desktop(note, command);
+}
+
+fn raise_desktop(note: &Note, command: Option<&std::ffi::OsStr>) {
+    static DESKTOP_FAILURE_LOGGED: AtomicBool = AtomicBool::new(false);
     let desktop = command.is_none();
     let mut child = if let Some(cmd) = command {
         let mut child = std::process::Command::new(cmd);
@@ -347,6 +351,7 @@ pub async fn watch(node: NodeHandle, paths: Paths) {
         return;
     }
     let command = command(&paths);
+    let in_flight = std::sync::Arc::new(AtomicUsize::new(0));
     let mut tracker = Tracker::default();
     let mut every = tokio::time::interval(CHECK_EVERY);
     every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -356,10 +361,23 @@ pub async fn watch(node: NodeHandle, paths: Paths) {
             return; // the node stopped
         };
         for note in tracker.observe(&report.unhealthy) {
-            // Each child is bounded and reaped independently of the next status check.
+            eprintln!("vox daemon: {} — {}", note.title, note.body);
+            if let Err(waiting) =
+                in_flight.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                    (count < 4).then_some(count + 1)
+                })
+            {
+                eprintln!(
+                    "vox daemon: desktop notification not shown: {} — {}; {waiting} desktop notifications still waiting",
+                    note.title, note.body
+                );
+                continue;
+            }
             let command = command.clone();
+            let in_flight = std::sync::Arc::clone(&in_flight);
             drop(tokio::task::spawn_blocking(move || {
-                raise(&note, command.as_deref());
+                raise_desktop(&note, command.as_deref());
+                in_flight.fetch_sub(1, Ordering::Release);
             }));
         }
     }
