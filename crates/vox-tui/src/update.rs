@@ -803,6 +803,7 @@ fn verify_apple_release(active: &Path, candidate: &Path, version: &str) -> Resul
     Err(not_running(&checked, active, Some(version), false))
 }
 
+#[cfg(not(target_os = "macos"))]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RunVerdict {
     Ran,
@@ -812,9 +813,11 @@ enum RunVerdict {
 }
 
 struct RunCheck {
+    #[cfg(not(target_os = "macos"))]
     verdict: RunVerdict,
     success: bool,
     stdout: Vec<u8>,
+    #[cfg(not(target_os = "macos"))]
     stderr: Vec<u8>,
 }
 
@@ -828,6 +831,8 @@ fn captured(mut pipe: impl std::io::Read, maximum: usize) -> Vec<u8> {
 
 fn run_check(path: &Path, expected: Option<&str>) -> RunCheck {
     use std::os::unix::process::CommandExt as _;
+    #[cfg(target_os = "macos")]
+    let _ = expected;
     use std::process::Stdio;
     let mut command = Command::new(path);
     command
@@ -839,10 +844,11 @@ fn run_check(path: &Path, expected: Option<&str>) -> RunCheck {
         .stderr(Stdio::piped());
     let mut child = match command.spawn() {
         Ok(child) => child,
-        Err(error) => {
+        Err(_error) => {
             return RunCheck {
+                #[cfg(not(target_os = "macos"))]
                 verdict: if matches!(
-                    error.kind(),
+                    _error.kind(),
                     std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
                 ) {
                     RunVerdict::CouldNotStart
@@ -851,7 +857,8 @@ fn run_check(path: &Path, expected: Option<&str>) -> RunCheck {
                 },
                 success: false,
                 stdout: Vec::new(),
-                stderr: error.to_string().into_bytes(),
+                #[cfg(not(target_os = "macos"))]
+                stderr: _error.to_string().into_bytes(),
             }
         }
     };
@@ -865,6 +872,7 @@ fn run_check(path: &Path, expected: Option<&str>) -> RunCheck {
     let err =
         std::thread::spawn(move || stderr.map_or_else(Vec::new, |pipe| captured(pipe, 64 * 1024)));
     let started = std::time::Instant::now();
+    #[cfg(not(target_os = "macos"))]
     let mut expired = false;
     let status = loop {
         match child.try_wait() {
@@ -873,7 +881,10 @@ fn run_check(path: &Path, expected: Option<&str>) -> RunCheck {
                 std::thread::sleep(Duration::from_millis(20))
             }
             Ok(None) => {
-                expired = true;
+                #[cfg(not(target_os = "macos"))]
+                {
+                    expired = true;
+                }
                 break None;
             }
             Err(_) => break None,
@@ -890,8 +901,9 @@ fn run_check(path: &Path, expected: Option<&str>) -> RunCheck {
     }
     let _ = child.wait();
     let stdout = out.join().unwrap_or_default();
-    let stderr = err.join().unwrap_or_default();
+    let _stderr = err.join().unwrap_or_default();
     let success = status.is_some_and(|status| status.success());
+    #[cfg(not(target_os = "macos"))]
     let answer = expected.map_or_else(
         || {
             std::str::from_utf8(&stdout)
@@ -903,6 +915,7 @@ fn run_check(path: &Path, expected: Option<&str>) -> RunCheck {
         |version| stdout == format!("vox {version}\n").as_bytes(),
     );
     RunCheck {
+        #[cfg(not(target_os = "macos"))]
         verdict: if expired {
             RunVerdict::DidNotAnswer
         } else if success && answer {
@@ -912,7 +925,8 @@ fn run_check(path: &Path, expected: Option<&str>) -> RunCheck {
         },
         success,
         stdout,
-        stderr,
+        #[cfg(not(target_os = "macos"))]
+        stderr: _stderr,
     }
 }
 
