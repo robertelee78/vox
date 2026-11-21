@@ -766,11 +766,10 @@ pub fn register(paths: &Paths, session: &str, codex: bool) {
 // Every registration rewrite, including a hook's idle update, shares this lock. Atomic
 // rename alone cannot stop a stale whole-record rewrite from restoring a removed room.
 // The lock file is outside the registrations directory, so it can never look like a session.
-fn registration_lock_typed(paths: &Paths) -> Result<std::fs::File, RegistrationStoreError> {
+fn registration_lock(paths: &Paths) -> Result<std::fs::File, String> {
     let path = paths.session_dir().with_extension("lock");
     if let Some(parent) = path.parent() {
-        vox_core::node::paths::create_private_dir(parent)
-            .map_err(|e| RegistrationStoreError::Failed(e.to_string()))?;
+        vox_core::node::paths::create_private_dir(parent).map_err(|e| e.to_string())?;
     }
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
@@ -779,24 +778,9 @@ fn registration_lock_typed(paths: &Paths) -> Result<std::fs::File, RegistrationS
         use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(0o600);
     }
-    let file = options
-        .open(&path)
-        .map_err(|e| RegistrationStoreError::Failed(e.to_string()))?;
-    file.lock()
-        .map_err(|e| RegistrationStoreError::Failed(e.to_string()))?;
+    let file = options.open(&path).map_err(|e| e.to_string())?;
+    file.lock().map_err(|e| e.to_string())?;
     Ok(file)
-}
-
-fn registration_lock(paths: &Paths) -> Result<std::fs::File, String> {
-    registration_lock_typed(paths).map_err(|e| e.to_string())
-}
-
-/// A registration could not be saved.
-#[derive(Debug, thiserror::Error)]
-pub enum RegistrationStoreError {
-    /// The lock or registration could not be written.
-    #[error("{0}")]
-    Failed(String),
 }
 
 fn registration_write(paths: &Paths) -> Option<std::fs::File> {
@@ -857,8 +841,8 @@ pub fn store(paths: &Paths, reg: &Session) {
 ///
 /// # Errors
 /// A failed registration write leaves the request refused.
-pub fn store_checked(paths: &Paths, reg: &Session) -> Result<(), RegistrationStoreError> {
-    let _lock = registration_lock_typed(paths)?;
+pub fn store_checked(paths: &Paths, reg: &Session) -> Result<(), String> {
+    let _lock = registration_lock(paths)?;
     let mut reg = reg.clone();
     let session = reg.session.clone();
     let session = session.as_str();
@@ -911,12 +895,10 @@ pub fn store_checked(paths: &Paths, reg: &Session) -> Result<(), RegistrationSto
     if let Some(mine) = reg.tmux.as_ref() {
         unbind_pane(paths, session, &mine.socket, &mine.pane);
     }
-    vox_core::node::paths::create_private_dir(&paths.session_dir())
-        .map_err(|e| RegistrationStoreError::Failed(e.to_string()))?;
-    let body =
-        serde_json::to_vec(&reg).map_err(|e| RegistrationStoreError::Failed(e.to_string()))?;
+    vox_core::node::paths::create_private_dir(&paths.session_dir()).map_err(|e| e.to_string())?;
+    let body = serde_json::to_vec(&reg).map_err(|e| e.to_string())?;
     vox_core::node::paths::write_private_file_unique(&paths.session_file(session), &body)
-        .map_err(|e| RegistrationStoreError::Failed(e.to_string()))
+        .map_err(|e| e.to_string())
 }
 
 /// Name `session`'s registration `name`, as its harness now calls it (ADR-029 MD-1): what an

@@ -252,8 +252,7 @@ export default function vox(pi) {
         poisonSession(op.fence?.session)
       } else if (!enveloped && fenced(op.fence)) {
         confirmed = false
-        report(code === 75 ? "Session registration is no longer present; reacquiring it" : "context preparation unavailable; reacquiring registration")
-        scheduleRetry()
+        if (scheduleRetry()) report(code === 75 ? "Session registration is no longer present; reacquiring it" : "context preparation unavailable; reacquiring registration")
       }
       if (!settled) fail(new Error("Vox prepare ended before its envelope"))
       if (op.decision === "commit" || op.decision === "cancel") {
@@ -262,8 +261,7 @@ export default function vox(pi) {
         if (op.record) op.record.state = op.decision === "commit" ? "committed" : "cancelled"
         if (!acknowledged && enveloped) {
           confirmed = false
-          report("finishing the saved context decision; reacquiring registration")
-          scheduleRetry()
+          if (scheduleRetry()) report("finishing the saved context decision; reacquiring registration")
         }
       } else if (!op.done) {
         if (!enveloped) {
@@ -354,7 +352,8 @@ export default function vox(pi) {
     retryTimer = null
   }
   function scheduleRetry() {
-    if (retryTimer || stopped || confirmed || refusal === "permanent" || !watcher) return
+    if (stopped || confirmed || refusal === "permanent" || !watcher) return false
+    if (retryTimer) return true
     const delay = [1, 2, 4, 8, 16, 30][Math.min(retryStep++, 5)] * 1000
     retryTimer = setTimeout(() => {
       retryTimer = null
@@ -367,6 +366,7 @@ export default function vox(pi) {
       })
     }, delay)
     retryTimer.unref?.()
+    return true
   }
   function failWatcher(reason) {
     retire()

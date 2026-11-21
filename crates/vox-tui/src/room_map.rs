@@ -271,14 +271,6 @@ pub fn room_for(
     }))
 }
 
-/// Whether the operator said no to binding `start` to a room (RB-7): its block's room is `none`.
-#[must_use]
-pub fn declined(data_root: &Path, start: &Path) -> bool {
-    read(data_root)
-        .ok()
-        .is_some_and(|entries| resolve(&entries, start).is_some_and(|e| e.room == DECLINED))
-}
-
 /// What the hook tells a session about its room this turn, before its rooms' news (ADR-029
 /// RB-5), or `None` when there is nothing to tell:
 /// - a session new to its node that works in no room is told, once, that its repo is not tied to a

@@ -136,6 +136,7 @@ mod test_knobs;
 optional_proof::not_run!(
     a_native_omp_conversation_survives_a_decided_turn_restart,
     a_native_omp_turn_without_a_decision_stays_uncertain,
+    a_native_omp_conversation_finishes_a_decision_after_a_room_move,
     nine_restarted_sessions_wait_for_registration,
     a_session_retries_when_a_sibling_installs_policy,
     a_linked_worktree_gets_its_repository_offer_and_names_map_authority,
@@ -5294,7 +5295,7 @@ fn rg4_journey(case: &str) {
     #[cfg(target_os = "macos")]
     test_knobs::require(&["VOX_TEST_KEYCHAIN"]);
     match case {
-        "extension" => test_knobs::require(&["VOX_TEST_DAEMON_SERVE_DELAY_MS"]),
+        "extension" | "moved" => test_knobs::require(&["VOX_TEST_DAEMON_SERVE_DELAY_MS"]),
         "startup" => test_knobs::require(&["VOX_TEST_HOLD_IDENTITY_STARTUP"]),
         _ => {}
     }
@@ -5345,4 +5346,11 @@ fn a_linked_worktree_gets_its_repository_offer_and_names_map_authority() {
 #[ignore = "real native extension without a model decision"]
 fn a_native_omp_turn_without_a_decision_stays_uncertain() {
     rg4_journey("undecided");
+}
+
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "real native extension, saved decision and operator room move; test-knobs"]
+fn a_native_omp_conversation_finishes_a_decision_after_a_room_move() {
+    rg4_journey("moved");
 }

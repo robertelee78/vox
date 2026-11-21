@@ -80,7 +80,7 @@ async function runTurn(reason, userText) {
   for (const m of injected) {
     const text = typeof m.content === "string" ? m.content : JSON.stringify(m.content)
     const room = text.match(/<vox-room-[0-9a-f]+[^>]*>([\s\S]*?)<\/vox-room-/)
-    log("INJECTED", text.slice(0, 160).replace(/\n/g, "⏎"), "ROOM-PART:", room ? room[1].trim().replace(/\n/g, "⏎").slice(0, 600) : "(none)")
+    log("INJECTED", text.replace(/\n/g, "⏎"), "ROOM-PART:", room ? room[1].trim().replace(/\n/g, "⏎") : "(none)")
   }
   if (!injected.length) log("context", `no injection (${out.length} msgs)`)
   await emit("before_provider_request", { payload: { messages: out } })
@@ -99,6 +99,7 @@ async function runTurn(reason, userText) {
   await emit("agent_end", { willContinue: false, awaitingAsyncWork: false })
   idle = true
   log("turn-end", reason)
+  if (armed && process.env.RCA_STOP_AFTER_ASIDE_DECISION === "1") process.kill(process.pid, "SIGSTOP")
 }
 
 const vox = (await import(pathToFileURL(extPath))).default

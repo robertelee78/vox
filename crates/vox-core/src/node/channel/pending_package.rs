@@ -17,7 +17,6 @@ pub(crate) enum Work {
     Select {
         trust_digest: Digest32,
         replay: bool,
-        abandon_unopened: bool,
     },
     Open {
         pending: PendingPackage,
@@ -316,14 +315,10 @@ impl ChannelState {
             Work::Select {
                 trust_digest,
                 replay,
-                abandon_unopened,
             } => {
                 // Context is established before the durable selection cursor can advance.
                 let context = self.join_context()?;
                 let mut queue = self.key_packages.clone();
-                if abandon_unopened {
-                    queue.abandon_unopened();
-                }
                 if replay {
                     queue.retry_retained();
                 }

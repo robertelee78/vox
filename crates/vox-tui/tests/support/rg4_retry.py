@@ -86,6 +86,12 @@ def hook_command(session, cwd=WORK, room_id=None):
 def sessions(r):
     return run(["room", "sessions", r, "--node", "agent", "--json"], check=False).stdout
 
+def session_rows(r):
+    return [json.loads(line) for line in sessions(r).splitlines() if line.startswith("{")]
+
+def open_sessions(r):
+    return {row["id"] for row in session_rows(r) if row.get("open") is True}
+
 def release(base, phase):
     with socket.socket(socket.AF_UNIX) as s:
         s.connect(str(base.with_suffix(f".{phase}.release")))
@@ -119,13 +125,9 @@ def registrations():
     if any("session registration is busy" in out + err or "LockBusy" in out + err
            for out, err in outputs):
         errors.append("nine restarted Sessions were refused by the held registration lock")
-    listed = ""
-    for _ in range(30):
-        listed = sessions(r)
-        if all(f"rg4-nine-{i}" in listed for i in range(9)):
-            break
-    if not all(f"rg4-nine-{i}" in listed for i in range(9)):
-        errors.append("30 answered Session reads did not show all nine restarted Sessions: " + listed)
+    if not errors:
+        wait(lambda: {f"rg4-nine-{i}" for i in range(9)} <= open_sessions(r),
+             "all nine restarted Sessions appear in the room")
 
     run(["room", "create", "--node", "agent", "--name", "retry-two", "--passphrase-file", "-"],
         "room passphrase\n")
@@ -171,6 +173,10 @@ def registrations():
 
 def startup():
     r = room()
+    run(["room", "create", "--node", "agent", "--name", "gate-only", "--passphrase-file", "-"],
+        "room passphrase\n")
+    gate_room = next(line.split()[0] for line in run(["room", "list", "--node", "agent"]).stdout.splitlines()
+                     if "gate-only" in line)
     protected = ROOT / "sibling.pass"
     protected.write_text("identity passphrase\n")
     run(["node", "create", "sibling", "--passphrase-file", str(protected)])
@@ -184,28 +190,30 @@ def startup():
                          env=ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     children.append(p)
     wait(lambda: base.with_suffix(".policy.selected").exists(), "sibling owns policy gate")
-    h = hook_command("rg4-opening-during-policy", room_id=r)
-    out, err = h.communicate()
-    print("[policy registration]", out, err, flush=True)
-    # A status command proves the daemon answered while the sibling owns the gate.
+    host = Host(WORK, r)
+    opening_session = host.session
+    # Record what the shipped product answers at both boundaries, not a read-count timer.
     run(["status", "--node", "agent", "--json"])
+    policy_answer = run(["room", "post", gate_room, "--node", "agent", "rg4-policy-held"], check=False)
+    assert opening_session not in open_sessions(r), "PRODUCT: Session opening bypassed the held policy installation"
     release(base, "policy")
     wait(lambda: base.with_suffix(".rooms.selected").exists(), "sibling has installed policy")
-    opened = False
-    for _ in range(30):
-        out = sessions(r)
-        if "rg4-opening-during-policy" in out:
-            opened = True
-            break
+    starting = run(["node", "list"])
+    assert any(line.split()[:2] == ["sibling", "Attaching"] for line in starting.stdout.splitlines()), \
+        "APPARATUS: sibling startup completed before the room-startup hold"
+    run(["status", "--node", "sibling", "--json"], check=False)
+    gate_answer = run(["room", "post", gate_room, "--node", "agent", "rg4-policy-installed"], check=False)
     release(base, "rooms")
     attach_out, attach_err = p.communicate()
     print("[sibling attach]", p.returncode, attach_out, attach_err, flush=True)
-    assert opened, "PRODUCT: 30 answered Session reads show no opening while sibling room reopening is held"
     assert p.returncode == 0, f"PRODUCT: sibling failed to attach: {attach_out}{attach_err}"
-    print("VERDICT GREEN: refused Session opening retried after policy, before sibling rooms reopened", flush=True)
+    wait(lambda: opening_session in open_sessions(r), "the original registered Session opens with no new hook")
+    assert gate_answer.returncode == 0, "PRODUCT: policy is installed but the sibling's room operation was refused: " + gate_answer.stdout + gate_answer.stderr
+    assert policy_answer.returncode != 0, "APPARATUS: the policy hold did not stage a real publication refusal"
+    print("VERDICT GREEN: installed policy no longer gates the sibling's room operation; the original Session opens without another hook", flush=True)
 
 class Host:
-    def __init__(self, cwd, room_id=None):
+    def __init__(self, cwd, room_id=None, stop_after_decision=False):
         self.session = "rg4-native-" + os.urandom(8).hex()
         self.lines = []
         self.cv = threading.Condition()
@@ -213,6 +221,8 @@ class Host:
         ext = ROOT / "extension.mjs"
         ext.write_text(run(["agent", "plugin", "omp", "--node", "agent"]).stdout)
         env = dict(ENV, VOX_BIN=VOX, RCA_HOLD_FILE=str(self.hold))
+        if stop_after_decision:
+            env["RCA_STOP_AFTER_ASIDE_DECISION"] = "1"
         if room_id:
             env["VOX_ROOM"] = room_id
         self.p = subprocess.Popen(["node", str(SUPPORT / "omp_turn_host.mjs"), str(ext), self.session, str(cwd)],
@@ -238,7 +248,7 @@ class Host:
         self.await_line("turn-end: prompt", mark)
         return mark
 
-def extension():
+def extension(moved=False):
     r = room()
     create("person")
     link = run(["room", "link", r, "--node", "agent"]).stdout.strip()
@@ -247,11 +257,20 @@ def extension():
     agent = run(["id", "--node", "agent"]).stdout.strip()
     run(["trust", "add", person, "--node", "agent", "--name", "person"], "\n")
     run(["trust", "add", agent, "--node", "person", "--name", "agent"], "\n")
-    host = Host(WORK, r)
+    second = None
+    if moved:
+        run(["room", "create", "--node", "agent", "--name", "after-move", "--passphrase-file", "-"],
+            "room passphrase\n")
+        second = next(line.split()[0] for line in run(["room", "list", "--node", "agent"]).stdout.splitlines()
+                      if "after-move" in line)
+        link = run(["room", "link", second, "--node", "agent"]).stdout.strip()
+        run(["room", "join", link, "--node", "person", "--passphrase-file", "-"], "room passphrase\n")
+    host = Host(WORK, r, stop_after_decision=moved)
     host.turn("hello")
     host.hold.with_suffix(".arm").write_text("hold")
     # The stand-in uses <hold>.arm, not Path.with_suffix on a suffixed filename.
-    run(["room", "post", r, "--node", "person", "rg4-held-news"])
+    run(["room", "post", r, "--node", "person", "--type", "ask", "--to", agent,
+         "--session", "rg4-person", "rg4-held-news"])
     host.await_line("hold-begin")
     assert any("INJECTED" in line and "rg4-held-news" in line for line in host.lines), \
         "APPARATUS: held native turn did not carry the room post"
@@ -276,9 +295,28 @@ def extension():
     host.hold.with_suffix(".arm").unlink(missing_ok=True)
     host.hold.write_text("release")
     host.await_line("turn-end: aside")
-    # Wait for the hook's local cursor save or its named main failure, not a silence verdict.
-    wait(lambda: any("finishing the saved context decision" in l or "delivery in this conversation is uncertain" in l
-                     for l in host.lines), "held decision acknowledged or refused")
+    if moved:
+        # The stand-in stopped its own event loop immediately after giving the decision,
+        # before the extension can handle the hook's exit and schedule another hook.
+        paused.add(host.p.pid)
+        def saved_receipt():
+            for file in DATA.glob("**/omp-uncertain/*"):
+                try:
+                    saved = json.loads(file.read_text())
+                except (OSError, ValueError):
+                    continue
+                if saved.get("session") == host.session and saved.get("decision") is True and saved.get("receipts"):
+                    return True
+            return False
+        wait(saved_receipt, "a real decided turn leaves its pending attention receipt")
+        def preparation_exited():
+            rows = subprocess.run(["ps", "-axo", "ppid=,command="], capture_output=True, text=True).stdout
+            return not any(line.split(None, 1)[0] == str(host.p.pid) and "--omp-prepare" in line
+                           for line in rows.splitlines() if line.split())
+        wait(preparation_exited, "the decided preparation exits before the operator moves the room")
+    else:
+        wait(lambda: any("finishing the saved context decision" in l or "delivery in this conversation is uncertain" in l
+                         for l in host.lines), "held decision acknowledged or refused")
     os.kill(replacement, signal.SIGCONT)
     paused.remove(replacement)
     out, err = restart.communicate()
@@ -287,18 +325,36 @@ def extension():
     wait(lambda: run(["node", "list"], check=False).stdout.count("Ready") >= 2, "both kept nodes Ready")
     wait(lambda: all("rg4-held-news" in run(["room", "read", r, "--node", node], check=False).stdout
                      for node in ("agent", "person")), "both reopened rooms show the held post")
-    run(["room", "post", r, "--node", "person", "rg4-after-restart"])
-    wait(lambda: "rg4-after-restart" in run(["room", "read", r, "--node", "agent"], check=False).stdout,
+    if moved:
+        run(["agent", "room", second, "--node", "agent", "--session", host.session])
+        wait(lambda: any(row.get("id") == host.session and row.get("open") is False for row in session_rows(r)),
+             "the move closes the old room's Session before the next hook")
+        probe = run(["agent", "hook", "--node", "agent", "--session", host.session, "--omp-check-uncertainty"],
+                    extra={"VOX_HARNESS": "omp"}, check=False)
+        assert probe.returncode == 0, f"PRODUCT: the next hook could not finish the saved decision after a room move: {probe.returncode} {probe.stderr}"
+        os.kill(host.p.pid, signal.SIGCONT)
+        paused.remove(host.p.pid)
+    post_room = second if moved else r
+    marker = "rg4-after-room-move" if moved else "rg4-after-restart"
+    run(["room", "post", post_room, "--node", "person", marker])
+    wait(lambda: marker in run(["room", "read", post_room, "--node", "agent"], check=False).stdout,
          "later post reaches the native conversation's node")
-    for i in range(6):
-        host.turn("read after restart " + str(i))
+    wait(lambda: any(("STAGED:" in line and marker in line)
+                     or "delivery in this conversation is uncertain" in line for line in host.lines),
+         "the native extension stages later news or refuses the conversation")
+    host.turn("read after recovery")
     # Accepted native history is legitimately reconstructed on later provider requests.
     # Count fresh materializations, not those replays, and require actual context injection.
-    shown = sum("STAGED:" in line and "rg4-after-restart" in line for line in host.lines)
-    injected = any("INJECTED" in line and "rg4-after-restart" in line for line in host.lines)
+    shown = sum("STAGED:" in line and marker in line for line in host.lines)
+    injected = any("INJECTED" in line and marker in line for line in host.lines)
     assert shown == 1 and injected, f"PRODUCT: after daemon restart the same native conversation showed the later post {shown} fresh times (injected={injected}), not once"
     assert not any("delivery in this conversation is uncertain" in line for line in host.lines), \
         "PRODUCT: a saved native decision made the conversation uncertain"
+    if moved:
+        host.send("quit")
+        host.p.wait()
+        print("VERDICT GREEN: the next hook finished the saved decision after a room move; new-room news was shown once", flush=True)
+        return
     # A new undecided publication must retain the old fail-closed meaning.
     host.hold.with_suffix(".arm").write_text("hold")
     before = len(host.lines)
@@ -333,13 +389,16 @@ def riders():
     h = hook_command("rg4-linked-offer", cwd=linked)
     out, err = h.communicate()
     print("[linked worktree offer]", out, err, flush=True)
-    assert f"this repo ({repo.resolve()})" in out, f"PRODUCT: linked-worktree offer must name repository {repo.resolve()}, not {linked.resolve()}: {out}{err}"
+    errors = []
+    if f"this repo ({repo.resolve()})" not in out:
+        errors.append(f"linked-worktree offer must name repository {repo.resolve()}, not {linked.resolve()}: {out}{err}")
     # Bind this registered start explicitly to an operator decision, then try to shadow it.
     (DATA / "rooms").write_text(f"repo {repo}\n    room none\n")
     (DATA / "rooms").chmod(0o600)
     refused = run(["agent", "room", "--node", "agent", "--session", "rg4-linked-offer", "--none"], check=False)
-    assert refused.returncode != 0 and "operator" in refused.stderr.lower() and "own terminal" in refused.stderr, \
-        f"PRODUCT: --none refusal must name who may change the map: {refused.stdout}{refused.stderr}"
+    if not (refused.returncode != 0 and "operator" in refused.stderr.lower() and "own terminal" in refused.stderr):
+        errors.append(f"--none refusal must name who may change the map: {refused.stdout}{refused.stderr}")
+    assert not errors, "PRODUCT: " + "; ".join(errors)
     print("VERDICT GREEN: linked-worktree offer names repository; refusal names operator authority", flush=True)
 
 try:
@@ -356,6 +415,8 @@ try:
         startup()
     elif CASE == "extension":
         extension()
+    elif CASE == "moved":
+        extension(moved=True)
     elif CASE == "riders":
         riders()
     elif CASE == "undecided":

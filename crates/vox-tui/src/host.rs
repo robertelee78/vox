@@ -1801,15 +1801,10 @@ impl Router {
             crate::omp_fence::FenceError::Invalid => invalid(),
         })
     }
-    fn registration_store_refusal(
-        node: &NodeName,
-        error: crate::wake::RegistrationStoreError,
-    ) -> Refusal {
-        match error {
-            crate::wake::RegistrationStoreError::Failed(why) => Refusal::Failed {
-                node: node.clone(),
-                why: format!("session was not registered: {why}"),
-            },
+    fn registration_store_refusal(node: &NodeName, why: String) -> Refusal {
+        Refusal::Failed {
+            node: node.clone(),
+            why: format!("session was not registered: {why}"),
         }
     }
 
@@ -2171,8 +2166,7 @@ impl Router {
                     match attempt {
                         Err(why)
                             if (vox_core::node::sessions::opening_refreshing(&why)
-                                || vox_core::node::sessions::opening_room_change_pending(&why)
-                                || why == vox_core::node::api::Fault::ComputerPolicy.explain())
+                                || vox_core::node::sessions::opening_room_change_pending(&why))
                                 && !*detached.borrow()
                                 && still_registered() =>
                         {

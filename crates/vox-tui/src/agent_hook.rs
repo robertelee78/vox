@@ -361,6 +361,18 @@ async fn omp_finish_decision(paths: &Paths, session: &str) -> Result<(), AppErro
         let at = crate::client::one_shot(paths)?;
         for (recipient, sources, ticket) in receipts {
             let room = recipient.room;
+            // A moved conversation cannot settle its old room's receipt. A Session that
+            // is merely reopening after restart still belongs to this room and retries.
+            if crate::wake::pause_registration(paths, session)
+                .map_err(|reason| AppError::Refused {
+                    code: 75,
+                    message: format!("Vox is finishing the saved OMP decision; retry: {reason}"),
+                })?
+                .and_then(|registration| registration.room)
+                != Some(b32_encode(&room))
+            {
+                continue;
+            }
             let instance = recipient.instance;
             let operation = if commit {
                 Operation::Received {
@@ -2657,10 +2669,10 @@ impl Daemon {
             } else {
                 None
             };
-            crate::wake::store_checked(&paths, &record).map_err(|why| match why {
-                crate::wake::RegistrationStoreError::Failed(why) => Unregistered::Failed(
-                    AppError::Usage(format!("the session was not registered: {why}")),
-                ),
+            crate::wake::store_checked(&paths, &record).map_err(|why| {
+                Unregistered::Failed(AppError::Usage(format!(
+                    "the session was not registered: {why}"
+                )))
             })?;
             return Err(Unregistered::Attaching(self.node.clone()));
         }
