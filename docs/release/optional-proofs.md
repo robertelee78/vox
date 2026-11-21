@@ -283,9 +283,10 @@ The named reader mutant is the same command with `VOX_PROOF_RG1_NO_PAGING=1`: it
 older-page reads in the proof, not the product, and must turn the first-row assertion red.
 The busy-room journey's apparatus failures say APPARATUS. A refused join quotes the
 product as RED PRODUCT and names the joining member; the final verdict counts refused joins.
-After admission, 100 acknowledged
-post-join posts with none displayed is RED PRODUCT in either direction, with all marks
-reported. The acknowledged post set is fixed by each offer's join phase, not a sliding
+After admission, 100 acknowledged post-join posts with none displayed is RED PRODUCT in
+either direction, with all marks reported. If a member has no acknowledged post, 100 answered
+offers (acknowledged plus refused since join) produce a red saying how many were refused
+and that none was acknowledged. The acknowledged post set is fixed by each offer's join phase, not a sliding
 newest-post window. GREEN additionally requires every member's post shown both ways and
 every acknowledged post on every member after the authors stop; errors from the final
 in-flight commands are checked after those commands finish. Pause-thread and serving-daemon
@@ -307,6 +308,15 @@ For an **apparatus smoke only**, add `VOX_PROOF_RG1_NO_PAUSE=1` to the paused-va
 command. It disables the serving-process pause so the
 post-admission code can run on the shipped helper. Its product red or green is never a
 verdict on an ADR requirement; record which post-admission branches it actually reaches.
+
+Coverage remains limited: no direction has ever become shown, so the `shown`/`shown_post`
+success paths, the all-directions-shown loop end, the stopped-authors loop (including its
+demand-count and refusal branches), and GREEN have never run. Neither have the
+refused-newcomer branch under this code, the refused-link fallback, the tail's error
+branches, a tail with a member refused at admission, or the all-posts-refused bound.
+The first candidate that gets past the 100-post red is these shown-dependent branches'
+first run; an APPARATUS fault or a hang there is a defect of this proof to fix, not the
+candidate's failure.
 
 ## The proofs
 

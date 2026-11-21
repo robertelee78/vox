@@ -9843,13 +9843,42 @@ mod rg1 {
         id: &str,
         wanted: Option<&str>,
     ) -> (BTreeSet<String>, usize, Option<String>) {
-        try_read(w, id, wanted).unwrap_or_else(|why| panic!("RED PRODUCT: {why}"))
+        try_read(w, id, wanted, None).unwrap_or_else(|why| panic!("RED PRODUCT: {why}"))
+    }
+
+    fn check_observation_process(
+        name: &str,
+        command: &str,
+        code: Option<i32>,
+        stdout: &str,
+        stderr: &str,
+        state: Option<&Mutex<LoadState>>,
+    ) -> Result<(), String> {
+        if code.is_none()
+            || (code != Some(0) && stdout.trim().is_empty() && stderr.trim().is_empty())
+        {
+            let why = format!(
+                "{name}'s {command} process ended without a complete product answer \
+                (exit={code:?}); stdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+            if let Some(state) = state {
+                state
+                    .lock()
+                    .expect("APPARATUS: load state")
+                    .errors
+                    .push(why.clone());
+                return Err(why);
+            }
+            panic!("APPARATUS: {why}");
+        }
+        Ok(())
     }
 
     fn try_read(
         w: &Worker,
         id: &str,
         wanted: Option<&str>,
+        state: Option<&Mutex<LoadState>>,
     ) -> Result<(BTreeSet<String>, usize, Option<String>), String> {
         let mut before = None::<String>;
         let mut cursors = BTreeSet::new();
@@ -9862,6 +9891,14 @@ mod rg1 {
                 args.extend(["--before", cursor]);
             }
             let out = w.vox(None, &args);
+            check_observation_process(
+                &w.name,
+                "room read",
+                out.code,
+                &out.stdout,
+                &out.stderr,
+                state,
+            )?;
             if !out.ok {
                 return Err(format!("{}'s paging reader refused: {out:?}", w.name));
             }
@@ -10712,11 +10749,12 @@ except Exception as e: print(json.dumps({"kind":"apparatus","error":repr(e)}),fl
     }
 
     fn status(w: &Worker, id: &str) -> Value {
-        try_status(w, id).unwrap_or_else(|why| panic!("RED PRODUCT: {why}"))
+        try_status(w, id, None).unwrap_or_else(|why| panic!("RED PRODUCT: {why}"))
     }
 
-    fn try_status(w: &Worker, id: &str) -> Result<Value, String> {
+    fn try_status(w: &Worker, id: &str, state: Option<&Mutex<LoadState>>) -> Result<Value, String> {
         let out = w.vox(None, &["status", "--json"]);
+        check_observation_process(&w.name, "status", out.code, &out.stdout, &out.stderr, state)?;
         if !out.ok {
             return Err(format!("{}'s status refused: {out:?}", w.name));
         }
@@ -10742,11 +10780,22 @@ except Exception as e: print(json.dumps({"kind":"apparatus","error":repr(e)}),fl
         member(status, author)?["holds_through"].as_u64()
     }
 
-    fn doctor(w: &Worker, id: &str, name: &str) -> Result<(bool, Value), String> {
+    fn doctor(
+        w: &Worker,
+        id: &str,
+        name: &str,
+        state: &Mutex<LoadState>,
+    ) -> Result<(bool, Value), String> {
         let out = w.vox(None, &["agent", "doctor", "--room", id, "--json"]);
-        if !out.ok {
-            return Err(format!("{}'s doctor refused: {out:?}", w.name));
-        }
+        check_observation_process(
+            &w.name,
+            "agent doctor",
+            out.code,
+            &out.stdout,
+            &out.stderr,
+            Some(state),
+        )?;
+        // A nonzero doctor exit can report unrelated failed harness hooks; its JSON still carries trust.
         let report: Value = serde_json::from_str(&out.stdout)
             .map_err(|error| format!("{}'s doctor is not JSON: {error}; {out:?}", w.name))?;
         let trust = format!("trust {name}");
@@ -10782,13 +10831,13 @@ except Exception as e: print(json.dumps({"kind":"apparatus","error":repr(e)}),fl
         since: Instant,
         state: &Mutex<LoadState>,
     ) -> Result<(), String> {
-        let source_status = try_status(source, id)?;
-        let target_status = try_status(target, id)?;
-        let (grant, doctor) = doctor(source, id, &target.name)?;
+        let source_status = try_status(source, id, Some(state))?;
+        let target_status = try_status(target, id, Some(state))?;
+        let (grant, doctor) = doctor(source, id, &target.name, state)?;
         let held = held_position(&target_status, &source.b32()).is_some_and(|n| n >= through);
         let key = member(&source_status, &target.b32())
             .is_some_and(|row| row["key_delivery_pending"] == false);
-        let (texts, pages, _) = try_read(target, id, Some(marker))?;
+        let (texts, pages, _) = try_read(target, id, Some(marker), Some(state))?;
         // A later acknowledged post still proves this direction; convergence checks the anchor too.
         let shown_post = if texts.contains(marker) {
             Some(marker.to_owned())
@@ -11222,7 +11271,7 @@ except Exception as e: print(json.dumps({"kind":"apparatus","error":repr(e)}),fl
                 refusal_summary(&state)
             );
             panic!(
-                "RED PRODUCT: refused {} of 7 joins: {refusals:?}; {refused_posts} posts refused; \
+                "RED PRODUCT: apparatus_smoke={no_pause}; refused {} of 7 joins: {refusals:?}; {refused_posts} posts refused; \
                 {refused_commands} other commands refused; newcomer was refused; \
                 each member/author/post/command/refusal is quoted above",
                 refusals.len()
@@ -11268,15 +11317,32 @@ except Exception as e: print(json.dumps({"kind":"apparatus","error":repr(e)}),fl
             check_load(&load, &state, false);
             for (n, w) in workers.iter().enumerate() {
                 if markers[n].is_none() {
-                    let text = state
-                        .lock()
-                        .expect("APPARATUS: load state")
-                        .acknowledged
-                        .get(&w.name)
-                        .and_then(|rows| rows.iter().find(|(_, after)| *after))
-                        .map(|(text, _)| text.clone());
+                    let (text, refused, total) = {
+                        let state = state.lock().expect("APPARATUS: load state");
+                        let text = state
+                            .acknowledged
+                            .get(&w.name)
+                            .and_then(|rows| rows.iter().find(|(_, after)| *after))
+                            .map(|(text, _)| text.clone());
+                        let refused = state
+                            .refused_posts
+                            .get(&w.name)
+                            .into_iter()
+                            .flatten()
+                            .filter(|refusal| refusal.at >= joined)
+                            .count();
+                        let total = post_count(&state, &w.name) + refused;
+                        (text, refused, total)
+                    };
+                    if text.is_none() && total >= 100 {
+                        tail_failure = Some(format!(
+                            "{}: {refused} of {total} posts since join refused, none acknowledged",
+                            w.name
+                        ));
+                        break 'timeline;
+                    }
                     if let Some(text) = text {
-                        let report = match try_status(w, &id) {
+                        let report = match try_status(w, &id, Some(&state)) {
                             Ok(report) => report,
                             Err(why) => {
                                 tail_failure = Some(why);
@@ -11295,6 +11361,7 @@ except Exception as e: print(json.dumps({"kind":"apparatus","error":repr(e)}),fl
                 }
             }
             let Some((new_marker, new_through)) = markers[new_index].as_ref() else {
+                std::thread::sleep(Duration::from_millis(100));
                 continue;
             };
             for n in 0..new_index {
@@ -11341,7 +11408,7 @@ except Exception as e: print(json.dumps({"kind":"apparatus","error":repr(e)}),fl
                     let count =
                         post_count(&state.lock().expect("APPARATUS: load state"), &source.name);
                     if count >= 100 {
-                        let shown = match try_read(target, &id, None) {
+                        let shown = match try_read(target, &id, None, Some(&state)) {
                             Ok((shown, _, _)) => shown,
                             Err(why) => {
                                 tail_failure = Some(why);
@@ -11374,7 +11441,12 @@ except Exception as e: print(json.dumps({"kind":"apparatus","error":repr(e)}),fl
             {
                 break;
             }
+            if markers[..new_index].iter().all(Option::is_none) {
+                // No direction is ready for an observation yet; avoid an all-refused busy loop.
+                std::thread::sleep(Duration::from_millis(100));
+            }
         }
+        check_slow(&pauses, &mut daemons[1], &state);
         assert!(
             load.finish(),
             "APPARATUS: a load thread stopped while final answers were collected; {}",
@@ -11400,7 +11472,7 @@ except Exception as e: print(json.dumps({"kind":"apparatus","error":repr(e)}),fl
                 check_slow(&pauses, &mut daemons[1], &state);
                 let mut complete = true;
                 for w in &workers {
-                    let (shown, pages, oldest) = match try_read(w, &id, None) {
+                    let (shown, pages, oldest) = match try_read(w, &id, None, Some(&state)) {
                         Ok(page) => page,
                         Err(why) => {
                             tail_failure = Some(why);
@@ -11438,6 +11510,17 @@ except Exception as e: print(json.dumps({"kind":"apparatus","error":repr(e)}),fl
                             args.extend(["--before", oldest]);
                         }
                         let demand = w.vox(None, &args);
+                        if let Err(why) = check_observation_process(
+                            &w.name,
+                            "room read --history older",
+                            demand.code,
+                            &demand.stdout,
+                            &demand.stderr,
+                            Some(&state),
+                        ) {
+                            tail_failure = Some(why);
+                            break 'convergence;
+                        }
                         if !demand.ok {
                             tail_failure = Some(format!(
                                 "{} refused older history while missing post {:?}: {demand:?}",
@@ -11454,6 +11537,8 @@ except Exception as e: print(json.dumps({"kind":"apparatus","error":repr(e)}),fl
                 }
             }
         }
+        check_slow(&pauses, &mut daemons[1], &state);
+        check_errors(&state, false);
         drop(pauses);
         free_disk(root.path());
         let refused_posts = report_post_refusals(&state);
@@ -11468,13 +11553,13 @@ except Exception as e: print(json.dumps({"kind":"apparatus","error":repr(e)}),fl
                 && refused_posts == 0
                 && refused_commands == 0
                 && tail_failure.is_none(),
-            "RED PRODUCT: refused {} of 7 joins: {refusals:?}; {refused_posts} posts refused; \
+            "RED PRODUCT: apparatus_smoke={no_pause}; refused {} of 7 joins: {refusals:?}; {refused_posts} posts refused; \
              {refused_commands} other commands refused; tail={tail}; \
              each member/author/post/command/refusal is quoted above",
             refusals.len()
         );
         eprintln!(
-            "GREEN: RG-1 every member shown both ways; all {} acknowledged posts shown \
+            "GREEN: RG-1 apparatus_smoke={no_pause}; every member shown both ways; all {} acknowledged posts shown \
             on every member after authors stop; daemons=4 anchor_processes=1 run={:?}",
             acknowledged.len(),
             join_started.elapsed()
