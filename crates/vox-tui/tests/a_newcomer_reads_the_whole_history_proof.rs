@@ -89,6 +89,7 @@ optional_proof::not_run!(
     a_busy_room_newcomer_reads_every_member_with_a_paused_member,
     a_busy_room_newcomer_reads_every_member_with_a_delayed_path,
     the_busy_room_reader_finds_the_first_of_five_thousand_rows,
+    a_returning_reader_eight_thousand_entries_behind_reads_and_pages_back,
 );
 
 #[path = "support/test_knobs.rs"]
@@ -9665,6 +9666,15 @@ fn the_busy_room_reader_finds_the_first_of_five_thousand_rows() {
     rg1::paging_check();
 }
 
+/// ADR-052 RG-6: a member returns after 8,000 acknowledged posts, reads the last one and pages
+/// back to the first. The protocol refusal itself, not elapsed silence, identifies the old wedge.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "eight thousand CLI posts and two real daemons; optional"]
+fn a_returning_reader_eight_thousand_entries_behind_reads_and_pages_back() {
+    rg1::returning_reader();
+}
+
 #[cfg(feature = "optional-proofs")]
 #[path = "support/port_forward.rs"]
 mod port_forward;
@@ -10022,6 +10032,181 @@ mod rg1 {
             "GREEN: RG-1 first of 5,000 rows found in {pages} pages; run={:?}; daemons=1",
             started.elapsed()
         );
+    }
+
+    pub(super) fn returning_reader() {
+        let root = root();
+        free_disk(root.path());
+        let staged = std::env::var_os("VOX_PROOF_RG6_STAGED");
+        if let Some(staged) = &staged {
+            let copied = Command::new("cp")
+                .arg("-R")
+                .arg(Path::new(staged).join("."))
+                .arg(root.path())
+                .status()
+                .expect("APPARATUS: copy stopped real-binary staging");
+            assert!(copied.success(), "APPARATUS: copy real-binary staging");
+        }
+        let exe = binary();
+        let alice = room::worker_as(root.path(), "behind-author", &exe);
+        let bob = room::worker_as(root.path(), "behind-reader", &exe);
+        if staged.is_none() {
+            for (w, peer) in [(&alice, &bob), (&bob, &alice)] {
+                w.vox_env(
+                    None,
+                    &[("VOX_IDENTITY_PASSPHRASE", room::ID_PASS)],
+                    &["trust", "add", &peer.b32(), "--name", &peer.name],
+                    None,
+                )
+                .expect_ok("mutual trust before the room");
+            }
+        }
+        let listen = if staged.is_some() {
+            let port = std::fs::read_to_string(alice.data.join(".daemon/port"))
+                .expect("APPARATUS: staged author's listener");
+            format!("127.0.0.1:{}", port.trim())
+        } else {
+            "127.0.0.1:0".to_owned()
+        };
+        let _alice = start(&alice, &listen, None);
+        let id = if staged.is_none() {
+            let bob_daemon = start(&bob, "127.0.0.1:0", None);
+            let id = create(&alice);
+            let link = alice.vox(None, &["room", "link", &id]);
+            link.expect_ok("returning-reader room link");
+            bob.vox_in(
+                None,
+                &["room", "join", "--passphrase-file", "-", link.stdout.trim()],
+                Some(room::ROOM_PASS),
+            )
+            .expect_ok("reader joins before going away");
+            post(&alice, &id, "RG6-before-away", true);
+            while !read(&bob, &id, Some("RG6-before-away"))
+                .0
+                .contains("RG6-before-away")
+            {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            bob_daemon.stop();
+            for n in 1..=8000 {
+                post(&alice, &id, &format!("RG6-away-{n:04}"), true);
+            }
+            id
+        } else {
+            let out = alice.vox(None, &["status", "--json"]);
+            out.expect_ok("staged author status");
+            let report = out.json();
+            report["rooms"][0]["id"]
+                .as_str()
+                .or_else(|| report["preparing"][0]["id"].as_str())
+                .expect("APPARATUS: staged room id")
+                .to_owned()
+        };
+        super::wait_room_open(&alice.data, &id[..12], &alice.name);
+        let _bob = start(&bob, "127.0.0.1:0", None);
+        super::wait_room_open(&bob.data, &id[..12], &bob.name);
+        super::wait_governance_current(&bob.data, &bob.name, &id, "returning reader");
+        let mut demand = false;
+        let mut before = None::<String>;
+        let mut numbered = BTreeMap::<usize, Value>::new();
+        loop {
+            let mut args = vec!["room", "read", &id, "--json", "--limit", "200"];
+            if let Some(before) = &before {
+                args.extend(["--before", before]);
+            }
+            let (ok, out, err) = super::vox(&bob.data, &args, None);
+            assert!(ok, "PRODUCT: returning reader page refused: {out}{err}");
+            for line in out.lines().filter(|line| !line.trim().is_empty()) {
+                let row: Value = serde_json::from_str(line).unwrap_or_else(|error| {
+                    panic!("PRODUCT: malformed reader row: {error}: {line}")
+                });
+                if let Some(n) = row["text"]
+                    .as_str()
+                    .and_then(|text| text.strip_prefix("RG6-away-"))
+                    .and_then(|n| n.parse().ok())
+                {
+                    numbered.insert(n, row);
+                }
+            }
+            let (ok, out, err) = super::vox(&bob.data, &["status", "--json"], None);
+            assert!(ok, "PRODUCT: reader status refused: {out}{err}");
+            assert!(
+                !out.contains("protocol limits exceeded"),
+                "RED PRODUCT: returning reader cannot read and page back its acknowledged \
+                 backlog; vox status reports: {out}"
+            );
+            if numbered.contains_key(&8000) {
+                let mut first = 8000;
+                while first > 1 && numbered.contains_key(&(first - 1)) {
+                    first -= 1;
+                }
+                eprintln!(
+                    "[RG-6] returning reader shows {} posts; recent suffix={first}..=8000",
+                    numbered.len()
+                );
+                if first == 1 {
+                    let rows = super::room_rows(&bob.data, &id);
+                    assert_eq!(
+                        rows.iter()
+                            .filter(|row| row["text"]
+                                .as_str()
+                                .is_some_and(|text| text.starts_with("RG6-away-")))
+                            .count(),
+                        8000,
+                        "PRODUCT: the final paged read does not show all 8,000 acknowledged posts"
+                    );
+                    eprintln!(
+                        "GREEN: returning reader shows last post and pages back to all 8,000 posts"
+                    );
+                    break;
+                }
+                if !demand {
+                    // The pre-away row is an older cached island, not the boundary of the
+                    // recent suffix. Ask below that suffix, never below the old island.
+                    let cursor = numbered[&first]["entry_hash"]
+                        .as_str()
+                        .expect("PRODUCT: rendered row has no history cursor")
+                        .to_owned();
+                    let (ok, out, err) = super::vox(
+                        &bob.data,
+                        &[
+                            "room",
+                            "read",
+                            &id,
+                            "--history",
+                            "older",
+                            "--before",
+                            &cursor,
+                        ],
+                        None,
+                    );
+                    assert!(ok, "PRODUCT: older history refused: {out}{err}");
+                    eprintln!("[RG-6] older before {first}: {out}{err}");
+                    before = Some(cursor);
+                    demand = true;
+                } else {
+                    let observed = super::history_observation(&bob.data, &id);
+                    if observed.phase == "more" {
+                        let (ok, out, err) = super::vox(
+                            &bob.data,
+                            &["room", "read", &id, "--history", "resume"],
+                            None,
+                        );
+                        assert!(ok, "PRODUCT: history resume refused: {out}{err}");
+                    } else if observed.phase == "complete" {
+                        demand = false;
+                    } else if matches!(observed.phase.as_str(), "unavailable" | "paused") {
+                        let (ok, out, err) = super::vox(
+                            &bob.data,
+                            &["room", "read", &id, "--history", "resume"],
+                            None,
+                        );
+                        assert!(ok, "PRODUCT: paused history resume refused: {out}{err}");
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 
     /// The prototype's OMP Session stand-in, with the same watcher ownership and bridge events.
