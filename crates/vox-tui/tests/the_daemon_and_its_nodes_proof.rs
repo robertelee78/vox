@@ -395,6 +395,7 @@ for await (const line of createInterface({input: process.stdin})) {
             .env("VOX_BIN", wrapper)
             .env("VOX_PROOF_BINARY", VOX)
             .env("VOX_PROOF_WATCH_TRACE", &trace)
+            .env("VOX_TEST_WATCH_READY_INTERVAL_SECS", "1")
             .current_dir(a._tmp.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -507,23 +508,34 @@ impl Drop for OmpConversation {
 #[ignore = "native extension, real daemon and production Argon2id; run in release with test-knobs"]
 fn a_conversation_reports_one_reconnecting_line_when_its_daemon_restarts() {
     watchdog::arm();
+    // Both event orders, a timer before either event, and a slot removed before its event.
+    reconnect_with_held_stop("agent", "detaching");
+    reconnect_with_held_stop("*", "detaching");
+    reconnect_with_held_stop("agent", "event");
+    reconnect_with_held_stop("held", "detaching");
+}
+
+fn reconnect_with_held_stop(held_node: &str, phase: &str) {
     test_knobs::require(&[
         "VOX_TEST_STOP_HOLD_NODE",
         "VOX_TEST_STOP_HOLD_FILE",
+        "VOX_TEST_WATCH_READY_INTERVAL_SECS",
+        "VOX_TEST_STOP_HOLD_PHASE",
         "VOX_TEST_ATTACH_HOLD_NODE",
         "VOX_TEST_ATTACH_HOLD_FILE",
     ]);
     let a = Account::new();
     a.make_node("agent");
     a.make_node("held");
-    let stop_hold = a._tmp.path().join("hold-second-node-stop");
-    std::fs::write(&stop_hold, "").expect("APPARATUS: second-node stop hold");
+    let stop_hold = a._tmp.path().join("hold-node-stop");
+    std::fs::write(&stop_hold, "").expect("APPARATUS: node stop hold");
     let mut daemon = Daemon::start(
         &a,
         &["--node", "agent"],
         &[
-            ("VOX_TEST_STOP_HOLD_NODE", "held"),
+            ("VOX_TEST_STOP_HOLD_NODE", held_node),
             ("VOX_TEST_STOP_HOLD_FILE", stop_hold.to_str().unwrap()),
+            ("VOX_TEST_STOP_HOLD_PHASE", phase),
         ],
     );
     daemon.expect("node agent is Ready", Duration::from_secs(30), |line| {
@@ -538,12 +550,21 @@ fn a_conversation_reports_one_reconnecting_line_when_its_daemon_restarts() {
         "APPARATUS: agent was not remembered for restart: {out}{err}"
     );
     let mut conversation = OmpConversation::start(&a);
-    let before_stop = conversation.observations();
     let signalled = Command::new("/bin/kill")
         .args(["-TERM", &daemon.child.id().to_string()])
         .status()
         .expect("APPARATUS: signal the proof's daemon");
     assert!(signalled.success(), "APPARATUS: daemon stop signal failed");
+    let agent_state = if phase != "event" && held_node != "held" {
+        "Detaching"
+    } else {
+        "Locked"
+    };
+    let sibling_state = if phase != "event" && held_node != "agent" {
+        "Detaching"
+    } else {
+        "Locked"
+    };
     let mut stopping_nodes = String::new();
     assert!(
         wait_until(Duration::from_secs(15), || {
@@ -551,26 +572,58 @@ fn a_conversation_reports_one_reconnecting_line_when_its_daemon_restarts() {
             let staged = ok
                 && out
                     .lines()
-                    .any(|line| line.starts_with("agent ") && line.contains("Locked"))
+                    .any(|line| line.starts_with("agent ") && line.contains(agent_state))
                 && out
                     .lines()
-                    .any(|line| line.starts_with("held ") && line.contains("Detaching"));
+                    .any(|line| line.starts_with("held ") && line.contains(sibling_state));
             stopping_nodes = format!("{out}{err}");
             staged
         }),
-        "APPARATUS: daemon did not answer with agent detached and held still detaching: \
+        "APPARATUS: daemon did not answer with agent {agent_state} and held {sibling_state}: \
          {stopping_nodes}; {}",
         daemon.said()
     );
-    println!("stopping daemon still answers:\n{stopping_nodes}");
+    println!(
+        "stopping pid {}, held node {held_node} at {phase}, still answers:\n{stopping_nodes}",
+        daemon.child.id()
+    );
+    // A new timer probe must see this stable held phase, not the preceding transition.
+    let before_probe = conversation.observations();
     assert!(
-        conversation.observed_frame_after(before_stop, "unavailable")
-            && daemon.child.try_wait().unwrap().is_none(),
+        wait_until(Duration::from_secs(90), || {
+            std::fs::read_to_string(&conversation.trace)
+                .unwrap_or_default()
+                .lines()
+                .skip(before_probe)
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .any(|frame| {
+                    frame["type"] == "unavailable"
+                        && frame["pid"] == daemon.child.id()
+                        && matches!(
+                            frame["reason"].as_str(),
+                            Some("reconnecting" | "node-not-ready")
+                        )
+                })
+        }) && daemon.child.try_wait().unwrap().is_none(),
         "APPARATUS: watcher did not probe while the stopping daemon still answered:\n{}",
         std::fs::read_to_string(&conversation.trace).unwrap_or_default()
     );
     conversation.until(|frame| frame.get("notice").is_some());
-    std::fs::remove_file(&stop_hold).expect("APPARATUS: release second-node stop");
+    conversation.prompt("while-stopping");
+    let during_stop = conversation.notices.join("\n");
+    assert!(
+        during_stop
+            .lines()
+            .filter(|line| line.contains("reconnecting"))
+            .count()
+            == 1
+            && !during_stop.contains("is unavailable")
+            && !during_stop.contains("vox node create"),
+        "PRODUCT: while agent is {agent_state} and held is {sibling_state} (hold {held_node} at \
+         {phase}), the stopping daemon must give exactly one reconnecting line and never blame \
+         the node: {during_stop}"
+    );
+    std::fs::remove_file(&stop_hold).expect("APPARATUS: release node stop");
     let stopped = daemon.child.wait().expect("APPARATUS: reap stopped daemon");
     assert!(
         stopped.success(),

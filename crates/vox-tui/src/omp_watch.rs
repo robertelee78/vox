@@ -1,4 +1,4 @@
-//! Read-only daemon availability observation and OMP lifetime ownership.
+//! Daemon availability observation and OMP lifetime ownership.
 use crate::omp_fence::{FenceError, Owner};
 use crate::wake::AttentionRoute;
 use std::io::{BufRead, Read, Write};
@@ -14,6 +14,14 @@ use vox_core::node::daemonipc::{
 use vox_core::node::paths::{Account, NodeName};
 
 const DEADLINE: Duration = Duration::from_secs(2);
+#[cfg(feature = "test-knobs")]
+fn ready_interval() -> u64 {
+    std::env::var("VOX_TEST_WATCH_READY_INTERVAL_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|seconds| (1..=30).contains(seconds))
+        .unwrap_or(30)
+}
 const MAX_LINE: u64 = 65536;
 
 #[derive(serde::Deserialize)]
@@ -97,11 +105,13 @@ async fn selected(
     if entry.is_some() {
         return Ok(false);
     }
-    // Hello lists only attached nodes. Ask this same daemon whether ours is still starting.
+    // Hello lists only attached nodes. Ask this daemon whether ours is starting or stopping.
     match tokio::time::timeout(DEADLINE, client.request(DaemonRequest::Nodes)).await {
         Ok(Ok(DaemonFrame::Nodes(nodes))) => {
             let entry = nodes.iter().find(|entry| entry.name == *node);
-            if entry.is_some_and(|entry| entry.state == NodeState::Attaching) {
+            if entry.is_some_and(|entry| {
+                matches!(entry.state, NodeState::Attaching | NodeState::Detaching)
+            }) {
                 return Err(ProbeError::Attaching);
             }
             Ok(entry.is_some_and(|entry| {
@@ -173,11 +183,15 @@ async fn snapshot(
             Ok(Ok(DaemonFrame::Ok)) => {
                 let (tx, events) = mpsc::channel(1);
                 let stopping_pid = Arc::clone(stopping_pid);
-                let watched_node = node.clone();
                 let task = tokio::spawn(async move {
                     while let Ok(Some(DaemonFrame::Event(event))) = sub.next().await {
-                        if matches!(event, DaemonEvent::Detached { node, cause: DetachCause::DaemonStopping } if node == watched_node)
-                        {
+                        if matches!(
+                            event,
+                            DaemonEvent::Detached {
+                                cause: DetachCause::DaemonStopping,
+                                ..
+                            }
+                        ) {
                             stopping_pid.store(pid, Ordering::Relaxed);
                         }
                         let _ = tx.try_send(());
@@ -361,7 +375,11 @@ pub(crate) async fn run(
 
                         if let Some(id) = snapshot_id.take() { if !ack(&id, Ok(())) { return 1; } }
                         if !output(serde_json::json!({"type":"ready"})) { return 1; }
-                        delay = 30; backoff = 1;
+                        backoff = 1;
+                        #[cfg(not(feature = "test-knobs"))]
+                        { delay = 30; }
+                        #[cfg(feature = "test-knobs")]
+                        { delay = ready_interval(); }
                     }
                     other => {
                         subscription = None;
