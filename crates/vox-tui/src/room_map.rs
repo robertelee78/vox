@@ -271,14 +271,6 @@ pub fn room_for(
     }))
 }
 
-/// Whether the operator said no to binding `start` to a room (RB-7): its block's room is `none`.
-#[must_use]
-pub fn declined(data_root: &Path, start: &Path) -> bool {
-    read(data_root)
-        .ok()
-        .is_some_and(|entries| resolve(&entries, start).is_some_and(|e| e.room == DECLINED))
-}
-
 /// What the hook tells a session about its room this turn, before its rooms' news (ADR-029
 /// RB-5), or `None` when there is nothing to tell:
 /// - a session new to its node that works in no room is told, once, that its repo is not tied to a
@@ -297,17 +289,18 @@ pub fn note(
     node: &str,
     session: Option<&str>,
 ) -> Option<String> {
-    if let Err(e) = read(data_root) {
-        return Some(format!("Vox: {e}\n"));
-    }
+    let entries = match read(data_root) {
+        Ok(entries) => entries,
+        Err(e) => return Some(format!("Vox: {e}\n")),
+    };
     if let Some(j) = joining {
         return Some(format!("Vox: {j}\n"));
     }
-    if !new || room.is_some() || declined(data_root, start) {
+    if !new || room.is_some() || resolve(&entries, start).is_some_and(|e| e.room == DECLINED) {
         return None;
     }
-    // As the map will hold it: the directory itself, a symlink to it resolved.
-    let dir = std::fs::canonicalize(start).unwrap_or_else(|_| start.to_path_buf());
+    // The offer answers for the repository, including a session in a linked worktree.
+    let dir = ask_directory(&entries, start);
     let create = vox_text::shell::node_command(
         &[
             "vox",

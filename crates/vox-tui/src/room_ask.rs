@@ -210,9 +210,6 @@ pub fn needs_you(asks: &[RoomAsk], data_root: &std::path::Path) -> String {
 pub async fn fetch(account: &Account) -> Result<Vec<RoomAsk>, AppError> {
     let mut d = match DaemonClient::open(&account.socket()).await {
         Ok(d) => d,
-        Err(e @ vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Version { .. })) => {
-            return Err(AppError::Usage(e.to_string()));
-        }
         Err(_) => return Ok(Vec::new()),
     };
     match d

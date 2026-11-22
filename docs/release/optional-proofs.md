@@ -189,6 +189,34 @@ run** for the paging change, and blocks neither CI nor release. CI compiles it. 
 CARGO_BUILD_JOBS=2 cargo test --release -p vox-tui --features optional-proofs --test a_large_room_reads_whole_proof a_hundred_thousand_entry_session_opens_in_one_second_with_bounded_memory -- --ignored --exact --nocapture
 ```
 
+## Agent retry ownership (ADR-052 RG-4)
+
+The optional acts in `agent_hook_proof` drive the generated, shipped OMP extension with
+`support/omp_turn_host.mjs`, the existing recorded-reproduction host stand-in, not a model.
+Each process uses scratch data and config roots. Run one exact act in release with
+`--features test-knobs,optional-proofs -- --ignored --exact <name> --nocapture`:
+
+- `a_native_omp_conversation_survives_a_decided_turn_restart`: physically pauses the replacement
+  daemon during a held turn; later room news must appear once in the same conversation.
+- `a_native_omp_turn_without_a_decision_stays_uncertain`: preserves the undecided refusal.
+- `a_native_omp_conversation_finishes_a_decision_after_a_room_move`: holds a real saved
+  attention receipt across an operator room move; the next hook finishes it and new-room news
+  is shown once. The old Session must be reported ended before that hook.
+- `a_native_omp_conversation_finishes_a_decision_after_a_session_resume`: ends and resumes the conversation's
+  Session in its original room while a decided receipt is pending; the next hook finishes and
+  later news is shown once.
+- `nine_restarted_sessions_wait_for_registration`: nine real hooks contend on the kernel lock.
+- `a_sibling_room_post_is_accepted_after_policy_installation`: holds real sibling startup across policy
+  installation and the room-startup boundary. A sibling room operation is accepted after
+  policy installation, and the pending native Session opens after release without another hook.
+  Its verdict uses the product's response, not a count of status polls.
+- `a_linked_worktree_gets_its_repository_offer_and_names_map_authority`: checks both hook riders.
+
+`key_package_proof` also includes `a_governance_refresh_is_a_retryable_read_refusal` and
+`an_abandoned_key_request_is_selected_again`, run with `test-knobs`. The latter abandons one
+real selected log package before Open; the returning offline member must still read the
+sender's post while direct key sends remain held. No in-process node or live model is used.
+
 ## Busy-room newcomer and paging (ADR-052 RG-1, #1315)
 
 `a_newcomer_reads_the_whole_history_proof` includes two variants of the same busy-room
