@@ -1674,6 +1674,10 @@ fn opening_a_room_reclaims_old_serving_proofs_across_interruption() {
 }
 
 /// RG-13: implicit steps last two days; signed admin choices and lifecycle survive.
+///
+/// The repeat check compares total public entries with a sibling that made one choice,
+/// not StepPolicy entries: the product lists no per-kind log. Both fixtures' lifecycle,
+/// activity and ordinary post are read back before comparison, then checked after reopens.
 #[cfg(feature = "test-knobs")]
 #[test]
 #[ignore = "real binary, private Session records and test-knobs clock; run in release"]
@@ -1873,9 +1877,6 @@ fn session_steps_expire_after_two_days_unless_the_admin_chose_otherwise() {
             assert!(ok, "APPARATUS: repeat default-equal choice: {out}{err}");
             let after_repeat = governance_revision();
             println!("SEEN: repeated default-equal choice governance revision: before={after_first}; after={after_repeat}; {out}{err}");
-            if after_repeat != after_first {
-                policy_failures.push(format!("repeating a signed default-equal choice must leave governance revision unchanged: before={after_first}; after={after_repeat}"));
-            }
         }
         let lifecycle = serde_json::json!({"v":1,"type":"session","from":"ttl-session",
             "body":"","at":{"session_name":"TTL-LIFECYCLE"},
@@ -1909,18 +1910,65 @@ fn session_steps_expire_after_two_days_unless_the_admin_chose_otherwise() {
         let began = Instant::now();
         loop {
             let (listed, shown) = read_session(&room);
-            if listed.contains("TTL-LIFECYCLE") && shown.contains("TTL-ACTIVITY") {
+            let (ok, ordinary, err) = run(&["room", "read", &room, "--json"], None);
+            if listed.contains("TTL-LIFECYCLE")
+                && shown.contains("TTL-ACTIVITY")
+                && ok
+                && ordinary.contains("ORDINARY-FOREVER")
+            {
                 break;
             }
             assert!(
                 began.elapsed() < Duration::from_secs(120),
-                "APPARATUS: activities/lifecycle were not initially readable: {listed}{shown}"
+                "APPARATUS: activities/lifecycle/ordinary post were not initially readable: {listed}{shown}{ordinary}{err}"
             );
             std::thread::sleep(Duration::from_millis(50));
         }
         rooms.push((name, room));
     }
+    let repeat_entry_failure = |stage: &str| {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let (ok, out, err) = run(&["status", "--json"], None);
+            assert!(
+                ok,
+                "APPARATUS: status comparing repeated choice: {out}{err}"
+            );
+            let status: serde_json::Value =
+                serde_json::from_str(&out).expect("APPARATUS: comparison status JSON");
+            let reports = status["rooms"]
+                .as_array()
+                .expect("APPARATUS: comparison status rooms");
+            let count = |name: &str| {
+                reports
+                    .iter()
+                    .find(|room| room["name"] == name)
+                    .and_then(|room| room["log_entries"].as_u64())
+                    .expect("APPARATUS: comparison room not published")
+            };
+            let equal = count("equal");
+            let seven = count("seven");
+            if equal == seven {
+                println!(
+                    "SEEN: {stage} repeat public log comparison: equal={equal}; seven={seven}"
+                );
+                return None;
+            }
+            if Instant::now() >= deadline {
+                println!(
+                    "SEEN: {stage} repeat public log comparison: equal={equal}; seven={seven}"
+                );
+                return Some(format!(
+                    "PRODUCT: repeating the signed step choice must leave equal's public log count equal to sibling seven (one choice), at {stage}: equal log_entries={equal}; seven log_entries={seven}"
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
     let mut failures = policy_failures;
+    if let Some(failure) = repeat_entry_failure("initial readback") {
+        failures.push(failure);
+    }
     for offset in [86_400_001, 172_800_001] {
         drop(daemon);
         daemon = launch(offset);
@@ -1971,6 +2019,9 @@ fn session_steps_expire_after_two_days_unless_the_admin_chose_otherwise() {
                 shown.contains("TTL-ACTIVITY"),
                 listed.contains("TTL-LIFECYCLE")
             );
+        }
+        if let Some(failure) = repeat_entry_failure(&format!("+{offset}ms reopen")) {
+            failures.push(failure);
         }
     }
     if std::env::var_os("VOX_MUTANT_STEPS_EXPLICIT_EQUAL_IGNORED").is_some() {
