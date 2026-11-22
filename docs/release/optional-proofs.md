@@ -586,6 +586,8 @@ or login item is involved. A fixture that is not older is an `APPARATUS` refusal
 | `nodes_of_one_daemon_proof::computer_pairing_uses_an_anchor_without_room_membership_and_reconnects` | Paired computers do not converge after path loss, lose historical misses across restart, or fail to apply the current managed grants after a newer policy. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test nodes_of_one_daemon_proof -- --ignored --exact computer_pairing_uses_an_anchor_without_room_membership_and_reconnects --nocapture` | a real machine with IPv4 and IPv6 loopback; run alone | several minutes; not timed in CI |
 | `nodes_of_one_daemon_proof::computer_preview_and_approval_survive_a_crash` | An authenticated Add Computer preview or the local operator's approval disappears when the daemon crashes before the other operator approves. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test nodes_of_one_daemon_proof -- --ignored --exact computer_preview_and_approval_survive_a_crash --nocapture` | a real machine; run alone | not timed in CI |
 | `nodes_of_one_daemon_proof::two_paired_computers_that_are_idle_exchange_nothing` | Idle paired computers keep exchanging unchanged histories, re-derive bindings, fail to reconcile siblings while one actor is held, replace policy during a held admitted join, or leave a refused pre-lease join on a real board after restart. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test nodes_of_one_daemon_proof -- --ignored --exact two_paired_computers_that_are_idle_exchange_nothing --nocapture` | a real machine; run alone | several minutes; not timed in CI |
+| `a_post_answers_promptly_while_a_peer_posts_proof::status_and_posts_answer_while_ten_sessions_step` | Status or posts lag behind agent Session saves. Holds one exact Session's durable transaction while ten real hooks step; status must answer within 1 s and every post within 5 s. Also holds an attention commit while Session, admin and hook pause-status reads wait; status must still answer within 1 s before release. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test a_post_answers_promptly_while_a_peer_posts_proof -- --ignored --exact status_and_posts_answer_while_ten_sessions_step --nocapture` | a real machine; run alone | latency measured, not timed in CI |
+| `a_daemon_reopens_its_rooms_proof::a_restarted_room_drives_its_session_refresh_to_ready` | A retained room reopens slowly while it replays its own and other authors' Session lifecycle records. Stages all 257 heads from each author, then requires automatic public room readiness within 5 s without polling to wake the replay. The test-only receipt counts opened records, not index-only visits; zero-open batches can still walk the index. Only an apparatus positive-share check reads the count; readiness is measured from the public room-open event. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test a_daemon_reopens_its_rooms_proof -- --ignored --exact a_restarted_room_drives_its_session_refresh_to_ready --nocapture` | two real daemons and a real wire client; run alone | restart within 5 s |
 
 For the constructor boundary independently of the full journey, set
 `VOX_PROOF_STEP=constructor-re-admission` on that command. This selector is not a substitute
@@ -851,6 +853,22 @@ Seventy shipped nodes share one scratch daemon, join a room, trust each other an
 messages read. The app client must expose all69 readers on every message and every trust
 relationship. The terminal must open the room and show every reader and peer's trust (#792).
 This expensive proof is optional and blocks neither CI nor release.
+
+### RG-8 computer anchors and late pairing closure
+
+The existing `nodes_of_one_daemon_proof` hosts two on-demand real-binary acts:
+`computer_management_uses_anchors_added_after_start` stages a real relay and restart;
+`either_computer_closes_a_half_signed_pairing_at_once` waits for each late completion's
+causal exchange outcome, once for each holder, so may take two minutes. Both are compiled
+only with `optional-proofs`, with loud `not_run!` stand-ins otherwise.
+Build once with `cargo test --release -p vox-tui --features test-knobs,optional-proofs --test nodes_of_one_daemon_proof --no-run`,
+then select one function with `-- --ignored --exact --nocapture`. Run these acts quiet.
+Each uses isolated account data/config roots. Closing a half-signed attempt is local:
+the other computer can still complete until expiry; the closer refuses it. Close it on
+both computers to stop the attempt on both.
+
+The seconds-long no-route diagnosis, status guidance and pause/resume guidance acts are
+release-gate proofs, not optional proofs.
 
 ### Linux release installation (ADR-051, RG-11)
 

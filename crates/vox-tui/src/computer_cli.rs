@@ -251,9 +251,9 @@ pub async fn run(command: ComputerCmd) -> Result<(), AppError> {
             )
             .await?;
             if conflict.inviter_approved {
-                eprintln!("On {}, wait until the signed incomplete proposal expires at Unix ms {}; closing it cannot withdraw a signature retained elsewhere.", conflict.peer.name, conflict.expires_ms);
+                eprintln!("On {}, the signed incomplete proposal can be closed now; its retained signature can still be used elsewhere until Unix ms {}.", conflict.peer.name, conflict.expires_ms);
             }
-            eprintln!("On {}, close the old proposal with:\n  {}\nIf it was signed after review, wait until expiry before closing; closing cannot withdraw a retained signature. Then create a fresh invitation with:\n  {}\nBring that fresh invitation here and approve on both computers.",
+            eprintln!("On {}, close the old proposal now with:\n  {}\nClosing cannot withdraw a signature retained elsewhere; close it on both computers. Then create a fresh invitation with:\n  {}\nBring that fresh invitation here and approve on both computers.",
                 conflict.peer.name,
                 vox_text::shell::command(&["vox", "computer", "cancel", &conflict.operation_id]),
                 vox_text::shell::command(&["vox", "computer", "invite"]));
@@ -418,6 +418,88 @@ fn show(
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64);
+    match status.state.as_str() {
+        "individual" => {
+            println!("This computer is not in a group.");
+            println!("Next: vox computer invite — add another computer.");
+        }
+        "needs-approval" => {
+            println!("This computer needs your pairing approval.");
+            if let Some(pairing) = &status.pairing {
+                println!(
+                    "Next: {}",
+                    vox_text::shell::command(&[
+                        "vox",
+                        "computer",
+                        "approve",
+                        &pairing.operation_id
+                    ])
+                );
+            }
+        }
+        "waiting" => {
+            if status
+                .pairing
+                .as_ref()
+                .is_some_and(|pairing| pairing.approved_here)
+            {
+                println!("This computer approved pairing; the other approval has not arrived.");
+            } else {
+                println!("This computer is waiting for pairing.");
+            }
+            if let Some(operation) = status
+                .pairing
+                .as_ref()
+                .map(|pairing| pairing.operation_id.as_str())
+                .or(status.invite_id.as_deref())
+            {
+                println!(
+                    "Next: {} — close this attempt here, or finish approval on the other computer.",
+                    vox_text::shell::command(&["vox", "computer", "cancel", operation])
+                );
+            }
+        }
+        "confirmed" => {
+            let peers: Vec<_> = status
+                .computers
+                .iter()
+                .filter(|computer| computer.fingerprint != status.this_computer.fingerprint)
+                .map(|computer| computer.name.as_str())
+                .collect();
+            println!("This computer is in a group with {}.", peers.join(", "));
+            println!("Next: vox computer invite — add a computer; vox computer status --details — review this group.");
+        }
+        "removed" => {
+            println!("This computer was removed from its group.");
+            println!("Next: vox computer retire — review and finish local retirement.");
+        }
+        "group-conflict" => {
+            println!("This computer has a pairing proposal from another group.");
+            if let Some(conflict) = &status.conflict {
+                println!(
+                    "Next: {} — keep this group and close the proposal.",
+                    vox_text::shell::command(&[
+                        "vox",
+                        "computer",
+                        "cancel",
+                        &conflict.operation_id
+                    ])
+                );
+            }
+        }
+        "expired" => {
+            println!("This computer's group change did not finish; the last convergence deadline was missed.");
+            println!("Next: vox computer status --details — read the failed computer and cause; pairing again does not erase that miss.");
+        }
+        "applying" => {
+            println!("This computer is in a group; application is still pending.");
+            println!("Next: vox computer status --details — read which nodes or computers are pending and why.");
+        }
+        _ => {
+            println!("This computer's trust cannot be applied safely.");
+            println!("Next: vox computer status --details — read the retained authority or storage failure.");
+        }
+    }
     if details || status.pairing.is_some() {
         println!(
             "{}  {}\ninstallation {}\ncomputer trust: {}\npolicy revision {}",
@@ -494,7 +576,7 @@ fn show(
             println!("  {item}");
         }
         if conflict.inviter_approved {
-            println!("The inviter already signed the proposal; wait until Unix ms {} before closing it there. Closing cannot withdraw an already-recorded signature.", conflict.expires_ms);
+            println!("The inviter already signed the proposal. Closing it here cannot withdraw that signature on the other computer.");
         }
         if conflict.expires_ms <= now_ms {
             println!("The proposal expired. On {}, close it with {} and create a fresh invitation with {}.",

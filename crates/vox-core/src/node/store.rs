@@ -11,8 +11,14 @@
 //!
 //! ## Tables
 //! - `segments`: `(channel_id, kind, segment_id) → canonical SealedSegment bytes`
+//! - `small_segments`: the same keys and seals, for values up to 1,024 bytes
 //! - `sek_wraps`: `channel_id → canonical SekWrap bytes`
-//! - `meta`: `name → bytes` (currently only the schema version)
+//! - `meta`: public node facts, schema version and completed room packing
+//!
+//! Version-1 stores remain readable from either segment table. New writes choose
+//! one table and delete the other copy in the same transaction; opened rooms move
+//! legacy small rows in bounded transactions. The first such write advances the
+//! schema marker atomically, so an older binary refuses rather than omitting rows.
 //!
 //! (The `rendezvous` table is M14's.)
 //!
@@ -43,11 +49,21 @@ use crate::atrest::store::{
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
 
-/// The on-disk schema version this build reads and writes.
-pub const SCHEMA_VERSION: u32 = 1;
+/// The newest on-disk schema this build writes; version 1 remains readable.
+pub const SCHEMA_VERSION: u32 = 2;
 
 type SegmentKey = (Digest32, u8, u64);
 const SEGMENTS: TableDefinition<SegmentKey, &[u8]> = TableDefinition::new("segments");
+const SMALL_SEGMENTS: TableDefinition<SegmentKey, &[u8]> = TableDefinition::new("small_segments");
+const SMALL_SEGMENT_BYTES: usize = 1024;
+
+fn small_segment(bytes: usize) -> bool {
+    #[cfg(feature = "test-knobs")]
+    if super::computer::fx28_mutant("small-rows-mixed") {
+        return false;
+    }
+    bytes <= SMALL_SEGMENT_BYTES
+}
 const SEK_WRAPS: TableDefinition<Digest32, &[u8]> = TableDefinition::new("sek_wraps");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const META_SCHEMA: &str = "schema_version";
@@ -711,22 +727,25 @@ impl Store {
             Err(error) => return Err(storage("retry write")(error)),
         };
         {
-            let saved = original
-                .open_table(SEGMENTS)
-                .map_err(storage("retry read segments"))?;
-            let mut writable = txn
-                .open_table(SEGMENTS)
-                .map_err(storage("retry write segments"))?;
-            let lo: SegmentKey = (*channel, 0, 0);
-            let hi: SegmentKey = (*channel, u8::MAX, u64::MAX);
-            for row in saved
-                .range(lo..=hi)
-                .map_err(storage("retry room segments"))?
-            {
-                let (key, value) = row.map_err(storage("retry room segment"))?;
-                writable
-                    .insert(key.value(), value.value())
-                    .map_err(storage("retry save segment"))?;
+            for definition in [SEGMENTS, SMALL_SEGMENTS] {
+                let Some(saved) = source_table(&original, definition, "retry read segments")?
+                else {
+                    continue;
+                };
+                let mut writable = txn
+                    .open_table(definition)
+                    .map_err(storage("retry write segments"))?;
+                let lo: SegmentKey = (*channel, 0, 0);
+                let hi: SegmentKey = (*channel, u8::MAX, u64::MAX);
+                for row in saved
+                    .range(lo..=hi)
+                    .map_err(storage("retry room segments"))?
+                {
+                    let (key, value) = row.map_err(storage("retry room segment"))?;
+                    writable
+                        .insert(key.value(), value.value())
+                        .map_err(storage("retry save segment"))?;
+                }
             }
             let wraps = original
                 .open_table(SEK_WRAPS)
@@ -822,12 +841,14 @@ impl Store {
             super::paths::set_private_file_mode(&fresh_path)?;
             let w = fresh.begin_write().map_err(storage("begin write"))?;
             {
-                if let Some(from) = source_table(&r, SEGMENTS, "open segments")? {
-                    let mut to = w.open_table(SEGMENTS).map_err(storage("open segments"))?;
-                    for item in from.iter().map_err(storage("iterate segments"))? {
-                        let (k, v) = item.map_err(storage("iterate segments"))?;
-                        to.insert(k.value(), v.value())
-                            .map_err(storage("write segment"))?;
+                for definition in [SEGMENTS, SMALL_SEGMENTS] {
+                    if let Some(from) = source_table(&r, definition, "open segments")? {
+                        let mut to = w.open_table(definition).map_err(storage("open segments"))?;
+                        for item in from.iter().map_err(storage("iterate segments"))? {
+                            let (k, v) = item.map_err(storage("iterate segments"))?;
+                            to.insert(k.value(), v.value())
+                                .map_err(storage("write segment"))?;
+                        }
                     }
                 }
                 if let Some(from) = source_table(&r, SEK_WRAPS, "open sek_wraps")? {
@@ -1020,12 +1041,14 @@ impl Store {
                 };
             match found {
                 None => {
+                    txn.open_table(SMALL_SEGMENTS)
+                        .map_err(storage("open small segments"))?;
                     meta.insert(META_SCHEMA, SCHEMA_VERSION.to_be_bytes().as_slice())
                         .map_err(storage("write schema"))?;
                 }
                 Some(bytes) => {
                     let found = u32::from_be_bytes(bytes);
-                    if found != SCHEMA_VERSION {
+                    if !matches!(found, 1 | SCHEMA_VERSION) {
                         return Err(Error::Storage {
                             op: "schema check",
                             detail: format!(
@@ -1059,16 +1082,20 @@ impl Store {
             detail: "schema version is not 4 bytes".into(),
         })?;
         let found = u32::from_be_bytes(bytes);
-        if found != SCHEMA_VERSION {
+        if !matches!(found, 1 | SCHEMA_VERSION) {
             return Err(Error::Storage {
                 op: "schema check",
                 detail: format!("on-disk schema {found}, this build reads {SCHEMA_VERSION}"),
             });
         }
+        if found == SCHEMA_VERSION {
+            txn.open_table(SMALL_SEGMENTS)
+                .map_err(storage("open small segments"))?;
+        }
         Ok(true)
     }
 
-    /// The store's schema version (always [`SCHEMA_VERSION`] once opened).
+    /// The stored schema version (1 until the first small-row write on an old store).
     pub fn schema_version(&self) -> Result<u32> {
         let txn = self.begin_read()?;
         let meta = txn.open_table(META).map_err(storage("open meta"))?;
@@ -1132,12 +1159,14 @@ impl Store {
         id: u64,
     ) -> Result<Option<SealedSegment>> {
         let txn = self.begin_read()?;
-        let t = txn.open_table(SEGMENTS).map_err(storage("open segments"))?;
-        let key: SegmentKey = (*channel, kind_code(kind), id);
-        match t.get(key).map_err(storage("read segment"))? {
-            None => Ok(None),
-            Some(v) => sealed_segment_from_slice(v.value()).map(Some),
-        }
+        let mixed = txn.open_table(SEGMENTS).map_err(storage("open segments"))?;
+        let small = source_table(&txn, SMALL_SEGMENTS, "open small segments")?;
+        segment_from_tables(
+            &mixed,
+            small.as_ref(),
+            (*channel, kind_code(kind), id),
+            None,
+        )
     }
 
     /// Every sealed segment of `kind` in `channel`, ordered by id ascending.
@@ -1166,12 +1195,50 @@ impl Store {
         mut visit: impl FnMut(u64, SealedSegment) -> Result<()>,
     ) -> Result<()> {
         let txn = self.begin_read()?;
-        let t = txn.open_table(SEGMENTS).map_err(storage("open segments"))?;
+        let mixed = txn.open_table(SEGMENTS).map_err(storage("open segments"))?;
+        let small = source_table(&txn, SMALL_SEGMENTS, "open small segments")?;
         let lo: SegmentKey = (*channel, kind_code(kind), 0);
         let hi: SegmentKey = (*channel, kind_code(kind), u64::MAX);
-        for item in t.range(lo..=hi).map_err(storage("range segments"))? {
-            let (k, v) = item.map_err(storage("iterate segments"))?;
-            visit(k.value().2, sealed_segment_from_slice(v.value())?)?;
+        let mut legacy = mixed.range(lo..=hi).map_err(storage("range segments"))?;
+        let mut packed = small
+            .as_ref()
+            .map(|table| table.range(lo..=hi))
+            .transpose()
+            .map_err(storage("range small segments"))?;
+        let mut a = legacy
+            .next()
+            .transpose()
+            .map_err(storage("iterate segments"))?;
+        let mut b = packed
+            .as_mut()
+            .and_then(Iterator::next)
+            .transpose()
+            .map_err(storage("iterate small segments"))?;
+        while a.is_some() || b.is_some() {
+            if let Some((key, value)) = b.take_if(|(key, _)| {
+                a.as_ref()
+                    .is_none_or(|(other, _)| key.value() <= other.value())
+            }) {
+                let id = key.value().2;
+                visit(id, sealed_segment_from_slice(value.value())?)?;
+                if a.as_ref().is_some_and(|(key, _)| key.value().2 == id) {
+                    a = legacy
+                        .next()
+                        .transpose()
+                        .map_err(storage("iterate segments"))?;
+                }
+                b = packed
+                    .as_mut()
+                    .and_then(Iterator::next)
+                    .transpose()
+                    .map_err(storage("iterate small segments"))?;
+            } else if let Some((key, value)) = a.take() {
+                visit(key.value().2, sealed_segment_from_slice(value.value())?)?;
+                a = legacy
+                    .next()
+                    .transpose()
+                    .map_err(storage("iterate segments"))?;
+            }
         }
         Ok(())
     }
@@ -1333,6 +1400,7 @@ impl Store {
             class: Class::Unsaid,
             received_flow: None,
             received_authors: BTreeSet::new(),
+            small_schema_checked: false,
             epochs,
         })
     }
@@ -1357,6 +1425,7 @@ impl Store {
             class: Class::Received,
             received_flow: Some(flow.clone()),
             received_authors: BTreeSet::new(),
+            small_schema_checked: false,
             epochs,
         })
     }
@@ -1521,6 +1590,107 @@ impl Store {
         Ok(())
     }
 
+    /// Repartition only this opened room. Each native transaction examines at most 64
+    /// legacy keys and moves at most 64 KiB; insert, deletion and schema marker commit together.
+    /// A restart needs no cursor record: it scans the legacy rows which remain.
+    pub(crate) fn pack_small_room_rows(&self, channel: &Digest32) -> Result<()> {
+        let complete = format!("small_rows_packed/{}", super::link::b32_encode(channel));
+        if self.get_meta(&complete)?.is_some() {
+            return Ok(());
+        }
+        let mut after = None;
+        loop {
+            let mut batch = self.batch()?;
+            batch.derived();
+            let (rows, last) = {
+                let mixed = batch
+                    .txn
+                    .open_table(SEGMENTS)
+                    .map_err(storage("open segments"))?;
+                let low = after.map_or(Bound::Included((*channel, 0, 0)), Bound::Excluded);
+                let high = Bound::Included((*channel, u8::MAX, u64::MAX));
+                let mut rows = Vec::new();
+                let mut last = None;
+                for row in mixed
+                    .range((low, high))
+                    .map_err(storage("range room segments"))?
+                    .take(64)
+                {
+                    let (key, value) = row.map_err(storage("read room segment"))?;
+                    last = Some(key.value());
+                    if small_segment(value.value().len()) {
+                        rows.push((key.value(), value.value().to_vec()));
+                    }
+                }
+                (rows, last)
+            };
+            let Some(last) = last else {
+                batch.put_meta(&complete, &[1])?;
+                return batch.commit();
+            };
+            after = Some(last);
+            if rows.is_empty() {
+                continue;
+            }
+            #[cfg(feature = "test-knobs")]
+            let moved_stable = rows.iter().any(|(key, _)| matches!(key.1, 2 | 3));
+            batch.small_schema()?;
+            {
+                let mut mixed = batch
+                    .txn
+                    .open_table(SEGMENTS)
+                    .map_err(storage("open segments"))?;
+                let mut small = batch
+                    .txn
+                    .open_table(SMALL_SEGMENTS)
+                    .map_err(storage("open small segments"))?;
+                for (key, value) in rows {
+                    if small
+                        .get(key)
+                        .map_err(storage("read small segment"))?
+                        .is_none()
+                    {
+                        small
+                            .insert(key, value.as_slice())
+                            .map_err(storage("move small segment"))?;
+                    }
+                    #[cfg(feature = "test-knobs")]
+                    if super::computer::fx28_mutant("small-rows-duplicate")
+                        && matches!(key.1, 2 | 3)
+                    {
+                        continue;
+                    }
+                    mixed.remove(key).map_err(storage("delete moved segment"))?;
+                }
+            }
+            #[cfg(feature = "test-knobs")]
+            if moved_stable && std::env::var_os("VOX_TEST_SMALL_ROWS_COMMITTED").is_some() {
+                batch.ruled();
+            }
+            #[cfg(feature = "test-knobs")]
+            if std::env::var_os("VOX_TEST_SMALL_ROWS_FAIL_FILE")
+                .is_some_and(|path| Path::new(&path).exists())
+            {
+                eprintln!("vox: small-row move ENOSPC fault engaged before commit");
+                return Err(storage("pack small rows")(
+                    std::io::Error::from_raw_os_error(28),
+                ));
+            }
+            batch.commit()?;
+            #[cfg(feature = "test-knobs")]
+            if let Some(marker) =
+                std::env::var_os("VOX_TEST_SMALL_ROWS_COMMITTED").filter(|_| moved_stable)
+            {
+                let marker = PathBuf::from(marker);
+                std::fs::write(&marker, b"one bounded small-row move committed\n")
+                    .map_err(storage("write proof marker"))?;
+                while marker.exists() {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
+        }
+    }
+
     /// Reclaim space after deletions. Returns whether anything was compacted.
     pub fn compact(&mut self) -> Result<bool> {
         match self.db.get_mut().unwrap_or_else(PoisonError::into_inner) {
@@ -1557,6 +1727,63 @@ fn source_table<K: redb::Key + 'static, V: redb::Value + 'static>(
     }
 }
 
+fn segment_from_tables<T: ReadableTable<SegmentKey, &'static [u8]>>(
+    mixed: &T,
+    small: Option<&T>,
+    key: SegmentKey,
+    plaintext_limit: Option<usize>,
+) -> Result<Option<SealedSegment>> {
+    for table in small.into_iter().chain(std::iter::once(mixed)) {
+        if let Some(value) = table.get(key).map_err(storage("read segment"))? {
+            if plaintext_limit.is_some_and(|limit| value.value().len() > limit.saturating_add(64)) {
+                return Err(Error::MalformedAtRest("sealed object exceeds read bound"));
+            }
+            return sealed_segment_from_slice(value.value()).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+fn segment_id_in<T: ReadableTable<SegmentKey, &'static [u8]>>(
+    table: &T,
+    channel: &Digest32,
+    kind: SegmentKind,
+    after: Option<u64>,
+    last: bool,
+) -> Result<Option<u64>> {
+    let low = after.map_or(Bound::Included((*channel, kind_code(kind), 0)), |id| {
+        Bound::Excluded((*channel, kind_code(kind), id))
+    });
+    let high = Bound::Included((*channel, kind_code(kind), u64::MAX));
+    let mut rows = table
+        .range((low, high))
+        .map_err(storage("range segments"))?;
+    let row = if last { rows.next_back() } else { rows.next() };
+    Ok(row
+        .transpose()
+        .map_err(storage("iterate segments"))?
+        .map(|(key, _)| key.value().2))
+}
+
+fn segment_id_from_tables<T: ReadableTable<SegmentKey, &'static [u8]>>(
+    mixed: &T,
+    small: Option<&T>,
+    channel: &Digest32,
+    kind: SegmentKind,
+    after: Option<u64>,
+    last: bool,
+) -> Result<Option<u64>> {
+    let mixed = segment_id_in(mixed, channel, kind, after, last)?;
+    let small = small
+        .map(|table| segment_id_in(table, channel, kind, after, last))
+        .transpose()?
+        .flatten();
+    Ok(match (mixed, small) {
+        (Some(a), Some(b)) => Some(if last { a.max(b) } else { a.min(b) }),
+        (a, b) => a.or(b),
+    })
+}
+
 /// One consistent sealed-segment snapshot. It owns no Store or SEK reference.
 pub(crate) struct Snapshot {
     txn: Cached<redb::ReadTransaction>,
@@ -1572,22 +1799,17 @@ impl Snapshot {
         id: u64,
         plaintext_limit: usize,
     ) -> Result<Option<SealedSegment>> {
-        let table = self
+        let mixed = self
             .txn
             .open_table(SEGMENTS)
             .map_err(storage("open segments"))?;
-        let value = table
-            .get((*channel, kind_code(kind), id))
-            .map_err(storage("read segment"))?;
-        value
-            .map(|value| {
-                // Version, nonce, AEAD tag and canonical CBOR byte-string headers fit in 64 bytes.
-                if value.value().len() > plaintext_limit.saturating_add(64) {
-                    return Err(Error::MalformedAtRest("sealed object exceeds read bound"));
-                }
-                sealed_segment_from_slice(value.value())
-            })
-            .transpose()
+        let small = source_table(&self.txn, SMALL_SEGMENTS, "open small segments")?;
+        segment_from_tables(
+            &mixed,
+            small.as_ref(),
+            (*channel, kind_code(kind), id),
+            Some(plaintext_limit),
+        )
     }
     /// Read the last segment key without opening its sealed body.
     pub(crate) fn last_segment_id(
@@ -1595,19 +1817,12 @@ impl Snapshot {
         channel: &Digest32,
         kind: SegmentKind,
     ) -> Result<Option<u64>> {
-        let table = self
+        let mixed = self
             .txn
             .open_table(SEGMENTS)
             .map_err(storage("open segments"))?;
-        let mut rows = table
-            .range((*channel, kind_code(kind), 0)..=(*channel, kind_code(kind), u64::MAX))
-            .map_err(storage("range segments"))?;
-        let found = rows
-            .next_back()
-            .transpose()
-            .map_err(storage("iterate segments"))?
-            .map(|(key, _)| key.value().2);
-        Ok(found)
+        let small = source_table(&self.txn, SMALL_SEGMENTS, "open small segments")?;
+        segment_id_from_tables(&mixed, small.as_ref(), channel, kind, None, true)
     }
 
     /// Read only the next segment key. A readiness check never copies the sealed body.
@@ -1617,23 +1832,12 @@ impl Snapshot {
         kind: SegmentKind,
         after: Option<u64>,
     ) -> Result<Option<u64>> {
-        use std::ops::Bound::{Excluded, Included};
-        let table = self
+        let mixed = self
             .txn
             .open_table(SEGMENTS)
             .map_err(storage("open segments"))?;
-        let low = match after {
-            Some(id) => Excluded((*channel, kind_code(kind), id)),
-            None => Included((*channel, kind_code(kind), 0)),
-        };
-        let mut rows = table
-            .range((low, Included((*channel, kind_code(kind), u64::MAX))))
-            .map_err(storage("range segments"))?;
-        Ok(rows
-            .next()
-            .transpose()
-            .map_err(storage("iterate segments"))?
-            .map(|(key, _)| key.value().2))
+        let small = source_table(&self.txn, SMALL_SEGMENTS, "open small segments")?;
+        segment_id_from_tables(&mixed, small.as_ref(), channel, kind, after, false)
     }
 
     pub(crate) fn get_segment(
@@ -1642,16 +1846,17 @@ impl Snapshot {
         kind: SegmentKind,
         id: u64,
     ) -> Result<Option<SealedSegment>> {
-        let table = self
+        let mixed = self
             .txn
             .open_table(SEGMENTS)
             .map_err(storage("open segments"))?;
-        let value = table
-            .get((*channel, kind_code(kind), id))
-            .map_err(storage("read segment"))?;
-        value
-            .map(|v| sealed_segment_from_slice(v.value()))
-            .transpose()
+        let small = source_table(&self.txn, SMALL_SEGMENTS, "open small segments")?;
+        segment_from_tables(
+            &mixed,
+            small.as_ref(),
+            (*channel, kind_code(kind), id),
+            None,
+        )
     }
     /// The next sealed row in this pinned snapshot, without materializing the remaining range.
     pub(crate) fn segment_after(
@@ -1660,26 +1865,13 @@ impl Snapshot {
         kind: SegmentKind,
         after: Option<u64>,
     ) -> Result<Option<(u64, SealedSegment)>> {
-        use std::ops::Bound::{Excluded, Included};
-        let table = self
-            .txn
-            .open_table(SEGMENTS)
-            .map_err(storage("open segments"))?;
-        let low = match after {
-            Some(id) => Excluded((*channel, kind_code(kind), id)),
-            None => Included((*channel, kind_code(kind), 0)),
-        };
-        let high = Included((*channel, kind_code(kind), u64::MAX));
-        let mut rows = table
-            .range((low, high))
-            .map_err(storage("range segments"))?;
-        let result = rows
-            .next()
+        self.segment_id_after(channel, kind, after)?
+            .map(|id| {
+                self.get_segment(channel, kind, id)
+                    .map(|segment| segment.map(|segment| (id, segment)))
+            })
             .transpose()
-            .map_err(storage("iterate segments"))?
-            .map(|(key, value)| Ok((key.value().2, sealed_segment_from_slice(value.value())?)))
-            .transpose();
-        result
+            .map(Option::flatten)
     }
 }
 
@@ -1690,11 +1882,40 @@ pub struct Batch<'a> {
     class: Class,
     received_flow: Option<ReceivedFlow>,
     received_authors: BTreeSet<Digest32>,
+    small_schema_checked: bool,
     /// The store's writer, held from the batch's beginning to its commit's mark.
     epochs: MutexGuard<'a, Epochs>,
 }
 
 impl Batch<'_> {
+    fn small_schema(&mut self) -> Result<()> {
+        if self.small_schema_checked {
+            return Ok(());
+        }
+        let changed = {
+            let mut meta = self.txn.open_table(META).map_err(storage("open meta"))?;
+            let version: [u8; 4] = meta
+                .get(META_SCHEMA)
+                .map_err(storage("read schema"))?
+                .ok_or(Error::MalformedAtRest("schema marker missing"))?
+                .value()
+                .try_into()
+                .map_err(|_| Error::MalformedAtRest("schema marker size"))?;
+            if u32::from_be_bytes(version) == SCHEMA_VERSION {
+                false
+            } else {
+                meta.insert(META_SCHEMA, SCHEMA_VERSION.to_be_bytes().as_slice())
+                    .map_err(storage("write schema"))?;
+                true
+            }
+        };
+        if changed {
+            self.ruled();
+        }
+        self.small_schema_checked = true;
+        Ok(())
+    }
+
     /// Associate an author's visible semantic state with this exact received transaction.
     /// The association is installed under the Store writer immediately after commit.
     pub(crate) fn note_received_author(&mut self, author: Digest32) -> Result<()> {
@@ -1762,21 +1983,20 @@ impl Batch<'_> {
         id: u64,
         plaintext_limit: usize,
     ) -> Result<Option<SealedSegment>> {
-        let table = self
+        let mixed = self
             .txn
             .open_table(SEGMENTS)
             .map_err(storage("open segments"))?;
-        let value = table
-            .get((*channel, kind_code(kind), id))
-            .map_err(storage("read segment"))?;
-        value
-            .map(|value| {
-                if value.value().len() > plaintext_limit.saturating_add(64) {
-                    return Err(Error::MalformedAtRest("sealed object exceeds read bound"));
-                }
-                sealed_segment_from_slice(value.value())
-            })
-            .transpose()
+        let small = self
+            .txn
+            .open_table(SMALL_SEGMENTS)
+            .map_err(storage("open small segments"))?;
+        segment_from_tables(
+            &mixed,
+            Some(&small),
+            (*channel, kind_code(kind), id),
+            Some(plaintext_limit),
+        )
     }
     /// Read the last segment key without opening its sealed body.
     pub(crate) fn last_segment_id(
@@ -1784,19 +2004,15 @@ impl Batch<'_> {
         channel: &Digest32,
         kind: SegmentKind,
     ) -> Result<Option<u64>> {
-        let table = self
+        let mixed = self
             .txn
             .open_table(SEGMENTS)
             .map_err(storage("open segments"))?;
-        let mut rows = table
-            .range((*channel, kind_code(kind), 0)..=(*channel, kind_code(kind), u64::MAX))
-            .map_err(storage("range segments"))?;
-        let found = rows
-            .next_back()
-            .transpose()
-            .map_err(storage("iterate segments"))?
-            .map(|(key, _)| key.value().2);
-        Ok(found)
+        let small = self
+            .txn
+            .open_table(SMALL_SEGMENTS)
+            .map_err(storage("open small segments"))?;
+        segment_id_from_tables(&mixed, Some(&small), channel, kind, None, true)
     }
 
     /// Read only the next segment key. A readiness check never copies the sealed body.
@@ -1806,24 +2022,15 @@ impl Batch<'_> {
         kind: SegmentKind,
         after: Option<u64>,
     ) -> Result<Option<u64>> {
-        use std::ops::Bound::{Excluded, Included};
-        let table = self
+        let mixed = self
             .txn
             .open_table(SEGMENTS)
             .map_err(storage("open segments"))?;
-        let low = match after {
-            Some(id) => Excluded((*channel, kind_code(kind), id)),
-            None => Included((*channel, kind_code(kind), 0)),
-        };
-        let mut rows = table
-            .range((low, Included((*channel, kind_code(kind), u64::MAX))))
-            .map_err(storage("range segments"))?;
-        let found = rows
-            .next()
-            .transpose()
-            .map_err(storage("iterate segments"))?
-            .map(|(key, _)| key.value().2);
-        Ok(found)
+        let small = self
+            .txn
+            .open_table(SMALL_SEGMENTS)
+            .map_err(storage("open small segments"))?;
+        segment_id_from_tables(&mixed, Some(&small), channel, kind, after, false)
     }
 
     /// Read this transaction's writes as well as its original rows. Reading through Store
@@ -1834,16 +2041,15 @@ impl Batch<'_> {
         kind: SegmentKind,
         id: u64,
     ) -> Result<Option<SealedSegment>> {
-        let table = self
+        let mixed = self
             .txn
             .open_table(SEGMENTS)
             .map_err(storage("open segments"))?;
-        let value = table
-            .get((*channel, kind_code(kind), id))
-            .map_err(storage("read segment"))?;
-        value
-            .map(|v| sealed_segment_from_slice(v.value()))
-            .transpose()
+        let small = self
+            .txn
+            .open_table(SMALL_SEGMENTS)
+            .map_err(storage("open small segments"))?;
+        segment_from_tables(&mixed, Some(&small), (*channel, kind_code(kind), id), None)
     }
 
     /// The next sealed row in this transaction, without materializing the remaining range.
@@ -1853,57 +2059,50 @@ impl Batch<'_> {
         kind: SegmentKind,
         after: Option<u64>,
     ) -> Result<Option<(u64, SealedSegment)>> {
-        use std::ops::Bound::{Excluded, Included};
-        let table = self
-            .txn
-            .open_table(SEGMENTS)
-            .map_err(storage("open segments"))?;
-        let low = match after {
-            Some(id) => Excluded((*channel, kind_code(kind), id)),
-            None => Included((*channel, kind_code(kind), 0)),
-        };
-        let high = Included((*channel, kind_code(kind), u64::MAX));
-        let mut rows = table
-            .range((low, high))
-            .map_err(storage("range segments"))?;
-        let result = rows
-            .next()
+        self.segment_id_after(channel, kind, after)?
+            .map(|id| {
+                self.get_segment(channel, kind, id)
+                    .map(|segment| segment.map(|segment| (id, segment)))
+            })
             .transpose()
-            .map_err(storage("iterate segments"))?
-            .map(|(key, value)| Ok((key.value().2, sealed_segment_from_slice(value.value())?)))
-            .transpose();
-        result
+            .map(Option::flatten)
     }
 
     /// Delete one room's rows and wrap in this transaction, one key at a time.
     /// Callers can commit a bounded cleanup receipt with the deletion itself.
     pub(crate) fn purge_channel(&mut self, channel: &Digest32) -> Result<usize> {
         let mut gone = 0usize;
-        let mut table = self
-            .txn
-            .open_table(SEGMENTS)
-            .map_err(storage("open segments"))?;
         let low: SegmentKey = (*channel, 0, 0);
         let high: SegmentKey = (*channel, u8::MAX, u64::MAX);
-        loop {
-            let next = table
-                .range(low..=high)
-                .map_err(storage("range segments"))?
-                .next()
-                .transpose()
-                .map_err(storage("iterate segments"))?
-                .map(|(key, _)| key.value());
-            let Some(key) = next else {
-                break;
-            };
-            if table
-                .remove(key)
-                .map_err(storage("delete segment"))?
-                .is_some()
-            {
-                gone += 1;
+        for definition in [SEGMENTS, SMALL_SEGMENTS] {
+            let mut table = self
+                .txn
+                .open_table(definition)
+                .map_err(storage("open segments"))?;
+            loop {
+                let next = table
+                    .range(low..=high)
+                    .map_err(storage("range segments"))?
+                    .next()
+                    .transpose()
+                    .map_err(storage("iterate segments"))?
+                    .map(|(key, _)| key.value());
+                let Some(key) = next else { break };
+                if table
+                    .remove(key)
+                    .map_err(storage("delete segment"))?
+                    .is_some()
+                {
+                    gone += 1;
+                }
             }
         }
+        let complete = format!("small_rows_packed/{}", super::link::b32_encode(channel));
+        self.txn
+            .open_table(META)
+            .map_err(storage("open meta"))?
+            .remove(complete.as_str())
+            .map_err(storage("delete packing marker"))?;
         #[cfg(feature = "test-knobs")]
         if crate::node::computer::fx28_mutant("leave-keep-sek-wrap") {
             return Ok(gone);
@@ -1930,13 +2129,24 @@ impl Batch<'_> {
         id: u64,
         seg: &SealedSegment,
     ) -> Result<()> {
-        let mut t = self
-            .txn
-            .open_table(SEGMENTS)
-            .map_err(storage("open segments"))?;
+        let bytes = sealed_segment_to_vec(seg);
         let key: SegmentKey = (*channel, kind_code(kind), id);
-        t.insert(key, sealed_segment_to_vec(seg).as_slice())
+        let (target, other) = if small_segment(bytes.len()) {
+            self.small_schema()?;
+            (SMALL_SEGMENTS, SEGMENTS)
+        } else {
+            (SEGMENTS, SMALL_SEGMENTS)
+        };
+        self.txn
+            .open_table(target)
+            .map_err(storage("open segments"))?
+            .insert(key, bytes.as_slice())
             .map_err(storage("write segment"))?;
+        self.txn
+            .open_table(other)
+            .map_err(storage("open segments"))?
+            .remove(key)
+            .map_err(storage("delete old segment"))?;
         Ok(())
     }
 
@@ -1947,12 +2157,17 @@ impl Batch<'_> {
         kind: SegmentKind,
         id: u64,
     ) -> Result<bool> {
-        let mut t = self
-            .txn
-            .open_table(SEGMENTS)
-            .map_err(storage("open segments"))?;
         let key: SegmentKey = (*channel, kind_code(kind), id);
-        let existed = t.remove(key).map_err(storage("delete segment"))?.is_some();
+        let mut existed = false;
+        for definition in [SEGMENTS, SMALL_SEGMENTS] {
+            existed |= self
+                .txn
+                .open_table(definition)
+                .map_err(storage("open segments"))?
+                .remove(key)
+                .map_err(storage("delete segment"))?
+                .is_some();
+        }
         Ok(existed)
     }
 
@@ -1983,6 +2198,7 @@ impl Batch<'_> {
             class,
             received_flow,
             received_authors,
+            small_schema_checked: _,
             mut epochs,
         } = self;
         let class = if !received_authors.is_empty() && matches!(class, Class::Derived) {

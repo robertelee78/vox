@@ -680,7 +680,7 @@ impl PendingSession {
                 .append(store, sek, signer, content, completion.as_ref(), None)
                 .map(SessionSaved::Appended),
             SessionWrite::Refresh { owed } => self
-                .refresh_records(store, sek, signer, &owed, rotated)
+                .refresh_records(store, sek, signer, &owed)
                 .map(SessionSaved::Refreshed),
             SessionWrite::Drive { ensure } => {
                 if ensure
@@ -699,7 +699,7 @@ impl PendingSession {
                 let refresh = if owed.is_empty() {
                     SessionRefresh::Complete
                 } else {
-                    self.refresh_records(store, sek, signer, &owed, rotated)?
+                    self.refresh_records(store, sek, signer, &owed)?
                 };
                 let mut releases = Vec::new();
                 if refresh == SessionRefresh::Complete && self.release_ready {
@@ -1380,7 +1380,6 @@ impl PendingSession {
         sek: &Sek,
         signer: &dyn RootSigner,
         owed: &[Digest32],
-        rotated: bool,
     ) -> Result<SessionRefresh> {
         if let Some(wait) = self.refresh_wait {
             return Ok(SessionRefresh::Waiting(wait));
@@ -1412,6 +1411,8 @@ impl PendingSession {
             .take()
             .ok_or(Error::MalformedAtRest("Session refresh cursor missing"))?;
         let mut bytes = 0usize;
+        #[cfg(feature = "test-knobs")]
+        let mut walked = (0usize, 0usize);
         let progress = (|| -> Result<()> {
             for _ in 0..WORK_ROWS {
                 if work.stage == 0 {
@@ -1434,6 +1435,11 @@ impl PendingSession {
                         break;
                     }
                     bytes = bytes.saturating_add(row.text.len());
+                    #[cfg(feature = "test-knobs")]
+                    {
+                        walked.0 += 1;
+                        walked.1 += usize::from(row.author != self.me);
+                    }
                     if row.author == self.me && crate::node::sessions::is_record(&row.text) {
                         let tracked = self
                             .entries
@@ -1484,6 +1490,12 @@ impl PendingSession {
                             break;
                         }
                         bytes = bytes.saturating_add(size);
+                        #[cfg(feature = "test-knobs")]
+                        {
+                            walked.0 += 1;
+                            walked.1 +=
+                                usize::from(saved.record.message.header.author_id != self.me);
+                        }
                         if !self.expired(&saved) {
                             if let Some(row) = saved.row.filter(|row| {
                                 row.author == self.me && crate::node::sessions::is_record(&row.body)
@@ -1513,13 +1525,29 @@ impl PendingSession {
         if progress.as_ref().is_err_and(floor_index::refreshing) {
             self.refresh = Some(work);
             self.refresh_changed = true;
-            return Ok(if rotated || self.committed_rows != 0 {
-                SessionRefresh::Progressed
-            } else {
-                SessionRefresh::Waiting("its Session index being refreshed")
-            });
+            return Ok(SessionRefresh::Waiting("its Session index being refreshed"));
         }
         progress?;
+        #[cfg(feature = "test-knobs")]
+        if let Some(path) = std::env::var_os("VOX_TEST_SESSION_REFRESH_RECEIPT") {
+            use std::io::Write as _;
+            let receipt = || -> std::io::Result<()> {
+                writeln!(
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)?,
+                    "{}\t{}\t{}",
+                    crate::node::link::b32_encode(&self.room),
+                    walked.0,
+                    walked.1
+                )
+            };
+            receipt().map_err(|error| Error::Path {
+                op: "write Session refresh proof receipt",
+                detail: error.to_string(),
+            })?;
+        }
         work.private = private_index::lifecycle_revision(&store.snapshot()?, sek, &self.room)?;
         let complete = work.stage == 2 && work.grant == self.refresh_grant(store, sek, owed)?;
         self.refresh = Some(work);

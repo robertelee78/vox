@@ -416,7 +416,7 @@ pub struct Management {
     /// The sole persistent transaction domain.
     pub computer: Arc<Computer>,
     net: Arc<NodeNet>,
-    anchors: BootstrapSet,
+    anchors: Mutex<BootstrapSet>,
     serving: Mutex<std::collections::BTreeSet<u64>>,
     /// Computers an exchange is in flight with: one at a time per computer, never a round that
     /// waits for every computer, so a slow one delays no other (#989).
@@ -774,6 +774,25 @@ impl Management {
         })?
     }
 
+    /// Apply the machine's current anchors without changing computer trust.
+    pub fn set_anchors(&self, anchors: BootstrapSet) -> Result<()> {
+        {
+            let mut current = lock(&self.anchors);
+            if *current == anchors {
+                return Ok(());
+            }
+            let mut policy = crate::node::net::PeerPolicy::new();
+            for anchor in anchors.nodes() {
+                policy.add_anchor(anchor.id);
+            }
+            self.net.policy().replace(policy);
+            *current = anchors;
+        }
+        let result = self.record_reach();
+        self.transport_wake.notify_one();
+        result
+    }
+
     /// Record transport reach without creating a policy-application event or receipt. An
     /// endpoint change cannot renew an expired node application's causal deadline.
     pub fn record_reach(&self) -> Result<()> {
@@ -792,7 +811,7 @@ impl Management {
         if s.genesis.is_some() && s.grant(&local).is_some() && s.quarantined.is_empty() {
             let reach = Reach {
                 endpoints,
-                anchors: self.anchors.clone(),
+                anchors: lock(&self.anchors).clone(),
                 token: s
                     .reaches
                     .get(&local)
@@ -946,7 +965,7 @@ impl Management {
         let me = Arc::new(Self {
             computer,
             net,
-            anchors,
+            anchors: Mutex::new(anchors),
             serving: Mutex::new(Default::default()),
             inflight: Mutex::new(BTreeMap::new()),
             slots: Arc::new(tokio::sync::Semaphore::new(MANAGEMENT_SLOTS)),
@@ -1272,7 +1291,7 @@ impl Management {
                 transport,
                 expires,
                 endpoints,
-                anchors: self.anchors.clone(),
+                anchors: lock(&self.anchors).clone(),
             }
             .url(),
         );
@@ -1304,28 +1323,44 @@ impl Management {
                 return self.status();
             }
         }
-        let closed_expired = self.computer.change(|s| {
-            if s.pending.as_ref().is_some_and(|g| (g.operation()==id || s.invitations.iter().any(|i| i.id==id && i.nonce==g.nonce)) && enrolled(s,g)) || s.genesis.as_ref().is_some_and(|g|g.operation()==id) {
-                return Err(Error::Profile("this pairing is established; cancellation does not remove computer trust"));
+        let closed_signed = self.computer.change(|s| {
+            if s.pending.as_ref().is_some_and(|g| {
+                (g.operation() == id
+                    || s.invitations
+                        .iter()
+                        .any(|i| i.id == id && i.nonce == g.nonce))
+                    && enrolled(s, g)
+            }) || s.genesis.as_ref().is_some_and(|g| g.operation() == id)
+            {
+                return Err(Error::Profile(
+                    "this pairing is established; cancellation does not remove computer trust",
+                ));
             }
             if s.cancelled.contains_key(&id) {
-                return Ok(false);
+                return Ok(None);
             }
             let pending_nonce = s.pending.as_ref().and_then(|g| {
-                (g.operation() == id || s.invitations.iter().any(|i| i.id == id && i.nonce == g.nonce))
-                    .then_some(g.nonce)
+                (g.operation() == id
+                    || s.invitations
+                        .iter()
+                        .any(|i| i.id == id && i.nonce == g.nonce))
+                .then_some(g.nonce)
             });
             let pending = pending_nonce.is_some();
             if s.invitations.iter().any(|i| i.id == id && i.cancelled) {
-                return Ok(false);
+                return Ok(None);
             }
-            let locally_approved = pending && s.pending.as_ref().is_some_and(|g| {
-                side(g, &self.computer.signer.fingerprint())
-                    .ok().is_some_and(|at| g.approvals[at].is_some())
-            });
-            if locally_approved && s.pending_expires > now() {
-                return Err(Error::Profile("this approval is already signed and the other computer may complete it; wait for its result or close the incomplete attempt after it expires"));
-            }
+            let locally_approved = pending
+                && s.pending.as_ref().is_some_and(|g| {
+                    side(g, &self.computer.signer.fingerprint())
+                        .ok()
+                        .is_some_and(|at| g.approvals[at].is_some())
+                });
+            let signed_attempt = s
+                .pending
+                .as_ref()
+                .filter(|_| locally_approved)
+                .map(|g| (g.expires, g.operation()));
             let mut found = pending;
             for i in &mut s.invitations {
                 if (i.id == id || pending_nonce == Some(i.nonce)) && !i.cancelled {
@@ -1344,15 +1379,24 @@ impl Management {
                     s.cancelled_links.push(link);
                 }
                 s.pending_expires = 0;
-                if s.genesis.is_none() { s.rosters.clear(); s.members.clear(); s.reaches.clear(); s.group_genesis=None; }
+                if s.genesis.is_none() {
+                    s.rosters.clear();
+                    s.members.clear();
+                    s.reaches.clear();
+                    s.group_genesis = None;
+                }
                 // Fault exclusion is permanent within this retired incarnation. Retain its
                 // signed evidence, but do not carry its derived fault into a fresh enrollment.
-                if s.genesis.is_none() { s.quarantined.clear(); s.receipts.clear(); }
+                if s.genesis.is_none() {
+                    s.quarantined.clear();
+                    s.receipts.clear();
+                }
             }
-            Ok(locally_approved)
+            Ok(signed_attempt)
         })?;
-        if closed_expired {
-            *lock(&self.closed_problem) = Some("Expired attempt closed on this computer. Its signed intent remains retained and cannot activate here. The other computer may have recorded approval; this does not remove trust there.".into());
+        if let Some((expires, operation)) = closed_signed {
+            let operation = text_id(&operation);
+            *lock(&self.closed_problem) = Some(format!("Incomplete attempt closed on this computer. The other computer can still complete its side until Unix ms {expires}, and would then count this computer in its group. This computer will refuse it. Close it there too with: vox computer cancel {operation}. Closing here does not remove trust there."));
         }
         // Cancellation revokes transport even when no policy revision moved.
         self.transport_wake.notify_one();
@@ -1870,7 +1914,7 @@ impl Management {
                         transport: i.transport.clone(),
                         expires: i.expires,
                         endpoints,
-                        anchors: self.anchors.clone(),
+                        anchors: lock(&self.anchors).clone(),
                     }
                     .url()
                 })
@@ -2268,7 +2312,7 @@ impl Management {
             if !established && link.expires <= now() {
                 continue;
             }
-            let mut anchors = self.anchors.clone();
+            let mut anchors = lock(&self.anchors).clone();
             for a in link.anchors.nodes() {
                 anchors.add(a.clone())?;
             }
@@ -2306,7 +2350,7 @@ impl Management {
                     i.expires
                 },
                 peer: i.target,
-                anchors: self.anchors.clone(),
+                anchors: lock(&self.anchors).clone(),
                 renewable: established,
             });
         }
@@ -2406,14 +2450,14 @@ impl Management {
                 .invitations
                 .iter()
                 .filter(|i| i.cancelled && i.expires > now())
-                .map(|i| (i.id, self.anchors.clone()))
+                .map(|i| (i.id, lock(&self.anchors).clone()))
                 .collect();
             for url in &s.cancelled_links {
                 let link = Link::parse(url)?;
                 if link.expires <= now() {
                     continue;
                 }
-                let mut anchors = self.anchors.clone();
+                let mut anchors = lock(&self.anchors).clone();
                 for a in link.anchors.nodes() {
                     anchors.add(a.clone())?;
                 }
@@ -2534,6 +2578,16 @@ impl Management {
     ) -> Result<Arc<VoxConnection>> {
         if let Some(conn) = self.net.manager().existing(&target) {
             return Ok(conn);
+        }
+        if endpoints.is_empty()
+            && self
+                .transport_leases(supplied)?
+                .iter()
+                .all(|lease| lease.peer != Some(target) || lease.anchors.nodes().is_empty())
+        {
+            return Err(Error::Profile(
+                "this pairing link has no address and no anchor to reach its computer; on the other computer, run vox computer invite with a reachable address or add an anchor, then use its new link",
+            ));
         }
         // The direct dial starts immediately. Anchor registration is a separate raced path and
         // neither its absence nor its refusal can delay or fail a directly reachable computer.
