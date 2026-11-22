@@ -831,6 +831,22 @@ messages read. The app client must expose all69 readers on every message and eve
 relationship. The terminal must open the room and show every reader and peer's trust (#792).
 This expensive proof is optional and blocks neither CI nor release.
 
+### RG-8 computer anchors and late pairing closure
+
+The existing `nodes_of_one_daemon_proof` hosts two on-demand real-binary acts:
+`computer_management_uses_anchors_added_after_start` stages a real relay and restart;
+`either_computer_closes_a_half_signed_pairing_at_once` waits for each late completion's
+causal exchange outcome, once for each holder, so may take two minutes. Both are compiled
+only with `optional-proofs`, with loud `not_run!` stand-ins otherwise.
+Build once with `cargo test --release -p vox-tui --features test-knobs,optional-proofs --test nodes_of_one_daemon_proof --no-run`,
+then select one function with `-- --ignored --exact --nocapture`. Run these acts quiet.
+Each uses isolated account data/config roots. Closing a half-signed attempt is local:
+the other computer can still complete until expiry; the closer refuses it. Close it on
+both computers to stop the attempt on both.
+
+The seconds-long no-route diagnosis, status guidance and pause/resume guidance acts are
+release-gate proofs, not optional proofs.
+
 ### Linux release installation (ADR-051, RG-11)
 
 Build the Linux dist with `scripts/build-linux-release.sh /absolute/path/to/linux-dist`.
