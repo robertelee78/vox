@@ -211,6 +211,9 @@ impl Node {
         let me = profile.fingerprint();
         let store = profile.store_handle();
         let known = store.channels()?;
+        if !computer.offer_boundaries_owed(me, &known) {
+            return Ok(());
+        }
         let mut captured = Vec::new();
         for (room, instance) in &self.channels {
             let channel = instance.lock().await;

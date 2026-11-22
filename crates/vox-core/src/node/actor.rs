@@ -24925,15 +24925,28 @@ impl Node {
         self.decisions.set_aliases(&trusted);
         // Who is offered to the keyring (K-15 – K-18), over every open room.
         let names_here: Vec<Option<String>> = channels.iter().map(|c| c.name.clone()).collect();
+        let removed_offer_members = match (&self.computer, &self.profile) {
+            (Some(computer), Some(profile))
+                if open_channels
+                    .iter()
+                    .any(|room| !room.offer_bases.is_empty()) =>
+            {
+                computer.removed_offer_members(profile.fingerprint()).ok()
+            }
+            _ => None,
+        };
         let offers = crate::node::offers::offers(
             &open_channels,
             &names_here,
             &trusted,
             &self.dismissed_offers,
             |room, basis| match (&self.computer, &self.profile) {
-                (Some(computer), Some(profile)) => {
-                    computer.suppress_offer(profile.fingerprint(), room, basis)
-                }
+                (Some(computer), Some(profile)) => computer.suppress_offer(
+                    profile.fingerprint(),
+                    room,
+                    basis,
+                    removed_offer_members.as_ref(),
+                ),
                 _ => false,
             },
         );

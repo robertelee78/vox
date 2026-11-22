@@ -405,9 +405,16 @@ impl Suppression {
 }
 impl State {
     fn members_of_computer(&self, target: Digest32) -> Result<BTreeSet<Digest32>> {
+        self.members_of_computer_in(target, &self.accepted_history()?)
+    }
+    fn members_of_computer_in(
+        &self,
+        target: Digest32,
+        accepted: &BTreeSet<Digest32>,
+    ) -> Result<BTreeSet<Digest32>> {
         let mut nodes = BTreeSet::new();
-        for id in self.accepted_history()? {
-            let event = self.history[&id].event()?;
+        for id in accepted {
+            let event = self.history[id].event()?;
             if event.author == target {
                 for binding in event.bindings {
                     nodes.insert(binding.verify(&event.author, &event.group)?);
@@ -543,11 +550,40 @@ impl Computer {
         *lock(&self.state) = next;
         Ok(true)
     }
+    /// One temporary member set per owed removal for this offers publication.
+    pub(crate) fn removed_offer_members(
+        &self,
+        node: Digest32,
+    ) -> Result<BTreeMap<Digest32, BTreeSet<Digest32>>> {
+        let s = lock(&self.state);
+        let mut owed = s
+            .suppression
+            .iter()
+            .filter(|(_, work)| {
+                work.local_nodes.contains(&node)
+                    && work.remembered.get(&node).is_none_or(|rooms| {
+                        rooms
+                            .iter()
+                            .any(|room| !work.boundaries.contains_key(&(node, *room)))
+                    })
+            })
+            .peekable();
+        if owed.peek().is_none() {
+            return Ok(BTreeMap::new());
+        }
+        let accepted = s.accepted_history()?;
+        owed.map(|(event, _)| {
+            let removal = s.history[event].event()?.removal.ok_or_else(bad)?;
+            Ok((*event, s.members_of_computer_in(removal.target, &accepted)?))
+        })
+        .collect()
+    }
     pub(crate) fn suppress_offer(
         &self,
         node: Digest32,
         room: Digest32,
         basis: &crate::node::api::OfferBasis,
+        removed_members: Option<&BTreeMap<Digest32, BTreeSet<Digest32>>>,
     ) -> bool {
         #[cfg(feature = "test-knobs")]
         if super::fx28_mutant("offer-removed-nodes") {
@@ -576,9 +612,9 @@ impl Computer {
                     }
                     basis.seq <= *cut
                 }
-                None => s
-                    .removed_members(event)
-                    .map_or(true, |members| members.contains(&basis.member)),
+                None => removed_members
+                    .and_then(|members| members.get(event))
+                    .is_none_or(|members| members.contains(&basis.member)),
             }
         })
     }

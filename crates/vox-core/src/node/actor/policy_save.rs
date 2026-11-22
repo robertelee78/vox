@@ -625,9 +625,12 @@ impl Node {
         }
         // Room withdrawals keep their existing durable PendingLocks and run independently.
         drop(lifetime);
-        if let Err(error) = self.capture_open_computer_offer_boundaries().await {
-            let _ = work.reply.send(Err(error));
-            return;
+        if self.capture_open_computer_offer_boundaries().await.is_err() {
+            // Policy is already applied. Keep unpaid boundaries behind their read barrier,
+            // and let each room retry without stranding this completion's other waiters.
+            for room in self.channels.keys().copied() {
+                self.governance_work.wake_room(room);
+            }
         }
         self.computer_expired = expired;
         self.computer_revision
