@@ -17,7 +17,7 @@
 //! **Asserted:**
 //!
 //! 1. on that wiring the doctor reports every check `ok` and exits 0;
-//! 2. each check, broken alone, names its own fix: an unknown room; the Claude hook twice,
+//! 2. each check, broken alone, names its own fix: an unknown room; either Claude handler twice,
 //!    and missing; Codex's trust of its hook withdrawn; the OpenCode plugin edited; the drain's cursor directory unwritable; the session's wake endpoint gone; bob
 //!    not trusting alice; alice announcing another vox version; bob's node stopped (exit 1 on
 //!    every `fail`);
@@ -210,6 +210,7 @@ fn an_agent_session_is_checked_from_both_sides() {
     );
     claude.expect_ok("`vox agent plugin claude`");
     write(&home.claude(), &claude.stdout);
+    let claude_settings = claude.json();
     let plugin = bob_vox(
         bob,
         &home,
@@ -233,9 +234,14 @@ fn an_agent_session_is_checked_from_both_sides() {
     let inbox = listen(&sock);
     let sock_s = sock.to_string_lossy().into_owned();
     let hook_input = r#"{"session_id":"session-bob","hook_event_name":"UserPromptSubmit","cwd":"/tmp","prompt":"hi"}"#;
+    let native_attention = claude_settings["env"]["VOX_CLAUDE_NATIVE_ATTENTION"]
+        .as_str()
+        .expect("APPARATUS: Claude's generated settings must enable native attention");
     let session_env = [
         ("CLAUDE_CODE_MESSAGING_SOCKET", sock_s.as_str()),
         ("CLAUDE_CODE_MESSAGING_TOKEN", "a-token"),
+        ("VOX_CLAUDE_NATIVE_ATTENTION", native_attention),
+        ("CLAUDE_CODE_ENTRYPOINT", "cli"),
     ];
     bob.vox_env(
         None,
@@ -356,7 +362,9 @@ fn an_agent_session_is_checked_from_both_sides() {
         } else {
             "alice-fresh"
         };
-        let input = format!(r#"{{"session_id":"{session_id}","cwd":"/tmp"}}"#);
+        let input = format!(
+            r#"{{"session_id":"{session_id}","hook_event_name":"UserPromptSubmit","cwd":"/tmp","prompt":"continue"}}"#
+        );
         let drained = w.vox_env(
             None,
             env,
@@ -390,22 +398,43 @@ fn an_agent_session_is_checked_from_both_sides() {
     expect("an unknown room", &o, &v, "room", "fail", "--room");
 
     let wired = read(&home.claude());
-    let mut twice: serde_json::Value = serde_json::from_str(&wired).unwrap();
-    let entry = twice["hooks"]["UserPromptSubmit"][0].clone();
-    twice["hooks"]["UserPromptSubmit"]
-        .as_array_mut()
-        .expect("APPARATUS: vox's claude snippet has a UserPromptSubmit list")
-        .push(entry);
-    write(&home.claude(), &twice.to_string());
-    let (o, v) = doctor(bob, &home, &room);
-    expect(
-        "the Claude hook twice",
-        &o,
-        &v,
-        "claude-hook UserPromptSubmit",
-        "fail",
-        "keep one",
-    );
+    for (index, role, id) in [
+        (0, "ordinary", "claude-hook UserPromptSubmit"),
+        (
+            1,
+            "native attention",
+            "claude-hook UserPromptSubmit native attention",
+        ),
+    ] {
+        let mut twice: serde_json::Value = serde_json::from_str(&wired).unwrap();
+        let entry = twice["hooks"]["UserPromptSubmit"][index].clone();
+        assert!(
+            entry["hooks"][0]["command"]
+                .as_str()
+                .is_some_and(|c| c.contains("--native-attention") == (index == 1)),
+            "APPARATUS: generated {role} handler was not reached: {entry}"
+        );
+        twice["hooks"]["UserPromptSubmit"]
+            .as_array_mut()
+            .expect("APPARATUS: vox's claude snippet has a UserPromptSubmit list")
+            .push(entry);
+        write(&home.claude(), &twice.to_string());
+        let (o, v) = doctor(bob, &home, &room);
+        expect(
+            &format!("the Claude {role} handler twice"),
+            &o,
+            &v,
+            id,
+            "fail",
+            "keep one",
+        );
+        let detail = check(&v, id)["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("runs 2 times"),
+            "PRODUCT (2): the doctor must name the duplicated {role} handler, not count the \
+             disjoint handler: {detail}"
+        );
+    }
     write(&home.claude(), "{}");
     let (o, v) = doctor(bob, &home, &room);
     expect(
@@ -516,7 +545,7 @@ fn an_agent_session_is_checked_from_both_sides() {
         &v,
         "version ",
         "warn",
-        "same vox",
+        "claim rules",
     );
 
     bob.vox(
@@ -594,4 +623,39 @@ fn an_agent_session_is_checked_from_both_sides() {
         "PRODUCT (6): a ping nobody answers must end in a named timeout saying what it cannot \
          tell apart, exit 1: {ping:?}"
     );
+}
+
+/// The claim-rules act is independent of Claude wiring and process-provenance checks.
+#[test]
+#[ignore = "two real nodes and the public agent doctor; run in release"]
+fn the_doctor_explains_incompatible_claim_rules() {
+    watchdog::arm();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("APPARATUS: doctor runtime");
+    let temporary = tempfile::tempdir().expect("APPARATUS: doctor profiles");
+    let room = runtime.block_on(support::room(temporary.path(), &["alice", "bob"]));
+    let (alice, bob) = (&room.workers[0], &room.workers[1]);
+    let home = Home {
+        root: temporary.path().join("doctor-home"),
+    };
+    std::fs::create_dir_all(&home.root).expect("APPARATUS: private doctor home");
+    let hello = r#"{"v":1,"type":"hello","from":"old-alice","body":"MISSING-CLAIM-RULES","data":{"vox":"0.0.1"}}"#;
+    runtime.block_on(support::post_raw(alice, room.cid, hello));
+    until(
+        bob,
+        None,
+        "the old package-only hello to arrive",
+        &["room", "read", &room.id],
+        |out| out.ok && out.stdout.contains("MISSING-CLAIM-RULES"),
+    );
+    let (out, report) = doctor(bob, &home, &room.id);
+    println!("claim-rules doctor: {out:?}");
+    let version = check(&report, "version ");
+    assert!(version["status"] == "warn"
+        && version["detail"].as_str().is_some_and(|text| text.contains("no claim-rules number"))
+        && version["fix"].as_str().is_some_and(|text| text.contains("claim rules")),
+        "PRODUCT: an unstamped worker must be refused with claim-rules advice, not package-version advice: {version}");
 }
