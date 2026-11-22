@@ -44,9 +44,9 @@
 //! room, each read showing carol's control line or `CANNOT MEASURE`. A pairwise key from an
 //! untrusted author is refused (M3), not saved for a later trust. With alice offline when bob
 //! trusts her, none of her pre-rotation posts opens. A sealed key-package in the room's log is
-//! instead held until trust and taken then (M5): post-rotation posts may open at trust only
-//! with alice's own evidence that she could not reach bob and sent the key through the log.
-//! Before that,
+//! instead held until trust and taken then (M5): post-rotation posts may open at trust only in a
+//! room where alice's daemon reported, after the rotation, that her key for bob went into that
+//! room's log (M7). Before that,
 //! alice's key changes: she removes carol from her ring and trusts her again, which rotates her
 //! sender key, so every post so far sits under a **retired** generation, and she posts once more
 //! under the new one (carol renders it, or `CANNOT MEASURE`). Bob and dave are away across the
@@ -58,8 +58,8 @@
 //! generation included, in both rooms.
 //!
 //!
-//! **Nor by the log.** Dave trusts bob while bob's daemon is stopped: dave's node says it could
-//! not reach bob (else APPARATUS), so his key goes to bob as a key-package in the room's log.
+//! **Nor by the log.** Dave trusts bob while bob's daemon is stopped: dave's node must say that
+//! his key for bob went into each room's log (M7), so it goes to bob as a key-package there.
 //! Dave posts (alice renders it, or `PRODUCT (staging)`); bob comes back (he renders a new post of
 //! carol's); after 10 s more bob's read and his drain show **0** of dave's posts. Then bob trusts
 //! dave, and within 120 s renders them: the key was held, not lost.
@@ -81,6 +81,10 @@
 //!   `owe_history` loop removed from `ChannelState::rotate_sender_to` in
 //!   `crates/vox-core/src/node/channel.rs`. Alice's next prune deletes it, and dave never renders
 //!   the posts under it.
+//! - M7: the log delivery not narrated — the `net.manager().note` removed from
+//!   `note_key_package_posted` in `crates/vox-core/src/node/actor.rs`. Dave's report of his key
+//!   for bob going into each room's log never comes; where alice's key reached bob by the log,
+//!   her posts that bob opens at his trust are accounted for by no delivery she reported.
 #![cfg(unix)]
 
 #[path = "support/typed.rs"]
@@ -662,10 +666,11 @@ fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
         );
     }
 
-    // Pairwise keys were refused before storage. A log package is retained until trust.
-    // A log re-key can also carry history (consent_release.rs:1312–1330): if an unmutated
-    // run ever opens pre-rotation posts with log evidence, scope the count by the history
-    // alice put in that package, rather than assuming generation alone proves its path.
+    // Pairwise keys were refused before storage. A log package is retained until trust, and
+    // alice's daemon says so when her key for bob goes into a room's log, whichever prekey the
+    // package names. A log re-key can also carry history (consent_release.rs:1312–1330): if an
+    // unmutated run ever opens pre-rotation posts with that evidence, scope the count by the
+    // history alice put in that package, rather than assuming generation alone proves its path.
     let tmp_path = tmp.path().to_owned();
     let mut alice = alice;
     alice.daemon = None;
@@ -675,15 +680,24 @@ fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
         .get(before_rotation..)
         .expect("APPARATUS: alice's daemon output was truncated across rotation");
     let bob_short: String = bob.fp.chars().take(26).collect();
-    let reach_refusal = format!("could not reach {bob_short}");
-    let log_evidence: Vec<&str> = after_rotation
-        .lines()
-        .filter(|line| line.contains(&reach_refusal))
-        .collect();
-    eprintln!("[proof] alice's post-rotation log-key evidence for bob: {log_evidence:?}");
+    let to_log = |room: &str| -> Vec<String> {
+        let room_short: String = room.chars().take(12).collect();
+        after_rotation
+            .lines()
+            .filter(|line| {
+                line.contains(&format!("connection to {bob_short}"))
+                    && line.contains(&format!(
+                        "your key for it in room {room_short} went into the room's log"
+                    ))
+            })
+            .map(str::to_owned)
+            .collect()
+    };
     bob.trust(&alice);
     std::thread::sleep(Duration::from_secs(10));
     for (name, room, _) in &alice_posted {
+        let log_evidence = to_log(room);
+        eprintln!("[proof] room {name}: alice's post-rotation report of her key for bob going into the room's log: {log_evidence:?}");
         let (ok, seen, e) = bob.vox(&["room", "read", room], None);
         assert!(
             ok && seen.contains(&format!("CAROL-TO-BOB-IN-{name}")),
@@ -701,12 +715,12 @@ fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
         assert!(
             after == 0 || !log_evidence.is_empty(),
             "PRODUCT: bob renders {after} of alice's post-rotation posts in room {name}, with her \
-             offline, the moment he trusted her, but alice never reported that she could not \
-             reach bob after rotation: no log-key delivery accounts for them"
+             offline, the moment he trusted her, but alice never reported that her key for bob \
+             in that room went into the room's log: no delivery she made accounts for them"
         );
         eprintln!(
             "[proof] room {name}: bob opens {n} pre-rotation and {after} post-rotation posts at \
-             trust with alice offline; log delivery reported: {}",
+             trust with alice offline; alice reported a log delivery to him there: {}",
             !log_evidence.is_empty()
         );
     }
@@ -760,15 +774,28 @@ fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
     // Dave's daemon since it came back after alice's rotation.
     let dave_log = tmp_path.join("dave.daemon-after-rotation.err");
     let bob_short: String = bob.fp.chars().take(26).collect();
+    let rooms_short: Vec<String> = alice_posted
+        .iter()
+        .map(|(_, room, _)| room.chars().take(12).collect())
+        .collect();
     assert!(
         until(
-            "dave's node says it could not reach bob",
+            "dave's node says his key for bob went into each room's log",
             Duration::from_secs(120),
-            || std::fs::read_to_string(&dave_log)
-                .is_ok_and(|t| t.contains(&format!("could not reach {bob_short}")))
+            || std::fs::read_to_string(&dave_log).is_ok_and(|t| {
+                rooms_short.iter().all(|room| {
+                    t.lines().any(|l| {
+                        l.contains(&format!("connection to {bob_short}"))
+                            && l.contains(&format!(
+                                "your key for it in room {room} went into the room's log"
+                            ))
+                    })
+                })
+            })
         ),
-        "APPARATUS: staging not achieved: within 120 s of trusting bob, dave's node never said it \
-         could not reach him, so his key may not have gone by the log"
+        "PRODUCT: dave trusted bob while bob was away, and within 120 s dave's node never said \
+         that his key for bob went into each room's log, so no delivery dave reported accounts \
+         for the key bob takes later"
     );
     for (name, room, _) in &alice_posted {
         let line = format!("DAVE-BY-LOG-IN-{name}");

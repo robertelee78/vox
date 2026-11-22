@@ -390,6 +390,30 @@ pub async fn pull(
     list: &[Listed],
     prior: &BTreeMap<String, String>,
 ) -> Result<Pulled, (String, Pulled)> {
+    pull_inner(bound, dir, list, prior, None).await
+}
+
+/// Pull a folder into a profile that must still be the one originally opened.
+///
+/// # Errors
+/// Why the pull stopped, with the files already placed.
+pub async fn pull_profile(
+    bound: SocketAddr,
+    dir: &Path,
+    list: &[Listed],
+    prior: &BTreeMap<String, String>,
+    paths: &crate::node::paths::Paths,
+) -> Result<Pulled, (String, Pulled)> {
+    pull_inner(bound, dir, list, prior, Some(paths)).await
+}
+
+async fn pull_inner(
+    bound: SocketAddr,
+    dir: &Path,
+    list: &[Listed],
+    prior: &BTreeMap<String, String>,
+    paths: Option<&crate::node::paths::Paths>,
+) -> Result<Pulled, (String, Pulled)> {
     let mut done = Pulled::default();
     if let Err(e) = check(list) {
         return Err((e, done));
@@ -426,6 +450,11 @@ pub async fn pull(
         let Some(parent) = target.parent() else {
             return fail("no folder to put it in".into(), done);
         };
+        if let Some(paths) = paths {
+            if let Err(e) = paths.verify_profile() {
+                return fail(e.to_string(), done);
+            }
+        }
         if let Err(e) = make_parents(dir, parent) {
             return fail(e, done);
         }
@@ -438,6 +467,11 @@ pub async fn pull(
         }
         let part = parent.join(format!(".{name}.{}.part", hex(&nonce)));
         let got = fetch(bound, &url_path(&f.path), &part, f.size, &f.sha256).await;
+        if let Some(paths) = paths {
+            if let Err(e) = paths.verify_profile() {
+                return fail(e.to_string(), done);
+            }
+        }
         let placed = got.and_then(|()| {
             std::fs::rename(&part, &target).map_err(|e| format!("putting it in place: {e}"))
         });

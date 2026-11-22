@@ -544,3 +544,142 @@ fn claims_use_their_rules_and_keep_the_v0430_package_stamp() {
         "PRODUCT: the v0.4.30 package-stamped claim must remain held: {board}"
     );
 }
+
+#[test]
+#[ignore = "on-demand proof with two networked nodes and production Argon2id; run in release"]
+fn legacy_claim_retry_survives_package_stamp_change() {
+    watchdog::arm();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("APPARATUS: cannot build runtime");
+    let tmp = tempfile::tempdir().expect("APPARATUS: cannot make scratch directory");
+    let room = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
+    let (alice, bob) = (&room.workers[0], &room.workers[1]);
+    let r = room.id.as_str();
+    support::register_sending_session(alice, r, "a1");
+
+    let legacy = serde_json::json!({
+        "v": 1, "type": "claim", "from": "a1", "body": "claiming",
+        "data": {"resource": "legacy-retry", "op": "legacy-retry-01", "vox": "0.4.30"}
+    });
+    rt.block_on(post_raw(alice, room.cid, &legacy.to_string()));
+    let before = until(
+        bob,
+        None,
+        "the legacy claim to reach bob",
+        &["room", "read", r, "--json"],
+        |out| {
+            out.ok
+                && out
+                    .ndjson()
+                    .iter()
+                    .any(|row| row["envelope"]["data"]["op"] == "legacy-retry-01")
+        },
+    );
+    let original = before
+        .ndjson()
+        .iter()
+        .find(|row| row["envelope"]["data"]["op"] == "legacy-retry-01")
+        .and_then(|row| row["entry_hash"].as_str().map(str::to_owned))
+        .expect("APPARATUS: the legacy claim has no entry hash");
+    let retry = alice.vox(
+        Some("a1"),
+        &[
+            "room",
+            "claim",
+            r,
+            "legacy-retry",
+            "--op",
+            "legacy-retry-01",
+            "--json",
+        ],
+    );
+    assert!(
+        retry.ok,
+        "PRODUCT: retry of the v0.4.30 claim was refused: {retry:?}"
+    );
+    let result = retry.json();
+    assert!(
+        result["status"] == "already-posted" && result["entry_hash"] == original,
+        "PRODUCT: retry must return the original claim without posting again: {retry:?}"
+    );
+    let read = alice.vox(None, &["room", "read", r, "--json"]);
+    assert!(
+        read.ok
+            && read
+                .ndjson()
+                .iter()
+                .filter(|row| row["envelope"]["data"]["op"] == "legacy-retry-01")
+                .count()
+                == 1,
+        "PRODUCT: retry must leave exactly one claim: {read:?}"
+    );
+
+    // A concurrent retry may already have been posted before either lookup.
+    let duplicate = serde_json::json!({
+        "v": 1, "type": "claim", "from": "a1", "body": "claiming again",
+        "data": {"resource": "legacy-retry", "op": "legacy-retry-01", "vox": "9.9.9", "claims": RULES}
+    });
+    rt.block_on(post_raw(alice, room.cid, &duplicate.to_string()));
+    let board = until(
+        bob,
+        None,
+        "the concurrent retry to reach bob",
+        &["room", "read", r, "--json"],
+        |out| {
+            out.ok
+                && out
+                    .ndjson()
+                    .iter()
+                    .filter(|row| row["envelope"]["data"]["op"] == "legacy-retry-01")
+                    .count()
+                    == 2
+        },
+    );
+    assert!(
+        board
+            .ndjson()
+            .iter()
+            .any(|row| row["op"]["id"] == "legacy-retry-01" && row["op"]["status"] == "duplicate"),
+        "PRODUCT: matching retries must be marked duplicate, not conflicting: {board:?}"
+    );
+    let board = bob.vox(None, &["room", "board", r, "--json"]);
+    assert!(
+        board.ok
+            && resource(&board.json(), "legacy-retry").is_some_and(|row| row["state"] == "held"),
+        "PRODUCT: the matching retries must leave the claim held: {board:?}"
+    );
+
+    let foreign = serde_json::json!({
+        "v": 1, "type": "claim", "from": "a1", "body": "foreign rules",
+        "data": {"resource": "foreign-retry", "op": "foreign-retry-01", "vox": "0.4.30", "claims": another_rules_number()}
+    });
+    rt.block_on(post_raw(alice, room.cid, &foreign.to_string()));
+    let read = alice.vox(None, &["room", "read", r, "--json"]);
+    assert!(
+        read.ok
+            && read
+                .ndjson()
+                .iter()
+                .any(|row| row["envelope"]["data"]["op"] == "foreign-retry-01"),
+        "APPARATUS: foreign-rules claim not staged: {read:?}"
+    );
+    let refused = alice.vox(
+        Some("a1"),
+        &[
+            "room",
+            "claim",
+            r,
+            "foreign-retry",
+            "--op",
+            "foreign-retry-01",
+            "--json",
+        ],
+    );
+    assert!(
+        refused.code == Some(4) && refused.stderr.contains("conflicts"),
+        "PRODUCT: the same op under different claim rules must still be refused: {refused:?}"
+    );
+}

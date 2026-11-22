@@ -34,6 +34,18 @@ use release_server::{serve, Server};
 #[path = "support/attach.rs"]
 mod unlock_staging;
 
+#[cfg(target_os = "linux")]
+#[path = "support/dead_candidate.rs"]
+mod dead_candidate;
+
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(
+    the_linux_release_asset_installs_only_where_it_runs,
+    the_linux_release_installer_refuses_below_its_floor,
+    the_linux_release_installer_names_a_missing_loader,
+);
+
 use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -311,7 +323,8 @@ fn run_installer_env(
         .map_or(SYSTEM_PATH.to_owned(), |(_, v)| {
             format!("{v}:{SYSTEM_PATH}")
         });
-    let out = Command::new("sh")
+    let mut command = Command::new("sh");
+    command
         .arg(install_sh())
         .env_clear()
         .env("HOME", home)
@@ -326,9 +339,17 @@ fn run_installer_env(
         .env("VOX_INSTALL_DIR", home.join("bin"))
         .env("VOX_CHANNEL", channel)
         .envs(extra.iter().copied().filter(|(k, _)| *k != "PATH"))
-        .env("PATH", path)
-        .output()
-        .staged();
+        .env("PATH", path);
+    #[cfg(target_os = "linux")]
+    let out = {
+        let (out, timely, leaked) = dead_candidate::bounded(&mut command);
+        if !timely || !leaked.is_empty() {
+            return (false, format!("PRODUCT: installer did not return within 40 seconds or left sleep children running: timely={timely}, leaked={leaked:?}; {}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)));
+        }
+        out
+    };
+    #[cfg(not(target_os = "linux"))]
+    let out = command.output().staged();
     (
         out.status.success(),
         format!(
@@ -350,6 +371,11 @@ fn install_sh_installs_what_it_verified_and_refuses_what_it_could_not() {
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty())
         .collect();
+    if cfg!(all(target_os = "linux", not(target_arch = "x86_64"))) {
+        claims.push(blocked("install.linux_candidate_arms", "CANNOT MEASURE: ADR-051's Linux arms run as x86_64 in an emulated container; this is aarch64"));
+        report(&claims, &receipts, &[]);
+        return;
+    }
 
     let tree = tempfile::tempdir().staged();
     release_tree(tree.path(), "stable", &|_| {});
@@ -838,7 +864,7 @@ fn install_sh_installs_what_it_verified_and_refuses_what_it_could_not() {
         }
     }
 
-    // Linux retains its existing read-only partial cleanup behavior.
+    // A rerun removes both the old fixed partial and a dead per-invocation owner's partial.
     if cfg!(target_os = "linux") {
         use std::os::unix::fs::PermissionsExt as _;
         let tmp = tempfile::tempdir().staged();
@@ -846,7 +872,15 @@ fn install_sh_installs_what_it_verified_and_refuses_what_it_could_not() {
         let bin = home.join("bin");
         let (first, said_first) = run_installer(&server, home, "stable");
         if first {
-            for leftover in [".vox-candidate.partial", ".vox-previous"] {
+            let mut dead = Command::new("sh").args(["-c", "exit 0"]).spawn().staged();
+            let dead_pid = dead.id();
+            dead.wait().staged();
+            let dead_partial = format!(".vox-candidate.{dead_pid}.dead00");
+            for leftover in [
+                ".vox-candidate.partial",
+                dead_partial.as_str(),
+                ".vox-previous",
+            ] {
                 std::fs::write(bin.join(leftover), b"cut short").staged();
                 std::fs::set_permissions(
                     bin.join(leftover),
@@ -862,7 +896,7 @@ fn install_sh_installs_what_it_verified_and_refuses_what_it_could_not() {
                 .staged()
                 .filter_map(Result::ok)
                 .map(|e| e.file_name().to_string_lossy().into_owned())
-                .filter(|n| n.ends_with(".partial"))
+                .filter(|n| n.starts_with(".vox-candidate."))
                 .collect();
             claims.push(claim(
                 "install.reruns_after_a_cut_short_run",
@@ -877,6 +911,8 @@ fn install_sh_installs_what_it_verified_and_refuses_what_it_could_not() {
             ));
         }
     }
+    #[cfg(target_os = "linux")]
+    linux_candidate_claims(&mut claims);
 
     // ---- macOS: the app lands where the person can open it, and vox is a link into it ----
     if cfg!(target_os = "macos") {
@@ -1246,6 +1282,579 @@ fn install_sh_installs_what_it_verified_and_refuses_what_it_could_not() {
     }
 
     report(&claims, &receipts, &allowed);
+}
+
+#[cfg(target_os = "linux")]
+fn linux_candidate_claims(claims: &mut Vec<Claim>) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let tree = tempfile::tempdir().staged();
+    release_tree(tree.path(), "stable", &|_| {});
+    let server =
+        serve(tree.path()).unwrap_or_else(|why| panic!("APPARATUS: Linux candidate server: {why}"));
+    let inputs = tempfile::tempdir().staged();
+    let dead = inputs.path().join("dead");
+    let need = dead_candidate::stage(Path::new(VOX), &dead);
+    let home = tempfile::tempdir().staged();
+    let (ok, text) = run_installer(&server, home.path(), "stable");
+    assert!(ok, "APPARATUS: existing install for refusal arms: {text}");
+    let bin = home.path().join("bin");
+    std::fs::write(bin.join(".vox-previous"), "cut short").staged();
+    let active = std::fs::read(bin.join("vox")).staged();
+    let marker = std::fs::read(marker_path(home.path())).staged();
+    let no_partials = |bin: &Path| {
+        std::fs::read_dir(bin)
+            .staged()
+            .filter_map(Result::ok)
+            .all(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                !name.ends_with(".partial")
+                    && !name.starts_with(".vox-candidate.")
+                    && !name.starts_with(".vox-previous.")
+            })
+    };
+    release_tree_of(tree.path(), "stable", SERVED, &dead, &|_| {});
+    let (ok, text) = run_installer(&server, home.path(), "stable");
+    let preserved = std::fs::read(bin.join("vox")).unwrap_or_default() == active
+        && std::fs::read(marker_path(home.path())).unwrap_or_default() == marker
+        && std::fs::read(bin.join(".vox-previous")).unwrap_or_default() == b"cut short"
+        && no_partials(&bin);
+    claims.push(claim(
+        "install.keeps_the_previous_when_the_candidate_does_not_run",
+        !ok && preserved,
+        format!(
+            "exit_ok={ok}, active/previous/marker preserved and no partials={preserved}; {text}"
+        ),
+    ));
+    claims.push(claim(
+        "install.refuses_a_candidate_that_does_not_run",
+        !ok && text.contains(&format!("version `{need}' not found"))
+            && text.contains(&format!(
+                "needs glibc {}",
+                need.trim_start_matches("GLIBC_")
+            ))
+            && text.contains("defect in Vox, not in this machine")
+            && text.contains("nothing was changed:")
+            && text.contains(&format!("is still vox {SERVED}.")),
+        text,
+    ));
+    let empty = tempfile::tempdir().staged();
+    let (ok, text) = run_installer(&server, empty.path(), "stable");
+    claims.push(claim(
+        "install.refuses_a_candidate_that_does_not_run_on_first_install",
+        !ok && std::fs::read_dir(empty.path().join("bin"))
+            .staged()
+            .next()
+            .is_none()
+            && text.trim_end().ends_with("nothing was installed."),
+        text,
+    ));
+
+    release_tree(tree.path(), "stable", &|_| {});
+    let shim = inputs.path().join("shim");
+    std::fs::create_dir(&shim).staged();
+    std::fs::write(shim.join("getconf"), "#!/bin/sh\nprintf 'glibc 2.27\\n'\n").staged();
+    std::fs::set_permissions(shim.join("getconf"), std::fs::Permissions::from_mode(0o755)).staged();
+    let empty = tempfile::tempdir().staged();
+    std::fs::write(
+        empty.path().join(".zshrc"),
+        "export VOX_PROOF_USER_LINE=kept\n",
+    )
+    .staged();
+    let before = server.requests();
+    let (ok, text) = run_installer_env(
+        &server,
+        empty.path(),
+        "stable",
+        &[("PATH", shim.to_str().staged())],
+    );
+    let expected = "vox install: this Linux is not supported: Vox needs glibc 2.28 or newer (Ubuntu 20.04, Debian 10, RHEL 8 and newer), and this system has glibc 2.27. Nothing was downloaded or installed.\n";
+    claims.push(claim(
+        "install.refuses_an_old_glibc_before_downloading",
+        !ok && text == expected
+            && server.requests() == before
+            && ["bin", "data", "config"]
+                .iter()
+                .all(|path| !empty.path().join(path).exists())
+            && std::fs::read_to_string(empty.path().join(".zshrc")).staged()
+                == "export VOX_PROOF_USER_LINE=kept\n",
+        format!("requests={}; {text}", server.requests() - before),
+    ));
+
+    for (id, script, wanted) in [
+        (
+            "install.stops_a_candidate_that_does_not_answer",
+            "#!/bin/sh\necho starting >&2\ntrap '' TERM; exec sleep 600\n",
+            "did not answer `--version` within 20 seconds and was stopped. Before that it said:",
+        ),
+        (
+            "install.says_what_an_unexplained_candidate_said",
+            "#!/bin/sh\necho 'boom: no such table' >&2\nexit 3\n",
+            "the cause is not one this installer can name",
+        ),
+    ] {
+        // A baseline may have replaced the first install with the dead candidate.
+        release_tree(tree.path(), "stable", &|_| {});
+        let (ok, text) = run_installer(&server, home.path(), "stable");
+        assert!(ok, "APPARATUS: restore working install before {id}: {text}");
+        let fixture = inputs.path().join("script");
+        std::fs::write(&fixture, script).staged();
+        release_tree_of(tree.path(), "stable", SERVED, &fixture, &|_| {});
+        let (ok, text) = run_installer(&server, home.path(), "stable");
+        let said = if id.contains("stops") {
+            "  starting"
+        } else {
+            "  boom: no such table"
+        };
+        claims.push(claim(
+            id,
+            !ok && text.contains(wanted)
+                && text.contains(said)
+                && text.contains("nothing was changed:")
+                && text.contains(&format!("is still vox {SERVED}."))
+                && !text.contains("did not return within 40 seconds")
+                && !text.contains("needs glibc 2.28")
+                && no_partials(&bin)
+                && std::fs::read(bin.join("vox")).unwrap_or_default() == active,
+            text,
+        ));
+    }
+    release_tree(tree.path(), "stable", &|_| {});
+    let stdin_fixture = inputs.path().join("stdin-candidate");
+    std::fs::write(&stdin_fixture, format!(
+        "#!/bin/sh\nif read line; then echo 'candidate consumed installer stdin' >&2; exit 1; fi\nprintf 'vox {}\\n'\n", SERVED
+    )).staged();
+    release_tree_of(tree.path(), "stable", SERVED, &stdin_fixture, &|_| {});
+    let mut piped_command = Command::new("sh");
+    piped_command
+        .arg(install_sh())
+        .env_clear()
+        .env("HOME", home.path())
+        .env("PATH", SYSTEM_PATH)
+        .env("VOX_DATA_DIR", home.path().join("data"))
+        .env("VOX_CONFIG_DIR", home.path().join("config"))
+        .env("VOX_RELEASE_BASE", &server.base)
+        .env("VOX_INSTALL_DIR", &bin)
+        .env("VOX_NO_SHELL_SETUP", "1")
+        .env("VOX_NO_SKILL_INSTALL", "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut piped = piped_command
+        .spawn()
+        .expect("APPARATUS: launch installer with piped stdin");
+    writeln!(
+        piped.stdin.take().expect("APPARATUS: installer stdin"),
+        "installer input"
+    )
+    .staged();
+    let piped = piped
+        .wait_with_output()
+        .expect("APPARATUS: collect piped installer");
+    let piped_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&piped.stdout),
+        String::from_utf8_lossy(&piped.stderr)
+    );
+    claims.push(claim(
+        "install.candidate_does_not_consume_installer_input",
+        piped.status.success() && !piped_text.contains("candidate consumed installer stdin"),
+        format!("exit={}; {piped_text}", piped.status),
+    ));
+    // Two real installers publish different checked bytes to the same directory.
+    let first = inputs.path().join("first-candidate");
+    let second = inputs.path().join("second-candidate");
+    let ready_pipe = inputs.path().join("candidate-ready");
+    let release_pipe = inputs.path().join("candidate-release");
+    for pipe in [&ready_pipe, &release_pipe] {
+        let status = Command::new("mkfifo").arg(pipe).status().staged();
+        assert!(status.success(), "APPARATUS: create installer hold pipe");
+    }
+    let done = inputs.path().join("first-checked");
+    let first_script = format!(
+        "#!/bin/sh\nif [ ! -e '{}' ]; then printf 'ready\\n' > '{}'; read ignored < '{}'; : > '{}'; fi\nprintf 'vox {}\\n'\n",
+        done.display(), ready_pipe.display(), release_pipe.display(), done.display(), SERVED
+    );
+    let second_script = format!(
+        "#!/bin/sh\n# second candidate\nprintf 'vox {}\\n'\n",
+        SERVED
+    );
+    std::fs::write(&first, &first_script).staged();
+    std::fs::write(&second, &second_script).staged();
+    release_tree_of(tree.path(), "stable", SERVED, &first, &|_| {});
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let ready = ready_pipe.clone();
+    std::thread::spawn(move || {
+        use std::io::BufRead as _;
+        let result = std::fs::File::open(ready).and_then(|file| {
+            let mut line = String::new();
+            std::io::BufReader::new(file).read_line(&mut line)?;
+            Ok(line)
+        });
+        let _ = ready_tx.send(result);
+    });
+    let (a, b) = std::thread::scope(|scope| {
+        let first_run = scope.spawn(|| run_installer(&server, home.path(), "stable"));
+        let ready = ready_rx.recv_timeout(std::time::Duration::from_secs(30));
+        assert!(
+            matches!(&ready, Ok(Ok(line)) if line == "ready\n"),
+            "APPARATUS: first installer did not reach its candidate check: {ready:?}"
+        );
+        let held: Vec<PathBuf> = std::fs::read_dir(&bin)
+            .staged()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".vox-candidate.")
+            })
+            .map(|entry| entry.path())
+            .collect();
+        assert_eq!(
+            held.len(),
+            1,
+            "APPARATUS: expected one held installer candidate: {held:?}"
+        );
+        let mut dead = Command::new("sh").args(["-c", "exit 0"]).spawn().staged();
+        let dead_pid = dead.id();
+        dead.wait().staged();
+        let stale = bin.join(format!(".vox-candidate.{dead_pid}.dead00"));
+        let legacy = bin.join(".vox-candidate.partial");
+        std::fs::write(&stale, b"cut short").staged();
+        std::fs::write(&legacy, b"cut short").staged();
+        release_tree_of(tree.path(), "stable", SERVED, &second, &|_| {});
+        let second_run = run_installer(&server, home.path(), "stable");
+        claims.push(claim(
+            "install.rerun_cleans_dead_partials_but_keeps_a_live_install",
+            second_run.0 && held[0].exists() && !stale.exists() && !legacy.exists(),
+            format!("second={second_run:?}; live partial kept={}; dead partial retained={}; legacy partial retained={}",
+                held[0].exists(), stale.exists(), legacy.exists()),
+        ));
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut release = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(nix::libc::O_NONBLOCK)
+            .open(&release_pipe)
+            .expect("APPARATUS: first installer left its check before release");
+        writeln!(release, "continue").staged();
+        (
+            first_run.join().expect("APPARATUS: first installer thread"),
+            second_run,
+        )
+    });
+    let installed = std::fs::read(bin.join("vox")).unwrap_or_default();
+    claims.push(claim(
+        "install.concurrent_checks_publish_their_own_candidate",
+        a.0 && b.0 && installed == first_script.as_bytes(),
+        format!(
+            "first={:?}; second={:?}; installed_first={}",
+            a,
+            b,
+            installed == first_script.as_bytes()
+        ),
+    ));
+    release_tree(tree.path(), "stable", &|_| {});
+    // Only the uid is staged. The value is the real kernel readback, never a product hook.
+    std::fs::remove_file(shim.join("getconf")).staged();
+    std::fs::write(shim.join("id"), "#!/bin/sh\nprintf '1000\\n'\n").staged();
+    std::fs::set_permissions(shim.join("id"), std::fs::Permissions::from_mode(0o755)).staged();
+    let cap = std::fs::read_to_string("/proc/sys/net/core/rmem_max")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    let (ok, text) = run_installer_env(
+        &server,
+        home.path(),
+        "stable",
+        &[("PATH", shim.to_str().staged())],
+    );
+    let commands = text.contains("sysctl -w net.core.rmem_max=4194304")
+        && text.contains("echo 'net.core.rmem_max = 4194304' > /etc/sysctl.d/90-vox.conf");
+    let expected = match cap {
+        Some(value) if value >= 4_194_304 => !commands,
+        Some(value) => commands && text.contains(&format!("at {value} bytes")),
+        None => commands && text.contains("an unknown number of bytes"),
+    };
+    claims.push(claim(
+        "install.non_root_reports_the_actual_receive_buffer",
+        ok && expected,
+        text,
+    ));
+    if std::env::var_os("VOX_PROOF_ROOT_SYSCTL").as_deref() == Some(std::ffi::OsStr::new("1")) {
+        assert!(
+            Path::new("/run/.containerenv").exists() || Path::new("/.dockerenv").exists(),
+            "APPARATUS: root sysctl scene requires a disposable container"
+        );
+        let uid = Command::new("/usr/bin/id").arg("-u").output().staged();
+        assert_eq!(
+            String::from_utf8_lossy(&uid.stdout).trim(),
+            "0",
+            "APPARATUS: root sysctl scene requires container root"
+        );
+        let before = std::fs::read_to_string("/proc/sys/net/core/rmem_max")
+            .expect("APPARATUS: container kernel receive buffer");
+        let value: u64 = before
+            .trim()
+            .parse()
+            .expect("APPARATUS: numeric receive buffer");
+        assert!(
+            value < 4_194_304,
+            "APPARATUS: container receive buffer already meets the target"
+        );
+        let (ok, text) = run_installer(&server, home.path(), "stable");
+        let after = std::fs::read_to_string("/proc/sys/net/core/rmem_max")
+            .expect("APPARATUS: container kernel readback");
+        let actual: u64 = after.trim().parse().expect("APPARATUS: numeric readback");
+        let persisted = std::fs::read_to_string("/etc/sysctl.d/90-vox.conf").unwrap_or_default();
+        claims.push(claim(
+            "install.root_reports_refused_receive_buffer",
+            ok && actual < 4_194_304
+                && persisted == "net.core.rmem_max = 4194304\n"
+                && !text.contains("net.core.rmem_max: set to 4194304")
+                && text.contains(&format!("at {actual} bytes"))
+                && text.contains("sysctl -w net.core.rmem_max=4194304"),
+            format!("before={value} after={actual} persisted={persisted:?}; {text}"),
+        ));
+    }
+}
+
+/// ADR-051 asset arms (a), (b), (i), driven on the release's own installer and binary.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "optional: release assets and disposable x86_64 Linux containers"]
+fn the_linux_release_asset_installs_only_where_it_runs() {
+    linux_asset_claims(&[0, 1]);
+}
+
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "optional: release assets and disposable x86_64 Linux containers"]
+fn the_linux_release_installer_refuses_below_its_floor() {
+    linux_asset_claims(&[2, 3]);
+}
+
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "optional: release assets and disposable x86_64 Linux containers"]
+fn the_linux_release_installer_names_a_missing_loader() {
+    linux_asset_claims(&[4]);
+}
+
+#[cfg(feature = "optional-proofs")]
+fn linux_asset_claims(selected: &[usize]) {
+    use std::process::Stdio;
+    // `podman` with the operator's connection list and nothing else of the real HOME.
+    fn podman() -> Command {
+        let mut cmd = Command::new("podman");
+        watchdog::temp_home::real_podman(&mut cmd);
+        cmd
+    }
+    struct Container {
+        name: String,
+        image: String,
+        pulled: bool,
+        created: bool,
+    }
+    impl Drop for Container {
+        fn drop(&mut self) {
+            if self.created {
+                let _ = podman().args(["rm", "-f", &self.name]).status();
+            }
+            if self.created && self.pulled {
+                let _ = podman().args(["rmi", &self.image]).status();
+            }
+        }
+    }
+    struct Tunnel(Option<std::process::Child>);
+    impl Drop for Tunnel {
+        fn drop(&mut self) {
+            if let Some(child) = &mut self.0 {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+    watchdog::arm();
+    let dist = std::env::var_os("VOX_PROOF_DIST")
+        .map(PathBuf::from)
+        .expect("APPARATUS: set VOX_PROOF_DIST to the release asset directory");
+    let binary = dist.join("vox-x86_64-unknown-linux-gnu");
+    let installer = dist.join("install.sh");
+    let bytes = std::fs::read(&binary).staged();
+    let record: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(dist.join("stable-x86_64-unknown-linux-gnu.json")).staged(),
+    )
+    .staged();
+    let digest = sha256_hex(&bytes);
+    let digest_file =
+        std::fs::read_to_string(dist.join("vox-x86_64-unknown-linux-gnu.sha256")).staged();
+    assert!(
+        record["sha256"].as_str() == Some(digest.as_str())
+            && digest_file.split_whitespace().next() == Some(digest.as_str())
+            && record["size"].as_u64() == Some(bytes.len() as u64),
+        "APPARATUS: release asset, sha256 file and record disagree"
+    );
+    let version = record["version"]
+        .as_str()
+        .expect("APPARATUS: release version");
+    let tree = tempfile::tempdir().staged();
+    let assets = tree.path().join(format!("releases/download/v{version}"));
+    let records = tree.path().join("releases/latest/download");
+    std::fs::create_dir_all(&assets).staged();
+    std::fs::create_dir_all(&records).staged();
+    std::fs::write(assets.join("vox-x86_64-unknown-linux-gnu"), &bytes).staged();
+    std::fs::copy(
+        dist.join("stable-x86_64-unknown-linux-gnu.json"),
+        records.join("stable-x86_64-unknown-linux-gnu.json"),
+    )
+    .staged();
+    let server =
+        serve(tree.path()).unwrap_or_else(|why| panic!("APPARATUS: asset release server: {why}"));
+    // Remote Podman runs in a Linux VM, not in this host's loopback namespace. Forward this
+    // proof's one server port there; no real profile or home directory enters a container.
+    let connections = podman()
+        .args(["system", "connection", "list", "--format", "json"])
+        .output()
+        .staged();
+    assert!(
+        connections.status.success(),
+        "APPARATUS: Podman connection discovery failed"
+    );
+    let connections: Vec<serde_json::Value> = serde_json::from_slice(&connections.stdout).staged();
+    let mut tunnel = Tunnel(None);
+    if let Some(connection) = connections
+        .iter()
+        .find(|connection| connection["Default"] == true)
+    {
+        if let Some(uri) = connection["URI"]
+            .as_str()
+            .filter(|uri| uri.starts_with("ssh://"))
+        {
+            assert!(
+                connection["Name"] == "podman-machine-default",
+                "APPARATUS: only podman-machine-default is authorized for this proof"
+            );
+            let uri = reqwest::Url::parse(uri).staged();
+            let port = reqwest::Url::parse(&server.base).staged().port().staged();
+            let forward = format!("{port}:127.0.0.1:{port}");
+            let mut child = Command::new("ssh")
+                .args([
+                    "-F",
+                    "/dev/null",
+                    "-N",
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "StrictHostKeyChecking=no",
+                    "-o",
+                    "UserKnownHostsFile=/dev/null",
+                    "-o",
+                    "ExitOnForwardFailure=yes",
+                    "-i",
+                ])
+                .arg(connection["Identity"].as_str().staged())
+                .args(["-p", &uri.port().staged().to_string(), "-R", &forward])
+                .arg(format!("{}@{}", uri.username(), uri.host_str().staged()))
+                .stdin(Stdio::null())
+                .spawn()
+                .staged();
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            assert!(
+                child.try_wait().staged().is_none(),
+                "APPARATUS: release-server SSH forward failed"
+            );
+            tunnel.0 = Some(child);
+        }
+    }
+    let mut claims = Vec::new();
+    let receipts = BTreeMap::new();
+    for (index, id, image, packages, failing_getconf) in [
+        (0, "asset.install_on_floor", "docker.io/library/almalinux@sha256:768bedc30fe0a536adb0a65d2eddb7caad364e514fbddd0ae9e026975f590342",
+            "dnf install -y curl shadow-utils util-linux procps-ng; useradd -m -u 1000 user", false),
+        (1, "asset.install_above_floor", "docker.io/library/ubuntu@sha256:f64b2ffc2f10ab8f8505aa56b2664bd846cbb9df87c7e2532e30f7667021c0e6",
+            "apt-get update; DEBIAN_FRONTEND=noninteractive apt-get install -y curl passwd util-linux procps; useradd -m -u 1000 user", false),
+        (2, "asset.refuses_below_floor_before_downloading", "docker.io/library/ubuntu@sha256:152dc042452c496007f07ca9127571cb9c29697f42acbfad72324b2bb2e43c98",
+            "apt-get update; DEBIAN_FRONTEND=noninteractive apt-get install -y curl passwd util-linux; useradd -m -u 1000 user", false),
+        (3, "asset.refuses_below_floor_when_getconf_fails", "docker.io/library/ubuntu@sha256:152dc042452c496007f07ca9127571cb9c29697f42acbfad72324b2bb2e43c98",
+            "apt-get update; DEBIAN_FRONTEND=noninteractive apt-get install -y curl passwd util-linux; useradd -m -u 1000 user", true),
+        (4, "asset.names_the_missing_loader", "docker.io/library/alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc",
+            "apk add --no-cache curl shadow util-linux; useradd -m -u 1000 user", false),
+    ] {
+        if !selected.contains(&index) { continue; }
+        let pulled = !podman().args(["image", "exists", image]).status().staged().success();
+        let mut container = Container { name: format!("vox-rg11-assets-{}-{index}", std::process::id()), image: image.to_owned(), pulled, created: false };
+        let work = tempfile::tempdir().staged();
+        let entry = work.path().join("entry.sh");
+        let shim = if failing_getconf { "mkdir -p \"$HOME/shim\"; printf '#!/bin/sh\\nexit 1\\n' >\"$HOME/shim/getconf\"; chmod 755 \"$HOME/shim/getconf\"; export PATH=\"$HOME/shim:$PATH\"" } else { ":" };
+        std::fs::write(&entry, format!(r#"set -eu
+{packages}
+uname -m; cat /proc/version; getconf GNU_LIBC_VERSION || ldd --version || :
+if [ ! -e /lib64/ld-linux-x86-64.so.2 ]; then echo LOADER_ABSENT; fi
+cat >/user.sh <<'USER'
+export HOME=/home/user VOX_DATA_DIR=/home/user/data VOX_CONFIG_DIR=/home/user/config
+export VOX_PROXY=127.0.0.1:0 VOX_LISTEN=127.0.0.1:0
+export VOX_RELEASE_BASE='{base}' VOX_NO_SHELL_SETUP=1 VOX_NO_SKILL_INSTALL=1
+{shim}
+echo INSTALL_BEGIN
+sh /install.sh
+rc=$?
+echo INSTALL_EXIT=$rc
+if [ -e "$HOME/.local/bin" ]; then echo BIN_EXISTS; fi
+if [ -e "$HOME/.local/bin/vox" ]; then "$HOME/.local/bin/vox" --version; fi
+if [ "$rc" = 0 ]; then
+  "$HOME/.local/bin/vox" daemon --detach
+  pid=$(cat "$VOX_DATA_DIR/.daemon/lock")
+  echo "DAEMON_EXE=$(readlink /proc/$pid/exe)"
+  if tr '\000' '\n' <"/proc/$pid/cmdline" | grep -Fx "$HOME/.local/bin/vox" >/dev/null; then
+    echo "DAEMON_BINARY=$HOME/.local/bin/vox"
+  fi
+  "$HOME/.local/bin/vox" status
+  kill -TERM "$pid"
+fi
+find "$HOME/.local/bin" -mindepth 1 2>/dev/null | sed 's/^/LEFTOVER /'
+exit 0
+USER
+chmod 755 /user.sh
+su -s /bin/sh user -c /user.sh
+"#, base=server.base)).staged();
+        let created = podman().args(["create", "--platform", "linux/amd64",
+            "--cpus", "4", "--memory", "8g", "--network", "host", "--name", &container.name,
+            image, "/bin/sh", "/entry.sh"]).output().staged();
+        assert!(created.status.success(), "APPARATUS: create {image}: {}", String::from_utf8_lossy(&created.stderr));
+        container.created = true;
+        for (source, destination) in [(&entry, "/entry.sh"), (&installer, "/install.sh")] {
+            let out = podman().arg("cp").arg(source)
+                .arg(format!("{}:{destination}", container.name)).output().staged();
+            assert!(out.status.success(), "APPARATUS: copy container input: {}", String::from_utf8_lossy(&out.stderr));
+        }
+        let before = server.requests();
+        let started = std::time::Instant::now();
+        let out = podman().args(["start", "-a", &container.name]).output().staged();
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success() && text.contains("INSTALL_BEGIN"),
+            "APPARATUS: {id} did not reach the installer: {text}");
+        assert!(text.contains("\nx86_64\n"), "APPARATUS: {id} did not run as x86_64: {text}");
+        if index == 4 {
+            assert!(text.contains("LOADER_ABSENT"), "APPARATUS: Alpine's missing loader was not staged: {text}");
+        }
+        let fetched = server.requests() - before;
+        let ok = match index {
+            0 | 1 => text.contains("INSTALL_EXIT=0") && text.contains(&format!("vox {version}"))
+                && text.contains(&format!("installed: /home/user/.local/bin/vox (vox {version})"))
+                && text.contains("DAEMON_BINARY=/home/user/.local/bin/vox"),
+            2 => text.contains("INSTALL_EXIT=1") && fetched == 0
+                && text.contains("and this system has glibc 2.27. Nothing was downloaded or installed.")
+                && !text.contains("BIN_EXISTS") && !text.contains("LEFTOVER "),
+            3 => text.contains("INSTALL_EXIT=1") && text.contains("GLIBC_2.28' not found")
+                && text.contains("this system is older than that") && text.contains("nothing was installed.")
+                && !text.contains("LEFTOVER "),
+            _ => text.contains("LOADER_ABSENT") && text.contains("INSTALL_EXIT=1")
+                && text.contains("the program loader this build needs, /lib64/ld-linux-x86-64.so.2, is not on this system.")
+                && text.contains("nothing was installed.") && !text.contains("LEFTOVER "),
+        };
+        claims.push(claim(id, ok, format!("image={image}, wall={:?}, requests={fetched}; {text}", started.elapsed())));
+    }
+    report(&claims, &receipts, &[]);
 }
 
 /// The environment `vox uninstall` runs in: the scratch home, and a data root and config directory

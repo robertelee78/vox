@@ -19081,7 +19081,8 @@ impl Node {
         false
     }
 
-    /// Record the in-memory consequences of a package whose durable append already succeeded.
+    /// Record the in-memory consequences of a package whose durable append already succeeded,
+    /// and say once per posted key that it went through the room's log, whichever prekey it names.
     fn note_key_package_posted(
         &mut self,
         posted_as: (Digest32, Digest32, Digest32),
@@ -19096,7 +19097,18 @@ impl Node {
         {
             self.refused_otps.note(posted_as.1, prekey_id);
         }
-        self.packages_posted.insert(posted_as);
+        if self.packages_posted.insert(posted_as) {
+            if let Some(net) = self.net.as_ref() {
+                net.manager().note(
+                    posted_as.1,
+                    format!(
+                        "your key for it in room {} went into the room's log as a key package; it \
+                         takes the key from there",
+                        crate::node::network::short_id(posted_as.0)
+                    ),
+                );
+            }
+        }
     }
 
     fn key_package_work_ready(&self) -> bool {

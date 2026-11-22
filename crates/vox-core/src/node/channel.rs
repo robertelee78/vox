@@ -5706,7 +5706,7 @@ impl ChannelState {
         crate::node::retention::shortest(self.room_retention(), self.node_retention)
     }
 
-    /// Configured room policy for Session activity; defaults to seven days.
+    /// Configured room policy for Session activity; defaults to two days.
     pub fn room_step_retention(&self) -> u64 {
         self.governance_display.step_ttl_ms / 1_000
     }
