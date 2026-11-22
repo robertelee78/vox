@@ -191,6 +191,8 @@ pub(super) fn retain_accepted_join_native(
 
 /// A stored accepted room already owns its reopen keys. Finish its journal handoff so startup
 /// reopens it normally; an acceptance with no stored room still needs the joining passphrase.
+/// A room whose records do not agree is left as it was (closed, and `vox room leave` cancels
+/// it): one room's records must never stop the node from starting.
 pub(super) fn finish_saved_accepted_joins(
     store: &Store,
     signer: &VaultRootSigner,
@@ -204,14 +206,31 @@ pub(super) fn finish_saved_accepted_joins(
         let Some(join) = accepted.get(room) else {
             continue;
         };
-        if store.get_sek_wrap(room)?.as_ref() != Some(&join.wrap) {
-            return Err(Error::Profile("accepted join wrap changed"));
-        }
         let proposal = crate::node::joinstream::AdmissionProposal::from_body(&join.proposal)?;
-        let cleanup = unfinished
-            .get(room)
-            .ok_or(Error::Profile("accepted join cleanup missing"))?;
-        verify_join_rollback(cleanup, signer, *room, proposal.epoch)?;
+        let unfit = if store.get_sek_wrap(room)?.as_ref() != Some(&join.wrap) {
+            Some("its saved key is not the accepted join's")
+        } else {
+            match unfinished
+                .get(room)
+                .map(|cleanup| verified_join_rollback(cleanup, signer, *room))
+            {
+                None => Some("its cleanup record is missing"),
+                Some(Err(_)) => Some("its cleanup record does not verify"),
+                // A later publication of the room may have advanced the record's epoch.
+                Some(Ok(epoch)) if epoch < proposal.epoch => {
+                    Some("its cleanup record is older than the join")
+                }
+                Some(Ok(_)) => None,
+            }
+        };
+        if let Some(reason) = unfit {
+            eprintln!(
+                "vox node: room {} stays closed after its interrupted join: {reason}; \
+                 `vox room leave` cancels it",
+                crate::node::link::b32_encode(room)
+            );
+            continue;
+        }
         accepted.remove(room);
         unfinished.remove(room);
         changed = true;
@@ -2243,21 +2262,33 @@ fn add_rollback_route(pending: &mut PendingWithdrawal, board: Digest32, route: S
     }
 }
 
+/// The join's signed Member withdrawal for this room by this profile, and the epoch it names.
+fn verified_join_rollback(
+    cleanup: &PendingWithdrawal,
+    signer: &VaultRootSigner,
+    room: Digest32,
+) -> crate::error::Result<u64> {
+    let withdrawal = crate::nat::withdraw::BoardWithdraw::from_wire(&cleanup.wire)?;
+    if withdrawal.channel_id != room
+        || withdrawal.scope != crate::nat::withdraw::WithdrawScope::Member
+        || withdrawal.author_id != crate::identity::composite::RootSigner::fingerprint(signer)
+    {
+        return Err(Error::Profile("join rollback identity changed"));
+    }
+    withdrawal.verify(&crate::identity::composite::RootSigner::public_key(signer))?;
+    Ok(withdrawal.epoch)
+}
+
 fn verify_join_rollback(
     cleanup: &PendingWithdrawal,
     signer: &VaultRootSigner,
     room: Digest32,
     epoch: u64,
 ) -> crate::error::Result<()> {
-    let withdrawal = crate::nat::withdraw::BoardWithdraw::from_wire(&cleanup.wire)?;
-    if withdrawal.channel_id != room
-        || withdrawal.epoch != epoch
-        || withdrawal.scope != crate::nat::withdraw::WithdrawScope::Member
-        || withdrawal.author_id != crate::identity::composite::RootSigner::fingerprint(signer)
-    {
+    if verified_join_rollback(cleanup, signer, room)? != epoch {
         return Err(Error::Profile("join rollback identity changed"));
     }
-    withdrawal.verify(&crate::identity::composite::RootSigner::public_key(signer))
+    Ok(())
 }
 impl JournalWork {
     fn run(self, store: &Store, signer: &VaultRootSigner) -> crate::error::Result<JournalDelta> {
