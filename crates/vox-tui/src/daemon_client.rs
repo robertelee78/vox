@@ -71,9 +71,6 @@ pub async fn ensure_daemon(
         Err(e @ vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Root)) => {
             return Err(AppError::Usage(format!("{e}")))
         }
-        Err(e @ vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Version { .. })) => {
-            return Err(AppError::Usage(e.to_string()));
-        }
         Err(_) => {}
     }
     if restarting(account)? {
@@ -125,10 +122,7 @@ pub async fn ensure_daemon_for_hook(
             return Err(AppError::Core(e))
         }
         Ok(Err(
-            e @ vox_core::error::Error::Ipc(
-                vox_core::error::IpcHandshake::Version { .. }
-                | vox_core::error::IpcHandshake::Protocol { .. },
-            ),
+            e @ vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Protocol { .. }),
         )) => return Err(AppError::Core(e)),
         Ok(Err(_)) => {}
     }

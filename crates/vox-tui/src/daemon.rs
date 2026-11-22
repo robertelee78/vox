@@ -988,23 +988,15 @@ fn already_running(
     let answering = rt.block_on(async {
         let t0 = std::time::Instant::now();
         loop {
-            match DaemonClient::open(&socket).await {
-                Ok(_) => return Ok(true),
-                Err(
-                    e @ vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Version {
-                        ..
-                    }),
-                ) => {
-                    return Err(AppError::Usage(e.to_string()));
-                }
-                Err(_) => {}
+            if DaemonClient::open(&socket).await.is_ok() {
+                return true;
             }
             if t0.elapsed() >= crate::daemon_client::START_WITHIN {
-                return Ok(false);
+                return false;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-    })?;
+    });
     if !answering {
         if crate::daemon_client::restarting(account)? {
             return Err(AppError::Usage(format!(

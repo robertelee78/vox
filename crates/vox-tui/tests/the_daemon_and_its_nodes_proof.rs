@@ -299,6 +299,15 @@ impl Daemon {
     }
 }
 
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
 /// A room on `node`, made through the daemon that holds it: its id.
 fn make_room(a: &Account, node: &str) -> String {
     let (ok, out, err) = a.run(
@@ -320,6 +329,485 @@ fn make_room(a: &Account, node: &str) -> String {
     list.lines()
         .find_map(|l| l.split_whitespace().next().map(str::to_owned))
         .unwrap_or_else(|| panic!("APPARATUS: no room listed on {node}: {list}"))
+}
+
+/// The generated extension runs in a small native-event driver, using real hooks and watcher.
+/// Its notifications are exactly the strings OMP's UI receives.
+struct OmpConversation {
+    child: Child,
+    frames: std::sync::mpsc::Receiver<serde_json::Value>,
+    notices: Vec<String>,
+    trace: PathBuf,
+}
+
+impl OmpConversation {
+    fn start(a: &Account) -> Self {
+        let (ok, extension, err) = a.run(&["agent", "plugin", "omp", "--node", "agent"], "");
+        assert!(ok, "APPARATUS: generated native extension: {err}");
+        std::fs::write(a._tmp.path().join("extension.mjs"), extension).unwrap();
+        let wrapper = a._tmp.path().join("vox-traced");
+        std::fs::write(&wrapper, "#!/bin/bash\nset -o pipefail\nif [[ \"$1 $2\" == 'agent omp-watch' ]]; then\n  \"$VOX_PROOF_BINARY\" \"$@\" | tee -a \"$VOX_PROOF_WATCH_TRACE\"\nelse\n  exec \"$VOX_PROOF_BINARY\" \"$@\"\nfi\n").unwrap();
+        std::fs::set_permissions(
+            &wrapper,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .unwrap();
+        let trace = a._tmp.path().join("watcher.jsonl");
+        let driver = a._tmp.path().join("conversation.mjs");
+        std::fs::write(
+            &driver,
+            r#"
+import extension from "./extension.mjs";
+import { createInterface } from "node:readline";
+const events = new Map();
+const say = value => console.log(JSON.stringify(value));
+const pi = {
+  on: (name, handler) => events.set(name, handler),
+  getSessionName: () => "identity-proof",
+  sendMessage: () => {}, appendEntry: () => {}
+};
+const context = {
+  mode: "tui", agent: {kind: "main"}, cwd: process.cwd(),
+  isIdle: () => true,
+  getAsyncJobSnapshot: () => ({running: [], recent: []}),
+  sessionManager: {getSessionId: () => "identity-proof", getLeafId: () => null,
+    getBranch: () => [], getEntries: () => []},
+  ui: {notify: text => say({notice: text})}
+};
+extension(pi);
+await events.get("session_start")({}, context);
+say({started: true});
+for await (const line of createInterface({input: process.stdin})) {
+  if (line === "quit") {
+    await events.get("session_shutdown")();
+    process.exit(0);
+  }
+  await events.get("before_agent_start")({reason: "prompt"});
+  say({barrier: line});
+}
+"#,
+        )
+        .unwrap();
+        let environment = a.cmd(&[]);
+        let mut command = Command::new("node");
+        command.env_clear();
+        for (key, value) in environment.get_envs() {
+            if let Some(value) = value {
+                command.env(key, value);
+            }
+        }
+        let mut child = command
+            .arg(driver)
+            .env("VOX_BIN", wrapper)
+            .env("VOX_PROOF_BINARY", VOX)
+            .env("VOX_PROOF_WATCH_TRACE", &trace)
+            .env("VOX_TEST_WATCH_READY_INTERVAL_SECS", "1")
+            .current_dir(a._tmp.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("APPARATUS: native event driver (node)");
+        let stdout = child.stdout.take().unwrap();
+        let (tx, frames) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::BufRead as _;
+            for line in std::io::BufReader::new(stdout).lines() {
+                let line = line.expect("APPARATUS: native driver output");
+                let value = serde_json::from_str(&line)
+                    .unwrap_or_else(|_| panic!("APPARATUS: native driver said {line}"));
+                if tx.send(value).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut conversation = Self {
+            child,
+            frames,
+            notices: Vec::new(),
+            trace,
+        };
+        conversation.until(|frame| frame["started"] == true);
+        assert!(
+            wait_until(Duration::from_secs(30), || std::fs::read_to_string(
+                &conversation.trace
+            )
+            .unwrap_or_default()
+            .contains("\"type\":\"ready\"")),
+            "APPARATUS: conversation never observed its attached node"
+        );
+        assert!(
+            a.data
+                .join("nodes/agent/sessions/identity-proof.json")
+                .is_file(),
+            "APPARATUS: native conversation was not registered before the transition"
+        );
+        conversation
+    }
+
+    fn until(&mut self, done: impl Fn(&serde_json::Value) -> bool) {
+        loop {
+            let frame = self
+                .frames
+                .recv_timeout(Duration::from_secs(45))
+                .expect("APPARATUS: native event driver did not reach its requested observation");
+            if let Some(text) = frame["notice"].as_str() {
+                println!("OMP notification: {text}");
+                self.notices.push(text.into());
+            }
+            if done(&frame) {
+                break;
+            }
+        }
+    }
+
+    fn prompt(&mut self, id: &str) {
+        writeln!(self.child.stdin.as_mut().unwrap(), "{id}").unwrap();
+        self.until(|frame| frame["barrier"] == id);
+    }
+
+    fn observations(&self) -> usize {
+        std::fs::read_to_string(&self.trace)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    }
+
+    fn observe_after(&self, before: usize) {
+        assert!(
+            wait_until(Duration::from_secs(45), || self.observations() > before
+                || std::fs::read_to_string(&self.trace)
+                    .unwrap_or_default()
+                    .contains("identity-changed")),
+            "APPARATUS: no watcher snapshot after the staged node replacement"
+        );
+    }
+
+    fn observed_frame_after(&self, before: usize, kind: &str) -> bool {
+        // The watcher caps its availability backoff at 30 s. Three capped intervals
+        // cover a probe already in flight and the replacement's next subscription.
+        wait_until(Duration::from_secs(90), || {
+            std::fs::read_to_string(&self.trace)
+                .unwrap_or_default()
+                .lines()
+                .skip(before)
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .any(|frame| frame["type"] == kind)
+        })
+    }
+}
+
+impl Drop for OmpConversation {
+    fn drop(&mut self) {
+        if let Some(stdin) = self.child.stdin.as_mut() {
+            let _ = writeln!(stdin, "quit");
+        }
+        let _ = self.child.wait();
+        println!(
+            "watcher observations:\n{}",
+            std::fs::read_to_string(&self.trace).unwrap_or_default()
+        );
+    }
+}
+
+#[test]
+#[ignore = "native extension, real daemon and production Argon2id; run in release with test-knobs"]
+fn a_conversation_reports_one_reconnecting_line_when_its_daemon_restarts() {
+    watchdog::arm();
+    // Both event orders, a timer before either event, and a slot removed before its event.
+    reconnect_with_held_stop("agent", "detaching");
+    reconnect_with_held_stop("*", "detaching");
+    reconnect_with_held_stop("agent", "event");
+    reconnect_with_held_stop("held", "detaching");
+}
+
+fn reconnect_with_held_stop(held_node: &str, phase: &str) {
+    test_knobs::require(&[
+        "VOX_TEST_STOP_HOLD_NODE",
+        "VOX_TEST_STOP_HOLD_FILE",
+        "VOX_TEST_WATCH_READY_INTERVAL_SECS",
+        "VOX_TEST_STOP_HOLD_PHASE",
+        "VOX_TEST_ATTACH_HOLD_NODE",
+        "VOX_TEST_ATTACH_HOLD_FILE",
+    ]);
+    let a = Account::new();
+    a.make_node("agent");
+    a.make_node("held");
+    let stop_hold = a._tmp.path().join("hold-node-stop");
+    std::fs::write(&stop_hold, "").expect("APPARATUS: node stop hold");
+    let mut daemon = Daemon::start(
+        &a,
+        &["--node", "agent"],
+        &[
+            ("VOX_TEST_STOP_HOLD_NODE", held_node),
+            ("VOX_TEST_STOP_HOLD_FILE", stop_hold.to_str().unwrap()),
+            ("VOX_TEST_STOP_HOLD_PHASE", phase),
+        ],
+    );
+    daemon.expect("node agent is Ready", Duration::from_secs(30), |line| {
+        line.contains("node agent is Ready")
+    });
+    let (ok, out, err) = a.run(&["node", "attach", "held"], "");
+    assert!(ok, "APPARATUS: second node did not attach: {out}{err}");
+    // Keep agent too: the replacement must actually attach it from remembered credentials.
+    let (ok, out, err) = a.run(&["node", "attach", "agent"], "");
+    assert!(
+        ok,
+        "APPARATUS: agent was not remembered for restart: {out}{err}"
+    );
+    let mut conversation = OmpConversation::start(&a);
+    let stop_started = Instant::now();
+    let signalled = Command::new("/bin/kill")
+        .args(["-TERM", &daemon.child.id().to_string()])
+        .status()
+        .expect("APPARATUS: signal the proof's daemon");
+    assert!(signalled.success(), "APPARATUS: daemon stop signal failed");
+    let agent_state = if phase != "event" && held_node != "held" {
+        "Detaching"
+    } else {
+        "Locked"
+    };
+    let sibling_state = if phase != "event" && held_node != "agent" {
+        "Detaching"
+    } else {
+        "Locked"
+    };
+    let mut stopping_nodes = String::new();
+    assert!(
+        wait_until(Duration::from_secs(15), || {
+            let (ok, out, err) = a.run(&["node", "list"], "");
+            let staged = ok
+                && out
+                    .lines()
+                    .any(|line| line.starts_with("agent ") && line.contains(agent_state))
+                && out
+                    .lines()
+                    .any(|line| line.starts_with("held ") && line.contains(sibling_state));
+            stopping_nodes = format!("{out}{err}");
+            staged
+        }),
+        "APPARATUS: daemon did not answer with agent {agent_state} and held {sibling_state}: \
+         {stopping_nodes}; {}",
+        daemon.said()
+    );
+    println!(
+        "stopping pid {}, held node {held_node} at {phase}, still answers:\n{stopping_nodes}",
+        daemon.child.id()
+    );
+    // A new timer probe must see this stable held phase, not the preceding transition.
+    let before_probe = conversation.observations();
+    assert!(
+        wait_until(Duration::from_secs(90), || {
+            std::fs::read_to_string(&conversation.trace)
+                .unwrap_or_default()
+                .lines()
+                .skip(before_probe)
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .any(|frame| {
+                    frame["type"] == "unavailable"
+                        && frame["pid"] == daemon.child.id()
+                        && matches!(
+                            frame["reason"].as_str(),
+                            Some("reconnecting" | "node-not-ready")
+                        )
+                })
+        }) && daemon.child.try_wait().unwrap().is_none(),
+        "APPARATUS: watcher did not probe while the stopping daemon still answered:\n{}",
+        std::fs::read_to_string(&conversation.trace).unwrap_or_default()
+    );
+    conversation.until(|frame| frame.get("notice").is_some());
+    conversation.prompt("while-stopping");
+    std::fs::remove_file(&stop_hold).expect("APPARATUS: release node stop");
+    let held_for = stop_started.elapsed();
+    assert!(
+        held_for < Duration::from_secs(5),
+        "APPARATUS: hold {held_node} at {phase} released after {held_for:?}, beyond the \
+         daemon's five-second shutdown patience; its exit is not a product verdict"
+    );
+    let during_stop = conversation.notices.join("\n");
+    assert!(
+        during_stop
+            .lines()
+            .filter(|line| line.contains("reconnecting"))
+            .count()
+            == 1
+            && !during_stop.contains("is unavailable")
+            && !during_stop.contains("vox node create"),
+        "PRODUCT: while agent is {agent_state} and held is {sibling_state} (hold {held_node} at \
+         {phase}), the stopping daemon must give exactly one reconnecting line and never blame \
+         the node: {during_stop}"
+    );
+    let stopped = daemon.child.wait().expect("APPARATUS: reap stopped daemon");
+    assert!(
+        stopped.success(),
+        "PRODUCT: daemon failed to finish stopping: {}",
+        daemon.said()
+    );
+    let before_restart = conversation.observations();
+    let attach_hold = a._tmp.path().join("hold-replacement-attach");
+    std::fs::write(&attach_hold, "").expect("APPARATUS: replacement attach hold");
+    let daemon = Daemon::start(
+        &a,
+        &["--no-node"],
+        &[
+            ("VOX_TEST_ATTACH_HOLD_NODE", "agent"),
+            ("VOX_TEST_ATTACH_HOLD_FILE", attach_hold.to_str().unwrap()),
+        ],
+    );
+    daemon.expect("serving", Duration::from_secs(30), |line| {
+        line.contains("serving")
+    });
+    let (ok, out, err) = a.run(&["node", "list"], "");
+    assert!(
+        ok && out
+            .lines()
+            .any(|line| line.starts_with("agent ") && line.contains("Attaching")),
+        "APPARATUS: replacement did not report agent Attaching: {out}{err}"
+    );
+    println!(
+        "replacement pid {} is still attaching:\n{out}",
+        daemon.child.id()
+    );
+    let before_attach_probe = conversation.observations();
+    assert!(
+        wait_until(Duration::from_secs(90), || {
+            std::fs::read_to_string(&conversation.trace)
+                .unwrap_or_default()
+                .lines()
+                .skip(before_attach_probe)
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .any(|frame| {
+                    frame["type"] == "unavailable"
+                        && frame["pid"] == daemon.child.id()
+                        && matches!(
+                            frame["reason"].as_str(),
+                            Some("reconnecting" | "node-not-ready")
+                        )
+                })
+        }),
+        "APPARATUS: no watcher frame from the attaching replacement pid {}:\n{}",
+        daemon.child.id(),
+        std::fs::read_to_string(&conversation.trace).unwrap_or_default()
+    );
+    conversation.prompt("replacement-attaching");
+    let during_attach = conversation.notices.join("\n");
+    assert!(
+        during_attach.lines().filter(|line| line.contains("reconnecting")).count() == 1
+            && !during_attach.contains("is unavailable") && !during_attach.contains("vox node create"),
+        "PRODUCT: an attaching replacement must keep one reconnecting line and never blame the node: {during_attach}"
+    );
+    std::fs::remove_file(&attach_hold).expect("APPARATUS: release replacement attach");
+    daemon.expect("node agent is Ready", Duration::from_secs(30), |line| {
+        line.contains("node agent is Ready")
+    });
+    // PRODUCT, not apparatus: this already-ready conversation must reconnect to the
+    // replacement daemon. Counting its one notice without resumed readiness proves nothing.
+    assert!(
+        conversation.observed_frame_after(before_restart, "ready"),
+        "PRODUCT: watcher never became ready within 90 s after restart despite its 30 s \
+         backoff cap:\n{}",
+        std::fs::read_to_string(&conversation.trace).unwrap_or_default()
+    );
+    conversation.prompt("after-restart");
+    let notices = conversation.notices.join("\n");
+    drop(conversation);
+    daemon.stop();
+    assert!(
+        notices
+            .lines()
+            .filter(|line| line.contains("reconnecting"))
+            .count()
+            == 1
+            && !notices.contains("is unavailable")
+            && !notices.contains("vox node create"),
+        "PRODUCT: a daemon restart must say reconnecting once, not blame the node: {notices}"
+    );
+}
+
+#[test]
+#[ignore = "native extension and a node locked after restart; run in release with test-knobs"]
+fn a_conversation_explains_a_locked_node_after_its_daemon_restarts() {
+    watchdog::arm();
+    let a = Account::new();
+    a.make_node("agent");
+    let daemon = Daemon::start(&a, &["--node", "agent"], &[]);
+    daemon.expect("node agent is Ready", Duration::from_secs(30), |line| {
+        line.contains("node agent is Ready")
+    });
+    let mut conversation = OmpConversation::start(&a);
+    daemon.stop();
+    conversation.until(|frame| frame.get("notice").is_some());
+    // Start the replacement without unlocking a node, then lock through the public CLI.
+    // This stages the same answered-but-not-ready state as a missing restart credential.
+    let daemon = Daemon::start(&a, &["--no-node"], &[]);
+    daemon.expect("serving", Duration::from_secs(30), |line| {
+        line.contains("serving")
+    });
+    let (ok, out, err) = a.run(&["node", "lock", "agent"], "");
+    assert!(
+        ok,
+        "APPARATUS: could not lock the replacement's node: {out}{err}"
+    );
+    let (ok, out, err) = a.run(&["node", "list"], "");
+    assert!(
+        ok && out.contains("agent") && out.contains("Locked"),
+        "APPARATUS: replacement did not report its locked node: {out}{err}"
+    );
+    let before = conversation.observations();
+    assert!(
+        conversation.observed_frame_after(before, "unavailable"),
+        "PRODUCT: watcher did not report the replacement's locked node:\n{}",
+        std::fs::read_to_string(&conversation.trace).unwrap_or_default()
+    );
+    conversation.prompt("locked-after-restart");
+    let notices = conversation.notices.join("\n");
+    drop(conversation);
+    daemon.stop();
+    assert!(
+        notices.contains("vox node unlock -- agent"),
+        "PRODUCT: a daemon that answers with a locked node must explain how to unlock it, \
+         even after its reconnecting notice: {notices}"
+    );
+}
+
+#[test]
+#[ignore = "native extension, real daemon and rebuilt node; run in release with test-knobs"]
+fn a_conversation_refuses_a_rebuilt_node_under_the_same_name() {
+    watchdog::arm();
+    let a = Account::new();
+    let original = a.make_node("agent");
+    let daemon = Daemon::start(&a, &["--node", "agent"], &[]);
+    daemon.expect("node agent is Ready", Duration::from_secs(30), |line| {
+        line.contains("node agent is Ready")
+    });
+    let mut conversation = OmpConversation::start(&a);
+    daemon.stop();
+    conversation.until(|frame| frame.get("notice").is_some());
+    // No daemon is left on the old directory: this is identity fencing, not store rewriting.
+    std::fs::rename(a.data.join("nodes/agent"), a.data.join("nodes/original")).unwrap();
+    let rebuilt = a.make_node("agent");
+    assert_ne!(
+        original, rebuilt,
+        "APPARATUS: rebuilt node did not get a fresh identity"
+    );
+    let daemon = Daemon::start(&a, &["--node", "agent"], &[]);
+    daemon.expect("node agent is Ready", Duration::from_secs(30), |line| {
+        line.contains("node agent is Ready")
+    });
+    let before = conversation.observations();
+    conversation.observe_after(before);
+    conversation.prompt("rebuilt");
+    conversation.prompt("refused-again");
+    let notices = conversation.notices.join("\n");
+    let registered = a
+        .data
+        .join("nodes/agent/sessions/identity-proof.json")
+        .exists();
+    drop(conversation);
+    daemon.stop();
+    assert!(notices.contains("identity changed") && notices.contains("conversation is refused")
+        && notices.contains("new OMP conversation") && !registered,
+        "PRODUCT: a rebuilt node must not adopt the old conversation; registered={registered}; {notices}");
 }
 
 #[cfg(feature = "test-knobs")]
@@ -1445,10 +1933,10 @@ fn a_restart_owns_its_replacement_while_a_client_waits() {
     let a = Account::new();
     a.make_node("default");
     let pass = a._tmp.path().join("identity.pass");
-    let Daemon {
-        child,
-        out: foreground_output,
-    } = Daemon::start(
+    // `Daemon` ends its own child when it is dropped, so it is kept whole here; `children` holds
+    // only the restart callers, which may be stopped and must be continued before they are killed.
+    // Declared first, the daemon is dropped last.
+    let mut daemon = Daemon::start(
         &a,
         &[
             "--node",
@@ -1459,7 +1947,8 @@ fn a_restart_owns_its_replacement_while_a_client_waits() {
         ],
         &[("VOX_TEST_STOP_HOLD_MS", "3000")],
     );
-    let mut children = Children(vec![child]);
+    let foreground_output = daemon.out.clone();
+    let mut children = Children(Vec::new());
     assert!(
         wait_until(Duration::from_secs(60), || std::fs::read_to_string(
             &foreground_output
@@ -1489,7 +1978,7 @@ fn a_restart_owns_its_replacement_while_a_client_waits() {
             .spawn()
             .unwrap();
         children.0.push(caller);
-        let caller_pid = children.0[1].id();
+        let caller_pid = children.0[0].id();
         assert!(
             wait_until(Duration::from_secs(30), || a
                 .log()
@@ -1510,8 +1999,8 @@ fn a_restart_owns_its_replacement_while_a_client_waits() {
         );
         assert!(
             wait_until(Duration::from_secs(30), || {
-                if old == children.0[0].id() {
-                    children.0[0].try_wait().unwrap().is_some()
+                if old == daemon.child.id() {
+                    daemon.child.try_wait().unwrap().is_some()
                 } else {
                     !alive(old) || a.lock_pid() != Some(old)
                 }
@@ -1543,7 +2032,7 @@ fn a_restart_owns_its_replacement_while_a_client_waits() {
                 .args(["-CONT", &caller_pid.to_string()])
                 .status();
         }
-        let status = children.0[1].wait().unwrap();
+        let status = children.0[0].wait().unwrap();
         children.0.pop();
         let restart = std::fs::read_to_string(&output).unwrap_or_default();
         eprintln!("restart killed={killed}, old={old}, status={status}: {restart}\nclient: {out}{err}\nhook: {}{}\n{}", hook.1, hook.2, a.log());
