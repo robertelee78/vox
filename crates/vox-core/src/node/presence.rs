@@ -656,18 +656,23 @@ impl NetPresence {
         })
     }
 
-    /// Register the daemon's separate management role and start accepting even with no nodes.
-    /// This uses the same endpoint and UDP socket as every node of the data root.
+    /// Register the daemon's separate management role on the shared socket. The caller starts
+    /// accepting after initial node attachments, so their identities are not refused mid-start.
     pub fn attach_management(&self, signer: Arc<dyn RootSigner + Send + Sync>) -> Result<NodeLink> {
         let (tx, inbound) = mpsc::channel(INBOUND_QUEUE);
         let endpoint = self.shared.register_management(signer, tx)?;
-        lock(&self.accept).get_or_insert_with(|| {
-            spawn_accept_loop(Arc::clone(&self.shared), self.bursts.clone())
-        });
         Ok(NodeLink {
             endpoint: Arc::new(endpoint),
             inbound,
         })
+    }
+
+    /// Accept management connections after startup, including a daemon with no Ready nodes.
+    /// A node attachment may already have started this same loop.
+    pub fn accept_management(&self) {
+        lock(&self.accept).get_or_insert_with(|| {
+            spawn_accept_loop(Arc::clone(&self.shared), self.bursts.clone())
+        });
     }
 
     /// The shared endpoint.
