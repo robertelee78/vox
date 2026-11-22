@@ -81,7 +81,11 @@ pub(super) struct Pending {
 }
 
 impl Work {
-    fn run(self, lifetime: &maintenance_save::Lifetime) -> crate::error::Result<ChannelState> {
+    fn run(
+        self,
+        lifetime: &maintenance_save::Lifetime,
+        retention: (u64, u64),
+    ) -> crate::error::Result<ChannelState> {
         let store = &lifetime.store;
         let signer = lifetime.signer.as_ref();
         match self {
@@ -106,6 +110,8 @@ impl Work {
                     now,
                     &anchors,
                 )?;
+                channel.set_node_retention(retention.0);
+                channel.set_node_step_retention(retention.1);
                 if let Some((tag, endpoint, kind)) = service {
                     if let Err(error) =
                         channel.offer_unpublished_service(store, signer, &tag, endpoint, kind, now)
@@ -121,7 +127,22 @@ impl Work {
                         return Err(error);
                     }
                 }
-                if let Err(error) = fold_unpublished_governance(&mut channel, store, now) {
+                let prepared = (|| -> crate::error::Result<()> {
+                    fold_unpublished_governance(&mut channel, store, now)?;
+                    // The creator has no missing history. Settle its first bounded saved
+                    // projection before the new room is advertised as readable.
+                    if let Some(pending) = channel.prepare_pending_retention(
+                        &lifetime.store,
+                        Arc::new(()),
+                        crate::node::channel::pending_retention::Step::Projection,
+                        now,
+                    )? {
+                        let completed = pending.save(store);
+                        channel.finish_pending_retention(store, completed)?;
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = prepared {
                     metadata_save::purge_unpublished(
                         store,
                         signer,
@@ -489,6 +510,10 @@ impl Node {
                 return;
             }
         };
+        let retention = (
+            self.node_retention_for(&room),
+            self.node_step_retention.for_room(&room),
+        );
         let store = Arc::clone(&lifetime.store);
         let result = Arc::new(std::sync::Mutex::new(None));
         let returned = Arc::clone(&result);
@@ -535,7 +560,7 @@ impl Node {
                     lifetime.publication = Some(publication);
                     let lifetime = Arc::new(lifetime);
                     let held = Arc::clone(&lifetime);
-                    let result = tokio::task::spawn_blocking(move || work.run(&held))
+                    let result = tokio::task::spawn_blocking(move || work.run(&held, retention))
                         .await
                         .unwrap_or_else(|_| Err(Error::Profile("room constructor worker stopped")));
                     Returned::Started { result, lifetime }
@@ -549,11 +574,12 @@ impl Node {
                     {
                         let lifetime = Arc::new(lifetime);
                         let held = Arc::clone(&lifetime);
-                        let result = tokio::task::spawn_blocking(move || work.run(&held))
-                            .await
-                            .unwrap_or_else(|_| {
-                                Err(Error::Profile("room constructor worker stopped"))
-                            });
+                        let result =
+                            tokio::task::spawn_blocking(move || work.run(&held, retention))
+                                .await
+                                .unwrap_or_else(|_| {
+                                    Err(Error::Profile("room constructor worker stopped"))
+                                });
                         *returned
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner) =

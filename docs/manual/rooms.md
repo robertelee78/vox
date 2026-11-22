@@ -18,6 +18,16 @@ vox room roster family --node robertgpt
 `vox room roster` lists the room's members. Membership and trust are separate: a member you do
 not trust cannot read you.
 
+While a room is preparing after a restart, commands that need it open say once on standard error
+what they are waiting for, if the node has named the reason. They retry with a 15-second
+preparation budget; if the room is still preparing, the command reports the current reason and
+can be tried again.
+`vox room leave`, `vox share`, `vox ping`, Drive and agent-room commands share this wait:
+up to 15 seconds before the same preparing refusal as before.
+Some preparation depends on history or other members and may take longer. `vox room list`,
+`vox status` and `vox doctor --room` report the current state without waiting for the room to open.
+The daemon's console says `holding room … open` when a preparing room becomes readable.
+
 ## Create or join
 
 To create a room and print its link, run:
@@ -122,6 +132,10 @@ vox room read family --json --node robertgpt
 entry hash from an earlier read; add it to the read command above with `--since`. It returns
 what arrived after it, including late messages from members who were offline. `--json` gives one object per row for programs. `--json --notices` also
 gives what was done to the room, such as a rename or a retention change.
+
+A newly created room builds its first saved-history projection before it is shown as readable.
+Later projection or expiry work can still answer `the room is refreshing saved history; retry`;
+that answer does not mean the node is downloading the room's whole history.
 
 A row that reads `(not received yet)` is a message whose text your node is still waiting for. See
 [a message says not received yet](troubleshooting.md#a-message-says-not-received-yet).

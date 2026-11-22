@@ -906,6 +906,16 @@ impl Node {
             }
         }
         let id = channel.channel_id();
+        #[cfg(feature = "test-knobs")]
+        if prepared.save.stage == Stage::Retention(Step::Projection)
+            && std::env::var_os("VOX_TEST_PREPARING_HOLD_FILE")
+                .is_some_and(|path| std::path::Path::new(&path).exists())
+        {
+            prepared.save.lifetime = None;
+            prepared.wait_on("building its saved history projection", now.get());
+            prepared.legacy_cleanup_due = Some(std::time::Instant::now() + TICK);
+            return Ok(false);
+        }
         let policy = (
             self.node_retention_for(&id),
             self.node_step_retention.for_room(&id),
