@@ -97,6 +97,8 @@ struct Delivery {
     /// Held until these exact retry bytes are no longer needed.
     reservation: DeliveryReservation,
     opening: Digest32,
+    /// Shared with every queued copy until the opening is first written or retired.
+    prekey: Option<prekeys::OneTimeReservation>,
 }
 
 /// A pairwise session this node opened (ADR-004 O2, O3).
@@ -471,16 +473,12 @@ fn detail_of(
             None => sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         };
     let read_summary_stamp = publication.read_summary_stamp;
-    let (read_by, held, unread) = match prev.filter(|p| {
+    let (read_by, held) = match prev.filter(|p| {
         ch.display_is_current(&p.display_stamp, &display_stamp)
             && p.read_summary_stamp == read_summary_stamp
     }) {
-        Some(p) => (p.read_by.clone(), p.held.clone(), p.unread.clone()),
-        None => (
-            ch.read_by_own(store)?,
-            ch.held_own(store)?,
-            ch.unread(store)?,
-        ),
+        Some(p) => (p.read_by.clone(), p.held.clone()),
+        None => (ch.read_by_own(store)?, ch.held_own(store)?),
     };
     // Who trusts each member (ADR-028 K-7), once: this identity's own entry is `consenting`.
     // The trust picture (who reads whom, who consented, the offer bases, where drive comes
@@ -613,7 +611,6 @@ fn detail_of(
         held,
         held_through,
         holds_through,
-        unread,
         // The authors this node can answer for now; a refreshing author is named in each
         // listing's revision rather than holding the whole room's detail back (ADR-037 R4).
         drive_from,
@@ -2678,6 +2675,7 @@ struct PairwiseJob {
     /// What the write's outcome tells the actor.
     after: AfterWrite,
     credit: PairwiseCredit,
+    prekey: Option<prekeys::OneTimeReservation>,
 }
 
 /// What a pairwise write's outcome decides.
@@ -2720,19 +2718,12 @@ async fn write_pairwise_jobs(
                 None => return,
             },
         };
-        let send = async {
-            match &job.credit.room_fence {
-                Some(fence) => {
-                    crate::node::pairwise_stream::write_pairwise_fenced(
-                        &job.conn,
-                        &job.frames,
-                        fence,
-                    )
-                    .await
-                }
-                None => crate::node::pairwise_stream::write_pairwise(&job.conn, &job.frames).await,
-            }
-        };
+        let send = crate::node::pairwise_stream::write_pairwise_owned(
+            &job.conn,
+            &job.frames,
+            job.credit.room_fence.as_deref(),
+            job.prekey.as_ref(),
+        );
         let written = tokio::select! {
             biased;
             _ = epoch_changed.changed() => return,
@@ -2967,6 +2958,28 @@ async fn read_pairwise_streams(
                 continue;
             }
         };
+        #[cfg(feature = "test-knobs")]
+        if std::env::var_os("VOX_TEST_PAIRWISE_OPENING_RECEIPTS").is_some() {
+            if let PairwiseFrame::Hello {
+                channel_id,
+                initial,
+            }
+            | PairwiseFrame::RotationHello {
+                channel_id,
+                initial,
+                ..
+            } = &first
+            {
+                if let Ok(initial) = InitialMessage::from_wire(initial) {
+                    eprintln!(
+                        "PAIRWISE WIRE RECEIPT peer={} room={} one_time={:?}",
+                        crate::node::link::b32_encode(&peer),
+                        crate::node::link::b32_encode(channel_id),
+                        initial.one_time_prekey_id
+                    );
+                }
+            }
+        }
         if matches!(first, PairwiseFrame::RecoveryReply { .. })
             || (matches!(first, PairwiseFrame::RecoveryOpen { .. })
                 && !conn.supports_own_recovery())
@@ -6289,10 +6302,7 @@ enum RecoveryWriterGate {
 struct OwnKeyComputerReady {
     _secret: own_keys::SecretLease,
     owner: Arc<()>,
-    rooms: Vec<(Digest32, SharedChannel)>,
-    transitions: Option<Vec<crate::node::channel::own_writer_gate::Transition>>,
     publication: Option<crate::node::computer::ComputerPublicationTransition>,
-    preflight: crate::error::Result<Option<trust_save::PolicyPublicationBlocked>>,
     binding: crate::error::Result<()>,
     work: computer::OwnKeyPolicyWork,
 }
@@ -6550,7 +6560,6 @@ pub struct Node {
     own_key_leave_pending: BTreeMap<Digest32, Arc<()>>,
     own_key_ended_pending: BTreeMap<Digest32, Arc<()>>,
     own_key_untrust_pending: Option<Arc<()>>,
-    own_key_room_set_changed: watch::Sender<()>,
     own_key_computer_pending: std::collections::VecDeque<computer::OwnKeyPolicyWork>,
     own_key_computer_flight: Option<OwnKeyPolicyFlight>,
     /// Peers' acknowledgements of this node's own feed reported by lane rounds, applied on
@@ -7112,6 +7121,7 @@ pub struct Node {
     /// The ADR-020 §3 trust keyring, loaded on unlock and empty while locked
     /// (it is sealed under the identity, so there is nothing to hold locked).
     trust: crate::node::trust::Keyring,
+    trust_generation: u64,
     /// The trust offers this node dismissed (ADR-028 K-18), loaded on unlock and empty while
     /// locked: sealed under the identity like the keyring.
     dismissed_offers: crate::node::offers::DismissedOffers,
@@ -7142,6 +7152,7 @@ pub struct Node {
     session_ingress_scan: usize,
     drive_receipt_cursor: u64,
     session_ingress_waits: BTreeMap<(Digest32, String), session_save::IngressWait>,
+    pending_session_bookkeeping: Option<session_save::Bookkeeping>,
     /// An empty inbox clears a recovery failure, not delivery or room cleanup failures.
     /// Separate health keeps successful reads/appends from hiding unresolved cleanup.
     session_ingress_recovery_error: Option<String>,
@@ -7388,7 +7399,6 @@ impl Node {
             own_key_leave_pending: BTreeMap::new(),
             own_key_ended_pending: BTreeMap::new(),
             own_key_untrust_pending: None,
-            own_key_room_set_changed: watch::channel(()).0,
             own_key_computer_pending: std::collections::VecDeque::new(),
             own_key_computer_flight: None,
             held_notes: Vec::new(),
@@ -7591,6 +7601,7 @@ impl Node {
             view_owed: None,
             event_tx,
             trust: crate::node::trust::Keyring::new(),
+            trust_generation: 1,
             dismissed_offers: crate::node::offers::DismissedOffers::default(),
             peer_book: crate::node::peer_book::PeerBook::new(),
             peer_book_save: peer_book_save::State::default(),
@@ -7606,6 +7617,7 @@ impl Node {
             session_ingress_scan: 0,
             drive_receipt_cursor: 0,
             session_ingress_waits: BTreeMap::new(),
+            pending_session_bookkeeping: None,
             session_ingress_recovery_error: None,
             session_ingress_error: None,
             session_retirement_error: None,
@@ -7826,6 +7838,25 @@ impl Node {
         }
     }
 
+    fn event_waits_for_save(&self, event: &NetEvent, save_pending: bool) -> bool {
+        let room = match event {
+            NetEvent::SessionActivity { channel_id, .. }
+            | NetEvent::SessionProjection { channel_id, .. }
+            | NetEvent::SessionFiles { channel_id, .. }
+            | NetEvent::RoomHistory { channel_id, .. } => Some(channel_id),
+            _ => None,
+        };
+        if room.is_some_and(|room| self.session_bookkeeping_blocks_room(room)) {
+            return true;
+        }
+        self.seat_waits_for_install(event).unwrap_or_else(|| {
+            save_pending
+                && (event.waits_for_store()
+                    || matches!(event, NetEvent::LocalTrustBlacklist(_)
+                        if !self.trust.local_history_imported()))
+        })
+    }
+
     async fn run_loop(
         &mut self,
         cmd_rx: &mut mpsc::Receiver<(NodeCommand, oneshot::Sender<Outcome>)>,
@@ -7861,18 +7892,14 @@ impl Node {
         )> = std::collections::VecDeque::new();
         loop {
             let save_pending = self.store_save_pending();
-            let saved_ready = if !save_pending {
-                saved_events
-                    .iter()
-                    .position(|(event, _)| self.seat_waits_for_install(event) != Some(true))
-            } else {
-                // A seat can pass blocked Store events once its own roster is installed.
-                // Ordinary Store events keep FIFO order and their original admission credit.
-                saved_events
-                    .iter()
-                    .position(|(event, _)| self.seat_waits_for_install(event) == Some(false))
-            };
+            let saved_ready = saved_events
+                .iter()
+                .position(|(event, _)| !self.event_waits_for_save(event, save_pending));
             let receive_net = saved_events.iter().all(|(_, credit)| credit.is_some());
+            let publication_computer = self.computer.clone();
+            let publication_busy = publication_computer
+                .as_ref()
+                .is_some_and(|computer| computer.publication_writer_pending());
             let journal_busy = self.deferred_commands.front().is_some_and(|deferred| {
                 Self::command_needs_journal(&deferred.command.0)
                     && self
@@ -7880,8 +7907,21 @@ impl Node {
                         .as_ref()
                         .is_some_and(|computer| computer.writer_pending())
             });
-            let resume_command =
-                !self.store_save_pending() && !journal_busy && !self.deferred_commands.is_empty();
+            let authority_busy = self.deferred_commands.front().is_some_and(|deferred| {
+                matches!(
+                    deferred.command.0,
+                    NodeCommand::SendText { .. }
+                        | NodeCommand::SendTextAt { .. }
+                        | NodeCommand::SendTextAdmitted { .. }
+                ) && (publication_busy
+                    || self
+                        .computer_authority()
+                        .is_some_and(|authority| matches!(authority.superseded(), Ok(true))))
+            });
+            let resume_command = !self.store_save_pending()
+                && !journal_busy
+                && !authority_busy
+                && !self.deferred_commands.is_empty();
             let receive_command = resume_command
                 || self
                     .deferred_commands
@@ -7902,10 +7942,6 @@ impl Node {
                     std::future::pending::<()>().await;
                 }
             };
-            let publication_computer = self.computer.clone();
-            let publication_busy = publication_computer
-                .as_ref()
-                .is_some_and(|computer| computer.publication_writer_pending());
             let resume_publication = publication_busy || self.metadata_publication_waiting();
             let publication_ready = async move {
                 if let Some(computer) = publication_computer {
@@ -7955,6 +7991,9 @@ impl Node {
                 () = post_save_wake.notified() => {
                     self.complete_identity_startup().await;
                     self.complete_pending_posts().await;
+                    if self.complete_session_bookkeeping() {
+                        self.publish().await;
+                    }
                     self.complete_pending_policies().await;
                     self.complete_pending_metadata().await;
                     self.start_own_key_computer_drain();
@@ -8080,6 +8119,9 @@ impl Node {
                         continue;
                     }
                     if (self.store_save_pending() && Self::command_waits_for_save(&command))
+                        || matches!(&command, NodeCommand::RoomPause {
+                            channel_id, paused: None, ..
+                        } if self.session_bookkeeping_blocks_room(channel_id))
                         || ((self.policy_save_pending() || !self.own_key_leave_pending.is_empty()
                             || !self.own_key_ended_pending.is_empty()) && matches!(command,
                             NodeCommand::SendText { .. } | NodeCommand::SendTextAt { .. }
@@ -8338,11 +8380,7 @@ impl Node {
                     }
                     net_rx.recv().await.map(|event| (event, None, false))
                 }, if receive_net || saved_ready.is_some() => {
-                    let waits_for_store = self.seat_waits_for_install(&event).unwrap_or_else(|| {
-                        save_pending && (event.waits_for_store()
-                            || matches!(&event, NetEvent::LocalTrustBlacklist(_)
-                                if !self.trust.local_history_imported()))
-                    });
+                    let waits_for_store = self.event_waits_for_save(&event, save_pending);
                     if waits_for_store
                     {
                         let credit = if parked {
@@ -8633,10 +8671,7 @@ impl Node {
                 operation,
                 reply,
             } => {
-                let result = self
-                    .attention(&channel_id, by, expected_instance, operation)
-                    .await;
-                let _ = reply.send(result);
+                self.begin_attention(channel_id, by, expected_instance, operation, reply);
                 Outcome::Done
             }
             NodeCommand::RoomPause {
@@ -8751,47 +8786,7 @@ impl Node {
                 drive,
                 reply,
             } => {
-                let result = if self
-                    .session_rooms_retiring
-                    .iter()
-                    .any(|item| item.room == channel_id)
-                {
-                    Err(crate::error::Error::Profile(
-                        "this room was removed; its Session activity was not accepted",
-                    )
-                    .into())
-                } else if let Some(drive) = drive {
-                    self.admit_session_drive(channel_id, &session_id, &bodies, drive)
-                        .await
-                } else {
-                    self.profile
-                        .as_ref()
-                        .ok_or_else(|| {
-                            crate::node::session_ingress::AdmissionError::from(
-                                crate::error::Error::Profile("the node is locked"),
-                            )
-                        })
-                        .and_then(|profile| {
-                            crate::node::session_ingress::admit(
-                                profile,
-                                channel_id,
-                                &session_id,
-                                &bodies,
-                            )
-                        })
-                };
-                if result.is_ok() {
-                    self.ingress_scan_wake();
-                }
-                use crate::node::session_ingress::{AdmissionError, OwnedAdmission};
-                let receipt = match result {
-                    Ok(saved) => OwnedAdmission::Committed(saved),
-                    Err(AdmissionError::NotCommitted(error)) => {
-                        OwnedAdmission::NotCommitted { error, bodies }
-                    }
-                    Err(AdmissionError::Unconfirmed(error)) => OwnedAdmission::Unconfirmed(error),
-                };
-                let _ = reply.send(receipt);
+                self.begin_session_admission(channel_id, session_id, bodies, drive, reply);
                 Outcome::Done
             }
             NodeCommand::DeliverSessionDrive {
@@ -11845,7 +11840,6 @@ impl Node {
             NetEvent::OwnKeyComputerCancelled { owner } => {
                 self.own_key_computer_pending
                     .retain(|work| !Arc::ptr_eq(&work.owner, &owner));
-                self.cancel_policy_publication(&owner);
                 if let Some(flight) = &self.own_key_computer_flight {
                     if Arc::ptr_eq(&flight.owner, &owner) {
                         flight.fence.retire();
@@ -11919,6 +11913,19 @@ impl Node {
                 }
                 if let Some(i) = self.initiated.get_mut(&(channel_id, peer)) {
                     i.hello_delivered = false;
+                    if i.reservation
+                        .as_deref()
+                        .is_some_and(|prekey| !prekey.is_named())
+                    {
+                        // This exact opening never crossed the write fence. Other queued
+                        // copies still own its reservation until they finish or drop.
+                        let key = (channel_id, peer);
+                        self.sessions.remove(&key);
+                        self.initiated.remove(&key);
+                        self.accepted_hello.remove(&key);
+                        self.reopen.remove(&key);
+                        self.session_serial.remove(&key);
+                    }
                 }
             }
             NetEvent::ReopenUndelivered {
@@ -11934,6 +11941,16 @@ impl Node {
                 }
                 if let Some(i) = self.initiated.get_mut(&(channel_id, peer)) {
                     i.hello_delivered = false;
+                    if i.reservation
+                        .as_deref()
+                        .is_some_and(|prekey| !prekey.is_named())
+                    {
+                        let key = (channel_id, peer);
+                        self.sessions.remove(&key);
+                        self.initiated.remove(&key);
+                        self.accepted_hello.remove(&key);
+                        self.session_serial.remove(&key);
+                    }
                 }
                 self.reopen.insert((channel_id, peer));
             }
@@ -12473,7 +12490,11 @@ impl Node {
                             .deliveries
                             .get(&delivery)
                             .is_some_and(|d| Some(d.opening) == opening)
-                        && (refused_as(KeyRefusal::UnknownPrekey)
+                        && ((!answered
+                            && self.deliveries.get(&delivery).is_some_and(|d| {
+                                d.prekey.as_ref().is_some_and(|prekey| !prekey.is_named())
+                            }))
+                            || refused_as(KeyRefusal::UnknownPrekey)
                             || refused_as(KeyRefusal::HelloRefused)
                             || refused_as(KeyRefusal::CannotOpen))
                     {
@@ -14104,7 +14125,6 @@ impl Node {
                     owner,
                     guard,
                     reply: completion,
-                    targets: Vec::new(),
                 })
                 .await;
                 self.start_own_key_computer_drain();
@@ -19026,7 +19046,8 @@ impl Node {
         false
     }
 
-    /// Record the in-memory consequences of a package whose durable append already succeeded.
+    /// Record the in-memory consequences of a package whose durable append already succeeded,
+    /// and say once per posted key that it went through the room's log, whichever prekey it names.
     fn note_key_package_posted(
         &mut self,
         posted_as: (Digest32, Digest32, Digest32),
@@ -19041,7 +19062,18 @@ impl Node {
         {
             self.refused_otps.note(posted_as.1, prekey_id);
         }
-        self.packages_posted.insert(posted_as);
+        if self.packages_posted.insert(posted_as) {
+            if let Some(net) = self.net.as_ref() {
+                net.manager().note(
+                    posted_as.1,
+                    format!(
+                        "your key for it in room {} went into the room's log as a key package; it \
+                         takes the key from there",
+                        crate::node::network::short_id(posted_as.0)
+                    ),
+                );
+            }
+        }
     }
 
     fn key_package_work_ready(&self) -> bool {
@@ -19140,6 +19172,11 @@ impl Node {
                     epoch: self.delivery_epoch,
                 },
                 credit: job,
+                prekey: self
+                    .initiated
+                    .get(&(channel_id, peer))
+                    .and_then(|opening| opening.reservation.as_deref())
+                    .cloned(),
             });
         }
     }
@@ -19260,6 +19297,7 @@ impl Node {
         let generation = channel.removal_generation(profile.store()).ok()?;
         let fence = Arc::new(crate::node::pairwise_stream::RoomSendFence {
             resource: channel.history_read_resource()?,
+            signer: Arc::downgrade(&profile.signer_arc().ok()?),
             #[cfg(feature = "test-knobs")]
             store: profile.store_handle(),
             room: *room,
@@ -19828,6 +19866,8 @@ impl Node {
     /// node is *locking* ([`NodeView::locking`]). The returned receiver fires once it has settled.
     async fn lock_all(&mut self) -> oneshot::Receiver<()> {
         self.session_ingress_waits.clear();
+        // The worker retains its original secret guard through physical completion.
+        self.pending_session_bookkeeping = None;
         self.session_ingress_scan = 0;
         self.retire_parked_construction(Fault::Locked);
         self.retire_parked_private_drives(Fault::Locked);
@@ -19895,7 +19935,6 @@ impl Node {
         // Retire queued scanner admission and its wake before dropping room ownership. A
         // physical blocking read retains its own secret guard until it actually exits.
         self.key_body_scan = key_body_scan::Controller::default();
-        self.own_key_room_set_changed.send_replace(());
         let busy: Vec<_> = self.own_key_donor_busy.keys().copied().collect();
         for key in busy {
             self.retire_own_key_donor_busy(key);
@@ -20228,9 +20267,6 @@ impl Node {
         self.own_recovery_rooms.remove(channel_id);
         self.own_recovery_body_debts.remove(channel_id);
         self.own_readable_effects.remove(channel_id);
-        if self.channels.contains_key(channel_id) {
-            self.own_key_room_set_changed.send_replace(());
-        }
         self.retire_parked_private_drive(channel_id, Fault::ChannelNotOpen);
         self.session_ingress_waits
             .retain(|(room, _), _| room != channel_id);
@@ -20841,7 +20877,6 @@ impl Node {
         crate::node::status::SyncBook::note_set_aside(&self.sync_book, channel_id, ch.set_aside());
         let install = || {
             self.role_wake.install(channel_id, &ch.role_owed());
-            self.own_key_room_set_changed.send_replace(());
             if let Some(net) = self.net.as_ref() {
                 net.forget_board_exchange_room(&channel_id);
             }
@@ -20919,61 +20954,35 @@ impl Node {
         let OwnKeyComputerReady {
             _secret,
             owner,
-            rooms,
-            transitions,
             publication,
-            preflight,
             binding,
             work,
         } = ready;
-        if self
+        if !self
             .own_key_computer_flight
             .as_ref()
             .is_some_and(|flight| Arc::ptr_eq(&flight.owner, &owner))
         {
-            self.own_key_computer_flight = None;
-            let current = rooms.len() == self.channels.len()
-                && rooms.iter().all(|(id, old)| {
-                    self.channels
-                        .get(id)
-                        .is_some_and(|current| Arc::ptr_eq(current, old))
-                });
-            if work.reply.is_closed() {
-                drop(transitions);
-            } else if let Err(error) = work.guard.active(self.computer.as_ref()) {
-                let _ = work.reply.send(Err(error));
-            } else if let Err(error) = preflight {
-                let _ = work.reply.send(Err(error));
-            } else if !current {
-                drop(transitions);
-                self.own_key_computer_pending.push_front(work);
-            } else if let Ok(Some(blocked)) = preflight {
-                drop(transitions);
-                drop(publication);
-                drop(_secret);
-                self.wait_policy_publication(work, blocked).await;
-            } else if let Err(error) = binding {
-                let _ = work.reply.send(Err(error));
-            } else if current {
-                if let Some(transitions) = transitions {
-                    if let Some(publication) = publication {
-                        self.begin_owned_computer_policy(work, _secret, publication, transitions)
-                            .await;
-                    } else {
-                        let _ = work.reply.send(Err(Error::ComputerPolicySuperseded));
-                    }
-                } else {
-                    self.own_key_computer_pending.push_front(work);
-                }
-            } else {
-                drop(transitions);
-                self.own_key_computer_pending.push_front(work);
-            }
-            self.start_own_key_computer_drain();
+            return;
         }
+        self.own_key_computer_flight = None;
+        if work.reply.is_closed() {
+            return;
+        }
+        if let Err(error) = work.guard.active(self.computer.as_ref()) {
+            let _ = work.reply.send(Err(error));
+        } else if let Err(error) = binding {
+            let _ = work.reply.send(Err(error));
+        } else if let Some(publication) = publication {
+            self.begin_owned_computer_policy(work, _secret, publication)
+                .await;
+        } else {
+            let _ = work.reply.send(Err(Error::ComputerPolicySuperseded));
+        }
+        self.start_own_key_computer_drain();
     }
 
-    async fn apply_owned_computer_policy(&mut self, mut work: computer::OwnKeyPolicyWork) {
+    async fn apply_owned_computer_policy(&mut self, work: computer::OwnKeyPolicyWork) {
         if work.reply.is_closed() {
             return;
         }
@@ -20989,10 +20998,6 @@ impl Node {
             let _ = work.reply.send(Ok(()));
             return;
         }
-        // The first binding-dependent plan cannot run before the native binding exists.
-        // Conservatively drain every currently trusted writer; the later real plan still
-        // checks for any newly required target under the original room-set fence.
-        work.targets = self.trust.trusted().into_iter().collect();
         self.own_key_computer_pending.push_back(work);
         self.start_own_key_computer_drain();
     }
@@ -21018,7 +21023,6 @@ impl Node {
                 let _ = work.reply.send(Ok(()));
                 continue;
             }
-            work.targets.sort_unstable();
             let Ok(secret) = self.secret_work.clone().try_read_owned() else {
                 let _ = work.reply.send(Err(Error::AtRestLocked));
                 continue;
@@ -21034,108 +21038,26 @@ impl Node {
                 fence: Arc::clone(&fence),
                 result,
             });
-            let rooms: Vec<_> = self
-                .channels
-                .iter()
-                .map(|(id, room)| (*id, Arc::clone(room)))
-                .collect();
-            let watches: Vec<_> = rooms
-                .iter()
-                .map(|(id, _)| self.own_key_room_watch(*id))
-                .collect();
-            let mut room_set_changed = self.own_key_room_set_changed.subscribe();
             let mut epoch_changed = self.pairwise_epoch.subscribe();
             let wake = Arc::clone(&self.own_key_transition_wake);
-            let inspection_store = self.profile.as_ref().map(|profile| profile.store_handle());
             let computer = self.computer.clone();
             let binding = self.profile.as_ref().map(|profile| {
-                let signer = profile.signer_arc();
-                let name = self
-                    .paths
-                    .profile_dir
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .map(str::to_owned)
-                    .ok_or(Error::Profile("managed node name is unreadable"));
-                (signer, name)
+                (
+                    profile.signer_arc(),
+                    self.paths
+                        .profile_dir
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .map(str::to_owned)
+                        .ok_or(Error::Profile("managed node name is unreadable")),
+                )
             });
             tokio::spawn(async move {
-                let (rooms, preflight) = match inspection_store {
-                    Some(store) => match tokio::task::spawn_blocking(move || {
-                        let result = trust_save::inspect_policy_rooms(&rooms, &store);
-                        (rooms, result)
-                    })
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(_) => {
-                            if let Some(result) = completed.upgrade() {
-                                *result.lock().unwrap_or_else(|error| error.into_inner()) =
-                                    Some(OwnKeyComputerReady {
-                                        _secret: secret,
-                                        owner,
-                                        rooms: Vec::new(),
-                                        transitions: None,
-                                        publication: None,
-                                        preflight: Err(Error::Profile(
-                                            "Computer policy room inspection worker stopped",
-                                        )),
-                                        binding: Ok(()),
-                                        work,
-                                    });
-                                wake.notify_one();
-                            } else {
-                                let _ = work.reply.send(Err(Error::AtRestLocked));
-                            }
-                            return;
-                        }
-                    },
-                    None => (rooms, Ok(None)),
-                };
-                if preflight.as_ref().is_err() || matches!(&preflight, Ok(Some(_))) {
-                    if let Some(result) = completed.upgrade() {
-                        *result.lock().unwrap_or_else(|error| error.into_inner()) =
-                            Some(OwnKeyComputerReady {
-                                _secret: secret,
-                                owner,
-                                rooms,
-                                transitions: None,
-                                publication: None,
-                                preflight,
-                                binding: Ok(()),
-                                work,
-                            });
-                        wake.notify_one();
-                    } else {
-                        let _ = work.reply.send(Err(Error::AtRestLocked));
-                    }
-                    return;
-                }
-                let mut changes: Vec<_> = watches
-                    .into_iter()
-                    .map(|mut watch| {
-                        Box::pin(async move {
-                            let _ = watch.changed().await;
-                        })
-                    })
-                    .collect();
-                let retired = std::future::poll_fn(move |cx| {
-                    for change in &mut changes {
-                        if std::future::Future::poll(change.as_mut(), cx).is_ready() {
-                            return std::task::Poll::Ready(());
-                        }
-                    }
-                    std::task::Poll::Pending
-                });
-                tokio::pin!(retired);
-                let mut proceed = true;
                 let publication = tokio::select! {
                     biased;
-                    () = fence.retired() => { proceed = false; None },
-                    _ = work.reply.closed() => { proceed = false; None },
-                    _ = room_set_changed.changed() => { proceed = false; None },
-                    _ = epoch_changed.changed() => { proceed = false; None },
-                    _ = &mut retired => { proceed = false; None },
+                    () = fence.retired() => None,
+                    _ = work.reply.closed() => None,
+                    _ = epoch_changed.changed() => None,
                     publication = async {
                         match &computer {
                             Some(computer) => Some(computer.publication_transition().await),
@@ -21143,36 +21065,10 @@ impl Node {
                         }
                     } => publication,
                 };
-                let mut transitions = Vec::with_capacity(rooms.len());
-                for (_, room) in rooms.iter().filter(|_| proceed) {
-                    let gate = tokio::select! {
-                        biased;
-                        () = fence.retired() => None,
-                        _ = work.reply.closed() => None,
-                        _ = room_set_changed.changed() => None,
-                        _ = epoch_changed.changed() => None,
-                        _ = &mut retired => None,
-                        channel = room.lock() => Some(Arc::clone(&channel.own_writer_gate)),
-                    };
-                    let Some(gate) = gate else { break };
-                    let transition = tokio::select! {
-                        biased;
-                        () = fence.retired() => None,
-                        _ = work.reply.closed() => None,
-                        _ = room_set_changed.changed() => None,
-                        _ = epoch_changed.changed() => None,
-                        _ = &mut retired => None,
-                        transition = gate.transition(Some(&work.targets)) => Some(transition),
-                    };
-                    let Some(transition) = transition else { break };
-                    transitions.push(transition);
-                }
-                let transitions =
-                    (proceed && transitions.len() == rooms.len()).then_some(transitions);
                 let (publication, binding) = match (publication, binding, computer) {
                     (Some(publication), Some((signer, name)), Some(computer)) => {
                         match (signer, name) {
-                            (Ok(signer), Ok(name)) if transitions.is_some() => {
+                            (Ok(signer), Ok(name)) => {
                                 let guard = work.guard.clone();
                                 match tokio::task::spawn_blocking(move || {
                                     let result = (|| {
@@ -21202,7 +21098,6 @@ impl Node {
                                 }
                             }
                             (Err(error), _) | (_, Err(error)) => (Some(publication), Err(error)),
-                            _ => (Some(publication), Ok(())),
                         }
                     }
                     (publication, _, _) => (publication, Ok(())),
@@ -21212,11 +21107,8 @@ impl Node {
                         Some(OwnKeyComputerReady {
                             _secret: secret,
                             owner,
-                            rooms,
-                            transitions,
-                            binding,
                             publication,
-                            preflight,
+                            binding,
                             work,
                         });
                     wake.notify_one();
@@ -21229,26 +21121,21 @@ impl Node {
         self.resume_parked_construction();
     }
 
-    /// Retire sends from all current rooms off actor before committing a keyring removal.
+    /// Admit the keyring save without waiting for any room's sender work.
     fn begin_own_key_untrust(&mut self, command: NodeCommand, mut reply: oneshot::Sender<Outcome>) {
         if self.own_key_untrust_pending.is_some() {
             let _ = reply.send(Outcome::Failed(Fault::RoomChangePending));
             return;
         }
-        let target = match &command {
-            NodeCommand::Untrust { fingerprint } => *fingerprint,
-            NodeCommand::Proved { change } => match change.as_ref() {
-                NodeCommand::Untrust { fingerprint } => *fingerprint,
-                _ => {
-                    let _ = reply.send(Outcome::Failed(Fault::Internal));
-                    return;
-                }
-            },
+        match &command {
+            NodeCommand::Untrust { .. } => {}
+            NodeCommand::Proved { change }
+                if matches!(change.as_ref(), NodeCommand::Untrust { .. }) => {}
             _ => {
                 let _ = reply.send(Outcome::Failed(Fault::Internal));
                 return;
             }
-        };
+        }
         let Ok(secret) = self.secret_work.clone().try_read_owned() else {
             let _ = reply.send(Outcome::Failed(Fault::Locked));
             return;
@@ -21259,46 +21146,16 @@ impl Node {
         if let Some(net) = self.net.as_ref() {
             net.forget_board_exchanges();
         }
-        let rooms: Vec<_> = self
-            .channels
-            .iter()
-            .map(|(room, instance)| (*room, Arc::clone(instance)))
-            .collect();
-        let watches: Vec<_> = rooms
-            .iter()
-            .map(|(room, _)| self.own_key_room_watch(*room))
-            .collect();
         let mut epoch_changed = self.pairwise_epoch.subscribe();
-        let mut room_set_changed = self.own_key_room_set_changed.subscribe();
         let completions = Arc::clone(&self.own_key_completions);
         let lifecycle_epoch = completions.lifecycle_epoch();
         let computer = self.computer.clone();
         tokio::spawn(async move {
-            let mut transitions = Vec::with_capacity(rooms.len());
-            let mut changes: Vec<_> = watches
-                .into_iter()
-                .map(|mut watch| {
-                    Box::pin(async move {
-                        let _ = watch.changed().await;
-                    })
-                })
-                .collect();
-            let retired = std::future::poll_fn(move |cx| {
-                for change in &mut changes {
-                    if std::future::Future::poll(change.as_mut(), cx).is_ready() {
-                        return std::task::Poll::Ready(());
-                    }
-                }
-                std::task::Poll::Pending
-            });
-            tokio::pin!(retired);
             let mut proceed = true;
             let journal = tokio::select! {
                 biased;
                 _ = reply.closed() => { proceed = false; None },
                 _ = epoch_changed.changed() => { proceed = false; None },
-                _ = room_set_changed.changed() => { proceed = false; None },
-                _ = &mut retired => { proceed = false; None },
                 journal = async {
                     match &computer {
                         Some(computer) => Some(computer.journal_writer().await),
@@ -21306,35 +21163,12 @@ impl Node {
                     }
                 } => journal,
             };
-            for (_, instance) in rooms.iter().filter(|_| proceed) {
-                let gate: Option<Arc<crate::node::channel::own_writer_gate::Gate>> = tokio::select! {
-                    biased;
-                    _ = reply.closed() => None,
-                    _ = epoch_changed.changed() => None,
-                    _ = room_set_changed.changed() => None,
-                    _ = &mut retired => None,
-                    channel = instance.lock() => Some(Arc::clone(&channel.own_writer_gate)),
-                };
-                let Some(gate) = gate else { break };
-                let transition = tokio::select! {
-                    biased;
-                    _ = reply.closed() => None,
-                    _ = epoch_changed.changed() => None,
-                    _ = room_set_changed.changed() => None,
-                    _ = &mut retired => None,
-                    transition = gate.transition(Some(std::slice::from_ref(&target))) => Some(transition),
-                };
-                let Some(transition) = transition else { break };
-                transitions.push(transition);
-            }
-            let transitions = (proceed && transitions.len() == rooms.len()).then_some(transitions);
             completions.complete_lifecycle(
                 lifecycle_epoch,
                 leave_save::Ready::Untrust {
                     _secret: secret,
                     owner,
-                    rooms,
-                    transitions,
+                    admitted: proceed,
                     journal,
                     command,
                     reply,
@@ -23127,22 +22961,13 @@ impl Node {
     /// Called whenever either input moves — the keyring (`Trust`/`Revoke`) or a channel's
     /// author set (any board admission) — and once per accept as a backstop.
     async fn refresh_reachers(&mut self) {
-        let _ = self.refresh_reachers_causal(None).await;
-    }
-
-    /// Recompute reachers for one computer-policy event. Its owner is checked after every await
-    /// and immediately before publication: a command deadline or exact target supersession
-    /// empties registered gates, while elapsed live-follower observation time is not authority.
-    async fn refresh_reachers_guarded(
-        &mut self,
-        guard: &computer::ComputerPolicyGuard,
-    ) -> crate::error::Result<()> {
-        self.refresh_reachers_causal(Some(guard)).await
+        let _ = self.refresh_reachers_causal(None, None).await;
     }
 
     async fn refresh_reachers_causal(
         &mut self,
         causal: Option<&computer::ComputerPolicyGuard>,
+        only_room: Option<Digest32>,
     ) -> crate::error::Result<()> {
         // A **locked** node is not a node that withdrew its trust. `lock` clears the keyring
         // because it is sealed under the identity (ADR-020 §3), so recomputing here would
@@ -23153,9 +22978,12 @@ impl Node {
         if self.profile.is_none() {
             return Ok(());
         }
-        let trusted = self.trust.trusted();
         let mut room_error = None;
-        for (cid, shared) in &self.channels {
+        for (cid, shared) in self
+            .channels
+            .iter()
+            .filter(|(cid, _)| only_room.is_none_or(|room| room == **cid))
+        {
             let ch = shared.lock().await;
             if let Some(guard) = causal {
                 if let Err(error) = guard.active(self.computer.as_ref()) {
@@ -23175,7 +23003,7 @@ impl Node {
             let next = (|| -> crate::error::Result<_> {
                 let mut next = std::collections::BTreeSet::new();
                 if !left && !ch.is_member_removed(profile.store(), &ch.me())? {
-                    for fp in &trusted {
+                    for (fp, _) in self.trust.iter() {
                         if ch.is_member(fp) && !ch.is_member_removed(profile.store(), fp)? {
                             next.insert(*fp);
                         }
@@ -23241,6 +23069,9 @@ impl Node {
                     ch.services().clone()
                 },
             );
+        }
+        if only_room.is_some() {
+            return room_error.map_or(Ok(()), Err);
         }
         // A channel this node no longer holds must deny, including to tasks still holding
         // the handle: empty it before letting go, or they would read the last value forever.
@@ -23312,141 +23143,6 @@ impl Node {
         let now_ms = self.now_ms();
         self.refresh_node_retention(now_ms);
         self.node_retention.for_room(channel_id)
-    }
-
-    async fn attention(
-        &self,
-        channel_id: &Digest32,
-        by: Digest32,
-        expected_instance: Option<[u8; 16]>,
-        operation: crate::node::attention::Operation,
-    ) -> Result<crate::node::attention::Reply, String> {
-        let profile = self
-            .profile
-            .as_ref()
-            .filter(|p| p.is_unlocked())
-            .ok_or("this node is locked")?;
-        let owner = profile.fingerprint();
-        if by != owner && !self.computer_authority_current() {
-            return Err("attention waits for current computer trust".into());
-        }
-        if by != owner
-            && (!matches!(operation, crate::node::attention::Operation::Page(_))
-                || !self.trust.has_drive(&by)
-                || !self.trust.is_trusted(&by))
-        {
-            return Err("attention requires current drive permission".into());
-        }
-        let shared = self
-            .channels
-            .get(channel_id)
-            .ok_or("the room is not open")?;
-        let mut channel = shared.lock().await;
-        if by != owner && !channel.is_member(&by) {
-            return Err("attention requires current room membership".into());
-        }
-        if !matches!(&operation, crate::node::attention::Operation::Page(_)) {
-            if let Some(expected) = expected_instance {
-                if channel
-                    .history_instance(profile.store())
-                    .map_err(|error| error.to_string())?
-                    != expected
-                {
-                    return Err("the selected room changed; refresh and retry".into());
-                }
-            }
-        }
-        if matches!(&operation, crate::node::attention::Operation::Page(_)) {
-            // Reading already-committed attention takes no physical publication lease.
-            // A policy transition waiting for a save must not block the old committed
-            // selection; a completed transition still invalidates it before release.
-            if !self.computer_authority_current() {
-                return Err("attention waits for current computer trust".into());
-            }
-            let result = channel.attention(
-                profile.store(),
-                owner,
-                expected_instance,
-                operation,
-                (self.millis_clock)(),
-            );
-            return if self.computer_authority_current() {
-                result
-            } else {
-                Err("attention waits for current computer trust".into())
-            };
-        }
-        let write = || {
-            channel.attention(
-                profile.store(),
-                owner,
-                expected_instance,
-                operation,
-                (self.millis_clock)(),
-            )
-        };
-        self.with_current_computer_authority(write)
-            .ok_or_else(|| "attention waits for current computer trust".to_owned())?
-    }
-
-    async fn admit_session_drive(
-        &self,
-        channel_id: Digest32,
-        session: &str,
-        bodies: &[String],
-        drive: crate::node::session_ingress::DriveAdmission,
-    ) -> crate::node::session_ingress::AdmissionResult {
-        use crate::error::Error;
-        use crate::node::channel::session_projection::{Query, Reply};
-        let refuse =
-            || Error::Profile("Drive authority or Session opening changed; nothing was sent");
-        let profile = self
-            .profile
-            .as_ref()
-            .filter(|p| p.is_unlocked())
-            .ok_or_else(refuse)?;
-        if drive.author != profile.fingerprint()
-            && (!self.trust.is_trusted(&drive.author) || !self.trust.has_drive(&drive.author))
-        {
-            return Err(refuse().into());
-        }
-        if self.store_save_pending() || self.failed_post_reads.contains_key(&channel_id) {
-            return Err(refuse().into());
-        }
-        let shared = self.channels.get(&channel_id).ok_or_else(refuse)?.clone();
-        let mut room = shared.lock().await;
-        if room.is_poisoned()
-            || !room.is_member(&drive.author)
-            || room
-                .history_instance(profile.store())
-                .map_err(|_| refuse())?
-                != drive.instance
-        {
-            return Err(refuse().into());
-        }
-        let answer = room
-            .session_query(
-                profile.store(),
-                Query::Exact {
-                    node: profile.fingerprint(),
-                    id: session.to_owned(),
-                },
-                crate::node::ipc::rows_budget(),
-                self.now_ms().get(),
-            )
-            .map_err(|_| refuse())?;
-        match answer {
-            Reply::Page { rows, revision, .. }
-                if !revision.provisional()
-                    && rows
-                        .iter()
-                        .any(|row| row.open && row.opening == drive.opening) => {}
-            _ => return Err(refuse().into()),
-        }
-        self.with_current_computer_authority(|| {
-            crate::node::session_ingress::admit_drive(profile, channel_id, session, &drive, bodies)
-        })
-        .ok_or_else(refuse)?
     }
 
     async fn deliver_session_drive(
@@ -23740,15 +23436,6 @@ impl Node {
             for peer in members {
                 self.pull_private_sessions(room, peer).await;
             }
-        }
-    }
-
-    /// Reannounce this node's private-stream capability after a local authorization boundary.
-    /// Each room coalesces repeated changes into one authenticated public control record.
-    async fn owe_private_support_in_open_rooms(&mut self) {
-        let rooms: Vec<_> = self.channels.values().map(Arc::clone).collect();
-        for room in rooms {
-            room.lock().await.owe_private_support();
         }
     }
 
@@ -26413,6 +26100,9 @@ pub fn fault_of(e: &Error) -> Fault {
         Error::Profile("locked") => Fault::Locked,
         Error::Profile("no such room on this node") => Fault::UnknownChannel,
         Error::ComputerPolicySuperseded => Fault::ComputerPolicy,
+        Error::Profile("this room's trust withdrawal is incomplete") => {
+            Fault::TrustRemovalIncomplete
+        }
         Error::Profile("computer policy changed before the room mutation") => Fault::ComputerPolicy,
         Error::Profile(crate::node::channel::UNSUPPORTED_ROOM_FORMAT) => {
             Fault::UnsupportedRoomFormat

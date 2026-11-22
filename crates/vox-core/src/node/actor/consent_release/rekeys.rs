@@ -62,7 +62,6 @@ pub(in crate::node::actor) struct Target {
     step: Step,
     all_sent: bool,
     legacy_before: Option<LegacySessionRollback>,
-    reservations: Vec<prekeys::OneTimeReservation>,
     #[cfg(feature = "test-knobs")]
     generations: Vec<u64>,
 }
@@ -413,7 +412,6 @@ impl Node {
                 step: Step::Ready,
                 all_sent: true,
                 legacy_before: None,
-                reservations: Vec::new(),
                 #[cfg(feature = "test-knobs")]
                 generations: Vec::with_capacity(capacity),
             };
@@ -475,6 +473,14 @@ impl Node {
                             epoch: target.pass.attachment,
                         },
                         credit: admission.job,
+                        prekey: hello
+                            .then(|| {
+                                self.initiated
+                                    .get(&(room, target.peer))
+                                    .and_then(|opening| opening.reservation.as_deref())
+                                    .cloned()
+                            })
+                            .flatten(),
                     },
                 ));
             }
@@ -512,6 +518,7 @@ impl Node {
                             epoch: target.pass.attachment,
                         },
                         credit: admission.job,
+                        prekey: delivery.prekey.clone(),
                     },
                 ));
                 continue;
@@ -644,12 +651,6 @@ impl Node {
                     .await;
                     return;
                 };
-                if let Some(prekey) = prekey {
-                    target.reservations.push(prekey);
-                }
-                if let Some(prekey) = frame.one_time_prekey {
-                    self.refused_otps.note(target.peer, prekey);
-                }
                 let bytes = frame.frame.into_boxed_slice();
                 self.deliveries.insert(
                     (room, target.peer, generation),
@@ -659,6 +660,7 @@ impl Node {
                         key: key_ref,
                         reservation,
                         opening: frame.opening,
+                        prekey: prekey.clone(),
                     },
                 );
                 self.key_left(&room, target.peer);
@@ -679,6 +681,7 @@ impl Node {
                             epoch: target.pass.attachment,
                         },
                         credit,
+                        prekey,
                     },
                 ));
             }
@@ -769,9 +772,6 @@ impl Node {
                 .insert(pair, (watched, !target.all_sent));
         }
         let jobs = std::mem::take(&mut target.jobs);
-        let hello = jobs
-            .iter()
-            .any(|(_, job)| matches!(&job.after, AfterWrite::Key { hello: true, .. }));
         #[cfg(feature = "test-knobs")]
         let bypass = crate::node::computer::fx28_mutant("stale-rekey-authority");
         #[cfg(not(feature = "test-knobs"))]
@@ -808,9 +808,6 @@ impl Node {
             }
         } else if target.all_sent {
             target.pass.delivered += 1;
-        }
-        if published && hello {
-            self.note_owned_legacy_hello(room, target.peer);
         }
         #[cfg(feature = "test-knobs")]
         if held_for_proof {

@@ -261,15 +261,6 @@ impl Node {
         self.begin_owned_owed_consents_for(lifetime, None, reply)
             .await;
     }
-    pub(super) async fn begin_managed_owed_consents(
-        &mut self,
-        lifetime: Arc<Lifetime>,
-        guard: computer::ComputerPolicyGuard,
-        reply: oneshot::Sender<crate::error::Result<()>>,
-    ) {
-        self.begin_owned_consent_pass(None, Some(lifetime), Some(reply), Some(guard))
-            .await;
-    }
 
     /// As the original owed-consent pass, the requested identity is dialled once immediately;
     /// it does not filter out other admitted/trusted members' existing durable obligations.
@@ -605,6 +596,12 @@ impl Node {
         decision: Option<crate::node::consent_order::Stamp>,
     ) -> std::result::Result<(Skdm, Option<ReleasePlan>, bool), Fault> {
         let profile = self.profile.as_ref().ok_or(Fault::UnknownChannel)?;
+        channel
+            .require_trust_withdrawn(
+                profile.store(),
+                profile.signer().map_err(|error| fault_of(&error))?,
+            )
+            .map_err(|error| fault_of(&error))?;
         if !channel.is_author(&target) {
             return Err(Fault::NotAdmitted);
         }
@@ -1054,6 +1051,21 @@ impl Node {
         {
             if package_seq.is_some() || consent_seq.is_some() {
                 self.note_local_governance_append(&room);
+            }
+        }
+        if matches!(
+            &continuation.stage,
+            Stage::Online { .. } | Stage::Legacy { .. }
+        ) {
+            let checked = continuation
+                .instance
+                .lock()
+                .await
+                .require_trust_withdrawn(&lifetime.store, lifetime.signer.as_ref());
+            if let Err(error) = checked {
+                self.fail_owned_consent(room, error, continuation, reply)
+                    .await;
+                return;
             }
         }
         let stage = std::mem::replace(&mut continuation.stage, Stage::Vacant);

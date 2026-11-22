@@ -1165,7 +1165,6 @@ impl Node {
         if lifetime
             .publish(|| {
                 self.role_wake.install(room, &channel.role_owed());
-                self.own_key_room_set_changed.send_replace(());
                 if let Some(net) = self.net.as_ref() {
                     net.forget_board_exchange_room(&room);
                 }
@@ -1214,7 +1213,6 @@ impl Node {
             .publish(|| {
                 self.role_wake
                     .install(parsed.channel_id, &channel.role_owed());
-                self.own_key_room_set_changed.send_replace(());
                 if let Some(net) = self.net.as_ref() {
                     net.forget_board_exchange_room(&parsed.channel_id);
                 }
