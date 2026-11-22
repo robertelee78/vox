@@ -52,6 +52,11 @@ const SEK_WRAPS: TableDefinition<Digest32, &[u8]> = TableDefinition::new("sek_wr
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const META_SCHEMA: &str = "schema_version";
 
+// redb starts small and doubles; avoid reclaiming ordinary small-store growth slack.
+const MIN_COMPACTION_RECLAIM_BYTES: u64 = 64 * 1024 * 1024;
+// Bound unlock work: larger live stores wait until retention brings them below this cap.
+const MAX_COMPACTION_USED_BYTES: u64 = 256 * 1024 * 1024;
+
 /// Successful store-backend flush calls across this process, including opening, recovery and
 /// rewrite files. Count the completed I/O, not transactions classified as durable.
 static FULL_FLUSHES: AtomicU64 = AtomicU64::new(0);
@@ -1473,31 +1478,36 @@ impl Store {
     /// Startup only, before sharing the store: allocated pages include the metadata trees,
     /// unlike the sum of row bodies. An overflowing comparison cannot exceed a u64 file.
     pub(crate) fn compact_if_needed(&mut self, notice: impl FnOnce(u64, u64)) -> Result<bool> {
-        let stats = {
+        let used_bytes = {
             let backing = self.db.get_mut().unwrap_or_else(PoisonError::into_inner);
             let Backing::Writable(db) = backing else {
                 return Ok(false);
             };
-            let txn = db.inner.begin_write().map_err(storage("measure store"))?;
-            let stats = txn.stats().map_err(storage("measure store"))?;
-            txn.abort().map_err(storage("finish store measurement"))?;
-            stats
+            let txn = db.inner.begin_read().map_err(storage("measure store"))?;
+            txn.allocated_bytes().map_err(storage("measure store"))?
         };
         let file_bytes = std::fs::metadata(&self.path)
             .map_err(storage("measure store file"))?
             .len();
-        let used_bytes = stats
-            .allocated_pages()
-            .checked_mul(stats.page_size() as u64);
         let Some((used_bytes, twice_used)) =
-            used_bytes.and_then(|used| used.checked_mul(2).map(|twice| (used, twice)))
+            used_bytes.checked_mul(2).map(|twice| (used_bytes, twice))
         else {
             return Ok(false);
         };
-        if file_bytes <= twice_used {
+        if file_bytes <= twice_used
+            || file_bytes - used_bytes < MIN_COMPACTION_RECLAIM_BYTES
+            || used_bytes > MAX_COMPACTION_USED_BYTES
+        {
             return Ok(false);
         }
         notice(file_bytes, used_bytes);
+        #[cfg(feature = "test-knobs")]
+        if std::env::var_os("VOX_TEST_COMPACT_FAIL").is_some() {
+            return Err(Error::Storage {
+                op: "compact",
+                detail: "compaction fault staged by proof".into(),
+            });
+        }
         self.compact()
     }
 

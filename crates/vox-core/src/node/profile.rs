@@ -421,9 +421,9 @@ impl Profile {
         std::sync::Arc::clone(&self.store)
     }
 
-    /// Reclaim in place at writable startup only when file bytes exceed twice the reachable
-    /// allocated page bytes, including metadata. `notice` explains the wait before work begins.
-    /// No shared room worker may hold the store yet.
+    /// Reclaim in place at verified unlock when slack and used space meet startup limits.
+    /// `notice` explains the wait before work begins. Shared ownership is reported to the
+    /// caller, which logs why compaction cannot run and continues ordinary startup.
     pub(crate) fn compact_store(&mut self, notice: impl FnOnce(u64, u64)) -> Result<bool> {
         let store = Arc::get_mut(&mut self.store).ok_or(Error::Profile(
             "startup compaction needs the store before it is shared",

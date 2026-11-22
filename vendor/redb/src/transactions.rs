@@ -2799,6 +2799,11 @@ impl ReadTransaction {
         })
     }
 
+    /// Vox decides whether to compact from allocator state without reading the store.
+    pub fn allocated_bytes(&self) -> Result<u64> {
+        Ok(self.mem.count_allocated_pages()? * self.mem.get_page_size() as u64)
+    }
+
     /// Open the given table
     pub fn open_table<K: Key + 'static, V: Value + 'static>(
         &self,

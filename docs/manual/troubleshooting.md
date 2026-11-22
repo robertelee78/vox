@@ -281,14 +281,18 @@ with its previously saved messages.
 ## Startup says it is reclaiming unused store space
 
 After verifying an identity, the daemon compacts its store in place when the file is more
-than twice its reachable allocated page bytes, including metadata. The foreground daemon
-and its log say `reclaiming unused store space in place` before starting. A large store can
-take a while: that node becomes Ready only after compaction finishes, then its rooms reopen.
+than twice its reachable allocated page bytes, including metadata, and reclaiming the unused
+space would return at least 64 MiB, and it holds at most 256 MiB. Larger live stores
+are left alone until retention reduces what they hold. Smaller stores keep their ordinary
+growth slack. The foreground daemon and its log say `reclaiming unused store space in place`
+before starting. That node becomes Ready when compaction finishes, then its rooms reopen.
+On one measured Mac, unlocking a file holding 249 MB took 1.73 seconds with compaction,
+and 0.30 seconds without; disk speed and store shape affect this, not just file size.
 There is no second store file or replacement rename. A locked identity is not compacted.
 
-If compaction fails, startup reports the storage error and asks you to free disk space and
-unlock again. Do not delete the store: its previously acknowledged rows remain the source
-for the next startup.
+If compaction cannot run or fails, the daemon log names the node and the storage error, and
+startup continues using the last committed store. Compaction is optional, not a reason to
+keep an otherwise usable node Locked. Do not delete or reset the store.
 
 ## A restored node writes nothing until its own history is recovered
 

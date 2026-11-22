@@ -943,9 +943,30 @@ fn a_member_who_joins_after_messages_expired_catches_up() {
 #[test]
 #[ignore = "real daemon, grown/expired store and crash during in-place compaction"]
 fn a_restart_compacts_expired_space_and_keeps_acknowledged_rows_after_a_crash() {
+    compaction_journey(false, false);
+}
+
+#[cfg(feature = "test-knobs")]
+#[test]
+#[ignore = "real daemon and grown/expired store with compaction failure"]
+fn a_failed_startup_compaction_still_opens_the_node_and_its_rooms() {
+    compaction_journey(true, false);
+}
+
+#[cfg(feature = "test-knobs")]
+#[test]
+#[ignore = "real daemon and store holding more than 256 MiB"]
+fn a_store_holding_more_than_the_startup_cap_is_left_alone() {
+    compaction_journey(false, true);
+}
+
+#[cfg(feature = "test-knobs")]
+fn compaction_journey(failure: bool, over_cap: bool) {
+    use redb::ReadableDatabase;
     use vox_core::node::ipc::{Frame, IpcClient, NodeSocket, Request};
     use vox_core::node::paths::{NodeName, Paths};
     const DAY: i64 = 86_400_000;
+    let measure = std::env::var_os("VOX_MUTANT_RG13_MEASURE").is_some();
     let tmp = tempfile::tempdir().expect("APPARATUS: scratch account");
     let root = tmp.path();
     std::fs::create_dir(root.join("cfg")).unwrap();
@@ -962,11 +983,27 @@ fn a_restart_compacts_expired_space_and_keeps_acknowledged_rows_after_a_crash() 
             .env_remove("VOX_NODE")
             .env_remove("VOX_IDENTITY_PASSPHRASE")
             .env_remove("VOX_TEST_COMPACT_RELOCATED")
+            .env_remove("VOX_TEST_COMPACT_FAIL")
+            .env_remove("VOX_TEST_COMPACT_FAILURE_LOCKS")
+            .env_remove("VOX_TEST_SKIP_STARTUP_COMPACTION")
+            .env_remove("VOX_TEST_COMPACT_IGNORE_CAP")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(std::fs::File::create(root.join(format!("daemon-{tag}.err"))).unwrap());
         if let Some(marker) = marker {
             cmd.env("VOX_TEST_COMPACT_RELOCATED", marker);
+        }
+        if std::env::var_os("VOX_MUTANT_SKIP_STARTUP_COMPACTION").is_some() {
+            cmd.env("VOX_TEST_SKIP_STARTUP_COMPACTION", "1");
+        }
+        if std::env::var_os("VOX_MUTANT_REMOVE_COMPACTION_CAP").is_some() {
+            cmd.env("VOX_TEST_COMPACT_IGNORE_CAP", "1");
+        }
+        if tag == "failed" {
+            cmd.env("VOX_TEST_COMPACT_FAIL", "1");
+            if std::env::var_os("VOX_MUTANT_COMPACTION_FAILURE_LOCKS").is_some() {
+                cmd.env("VOX_TEST_COMPACT_FAILURE_LOCKS", "1");
+            }
         }
         let mut child = cmd.spawn().expect("APPARATUS: spawn scratch daemon");
         writeln!(child.stdin.take().unwrap(), "{IDENTITY}").unwrap();
@@ -997,7 +1034,9 @@ fn a_restart_compacts_expired_space_and_keeps_acknowledged_rows_after_a_crash() 
                 .block_on(client.request(&request))
                 .expect("APPARATUS: request");
             if !matches!(&frame, Frame::Error { reason } if reason.contains("permissions are still being read")
-                || reason.contains("room governance is refreshing"))
+                || reason.contains("room governance is refreshing")
+                || reason.contains("preparing its saved history")
+                || reason.contains("refreshing saved history"))
             {
                 break frame;
             }
@@ -1034,25 +1073,60 @@ fn a_restart_compacts_expired_space_and_keeps_acknowledged_rows_after_a_crash() 
         .unwrap()
         .0;
     let room = vox_core::node::link::b32_encode(&cid);
-    let read_room = || {
-        let started = Instant::now();
-        loop {
-            let (ok, shown, err) = vox(root, &["room", "read", &room, "--json"], None);
-            if ok {
-                break shown;
-            }
-            assert!(
-                (err.contains("preparing its saved history")
-                    || err.contains("refreshing saved history"))
-                    && started.elapsed() < Duration::from_secs(180),
-                "PRODUCT (staging): saved room did not become readable: {shown}{err}"
-            );
-            std::thread::sleep(Duration::from_millis(100));
+    let read_room = || loop {
+        let (ok, shown, err) = vox(root, &["room", "read", &room, "--json"], None);
+        if ok {
+            break shown;
         }
+        assert!(
+            err.contains("preparing its saved history") || err.contains("refreshing saved history"),
+            "PRODUCT (staging): saved room did not become readable: {shown}{err}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
     };
-    let (ok, out, err) = vox(root, &["room", "retention", &room, "1d"], None);
-    assert!(ok, "PRODUCT (staging): retention: {out}{err}");
-    for id in 0..128 {
+    if !failure && !measure && !over_cap {
+        stop(initial);
+        let small_file = paths.store_file();
+        let before = std::fs::metadata(&small_file).unwrap().len();
+        assert!(
+            before < 64 * 1024 * 1024,
+            "APPARATUS: small-store fixture reached 64 MiB: {before}"
+        );
+        let small = launch("small", 0, None);
+        attached(root, "small");
+        let after = std::fs::metadata(&small_file).unwrap().len();
+        let log = std::fs::read_to_string(root.join("daemon-small.err")).unwrap();
+        assert_eq!(
+            before, after,
+            "PRODUCT: startup resized a small store: {log}"
+        );
+        assert!(
+            !log.contains("reclaiming unused store space"),
+            "PRODUCT: small store startup announced compaction: {log}"
+        );
+        stop(small);
+    } else {
+        stop(initial);
+    }
+    let initial = launch("grow", 0, None);
+    attached(root, "grow");
+    let _ = read_room();
+    if !measure && !over_cap {
+        let (ok, out, err) = vox(root, &["room", "retention", &room, "1d"], None);
+        assert!(ok, "PRODUCT (staging): retention: {out}{err}");
+    }
+    let mut id = 0;
+    loop {
+        let posts = if over_cap {
+            6000
+        } else if measure {
+            4400
+        } else {
+            1024
+        };
+        if id >= posts {
+            break;
+        }
         let frame = request(Request::Post {
             channel_id: cid,
             text: format!("expire-{id:04}-{}", "x".repeat(60_000)),
@@ -1062,21 +1136,33 @@ fn a_restart_compacts_expired_space_and_keeps_acknowledged_rows_after_a_crash() 
             matches!(frame, Frame::Ok),
             "PRODUCT (staging): grow post {id}: {frame:?}"
         );
+        id += 1;
     }
-    stop(initial);
-    let expired = launch("expiry", 2 * DAY, None);
-    attached(root, "expiry");
-    let started = Instant::now();
+    eprintln!(
+        "APPARATUS: grew store through {id} acknowledged 60000-byte posts; file {} bytes",
+        std::fs::metadata(paths.store_file()).unwrap().len()
+    );
+    let expired = if measure || over_cap {
+        // Expire in the running daemon so startup cannot first shrink a just-grown file.
+        let (ok, out, err) = vox(root, &["room", "retention", &room, "1s"], None);
+        assert!(ok, "PRODUCT (staging): large-store expiry: {out}{err}");
+        initial
+    } else {
+        stop(initial);
+        let expired = launch("expiry", 2 * DAY, None);
+        attached(root, "expiry");
+        expired
+    };
     loop {
         let shown = read_room();
         if !shown.contains("expire-") {
             break;
         }
-        assert!(
-            started.elapsed() < Duration::from_secs(180),
-            "PRODUCT (staging): old bodies did not expire: {shown}"
-        );
         std::thread::sleep(Duration::from_millis(100));
+    }
+    if measure || over_cap {
+        let (ok, out, err) = vox(root, &["room", "retention", &room, "forever"], None);
+        assert!(ok, "PRODUCT (staging): retain measurement rows: {out}{err}");
     }
     for id in 0..8 {
         let frame = request(Request::Post {
@@ -1148,23 +1234,224 @@ fn a_restart_compacts_expired_space_and_keeps_acknowledged_rows_after_a_crash() 
     let file = paths.store_file();
     let before = std::fs::metadata(&file).unwrap().len();
     let db = redb::Database::open(&file).expect("APPARATUS: inspect stopped store");
-    let txn = db.begin_write().unwrap();
-    let stats = txn.stats().unwrap();
-    let used = stats
-        .allocated_pages()
-        .checked_mul(stats.page_size() as u64)
-        .unwrap();
-    txn.abort().unwrap();
+    let txn = db.begin_read().unwrap();
+    let used = txn.allocated_bytes().unwrap();
+    drop(txn);
     drop(db);
     assert!(
         before > used.checked_mul(2).unwrap(),
         "APPARATUS: expiry did not reach compaction threshold: file {before}, reachable {used}"
     );
+    assert!(
+        before - used >= 64 * 1024 * 1024,
+        "APPARATUS: expiry did not free 64 MiB: file {before}, used {used}"
+    );
+    if over_cap {
+        assert!(
+            used > 256 * 1024 * 1024,
+            "APPARATUS: over-cap store did not hold more than 256 MiB: {used}"
+        );
+        let restarted = launch("over-cap", 0, None);
+        attached(root, "over-cap");
+        retained();
+        let after = std::fs::metadata(&file).unwrap().len();
+        let log = std::fs::read_to_string(root.join("daemon-over-cap.err")).unwrap();
+        if std::env::var_os("VOX_MUTANT_REMOVE_COMPACTION_CAP").is_some() {
+            assert!(
+                log.contains("mutant remove_compaction_cap engaged"),
+                "APPARATUS: cap mutant not seen: {log}"
+            );
+            eprintln!("{log}");
+        }
+        assert_eq!(
+            before, after,
+            "PRODUCT: startup compacted an over-cap store: used {used}; {log}"
+        );
+        assert!(
+            !log.contains("reclaiming unused store space"),
+            "PRODUCT: over-cap store startup announced compaction: {log}"
+        );
+        eprintln!(
+            "PRODUCT: over-cap store unchanged at {before} bytes, holding {used}; no wait line"
+        );
+        stop(restarted);
+        return;
+    }
+    if measure {
+        assert!(
+            (230 * 1024 * 1024..=256 * 1024 * 1024).contains(&used),
+            "APPARATUS: cap measurement must hold about 250 MiB: {used}"
+        );
+    }
+    if failure {
+        let failed = launch("failed", 2 * DAY, None);
+        // Unlock's own reply reports the terminal startup outcome, not elapsed silence.
+        let (ok, out, err) = vox(root, &["node", "unlock", "default"], None);
+        let log = std::fs::read_to_string(root.join("daemon-failed.err")).unwrap();
+        if std::env::var_os("VOX_MUTANT_COMPACTION_FAILURE_LOCKS").is_some() {
+            assert!(
+                log.contains("mutant compaction_failure_locks engaged"),
+                "APPARATUS: mutant not seen in daemon: {log}"
+            );
+            eprintln!("{log}");
+        }
+        assert!(
+            ok && out.contains("Ready"),
+            "PRODUCT: failed compaction kept node from Ready: {out}{err}; daemon: {log}"
+        );
+        retained();
+        assert!(
+            log.contains("node default: store compaction skipped:")
+                && log.contains("compaction fault staged by proof")
+                && log.contains("continuing startup"),
+            "PRODUCT: compaction failure did not name node and true reason: {log}"
+        );
+        eprintln!("PRODUCT: compaction failed, node Ready, room and retained private step readable; {log}");
+        stop(failed);
+        return;
+    }
     let saved = root.join("acknowledged.redb");
     std::fs::copy(&file, &saved).unwrap();
+    if measure {
+        use vox_core::node::daemonipc::{DaemonClient, DaemonFrame, DaemonRequest, KeepSource};
+        let shipped = std::env::var_os("RG13_SHIPPED_VOX")
+            .map(PathBuf::from)
+            .expect("APPARATUS: RG13_SHIPPED_VOX names the no-features binary");
+        let passphrase_file = root.join("measurement.passphrase");
+        std::fs::write(&passphrase_file, format!("{IDENTITY}\n")).unwrap();
+        let measured_cli = |args: &[&str]| {
+            Command::new(&shipped)
+                .args(args)
+                .env("VOX_DATA_DIR", root)
+                .env("VOX_CONFIG_DIR", root.join("cfg"))
+                .env_remove("VOX_IDENTITY_PASSPHRASE")
+                .env_remove("VOX_NODE")
+                .env_remove("VOX_ROOM")
+                .stdin(Stdio::null())
+                .output()
+                .expect("APPARATUS: measurement command")
+        };
+        // The CLI chooses the login Keychain on macOS even with a passphrase file.
+        // Send its real unlock request with the supported File source, touching no Keychain.
+        let measured_unlock = || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let mut daemon = DaemonClient::open(&paths.account().socket())
+                    .await
+                    .expect("APPARATUS: measurement unlock socket");
+                let started = Instant::now();
+                let frame = daemon
+                    .request(DaemonRequest::Attach {
+                        node: NodeName::parse("default").unwrap(),
+                        passphrase: Some(IDENTITY.to_owned().into()),
+                        keep: Some(KeepSource::File(passphrase_file.clone())),
+                        rooms: Vec::new(),
+                        anchors: Vec::new(),
+                    })
+                    .await
+                    .expect("APPARATUS: measurement unlock request");
+                (started.elapsed(), frame)
+            })
+        };
+        let measured_daemon = |tag: &str| {
+            let child = Command::new(&shipped)
+                .args(["daemon", "--no-node", "--listen", "127.0.0.1:0"])
+                .env("VOX_DATA_DIR", root)
+                .env("VOX_CONFIG_DIR", root.join("cfg"))
+                .env("VOX_PROXY", "127.0.0.1:0")
+                .env_remove("VOX_IDENTITY_PASSPHRASE")
+                .env_remove("VOX_NODE")
+                .env_remove("VOX_ROOM")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(std::fs::File::create(root.join(format!("daemon-{tag}.err"))).unwrap())
+                .spawn()
+                .expect("APPARATUS: no-features measurement daemon");
+            Daemon(child)
+        };
+        // Foreground fixture starts were not kept. This daemon serves the locked node,
+        // so the CLI's explicit unlock defines the start of the measured interval.
+        let measuring = measured_daemon("measure");
+        loop {
+            if rt
+                .block_on(DaemonClient::open(&paths.account().socket()))
+                .is_ok()
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::scope(|scope| {
+            let started = Instant::now();
+            let unlock = scope.spawn(measured_unlock);
+            loop {
+                let log = std::fs::read_to_string(root.join("daemon-measure.err")).unwrap();
+                if log.contains("reclaiming unused store space in place") {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let status = measured_cli(&["status"]);
+            eprintln!(
+                "MEASUREMENT vox status exit={:?}:\n{}{}",
+                status.status.code(),
+                String::from_utf8_lossy(&status.stdout),
+                String::from_utf8_lossy(&status.stderr)
+            );
+            let rooms = measured_cli(&["room", "list"]);
+            eprintln!(
+                "MEASUREMENT vox room list exit={:?} elapsed={:.6}s:\n{}{}",
+                rooms.status.code(),
+                started.elapsed().as_secs_f64(),
+                String::from_utf8_lossy(&rooms.stdout),
+                String::from_utf8_lossy(&rooms.stderr)
+            );
+            let (elapsed, ready) = unlock.join().expect("APPARATUS: unlock command thread");
+            assert!(
+                matches!(ready, DaemonFrame::Attached(..)),
+                "PRODUCT: measurement unlock failed: {ready:?}"
+            );
+            eprintln!(
+                "MEASUREMENT explicit-unlock-to-Ready={:.6}s file={before} used={used}",
+                elapsed.as_secs_f64()
+            );
+        });
+        retained();
+        rt.block_on(async {
+            let mut daemon = DaemonClient::open(&paths.account().socket()).await.unwrap();
+            daemon
+                .request(DaemonRequest::Detach {
+                    node: NodeName::parse("default").unwrap(),
+                })
+                .await
+                .expect("APPARATUS: detach for no-compaction comparison");
+        });
+        let (elapsed, ready) = measured_unlock();
+        eprintln!(
+            "MEASUREMENT no-compaction-explicit-unlock-to-Ready={:.6}s reply={ready:?}",
+            elapsed.as_secs_f64()
+        );
+        assert!(
+            matches!(ready, DaemonFrame::Attached(..)),
+            "PRODUCT: no-compaction unlock failed: {ready:?}"
+        );
+        stop(measuring);
+        return;
+    }
     let restarted = launch("compacted", 2 * DAY, None);
     attached(root, "compacted");
     retained();
+    let log = std::fs::read_to_string(root.join("daemon-compacted.err")).unwrap();
+    if std::env::var_os("VOX_MUTANT_SKIP_STARTUP_COMPACTION").is_some() {
+        assert!(
+            log.contains("mutant skip_startup_compaction engaged"),
+            "APPARATUS: skip mutant not seen in daemon: {log}"
+        );
+        eprintln!("{log}");
+    }
     let after = std::fs::metadata(&file).unwrap().len();
     assert!(after < before,
         "PRODUCT: daemon restart left expired space allocated: before {before}, after {after}, reachable {used}");
