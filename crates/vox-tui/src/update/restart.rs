@@ -479,9 +479,8 @@ async fn restart_checked(
         .iter()
         .map(|n| n.name.clone())
         .collect::<Vec<_>>();
-    // The updater process still runs its original release after the binary is replaced. It
-    // can ask its matching daemon for the names of services/forwards about to end. A repair
-    // from a different release reads Hello only, as every other mismatched client must.
+    // The updater still runs its original release after replacement. Conservatively ask
+    // only a matching release for held names; a repair across releases reads Hello only.
     let held = if before.version == env!("CARGO_PKG_VERSION") {
         match tokio::time::timeout(Duration::from_secs(10), held_names(account, &attached)).await {
             Ok(Ok(names)) => names,

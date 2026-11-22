@@ -1,44 +1,9 @@
-//! ADR-021 M21.1 — **workers must run the same Vox version, enforced**, through the
-//! shipped `vox` binary with the stamps other versions write.
+//! ADR-052 RG-10: coordination uses claim rules, not package versions.
 //!
-//! Mixed-version coordination is not supported: the operator upgrades every worker
-//! together. What must therefore be proved is not compatibility but **refusal** — a
-//! worker that would coordinate with another version announces itself, then stops
-//! before posting its claim or work message, and says exactly who and what:
-//!
-//! 1. **missing** — a claim with no version stamp, as every release before ADR-021 wrote
-//!    it. A current worker that has **never posted in the room** then has its first
-//!    `claim` refused with exit 3, naming that worker, "no version", and the required
-//!    version — and the claim is never posted;
-//! 2. **unknown** and **different** — a stamp that is not a version (`banana`) and one
-//!    that is another version (this build's patch + 1, `another_version`) are each
-//!    refused and named;
-//! 3. `post --work` is refused the same way, `board --json` says `refused` with the
-//!    table, and the drain hook tells the session plainly;
-//! 4. **plain conversation survives** a refusal, so the operator can still talk;
-//! 6. **a session that only reads announces the vox it runs now** (#994): a reader session
-//!    whose last stamp is another version re-announces on its next hook turn, without a
-//!    claim, and coordination resumes; a session that never announced posts nothing; the
-//!    refusal says that the stale worker re-announces on its next turn.
-//! 5. **recovery needs nobody**: once the stale worker runs the current binary, its
-//!    first participating verb announces the current version, and coordination
-//!    resumes for everyone, including an existing session whose old matching hello
-//!    was superseded by a different session's stamp or a `bye`.
-//!
-//! Every foreign stamp is written onto the control socket as exactly the envelope another
-//! version writes, because this build cannot be made to *be* another version. The
-//! missing stamp used to come from the real published v0.2.6, and it cannot any more,
-//! either way it could be run:
-//! - **its CLI against a current node** fails the handshake: the node speaks IPC protocol 7,
-//!   and v0.2.6 speaks 5;
-//! - **its own member node** can never deliver anything: since ADR-023 M23.2 the log entry
-//!   has 12 fields where v0.2.6 writes 10, so every entry it writes is refused at decode
-//!   (no compatibility, by design). Its claim would never reach alice, and the gate would
-//!   measure the log format, not the version refusal.
-//!
-//! Every red names its side: `PRODUCT:` quotes what `vox` said, `CANNOT MEASURE:` is a
-//! staging step that did not happen (a precondition), and `APPARATUS:` is the proof's own
-//! fault (the runtime, its temporary directory).
+//! The shipped binary refuses incompatible participants by name without posting work,
+//! keeps conversation usable, and recovers on participation, after bye, and on a
+//! read-only session's next hook turn (#994). Explicit other rules are ignored in the
+//! board; the exact v0.4.30 package-only claim remains held.
 
 #![cfg(unix)]
 
@@ -47,37 +12,27 @@ mod support;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
-use support::{post_raw, until, Out, Worker};
+use support::{post_raw, resource, until, Out, Worker};
 
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+const RULES: &str = vox_agentcomms::version::CLAIM_RULES;
 
-/// A version that is valid and is **not** this build's: its patch number plus one. Hard-coded,
-/// it stopped being different the day the tree was at that version: on 0.2.9 a hello stamped
-/// "0.2.9" matches, coordination is rightly allowed, and the proof waited for a refusal that
-/// could not come (CI 869d8f0).
-fn another_version() -> String {
-    let mut parts = VERSION.split('.').map(|p| {
-        p.parse::<u64>()
-            .expect("APPARATUS: this build's version is not numeric")
-    });
-    let mut next = || {
-        parts
-            .next()
-            .unwrap_or_else(|| panic!("APPARATUS: this build's version {VERSION} is not x.y.z"))
-    };
-    let (major, minor, patch) = (next(), next(), next());
-    format!("{major}.{minor}.{}", patch + 1)
+fn another_rules_number() -> String {
+    (RULES
+        .parse::<u32>()
+        .expect("APPARATUS: decimal claim rules")
+        + 1)
+    .to_string()
 }
 
 /// How a refusal names a worker's last announcement, without claiming which binary is running.
-/// Matched as that phrase, never as the bare stamp: every
-/// refusal also says `required <this version>`, so a bare "0.2.9" matched any refusal on a 0.2.9
-/// tree, and the proof passed on a stale one without testing the version at all.
+/// Matched as a phrase, never as the bare stamp: every
+/// refusal also names the required rules, so matching a bare number cannot prove which
+/// participant stamp caused the refusal.
 fn announced(stamp: &str, is_version: bool) -> String {
     if is_version {
-        format!("last announced vox {stamp}")
+        format!("last announced claim rules {stamp}")
     } else {
-        format!("last announced vox {stamp:?}")
+        format!("last announced claim rules {stamp:?}")
     }
 }
 
@@ -85,7 +40,7 @@ fn refused_naming(o: &Out, who: &Worker, what: &str) {
     assert_eq!(
         o.code,
         Some(3),
-        "PRODUCT: a version refusal must exit 3: {o:?}"
+        "PRODUCT: a claim-rules refusal must exit 3: {o:?}"
     );
     // The reader names the worker by its own name for it, the one `vox trust
     // add --name` gave (V210-162), not by a fingerprint prefix.
@@ -93,7 +48,7 @@ fn refused_naming(o: &Out, who: &Worker, what: &str) {
         &format!("worker {} session", who.name),
         what,
         " at ",
-        &format!("required {VERSION}"),
+        &format!("required {RULES}"),
     ] {
         assert!(
             o.stderr.contains(needle),
@@ -121,7 +76,7 @@ fn claims_by(w: &Worker, reader: &Worker, r: &str) -> usize {
 
 #[test]
 #[ignore = "on-demand proof with two networked nodes and production Argon2id; run in release"]
-fn a_worker_on_another_version_is_refused_by_name() {
+fn claims_use_their_rules_and_keep_the_v0430_package_stamp() {
     watchdog::arm();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -135,7 +90,7 @@ fn a_worker_on_another_version_is_refused_by_name() {
 
     // A harness's sending session must be registered before it can post (RA-3).
     // Stage through the same public hook used by the harness, with no real wake endpoint.
-    // Registration is a precondition here; this journey measures version recovery.
+    // Registration is a precondition here; this journey measures claim-rules recovery.
     for (worker, session) in [(alice, "a1"), (bob, "b1")] {
         let hook = worker.vox(
             None,
@@ -164,8 +119,8 @@ fn a_worker_on_another_version_is_refused_by_name() {
         );
     }
 
-    // ---- (1) missing: a pre-ADR-021 claim, and a fresh current worker is refused ----
-    // Exactly what a release before ADR-021 wrote for `vox room claim`: no `data.vox`.
+    // ---- (1) missing: an unstamped claim, and a fresh current worker is refused ----
+    // Exactly what a release before ADR-021 wrote for `vox room claim`: no `data.claims`.
     let old_claim = serde_json::json!({
         "v": 1, "type": "claim", "from": "b-old", "body": "claiming old-work",
         "data": { "resource": "old-work" }
@@ -178,10 +133,9 @@ fn a_worker_on_another_version_is_refused_by_name() {
         "the unstamped claim to reach alice",
         &["room", "read", r, "--json"],
         |o: &Out| {
-            o.ok && o
-                .ndjson()
-                .iter()
-                .any(|x| x["envelope"]["type"] == "claim" && x["envelope"]["data"]["vox"].is_null())
+            o.ok && o.ndjson().iter().any(|x| {
+                x["envelope"]["type"] == "claim" && x["envelope"]["data"]["claims"].is_null()
+            })
         },
     );
     let unstamped = seen
@@ -190,7 +144,7 @@ fn a_worker_on_another_version_is_refused_by_name() {
         .filter(|x| {
             x["author"] == bob.b32()
                 && x["envelope"]["type"] == "claim"
-                && x["envelope"]["data"]["vox"].is_null()
+                && x["envelope"]["data"]["claims"].is_null()
         })
         .count();
     eprintln!("[receipt] unstamped claims from bob that reached alice: {unstamped}");
@@ -209,7 +163,7 @@ fn a_worker_on_another_version_is_refused_by_name() {
         "PRODUCT: alice has never claimed, and `vox room read --json` shows a claim by her"
     );
     let o = alice.vox(Some("a1"), &["room", "claim", r, "new-work"]);
-    refused_naming(&o, bob, "no version");
+    refused_naming(&o, bob, "no claim-rules number");
     assert_eq!(
         claims_by(alice, alice, r),
         0,
@@ -231,7 +185,7 @@ fn a_worker_on_another_version_is_refused_by_name() {
         ],
         Some("starting"),
     );
-    refused_naming(&o, bob, "no version");
+    refused_naming(&o, bob, "no claim-rules number");
     let b = alice
         .vox(Some("a1"), &["room", "board", r, "--json"])
         .json();
@@ -311,14 +265,14 @@ fn a_worker_on_another_version_is_refused_by_name() {
     );
 
     // ---- (2) unknown, then different ----
-    let other = another_version();
+    let other = another_rules_number();
     for (stamp, named) in [
         ("banana".to_owned(), announced("banana", false)),
         (other.clone(), announced(&other, true)),
     ] {
         let hello = serde_json::json!({
             "v": 1, "type": "hello", "from": "b-foreign", "body": "a foreign worker",
-            "data": { "vox": &stamp, "op": format!("op-foreign-{}", stamp.replace('.', "-")) }
+            "data": { "claims": &stamp, "op": format!("op-foreign-{}", stamp.replace('.', "-")) }
         })
         .to_string();
         rt.block_on(post_raw(bob, room.cid, &hello));
@@ -358,16 +312,16 @@ fn a_worker_on_another_version_is_refused_by_name() {
     );
 
     // An existing session must refresh both its own and its author's latest stamp.
-    // Alice's a1 is stale even though a-second most recently announced the current version;
+    // Alice's a1 is stale even though a-second most recently announced the current claim rules;
     // bob's b1 is current, but another session of his node most recently announced an old one.
     for (worker, reader, session, stamp) in [
         (alice, bob, "a1", other.as_str()),
-        (alice, bob, "a-second", VERSION),
+        (alice, bob, "a-second", RULES),
         (bob, alice, "b-previous", other.as_str()),
     ] {
         let hello = serde_json::json!({
             "v": 1, "type": "hello", "from": session, "body": "a later announcement",
-            "data": { "vox": stamp, "op": format!("op-later-{session}") }
+            "data": { "claims": stamp, "op": format!("op-later-{session}") }
         })
         .to_string();
         rt.block_on(post_raw(worker, room.cid, &hello));
@@ -397,18 +351,18 @@ fn a_worker_on_another_version_is_refused_by_name() {
         None,
         "alice's existing a1 session to announce itself before refusal",
         &["room", "board", r, "--json"],
-        |o| participant_is(o, alice, "a1", VERSION),
+        |o| participant_is(o, alice, "a1", RULES),
     );
     let o = bob.vox(Some("b1"), &working);
     assert!(o.ok, "PRODUCT: bob's resumed work post was refused: {o:?}");
-    // A working post does not count as a version announcement. Using a claim here would
-    // conceal a missing hello, since the claim itself carries the current version.
+    // A working post does not count as a claim-rules announcement. Using a claim here would
+    // conceal a missing hello, since the claim itself carries the current claim rules.
     until(
         alice,
         None,
         "bob's existing b1 session to replace his later foreign announcement",
         &["room", "board", r, "--json"],
-        |o| participant_is(o, bob, "b1", VERSION),
+        |o| participant_is(o, bob, "b1", RULES),
     );
     let o = alice.vox(Some("a1"), &["room", "claim", r, "resumed-work"]);
     assert!(
@@ -440,16 +394,16 @@ fn a_worker_on_another_version_is_refused_by_name() {
         None,
         "bob's returning b1 session to announce itself after bye",
         &["room", "board", r, "--json"],
-        |o| participant_is(o, bob, "b1", VERSION),
+        |o| participant_is(o, bob, "b1", RULES),
     );
 
     // ---- (6) a session that only reads announces the vox it runs now (#994) ----
-    // Bob's session b-reader announced another version before an update and has only read
+    // Bob's session b-reader announced other claim rules before an update and has only read
     // since. Found 2026-10-20: such a session kept its old stamp for a day after both Macs
     // updated, and every worker in the room was refused, including the ones that were current.
     let stale = serde_json::json!({
         "v": 1, "type": "hello", "from": "b-reader", "body": "a reader's old announcement",
-        "data": { "vox": other.as_str(), "op": "op-reader-old" }
+        "data": { "claims": other.as_str(), "op": "op-reader-old" }
     })
     .to_string();
     rt.block_on(post_raw(bob, room.cid, &stale));
@@ -461,8 +415,7 @@ fn a_worker_on_another_version_is_refused_by_name() {
         |o: &Out| o.code == Some(3) && o.stderr.contains("b-reader"),
     );
     assert!(
-        o.stderr
-            .contains("announces the version it runs on its next turn")
+        o.stderr.contains("let them announce on their next turn")
             && o.stderr.contains("older than a day no longer counts"),
         "PRODUCT: the refusal does not say that the stale worker re-announces on its next turn \
          and that an old announcement lapses (#994): {o:?}"
@@ -490,9 +443,9 @@ fn a_worker_on_another_version_is_refused_by_name() {
     until(
         alice,
         None,
-        "bob's reader session to announce the current version from its hook turn",
+        "bob's reader session to announce the current claim rules from its hook turn",
         &["room", "board", r, "--json"],
-        |o| participant_is(o, bob, "b-reader", VERSION),
+        |o| participant_is(o, bob, "b-reader", RULES),
     );
     // A session that never announced stays silent: its hook turn posts no hello.
     let silent = bob.vox(
@@ -525,7 +478,7 @@ fn a_worker_on_another_version_is_refused_by_name() {
             panic!("PRODUCT: board --json has no participants row for bob: {board}")
         });
     assert!(
-        bobs["session"] == "b-reader" && bobs["version"] == VERSION,
+        bobs["session"] == "b-reader" && bobs["version"] == RULES,
         "PRODUCT: a session that never announced posted a hello from its hook turn (#994): bob's \
          latest counted session is {} at {}, not b-reader",
         bobs["session"],
@@ -535,5 +488,59 @@ fn a_worker_on_another_version_is_refused_by_name() {
     assert!(
         o.ok && o.stdout.contains("you hold reader-work"),
         "PRODUCT: coordination did not resume once the reader re-announced (#994): {o:?}"
+    );
+
+    // Explicit claim rules win; the exact v0.4.30 package-only claim is retained.
+    for (item, operation, stamp) in [
+        (
+            "other-rules-work",
+            "claim-other-rules",
+            Some(other.as_str()),
+        ),
+        ("legacy-work", "claim-legacy-0430", None),
+    ] {
+        // An explicit rules stamp takes precedence over the old package-only stamp.
+        let mut data = serde_json::json!({"resource": item, "op": operation, "vox": "0.4.30"});
+        if let Some(stamp) = stamp {
+            data["claims"] = stamp.into();
+        }
+        let envelope = serde_json::json!({
+            "v": 1, "type": "claim", "from": "legacy-session", "body": item, "data": data
+        });
+        rt.block_on(post_raw(bob, room.cid, &envelope.to_string()));
+        let received = until(
+            alice,
+            None,
+            "the signed claim to reach the reader",
+            &["room", "read", &room.id, "--json"],
+            |out: &Out| {
+                out.ok
+                    && out
+                        .ndjson()
+                        .iter()
+                        .any(|row| row["envelope"]["data"]["op"] == operation)
+            },
+        );
+        println!("reader received {operation}: {}", received.stdout);
+    }
+
+    let board = alice.vox(None, &["room", "board", &room.id, "--json"]);
+    println!("claim-rules board: {board:?}");
+    assert!(
+        board.ok,
+        "PRODUCT: the claim-rules board was refused: {board:?}"
+    );
+    let board = board.json();
+    assert!(
+        resource(&board, "other-rules-work").is_none()
+            && board["violations"].as_array().is_some_and(|rows| rows
+                .iter()
+                .any(|row| row["outcome"]["other_version"] == "mismatched")),
+        "PRODUCT: a claim under other claim rules must change nothing: {board}"
+    );
+    assert!(
+        resource(&board, "legacy-work")
+            .is_some_and(|row| row["state"] == "held" && row["owner_session"] == "legacy-session"),
+        "PRODUCT: the v0.4.30 package-stamped claim must remain held: {board}"
     );
 }

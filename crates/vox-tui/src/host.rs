@@ -4543,6 +4543,16 @@ impl Router {
 
     /// Attach kept node `node` from its keep `source`, as [`Self::attach_kept`] does each.
     async fn attach_one_kept(&self, node: &NodeName, source: Option<KeepSource>) {
+        // Keep the real startup state visible while a proof observes a replacement daemon.
+        #[cfg(feature = "test-knobs")]
+        if std::env::var("VOX_TEST_ATTACH_HOLD_NODE").as_deref() == Ok(node.as_str()) {
+            if let Some(path) = std::env::var_os("VOX_TEST_ATTACH_HOLD_FILE") {
+                let path = std::path::PathBuf::from(path);
+                while path.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        }
         let (passphrase, rooms) = match &source {
             None | Some(KeepSource::None) => (None, Vec::new()),
             // Off the runtime's workers: a Keychain that asks (locked, or the item made by
@@ -5215,6 +5225,22 @@ impl Router {
         done: watch::Sender<DetachOutcome>,
         cause: DetachCause,
     ) -> Result<(), Refusal> {
+        // Hold node stops at either transition boundary for lifecycle proofs.
+        // Never compiled into the installed binary.
+        #[cfg(feature = "test-knobs")]
+        if matches!(cause, DetachCause::DaemonStopping)
+            && std::env::var("VOX_TEST_STOP_HOLD_PHASE").as_deref() != Ok("event")
+            && std::env::var("VOX_TEST_STOP_HOLD_NODE")
+                .is_ok_and(|held| held == "*" || held == node.as_str())
+        {
+            if let Some(path) = std::env::var_os("VOX_TEST_STOP_HOLD_FILE") {
+                let path = std::path::PathBuf::from(path);
+                eprintln!("vox daemon: test holding stop of node {node}");
+                while path.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        }
         let mut physical_end = a.handle.termination();
         let _ = a.detached.send(true);
         {
@@ -5326,6 +5352,20 @@ impl Router {
             let _ = done.send(Some(Ok(())));
             Ok(())
         };
+        #[cfg(feature = "test-knobs")]
+        if matches!(cause, DetachCause::DaemonStopping)
+            && std::env::var("VOX_TEST_STOP_HOLD_PHASE").as_deref() == Ok("event")
+            && std::env::var("VOX_TEST_STOP_HOLD_NODE")
+                .is_ok_and(|held| held == "*" || held == node.as_str())
+        {
+            if let Some(path) = std::env::var_os("VOX_TEST_STOP_HOLD_FILE") {
+                let path = std::path::PathBuf::from(path);
+                eprintln!("vox daemon: test holding detached event of node {node}");
+                while path.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        }
         if !matches!(cause, DetachCause::DaemonStopping) {
             eprintln!(
                 "vox daemon: node {node} finished its work ({})",
