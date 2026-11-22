@@ -34,11 +34,8 @@ impl Router {
         // must still be able to ask that actor for its final current state. Move the owned
         // fence into the command so cancellation after enqueue cannot release it early.
         let publication_guard = if paused.is_some() && after.is_none() {
-            let paths = match self.inner.account.node_paths(node) {
-                Ok(paths) => paths,
-                Err(error) => return refuse(error.to_string()),
-            };
-            match crate::room_pause::publication_lock(&paths, info.channel_id, true).await {
+            let paths = handle.paths();
+            match crate::room_pause::publication_lock(paths, info.channel_id, true).await {
                 Ok(guard) => Some(guard),
                 Err(error) => return refuse(format!("room pause was not changed: {error}")),
             }
@@ -75,13 +72,7 @@ impl Router {
             interrupt_error: None,
         };
         if paused == Some(true) {
-            let paths = match self.inner.account.node_paths(node) {
-                Ok(paths) => paths,
-                Err(e) => {
-                    report.interrupt_error = Some(e.to_string());
-                    return saved(report);
-                }
-            };
+            let paths = handle.paths().clone();
             let room = vox_core::node::link::b32_encode(&info.channel_id);
             let registrations = match crate::wake::registered_page(&paths, &room, after, PAUSE_PAGE)
             {

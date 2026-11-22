@@ -533,6 +533,8 @@ enum Class {
 pub struct Store {
     db: RwLock<Backing>,
     path: PathBuf,
+    opened_directory: super::paths::FileIdentity,
+    opened_file: Mutex<super::paths::FileIdentity>,
     /// The store's one writer (ADR-038 FX-30): every write transaction is begun, committed and
     /// its received ownership moved while this is held, so the commit's visibility and its mark are one
     /// step to every other holder. redb admits one writer at a time anyway; this names it.
@@ -618,6 +620,10 @@ impl Store {
         let store = Self {
             db: RwLock::new(Backing::Writable(db)),
             path: path.to_owned(),
+            opened_directory: super::paths::FileIdentity::of(
+                path.parent().unwrap_or(Path::new(".")),
+            )?,
+            opened_file: Mutex::new(super::paths::FileIdentity::of(path)?),
             writer: Mutex::new(Epochs::default()),
             agreement_settlement: Arc::new(tokio::sync::Semaphore::new(1)),
             profile_owner: None,
@@ -630,17 +636,24 @@ impl Store {
     /// identity is still locked — see `Backing`. It becomes writable with
     /// [`Self::make_writable`].
     ///
-    /// A dirty store gets redb's normal crash repair. Other read failures leave
-    /// the file untouched; in particular, an empty file is not a new store.
+    /// Only a library recovery request permits a writable open before unlock: redb repairs
+    /// its own committed state, without initializing Vox tables. Missing public facts are
+    /// refused; the profile compares them with the unlocked vault before Vox writes.
     pub fn open_read_only(path: &Path) -> Result<Self> {
-        let db = match open_read_only_database(path) {
-            Ok(db) => db,
-            Err(redb::DatabaseError::RepairAborted) => return Self::open(path),
+        let backing = match open_read_only_database(path) {
+            Ok(db) => Backing::ReadOnly(db),
+            Err(redb::DatabaseError::RepairAborted) => {
+                Backing::Writable(open_database(path).map_err(|error| open_error(path, error))?)
+            }
             Err(error) => return Err(open_error(path, error)),
         };
         let store = Self {
-            db: RwLock::new(Backing::ReadOnly(db)),
+            db: RwLock::new(backing),
             path: path.to_owned(),
+            opened_directory: super::paths::FileIdentity::of(
+                path.parent().unwrap_or(Path::new(".")),
+            )?,
+            opened_file: Mutex::new(super::paths::FileIdentity::of(path)?),
             writer: Mutex::new(Epochs::default()),
             agreement_settlement: Arc::new(tokio::sync::Semaphore::new(1)),
             profile_owner: None,
@@ -650,7 +663,7 @@ impl Store {
         } else {
             Err(Error::Storage {
                 op: "read schema",
-                detail: format!("the store could not be read at {}: its schema or tables are missing; the file was not changed; restore it from a backup, or move it aside to start a new node", path.display()),
+                detail: format!("the store could not be read at {}: its schema or tables are missing; no Vox state was written; restore it from a backup, or move it aside to start a new node", path.display()),
             })
         }
     }
@@ -756,6 +769,7 @@ impl Store {
     /// [`Error::ProfileBusy`] if another process took the profile in between, or a storage
     /// error — in which case the store stays readable as it was.
     pub fn make_writable(&self) -> Result<()> {
+        self.verify_location()?;
         let mut backing = self.db.write().unwrap_or_else(PoisonError::into_inner);
         if matches!(*backing, Backing::Writable(_)) {
             return Ok(());
@@ -804,6 +818,7 @@ impl Store {
 
     /// The caller owns the writer; never recursively acquire it during recovery.
     fn rewrite_fresh_locked(&self, epochs: &mut Epochs) -> Result<()> {
+        self.verify_location()?;
         // The writer excludes every competing replacement. The owned read transaction
         // retains its database/cache/profile without holding the backing lock through I/O.
         let r = {
@@ -859,6 +874,7 @@ impl Store {
         let fresh = match copied {
             Ok(fresh) => fresh,
             Err(error) => {
+                self.verify_location()?;
                 let _ = std::fs::remove_file(&fresh_path);
                 return Err(error);
             }
@@ -871,6 +887,7 @@ impl Store {
                     op: "replace store",
                     detail: "store replacement generation exhausted".into(),
                 })?;
+        self.verify_location()?;
         // Both handles remain open across rename, each on its own inode.
         let install = std::fs::rename(&fresh_path, &self.path).map_err(|error| Error::Path {
             op: "replace store",
@@ -880,6 +897,10 @@ impl Store {
             let _ = std::fs::remove_file(&fresh_path);
             return Err(error);
         }
+        *self
+            .opened_file
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = super::paths::FileIdentity::of(&self.path)?;
         // Rename has installed the new inode, but it is not durable until its directory is
         // synced. Record that exact debt before directory sync. A failed sync leaves the
         // new backing writable, but gates later writes and acknowledgements on this exact
@@ -900,6 +921,7 @@ impl Store {
         if !epochs.replacement {
             return Ok(false);
         }
+        self.verify_location()?;
         {
             let mut backing = self.db.write().unwrap_or_else(PoisonError::into_inner);
             if matches!(*backing, Backing::Closed) {
@@ -924,6 +946,34 @@ impl Store {
         Ok(true)
     }
 
+    fn verify_location(&self) -> Result<()> {
+        super::paths::verify_profile_directory(
+            self.path.parent().unwrap_or(Path::new(".")),
+            Some(self.opened_directory),
+        )?;
+        let opened = *self
+            .opened_file
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if super::paths::FileIdentity::of(&self.path).ok() != Some(opened) {
+            let node = self
+                .path
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                .unwrap_or("<node>");
+            let unlock = vox_text::shell::command(&["vox", "node", "unlock", "--", node]);
+            return Err(Error::Path {
+                op: "write the opened store",
+                detail: format!(
+                    "store {} is gone or replaced; nothing was written; run `vox daemon --restart`, then `{unlock}`",
+                    self.path.display()
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// Begin a read transaction on whichever handle is open.
     fn begin_read(&self) -> Result<Cached<redb::ReadTransaction>> {
         self.db
@@ -936,6 +986,7 @@ impl Store {
     /// the store is read-only.
     fn writer(&self) -> Result<MutexGuard<'_, Epochs>> {
         let mut epochs = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        self.verify_location()?;
         self.finish_replacement(&mut epochs)?;
         Ok(epochs)
     }
