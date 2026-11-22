@@ -57,7 +57,10 @@ mod watchdog;
 #[path = "support/optional_proof.rs"]
 mod optional_proof;
 #[cfg(target_os = "macos")]
-optional_proof::not_run!(a_session_change_rewrites_only_that_session);
+optional_proof::not_run!(
+    a_session_change_rewrites_only_that_session,
+    an_existing_session_index_keeps_its_listing_when_upgraded
+);
 
 #[path = "support/attach.rs"]
 mod attach;
@@ -1098,6 +1101,7 @@ fn a_session_change_rewrites_only_that_session() {
         (next, bytes)
     };
     let mut measured = Vec::new();
+    let mut index_costs = Vec::new();
     let mut preserved = Vec::new();
     for n in [100usize, 1500] {
         let name = format!("local-{n}");
@@ -1271,7 +1275,13 @@ fn a_session_change_rewrites_only_that_session() {
         std::fs::write(evidence.join(format!("n{n}.json")), receipt.to_string())
             .expect("APPARATUS: measurement receipt");
         eprintln!("RG13 SESSION LOCALITY {receipt}");
-        measured.push((step_delta, name_delta));
+        measured.push((step_bytes, name_bytes));
+        eprintln!(
+            "RG13 INDEX COST n={n}: encrypted_index_bytes={} bytes_per_session={:.3}",
+            after.1,
+            after.1 as f64 / (n + 1) as f64
+        );
+        index_costs.push((n, after.1));
         // A late/out-of-order multipart dependency is not a Session until its complete
         // canonical body hashes correctly. Replaying it must preserve unrelated heads.
         let large_name = format!("MULTIPART-{n}-{}", "m".repeat(2400));
@@ -1483,6 +1493,7 @@ fn a_session_change_rewrites_only_that_session() {
         std::thread::sleep(Duration::from_millis(100));
     }
     eprintln!("RG13 canonical order: later event wins despite earlier event arriving last");
+    let mut failures = Vec::new();
     for (column, label) in [
         (0, "ordinary private step"),
         (1, "private lifecycle/name change"),
@@ -1497,10 +1508,416 @@ fn a_session_change_rewrites_only_that_session() {
         } else {
             measured[1].1
         };
-        assert!(
-            large <= small.saturating_mul(3).saturating_add(256),
-            "PRODUCT: {label} rewrote unrelated Sessions: 100={small} allocations; 1500={large}; \
-            only the target and logarithmic shared paths may change"
-        );
+        let bound = small.saturating_mul(3).saturating_add(256 * 1024);
+        eprintln!("RG13 OUTSIDE {label}: 100={small} OS-write bytes; 1500={large}; bound={bound}; passed={}", large <= bound);
+        if large > bound {
+            failures.push(format!("PRODUCT: {label} rewrote unrelated Sessions: 100={small} OS-write bytes; 1500={large}; bound={bound}"));
+        }
     }
+    for &(n, bytes) in &index_costs {
+        let bound = 2100 * (n as u64 + 1);
+        if bytes > bound {
+            failures.push(format!("PRODUCT: encrypted Session index exceeds 2100 bytes per Session at {n} unrelated Sessions: {bytes} bytes; bound={bound}"));
+        }
+    }
+    let (small_n, small_bytes) = index_costs[0];
+    let (large_n, large_bytes) = index_costs[1];
+    if u128::from(large_bytes) * (small_n as u128 + 1) * 100
+        > u128::from(small_bytes) * (large_n as u128 + 1) * 103
+    {
+        failures.push("PRODUCT: encrypted index bytes per Session grew by more than 3% between 100 and 1500 unrelated Sessions".to_owned());
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The first fixed read must preserve the base binary's published order, even while
+/// lazy membership backfill is held before it takes a writer. The hold/receipt are
+/// apparatus only; verdicts are the binary's listing and the daemon's OS write bytes.
+#[cfg(all(feature = "optional-proofs", target_os = "macos"))]
+#[test]
+#[ignore = "BASE-to-fixed real binary upgrade; run in release with test-knobs"]
+fn an_existing_session_index_keeps_its_listing_when_upgraded() {
+    watchdog::arm();
+    let evidence = std::env::var_os("RG13_SESSION_LOCAL_EVIDENCE")
+        .map(PathBuf::from)
+        .expect("APPARATUS: upgrade receipt directory");
+    let base = std::env::var_os("RG13_SESSION_BASE_VOX")
+        .map(PathBuf::from)
+        .expect("APPARATUS: pinned c5b12cef4 binary");
+    let fresh = std::env::var_os("RG13_SESSION_FRESH_RECEIPTS")
+        .map(PathBuf::from)
+        .expect("APPARATUS: fresh fixed outside measurements");
+    std::fs::create_dir_all(&evidence).expect("APPARATUS: upgrade receipts");
+    let mut tmp = tempfile::tempdir_in(&evidence).expect("APPARATUS: upgrade scratch profile");
+    tmp.disable_cleanup(true);
+    eprintln!(
+        "RG13 UPGRADE retained scratch profile {}",
+        tmp.path().display()
+    );
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("cfg")).expect("APPARATUS: upgrade config");
+    let keychain = attach::keychain(root);
+    let pass = root.join("identity.pass");
+    std::fs::write(&pass, IDENTITY).expect("APPARATUS: upgrade passphrase");
+    let run = |exe: &Path, argv: &[&str], input: Option<&str>| {
+        let mut child = Command::new(exe)
+            .args(argv)
+            .env("VOX_DATA_DIR", root)
+            .env("VOX_CONFIG_DIR", root.join("cfg"))
+            .env("VOX_TEST_KEYCHAIN", &keychain)
+            .env("VOX_PROXY", "127.0.0.1:0")
+            .env_remove("VOX_NODE")
+            .env_remove("VOX_ROOM")
+            .env_remove("VOX_SESSION")
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("APPARATUS: upgrade CLI");
+        if let Some(input) = input {
+            child
+                .stdin
+                .take()
+                .expect("APPARATUS: upgrade stdin")
+                .write_all(input.as_bytes())
+                .expect("APPARATUS: upgrade CLI input");
+        }
+        let out = child
+            .wait_with_output()
+            .expect("APPARATUS: upgrade CLI result");
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let fixed = Path::new(VOX);
+    let id = run(
+        &base,
+        &[
+            "id",
+            "--identity-passphrase-file",
+            pass.to_str().expect("APPARATUS: pass path"),
+        ],
+        None,
+    );
+    assert!(id.0, "APPARATUS: base identity: {id:?}");
+    let launch = |exe: &Path, tag: &str, hold: bool| {
+        let mut command = Command::new(exe);
+        command
+            .args(["daemon", "--listen", "127.0.0.1:0", "--passphrase-file"])
+            .arg(&pass)
+            .env("VOX_DATA_DIR", root)
+            .env("VOX_CONFIG_DIR", root.join("cfg"))
+            .env("VOX_TEST_KEYCHAIN", &keychain)
+            .env("VOX_PROXY", "127.0.0.1:0")
+            .env_remove("VOX_NODE")
+            .env_remove("VOX_ROOM")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(
+                std::fs::File::create(evidence.join(format!("upgrade-{tag}.daemon.log")))
+                    .expect("APPARATUS: upgrade daemon log"),
+            );
+        if hold {
+            command.env("VOX_TEST_HOLD_SESSION_BACKFILL", root.join("backfill"));
+        }
+        Daemon(command.spawn().expect("APPARATUS: upgrade daemon"))
+    };
+    let base_daemon = launch(&base, "base", false);
+    let deadline = Instant::now() + Duration::from_secs(240);
+    loop {
+        let listed = run(&base, &["room", "list"], None);
+        if listed.0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "APPARATUS: base daemon not ready: {listed:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let created = run(
+        &base,
+        &[
+            "room",
+            "create",
+            "--name",
+            "upgrade",
+            "--passphrase-file",
+            "-",
+        ],
+        Some(ROOMPASS),
+    );
+    assert!(created.0, "APPARATUS: base room: {created:?}");
+    let listed = run(&base, &["room", "list"], None);
+    assert!(listed.0, "APPARATUS: base room listing: {listed:?}");
+    let room = listed
+        .1
+        .lines()
+        .find(|line| line.contains("upgrade"))
+        .and_then(|line| line.split_whitespace().next())
+        .expect("APPARATUS: upgrade room id")
+        .to_owned();
+    let metadata = |i: usize, name: &str| {
+        serde_json::json!({"v":1,"type":"session",
+        "from":format!("upgrade-{i:04}"),"body":"","at":{"session_name":name},
+        "data":{"session":{"harness":"rg13 upgrade"}}})
+        .to_string()
+    };
+    for i in 0..=100 {
+        let posted = run(
+            &base,
+            &[
+                "room",
+                "post",
+                &room,
+                &metadata(i, &format!("Upgrade {i:04}")),
+            ],
+            None,
+        );
+        assert!(posted.0, "APPARATUS: base Session {i}: {posted:?}");
+    }
+    // The terminal's room label/id is abbreviated. Scope the hold by the full room
+    // identity returned by the BASE daemon, not by that display abbreviation.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let paths =
+        vox_core::node::paths::Paths::resolve("default", Some(root), Some(&root.join("cfg")))
+            .unwrap();
+    let mut client = rt
+        .block_on(vox_core::node::ipc::IpcClient::open_at(
+            &vox_core::node::ipc::NodeSocket::one_shot(
+                paths.account().socket(),
+                vox_core::node::paths::NodeName::parse("default").unwrap(),
+            ),
+        ))
+        .unwrap();
+    let rooms = rt
+        .block_on(client.request(&vox_core::node::ipc::Request::Rooms { after: None }))
+        .expect("APPARATUS: base full room identities");
+    let vox_core::node::ipc::Frame::Rooms { rooms } = rooms else {
+        panic!("APPARATUS: base full room listing frame");
+    };
+    let cid = rooms
+        .iter()
+        .find(|(_, name, ..)| name == "upgrade")
+        .expect("APPARATUS: base full upgrade room")
+        .0;
+    let full_room = vox_core::node::link::b32_encode(&cid);
+    drop(client);
+    let parse = |output: &(bool, String, String)| -> Vec<serde_json::Value> {
+        output
+            .1
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_str(line).expect("APPARATUS: Session JSON line"))
+            .collect()
+    };
+    let deadline = Instant::now() + Duration::from_secs(300);
+    let golden = loop {
+        let shown = run(&base, &["room", "sessions", &room, "--json"], None);
+        if shown.0 && !shown.2.contains("provisional") {
+            let rows = parse(&shown);
+            if rows.len() == 101 {
+                break rows;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "APPARATUS: base publication incomplete: {shown:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(
+        golden
+            .windows(2)
+            .all(|pair| pair[0]["opened_millis"].as_u64() <= pair[1]["opened_millis"].as_u64()),
+        "APPARATUS: base fixture was not oldest opening first"
+    );
+    let fence = run(
+        &base,
+        &["room", "post", &room, "UPGRADE-BASE-DURABILITY-FENCE"],
+        None,
+    );
+    assert!(fence.0, "APPARATUS: base durable fixture: {fence:?}");
+    std::fs::write(
+        evidence.join("upgrade-base-listing.json"),
+        serde_json::to_vec(&golden).unwrap(),
+    )
+    .expect("APPARATUS: base listing receipt");
+    drop(base_daemon);
+    let hold = root.join("backfill");
+    std::fs::create_dir(&hold).expect("APPARATUS: backfill staging directory");
+    std::fs::write(hold.join("arm"), &full_room).expect("APPARATUS: arm exact room backfill");
+    let daemon = launch(fixed, "fixed", true);
+    struct Release(PathBuf);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            let _ = std::fs::write(self.0.join("release"), "");
+        }
+    }
+    let release = Release(hold.clone());
+    let deadline = Instant::now() + Duration::from_secs(300);
+    while !hold.join("engaged").exists() {
+        if Instant::now() >= deadline {
+            let status = run(fixed, &["status", "--json"], None);
+            panic!(
+                "APPARATUS: base index did not reach held backfill; status={status:?}; log={}",
+                std::fs::read_to_string(evidence.join("upgrade-fixed.daemon.log"))
+                    .unwrap_or_default()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        std::fs::read_to_string(hold.join("engaged")).unwrap(),
+        full_room,
+        "APPARATUS: a different room engaged the backfill hold"
+    );
+    let first = run(fixed, &["room", "sessions", &room, "--json"], None);
+    eprintln!(
+        "RG13 UPGRADE first read while backfill held: ok={} rows={} log={}",
+        first.0,
+        first.1.lines().count(),
+        std::fs::read_to_string(evidence.join("upgrade-fixed.daemon.log")).unwrap_or_default()
+    );
+    assert!(
+        first.0,
+        "PRODUCT: first fixed read refused the base Session listing: {first:?}"
+    );
+    assert_eq!(
+        parse(&first),
+        golden,
+        "PRODUCT: first fixed read changed the base's oldest-first Session listing"
+    );
+    drop(release);
+    let deadline = Instant::now() + Duration::from_secs(300);
+    while !hold.join("published").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "APPARATUS: backfill did not report complete publication; log={}",
+            std::fs::read_to_string(evidence.join("upgrade-fixed.daemon.log")).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let after = loop {
+        let after = run(fixed, &["room", "sessions", &room, "--json"], None);
+        if after.0 {
+            break after;
+        }
+        // Publication can invalidate a multi-page read between its stamp and rows.
+        // Follow only that explicit read-only retry; never treat a refused write as saved.
+        assert!(
+            after
+                .2
+                .contains("Sessions changed while listing; run the command again")
+                && Instant::now() < deadline,
+            "PRODUCT: completed backfill refused its listing: {after:?}"
+        );
+    };
+    assert_eq!(
+        parse(&after),
+        golden,
+        "PRODUCT: published backfill changed the base's oldest-first Session listing"
+    );
+    eprintln!(
+        "RG13 UPGRADE first and published listings identical: {} oldest-first Sessions",
+        golden.len()
+    );
+    let writes = || {
+        libproc::libproc::pid_rusage::pidrusage::<libproc::libproc::pid_rusage::RUsageInfoV2>(
+            i32::try_from(daemon.0.id()).unwrap(),
+        )
+        .expect("APPARATUS: upgraded daemon write counter")
+        .ri_diskio_byteswritten
+    };
+    // Let retired backfill pages leave the writer before measuring an ordinary rename.
+    // The durable product store's file bytes are outside data, not an allocator verdict.
+    let paths =
+        vox_core::node::paths::Paths::resolve("default", Some(root), Some(&root.join("cfg")))
+            .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(300);
+    let mut prior = None;
+    let mut stable = 0;
+    loop {
+        let metadata =
+            std::fs::metadata(paths.store_file()).expect("APPARATUS: upgraded store metadata");
+        let current = (
+            metadata.len(),
+            metadata
+                .modified()
+                .expect("APPARATUS: store modification time"),
+        );
+        if prior == Some(current) {
+            stable += 1;
+        } else {
+            stable = 0;
+        }
+        if stable == 5 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "APPARATUS: backfill cleanup did not settle"
+        );
+        prior = Some(current);
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let before = writes();
+    let renamed = run(
+        fixed,
+        &["room", "post", &room, &metadata(0, "UPGRADED-TARGET")],
+        None,
+    );
+    assert!(
+        renamed.0,
+        "PRODUCT: upgraded room refused a rename: {renamed:?}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        let shown = run(fixed, &["room", "sessions", &room, "--json"], None);
+        if shown.0 && shown.1.contains("UPGRADED-TARGET") && !shown.2.contains("provisional") {
+            let rows = parse(&shown);
+            let unchanged = |rows: Vec<serde_json::Value>| {
+                rows.into_iter()
+                    .filter(|row| row["id"] != "upgrade-0000")
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                unchanged(rows),
+                unchanged(golden),
+                "PRODUCT: upgraded rename changed other Sessions or order"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT: upgraded rename did not appear in its Session listing: {shown:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let fence = run(
+        fixed,
+        &["room", "post", &room, "UPGRADE-RENAME-DURABILITY-FENCE"],
+        None,
+    );
+    assert!(fence.0, "APPARATUS: upgrade rename fence: {fence:?}");
+    let bytes = writes() - before;
+    let fresh: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(fresh.join("n100.json")).expect("APPARATUS: fresh outside measurements"),
+    )
+    .expect("APPARATUS: fresh metrics JSON");
+    let reference = fresh["name_change_os_write_bytes"]
+        .as_u64()
+        .expect("APPARATUS: fresh name write bytes");
+    let bound = reference.saturating_mul(3).saturating_add(256 * 1024);
+    eprintln!("RG13 UPGRADE rename OS-write bytes={bytes} fresh100={reference} bound={bound}");
+    assert!(bytes<=bound,"PRODUCT: rename after upgrading the base index rewrote unrelated Sessions: {bytes} OS-write bytes; bound={bound}");
 }

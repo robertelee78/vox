@@ -2,7 +2,7 @@
 //! A unit is one Session, or one multipart dependency until its inner Session is known.
 //! Temporary folds own their pages; only publication mutates the shared published paths.
 
-use super::record::{Descriptor, Key, Position, Source};
+use super::record::{Descriptor, EnvelopeRef, Key, Part, Position, Source};
 use crate::atrest::sek::Sek;
 use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
@@ -36,7 +36,7 @@ pub(in crate::node::channel) fn observe_public(
         add,
     )
 }
-use super::storage::{Tree, Write};
+use super::storage::{Read, Tree, Write};
 
 fn bad() -> Error {
     Error::MalformedAtRest("Session metadata membership")
@@ -62,57 +62,97 @@ pub(in crate::node::channel) fn candidate_envelope(envelope: &Envelope) -> bool 
         || (!envelope.from.trim().is_empty() && envelope.at.session_name.is_some())
 }
 
-fn unit(source: Source, body: &str) -> Option<Key> {
-    let envelope = Envelope::parse(body).ok()?;
-    if matches!(envelope.kind.as_str(), SESSION | SESSION_END) {
-        if let Some(tag) = envelope.data["session_parts"].as_str() {
-            let tag_hash = crate::node::link::b32_decode(tag, "Session metadata bundle").ok()?;
-            if crate::node::link::b32_encode(&tag_hash) != tag {
-                return None;
-            }
-            let mut key = hash_key(&sha256_concat(&[
-                b"vox/session-projection/bundle/v1",
-                &source.author,
-                &tag_hash,
-            ]));
-            key[63] = 1;
-            return Some(key);
-        }
+struct Body<'a>(&'a str);
+impl super::text::Input for Body<'_> {
+    fn len(&self) -> u64 {
+        self.0.len() as u64
     }
-    if envelope.from.trim().is_empty() {
-        return None;
+    fn read_at(&mut self, offset: u64, out: &mut [u8]) -> Result<usize> {
+        let bytes = self
+            .0
+            .as_bytes()
+            .get(usize::try_from(offset).map_err(|_| bad())?..)
+            .ok_or_else(bad)?;
+        let count = bytes.len().min(out.len());
+        out[..count].copy_from_slice(&bytes[..count]);
+        Ok(count)
     }
-    Some(group(&source.author, &envelope.from))
 }
 
-#[derive(Default)]
+fn unit(source: Source, body: &str) -> Option<Key> {
+    if let Ok(envelope) = Envelope::parse(body) {
+        if matches!(envelope.kind.as_str(), SESSION | SESSION_END) {
+            if let Some(tag) = envelope.data["session_parts"].as_str() {
+                let tag_hash =
+                    crate::node::link::b32_decode(tag, "Session metadata bundle").ok()?;
+                if crate::node::link::b32_encode(&tag_hash) != tag {
+                    return None;
+                }
+                let mut key = hash_key(&sha256_concat(&[
+                    b"vox/session-projection/bundle/v1",
+                    &source.author,
+                    &tag_hash,
+                ]));
+                key[63] = 1;
+                return Some(key);
+            }
+        }
+    }
+    // Old candidate trees used a substring selector. Preserve precisely the canonical
+    // interpreter's acceptance for those retained inputs, not a stricter new parser.
+    let metadata = super::metadata::parse(&mut Body(body)).ok()??;
+    if metadata.from.trim().is_empty()
+        || (!matches!(metadata.kind.as_str(), SESSION | SESSION_END) && metadata.name.is_none())
+    {
+        return None;
+    }
+    Some(group(&source.author, &metadata.from))
+}
+
+#[derive(Clone, Default)]
 struct Unit {
     sources: u64,
     events: u64,
     parts: u64,
+    author: Digest32,
+    group: Option<Key>,
 }
 impl Unit {
     fn read(bytes: &[u8]) -> Result<Self> {
         let mut d = Decoder::new(bytes);
-        if d.array()? != 4 || d.uint()? != 1 {
+        if d.array()? != 6 || d.uint()? != 2 {
             return Err(bad());
         }
         let value = Self {
             sources: d.uint()?,
             events: d.uint()?,
             parts: d.uint()?,
+            author: d.bytes()?.try_into().map_err(|_| bad())?,
+            group: match d.bytes()? {
+                [] => None,
+                hash => Some(hash_key(&hash.try_into().map_err(|_| bad())?)),
+            },
         };
         d.finish()?;
         Ok(value)
     }
     fn bytes(&self) -> Vec<u8> {
         let mut e = Encoder::new();
-        e.array(4)
-            .uint(1)
+        e.array(6)
+            .uint(2)
             .uint(self.sources)
             .uint(self.events)
-            .uint(self.parts);
+            .uint(self.parts)
+            .bytes(&self.author)
+            .bytes(self.group.as_ref().map_or(&[][..], |key| &key[..32]));
         e.finish()
+    }
+    fn source(&self, key: &Key, id: u64) -> Result<Source> {
+        Ok(Source {
+            position: Position::from_key(key)?,
+            author: self.author,
+            id,
+        })
     }
 }
 fn load(index: &Write<'_, '_>, key: &Key, canonical: bool) -> Result<Option<(u64, Unit)>> {
@@ -184,39 +224,27 @@ fn source_change(
     let old = load(index, &key, canonical)?;
     let mut value = old
         .as_ref()
-        .map(|(_, u)| Unit {
-            sources: u.sources,
-            events: u.events,
-            parts: u.parts,
-        })
-        .unwrap_or_default();
+        .map(|(_, unit)| unit.clone())
+        .unwrap_or_else(|| Unit {
+            author: source.author,
+            ..Unit::default()
+        });
+    if value.author != source.author {
+        return Err(bad());
+    }
     let position = source.position.key();
     let prior = index.waiting_find(value.sources, &position)?;
     if add {
-        if let Some(id) = prior {
-            let bytes = index.descriptor(id)?;
-            let mut d = Decoder::new(&bytes);
-            let previous = Source::read(&mut d)?;
-            d.finish()?;
-            if previous == source {
-                return Ok(());
-            }
+        if prior == Some(source.id) {
+            return Ok(());
         }
-    }
-    if !add && prior.is_none() {
+        value.sources = index.waiting_set(value.sources, position, Some(source.id))?;
+    } else if prior.is_none() {
         return Ok(());
     }
-    if let Some(id) = prior {
-        index.delete_descriptor(id)?;
-    }
-    let id = if add {
-        let mut e = Encoder::new();
-        source.put(&mut e);
-        Some(index.put_descriptor(&e.finish())?)
-    } else {
-        None
-    };
-    value.sources = index.waiting_set(value.sources, position, id)?;
+    // A removed source stays in this derived membership until publication removes its
+    // old group locator. Its signed/private row may already be gone; retained() decides
+    // which locators survive, without opening the removed body or keeping a second copy.
     store(index, key, old.map(|(id, _)| id), &value, canonical)?;
     if canonical {
         index.canonical_set(Tree::MetadataDirty, key, Some(1))?;
@@ -276,14 +304,11 @@ pub(super) fn backfill_event(
     };
     let (unit_id, mut value) = load(index, &unit_key, false)?.ok_or_else(bad)?;
     let key = event.source.position.key();
-    let id = index.put_descriptor(&event.bytes())?;
-    if let Some(old) = index.waiting_find(value.events, &key)? {
-        index.delete_descriptor(old)?;
-    }
-    value.events = index.waiting_set(value.events, key, Some(id))?;
+    value.events = index.waiting_set(value.events, key, Some(1))?;
     let group = group(&event.source.author, &event.id);
+    value.group = Some(group);
     let root = index.find(Tree::MetadataEvents, &group)?.unwrap_or(0);
-    let root = index.waiting_set(root, key, Some(id))?;
+    let root = index.waiting_set(root, key, Some(unit_id))?;
     index.set(Tree::MetadataEvents, group, Some(root))?;
     store(index, unit_key, Some(unit_id), &value, false)
 }
@@ -336,13 +361,7 @@ pub(super) fn next_source(
     let (_, unit) = load(index, target, true)?.ok_or_else(bad)?;
     index
         .nested_next(unit.sources, after)?
-        .map(|(key, id)| {
-            let bytes = index.descriptor(id)?;
-            let mut d = Decoder::new(&bytes);
-            let source = Source::read(&mut d)?;
-            d.finish()?;
-            Ok((key, source))
-        })
+        .map(|(key, id)| unit.source(&key, id).map(|source| (key, source)))
         .transpose()
 }
 
@@ -424,16 +443,79 @@ fn paths(index: &mut Write<'_, '_>, row: &Descriptor, id: u64, add: bool) -> Res
     Ok(())
 }
 
+fn envelope(read: &Read<'_>, source: Source) -> Result<Option<EnvelopeRef>> {
+    let Some(body) = read.source(source)? else {
+        return Ok(None);
+    };
+    let mut envelope = EnvelopeRef {
+        first: source,
+        bundle: None,
+        parts: 1,
+        bytes: body.len() as u64,
+    };
+    if let Ok(parsed) = Envelope::parse(&body) {
+        if matches!(parsed.kind.as_str(), SESSION | SESSION_END) {
+            if let Some(tag) = parsed.data["session_parts"].as_str() {
+                let tag_hash = crate::node::link::b32_decode(tag, "Session metadata bundle")?;
+                let value: serde_json::Value = serde_json::from_str(&body).map_err(|_| bad())?;
+                let count = value["part"]
+                    .get(1)
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(bad)?;
+                let mut bound = [u8::MAX; 64];
+                bound[..32].copy_from_slice(&source.position.hash);
+                let Some((key, id)) = read.previous(Tree::Parts, Some(bound))? else {
+                    return Ok(None);
+                };
+                if key[..32] != source.position.hash {
+                    return Ok(None);
+                }
+                let bytes = read.descriptor(id)?;
+                let mut d = Decoder::new(&bytes);
+                let last = Part::read(&mut d)?;
+                d.finish()?;
+                if last.number != count {
+                    return Ok(None);
+                }
+                envelope.bundle = Some(tag_hash);
+                envelope.parts = count;
+                envelope.bytes = last.offset.checked_add(last.bytes).ok_or_else(bad)?;
+            }
+        }
+    }
+    Ok(Some(envelope))
+}
+
 /// Replay one group's canonical events into isolated fold roots, then replace its paths
 /// in this same transaction. Untouched trees are never cloned or handed to cleanup.
-fn publish_group(index: &mut Write<'_, '_>, group: Key) -> Result<()> {
+fn publish_group(
+    index: &mut Write<'_, '_>,
+    group: Key,
+    published: &Read<'_>,
+    working: &Read<'_>,
+    target: u64,
+) -> Result<()> {
     let events = index
         .canonical_find(Tree::MetadataEvents, &group)?
         .unwrap_or(0);
     let mut after = None;
-    while let Some((key, id)) = index.nested_next(events, after)? {
-        let event = super::build::Event::read(&index.descriptor(id)?)?;
-        super::build::fold(index, event)?;
+    while let Some((key, unit_id)) = index.nested_next(events, after)? {
+        let unit = Unit::read(&index.descriptor(unit_id)?)?;
+        let id = index.waiting_find(unit.sources, &key)?.ok_or_else(bad)?;
+        let source = unit.source(&key, id)?;
+        let read = if unit_id == target {
+            working
+        } else {
+            published
+        };
+        if let Some(envelope) = envelope(read, source)? {
+            if let Some(event) = super::build::interpret(read, envelope)? {
+                if self::group(&event.source.author, &event.id) != group {
+                    return Err(bad());
+                }
+                super::build::fold(index, event)?;
+            }
+        }
         after = Some(key);
     }
     let old_root = index
@@ -512,11 +594,15 @@ fn drop_nested(index: &mut Write<'_, '_>, mut root: u64, descriptors: bool) -> R
 
 /// The temporary source/envelope fold completed. Update its old and new group before
 /// retiring any prior event locator. A kill before this commit retains the old roots.
-pub(super) fn publish(index: &mut Write<'_, '_>, target: Key) -> Result<()> {
+pub(super) fn publish(
+    index: &mut Write<'_, '_>,
+    target: Key,
+    published: &Read<'_>,
+    working: &Read<'_>,
+) -> Result<()> {
     let (unit_id, mut value) = load(index, &target, true)?.ok_or_else(bad)?;
-    while let Some((key, id)) = index.nested_next(value.events, None)? {
-        let event = super::build::Event::read(&index.descriptor(id)?)?;
-        let group = group(&event.source.author, &event.id);
+    while let Some((key, _)) = index.nested_next(value.events, None)? {
+        let group = value.group.ok_or_else(bad)?;
         index.set(Tree::MetadataDirty, group, Some(1))?;
         let root = index
             .canonical_find(Tree::MetadataEvents, &group)?
@@ -524,7 +610,13 @@ pub(super) fn publish(index: &mut Write<'_, '_>, target: Key) -> Result<()> {
         let root = index.waiting_set(root, key, None)?;
         index.canonical_set(Tree::MetadataEvents, group, (root != 0).then_some(root))?;
         value.events = index.waiting_set(value.events, key, None)?;
-        index.delete_descriptor(id)?;
+    }
+    let mut after = None;
+    while let Some((key, id)) = index.nested_next(value.sources, after)? {
+        if !published.retained(value.source(&key, id)?)? {
+            value.sources = index.waiting_set(value.sources, key, None)?;
+        }
+        after = Some(key);
     }
     while let Some((key, id)) = index.nested_next(value.parts, None)? {
         index.canonical_set(Tree::Parts, key, None)?;
@@ -543,10 +635,12 @@ pub(super) fn publish(index: &mut Write<'_, '_>, target: Key) -> Result<()> {
         let root = index
             .canonical_find(Tree::MetadataEvents, &group)?
             .unwrap_or(0);
-        let root = index.waiting_set(root, key, Some(id))?;
+        let root = index.waiting_set(root, key, Some(unit_id))?;
         index.canonical_set(Tree::MetadataEvents, group, Some(root))?;
-        value.events = index.waiting_set(value.events, key, Some(id))?;
+        value.events = index.waiting_set(value.events, key, Some(1))?;
+        value.group = Some(group);
         index.set(Tree::Events, key, None)?;
+        index.delete_descriptor(id)?;
     }
     if value.sources == 0 && value.events == 0 && value.parts == 0 {
         index.canonical_set(Tree::MetadataUnits, target, None)?;
@@ -555,7 +649,7 @@ pub(super) fn publish(index: &mut Write<'_, '_>, target: Key) -> Result<()> {
         store(index, target, Some(unit_id), &value, true)?;
     }
     while let Some((group, _)) = index.next(Tree::MetadataDirty, None)? {
-        publish_group(index, group)?;
+        publish_group(index, group, published, working, unit_id)?;
         index.set(Tree::MetadataDirty, group, None)?;
     }
     index.canonical_set(Tree::MetadataDirty, target, None)?;
@@ -572,7 +666,7 @@ pub(super) fn publish(index: &mut Write<'_, '_>, target: Key) -> Result<()> {
 }
 
 /// One cleanup step; nested roots are never mistaken for descriptor ids. Only a unit's
-/// source and event trees own descriptors; group membership and part locators do not.
+/// source ids and event/part membership are locators, never duplicate descriptors.
 pub(super) fn cleanup(index: &mut Write<'_, '_>, tree: Tree, key: Key, id: u64) -> Result<bool> {
     match tree {
         Tree::MetadataUnits => {
@@ -583,15 +677,12 @@ pub(super) fn cleanup(index: &mut Write<'_, '_>, tree: Tree, key: Key, id: u64) 
                     1 => unit.events,
                     _ => unit.parts,
                 };
-                if let Some((at, value)) = index.nested_next(root, None)? {
+                if let Some((at, _)) = index.nested_next(root, None)? {
                     let root = index.waiting_set(root, at, None)?;
                     match slot {
                         0 => unit.sources = root,
                         1 => unit.events = root,
                         _ => unit.parts = root,
-                    }
-                    if slot != 2 {
-                        index.delete_descriptor(value)?;
                     }
                     index.replace_descriptor(id, &unit.bytes())?;
                     return Ok(true);

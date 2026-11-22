@@ -289,7 +289,7 @@ impl Event {
     }
 }
 
-fn interpret(read: &Read<'_>, envelope: EnvelopeRef) -> Result<Option<Event>> {
+pub(super) fn interpret(read: &Read<'_>, envelope: EnvelopeRef) -> Result<Option<Event>> {
     let mut input = EnvelopeInput::new(read, envelope);
     let result = (|| {
         if let Some(expected) = envelope.bundle {
@@ -522,6 +522,43 @@ fn advance_phase(index: &mut Write<'_, '_>, phase: u8) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "test-knobs")]
+fn backfill_probe(room: &Digest32, publication: bool) -> Result<()> {
+    let Some(directory) = std::env::var_os("VOX_TEST_HOLD_SESSION_BACKFILL") else {
+        return Ok(());
+    };
+    let directory = std::path::PathBuf::from(directory);
+    let room = crate::node::link::b32_encode(room);
+    let run = || -> std::io::Result<()> {
+        if publication {
+            if std::fs::read_to_string(directory.join("engaged"))
+                .ok()
+                .as_deref()
+                == Some(room.as_str())
+            {
+                std::fs::write(directory.join("published"), &room)?;
+                eprintln!("RG13 backfill published {room}");
+            }
+        } else if std::fs::read_to_string(directory.join("arm"))
+            .ok()
+            .as_deref()
+            == Some(room.as_str())
+        {
+            std::fs::remove_file(directory.join("arm"))?;
+            std::fs::write(directory.join("engaged"), &room)?;
+            eprintln!("RG13 backfill held before writer {room}");
+            while !directory.join("release").exists() {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        Ok(())
+    };
+    run().map_err(|error| Error::Path {
+        op: "stage Session backfill proof",
+        detail: error.to_string(),
+    })
+}
+
 /// One ordinary page of work. The caller drives this from actor maintenance, not a client
 /// wait loop. A reader sees the old valid generation or an explicit refreshing refusal.
 pub(super) fn advance_owned(
@@ -542,6 +579,10 @@ pub(super) fn advance_owned(
         .as_ref()
         .map(|read| read.header.clone())
         .unwrap_or_default();
+    #[cfg(feature = "test-knobs")]
+    if !header.locality && header.ready && header.published.is_some() {
+        backfill_probe(room, false)?;
+    }
     let fingerprint_ready = captured
         .as_ref()
         .map(|read| read.find(Tree::Counts, &super::storage::OPENING_FINGERPRINT_MARKER))
@@ -750,11 +791,18 @@ pub(super) fn advance_owned(
             }
         }
         6 if state.target.is_some() => {
+            let published =
+                Read::open(snapshot, sek, room)?.with_source_policy(policy, dag, &view, now);
+            let working = Read::open(snapshot, sek, room)?
+                .with_source_policy(policy, dag, &view, now)
+                .work()?;
             super::locality::publish(
                 &mut index,
                 state
                     .target
                     .ok_or_else(|| invalid("Session target missing"))?,
+                &published,
+                &working,
             )?;
         }
         6 => {
@@ -777,5 +825,9 @@ pub(super) fn advance_owned(
     }
     index.seal()?;
     batch.commit()?;
+    #[cfg(feature = "test-knobs")]
+    if !header.locality && state.phase == 6 && state.target.is_none() {
+        backfill_probe(room, true)?;
+    }
     Ok(true)
 }

@@ -273,7 +273,7 @@ impl Header {
         if next == 0
             || !matches!(
                 stored_trees,
-                26 | 29 | 30 | 35 | 36 | 37 | 38 | 39 | 40 | 41 | 45 | TREES
+                26 | 29 | 30 | 35 | 36 | 37 | 38 | 39 | 40 | 41 | TREES
             )
         {
             return Err(invalid("Session index header roots"));
