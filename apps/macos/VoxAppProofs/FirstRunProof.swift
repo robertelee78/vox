@@ -593,7 +593,7 @@ final class FirstRunProof: XCTestCase {
         daemon?.terminate()
         daemon = nil
         let heldEnv = voxEnv.merging(["VOX_TEST_COMPACT_RELOCATED": marker]) { $1 }
-        daemon = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: heldEnv,
+        daemon = try start(knobs, ["daemon", "--passphrase-file", empty, "--listen", "127.0.0.1:0"], env: heldEnv,
                            until: "vox daemon: control socket")
         defer { _ = stager.run(["/bin/rm", "-f", marker], env: [:]) }
         let markerDeadline = Date().addingTimeInterval(300)
