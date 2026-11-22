@@ -100,6 +100,8 @@ signal-hook = { version = "0.3.18", features = ["extended-siginfo"] }
 # control socket (`SysControlAddr`, `UtunIfname`), `getpeereid` and `chown`, all through
 # nix's safe wrappers so `#![forbid(unsafe_code)]` holds.
 [target.'cfg(target_os = "macos")'.dependencies]
+# Cancel a launchd query with its caller's patience, without blocking hook runtime teardown.
+tokio = { workspace = true, features = ["process"] }
 nix = { version = "0.31", default-features = false, features = ["socket", "net", "ioctl", "user", "fs"] }
 # A kept node's identity passphrase in the login keychain, stored and read by the daemon only
 # (ADR-028 K-10, ADR-014 M-6): the crate's safe password calls.
