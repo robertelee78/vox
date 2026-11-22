@@ -136,3 +136,17 @@ fallback is unchanged.
 v0.4.30 claim through the CLI using its original operation ID. Package metadata
 does not change compatible operation content; different claim rules still do.
 This does not migrate operation projections written by earlier binaries.
+
+## A materialized accepted join reopens after a crash
+
+A verified join saved with its room wrap and reopen keys completes its retained
+admission handoff at startup. It then follows ordinary room reopening, including
+settlement and delivery of consented keys. An acceptance with no saved room still
+needs the person's join passphrase; a refused or abandoned join is not restored.
+
+The existing complete syscall crash sweep is
+`a_crash_after_a_consent_still_delivers_the_key_proof::a_crash_in_a_consent_whose_member_key_is_held_still_delivers_it`.
+Run it explicitly in the required build slot:
+`cargo test --release -p vox-tui --features test-knobs,optional-proofs --test a_crash_after_a_consent_still_delivers_the_key_proof a_crash_in_a_consent_whose_member_key_is_held_still_delivers_it -- --ignored --exact --nocapture`.
+It kills the serving daemon at each store boundary of the join and following
+consent, restarts it, and requires the member to read the next post.
