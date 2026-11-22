@@ -1516,6 +1516,101 @@ fn an_admin_the_creator_named_ends_a_room_and_then_it_takes_no_new_message() {
     eprintln!("[proof] end: a join to the ended room was told it ended");
 }
 
+fn rejoin_ended_with_status(worker: &Worker, link: &str) -> Out {
+    use std::io::Write as _;
+
+    struct Running(Option<std::process::Child>);
+    impl Drop for Running {
+        fn drop(&mut self) {
+            if let Some(child) = self.0.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+    fn finish(running: &mut Running, deadline: Instant, what: &str) -> std::process::Output {
+        loop {
+            if running
+                .0
+                .as_mut()
+                .expect("APPARATUS: owned command")
+                .try_wait()
+                .expect("APPARATUS: poll command")
+                .is_some()
+            {
+                return running
+                    .0
+                    .take()
+                    .expect("APPARATUS: completed command")
+                    .wait_with_output()
+                    .expect("APPARATUS: collect command");
+            }
+            assert!(
+                Instant::now() < deadline,
+                "PRODUCT: {what} did not answer within its command response bound"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    let command = |args: &[&str]| {
+        let mut command = std::process::Command::new(&worker.exe);
+        command
+            .args(args)
+            .env("VOX_DATA_DIR", &worker.data)
+            .env("VOX_CONFIG_DIR", &worker.cfg)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        support::strip_harness_env(&mut command);
+        command
+    };
+    let join_deadline = Instant::now() + GONE;
+    let mut join = Running(Some(
+        command(&["room", "join", "--passphrase-file", "-", link])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("APPARATUS: start ended-room join"),
+    ));
+    join.0
+        .as_mut()
+        .expect("APPARATUS: owned join")
+        .stdin
+        .take()
+        .expect("APPARATUS: join passphrase input")
+        .write_all(support::ROOM_PASS.as_bytes())
+        .expect("APPARATUS: write join passphrase");
+    let mut status = Running(Some(
+        command(&["status", "--json"])
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .expect("APPARATUS: start status beside ended-room join"),
+    ));
+    // Explicit command-response bounds, not an elapsed-silence verdict about background sync.
+    // Owned children are killed and reaped on any panic.
+    let output = finish(
+        &mut status,
+        Instant::now() + WITHIN,
+        "vox status during ended-room join",
+    );
+    assert!(
+        output.status.success(),
+        "PRODUCT: status was refused during ended-room join: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    eprintln!(
+        "[proof] status answered during ended-room join: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let joined = finish(&mut join, join_deadline, "vox room join for an ended room");
+    Out {
+        ok: joined.status.success(),
+        code: joined.status.code(),
+        stdout: String::from_utf8_lossy(&joined.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&joined.stderr).into_owned(),
+        argv: format!("{} room join --passphrase-file - {link}", worker.exe),
+    }
+}
+
 fn end_while_away(delegated: bool) {
     watchdog::arm();
     let rt = runtime();
@@ -1606,11 +1701,7 @@ fn end_while_away(delegated: bool) {
     setup(&room.workers[ender], &["room", "end", &id]);
     let deadline = Instant::now() + GONE;
     loop {
-        let result = room.workers[2].vox_in(
-            None,
-            &["room", "join", "--passphrase-file", "-", &link],
-            Some(support::ROOM_PASS),
-        );
+        let result = rejoin_ended_with_status(&room.workers[2], &link);
         assert!(
             !result.ok,
             "PRODUCT: ended room admitted a join: {result:?}"

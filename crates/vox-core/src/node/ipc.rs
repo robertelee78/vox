@@ -59,9 +59,10 @@ use crate::node::api::{MessageRow, NodeEvent};
 #[path = "ipc_omp_media.rs"]
 mod ipc_omp_media;
 
-/// The protocol this build speaks. Bumped when a frame's shape changes in a way
-/// an older client would misread; a client that sees a version it does not know
-/// MUST disconnect rather than guess.
+/// The only cross-release compatibility guard: package versions do not gate clients.
+/// Bump when an older peer cannot safely honor the contract, including additive tags it
+/// rejects, saved OMP fence files, and the extension/watcher line protocol. A client that
+/// sees a protocol it does not know MUST disconnect rather than guess.
 ///
 /// 6: the app API (`node::appipc`, ADR-022 M22.5). 7: a row carries where it arrived
 /// and whether it arrived late, and `Order` asks for the room's whole order (ADR-023
