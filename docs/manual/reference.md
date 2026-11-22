@@ -269,6 +269,12 @@ scope. If the machine inventory is unavailable, `anchors` is `null` and
 unqualified healthy verdict. An unavailable inventory is neither an empty complete list nor
 evidence that the daemon did not answer. `vox anchor list` still refuses an incomplete inventory.
 
+Status also reports every account node's store, including Locked or detached nodes. The JSON
+`stores` array gives `node`, `path`, apparent `file_bytes` and the filesystem's user-available
+`free_bytes`. Plain status renders those same byte values. An unreadable value is `null`, with
+`file_error` or `free_error` explaining why; it is never reported as zero. File length is not
+allocated blocks or the sum of live rows, and free disk can change between status requests.
+
 The top-level JSON field `full_flushes` counts successful store-backend `sync_data` calls across
 the daemon process, including all its nodes, database opening/recovery and temporary rewrite
 files. It resets when that process restarts. It counts completed flush I/O, not transactions

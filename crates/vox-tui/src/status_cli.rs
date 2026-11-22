@@ -25,6 +25,7 @@ pub async fn status(paths: &Paths, json: bool) -> Result<(), AppError> {
         other => return Err(crate::client::unexpected_daemon(&other)),
     };
     let name = crate::client::name_of(paths)?;
+    let stores = store_inventory(paths, &nodes);
     if let Some(info) = nodes
         .iter()
         .find(|n| n.name == name && n.status != Some(NodeStatus::Ready))
@@ -33,6 +34,7 @@ pub async fn status(paths: &Paths, json: bool) -> Result<(), AppError> {
             "node": name.as_str(), "status": info.status.map(|s| s.as_str()),
             "identity": info.fingerprint.map(|f| vox_core::node::link::b32_encode(&f)),
         });
+        value["stores"] = stores;
         vox_core::node::status::set_anchor_inventory(
             &mut value,
             vox_core::node::status::request_anchors(&at).await,
@@ -48,21 +50,81 @@ pub async fn status(paths: &Paths, json: bool) -> Result<(), AppError> {
                 );
             }
             print!("{}", render_anchors(&value));
+            print!("{}", render_stores(&value));
         }
         return Ok(());
     }
     let report = vox_core::node::status::request(&at)
         .await
         .map_err(|e| crate::client::said(&at, e))?;
+    let mut v: Value = serde_json::from_str(&report)
+        .map_err(|e| AppError::Usage(format!("the node's report did not parse: {e}")))?;
+    v["stores"] = stores;
     if json {
-        println!("{report}");
+        println!("{v}");
         return Ok(());
     }
-    let v: Value = serde_json::from_str(&report)
-        .map_err(|e| AppError::Usage(format!("the node's report did not parse: {e}")))?;
     validate_governance_status(&v)?;
     print!("{}", render(&v)?);
     Ok(())
+}
+
+/// Apparent store-file bytes and user-available filesystem bytes, without opening any store.
+/// Keep failures separate: unavailable metadata is not a zero-byte store or an empty disk.
+fn store_inventory(paths: &Paths, nodes: &[vox_core::node::daemonipc::NodeInfo]) -> Value {
+    let account = paths.account();
+    Value::Array(
+        nodes
+            .iter()
+            .map(|node| {
+                let path = account
+                    .node_dir(&node.name)
+                    .join(vox_core::node::paths::STORE_FILE);
+                let (file_bytes, file_error) = match std::fs::metadata(&path) {
+                    Ok(metadata) if metadata.is_file() => (Some(metadata.len()), None),
+                    Ok(_) => (None, Some("not a regular store file".to_owned())),
+                    Err(error) => (None, Some(error.to_string())),
+                };
+                let (free_bytes, free_error) = match vox_core::node::pulls::free_space(&path) {
+                    Ok(bytes) => (Some(bytes), None),
+                    Err(error) => (None, Some(error)),
+                };
+                serde_json::json!({
+                    "node": node.name.as_str(), "path": path,
+                    "file_bytes": file_bytes, "file_error": file_error,
+                    "free_bytes": free_bytes, "free_error": free_error,
+                })
+            })
+            .collect(),
+    )
+}
+
+fn render_stores(v: &Value) -> String {
+    use std::fmt::Write as _;
+    let Some(stores) = v["stores"].as_array() else {
+        return String::new();
+    };
+    let mut out = String::new();
+    for store in stores {
+        let _ = write!(
+            out,
+            "store {} ({}): file ",
+            s(store, "node"),
+            s(store, "path")
+        );
+        if let Some(bytes) = store["file_bytes"].as_u64() {
+            let _ = write!(out, "{bytes} bytes");
+        } else {
+            let _ = write!(out, "unavailable ({})", s(store, "file_error"));
+        }
+        out.push_str("; free disk: ");
+        if let Some(bytes) = store["free_bytes"].as_u64() {
+            let _ = writeln!(out, "{bytes} bytes");
+        } else {
+            let _ = writeln!(out, "unavailable ({})", s(store, "free_error"));
+        }
+    }
+    out
 }
 
 /// The human renderer must not silently turn a missing or wrong-typed governance answer into
@@ -198,6 +260,7 @@ fn render(v: &Value) -> Result<String, AppError> {
     if let Some(path) = v.get("log_path").and_then(Value::as_str) {
         let _ = writeln!(o, "daemon log: {path}");
     }
+    o.push_str(&render_stores(v));
     let _ = writeln!(
         o,
         "governance work: {}",
