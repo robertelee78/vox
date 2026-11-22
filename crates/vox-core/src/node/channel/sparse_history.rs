@@ -1880,12 +1880,6 @@ impl ChannelState {
         Ok(self.history_read(store)?.sparse_publication_request())
     }
 
-    pub(crate) fn history_publication_flow_root(&self, request: [u8; 16]) -> Option<[u8; 16]> {
-        self.history_publication_flow
-            .filter(|(owned, _)| *owned == request)
-            .map(|(_, root)| root)
-    }
-
     /// Called only under the room mutex after this Begin owns its physical reservation.
     pub(crate) fn register_history_publication_flow(
         &mut self,

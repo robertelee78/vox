@@ -3,7 +3,7 @@
 use super::*;
 use crate::atrest::vault::VaultRootSigner;
 use crate::node::channel::pending_trust::{CompletedTrust, PendingTrust, TrustSaved, TrustWrite};
-use crate::node::consent_order::{ConsentOrder, Stamp};
+use crate::node::consent_order::ConsentOrder;
 use crate::node::pending_consent::PendingConsents;
 use crate::node::pending_lock::PendingLocks;
 use crate::node::store::Store;
@@ -393,7 +393,6 @@ impl Completed {
 #[derive(Clone, Copy)]
 pub(super) enum ReconcileScope {
     Preparation,
-    Removals,
     Cache,
 }
 
@@ -427,7 +426,11 @@ pub(super) struct Reconcile {
 
 pub(super) enum ReconcileAction {
     Trust(Work),
-    Withdraw { target: Digest32 },
+    Withdraw {
+        target: Digest32,
+    },
+    /// Only the withdrawal hold of the proofs returns this: the shipped build never waits here.
+    #[cfg(feature = "test-knobs")]
     Progress,
     Complete,
 }
@@ -454,6 +457,21 @@ impl Reconcile {
         channel: &ChannelState,
         store: &Store,
     ) -> crate::error::Result<ReconcileAction> {
+        if channel.has_left(&channel.me()) {
+            return Ok(ReconcileAction::Complete);
+        }
+        #[cfg(feature = "test-knobs")]
+        if matches!(self.stage, ReconcileStage::Withdraw { .. }) {
+            if let Some(path) = std::env::var_os("VOX_TEST_RG3_HOLD_WITHDRAWAL") {
+                let path = std::path::PathBuf::from(path);
+                if std::fs::read_to_string(&path).is_ok_and(|room| {
+                    room.trim() == crate::node::link::b32_encode(&channel.channel_id())
+                }) {
+                    let _ = std::fs::write(path.with_extension("engaged"), "withdrawal held");
+                    return Ok(ReconcileAction::Progress);
+                }
+            }
+        }
         Ok(match self.stage {
             ReconcileStage::DeleteInitial => ReconcileAction::Trust(Work(TrustWrite::Delete {
                 trusted: self.trusted.clone(),
@@ -482,10 +500,10 @@ impl Reconcile {
                         target,
                         cursor: Cursor::Consent,
                     };
-                    ReconcileAction::Withdraw { target }
+                    return self.action(channel, store);
                 } else if let Some(after) = page.next {
                     self.consent_after = Some(after);
-                    ReconcileAction::Progress
+                    return self.action(channel, store);
                 } else {
                     self.stage = ReconcileStage::Marks;
                     ReconcileAction::Trust(Work(TrustWrite::MarkDecisions))
@@ -545,7 +563,6 @@ impl Reconcile {
                 } else if *done {
                     match self.scope {
                         ReconcileScope::Preparation => ReconcileStage::Consents,
-                        ReconcileScope::Removals => ReconcileStage::Complete,
                         ReconcileScope::Cache => ReconcileStage::Marks,
                     }
                 } else {
@@ -572,131 +589,6 @@ impl Reconcile {
             _ => return Err(Error::Profile("unexpected trust save completion")),
         }
         Ok(())
-    }
-}
-
-/// The global policy owner retains only these exact room bindings and committed-read pins,
-/// never a room mutex guard. Failed preflight releases every reservation before returning.
-pub(super) struct PolicyRoom {
-    pub(super) room: Digest32,
-    pub(super) instance: SharedChannel,
-    pub(super) owner: Arc<()>,
-    _pin: crate::node::channel::history::PendingHistoryRead,
-}
-
-pub(super) struct PolicyPublicationBlocked {
-    pub(super) room: Digest32,
-    pub(super) instance: SharedChannel,
-    pub(super) history_instance: [u8; 16],
-    pub(super) sparse: Option<([u8; 16], [u8; 16])>,
-    pub(super) wake: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + Sync>>,
-}
-
-pub(super) enum PolicyRooms {
-    Reserved(Vec<PolicyRoom>),
-    Blocked(PolicyPublicationBlocked),
-}
-
-pub(super) fn inspect_policy_rooms(
-    rooms: &[(Digest32, SharedChannel)],
-    store: &Store,
-) -> crate::error::Result<Option<PolicyPublicationBlocked>> {
-    use crate::node::channel::pending_text::PolicyBlocker;
-    for (room, instance) in rooms {
-        let channel = instance.blocking_lock();
-        let blocked = match channel.policy_publication_blocker(store)? {
-            None => continue,
-            Some(PolicyBlocker::Physical(wake)) => (None, wake),
-            Some(PolicyBlocker::Sparse {
-                request,
-                root,
-                wake,
-            }) => (Some((request, root)), wake),
-        };
-        let history_instance = channel.history_instance(store)?;
-        return Ok(Some(PolicyPublicationBlocked {
-            room: *room,
-            instance: Arc::clone(instance),
-            history_instance,
-            sparse: blocked.0,
-            wake: blocked.1,
-        }));
-    }
-    Ok(None)
-}
-
-pub(super) fn reserve_policy_rooms(
-    mut rooms: Vec<(Digest32, SharedChannel)>,
-    store: &Arc<Store>,
-    owner: Arc<()>,
-    require_append: bool,
-    managed: bool,
-) -> crate::error::Result<PolicyRooms> {
-    rooms.sort_by_key(|(room, _)| *room);
-    let mut reserved: Vec<PolicyRoom> = Vec::with_capacity(rooms.len());
-    let result = (|| {
-        for (room, instance) in rooms {
-            let mut channel = instance.blocking_lock();
-            if require_append {
-                channel.ensure_local_append_available(store)?;
-            }
-            if managed {
-                use crate::node::channel::pending_text::PolicyBlocker;
-                match channel.policy_publication_blocker(store)? {
-                    None => {}
-                    Some(PolicyBlocker::Physical(wake)) => {
-                        let history_instance = channel.history_instance(store)?;
-                        drop(channel);
-                        return Ok(Some(PolicyPublicationBlocked {
-                            room,
-                            instance,
-                            history_instance,
-                            sparse: None,
-                            wake,
-                        }));
-                    }
-                    Some(PolicyBlocker::Sparse {
-                        request,
-                        root,
-                        wake,
-                    }) => {
-                        let history_instance = channel.history_instance(store)?;
-                        drop(channel);
-                        return Ok(Some(PolicyPublicationBlocked {
-                            room,
-                            instance,
-                            history_instance,
-                            sparse: Some((request, root)),
-                            wake,
-                        }));
-                    }
-                }
-            }
-            let pin = channel.reserve_pending_write(store, Arc::clone(&owner))?;
-            drop(channel);
-            reserved.push(PolicyRoom {
-                room,
-                instance,
-                owner: Arc::clone(&owner),
-                _pin: pin,
-            });
-        }
-        Ok(None)
-    })();
-    match result {
-        Ok(None) => Ok(PolicyRooms::Reserved(reserved)),
-        outcome => {
-            for room in &mut reserved {
-                room.instance
-                    .blocking_lock()
-                    .release_pending_text(&room.owner, false);
-            }
-            match outcome {
-                Ok(Some(blocked)) => Ok(PolicyRooms::Blocked(blocked)),
-                Err(error) => Err(error),
-                Ok(None) => unreachable!(),
-            }
-        }
     }
 }
 
@@ -728,10 +620,14 @@ impl Node {
                 .retain(|(_, peer)| peer != target);
         }
         self.trust = saved.trust;
+        self.trust_generation = self.trust_generation.wrapping_add(1);
         self.note_key_body_trust_change();
         for (target, had_drive) in saved.changed_drive {
             self.note_capability(target, had_drive);
         }
+        self.governance_work.trust_waiting.clear();
+        self.governance_work.pending = true;
+        self.governance_work.again = true;
     }
 }
 
@@ -741,7 +637,6 @@ pub(super) struct Lifetime {
     pub(super) save: Option<Arc<maintenance_save::Lifetime>>,
     pub(super) transition: Option<Arc<crate::node::computer::ComputerPublicationTransition>>,
     pub(super) journal: Option<crate::node::computer::ComputerJournalWriter>,
-    pub(super) own_transitions: Vec<crate::node::channel::own_writer_gate::Transition>,
 }
 
 pub(super) enum PolicyContinuation {
@@ -763,7 +658,6 @@ pub(super) enum PolicyContinuation {
     Managed {
         lifetime: Lifetime,
         work: computer::OwnKeyPolicyWork,
-        reservations: Vec<PolicyRoom>,
     },
     FinishUntrust {
         lifetime: Lifetime,
@@ -783,29 +677,9 @@ pub(super) enum PolicyContinuation {
     },
 }
 
-pub(super) enum TrustContinuation {
-    Untrust {
-        lifetime: Lifetime,
-        operation: Untrust,
-        stage: UntrustStage,
-    },
-    Managed(policy_save::ManagedTurn),
-    Grant(policy_save::GrantTurn),
-}
-
 pub(super) struct Untrust {
     pub(super) target: Digest32,
     pub(super) alias: Option<String>,
-    pub(super) rooms: Vec<PolicyRoom>,
-    pub(super) cursor: usize,
-    pub(super) trusted: BTreeSet<Digest32>,
-    pub(super) completed: Vec<(Digest32, Digest32, u64)>,
-}
-
-pub(super) enum UntrustStage {
-    Withdraw,
-    Delete,
-    Reconcile(Reconcile),
 }
 
 impl PolicyContinuation {
@@ -834,47 +708,12 @@ impl PolicyContinuation {
         }
     }
 }
-impl TrustContinuation {
-    pub(super) fn lifetime(&self) -> &Lifetime {
-        match self {
-            Self::Untrust { lifetime, .. } => lifetime,
-            Self::Managed(turn) => &turn.lifetime,
-            Self::Grant(turn) => &turn.lifetime,
-        }
-    }
-    pub(super) fn instance(&self) -> &SharedChannel {
-        match self {
-            Self::Untrust { operation, .. } => &operation.rooms[operation.cursor].instance,
-            Self::Managed(turn) => &turn.rooms[turn.cursor].instance,
-            Self::Grant(turn) => &turn.rooms[turn.cursor].instance,
-        }
-    }
-}
 
-pub(super) enum Next {
-    Trust(Work),
-    Withdraw { target: Digest32 },
-}
-pub(super) enum TrustCompletion {
-    Trust(TrustSaved),
-    Withdraw(crate::node::channel::pending_text::consent::ConsentSaved),
-}
-pub(super) enum TrustResume {
-    Next {
-        room: Digest32,
-        work: Next,
-        continuation: TrustContinuation,
-    },
-    Progress {
-        room: Digest32,
-        continuation: TrustContinuation,
-    },
-    Finished {
-        continuation: TrustContinuation,
-    },
-}
 pub(super) enum PolicyResume {
-    Trust(TrustResume),
+    Untrusted {
+        lifetime: Lifetime,
+        operation: Untrust,
+    },
     Blacklist,
     LocalTrust {
         lifetime: Lifetime,
@@ -891,7 +730,6 @@ pub(super) enum PolicyResume {
         lifetime: Lifetime,
         source: policy_save::GrantSource,
         grant: Option<GrantSaved>,
-        rooms: Vec<PolicyRoom>,
     },
     GrantFinished {
         lifetime: Lifetime,
@@ -906,25 +744,21 @@ pub(super) enum PolicyResume {
         lifetime: Lifetime,
         work: computer::OwnKeyPolicyWork,
         result: crate::error::Result<computer::KeyringApplication>,
-        rooms: Vec<PolicyRoom>,
         revision: u64,
         expired: bool,
     },
     Failed {
         continuation: PolicyContinuation,
         error: Error,
-        rooms: Vec<PolicyRoom>,
     },
 }
 
 impl Node {
-    /// Common owner validates original attachment before this callback. `rooms` are the actual
-    /// native preflight reservations, retained even when policy persistence failed.
+    /// Install the saved keyring on its original attachment; rooms finish independently.
     pub(super) fn finish_owned_policy(
         &mut self,
         completed: PolicyCompleted,
         continuation: PolicyContinuation,
-        rooms: Vec<PolicyRoom>,
     ) -> PolicyResume {
         match (completed, continuation) {
             (
@@ -939,7 +773,6 @@ impl Node {
                     lifetime,
                     source,
                     grant,
-                    rooms,
                 }
             }
             (
@@ -962,30 +795,11 @@ impl Node {
                     alias,
                 },
             ) => {
-                let trusted = saved.trust.trusted();
                 self.install_owned_policy(saved);
-                let operation = Untrust {
-                    target,
-                    alias,
-                    rooms,
-                    cursor: 0,
-                    trusted,
-                    completed: Vec::new(),
-                };
-                let room = operation.rooms.first().map(|reserved| reserved.room);
-                let continuation = TrustContinuation::Untrust {
+                PolicyResume::Untrusted {
                     lifetime,
-                    operation,
-                    stage: UntrustStage::Withdraw,
-                };
-                PolicyResume::Trust(match room {
-                    Some(room) => TrustResume::Next {
-                        room,
-                        work: Next::Withdraw { target },
-                        continuation,
-                    },
-                    None => TrustResume::Finished { continuation },
-                })
+                    operation: Untrust { target, alias },
+                }
             }
             (
                 PolicyCompleted::Dismissed(result),
@@ -999,8 +813,8 @@ impl Node {
                         self.dismissed_offers = saved;
                         true
                     }
-                    // As before, dismissal is best-effort ONLY after the actual removal and all
-                    // debt/deletion commits. Its failure never resurrects a grant or old SKDM.
+                    // Offer dismissal follows the keyring save. Room withdrawals remain
+                    // durable PendingLocks regardless of this best-effort metadata result.
                     Ok(None) | Err(_) => false,
                 };
                 PolicyResume::FinishedUntrust {
@@ -1097,8 +911,10 @@ impl Node {
                 }
                 let result = result.map(|settled| {
                     if settled {
+                        self.computer_expired = expired;
                         self.computer_revision
-                            .store(u64::MAX, std::sync::atomic::Ordering::Release);
+                            .store(revision, std::sync::atomic::Ordering::Release);
+                        self.publish_computer_trust_projection();
                     }
                     computer::KeyringApplication { settled }
                 });
@@ -1107,7 +923,6 @@ impl Node {
                     lifetime,
                     work,
                     result,
-                    rooms,
                     revision,
                     expired,
                 }
@@ -1115,232 +930,11 @@ impl Node {
             (PolicyCompleted::Saved(Err(error)), continuation) => PolicyResume::Failed {
                 continuation,
                 error,
-                rooms,
             },
             (_, continuation) => PolicyResume::Failed {
                 continuation,
-                rooms,
                 error: Error::Profile("policy completion does not match its original caller"),
             },
         }
     }
-
-    /// `channel` is the exact room whose compact completion the common owner just installed.
-    /// This callback performs no transaction and never reports task delivery as a durable fact.
-    /// Returned Next/Progress retains the original lifetime and original caller/reply.
-    pub(super) fn finish_owned_trust(
-        &mut self,
-        room: Digest32,
-        channel: &ChannelState,
-        mut continuation: TrustContinuation,
-        result: crate::error::Result<TrustCompletion>,
-        store: &Store,
-    ) -> std::result::Result<TrustResume, Box<(TrustContinuation, Error)>> {
-        let saved = match result {
-            Ok(saved) => saved,
-            Err(error) => return Err(Box::new((continuation, error))),
-        };
-        let transition = (|| -> crate::error::Result<()> {
-            match (&mut continuation, saved) {
-                (
-                    TrustContinuation::Untrust {
-                        operation, stage, ..
-                    },
-                    TrustCompletion::Withdraw(saved),
-                ) => {
-                    if let crate::node::channel::pending_text::consent::ConsentSaved::Withdrawn(
-                        Some(revocation),
-                    ) = &saved
-                    {
-                        operation.completed.push((
-                            room,
-                            revocation.body.target_id,
-                            revocation.body.new_chain_id,
-                        ));
-                    }
-                    match stage {
-                        UntrustStage::Withdraw => {
-                            if !matches!(saved, crate::node::channel::pending_text::consent::ConsentSaved::Withdrawn(_)) {
-                                return Err(Error::Profile("trust withdrawal returned a grant"));
-                            }
-                            *stage = UntrustStage::Delete;
-                        }
-                        UntrustStage::Reconcile(state) => state.withdrawn(&saved)?,
-                        UntrustStage::Delete => {
-                            return Err(Error::Profile(
-                                "unexpected duplicate withdrawal completion",
-                            ))
-                        }
-                    }
-                }
-                (
-                    TrustContinuation::Untrust {
-                        operation, stage, ..
-                    },
-                    TrustCompletion::Trust(saved),
-                ) => match stage {
-                    UntrustStage::Delete => match saved {
-                        TrustSaved::Deleted {
-                            debt_cleared: Some(target),
-                            dropped,
-                        } if target == operation.target => {
-                            if dropped > 0 {
-                                self.governance_work.wake_room(room);
-                            }
-                            operation.cursor += 1;
-                            if operation.cursor == operation.rooms.len() {
-                                operation.cursor = 0;
-                                *stage = UntrustStage::Reconcile(Reconcile::new(
-                                    operation.trusted.clone(),
-                                    ReconcileScope::Removals,
-                                ));
-                            } else {
-                                *stage = UntrustStage::Withdraw;
-                            }
-                        }
-                        _ => {
-                            return Err(Error::Profile(
-                                "trust deletion did not commit its exact withdrawal debt",
-                            ))
-                        }
-                    },
-                    UntrustStage::Reconcile(state) => state.saved(&saved)?,
-                    UntrustStage::Withdraw => {
-                        return Err(Error::Profile(
-                            "withdrawal was not committed before deletion",
-                        ))
-                    }
-                },
-                _ => {
-                    return Err(Error::Profile(
-                        "trust completion does not match its original continuation",
-                    ))
-                }
-            }
-            Ok(())
-        })();
-        if let Err(error) = transition {
-            return Err(Box::new((continuation, error)));
-        }
-        self.continue_owned_trust(room, channel, continuation, store)
-    }
-
-    pub(super) fn continue_owned_trust(
-        &mut self,
-        room: Digest32,
-        channel: &ChannelState,
-        mut continuation: TrustContinuation,
-        store: &Store,
-    ) -> std::result::Result<TrustResume, Box<(TrustContinuation, Error)>> {
-        let next = match &mut continuation {
-            TrustContinuation::Untrust {
-                operation, stage, ..
-            } => {
-                match stage {
-                    UntrustStage::Withdraw => Some((
-                        operation.rooms[operation.cursor].room,
-                        Next::Withdraw {
-                            target: operation.target,
-                        },
-                    )),
-                    UntrustStage::Delete => Some((
-                        room,
-                        Next::Trust(Work(TrustWrite::Delete {
-                            trusted: operation.trusted.clone(),
-                            withdrawn: Some(operation.target),
-                        })),
-                    )),
-                    UntrustStage::Reconcile(state) => {
-                        let current = operation.rooms[operation.cursor].room;
-                        // Starting a new room needs no read yet; its first step is exact deletion.
-                        if current != room {
-                            Some((
-                                current,
-                                Next::Trust(Work(TrustWrite::Delete {
-                                    trusted: operation.trusted.clone(),
-                                    withdrawn: None,
-                                })),
-                            ))
-                        } else {
-                            match state.action(channel, store) {
-                                Ok(ReconcileAction::Trust(work)) => Some((room, Next::Trust(work))),
-                                Ok(ReconcileAction::Withdraw { target }) => {
-                                    Some((room, Next::Withdraw { target }))
-                                }
-                                Ok(ReconcileAction::Complete) => {
-                                    operation.cursor += 1;
-                                    if operation.cursor == operation.rooms.len() {
-                                        None
-                                    } else {
-                                        *stage = UntrustStage::Reconcile(Reconcile::new(
-                                            operation.trusted.clone(),
-                                            ReconcileScope::Removals,
-                                        ));
-                                        Some((
-                                            operation.rooms[operation.cursor].room,
-                                            Next::Trust(Work(TrustWrite::Delete {
-                                                trusted: operation.trusted.clone(),
-                                                withdrawn: None,
-                                            })),
-                                        ))
-                                    }
-                                }
-                                Ok(ReconcileAction::Progress) => {
-                                    return Ok(TrustResume::Progress { room, continuation })
-                                }
-                                Err(error) => return Err(Box::new((continuation, error))),
-                            }
-                        }
-                    }
-                }
-            }
-            TrustContinuation::Managed(_) => {
-                return Err(Box::new((
-                    continuation,
-                    Error::Profile("managed policy has its own retained room continuation"),
-                )))
-            }
-            TrustContinuation::Grant(_) => {
-                return Err(Box::new((
-                    continuation,
-                    Error::Profile("grant has its own retained room continuation"),
-                )))
-            }
-        };
-        Ok(match next {
-            Some((room, work)) => TrustResume::Next {
-                room,
-                work,
-                continuation,
-            },
-            None => TrustResume::Finished { continuation },
-        })
-    }
-}
-
-impl TrustContinuation {
-    pub(super) fn is_preparation(&self) -> bool {
-        false
-    }
-    pub(super) fn policy_reservation_owner(&self) -> Option<Arc<()>> {
-        match self {
-            Self::Untrust {
-                operation,
-                stage: UntrustStage::Withdraw,
-                ..
-            } => Some(Arc::clone(&operation.rooms[operation.cursor].owner)),
-            Self::Managed(turn) => turn.policy_reservation_owner(),
-            Self::Grant(turn) => Some(Arc::clone(&turn.rooms[turn.cursor].owner)),
-            _ => None,
-        }
-    }
-}
-
-pub(super) async fn retire_detached(
-    room: Digest32,
-    result: crate::error::Result<maintenance_save::Saved>,
-    continuation: TrustContinuation,
-    reply: Option<oneshot::Sender<Outcome>>,
-) {
-    policy_save::retire_detached(room, result, continuation, reply).await;
 }

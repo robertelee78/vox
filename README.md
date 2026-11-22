@@ -49,6 +49,10 @@ curl -fsSL https://voxlucis.us/install.sh | sh
 Targets: `x86_64-unknown-linux-gnu`, and `aarch64-apple-darwin` on macOS 13 or later. An Intel
 Mac, or macOS before 13, is not supported: the installer says so and downloads nothing.
 
+On Linux, Vox needs glibc 2.28 or newer: Ubuntu 20.04, Debian 10, RHEL 8,
+and everything newer. On an older system the installer says so and installs nothing; where it
+can tell before downloading, it downloads nothing.
+
 The installer downloads from the *exact release* its record names (not a moving `latest`),
 verifies size and SHA-256, and on macOS also requires the Developer ID signature (team
 `3T2D2YNTVW`, `us.vox.cli`, hardened runtime) and confirms the notarization ticket with Apple. On

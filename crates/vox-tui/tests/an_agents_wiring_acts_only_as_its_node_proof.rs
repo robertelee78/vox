@@ -85,6 +85,10 @@
 #[path = "support/test_knobs.rs"]
 mod test_knobs;
 
+#[cfg(target_os = "linux")]
+#[path = "support/typed.rs"]
+mod typed;
+
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -218,6 +222,8 @@ impl Drop for Dirs {
                 std::thread::sleep(Duration::from_millis(100));
             }
         }
+        #[cfg(target_os = "linux")]
+        typed::cleanup_linux_keys(&self.root.join("d"));
     }
 }
 

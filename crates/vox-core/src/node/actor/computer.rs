@@ -15,7 +15,6 @@ pub(super) struct OwnKeyPolicyWork {
     pub(super) owner: Arc<()>,
     pub(super) guard: ComputerPolicyGuard,
     pub(super) reply: tokio::sync::oneshot::Sender<crate::error::Result<()>>,
-    pub(super) targets: Vec<Digest32>,
 }
 
 pub(super) struct KeyringApplication {

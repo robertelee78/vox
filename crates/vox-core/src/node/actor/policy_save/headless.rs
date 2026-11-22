@@ -11,7 +11,6 @@ pub(crate) struct HeadlessPending {
     task: tokio::task::JoinHandle<()>,
     work: computer::OwnKeyPolicyWork,
     _transition: Arc<crate::node::computer::ComputerPublicationTransition>,
-    _transitions: Vec<crate::node::channel::own_writer_gate::Transition>,
     _secret: own_keys::SecretLease,
 }
 impl HeadlessPending {
@@ -33,7 +32,6 @@ impl Node {
         work: computer::OwnKeyPolicyWork,
         secret: own_keys::SecretLease,
         transition: crate::node::computer::ComputerPublicationTransition,
-        transitions: Vec<crate::node::channel::own_writer_gate::Transition>,
     ) {
         if self.pending_policy.is_some() {
             let _ = work
@@ -99,7 +97,6 @@ impl Node {
             task,
             work,
             _transition: transition,
-            _transitions: transitions,
             _secret: secret,
         }));
     }

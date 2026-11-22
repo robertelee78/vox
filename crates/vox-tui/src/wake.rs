@@ -766,7 +766,10 @@ pub fn register(paths: &Paths, session: &str, codex: bool) {
 // Every registration rewrite, including a hook's idle update, shares this lock. Atomic
 // rename alone cannot stop a stale whole-record rewrite from restoring a removed room.
 // The lock file is outside the registrations directory, so it can never look like a session.
+// A profile directory replaced since `paths` were resolved is refused before anything in it is
+// created or changed: every registration writer takes this lock first.
 fn registration_lock(paths: &Paths) -> Result<std::fs::File, String> {
+    paths.verify_profile().map_err(|e| e.to_string())?;
     let path = paths.session_dir().with_extension("lock");
     if let Some(parent) = path.parent() {
         vox_core::node::paths::create_private_dir(parent).map_err(|e| e.to_string())?;

@@ -15,6 +15,32 @@ use std::io::Write as _;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+/// Require a disposable container user before a kernel-keyring journey starts.
+#[cfg(target_os = "linux")]
+pub fn require_disposable_keyring() {
+    assert!(
+        std::env::var_os("VOX_PROOF_DISPOSABLE_KEYRING").as_deref()
+            == Some(std::ffi::OsStr::new("1")),
+        "APPARATUS: run this kernel-keyring proof as a disposable container user and set VOX_PROOF_DISPOSABLE_KEYRING=1"
+    );
+}
+
+/// Remove only keys named for nodes in this proof's scratch data root.
+#[cfg(target_os = "linux")]
+pub fn cleanup_linux_keys(data: &std::path::Path) {
+    use sha2::{Digest as _, Sha256};
+    let Ok(nodes) = std::fs::read_dir(data.join("nodes")) else {
+        return;
+    };
+    for node in nodes.flatten() {
+        let account = node.path().to_string_lossy().into_owned();
+        let name = format!("us.vox.node:{:x}", Sha256::digest(account.as_bytes()));
+        if let Err(error) = vox_sockdrops::kernel_key::forget(&name) {
+            eprintln!("APPARATUS: could not remove proof key {name}: {error}");
+        }
+    }
+}
+
 /// How long a typed verb may take, end to end: past it the driver kills `vox` and says so.
 pub const BOUND: Duration = Duration::from_secs(120);
 

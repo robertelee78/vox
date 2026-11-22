@@ -191,23 +191,38 @@ fn erased(w: &mut Worker, room: &str, cid: &[u8; 32], checkpoint: bool) {
             .open_read_only(&path)
             .unwrap_or_else(|e| panic!("APPARATUS: open {} read-only: {e}", path.display()));
         let read = db.begin_read().expect("APPARATUS: read stopped store");
-        let segments = read
-            .open_table(redb::TableDefinition::<([u8; 32], u8, u64), &[u8]>::new(
-                "segments",
-            ))
-            .expect("APPARATUS: open sealed segments");
-        let rows: Vec<_> = segments
-            .range((*cid, 0, 0)..=(*cid, u8::MAX, u64::MAX))
-            .expect("APPARATUS: range room rows")
-            .map(|row| row.expect("APPARATUS: read room row").0.value())
-            .collect();
-        // ADR-023 RL-8.1 / RL-8.4: retain only the separate non-secret checkpoint,
-        // never message bodies, room keys, passphrases or a second room log.
-        assert!(
-            rows.is_empty(),
-            "PRODUCT: {} kept deleted room rows: {rows:?}",
-            w.name
-        );
+        let mut binding = b"vox/own-continuity-scope/v1".to_vec();
+        binding.extend_from_slice(cid);
+        binding.extend_from_slice(&w.fp);
+        let scope = vox_core::hash::sha256(&binding);
+        let mut markers = Vec::new();
+        for name in ["segments", "small_segments"] {
+            let segments = match read.open_table(
+                redb::TableDefinition::<([u8; 32], u8, u64), &[u8]>::new(name),
+            ) {
+                Ok(table) => table,
+                Err(redb::TableError::TableDoesNotExist(_)) => continue,
+                Err(e) => panic!("APPARATUS: open {name}: {e}"),
+            };
+            let rows: Vec<_> = segments
+                .range((*cid, 0, 0)..=(*cid, u8::MAX, u64::MAX))
+                .unwrap_or_else(|e| panic!("APPARATUS: range room rows in {name}: {e}"))
+                .map(|row| row.expect("APPARATUS: read room row").0.value())
+                .collect();
+            // ADR-023 RL-8.1 / RL-8.4: retain only the separate non-secret checkpoint,
+            // never message bodies, room keys, passphrases or a second room log.
+            assert!(
+                rows.is_empty(),
+                "PRODUCT: {} kept deleted room rows in {name}: {rows:?}",
+                w.name
+            );
+            markers.extend(
+                segments
+                    .range((scope, 0, 0)..=(scope, u8::MAX, u64::MAX))
+                    .unwrap_or_else(|e| panic!("APPARATUS: range continuity rows in {name}: {e}"))
+                    .map(|row| row.expect("APPARATUS: read continuity row").0.value()),
+            );
+        }
         let wraps = read
             .open_table(redb::TableDefinition::<[u8; 32], &[u8]>::new("sek_wraps"))
             .expect("APPARATUS: open SEK wraps");
@@ -216,15 +231,7 @@ fn erased(w: &mut Worker, room: &str, cid: &[u8; 32], checkpoint: bool) {
             "PRODUCT: {} kept the deleted room's SEK wrap",
             w.name
         );
-        let mut binding = b"vox/own-continuity-scope/v1".to_vec();
-        binding.extend_from_slice(cid);
-        binding.extend_from_slice(&w.fp);
-        let scope = vox_core::hash::sha256(&binding);
-        let markers: Vec<_> = segments
-            .range((scope, 0, 0)..=(scope, u8::MAX, u64::MAX))
-            .expect("APPARATUS: range continuity rows")
-            .map(|row| row.expect("APPARATUS: read continuity row").0.value())
-            .collect();
+        // Count checkpoints across both tables, including duplicate copies.
         let expected = if checkpoint {
             vec![(scope, 4, 0)]
         } else {
