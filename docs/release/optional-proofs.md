@@ -32,6 +32,40 @@ They remove their own keys on normal exit, but a killed proof can leave one. Ins
 `keyctl list @u`; after identifying the exact `us.vox.node:<digest>` for the scratch node,
 remove only that serial with `keyctl unlink <serial> @u`. Do not clear the user's keyring.
 
+### Managed daemon recovery (ADR-052 RG-9)
+
+The optional Linux systemd journey in `the_daemon_and_its_nodes_proof.rs` supplies a minimal
+`Restart=on-failure` user unit with private profile roots, then removes it. Vox ships no
+systemd unit or manual enrollment instructions. A managed daemon stopped by a signal exits 71
+after clean shutdown; explicit product Stop exits 0. The journey checks recovery independently
+of client auto-start.
+
+```sh
+cargo test --release -p vox-tui --features optional-proofs,test-knobs \
+  --test the_daemon_and_its_nodes_proof \
+  a_systemd_user_unit_recovers_foreign_signals_and_honors_product_stop \
+  -- --ignored --exact --nocapture
+```
+
+Run it only inside its disposable `vox-rg9-…` container with a real systemd user session and
+`VOX_PROOF_SYSTEMD_CONTAINER` naming that container. There is no `vox daemon stop` subcommand;
+the proof sends the existing public control Stop request.
+
+The macOS guest journey loads the bundle's shipped launch agent with scratch bindings and
+boots it out even on failure. This establishes keep-alive behavior, not signed SMAppService
+enrollment or approval; those belong to the release journey.
+
+For the recovery-only guest journey, first build the helper in a shared build hold, then run:
+
+```sh
+python3 scripts/app-proofs-vm.py --recovery-vm /absolute/prebuilt/vox \
+  apps/macos/Bundle/LaunchAgents/us.vox.daemon.plist /absolute/receipt-directory
+```
+
+This route requires the existing stopped `vox-app-proofs` guest, snapshots supplied artifacts,
+does not resize it, and leaves it stopped. It stages a private node, requires a launchd-owned
+replacement before any healing client, checks `vox status`, and sends public control Stop.
+
 ### macOS update recovery (ADR-014 M-29a)
 
 For a newer release, `vox update` downloads and verifies its updater before transferring the

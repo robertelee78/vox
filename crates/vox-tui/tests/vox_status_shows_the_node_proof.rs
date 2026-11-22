@@ -780,3 +780,185 @@ fn vox_status_shows_rooms_peers_tunnels_udp_flows_and_what_is_unhealthy() {
          it unreachable:\n{text}"
     );
 }
+
+/// RG-13: disk usage belongs to the whole account, not only its selected Ready node.
+#[test]
+#[ignore = "real binary, two scratch stores and production Argon2id; run in release with test-knobs"]
+fn status_shows_every_store_and_its_filesystems_free_bytes() {
+    use vox_core::node::paths::{NodeName, Paths};
+    watchdog::arm();
+    let scratch = StatusNodes(tempfile::tempdir().expect("APPARATUS: store-size profile"));
+    let dir = scratch.0.path();
+    std::fs::create_dir_all(dir.join("home")).unwrap();
+    let run = |args: &[&str], input: &str| {
+        let (ok, out, err) = node_command(dir, args, input);
+        assert!(ok, "APPARATUS: vox {args:?}: {out}{err}");
+        out
+    };
+    run(
+        &[
+            "node",
+            "create",
+            "small",
+            "--listen",
+            "127.0.0.1:0",
+            "--passphrase-file",
+            "-",
+        ],
+        "\n",
+    );
+    run(
+        &[
+            "node",
+            "create",
+            "large",
+            "--listen",
+            "127.0.0.1:0",
+            "--passphrase-file",
+            "-",
+        ],
+        "large secret\n",
+    );
+    run(
+        &["node", "unlock", "large", "--passphrase-file", "-"],
+        "large secret\n",
+    );
+    run(
+        &[
+            "room",
+            "create",
+            "--node",
+            "large",
+            "--name",
+            "large-room",
+            "--passphrase-file",
+            "-",
+        ],
+        "room secret\n",
+    );
+    for n in 0..8 {
+        run(
+            &[
+                "room",
+                "post",
+                "--node",
+                "large",
+                "large-room",
+                &format!("store-size-{n}-{}", "x".repeat(4096)),
+            ],
+            "",
+        );
+    }
+    run(&["node", "lock", "large"], "");
+    let locked = run(&["status", "--node", "large", "--json"], "");
+    let locked: Value = serde_json::from_str(&locked).unwrap();
+    assert_eq!(
+        locked["status"], "Locked",
+        "APPARATUS: large store is not Locked: {locked}"
+    );
+    let account = Paths::resolve("small", Some(dir), Some(&dir.join("cfg")))
+        .unwrap()
+        .account();
+    let stores: Vec<_> = ["small", "large"]
+        .into_iter()
+        .map(|name| {
+            let path = account
+                .node_paths_as_they_are(&NodeName::parse(name).unwrap())
+                .store_file();
+            (name, path)
+        })
+        .collect();
+    let lengths: Vec<_> = stores
+        .iter()
+        .map(|(_, p)| std::fs::metadata(p).unwrap().len())
+        .collect();
+    assert_ne!(
+        lengths[0], lengths[1],
+        "APPARATUS: distinct store sizes were not staged"
+    );
+    let free = |path: &std::path::Path| {
+        let stat = rustix::fs::statvfs(path).expect("APPARATUS: fresh OS free-space sample");
+        #[allow(clippy::useless_conversion, clippy::unnecessary_fallible_conversions)]
+        let unit = u64::try_from(stat.f_frsize).unwrap();
+        stat.f_bavail.saturating_mul(unit)
+    };
+    for selected in ["small", "large"] {
+        let before: Vec<_> = stores.iter().map(|(_, p)| free(p)).collect();
+        let out = run(&["status", "--node", selected, "--json"], "");
+        let report: Value = serde_json::from_str(&out).expect("PRODUCT: status JSON");
+        let rows = report["stores"].as_array().unwrap_or_else(|| {
+            panic!(
+                "PRODUCT: status must report all account stores, including Locked large: {report}"
+            )
+        });
+        assert_eq!(
+            rows.len(),
+            2,
+            "PRODUCT: selected {selected} omitted an account store: {report}"
+        );
+        for (index, (name, path)) in stores.iter().enumerate() {
+            let row = rows
+                .iter()
+                .find(|row| row["node"] == *name)
+                .unwrap_or_else(|| panic!("PRODUCT: status omitted store {name}: {report}"));
+            let actual = std::fs::metadata(path).unwrap().len();
+            assert_eq!(
+                row["file_bytes"].as_u64(),
+                Some(actual),
+                "PRODUCT: {name} file length differs from the OS: {row}; actual={actual}"
+            );
+            assert_eq!(
+                row["path"].as_str(),
+                path.to_str(),
+                "PRODUCT: wrong store path: {row}"
+            );
+            let after = free(path);
+            let reported = row["free_bytes"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("PRODUCT: {name} free bytes unavailable: {row}"));
+            let tolerance = 64 * 1024 * 1024;
+            assert!(reported > 0 &&
+                reported >= before[index].min(after).saturating_sub(tolerance) &&
+                reported <= before[index].max(after).saturating_add(tolerance),
+                "PRODUCT: {name} free bytes disagree with fresh OS samples: {row}; before={} after={after}", before[index]);
+        }
+        let plain = run(&["status", "--node", selected], "");
+        for (name, path) in &stores {
+            assert!(
+                plain.contains(name) && plain.contains(path.to_string_lossy().as_ref()),
+                "PRODUCT: plain status must name {name}'s store: {plain}"
+            );
+        }
+        assert!(
+            plain.contains("free disk") && plain.contains("bytes"),
+            "PRODUCT: plain status must show store and free-disk bytes: {plain}"
+        );
+        eprintln!("OBSERVATION selected={selected}: {out}\n{plain}");
+    }
+    // A Locked store has no writer. Hide only this proof's file to stage unavailable metadata.
+    let missing = &stores[1].1;
+    let saved = missing.with_extension("proof-held");
+    std::fs::rename(missing, &saved).expect("APPARATUS: hide own Locked store");
+    let out = run(&["status", "--node", "small", "--json"], "");
+    let plain = run(&["status", "--node", "small"], "");
+    std::fs::rename(&saved, missing).expect("APPARATUS: restore own Locked store");
+    let report: Value = serde_json::from_str(&out).unwrap();
+    let row = report["stores"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["node"] == "large")
+        .expect("PRODUCT: missing store omitted");
+    assert!(
+        row["file_bytes"].is_null() && row["file_error"].as_str().is_some_and(|s| !s.is_empty()),
+        "PRODUCT: unreadable store must be unavailable with its reason, never zero: {row}"
+    );
+    assert!(
+        row["free_bytes"].is_null() && row["free_error"].as_str().is_some_and(|s| !s.is_empty()),
+        "PRODUCT: unavailable filesystem sample must retain its reason: {row}"
+    );
+    assert!(
+        plain.contains("unavailable") && plain.contains("large"),
+        "PRODUCT: plain status hides the unreadable store reason: {plain}"
+    );
+}

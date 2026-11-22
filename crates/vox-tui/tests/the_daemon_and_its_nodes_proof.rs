@@ -58,8 +58,13 @@ mod watchdog;
 #[path = "support/test_knobs.rs"]
 mod test_knobs;
 
+#[cfg(target_os = "linux")]
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
 #[path = "support/typed.rs"]
 mod typed;
+#[cfg(target_os = "linux")]
+optional_proof::not_run!(a_systemd_user_unit_recovers_foreign_signals_and_honors_product_stop);
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -1952,6 +1957,322 @@ fn a_linux_typed_unlock_survives_another_sessions_daemon() {
     );
     let _ = a.run(&["node", "lock", "default"], "");
     stop_pid(a.lock_pid().unwrap());
+}
+
+/// RG-9: real systemd in the authorized disposable container, not an in-process supervisor.
+#[cfg(all(target_os = "linux", feature = "optional-proofs"))]
+#[test]
+#[ignore = "optional: a systemd user session in the authorized vox-rg9 container"]
+fn a_systemd_user_unit_recovers_foreign_signals_and_honors_product_stop() {
+    use std::collections::BTreeMap;
+    use vox_core::node::daemonipc::{DaemonClient, DaemonFrame, DaemonRequest};
+    fn manager(args: &[&str]) -> std::process::Output {
+        Command::new("systemctl")
+            .arg("--user")
+            .args(args)
+            .output()
+            .expect("APPARATUS: run the scratch user's systemctl")
+    }
+    fn properties(unit: &str) -> BTreeMap<String, String> {
+        let output = manager(&[
+            "show",
+            unit,
+            "--property=MainPID,ActiveState,SubState,ExecMainStatus,Result,NRestarts,Job",
+        ]);
+        assert!(
+            output.status.success(),
+            "APPARATUS: inspect our user unit: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                line.split_once('=')
+                    .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            })
+            .collect()
+    }
+    fn pid(state: &BTreeMap<String, String>) -> Option<u32> {
+        state
+            .get("MainPID")?
+            .parse::<u32>()
+            .ok()
+            .filter(|pid| *pid > 1)
+    }
+    fn serving(a: &Account, unit: &str, old: Option<u32>, recovery: bool) -> u32 {
+        let began = Instant::now();
+        loop {
+            let state = properties(unit);
+            if let Some(current) = pid(&state).filter(|current| Some(*current) != old) {
+                if a.log().contains(&format!("serving (pid {current})")) {
+                    eprintln!("[proof] manager owns serving pid {current}: {state:?}");
+                    return current;
+                }
+            }
+            assert!(!(recovery && state.get("ActiveState").is_some_and(|s| s == "inactive")
+                && state.get("ExecMainStatus").is_some_and(|s| s == "0")),
+                "PRODUCT: a foreign TERM was reported as a successful stop, so Restart=on-failure left no daemon: {state:?}\n{}", a.log());
+            assert!(
+                began.elapsed() < Duration::from_secs(60),
+                "APPARATUS: user unit never reached a new serving generation: {state:?}\n{}",
+                a.log()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    fn stop(a: &Account, unit: &str) {
+        let account = vox_core::node::paths::Account::of(Some(&a.data), Some(&a.cfg)).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let reply = runtime.block_on(async {
+            let mut client = DaemonClient::open(&account.socket())
+                .await
+                .expect("APPARATUS: reach the unit's serving daemon");
+            client
+                .request(DaemonRequest::Stop)
+                .await
+                .expect("PRODUCT: explicit Stop was not acknowledged")
+        });
+        assert!(
+            matches!(reply, DaemonFrame::Ok),
+            "PRODUCT: explicit Stop was refused: {reply:?}"
+        );
+        let mut final_state = BTreeMap::new();
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                final_state = properties(unit);
+                final_state
+                    .get("ActiveState")
+                    .is_some_and(|s| s == "inactive")
+            }),
+            "APPARATUS: explicit Stop did not finish: {final_state:?}\n{}",
+            a.log()
+        );
+        assert!(pid(&final_state).is_none()
+            && final_state.get("ExecMainStatus").is_some_and(|s| s == "0")
+            && final_state.get("Result").is_some_and(|s| s == "success")
+            && final_state.get("Job").is_none_or(|s| s.is_empty() || s == "0"),
+            "PRODUCT: explicit Stop must leave the on-failure unit stopped with no queued restart: {final_state:?}\n{}", a.log());
+        eprintln!("[proof] explicit product Stop leaves the unit stopped: {final_state:?}");
+    }
+    struct Unit {
+        name: String,
+        path: PathBuf,
+        data: PathBuf,
+    }
+    impl Drop for Unit {
+        fn drop(&mut self) {
+            // All these processes were started for this proof's private profile, including its worker.
+            for pid in daemons_of(&self.data) {
+                let _ = Command::new("kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .status();
+            }
+            let _ = manager(&["stop", &self.name]);
+            let _ = std::fs::remove_file(&self.path);
+            let _ = manager(&["daemon-reload"]);
+        }
+    }
+    watchdog::arm();
+    assert!(
+        Path::new("/run/.containerenv").exists()
+            && std::env::var("VOX_PROOF_SYSTEMD_CONTAINER")
+                .is_ok_and(|name| name.starts_with("vox-rg9-")),
+        "APPARATUS: this proof runs only in its authorized disposable podman container"
+    );
+    let a = Account::new();
+    a.make_node("default");
+    let name = format!("vox-rg9-{}.service", std::process::id());
+    let runtime = PathBuf::from(
+        std::env::var_os("XDG_RUNTIME_DIR").expect("APPARATUS: container user runtime directory"),
+    );
+    let directory = runtime.join("systemd/user");
+    std::fs::create_dir_all(&directory).expect("APPARATUS: user unit directory");
+    let path = directory.join(&name);
+    assert!(
+        !path.exists(),
+        "APPARATUS: refusing an existing unit {}",
+        path.display()
+    );
+    // Vox ships no unit. This proof enrolls only its private on-failure unit.
+    std::fs::write(&path, format!(
+        "[Unit]\nDescription=Vox RG-9 proof\n[Service]\nExecStart={VOX} daemon --no-node --listen 127.0.0.1:0 --data-dir {} --config-dir {}\nEnvironment=VOX_DATA_DIR={} VOX_CONFIG_DIR={} VOX_PROXY=127.0.0.1:0 HOME={}\nRestart=on-failure\nRestartSec=1\n",
+        a.data.display(), a.cfg.display(), a.data.display(), a.cfg.display(), a._tmp.path().join("home").display()
+    )).expect("APPARATUS: write our scratch unit");
+    let unit = Unit {
+        name,
+        path,
+        data: a.data.clone(),
+    };
+    for args in [vec!["daemon-reload"], vec!["start", unit.name.as_str()]] {
+        let output = manager(&args);
+        assert!(
+            output.status.success(),
+            "APPARATUS: enroll our user unit: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let first = serving(&a, &unit.name, None, false);
+    let (ok, out, err) = a.run(&["node", "attach", "default"], "");
+    assert!(
+        ok,
+        "APPARATUS: attach the scratch node before TERM: {out}{err}"
+    );
+    let (ok, out, err) = a.run(&["status", "--json"], "");
+    assert!(ok, "APPARATUS: initial vox status failed: {out}{err}");
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &first.to_string()])
+            .status()
+            .unwrap()
+            .success(),
+        "APPARATUS: send TERM only to the unit daemon this proof started"
+    );
+    // No vox client has run: manager state plus the product's own serving line decide recovery.
+    let recovered = serving(&a, &unit.name, Some(first), true);
+    assert_ne!(
+        first, recovered,
+        "PRODUCT: foreign TERM left the same daemon generation"
+    );
+    let (ok, out, err) = a.run(&["node", "attach", "default"], "");
+    assert!(
+        ok,
+        "PRODUCT: attach after manager recovery failed: {out}{err}"
+    );
+    let (ok, out, err) = a.run(&["status", "--json"], "");
+    assert!(
+        ok,
+        "PRODUCT: vox status after manager recovery failed: {out}{err}"
+    );
+    let report: serde_json::Value = serde_json::from_str(&out)
+        .unwrap_or_else(|e| panic!("PRODUCT: vox status was not JSON: {e}: {out}"));
+    assert_eq!(
+        report["log_path"].as_str(),
+        a.data.join(".daemon/log").to_str(),
+        "PRODUCT: recovered vox status did not report this daemon's log: {out}"
+    );
+    assert!(
+        pid(&properties(&unit.name)) == Some(recovered) && a.lock_pid() == Some(recovered),
+        "PRODUCT: vox status did not use the manager's replacement: {out}{err}"
+    );
+    eprintln!("[proof] vox status after TERM: {out}");
+    stop(&a, &unit.name);
+}
+
+/// RG-9: an explicit product Stop is final; a foreign signal remains a clean but failed exit.
+#[test]
+#[ignore = "real daemon processes; run in release with test-knobs on macOS"]
+fn a_product_stop_exits_zero_and_foreign_signals_exit_for_the_manager() {
+    use vox_core::node::daemonipc::{DaemonClient, DaemonFrame, DaemonRequest};
+    struct Owned(Daemon);
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            if self.0.child.try_wait().ok().flatten().is_none() {
+                let _ = self.0.child.kill();
+                let _ = self.0.child.wait();
+            }
+        }
+    }
+    fn start(a: &Account, args: &[&str]) -> Owned {
+        let daemon = Owned(Daemon::start(a, args, &[]));
+        assert!(
+            wait_until(Duration::from_secs(30), || daemon
+                .0
+                .said()
+                .contains("control socket")),
+            "APPARATUS: the daemon did not start serving: {}",
+            daemon.0.said()
+        );
+        daemon
+    }
+    watchdog::arm();
+    let a = Account::new();
+    let account = vox_core::node::paths::Account::of(Some(&a.data), Some(&a.cfg))
+        .expect("APPARATUS: scratch account paths");
+    let mut daemon = start(&a, &["--login-item", "--no-node"]);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let stopped = runtime.block_on(async {
+        let mut client = DaemonClient::open(&account.socket())
+            .await
+            .expect("APPARATUS: connect to the serving daemon");
+        client
+            .request(DaemonRequest::Stop)
+            .await
+            .expect("PRODUCT: the explicit product stop was not acknowledged")
+    });
+    assert!(
+        matches!(stopped, DaemonFrame::Ok),
+        "PRODUCT: the product's explicit Stop was refused: {stopped:?}"
+    );
+    let status = daemon
+        .0
+        .child
+        .wait()
+        .expect("APPARATUS: reap explicitly stopped daemon");
+    eprintln!("[proof] explicit Stop: {status}\n{}", daemon.0.said());
+    assert!(
+        status.success()
+            && daemon
+                .0
+                .said()
+                .contains("stop requested by the product's control client"),
+        "PRODUCT: an explicit product Stop must exit zero after clean shutdown: {status}\n{}",
+        daemon.0.said()
+    );
+    drop(daemon);
+
+    for (signal, code) in [("TERM", 71), ("HUP", 71), ("INT", 71), ("QUIT", 71)] {
+        let mut daemon = start(&a, &["--login-item", "--no-node"]);
+        let pid = daemon.0.child.id();
+        let sent = Command::new("kill")
+            .args([&format!("-{signal}"), &pid.to_string()])
+            .status()
+            .expect("APPARATUS: signal the daemon this proof started");
+        assert!(
+            sent.success(),
+            "APPARATUS: could not send SIG{signal} to owned pid {pid}"
+        );
+        let status = daemon
+            .0
+            .child
+            .wait()
+            .expect("APPARATUS: reap signal-stopped daemon");
+        let said = daemon.0.said();
+        eprintln!("[proof] foreign SIG{signal} stopped pid {pid}: {status}\n{said}");
+        assert!(status.code() == Some(code) && said.contains(&format!("stopped by SIG{signal}"))
+            && !said.contains("did not finish stopping"),
+            "PRODUCT: SIG{signal} must finish clean shutdown then exit {code}, so a service manager can recover it; got {status}:\n{said}");
+    }
+
+    let mut daemon = start(&a, &["--no-node"]);
+    let pid = daemon.0.child.id();
+    let sent = Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .expect("APPARATUS: signal the hand-run daemon this proof started");
+    assert!(
+        sent.success(),
+        "APPARATUS: could not send SIGTERM to owned pid {pid}"
+    );
+    let status = daemon
+        .0
+        .child
+        .wait()
+        .expect("APPARATUS: reap hand-run daemon");
+    let said = daemon.0.said();
+    eprintln!("[proof] hand-run SIGTERM stopped pid {pid}: {status}\n{said}");
+    assert!(
+        status.success()
+            && said.contains("vox daemon: stopped by SIGTERM")
+            && !said.contains("a service manager may start it again")
+            && !said.contains("did not finish stopping"),
+        "PRODUCT: a hand-run daemon stopped by SIGTERM must exit zero with its old words and no service-manager claim; got {status}:\n{said}"
+    );
 }
 
 /// RG-9: a client arriving in a restart waits for its owner, even if the caller dies.

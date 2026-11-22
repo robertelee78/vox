@@ -15,7 +15,7 @@ use crate::identity::composite::{CompositePublicKey, CompositeSignature, RootSig
 const DOMAIN: &str = "vox/step-policy/v1";
 
 /// Default Session activity lifetime (SA-9); kept outside genesis so room identities stay fixed.
-pub const DEFAULT_STEP_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+pub const DEFAULT_STEP_TTL_MS: u64 = 2 * 24 * 60 * 60 * 1_000;
 
 /// A root-signed step policy, bound again to its enclosing log entry by `GovEntry`.
 #[derive(Debug, Clone)]
