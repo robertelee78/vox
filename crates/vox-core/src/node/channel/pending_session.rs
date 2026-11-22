@@ -525,7 +525,10 @@ impl PendingSession {
             .as_ref()
             .err()
             .filter(|error| {
-                self.encrypted
+                !matches!(
+                    error,
+                    Error::Profile("this room's trust withdrawal is incomplete")
+                ) && (self.encrypted
                     || !(super::super::governance::refreshing(error)
                         || ChannelState::authorization_refreshing(error)
                         || matches!(
@@ -533,7 +536,7 @@ impl PendingSession {
                             Error::OwnHistoryBehind
                                 | Error::RoomNotSynced
                                 | Error::Profile("room publication is busy; retry this operation")
-                        ))
+                        )))
             })
             .map(ToString::to_string);
         let drive = self
@@ -603,6 +606,14 @@ impl PendingSession {
             .write
             .take()
             .ok_or(Error::Profile("Session save input missing"))?;
+        if !matches!(
+            &write,
+            SessionWrite::Delivered { .. } | SessionWrite::RemovalRotation
+        ) {
+            if let Some(controls) = &self.controls {
+                controls.require_trust_withdrawn(store, signer)?;
+            }
+        }
         if let SessionWrite::Package { package, .. } = write {
             let controls = self
                 .controls
@@ -669,7 +680,7 @@ impl PendingSession {
                 .append(store, sek, signer, content, completion.as_ref(), None)
                 .map(SessionSaved::Appended),
             SessionWrite::Refresh { owed } => self
-                .refresh_records(store, sek, signer, &owed, rotated)
+                .refresh_records(store, sek, signer, &owed)
                 .map(SessionSaved::Refreshed),
             SessionWrite::Drive { ensure } => {
                 if ensure
@@ -688,7 +699,7 @@ impl PendingSession {
                 let refresh = if owed.is_empty() {
                     SessionRefresh::Complete
                 } else {
-                    self.refresh_records(store, sek, signer, &owed, rotated)?
+                    self.refresh_records(store, sek, signer, &owed)?
                 };
                 let mut releases = Vec::new();
                 if refresh == SessionRefresh::Complete && self.release_ready {
@@ -1148,6 +1159,9 @@ impl PendingSession {
         let state = self.drive.to_state();
         let drive = seal_segment(sek, SegmentKind::KeyMaterial, SEG_DRIVE, &state)?;
         let mut batch = store.batch()?;
+        if let Some(controls) = &self.controls {
+            controls.require_trust_withdrawn(store, signer)?;
+        }
         governance::check_removal_generation_in(&batch, sek, &self.room, self.removal_generation)?;
         // Unchanged ruled durability; inbox receipt, record, index and advanced ratchet are atomic.
         batch.ruled();
@@ -1367,7 +1381,6 @@ impl PendingSession {
         sek: &Sek,
         signer: &dyn RootSigner,
         owed: &[Digest32],
-        rotated: bool,
     ) -> Result<SessionRefresh> {
         if let Some(wait) = self.refresh_wait {
             return Ok(SessionRefresh::Waiting(wait));
@@ -1419,15 +1432,15 @@ impl PendingSession {
                         work.stage = 1;
                         continue;
                     };
+                    if bytes != 0 && bytes.saturating_add(row.text.len()) > WORK_BYTES {
+                        break;
+                    }
+                    bytes = bytes.saturating_add(row.text.len());
                     #[cfg(feature = "test-knobs")]
                     {
                         walked.0 += 1;
                         walked.1 += usize::from(row.author != self.me);
                     }
-                    if bytes != 0 && bytes.saturating_add(row.text.len()) > WORK_BYTES {
-                        break;
-                    }
-                    bytes = bytes.saturating_add(row.text.len());
                     if row.author == self.me && crate::node::sessions::is_record(&row.text) {
                         let tracked = self
                             .entries
@@ -1471,13 +1484,6 @@ impl PendingSession {
                         work.stage = 2;
                         break;
                     };
-                    #[cfg(feature = "test-knobs")]
-                    {
-                        let candidate = self.private_at(store, sek, id)?;
-                        walked.0 += 1;
-                        walked.1 +=
-                            usize::from(candidate.record.message.header.author_id != self.me);
-                    }
                     if id < work.through {
                         let saved = self.private_at(store, sek, id)?;
                         let size = saved.record.message.ciphertext.len();
@@ -1485,6 +1491,12 @@ impl PendingSession {
                             break;
                         }
                         bytes = bytes.saturating_add(size);
+                        #[cfg(feature = "test-knobs")]
+                        {
+                            walked.0 += 1;
+                            walked.1 +=
+                                usize::from(saved.record.message.header.author_id != self.me);
+                        }
                         if !self.expired(&saved) {
                             if let Some(row) = saved.row.filter(|row| {
                                 row.author == self.me && crate::node::sessions::is_record(&row.body)
@@ -1514,11 +1526,7 @@ impl PendingSession {
         if progress.as_ref().is_err_and(floor_index::refreshing) {
             self.refresh = Some(work);
             self.refresh_changed = true;
-            return Ok(if rotated || self.committed_rows != 0 {
-                SessionRefresh::Progressed
-            } else {
-                SessionRefresh::Waiting("its Session index being refreshed")
-            });
+            return Ok(SessionRefresh::Waiting("its Session index being refreshed"));
         }
         progress?;
         #[cfg(feature = "test-knobs")]

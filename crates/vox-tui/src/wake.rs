@@ -766,11 +766,13 @@ pub fn register(paths: &Paths, session: &str, codex: bool) {
 // Every registration rewrite, including a hook's idle update, shares this lock. Atomic
 // rename alone cannot stop a stale whole-record rewrite from restoring a removed room.
 // The lock file is outside the registrations directory, so it can never look like a session.
-fn registration_lock_typed(paths: &Paths) -> Result<std::fs::File, RegistrationStoreError> {
+// A profile directory replaced since `paths` were resolved is refused before anything in it is
+// created or changed: every registration writer takes this lock first.
+fn registration_lock(paths: &Paths) -> Result<std::fs::File, String> {
+    paths.verify_profile().map_err(|e| e.to_string())?;
     let path = paths.session_dir().with_extension("lock");
     if let Some(parent) = path.parent() {
-        vox_core::node::paths::create_private_dir(parent)
-            .map_err(|e| RegistrationStoreError::Failed(e.to_string()))?;
+        vox_core::node::paths::create_private_dir(parent).map_err(|e| e.to_string())?;
     }
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
@@ -779,29 +781,9 @@ fn registration_lock_typed(paths: &Paths) -> Result<std::fs::File, RegistrationS
         use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(0o600);
     }
-    let file = options
-        .open(&path)
-        .map_err(|e| RegistrationStoreError::Failed(e.to_string()))?;
-    file.try_lock().map_err(|e| match e {
-        std::fs::TryLockError::WouldBlock => RegistrationStoreError::Busy,
-        std::fs::TryLockError::Error(e) => RegistrationStoreError::Failed(e.to_string()),
-    })?;
+    let file = options.open(&path).map_err(|e| e.to_string())?;
+    file.lock().map_err(|e| e.to_string())?;
     Ok(file)
-}
-
-fn registration_lock(paths: &Paths) -> Result<std::fs::File, String> {
-    registration_lock_typed(paths).map_err(|e| e.to_string())
-}
-
-/// A registration write was either contended or failed permanently.
-#[derive(Debug, thiserror::Error)]
-pub enum RegistrationStoreError {
-    /// Another registration writer holds the node lock.
-    #[error("session registration is busy")]
-    Busy,
-    /// The lock or registration could not be written.
-    #[error("{0}")]
-    Failed(String),
 }
 
 fn registration_write(paths: &Paths) -> Option<std::fs::File> {
@@ -861,9 +843,9 @@ pub fn store(paths: &Paths, reg: &Session) {
 /// Store a registration before the daemon acknowledges that the session holds its node.
 ///
 /// # Errors
-/// Lock contention or a failed registration write leaves the request refused.
-pub fn store_checked(paths: &Paths, reg: &Session) -> Result<(), RegistrationStoreError> {
-    let _lock = registration_lock_typed(paths)?;
+/// A failed registration write leaves the request refused.
+pub fn store_checked(paths: &Paths, reg: &Session) -> Result<(), String> {
+    let _lock = registration_lock(paths)?;
     let mut reg = reg.clone();
     let session = reg.session.clone();
     let session = session.as_str();
@@ -916,12 +898,10 @@ pub fn store_checked(paths: &Paths, reg: &Session) -> Result<(), RegistrationSto
     if let Some(mine) = reg.tmux.as_ref() {
         unbind_pane(paths, session, &mine.socket, &mine.pane);
     }
-    vox_core::node::paths::create_private_dir(&paths.session_dir())
-        .map_err(|e| RegistrationStoreError::Failed(e.to_string()))?;
-    let body =
-        serde_json::to_vec(&reg).map_err(|e| RegistrationStoreError::Failed(e.to_string()))?;
+    vox_core::node::paths::create_private_dir(&paths.session_dir()).map_err(|e| e.to_string())?;
+    let body = serde_json::to_vec(&reg).map_err(|e| e.to_string())?;
     vox_core::node::paths::write_private_file_unique(&paths.session_file(session), &body)
-        .map_err(|e| RegistrationStoreError::Failed(e.to_string()))
+        .map_err(|e| e.to_string())
 }
 
 /// Name `session`'s registration `name`, as its harness now calls it (ADR-029 MD-1): what an
@@ -931,9 +911,14 @@ pub fn store_name(paths: &Paths, session: &str, name: &str) -> Option<Session> {
     let _lock = registration_write(paths)?;
     let mut reg = load(paths, session)?;
     reg.name = Some(name.to_owned());
-    if let Ok(body) = serde_json::to_vec(&reg) {
-        let _ =
-            vox_core::node::paths::write_private_file_unique(&paths.session_file(session), &body);
+    let body = serde_json::to_vec(&reg).ok()?;
+    if let Err(error) =
+        vox_core::node::paths::write_private_file_unique(&paths.session_file(session), &body)
+    {
+        eprintln!(
+            "vox: Session name was not changed: {error}; correct the storage problem and retry"
+        );
+        return None;
     }
     Some(reg)
 }

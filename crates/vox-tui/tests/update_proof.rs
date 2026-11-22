@@ -41,6 +41,13 @@ mod release_server;
 
 #[path = "support/test_knobs.rs"]
 mod test_knobs;
+
+#[path = "support/typed.rs"]
+mod typed;
+
+#[cfg(target_os = "linux")]
+#[path = "support/dead_candidate.rs"]
+mod dead_candidate;
 optional_proof::not_run!(
     an_older_release_updates_itself_and_refuses_a_bad_download,
     an_update_and_rollback_leave_one_launchable_vox,
@@ -935,13 +942,353 @@ fn holders(dir: &Path) -> Vec<String> {
 /// ADR-034 UP-1 and UP-2: the real update journey, isolated from unrelated download cases.
 #[test]
 #[ignore = "real update, production Argon2id; run in release with test-knobs"]
-fn an_update_restarts_its_daemon_and_refuses_a_different_local_version() {
+fn an_update_restarts_its_daemon_and_uses_a_different_local_version() {
     watchdog::arm();
     test_knobs::require(&["VOX_TEST_RELEASE_BASE"]);
     let mut claims = Vec::new();
     let mut receipts = BTreeMap::new();
     daemon_restart_claim(&mut claims, &mut receipts, cfg!(target_os = "macos"));
     dispose("daemon update proof", &claims, &receipts, false);
+}
+
+/// RG-11's typed credential is independent of the updater's rejection/rollback arms, so its
+/// missing-secret mutant cannot prevent those arms from reaching their own assertions.
+/// It runs natively on either Linux architecture: QEMU's x86_64 keyring calls can be absent
+/// even when the native kernel supports them. Candidate/rollback asset arms stay x86_64.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "real typed unlock and update, Linux kernel keyring; run in release with test-knobs"]
+fn a_linux_typed_unlock_stays_ready_after_update() {
+    typed::require_disposable_keyring();
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            for pid in holders(&self.0) {
+                let _ = Command::new("/bin/kill").arg(pid).status();
+            }
+            use sha2::{Digest as _, Sha256};
+            let account = self.0.join("nodes/typed").to_string_lossy().into_owned();
+            let name = format!("us.vox.node:{:x}", Sha256::digest(account.as_bytes()));
+            if let Ok(found) = Command::new("keyctl")
+                .args(["search", "@u", "user", &name])
+                .output()
+            {
+                if found.status.success() {
+                    let key = String::from_utf8_lossy(&found.stdout).trim().to_owned();
+                    let _ = Command::new("keyctl").args(["revoke", &key]).status();
+                    let _ = Command::new("keyctl").args(["unlink", &key, "@u"]).status();
+                }
+            }
+        }
+    }
+    watchdog::arm();
+    test_knobs::require(&["VOX_TEST_RELEASE_BASE"]);
+    let work = tmpdir();
+    let next: String = std::iter::once('9')
+        .chain(VERSION.chars().skip(1))
+        .collect();
+    let helper = vox_saying(work.path(), &next)
+        .unwrap_or_else(|why| panic!("APPARATUS: next release: {why}"));
+    let tree = tmpdir();
+    standalone_release_of(tree.path(), &next, &helper);
+    let server =
+        release_server::serve(tree.path()).unwrap_or_else(|why| panic!("APPARATUS: {why}"));
+    let home = tmpdir();
+    let link = install_dir(home.path(), "stable").join("vox");
+    let _cleanup = Cleanup(home.path().join("data"));
+    let env = [
+        ("VOX_TEST_RELEASE_BASE", server.base.as_str()),
+        ("VOX_NO_SHELL_SETUP", "1"),
+        ("VOX_NO_SKILL_INSTALL", "1"),
+        ("VOX_LISTEN", "127.0.0.1:0"),
+    ];
+    let pass = home.path().join("one-time-input");
+    write(&pass, "Linux update passphrase\n");
+    let out = vox(
+        &link,
+        home.path(),
+        &[
+            "node",
+            "create",
+            "typed",
+            "--passphrase-file",
+            pass.to_str().expect("APPARATUS: passphrase path"),
+        ],
+        &env,
+    );
+    assert!(
+        out.status.success(),
+        "APPARATUS: create protected node: {}",
+        said(&out)
+    );
+    std::fs::remove_file(pass).expect("APPARATUS: remove one-time input");
+    let (ok, text) = typed::typed(
+        &vox_command(&link, home.path(), &["node", "unlock", "typed"], &env),
+        "Linux update passphrase",
+    );
+    assert!(
+        ok && text.contains("Ready"),
+        "APPARATUS: typed unlock: {text}"
+    );
+    let updated = vox(&link, home.path(), &["update"], &env);
+    let status = vox(
+        &link,
+        home.path(),
+        &["status", "--node", "typed", "--json"],
+        &env,
+    );
+    let ready = status.status.success()
+        && serde_json::from_slice::<serde_json::Value>(&status.stdout)
+            .ok()
+            .is_some_and(|value| value["status"] == "Ready");
+    assert!(updated.status.success() && ready && reports(&link) == format!("vox {next}"),
+        "PRODUCT: a typed Linux unlock must remain Ready after update without input: update={}; status={}", said(&updated), said(&status));
+    eprintln!("PASS linux.typed_unlock_survives_update: {}", said(&status));
+    let _ = vox(&link, home.path(), &["node", "lock", "typed"], &env);
+}
+
+/// Two genuinely compiled releases, with one private profile and only foreground daemons.
+struct VersionProfile {
+    home: tempfile::TempDir,
+    next: PathBuf,
+    keychain: PathBuf,
+    daemon: Option<std::process::Child>,
+}
+
+impl VersionProfile {
+    fn new() -> Self {
+        let home = tempfile::Builder::new()
+            .prefix("vv")
+            .tempdir_in("/tmp")
+            .expect("APPARATUS: short scratch profile");
+        let next_version: String = std::iter::once('9')
+            .chain(VERSION.chars().skip(1))
+            .collect();
+        let next =
+            vox_saying(home.path(), &next_version).unwrap_or_else(|why| panic!("APPARATUS: {why}"));
+        let keychain = unlock_staging::keychain(&home.path().join("data"));
+        Self {
+            home,
+            next,
+            keychain,
+            daemon: None,
+        }
+    }
+
+    fn command(&self, bin: &Path, args: &[&str]) -> Command {
+        let mut command = vox_command(bin, self.home.path(), args, &[]);
+        command
+            .env("VOX_TEST_KEYCHAIN", &self.keychain)
+            .env("VOX_LISTEN", "127.0.0.1:0")
+            .env("VOX_IDENTITY_PASSPHRASE", "version proof passphrase");
+        command
+    }
+
+    fn run(&self, bin: &Path, args: &[&str]) -> Output {
+        self.command(bin, args)
+            .output()
+            .expect("APPARATUS: version journey command")
+    }
+
+    fn stop(&mut self) {
+        if let Some(mut child) = self.daemon.take() {
+            let _ = child.kill();
+            child.wait().expect("APPARATUS: reap scratch daemon");
+        }
+    }
+
+    fn start(&mut self, bin: &Path) {
+        self.stop();
+        let log = std::fs::File::create(self.home.path().join("daemon.log"))
+            .expect("APPARATUS: daemon log");
+        let child = self
+            .command(bin, &["daemon", "--no-node", "--listen", "127.0.0.1:0"])
+            .stdin(std::process::Stdio::null())
+            .stdout(log.try_clone().expect("APPARATUS: clone daemon log"))
+            .stderr(log)
+            .spawn()
+            .expect("APPARATUS: foreground scratch daemon");
+        self.daemon = Some(child);
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let list = self.run(bin, &["node", "list"]);
+            if list.status.success() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < until,
+                "APPARATUS: scratch daemon did not serve: {}",
+                said(&list)
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+}
+
+impl Drop for VersionProfile {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+#[test]
+#[ignore = "two compiled releases and a private daemon; run in release with test-knobs"]
+fn a_client_uses_another_package_version_with_the_same_control_protocol() {
+    watchdog::arm();
+    if cfg!(target_os = "macos") {
+        test_knobs::require(&["VOX_TEST_KEYCHAIN"]);
+    }
+    let mut profile = VersionProfile::new();
+    let next = profile.next.clone();
+    profile.start(&next);
+    let pass = profile.home.path().join("pass");
+    write(&pass, "version proof passphrase\n");
+    let created = profile.run(
+        &next,
+        &[
+            "node",
+            "create",
+            "agent",
+            "--passphrase-file",
+            pass.to_str().expect("APPARATUS: passphrase path"),
+        ],
+    );
+    assert!(
+        created.status.success(),
+        "APPARATUS: other-version node: {}",
+        said(&created)
+    );
+    let attached = profile.run(
+        &next,
+        &[
+            "node",
+            "attach",
+            "agent",
+            "--passphrase-file",
+            pass.to_str().expect("APPARATUS: passphrase path"),
+        ],
+    );
+    assert!(
+        attached.status.success(),
+        "APPARATUS: other-version attach: {}",
+        said(&attached)
+    );
+    let out = profile.run(Path::new(VOX), &["node", "list"]);
+    println!(
+        "current client, other-release daemon: exit={:?}\n{}",
+        out.status.code(),
+        said(&out)
+    );
+    let mut watcher = profile
+        .command(Path::new(VOX), &["agent", "omp-watch", "--node", "agent"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .expect("APPARATUS: availability watcher");
+    let frames: Vec<String> = {
+        use std::io::BufRead as _;
+        std::io::BufReader::new(watcher.stdout.take().expect("APPARATUS: watcher pipe"))
+            .lines()
+            .take(2)
+            .map(|line| line.expect("APPARATUS: watcher frame"))
+            .collect()
+    };
+    let _ = watcher.kill();
+    watcher.wait().expect("APPARATUS: reap watcher");
+    println!("same-protocol availability: {frames:?}");
+    assert!(out.status.success() && frames.iter().any(|line|
+        serde_json::from_str::<serde_json::Value>(line).is_ok_and(|frame| frame["type"] == "ready")),
+        "PRODUCT: same-protocol clients must use the other package's daemon: {}; watcher={frames:?}", said(&out));
+}
+
+#[test]
+#[ignore = "two compiled releases and a private daemon; run in release with test-knobs"]
+fn a_claim_is_still_held_after_the_package_version_changes() {
+    watchdog::arm();
+    if cfg!(target_os = "macos") {
+        test_knobs::require(&["VOX_TEST_KEYCHAIN"]);
+    }
+    let mut profile = VersionProfile::new();
+    profile.start(Path::new(VOX));
+    let pass = profile.home.path().join("pass");
+    write(&pass, "version proof passphrase\n");
+    let pass = pass
+        .to_str()
+        .expect("APPARATUS: passphrase path")
+        .to_owned();
+    for args in [
+        vec!["node", "create", "agent", "--passphrase-file", &pass],
+        vec!["node", "attach", "agent", "--passphrase-file", &pass],
+        vec![
+            "room",
+            "create",
+            "--node",
+            "agent",
+            "--name",
+            "version-room",
+            "--passphrase-file",
+            &pass,
+        ],
+        vec![
+            "room",
+            "claim",
+            "version-room",
+            "retained-work",
+            "--node",
+            "agent",
+            "--session",
+            "version-session",
+            "--ttl",
+            "3600",
+        ],
+    ] {
+        let out = profile.run(Path::new(VOX), &args);
+        assert!(
+            out.status.success(),
+            "APPARATUS: staging {args:?}: {}",
+            said(&out)
+        );
+        println!("before update {args:?}: {}", said(&out));
+    }
+    let next = profile.next.clone();
+    profile.start(&next);
+    let attached = profile.run(
+        &next,
+        &["node", "attach", "agent", "--passphrase-file", &pass],
+    );
+    assert!(
+        attached.status.success(),
+        "APPARATUS: updated node attach: {}",
+        said(&attached)
+    );
+    let board = profile.run(
+        &next,
+        &["room", "board", "version-room", "--node", "agent", "--json"],
+    );
+    println!(
+        "after update board: exit={:?}\n{}",
+        board.status.code(),
+        said(&board)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&board.stdout).unwrap_or_else(|_| {
+        panic!(
+            "PRODUCT: updated board did not answer JSON: {}",
+            said(&board)
+        )
+    });
+    assert!(
+        board.status.success()
+            && value["resources"]
+                .as_array()
+                .is_some_and(
+                    |rows| rows.iter().any(|row| row["resource"] == "retained-work"
+                        && row["state"] == "held"
+                        && row["owner_session"] == "version-session")
+                ),
+        "PRODUCT: the updated package dropped the held claim: {}",
+        said(&board)
+    );
 }
 
 /// Decider 2026-10-07: once `vox update` has put the new vox in place (Vox.app when `bundle`, the
@@ -953,6 +1300,10 @@ fn daemon_restart_claim(
     receipts: &mut BTreeMap<String, String>,
     bundle: bool,
 ) {
+    if cfg!(all(target_os = "linux", not(target_arch = "x86_64"))) {
+        claims.push(blocked("update.linux_candidate_arms", "CANNOT MEASURE: ADR-051's Linux arms run as x86_64 in an emulated container; this is aarch64"));
+        return;
+    }
     let id = if bundle {
         "bundle.update_restarts_the_daemon_onto_the_new_version"
     } else {
@@ -1153,14 +1504,18 @@ fn daemon_restart_claim(
     let mismatch = vox(&helper, home, &["status", "--node", "kept"], &env);
     let (kept_still_ready, plain_still_ready, after_mismatch) = listed(&link);
     claims.push(claim(
-        "daemon.version_mismatch_refused",
-        !mismatch.status.success() && kept_still_ready && plain_still_ready,
+        "daemon.same_protocol_other_package_is_usable",
+        mismatch.status.success() && kept_still_ready && plain_still_ready,
         format!(
             "the other release's status exited {:?}: {}; original nodes: {after_mismatch}",
             mismatch.status.code(),
             said(&mismatch)
         ),
     ));
+    #[cfg(target_os = "linux")]
+    if !bundle {
+        linux_download_refusal_claims(claims, &link, home, tree.path(), &helper, &next, &env);
+    }
 
     let out = vox(&link, home, &["update"], &env);
     let text = said(&out);
@@ -1186,22 +1541,6 @@ fn daemon_restart_claim(
         return;
     }
 
-    let refused_rename = vox(
-        Path::new(VOX),
-        home,
-        &["node", "rename", "kept", "renamed-by-mismatch"],
-        &env,
-    );
-    let (kept_after_refusals, _, after_refusals) = listed(&link);
-    claims.push(claim(
-        "daemon.mismatched_rename_preserves_attached_node",
-        !refused_rename.status.success() && kept_after_refusals,
-        format!(
-            "the mismatched rename exited {:?}: {}; original node: {after_refusals}",
-            refused_rename.status.code(),
-            said(&refused_rename)
-        ),
-    ));
     let rolled = vox(&link, home, &["update", "--rollback"], &env);
     let rolled_text = said(&rolled);
     let restored_version = reports(&link);
@@ -1218,6 +1557,37 @@ fn daemon_restart_claim(
         ),
     ));
     receipts.insert("update.rollback".into(), rolled_text);
+    #[cfg(target_os = "linux")]
+    if !bundle {
+        let dead = work.path().join("dead-previous");
+        let need = dead_candidate::stage(Path::new(VOX), &dead);
+        let previous = link.with_file_name(".vox-previous");
+        copy(&dead, &previous);
+        let planted = std::fs::read(&previous).expect("APPARATUS: dead previous");
+        let daemon = std::fs::read(data.join(".daemon/lock")).unwrap_or_default();
+        let (out, timely, leaked) = dead_candidate::bounded(&mut vox_command(
+            &link,
+            home,
+            &["update", "--rollback"],
+            &env,
+        ));
+        let text = said(&out);
+        claims.push(claim(
+            "rollback.refuses_a_previous_that_does_not_run",
+            timely
+                && leaked.is_empty()
+                && !out.status.success()
+                && reports(&link) == format!("vox {VERSION}")
+                && std::fs::read(&previous).unwrap_or_default() == planted
+                && !link.with_file_name(".vox-rollback.partial").exists()
+                && std::fs::read(data.join(".daemon/lock")).unwrap_or_default() == daemon
+                && text.contains("the retained previous vox")
+                && text.contains("it is not put back")
+                && text.contains(&format!("version `{need}' not found"))
+                && text.contains("there is nothing to roll back to"),
+            text,
+        ));
+    }
 
     // Every vox this left running is stopped, by its pid: whichever holds the account's files.
     for pid in holders(&data) {
@@ -1235,6 +1605,75 @@ fn daemon_restart_claim(
         ),
     ));
     receipts.insert(id.into(), text);
+}
+
+#[cfg(target_os = "linux")]
+fn linux_download_refusal_claims(
+    claims: &mut Vec<Claim>,
+    link: &Path,
+    home: &Path,
+    tree: &Path,
+    helper: &Path,
+    next: &str,
+    env: &[(&str, &str)],
+) {
+    let work = tmpdir();
+    let dead = work.path().join("dead");
+    let need = dead_candidate::stage(helper, &dead);
+    let active = std::fs::read(link).expect("APPARATUS: active binary snapshot");
+    let daemon = std::fs::read(home.join("data/.daemon/lock")).expect("APPARATUS: daemon snapshot");
+    for (id, source, wanted) in [
+        (
+            "update.refuses_a_candidate_that_does_not_run_and_says_why",
+            None,
+            "a release that needs more than that is a defect in Vox, not in this machine",
+        ),
+        (
+            "update.stops_a_candidate_that_does_not_answer",
+            Some("#!/bin/sh\necho starting >&2\ntrap '' TERM; exec sleep 600\n"),
+            "did not answer `--version` within 20 seconds and was stopped. Before that it said:",
+        ),
+        (
+            "update.says_what_an_unexplained_candidate_said",
+            Some("#!/bin/sh\necho 'boom: no such table' >&2\nexit 3\n"),
+            "the cause is not one this updater can name",
+        ),
+    ] {
+        let fixture = if let Some(script) = source {
+            let path = work.path().join("script");
+            write(&path, script);
+            path
+        } else {
+            dead.clone()
+        };
+        standalone_release_of(tree, next, &fixture);
+        let (out, timely, leaked) =
+            dead_candidate::bounded(&mut vox_command(link, home, &["update"], env));
+        let text = said(&out);
+        let specific = if source.is_none() {
+            text.contains(&format!("version `{need}' not found"))
+                && text.contains(&format!(
+                    "needs glibc {}",
+                    need.trim_start_matches("GLIBC_")
+                ))
+        } else if id.contains("stops") {
+            text.contains("  starting")
+        } else {
+            text.contains("  boom: no such table") && !text.contains("this build needs glibc")
+        };
+        let preserved = std::fs::read(link).unwrap_or_default() == active
+            && std::fs::read(home.join("data/.daemon/lock")).unwrap_or_default() == daemon
+            && !link.with_file_name(".vox-previous").exists()
+            && std::fs::read_dir(link.parent().expect("APPARATUS: install directory"))
+                .expect("APPARATUS: install listing")
+                .filter_map(Result::ok)
+                .all(|entry| !entry.file_name().to_string_lossy().ends_with(".partial"));
+        claims.push(claim(id, timely && leaked.is_empty() && !out.status.success() && preserved && specific
+            && text.contains(wanted) && text.contains("vox update: nothing was changed:")
+            && text.contains(&format!("is still vox {VERSION}.")),
+            format!("timely={timely}, sleep children still running={leaked:?}, installation and daemon preserved={preserved}; {text}")));
+    }
+    standalone_release_of(tree, next, helper);
 }
 
 /// **Optional** (the `optional-proofs` feature): the published previous release updates itself

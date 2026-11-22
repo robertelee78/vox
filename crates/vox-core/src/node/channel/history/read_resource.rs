@@ -89,16 +89,21 @@ impl ReadFacts {
         self.governance_ready && (self.governance_until == 0 || now < self.governance_until)
     }
     pub(super) fn require_governance_display(&self, now: u64) -> Result<()> {
-        if self.governance_current(now) {
+        #[cfg(feature = "test-knobs")]
+        let held = std::env::var_os("VOX_TEST_HOLD_GOVERNANCE_READ_FILE")
+            .is_some_and(|path| std::path::Path::new(&path).exists());
+        #[cfg(not(feature = "test-knobs"))]
+        let held = false;
+        if self.governance_current(now) && !held {
             Ok(())
         } else {
-            Err(Error::Profile("room governance is refreshing"))
+            Err(Error::Profile(governance::REFRESHING))
         }
     }
     pub(super) fn consent_facts(&self) -> Result<Arc<governance::ConsentFacts>> {
         self.consent
             .clone()
-            .ok_or(Error::Profile("room governance is refreshing"))
+            .ok_or(Error::Profile(governance::REFRESHING))
     }
     fn same_publication(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.gen, &other.gen)
@@ -234,6 +239,7 @@ impl ReadResource {
         &self,
         room: &Digest32,
         generation: u64,
+        signer: Option<&dyn crate::identity::composite::RootSigner>,
         step: impl FnOnce() -> T,
     ) -> Option<T> {
         let store = self.store.upgrade()?;
@@ -241,6 +247,19 @@ impl ReadResource {
             .with_publication_fence(|| {
                 if !self.removal_authorization_current(room, generation) {
                     return Ok(None);
+                }
+                if let Some(signer) = signer {
+                    let locks = crate::node::pending_lock::PendingLocks::load(&store, signer)?;
+                    let publication = self.publication.lock().unwrap_or_else(|e| e.into_inner());
+                    let Some(publication) = publication.as_ref() else {
+                        return Ok(None);
+                    };
+                    if locks
+                        .for_room(room)
+                        .any(|target| publication.facts.verified.contains_key(&target))
+                    {
+                        return Ok(None);
+                    }
                 }
                 Ok(Some(step()))
             })
@@ -399,6 +418,12 @@ impl ReadResource {
             .ok_or_else(|| "the node has stopped".to_owned())?;
         publication.facts.now_hint = publication.facts.now_hint.max(now_ms);
         let result = self.sek.with(|sek| {
+            #[cfg(feature = "test-knobs")]
+            if std::env::var_os("VOX_TEST_HOLD_GOVERNANCE_READ_FILE")
+                .is_some_and(|path| std::path::Path::new(&path).exists())
+            {
+                publication.facts.require_governance_display(now_ms)?;
+            }
             let rendered = publication.render(&store, sek)?;
             if rendered.directory_revision() != publication.directory_revision {
                 return Err(Error::StreamRefused(CHANGED));

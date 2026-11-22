@@ -684,6 +684,185 @@ fn status_and_posts_answer_while_ten_sessions_step() {
     for (index, (latency, output)) in posts.iter().enumerate() {
         eprintln!("RG12 post {index}: {latency:?} {output:?}");
     }
+    // A Session listing must not make the actor wait on the room mutex owned by an
+    // attention commit. Use a new opening so resolving it necessarily saves its ledger.
+    use vox_core::node::ipc::{Frame, IpcClient, NodeSocket, Request};
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("APPARATUS: attention wire runtime");
+    let at = NodeSocket::one_shot(
+        data.join(".daemon/vox.sock"),
+        vox_core::node::paths::NodeName::parse("default").expect("APPARATUS: node name"),
+    );
+    let (owner, cid) = rt.block_on(async {
+        let mut peer = IpcClient::open_at(&at)
+            .await
+            .expect("APPARATUS: node socket");
+        let owner = peer.me().expect("APPARATUS: owned node fingerprint");
+        let Frame::Rooms { rooms } = peer.rooms().await.expect("APPARATUS: room listing") else {
+            panic!("APPARATUS: unexpected room listing");
+        };
+        let cid = rooms
+            .iter()
+            .find(|(id, ..)| vox_core::node::link::b32_encode(id).starts_with(&room))
+            .expect("APPARATUS: latency room")
+            .0;
+        let mut opening =
+            vox_agentcomms::envelope::Envelope::new(vox_agentcomms::envelope::SESSION, "");
+        opening.from = "rg12-attention".into();
+        opening.data = serde_json::json!({"session":{"harness":"claude"}});
+        let saved = peer
+            .request(&Request::AppendSession {
+                channel_id: cid,
+                session_id: "rg12-attention".into(),
+                body: opening.to_text(),
+            })
+            .await
+            .expect("APPARATUS: attention Session opening");
+        assert!(
+            matches!(saved, Frame::Appended { .. }),
+            "APPARATUS: attention Session opening not saved: {saved:?}"
+        );
+        (owner, cid)
+    });
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let listed = run(&["room", "sessions", &room, "--json"], None, false);
+        if listed.0 && listed.1.contains("rg12-attention") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "APPARATUS: attention opening not shown: {listed:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::fs::remove_file(&engaged).expect("APPARATUS: clear step engagement");
+    std::fs::remove_file(&release).expect("APPARATUS: clear step release");
+    std::fs::write(&arm, "rg12-attention").expect("APPARATUS: arm attention flush");
+    let attention_status = std::thread::scope(|scope| {
+        struct Release<'a>(&'a Path);
+        impl Drop for Release<'_> {
+            fn drop(&mut self) {
+                let _ = std::fs::write(self.0, "");
+            }
+        }
+        let _release = Release(&release);
+        let attention = scope.spawn(|| {
+            rt.block_on(vox_core::node::attention::local(
+                &at,
+                owner,
+                cid,
+                None,
+                vox_core::node::attention::Operation::Resolve {
+                    session: "rg12-attention".into(),
+                },
+            ))
+        });
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !engaged.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if !engaged.exists() {
+            std::fs::write(&release, "").expect("APPARATUS: release unstaged attention");
+            panic!("APPARATUS: attention did not reach its armed durable flush");
+        }
+        let mut listing = command()
+            .args(["room", "sessions", &room, "--json"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("APPARATUS: concurrent Session listing");
+        let mut admins = command()
+            .args(["room", "admin", "list", &room])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("APPARATUS: concurrent room admins listing");
+        let pause = scope.spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("APPARATUS: pause-status wire runtime")
+                .block_on(vox_core::node::room_pause::status(&at, cid, owner))
+        });
+        // Give the already-started listing its turn before measuring status.
+        std::thread::sleep(Duration::from_millis(100));
+        let listing_held = listing
+            .try_wait()
+            .expect("APPARATUS: observe listing")
+            .is_none();
+        let admins_held = admins
+            .try_wait()
+            .expect("APPARATUS: observe admins listing")
+            .is_none();
+        let pause_held = !pause.is_finished();
+        let start = Instant::now();
+        let mut status = command()
+            .args(["status", "--json"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("APPARATUS: attention vox status");
+        let answered = loop {
+            if status
+                .try_wait()
+                .expect("APPARATUS: observe attention status")
+                .is_some()
+            {
+                break start.elapsed() < Duration::from_secs(1);
+            }
+            if start.elapsed() >= Duration::from_secs(1) {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        let observed = start.elapsed();
+        while start.elapsed() < Duration::from_secs(4) {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let before_release = status
+            .try_wait()
+            .expect("APPARATUS: observe held attention status")
+            .is_some();
+        std::fs::write(&release, "").expect("APPARATUS: release attention flush");
+        let output = status
+            .wait_with_output()
+            .expect("APPARATUS: attention status output");
+        let listed = listing
+            .wait_with_output()
+            .expect("APPARATUS: Session listing output");
+        let admins = admins
+            .wait_with_output()
+            .expect("APPARATUS: admins listing output");
+        let pause = pause
+            .join()
+            .expect("APPARATUS: pause-status driver panicked");
+        let saved = attention
+            .join()
+            .expect("APPARATUS: attention driver panicked");
+        eprintln!(
+            "RG12 attention status within_1s={answered} observed={observed:?} \
+            answered_before_release={before_release} listing_held={listing_held} \
+            admins_held={admins_held} pause_held={pause_held} \
+            status={output:?} listing={listed:?} admins={admins:?} pause={pause:?} attention={saved:?}"
+        );
+        assert!(
+            listing_held && admins_held && pause_held,
+            "APPARATUS: Session, admins or pause-status read did not overlap held attention commit"
+        );
+        assert!(listed.status.success() && admins.status.success() && pause.is_ok() && saved.is_ok(),
+            "PRODUCT: a room read or attention failed after commit release: {listed:?} {admins:?} {pause:?} {saved:?}");
+        answered && before_release && output.status.success()
+    });
+    assert!(
+        attention_status,
+        "PRODUCT: vox status did not answer within 1s while a Session listing waited on a held attention commit"
+    );
     assert!(
         steps.iter().all(|step| step.0),
         "PRODUCT: a Session step failed: {steps:?}"

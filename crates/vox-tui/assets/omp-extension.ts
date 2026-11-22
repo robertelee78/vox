@@ -36,6 +36,7 @@ export default function vox(pi) {
   let commandId = 0, commands = new Map(), installPending = null, revokePending = null
   let availabilityEpoch = 0, successorPending = false
   let reconcileSerial = 0, ownershipNotice = false, unavailableNotice = false, installed = false
+  let reconnectingNotice = false
   let cleanupCertain = true
   const token = randomBytes(32).toString("hex")
   const expected = Buffer.from(token)
@@ -252,16 +253,16 @@ export default function vox(pi) {
         poisonSession(op.fence?.session)
       } else if (!enveloped && fenced(op.fence)) {
         confirmed = false
-        report(code === 75 ? "Session registration is no longer present; reacquiring it" : "context preparation unavailable; reacquiring registration")
-        scheduleRetry()
+        if (scheduleRetry()) report(code === 75 ? "Session registration is no longer present; reacquiring it" : "context preparation unavailable; reacquiring registration")
       }
       if (!settled) fail(new Error("Vox prepare ended before its envelope"))
       if (op.decision === "commit" || op.decision === "cancel") {
-        const confirmed = enveloped && code === 0
-        if (op.record) op.record.state = confirmed ? (op.decision === "commit" ? "committed" : "cancelled") : "unknown"
-        if (!confirmed && enveloped) {
-          poisonSession(op.fence?.session)
-          if (op.fence?.session === session) publish({ type: "unavailable", error: "Vox context " + op.decision + " was not confirmed" })
+        const acknowledged = enveloped && code === 0
+        // The native decision is final; reacquisition finishes its saved bookkeeping.
+        if (op.record) op.record.state = op.decision === "commit" ? "committed" : "cancelled"
+        if (!acknowledged && enveloped && refusal !== "permanent") {
+          confirmed = false
+          if (scheduleRetry()) report("finishing the saved context decision; reacquiring registration")
         }
       } else if (!op.done) {
         if (!enveloped) {
@@ -352,7 +353,8 @@ export default function vox(pi) {
     retryTimer = null
   }
   function scheduleRetry() {
-    if (retryTimer || stopped || confirmed || refusal === "permanent" || !watcher) return
+    if (stopped || confirmed || refusal === "permanent" || !watcher) return false
+    if (retryTimer) return true
     const delay = [1, 2, 4, 8, 16, 30][Math.min(retryStep++, 5)] * 1000
     retryTimer = setTimeout(() => {
       retryTimer = null
@@ -365,6 +367,7 @@ export default function vox(pi) {
       })
     }, delay)
     retryTimer.unref?.()
+    return true
   }
   function failWatcher(reason) {
     retire()
@@ -435,13 +438,24 @@ export default function vox(pi) {
           if (refusal === "mismatch") refusal = null
           if (current() && generationRef && !confirmed && !retryTimer && refusal !== "permanent") void register()
         } else if (frame?.type === "unavailable") {
+          const reconnecting = frame.reason !== "node-not-ready" && (readyNode || reconnectingNotice || frame.reason === "reconnecting")
+          const connection = readyNode || reconnectingNotice ? "reconnecting" : "connecting"
           readyNode = false; confirmed = false; availabilityEpoch++
           if (frame.reason === "mismatch") {
             if (refusal !== "mismatch") report("Vox update mismatch; update Vox and restart the daemon")
             refusal = "mismatch"
-          } else if (current() && !unavailableNotice) {
-            unavailableNotice = true
-            report(`node ${VOX_NODE} is unavailable. If it has not been created, run \`vox node create -- ${VOX_NODE}\`; otherwise run \`vox node unlock -- ${VOX_NODE}\` in a terminal. If the daemon is not answering, restart it. Creating a node makes a new identity.`)
+          } else if (frame.reason === "identity-changed") {
+            refusal = "permanent"; generationRef = null; cancelRetry()
+            for (const child of children) child.kill()
+            report(`node ${VOX_NODE}'s identity changed or could not be confirmed. This conversation is refused; check the node, restart OMP, and start a new OMP conversation.`)
+          } else if (current()) {
+            if (reconnecting && !reconnectingNotice) {
+              reconnectingNotice = true
+              report(`${connection} to Vox; room news is available when its node is ready. If the daemon stays down, restart it.`)
+            } else if (!reconnecting && !unavailableNotice) {
+              unavailableNotice = true
+              report(`node ${VOX_NODE} is unavailable. If it has not been created, run \`vox node create -- ${VOX_NODE}\`; otherwise run \`vox node unlock -- ${VOX_NODE}\` in a terminal. If the daemon is not answering, restart it. Creating a node makes a new identity.`)
+            }
           }
         } else { failWatcher("availability helper returned an invalid frame"); return }
       }
@@ -460,7 +474,7 @@ export default function vox(pi) {
         for (const follower of followers) follower.destroy()
         followers.clear()
         for (const child of children) child.kill()
-      } else retire()
+      } else if (code !== 77) retire()
       watcher = null; instance = null; readyNode = false
       for (const command of commands.values()) { clearTimeout(command.timer); command.reject(new Error("Vox ownership ended")) }
       commands.clear()
@@ -478,6 +492,7 @@ export default function vox(pi) {
         }
         return
       }
+      if (code === 77) { watcherFailed = true; return }
       if (succession) {
         mismatchEpisode = true
         report("Vox update detected; reconnecting availability helper")
@@ -795,7 +810,7 @@ export default function vox(pi) {
     semanticPending.clear(); semanticPendingBytes = 0; clearTimeout(semanticTimer); semanticTimer = null
     liveMessage = null
     route = randomBytes(32).toString("hex")
-    generationRef = null; installPending = null; revokePending = null; confirmed = false; refusal = null; retryStep = 0; unavailableNotice = false; cancelRetry()
+    generationRef = null; installPending = null; revokePending = null; confirmed = false; refusal = null; retryStep = 0; unavailableNotice = false; reconnectingNotice = false; cancelRetry()
     if (operation) finish(operation, operation.injected ? null : "cancel")
     notices.clear()
     lastName = null

@@ -4,7 +4,7 @@
 # check-release-assets.sh on the result. A tag whose app cannot get this far would fail in
 # release.yml after the tag was pushed.
 #
-#   scripts/release-dry-run.sh OUTPUT_DIRECTORY [LINUX_VOX]
+#   scripts/release-dry-run.sh OUTPUT_DIRECTORY LINUX_DIST
 #
 # What is real: `cargo build --release --bin vox` and strip, scripts/build-macos-app.sh,
 # scripts/assemble-macos-app.sh, scripts/package-release.sh and scripts/check-release-assets.sh,
@@ -15,7 +15,6 @@
 #     Developer ID; nothing is notarized or stapled;
 #   - the two receipts: written in the shape the signers write, carrying the real digests, but
 #     attesting a notarization that did not happen;
-#   - the Linux asset, unless LINUX_VOX is given: a copy of the macOS `vox` under the Linux name.
 #
 # Then it checks the check: the same directory without the app's receipt must be refused.
 #
@@ -23,12 +22,12 @@
 # shared machine: BUILD_SLOT=~/vox-coord/build-slot.sh). OUTPUT_DIRECTORY must not exist.
 set -euo pipefail
 
-if [[ $# -lt 1 || $# -gt 2 ]]; then
-  echo "usage: $0 OUTPUT_DIRECTORY [LINUX_VOX]" >&2
+if [[ $# -ne 2 ]]; then
+  echo "usage: $0 OUTPUT_DIRECTORY LINUX_DIST" >&2
   exit 2
 fi
 out=$1
-linux_vox=${2:-}
+linux_dist=$2
 fail() {
   echo "release dry run: $*" >&2
   exit 1
@@ -42,7 +41,15 @@ cd "$ROOT"
 command -v jq >/dev/null 2>&1 || fail "needs jq"
 [[ "$out" == /* ]] || fail "the output directory must be absolute"
 [[ ! -e "$out" && ! -L "$out" ]] || fail "$out already exists"
-[[ -z "$linux_vox" || -f "$linux_vox" ]] || fail "$linux_vox is not a file"
+linux_files=(vox-x86_64-unknown-linux-gnu vox-x86_64-unknown-linux-gnu.sha256
+  stable-x86_64-unknown-linux-gnu.json proof-x86_64-unknown-linux-gnu.json
+  vox-x86_64-unknown-linux-gnu-symbols vox-x86_64-unknown-linux-gnu-symbols.sha256)
+for name in "${linux_files[@]}"; do
+  [[ -f "$linux_dist/$name" ]] || fail "LINUX_DIST must be the dist/ directory scripts/build-linux-release.sh wrote; it lacks $name"
+done
+[[ $(find "$linux_dist" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ') == "${#linux_files[@]}" ]] \
+  || fail "LINUX_DIST must hold exactly the six Linux release files"
+linux_dist=$(cd "$linux_dist" && pwd)
 
 TARGET=aarch64-apple-darwin
 MIN=13.0
@@ -114,12 +121,8 @@ ditto -c -k --sequesterRsrc --keepParent "$assembled" "$app_zip"
 # 4. Package, as the macOS job and the publish job do.
 cd "$out/repo"
 cp "$ROOT/Cargo.toml" .
-if [[ -n "$linux_vox" ]]; then
-  cp "$linux_vox" "$out/vox/vox-x86_64-unknown-linux-gnu"
-else
-  cp "$vox" "$out/vox/vox-x86_64-unknown-linux-gnu"
-fi
-"$ROOT/scripts/package-release.sh" "$out/vox/vox-x86_64-unknown-linux-gnu" x86_64-unknown-linux-gnu >/dev/null
+mkdir dist
+for name in "${linux_files[@]}"; do cp "$linux_dist/$name" dist/; done
 "$ROOT/scripts/package-release.sh" "$vox" "$TARGET" >/dev/null
 "$ROOT/scripts/package-release.sh" "$app_zip" "$TARGET" app >/dev/null
 receipt() { # package asset-name asset-file [helper-sha]
@@ -154,4 +157,3 @@ note "check-release-assets.sh refused the release without the app's receipt, as 
 
 echo "release dry run: $VERSION built, assembled, packaged and passed the publish check: $release"
 echo "release dry run: STAND-INS: ad-hoc signatures, no notarization or staple, receipts written here"
-[[ -n "$linux_vox" ]] || echo "release dry run: STAND-IN: vox-x86_64-unknown-linux-gnu is the macOS vox"

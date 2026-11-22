@@ -843,9 +843,9 @@ fn admit_inner(
     Ok(Committed { first, last, fresh })
 }
 
-/// Hold the durable Session transaction with its writer acquired, before its flush returns.
+/// Hold a durable Session or attention transaction with its writer acquired.
 #[cfg(feature = "test-knobs")]
-fn hold_flush_for_proof(session: &str) -> Result<()> {
+pub(crate) fn hold_flush_for_proof(session: &str) -> Result<()> {
     let Ok(spec) = std::env::var("VOX_TEST_HOLD_SESSION_FLUSH") else {
         return Ok(());
     };

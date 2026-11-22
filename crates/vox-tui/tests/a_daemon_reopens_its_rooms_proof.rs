@@ -32,9 +32,6 @@ mod watchdog;
 
 #[path = "support/optional_proof.rs"]
 mod optional_proof;
-#[cfg(feature = "optional-proofs")]
-#[path = "support/test_knobs.rs"]
-mod refresh_knobs;
 #[path = "support/room.rs"]
 mod refresh_room;
 use refresh_room::{attach, typed};
@@ -358,7 +355,6 @@ fn a_restarted_room_drives_its_session_refresh_to_ready() {
     use vox_core::node::api::NodeEvent;
     use vox_core::node::ipc::{Frame, IpcClient, NodeSocket, Request};
     watchdog::arm();
-    refresh_knobs::require(&["VOX_TEST_SESSION_REFRESH_RECEIPT"]);
     let tmp = refresh_room::diagnostic_tempdir();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -419,9 +415,16 @@ fn a_restarted_room_drives_its_session_refresh_to_ready() {
         std::thread::sleep(Duration::from_millis(100));
     }
     // These are real protocol requests to the shipped daemon, not an in-process Node.
-    // Each Appended response says this exact lifecycle record is saved.
-    const PER_AUTHOR: usize = 512;
+    // Public lifecycle posts replicate every staged row, unlike private delivery windows.
+    const PER_AUTHOR: usize = 256;
     let unchanged_room = vox_core::node::api::Fault::RoomChangePending.to_string();
+    let at = NodeSocket::one_shot(
+        room.workers[0].paths.account().socket(),
+        vox_core::node::paths::NodeName::parse("default").expect("APPARATUS: node name"),
+    );
+    let mut observer = rt
+        .block_on(IpcClient::open_at(&at))
+        .expect("APPARATUS: staging observer socket");
     for (index, label) in [(0, "own"), (1, "foreign")] {
         let worker = &room.workers[index];
         let at = NodeSocket::one_shot(
@@ -438,18 +441,17 @@ fn a_restarted_room_drives_its_session_refresh_to_ready() {
             opening.from.clone_from(&session);
             opening.at.session_name = Some(format!("rg12-{label}-{row}"));
             opening.data = serde_json::json!({"session":{"harness":"claude"}});
-            let request = Request::AppendSession {
+            let request = Request::Post {
                 channel_id: room.cid,
-                session_id: session,
-                body: opening.to_text(),
+                text: opening.to_text(),
+                card: false,
             };
             let deadline = Instant::now() + Duration::from_secs(60);
             loop {
                 match rt.block_on(peer.request(&request)) {
-                    Ok(Frame::Appended { .. }) => break,
+                    Ok(Frame::Ok) => break,
                     Ok(Frame::Error { reason }) if reason == unchanged_room => {
-                        // The previous append was saved; its Drive postlude may still own the
-                        // room. Only this definite-no-change refusal can retry the same input.
+                        // Only a definite-no-change refusal can retry the same input.
                         assert!(Instant::now() < deadline,
                             "APPARATUS: the prior room change did not release staging {label}/{row}");
                         std::thread::sleep(Duration::from_millis(10));
@@ -459,63 +461,67 @@ fn a_restarted_room_drives_its_session_refresh_to_ready() {
                     }
                 }
             }
+            if index == 1 {
+                let deadline = Instant::now() + Duration::from_secs(120);
+                loop {
+                    let shown =
+                        rt.block_on(observer.session_lookup(room.cid, worker.fp, session.clone()));
+                    if matches!(&shown, Ok(Frame::SessionsPage { sessions, .. })
+                        if sessions.iter().any(|head| head.node == worker.fp && head.id == session))
+                    {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "APPARATUS: owner did not hold foreign lifecycle row {session}: {shown:?}"
+                    );
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
         }
     }
-    let authors = [0, 1].map(|index| vox_core::node::link::b32_encode(&room.workers[index].fp));
     let expected_heads = ["own", "foreign"].map(|label| {
         [
             format!("rg12-{label}"),
             format!("rg12-{label}-{}", PER_AUTHOR - 1),
         ]
     });
-    // Another author's head listing is a delivery window: it shows newest heads and
-    // fetches older ones on demand, so stage each author's initial and final head.
-    let head_summary = |output: &refresh_room::Out| {
-        if !output.ok {
-            return None;
+    // Exact bounded lookups do not restart a whole-room listing every time its fold
+    // publishes another page. Observe every staged row before taking the peer away.
+    let deadline = Instant::now() + Duration::from_secs(600);
+    for (index, label) in ["own", "foreign"].into_iter().enumerate() {
+        for row in 0..=PER_AUTHOR {
+            let id = if row == PER_AUTHOR {
+                format!("rg12-{label}")
+            } else {
+                format!("rg12-{label}-{row}")
+            };
+            loop {
+                let shown = rt.block_on(observer.session_lookup(
+                    room.cid,
+                    room.workers[index].fp,
+                    id.clone(),
+                ));
+                if matches!(&shown, Ok(Frame::SessionsPage { sessions, .. })
+                    if sessions.iter().any(|head|
+                        head.node == room.workers[index].fp && head.id == id))
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "APPARATUS: owner did not hold staged lifecycle row {id}: {shown:?}"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
         }
-        let values = match output
-            .stdout
-            .lines()
-            .filter(|line| !line.is_empty())
-            .map(serde_json::from_str::<serde_json::Value>)
-            .collect::<Result<Vec<_>, _>>()
-        {
-            Ok(values) => values,
-            Err(_) => return None,
-        };
-        let heads = values
-            .iter()
-            .filter_map(|row| Some((row["node"].as_str()?, row["id"].as_str()?)))
-            .collect::<std::collections::BTreeSet<_>>();
-        let counts = authors.each_ref().map(|author| {
-            heads
-                .iter()
-                .filter(|(node, _)| *node == author.as_str())
-                .count()
-        });
-        let endpoints = expected_heads.iter().enumerate().all(|(index, ids)| {
-            ids.iter()
-                .all(|id| heads.contains(&(authors[index].as_str(), id.as_str())))
-        });
-        Some((counts, endpoints))
-    };
-    let deadline = Instant::now() + Duration::from_secs(120);
-    loop {
-        let shown = room.workers[0].vox(None, &["room", "sessions", &room.id, "--json"]);
-        if let Some((listed, true)) = head_summary(&shown) {
-            eprintln!(
-                "RG12 staged public Session heads: own={} foreign={}",
-                listed[0], listed[1]
-            );
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "APPARATUS: owner did not hold the known foreign/own lifecycle rows: {shown:?}"
-        );
-        std::thread::sleep(Duration::from_millis(100));
     }
+    drop(observer);
+    eprintln!(
+        "RG12 staged public Session heads: own={} foreign={}",
+        PER_AUTHOR + 1,
+        PER_AUTHOR + 1
+    );
     // No peer, periodic status probe or room-list loop supplies incidental wakes during replay.
     room.workers[1].stop_daemon_cleanly();
     room.workers[0].stop_daemon_cleanly();
@@ -570,6 +576,11 @@ fn a_restarted_room_drives_its_session_refresh_to_ready() {
         }
         start.elapsed()
     });
+    eprintln!("RG12 restart ready after {ready:?}; product bound 5s");
+    assert!(
+        ready < Duration::from_secs(5),
+        "PRODUCT: restarted room remained preparing for {ready:?}; room readiness must return within 5s"
+    );
     let walked = std::fs::read_to_string(&receipt)
         .expect("APPARATUS: restart did not reach its Session-refresh batches");
     let (rows, foreign) = walked
@@ -582,12 +593,12 @@ fn a_restarted_room_drives_its_session_refresh_to_ready() {
                 "APPARATUS: malformed refresh receipt {line:?}"
             );
             (
-                rows + fields[1].parse::<usize>().expect("APPARATUS: walked rows"),
+                rows + fields[1].parse::<usize>().expect("APPARATUS: opened rows"),
                 foreign + fields[2].parse::<usize>().expect("APPARATUS: foreign rows"),
             )
         });
     eprintln!(
-        "RG12 restart READY: authored={} own_openings={} foreign_openings={} walked={rows} own_walked={} foreign_walked={foreign} \
+        "RG12 restart READY: authored={} own_openings={} foreign_openings={} opened={rows} own_opened={} foreign_opened={foreign} \
         spawn_to_room_open={ready:?}\nwalk:\n{walked}\nproduct stderr:\n{}",
         2 * (PER_AUTHOR + 1),
         PER_AUTHOR + 1,
@@ -595,17 +606,50 @@ fn a_restarted_room_drives_its_session_refresh_to_ready() {
         rows - foreign,
         std::fs::read_to_string(&err).expect("APPARATUS: read restart product report")
     );
-    // Replay walks retained, indexed lifecycle sources rather than folded Session heads,
-    // so its counts need not match the number of acknowledged openings.
+    // This receipt counts opened records, not index-only visits at or above `through`.
+    // Zero-open batches still walk the index. Only this positive-share apparatus check
+    // reads the count; the PRODUCT readiness assertion above uses the public room event.
     assert!(
         foreign > 0 && rows > foreign,
-        "APPARATUS: restart did not walk a positive share of both own and foreign Session sources"
+        "APPARATUS: restart did not open a positive share of both own and foreign Session sources"
     );
-    let shown = worker.vox(None, &["room", "sessions", &room.id, "--json"]);
-    assert!(
-        head_summary(&shown).is_some_and(|(_, endpoints)| endpoints),
-        "PRODUCT: reopened room lost saved Session state or replay order: {shown:?}"
-    );
+    let mut observer = rt
+        .block_on(IpcClient::open_at(&at))
+        .expect("APPARATUS: reopened Session observer");
+    for (index, ids) in expected_heads.iter().enumerate() {
+        for id in ids {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                let shown = rt.block_on(observer.session_lookup(
+                    room.cid,
+                    room.workers[index].fp,
+                    id.clone(),
+                ));
+                if let Ok(Frame::SessionsPage {
+                    sessions,
+                    provisional,
+                    ..
+                }) = &shown
+                {
+                    if sessions
+                        .iter()
+                        .any(|head| head.node == room.workers[index].fp && head.id == *id)
+                    {
+                        break;
+                    }
+                    assert!(
+                        *provisional,
+                        "PRODUCT: reopened room lost saved Session {id}: {shown:?}"
+                    );
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "APPARATUS: reopened Session query did not settle for {id}: {shown:?}"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
     worker
         .vox(None, &["room", "post", &room.id, "rg12-after-refresh"])
         .expect_ok("the automatically refreshed room accepts a saved post");

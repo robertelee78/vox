@@ -415,6 +415,29 @@ impl Worker {
     }
 }
 
+/// Register a proof sender through the public hook and confirm it through doctor.
+pub fn register_sending_session(worker: &Worker, room: &str, session: &str) {
+    let registered = worker.vox(
+        None,
+        &[
+            "agent",
+            "hook",
+            "--node",
+            "default",
+            "--room",
+            room,
+            "--session",
+            session,
+            "--format",
+            "text",
+        ],
+    );
+    let doctor = worker.vox(None, &["agent", "doctor", "--node", "default", "--json"]);
+    assert!(registered.ok && doctor.json()["checks"].as_array().is_some_and(|checks|
+        checks.iter().any(|check| check["check"] == format!("session {session}"))),
+        "APPARATUS: sending session {session} was not registered; hook={registered:?}; doctor={doctor:?}");
+}
+
 /// A room shared by every worker, and the processes that serve it. Dropping it kills
 /// the daemons and the anchor.
 pub struct Room {

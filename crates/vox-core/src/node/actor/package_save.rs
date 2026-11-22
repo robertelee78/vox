@@ -109,7 +109,6 @@ enum Opening {
 enum After {
     Logged {
         replay: bool,
-        abandon_unopened: bool,
     },
     Preparation(Box<preparation_save::Continuation>),
     Inbound(Box<Inbound>),
@@ -237,15 +236,11 @@ impl Node {
             return false;
         }
         let replay = self.key_package_rooms.remove(&room).unwrap_or(false);
-        let abandon_unopened = self.key_package_unopened.remove(&room);
         let continuation = Continuation {
             instance,
             attachment: self.delivery_epoch,
             lifetime,
-            after: After::Logged {
-                replay,
-                abandon_unopened,
-            },
+            after: After::Logged { replay },
             stage: Stage::Select,
             attempt: None,
         };
@@ -254,7 +249,6 @@ impl Node {
             CommonWork::Packages(Work::Select {
                 trust_digest: crate::hash::sha256(&self.trust.to_bytes()),
                 replay,
-                abandon_unopened,
             }),
             maintenance_save::Continuation::Packages(continuation),
             reply,
@@ -317,10 +311,7 @@ impl Node {
                     let _ = reply.send(Outcome::Failed(fault_of(&error)));
                 }
             }
-            After::Logged {
-                replay,
-                abandon_unopened,
-            } => {
+            After::Logged { replay } => {
                 let publication_busy = matches!(
                     error,
                     Error::Profile("room publication is busy; retry this operation")
@@ -330,16 +321,12 @@ impl Node {
                         .entry(room)
                         .and_modify(|pending| *pending |= replay)
                         .or_insert(replay);
-                    if abandon_unopened {
-                        self.key_package_unopened.insert(room);
-                    }
                 }
                 if attached
                     && matches!(continuation.stage, Stage::Open | Stage::Install)
                     && matches!(fault_of(&error), Fault::GovernanceRefreshing)
                 {
                     self.key_package_governance_wait.insert(room);
-                    self.key_package_unopened.insert(room);
                     self.key_package_retry_at
                         .insert(room, std::time::Instant::now() + super::PREPARE_WAIT);
                     self.governance_work.wake_room(room);
@@ -945,7 +932,6 @@ impl Node {
             // reservation, and the policy's own room marks need this slot to release it.
             // Retain the same reselected obligation as an interrupted turn; the fresh-gated
             // package turn resumes it once the policy has finished.
-            self.key_package_unopened.insert(room);
             self.key_package_rooms.entry(room).or_insert(false);
             drop(continuation);
             self.post_save_wake.notify_one();

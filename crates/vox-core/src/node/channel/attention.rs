@@ -79,6 +79,8 @@ impl ChannelState {
             };
         }
         let session = operation.session().to_owned();
+        #[cfg(feature = "test-knobs")]
+        let proof_session = session.clone();
         let row = match self.session_query(
             store,
             SessionQuery::Lookup {
@@ -337,6 +339,8 @@ impl ChannelState {
                 }
             };
             if ledger.finish()? {
+                #[cfg(feature = "test-knobs")]
+                crate::node::session_ingress::hold_flush_for_proof(&proof_session)?;
                 batch.commit()?;
             }
             Ok(reply)

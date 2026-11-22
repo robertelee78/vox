@@ -3,6 +3,26 @@
 use super::*;
 use crate::node::decisions::DecisionLog;
 
+#[cfg(feature = "test-knobs")]
+async fn proof_hold(phase: &str) {
+    let Some(base) = std::env::var_os("VOX_TEST_HOLD_IDENTITY_STARTUP") else {
+        return;
+    };
+    let base = std::path::PathBuf::from(base);
+    let arm = base.with_extension(format!("{phase}.arm"));
+    if !arm.exists() {
+        return;
+    }
+    let release = base.with_extension(format!("{phase}.release"));
+    if let Ok(listener) = tokio::net::UnixListener::bind(&release) {
+        if std::fs::remove_file(arm).is_ok() {
+            let _ = std::fs::write(base.with_extension(format!("{phase}.selected")), phase);
+            let _ = listener.accept().await;
+        }
+        let _ = std::fs::remove_file(release);
+    }
+}
+
 pub(super) enum Work {
     Create {
         passphrase: Secret,
@@ -105,7 +125,7 @@ fn prepare(profile: &Profile, decisions: &DecisionLog, now: u64) -> crate::error
         }
         _ => return Err(Error::Profile("unexpected blacklist import completion")),
     }
-    let accepted = metadata_save::load_accepted_joins(profile.store(), signer)?;
+    let accepted = metadata_save::finish_saved_accepted_joins(profile.store(), signer)?;
     let unfinished = profile
         .store()
         .get_meta(PENDING_JOIN_CLEANUP_META_KEY)?
@@ -427,6 +447,8 @@ impl Node {
                 None => None,
             };
             let physical_exclusive = exclusive.clone();
+            #[cfg(feature = "test-knobs")]
+            proof_hold("policy").await;
             let returned = tokio::task::spawn_blocking(move || {
                 let (profile, loaded) = run(work, paths, now, argon2, &worker_decisions, &events);
                 let mut returned = Returned {
@@ -598,6 +620,11 @@ impl Node {
                         .store(policy.revision, std::sync::atomic::Ordering::Release);
                     self.computer_expired = policy.expired;
                 }
+                // Policy is installed. Room reopening owns its room's publication lease,
+                // not the daemon-wide transition needed by sibling Sessions.
+                drop(returned.exclusive.take());
+                #[cfg(feature = "test-knobs")]
+                proof_hold("rooms").await;
                 match returned
                     .boundary
                     .ok_or(Error::Profile("native startup has no identity boundary"))
@@ -620,8 +647,7 @@ impl Node {
                 }
             }
         };
-        // The original exclusive transition and secret lease are still held here. Publishing
-        // Ready and answering its original command are part of this exact startup attempt.
+        // The secret lease remains held until Ready is published and the command is answered.
         self.publish().await;
         if let Some(reply) = pending.reply {
             let _ = reply.send(outcome);

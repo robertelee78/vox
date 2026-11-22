@@ -261,6 +261,8 @@ impl Drop for SetupProcesses {
                 .args(["-TERM", &pid.to_string()])
                 .status();
         }
+        #[cfg(target_os = "linux")]
+        typed::cleanup_linux_keys(&self.0.join("vox-data"));
     }
 }
 
