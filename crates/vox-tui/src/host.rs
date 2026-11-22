@@ -1738,6 +1738,13 @@ impl Router {
                     .await?
             }
         };
+        g.handle
+            .paths()
+            .verify_profile()
+            .map_err(|error| Refusal::Failed {
+                node: u.node.clone(),
+                why: error.to_string(),
+            })?;
         let drive = (Arc::downgrade(&self.inner), u.node.clone());
         Ok(Lease {
             node: u.node,
@@ -1967,7 +1974,8 @@ impl Router {
         let handle = self.handle_of(node);
         // A room the hook named by a prefix of its id is resolved against the node's rooms, now
         // that the node is attached, and kept by its whole id.
-        if let (Some(h), Ok(paths)) = (handle.as_ref(), self.inner.account.node_paths(node)) {
+        if let Some(h) = handle.as_ref() {
+            let paths = h.paths();
             let ingress = self.inner.posting.lock().await;
             if let Some(why) = ingress.blocked_nodes.get(node) {
                 return Err(Refusal::Failed {
@@ -1975,7 +1983,7 @@ impl Router {
                     why: why.clone(),
                 });
             }
-            let named = crate::wake::registration(&paths, &id).and_then(|r| r.room);
+            let named = crate::wake::registration(paths, &id).and_then(|r| r.room);
             if let Some(prefix) =
                 named.filter(|r| vox_core::node::link::b32_decode(r, "room").is_err())
             {
@@ -1991,13 +1999,17 @@ impl Router {
                         .as_ref()
                         .map(|session| self.registration_fence(node, session, g.info.fingerprint))
                         .transpose()?;
-                    if crate::wake::store_room(&paths, &id, one).is_some() {
+                    paths.verify_profile().map_err(|error| Refusal::Failed {
+                        node: node.clone(),
+                        why: error.to_string(),
+                    })?;
+                    if crate::wake::store_room(paths, &id, one).is_some() {
                         // The OMP follower admits activity only for the registration as stored;
                         // the one `want` started holds the prefix and would refuse every entry.
-                        if let Some(reg) = crate::wake::registration(&paths, &id)
-                            .filter(|reg| reg.harness == "omp")
+                        if let Some(reg) =
+                            crate::wake::registration(paths, &id).filter(|reg| reg.harness == "omp")
                         {
-                            self.watch_harness(node, &reg);
+                            self.watch_harness(node, paths, &reg);
                         }
                     }
                 }
@@ -2267,14 +2279,10 @@ impl Router {
             node: node.clone(),
             why,
         };
-        let paths = self
-            .inner
-            .account
-            .node_paths(node)
-            .map_err(|e| failed(e.to_string()))?;
         let handle = self.handle_of(node).ok_or_else(|| {
             failed("its work is not running; try again when the node is Ready".into())
         })?;
+        let paths = handle.paths();
         vox_core::node::link::b32_decode(room, "room").map_err(|e| failed(e.to_string()))?;
         let lifecycle = self.session_lifecycle(node, session);
         let _lifecycle = lifecycle.lock().await;
@@ -2283,7 +2291,8 @@ impl Router {
         if let Some(why) = ingress.blocked_nodes.get(node) {
             return Err(failed(why.clone()));
         }
-        let before = crate::wake::store_room(&paths, session, room)
+        paths.verify_profile().map_err(|e| failed(e.to_string()))?;
+        let before = crate::wake::store_room(paths, session, room)
             .ok_or_else(|| failed(format!("no session {session} is registered")))?;
         if let Some(old) = before.filter(|old| old != room) {
             ingress.suppress_source_effects(node, session);
@@ -2293,11 +2302,11 @@ impl Router {
         }
         drop(ingress);
         self.inner.session_holds_wake.notify_one();
-        let reg = crate::wake::registration(&paths, session)
+        let reg = crate::wake::registration(paths, session)
             .ok_or_else(|| failed(format!("no session {session} is registered")))?;
         let joining = self.open_session(node, &handle, &reg, None).await;
         if reg.harness == "omp" {
-            self.watch_harness(node, &reg);
+            self.watch_harness(node, paths, &reg);
         }
         Ok(DaemonFrame::SessionRegistered {
             info: self
@@ -2704,9 +2713,10 @@ impl Router {
         for s in &ask.sessions {
             let label: String = s.session.chars().take(8).collect();
             let who = crate::room_ask::harness_words(&s.harness);
-            let Ok(paths) = self.inner.account.node_paths(&s.node) else {
+            let Some(handle) = self.handle_of(&s.node) else {
                 continue;
             };
+            let paths = handle.paths();
             let lifecycle = self.session_lifecycle(&s.node, &s.session);
             let _lifecycle = lifecycle.lock().await;
             self.settle_session_head(&s.node, &s.session).await;
@@ -2716,7 +2726,11 @@ impl Router {
                     said.push(format!("{who} session {label} was not bound: {why}"));
                     continue;
                 }
-                let before = crate::wake::store_room(&paths, &s.session, &room_b32);
+                if let Err(error) = paths.verify_profile() {
+                    said.push(format!("{who} session {label} was not bound: {error}"));
+                    continue;
+                }
+                let before = crate::wake::store_room(paths, &s.session, &room_b32);
                 let Some(before) = before else {
                     continue;
                 };
@@ -2729,12 +2743,12 @@ impl Router {
             }
             let joining = match (
                 self.handle_of(&s.node),
-                crate::wake::registration(&paths, &s.session),
+                crate::wake::registration(paths, &s.session),
             ) {
                 (Some(h), Some(reg)) => {
                     let joining = self.open_session(&s.node, &h, &reg, None).await;
                     if reg.harness == "omp" {
-                        self.watch_harness(&s.node, &reg);
+                        self.watch_harness(&s.node, paths, &reg);
                     }
                     joining
                 }
@@ -3515,7 +3529,7 @@ impl Router {
                 .await;
             // Recorded so the copy goes when the room's retention says (ADR-028 F-5), which is
             // all a record's expiry reads; its id is the share's, the one the drive named.
-            let _ = vox_core::node::pulls::record(
+            vox_core::node::pulls::record(
                 paths,
                 &vox_core::node::pulls::Pulled {
                     room: driven.room,
@@ -3527,7 +3541,8 @@ impl Router {
                     folder: None,
                     files: Vec::new(),
                 },
-            );
+            )
+            .map_err(|error| format!("file receipt was not saved: {error}"))?;
             let line = match note.as_deref().map(str::trim) {
                 Some(n) if !n.is_empty() => format!("{alias} sent you a file: {shown} — {n}"),
                 _ => format!("{alias} sent you a file: {shown}"),
@@ -3670,8 +3685,9 @@ impl Router {
         done
     }
 
-    /// Follow registered native activity; Claude Code's comes through its hooks.
-    fn watch_harness(&self, node: &NodeName, s: &crate::wake::Session) {
+    /// Follow registered native activity; Claude Code's comes through its hooks. `paths` are the
+    /// attached node's, so its follower never writes into a directory substituted for it.
+    fn watch_harness(&self, node: &NodeName, paths: &Paths, s: &crate::wake::Session) {
         match s.harness.as_str() {
             "codex" if !s.codex_home.is_empty() => {
                 self.inner
@@ -3684,16 +3700,14 @@ impl Router {
                     .watch(node, &s.session, &s.mirror, &s.token);
             }
             "omp" if !s.mirror.is_empty() => {
-                if let Ok(paths) = self.inner.account.node_paths(node) {
-                    if let Some(saved) = crate::wake::registration(&paths, &s.session) {
-                        if saved.harness == "omp"
-                            && saved.endpoint == s.endpoint
-                            && saved.mirror == s.mirror
-                            && saved.token == s.token
-                            && saved.attention == s.attention
-                        {
-                            self.inner.omp.watch(&paths, node, &saved);
-                        }
+                if let Some(saved) = crate::wake::registration(paths, &s.session) {
+                    if saved.harness == "omp"
+                        && saved.endpoint == s.endpoint
+                        && saved.mirror == s.mirror
+                        && saved.token == s.token
+                        && saved.attention == s.attention
+                    {
+                        self.inner.omp.watch(paths, node, &saved);
                     }
                 }
             }
@@ -3714,10 +3728,11 @@ impl Router {
         if !self.current_omp_registration(node, expected) {
             return;
         }
-        let Ok(paths) = self.inner.account.node_paths(node) else {
+        let Some(handle) = self.handle_of(node) else {
             return;
         };
-        let Some(reg) = crate::wake::store_name(&paths, &expected.session, name) else {
+        let paths = handle.paths();
+        let Some(reg) = crate::wake::store_name(paths, &expected.session, name) else {
             return;
         };
         if !self.current_omp_registration(node, expected) {
@@ -3738,13 +3753,11 @@ impl Router {
     /// registration keeps the name, and its open Session is renamed at once, not at its next
     /// message.
     fn rename_session(&self, node: &NodeName, session: &str, name: &str) {
-        let Ok(paths) = self.inner.account.node_paths(node) else {
-            return;
-        };
-        let Some(reg) = crate::wake::store_name(&paths, session, name) else {
-            return;
-        };
         let Some(handle) = self.handle_of(node) else {
+            return;
+        };
+        let paths = handle.paths();
+        let Some(reg) = crate::wake::store_name(paths, session, name) else {
             return;
         };
         let (router, node) = (self.clone(), node.clone());
@@ -4215,14 +4228,19 @@ impl Router {
             }
         };
         let generation = attachment.as_ref().map(|(_, generation)| *generation);
-        let paths = self
-            .inner
-            .account
-            .node_paths(node)
-            .map_err(|error| Refusal::Failed {
-                node: node.clone(),
-                why: error.to_string(),
-            })?;
+        // The attached node's paths name the directory it opened, so a replacement is refused.
+        // With no node attached no daemon holds the directory, which is resolved as it is now.
+        let paths = match &attachment {
+            Some((handle, _)) => handle.paths().clone(),
+            None => self
+                .inner
+                .account
+                .node_paths(node)
+                .map_err(|error| Refusal::Failed {
+                    node: node.clone(),
+                    why: error.to_string(),
+                })?,
+        };
         let failed = |why| Refusal::Failed {
             node: node.clone(),
             why: format!("OMP session end was not confirmed: {why}"),
@@ -4835,7 +4853,11 @@ impl Router {
                                         });
                                         // A saved registration is a durable opening obligation.
                                         for session in registered {
-                                            self.watch_harness(node, &session);
+                                            self.watch_harness(
+                                                node,
+                                                opening_handle.paths(),
+                                                &session,
+                                            );
                                             self.watch_title(node, &session);
                                             self.open_registered(
                                                 node,
@@ -4904,6 +4926,10 @@ impl Router {
                 })
             }
             Want::Session(s) => {
+                a.paths.verify_profile().map_err(|error| Refusal::Failed {
+                    node: node.clone(),
+                    why: error.to_string(),
+                })?;
                 let ending = lock(&self.inner.omp_ending);
                 if ending.contains(&(node.clone(), s.session.clone())) {
                     return Err(Refusal::RegistrationRetryable {
@@ -4915,7 +4941,7 @@ impl Router {
                 crate::wake::store_checked(&a.paths, &s)
                     .map_err(|error| Self::registration_store_refusal(node, error))?;
                 drop(ending);
-                self.watch_harness(node, &s);
+                self.watch_harness(node, &a.paths, &s);
                 a.sessions.insert(s.session.clone());
                 None
             }

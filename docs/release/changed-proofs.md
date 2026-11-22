@@ -120,6 +120,23 @@ are registered through the public hook before the operation acts. The separate
 act expects advice about matching claim rules, not matching package versions; it
 does not depend on the full journey's Claude wiring or process-provenance staging.
 
+RG-10's profile-replacement proof is
+`the_daemon_and_its_nodes_proof::a_room_leave_refuses_a_replaced_profile_directory`.
+It leaves the daemon running, substitutes the node directory, and requires leave,
+pause and a new agent hook to refuse without changing the replacement. The hook
+must create neither a session registration nor its lock there. A `SessionEnd`
+for a registration the replacement holds of its own must then leave the
+replacement unchanged: no `sessions.lock`, the registration kept. Every session
+registration writer takes the registration lock, and the lock checks the
+profile directory first. The directory checks cover an operator replacing a
+profile, not an attacker racing filesystem calls. The long-path Unix socket
+fallback is unchanged.
+
+`work_version_proof::legacy_claim_retry_survives_package_stamp_change` retries a
+v0.4.30 claim through the CLI using its original operation ID. Package metadata
+does not change compatible operation content; different claim rules still do.
+This does not migrate operation projections written by earlier binaries.
+
 ## A materialized accepted join reopens after a crash
 
 A verified join saved with its room wrap and reopen keys completes its retained

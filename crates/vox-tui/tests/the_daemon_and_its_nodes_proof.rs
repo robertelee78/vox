@@ -810,6 +810,188 @@ fn a_conversation_refuses_a_rebuilt_node_under_the_same_name() {
         "PRODUCT: a rebuilt node must not adopt the old conversation; registered={registered}; {notices}");
 }
 
+/// A daemon must not write into a directory substituted for the profile it opened: not by
+/// leave, pause or a new hook, and not by a session's end, which must neither create the
+/// registration lock in the replacement nor remove the replacement's own registration.
+/// Mutants: remove the shared profile-directory check, the session grant check, or the
+/// registration lock's check.
+#[test]
+#[ignore = "real daemon and encrypted profile; run in release with test-knobs"]
+fn a_room_leave_refuses_a_replaced_profile_directory() {
+    fn tree(root: &Path) -> Vec<(PathBuf, u32, Vec<u8>)> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fn visit(root: &Path, path: &Path, entries: &mut Vec<(PathBuf, u32, Vec<u8>)>) {
+            let metadata = std::fs::symlink_metadata(path).expect("APPARATUS: inspect profile");
+            let relative = path.strip_prefix(root).unwrap().to_owned();
+            let mode = metadata.permissions().mode();
+            if metadata.is_dir() {
+                entries.push((relative, mode, Vec::new()));
+                for entry in std::fs::read_dir(path).expect("APPARATUS: read profile directory") {
+                    visit(
+                        root,
+                        &entry.expect("APPARATUS: profile entry").path(),
+                        entries,
+                    );
+                }
+            } else if metadata.is_symlink() {
+                use std::os::unix::ffi::OsStrExt as _;
+                let target = std::fs::read_link(path).expect("APPARATUS: read profile symlink");
+                entries.push((relative, mode, target.as_os_str().as_bytes().to_vec()));
+            } else {
+                assert!(
+                    metadata.is_file(),
+                    "APPARATUS: unexpected profile entry {path:?}"
+                );
+                entries.push((
+                    relative,
+                    mode,
+                    std::fs::read(path).expect("APPARATUS: read profile file"),
+                ));
+            }
+        }
+
+        let mut entries = Vec::new();
+        visit(root, root, &mut entries);
+        entries.sort();
+        entries
+    }
+
+    watchdog::arm();
+    let a = Account::new();
+    a.make_node("agent");
+    let daemon = Daemon::start(&a, &["--node", "agent"], &[]);
+    daemon.expect("node agent is Ready", Duration::from_secs(30), |line| {
+        line.contains("node agent is Ready")
+    });
+    let room = make_room(&a, "agent");
+    let profile = a.data.join("nodes/agent");
+    let old = a.data.join("nodes/original-agent");
+    std::fs::rename(&profile, &old).expect("APPARATUS: move the opened profile");
+    let copy = Command::new("/bin/cp")
+        .arg("-R")
+        .arg(&old)
+        .arg(&profile)
+        .status()
+        .expect("APPARATUS: copy replacement profile");
+    assert!(
+        copy.success(),
+        "APPARATUS: copy replacement profile: {copy}"
+    );
+    std::fs::write(
+        profile.join("replacement-sentinel"),
+        b"replacement belongs here\n",
+    )
+    .expect("APPARATUS: write replacement sentinel");
+    let before = tree(&profile);
+    let (ok, out, err) = a.run(&["room", "leave", "--node", "agent", &room], "");
+    let after_leave = tree(&profile);
+    let (pause_ok, pause_out, pause_err) = a.run(&["room", "pause", "--node", "agent", &room], "");
+    let after_pause = tree(&profile);
+    let said = format!("{out}{err}");
+    let pause_said = format!("{pause_out}{pause_err}");
+    assert!(
+        !ok
+            && said.contains("profile directory")
+            && said.contains("gone or replaced")
+            && said.contains("nothing was written"),
+        "PRODUCT: leave must refuse the replaced profile in plain words; success={ok}, said: {said}"
+    );
+    assert_eq!(
+        before, after_leave,
+        "PRODUCT: room leave changed the replacement profile despite its refusal: {said}"
+    );
+    assert!(
+        !pause_ok
+            && pause_said.contains("profile directory")
+            && pause_said.contains("gone or replaced")
+            && pause_said.contains("nothing was written"),
+        "PRODUCT: pause must refuse the replaced profile in plain words; success={pause_ok}, said: {pause_said}"
+    );
+    assert_eq!(
+        before, after_pause,
+        "PRODUCT: room pause changed the replacement profile despite its refusal: {pause_said}"
+    );
+    let (hook_ok, hook_out, hook_err) = a.run(
+        &[
+            "agent",
+            "hook",
+            "--node",
+            "agent",
+            "--room",
+            &room,
+            "--session",
+            "s-replaced",
+            "--format",
+            "text",
+        ],
+        "",
+    );
+    let hook_said = format!("{hook_out}{hook_err}");
+    println!("replaced-profile hook: success={hook_ok}: {hook_said}");
+    assert!(
+        !profile.join("sessions/s-replaced.json").exists()
+            && !profile.join("sessions.lock").exists(),
+        "PRODUCT: a refused hook wrote a session registration or lock into the replacement: {hook_said}"
+    );
+    assert!(
+        hook_said.contains("profile directory")
+            && hook_said.contains("gone or replaced")
+            && hook_said.contains("nothing was written"),
+        "PRODUCT: the hook must explain the replaced-profile refusal: {hook_said}"
+    );
+    assert_eq!(
+        before,
+        tree(&profile),
+        "PRODUCT: the hook changed the replacement profile: {hook_said}"
+    );
+
+    // A restored profile holds its own registration. The old daemon serving that session's
+    // SessionEnd must leave it, and must not create the registration lock beside it.
+    fn listing(entries: &[(PathBuf, u32, Vec<u8>)]) -> String {
+        use std::hash::{Hash as _, Hasher as _};
+        entries
+            .iter()
+            .map(|(path, mode, bytes)| {
+                let mut hash = std::collections::hash_map::DefaultHasher::new();
+                bytes.hash(&mut hash);
+                format!(
+                    "{} mode={mode:o} size={} hash={:016x}",
+                    path.display(),
+                    bytes.len(),
+                    hash.finish()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+    std::fs::create_dir_all(profile.join("sessions"))
+        .expect("APPARATUS: make the replacement's sessions directory");
+    std::fs::write(
+        profile.join("sessions/s-restored.json"),
+        br#"{"session":"s-restored"}"#,
+    )
+    .expect("APPARATUS: write the replacement's own registration");
+    let before_end = tree(&profile);
+    let (end_ok, end_out, end_err) = a.hook("agent", "s-restored", "SessionEnd");
+    let after_end = tree(&profile);
+    println!("replaced-profile SessionEnd: success={end_ok}: {end_out}{end_err}");
+    let daemon_said = daemon.said();
+    for line in daemon_said
+        .lines()
+        .filter(|line| line.contains("gone or replaced"))
+    {
+        println!("daemon: {line}");
+    }
+    assert!(
+        !profile.join("sessions.lock").exists() && before_end == after_end,
+        "PRODUCT: the daemon's SessionEnd changed the replacement profile.\nbefore:\n{}\nafter:\n{}",
+        listing(&before_end),
+        listing(&after_end)
+    );
+    daemon.stop();
+}
+
 #[cfg(feature = "test-knobs")]
 #[test]
 #[ignore = "real binaries with production Argon2id; run in release"]
@@ -1152,7 +1334,7 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
             err.contains("could not read remembered state") && err.contains("it was not changed")
         };
         assert!(
-            !ok && truthful && !out.contains("Ready and remembered"),
+            !ok && truthful && !out.contains("Ready (remembered)"),
             "PRODUCT: failed persistence must fail unlock and name its partial state: {out}{err}"
         );
         let (_, shown, err) = a.run(&["node", "list"], "");
@@ -1175,7 +1357,7 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
         "",
     );
     assert!(
-        ok && out.contains("Ready and remembered"),
+        ok && out.contains("Ready (remembered)"),
         "PRODUCT: unlock must make the node Ready and remembered: {out}{err}"
     );
     let room = make_room(&a, "default");
@@ -1201,7 +1383,7 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
         ],
         "",
     );
-    assert!(!ok && err.contains("identity passphrase") && !out.contains("Ready and remembered"),
+    assert!(!ok && err.contains("identity passphrase") && !out.contains("Ready (remembered)"),
         "PRODUCT: a Ready protected node must reject empty input instead of remembering no passphrase: {out}{err}");
     let (_, listed, err) = a.run(&["node", "list"], "");
     assert!(
@@ -1221,7 +1403,7 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
         "",
     );
     assert!(
-        ok && out.contains("Ready and remembered"),
+        ok && out.contains("Ready (remembered)"),
         "PRODUCT: correct passphrase retry must remember the Ready node: {out}{err}"
     );
     let wrong = pass.with_extension("wrong");
@@ -1237,7 +1419,7 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
         ],
         "",
     );
-    assert!(!ok && err.contains("identity passphrase") && !out.contains("Ready and remembered"),
+    assert!(!ok && err.contains("identity passphrase") && !out.contains("Ready (remembered)"),
         "PRODUCT: wrong input must not replace an already-Ready node's usable restart secret: {out}{err}");
     // The restart and room read below prove the rejected replacement left usable material.
     stop_pid(a.lock_pid().expect("APPARATUS: unlocked node's daemon"));
@@ -1295,7 +1477,7 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
     );
     assert!(
         ok && err.contains("`vox node attach` is now `vox node unlock`")
-            && out.contains("Ready and remembered"),
+            && out.contains("Ready (remembered)"),
         "PRODUCT: attach --keep must be the remembering unlock alias: {out}{err}"
     );
     let (ok, out, err) = a.run(&["room", "read", &room], "");
@@ -1426,7 +1608,7 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
         ] {
             let (ok, out, err) = a.run(&args, "");
             assert!(!ok && err.contains("could not read remembered state") && err.contains("it was not changed")
-                && !out.contains("Ready and remembered") && !out.contains("Locked and forgotten"),
+                && !out.contains("Ready (remembered)") && !out.contains("Locked and forgotten"),
                 "PRODUCT: unreadable remembered state must be refused without claiming a change: {out}{err}");
         }
         let (ok, shown, err) = a.run(&["node", "list"], "");
@@ -1475,7 +1657,7 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
         "",
     );
     assert!(
-        ok && out.contains("Ready and remembered"),
+        ok && out.contains("Ready (remembered)"),
         "PRODUCT: unlock after the repaired lock must succeed: {out}{err}"
     );
     let (ok, out, err) = a.run(&["node", "attach", "default", "--no-remember"], "");
@@ -1499,7 +1681,7 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
         assert!(
             !ok && err.contains("Ready, but remembering could not be confirmed")
                 && err.contains("keychain")
-                && !out.contains("Ready and remembered"),
+                && !out.contains("Ready (remembered)"),
             "PRODUCT: a failed remember must fail unlock and name its partial state: {out}{err}"
         );
         let (_, listed, err) = a.run(&["node", "list"], "");
