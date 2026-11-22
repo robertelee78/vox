@@ -6,6 +6,7 @@ use super::*;
 use crate::node::retention::Tracked;
 
 pub(crate) const DUE_ENTRIES: usize = 64;
+pub(crate) const DUE_PAYLOAD_BYTES: usize = 1024 * 1024;
 const DUE_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

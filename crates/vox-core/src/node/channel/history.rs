@@ -245,6 +245,7 @@ impl Revision {
 enum Failure {
     Storage(Error),
     Request(&'static str),
+    Expired,
 }
 impl From<Error> for Failure {
     fn from(error: Error) -> Self {
@@ -253,6 +254,7 @@ impl From<Error> for Failure {
 }
 type Answer<T> = std::result::Result<T, Failure>;
 pub(crate) const CHANGED: &str = "the room changed while reading; refresh and retry";
+const REMOVING_EXPIRED: &str = "the room is removing expired saved history; retry";
 
 struct View<'a> {
     ch: &'a ReadFacts,
@@ -263,9 +265,9 @@ struct View<'a> {
 }
 
 impl View<'_> {
-    fn saved_answer(&self, query: Query, bytes: usize) -> Answer<Reply> {
-        // Exact indexed aggregates cannot subtract bodies hidden at read time. Maintenance
-        // settles their projection; bounded exact/cursor body reads remain independently usable.
+    fn saved_answer(mut self, query: Query, bytes: usize) -> Answer<Reply> {
+        // One sweep's complete due set can be excluded exactly from the pinned projection.
+        // A projection that is not current still refuses; independent body reads stay usable.
         if matches!(
             &query,
             Query::Count { .. }
@@ -288,7 +290,37 @@ impl View<'_> {
                 "the room is refreshing saved history; retry",
             ));
         }
-        self.answer(query, bytes)
+        self.body_answer(query, bytes)
+    }
+
+    fn body_answer(&mut self, query: Query, bytes: usize) -> Answer<Reply> {
+        let Query::Read {
+            since,
+            after,
+            limit,
+        } = query
+        else {
+            return self.answer(query, bytes);
+        };
+        let select = || Query::Read {
+            since,
+            after,
+            limit,
+        };
+        let answer = self.answer(select(), bytes);
+        // The hook's cursor read has no aggregate guard. Only when it actually meets
+        // expiry, collect the same bounded snapshot overlay and reselect once.
+        if matches!(&answer, Err(Failure::Expired))
+            && !self.rendered.retention_pending(
+                self.ch.now_hint,
+                self.ch.effective_retention(),
+                self.ch.effective_step_retention(),
+            )?
+        {
+            self.answer(select(), bytes)
+        } else {
+            answer
+        }
     }
 
     fn entry_retention(&self, entry: &Entry) -> Result<u64> {
@@ -408,7 +440,7 @@ impl View<'_> {
         Ok(out)
     }
 
-    fn accepted_cache_answer(&self, query: Query, bytes: usize) -> Answer<Reply> {
+    fn accepted_cache_answer(mut self, query: Query, bytes: usize) -> Answer<Reply> {
         use super::legacy_provisional::LEGACY_HISTORY_REQUIRED;
         // Counts, agreement and operation/attention authority require the completed current
         // projection. Cached row selection and its stable cursors remain usable.
@@ -445,7 +477,7 @@ impl View<'_> {
         // readiness and the bounded governance turn publishes the next in-memory revision.
         self.ch.require_governance_display(self.ch.now_hint)?;
         let me = self.ch.me();
-        let answer = self.answer(query, bytes)?;
+        let answer = self.body_answer(query, bytes)?;
         let facts = self.ch.consent_facts()?;
         let check = |row: &MessageRow| -> Answer<()> {
             // Owed placeholders are not accepted bodies. Do not expose unpublished
@@ -517,6 +549,7 @@ impl View<'_> {
             if self
                 .entry_expiry(&entry)?
                 .is_some_and(|at| self.ch.now_hint >= at)
+                && !self.rendered.expiry_body_visible()
             {
                 return Ok(None);
             }
@@ -577,7 +610,7 @@ impl View<'_> {
         &self,
         cursor: &mut Option<(u64, Digest32)>,
         backwards: bool,
-    ) -> Result<Option<MessageRow>> {
+    ) -> Answer<Option<MessageRow>> {
         let rendered = self
             .rendered
             .step(None, true, *cursor, backwards)?
@@ -591,11 +624,7 @@ impl View<'_> {
             return Ok(None);
         };
         *cursor = Some(key);
-        self.row(&key.1)?
-            .ok_or(Error::Profile(
-                "the room is removing expired saved history; retry",
-            ))
-            .map(Some)
+        self.row(&key.1)?.ok_or(Failure::Expired).map(Some)
     }
 
     fn count_before(&self, before: Option<(u64, Digest32)>) -> Result<u64> {
@@ -1614,9 +1643,7 @@ impl View<'_> {
                     };
                     let Some(row) = next else {
                         if arrival != previous_arrival {
-                            return Err(Failure::Request(
-                                "the room is removing expired saved history; retry",
-                            ));
+                            return Err(Failure::Expired);
                         }
                         break;
                     };
@@ -1842,6 +1869,7 @@ impl ChannelState {
         result.map_err(|failure| match failure {
             Failure::Request(why) => why.to_owned(),
             Failure::Storage(error) => error.to_string(),
+            Failure::Expired => REMOVING_EXPIRED.to_owned(),
         })
     }
 }

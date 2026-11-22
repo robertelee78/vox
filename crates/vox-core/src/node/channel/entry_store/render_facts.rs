@@ -430,6 +430,90 @@ impl Source<'_> {
         }
         Ok(out)
     }
+
+    // Reuse sealed summaries except on the boundary and the bounded excluded paths.
+    fn render_visible(
+        &self,
+        sek: &Sek,
+        room: &Digest32,
+        root: u64,
+        range: Option<(&Key, bool)>,
+        omitted: &[Key],
+        depth: usize,
+    ) -> Result<Summary> {
+        if omitted.is_empty() {
+            return match range {
+                Some((bound, before)) => self.render_range(sek, room, root, bound, before, depth),
+                None => self.render_summary(sek, room, root),
+            };
+        }
+        if root == 0 {
+            return Ok(Summary::default());
+        }
+        if depth >= MAX_DEPTH {
+            return Err(invalid("render tree depth"));
+        }
+        let mut out = Summary::default();
+        match self.page(sek, room, root)? {
+            Page::Leaf(rows) => {
+                for (key, value) in rows {
+                    if !omitted.contains(&key)
+                        && range.is_none_or(
+                            |(bound, before)| {
+                                if before {
+                                    key < *bound
+                                } else {
+                                    key > *bound
+                                }
+                            },
+                        )
+                    {
+                        out.add(Summary::value(value)?)?;
+                    }
+                }
+            }
+            Page::Ranked(rows) => {
+                let mut prior = None;
+                for (max, id, summary) in rows {
+                    let whole = range.is_none_or(|(bound, before)| {
+                        if before {
+                            max < *bound
+                        } else {
+                            prior.is_some_and(|p| p >= *bound)
+                        }
+                    });
+                    let outside = range.is_some_and(|(bound, before)| {
+                        if before {
+                            prior.is_some_and(|p| p >= *bound)
+                        } else {
+                            max <= *bound
+                        }
+                    });
+                    if !outside {
+                        if whole
+                            && !omitted
+                                .iter()
+                                .any(|key| *key <= max && prior.is_none_or(|p| *key > p))
+                        {
+                            out.add(summary)?;
+                        } else {
+                            out.add(self.render_visible(
+                                sek,
+                                room,
+                                id,
+                                range,
+                                omitted,
+                                depth + 1,
+                            )?)?;
+                        }
+                    }
+                    prior = Some(max);
+                }
+            }
+            Page::Branch(_) => return Err(invalid("unranked render range")),
+        }
+        Ok(out)
+    }
 }
 
 impl Write<'_, '_> {
@@ -860,8 +944,26 @@ impl Write<'_, '_> {
     }
 }
 
+struct Expired {
+    hash: Digest32,
+    cache: Option<u64>,
+    author: Digest32,
+}
+
+fn expiry_mutant(mode: &str) -> bool {
+    #[cfg(feature = "test-knobs")]
+    if std::env::var("VOX_TEST_EXPIRY_MUTANT").as_deref() == Ok(mode) {
+        eprintln!("test-knobs: expiry {mode} engaged");
+        return true;
+    }
+    let _ = mode;
+    false
+}
+
 pub(crate) struct RenderView<'a> {
     pub(super) order: OrderView<'a>,
+    expired: Vec<Expired>,
+    expired_owed: Vec<Digest32>,
 }
 impl RenderView<'_> {
     pub(crate) fn read_index(&self) -> &Read<'_> {
@@ -878,9 +980,65 @@ impl RenderView<'_> {
         !read.sparse_enabled()
             && (read.legacy_provisional().is_some() || read.legacy_required_any())
     }
-    pub(crate) fn retention_pending(&self, now: u64, ttl: u64, step_ttl: u64) -> Result<bool> {
-        Ok(self.order.read.retention_due(now, ttl, step_ttl, 0)?.1
-            || self.next_owed_expiry()?.is_some_and(|at| at <= now))
+    /// More than one native sweep still refuses. A complete bounded due set is instead
+    /// excluded from this pinned read, without changing storage or admitting a writer.
+    pub(crate) fn retention_pending(&mut self, now: u64, ttl: u64, step_ttl: u64) -> Result<bool> {
+        let read = &self.order.read;
+        if !read.retention_due(now, ttl, step_ttl, 0)?.1
+            && self.next_owed_expiry()?.is_none_or(|at| at > now)
+        {
+            return Ok(false);
+        }
+        if expiry_mutant("refuse") {
+            return Ok(true);
+        }
+        let (selected, more) = read.retention_due(now, ttl, step_ttl, DUE_ENTRIES)?;
+        if more {
+            return Ok(true);
+        }
+        let mut expired = Vec::with_capacity(selected.len());
+        let mut bytes = 0usize;
+        for (hash, tracked) in selected {
+            let entry = read
+                .get_by_hash(&hash)?
+                .ok_or(invalid("expired entry missing"))?;
+            let size = entry.payload.as_ref().map_or(0, Vec::len);
+            if !expired.is_empty() && bytes.saturating_add(size) > DUE_PAYLOAD_BYTES {
+                return Ok(true);
+            }
+            bytes = bytes.saturating_add(size);
+            expired.push(Expired {
+                hash,
+                cache: tracked.cache_id,
+                author: entry.skeleton.author_id,
+            });
+        }
+        let mut expired_owed = Vec::new();
+        let mut key = [0; 64];
+        while let Some((found, value)) =
+            self.source()
+                .first(read.sek, read.channel, self.roots().owed_expiry, &key, 0)?
+        {
+            let (expires, hash) = order_key(found)?;
+            if expires == u64::MAX || expires > now {
+                break;
+            }
+            if !matches!(value, Value::Owed(_)) {
+                return Err(invalid("owed expiry value"));
+            }
+            if expired_owed.len() == DUE_ENTRIES {
+                return Ok(true);
+            }
+            expired_owed.push(hash);
+            let Some(next) = successor(found) else { break };
+            key = next;
+        }
+        if self.expiry_body_visible() {
+            return Ok(false);
+        }
+        self.expired = expired;
+        self.expired_owed = expired_owed;
+        Ok(false)
     }
     pub(crate) fn snapshot(&self) -> &crate::node::store::Snapshot {
         &self.order.read.snapshot
@@ -891,6 +1049,59 @@ impl RenderView<'_> {
     }
     fn roots(&self) -> Roots {
         self.order.read.directory.active.rendered
+    }
+
+    fn expired(&self, hash: &Digest32) -> bool {
+        self.expired.iter().any(|row| row.hash == *hash)
+    }
+
+    pub(crate) fn expiry_body_visible(&self) -> bool {
+        expiry_mutant("show")
+    }
+
+    fn visible_summary(
+        &self,
+        root: u64,
+        display: bool,
+        range: Option<(&Key, bool)>,
+        owed: bool,
+    ) -> Result<Summary> {
+        let source = self.source();
+        let read = &self.order.read;
+        if (self.expired.is_empty() && self.expired_owed.is_empty()) || expiry_mutant("summary") {
+            return match range {
+                Some((key, before)) => {
+                    source.render_range(read.sek, read.channel, root, key, before, 0)
+                }
+                None => source.render_summary(read.sek, read.channel, root),
+            };
+        }
+        let mut keys = [[0; 64]; DUE_ENTRIES];
+        let mut len = 0;
+        if owed {
+            for hash in &self.expired_owed {
+                keys[len] = ordered(
+                    self.order
+                        .key(hash)?
+                        .ok_or(invalid("expired owed not published"))?,
+                );
+                len += 1;
+            }
+        } else {
+            for row in &self.expired {
+                if let Some(cache) = row.cache {
+                    keys[len] = ordered(if display {
+                        self.order
+                            .key(&row.hash)?
+                            .ok_or(invalid("expired row not published"))?
+                    } else {
+                        (cache, row.hash)
+                    });
+                    len += 1;
+                }
+            }
+        }
+        source.render_visible(read.sek, read.channel, root, range, &keys[..len], 0)
     }
     pub(crate) fn author_backfill_pending(&self, author: &Digest32) -> Result<bool> {
         Ok(self
@@ -936,6 +1147,9 @@ impl RenderView<'_> {
         ]
     }
     pub(crate) fn fact(&self, hash: &Digest32) -> Result<Option<RenderFact>> {
+        if self.expired(hash) {
+            return Ok(None);
+        }
         self.source().render_fact(
             self.order.read.sek,
             self.order.read.channel,
@@ -956,43 +1170,28 @@ impl RenderView<'_> {
         }
     }
     pub(crate) fn selected_before(&self, filter: &Filter, before: Option<OrderKey>) -> Result<u64> {
-        let root = self.root(Some(filter), true)?;
-        let summary = match before {
-            Some(key) => self.source().render_range(
-                self.order.read.sek,
-                self.order.read.channel,
-                root,
-                &ordered(key),
+        let bound = before.map(ordered);
+        Ok(self
+            .visible_summary(
+                self.root(Some(filter), true)?,
                 true,
-                0,
-            )?,
-            None => {
-                self.source()
-                    .render_summary(self.order.read.sek, self.order.read.channel, root)?
-            }
-        };
-        Ok(summary.count)
+                bound.as_ref().map(|key| (key, true)),
+                false,
+            )?
+            .count)
     }
     pub(crate) fn count(&self) -> Result<u64> {
         Ok(self
-            .source()
-            .render_summary(
-                self.order.read.sek,
-                self.order.read.channel,
-                self.roots().display,
-            )?
+            .visible_summary(self.roots().display, true, None, false)?
             .count)
     }
     pub(crate) fn before(&self, key: OrderKey) -> Result<u64> {
         Ok(self
-            .source()
-            .render_range(
-                self.order.read.sek,
-                self.order.read.channel,
+            .visible_summary(
                 self.roots().display,
-                &ordered(key),
                 true,
-                0,
+                Some((&ordered(key), true)),
+                false,
             )?
             .count)
     }
@@ -1000,15 +1199,7 @@ impl RenderView<'_> {
         let mut bound = ordered((arrival, [u8::MAX; 32]));
         bound[40..].fill(u8::MAX);
         Ok(self
-            .source()
-            .render_range(
-                self.order.read.sek,
-                self.order.read.channel,
-                self.roots().arrival,
-                &bound,
-                false,
-                0,
-            )?
+            .visible_summary(self.roots().arrival, false, Some((&bound, false)), false)?
             .count)
     }
     fn root(&self, filter: Option<&Filter>, display: bool) -> Result<u64> {
@@ -1075,20 +1266,10 @@ impl RenderView<'_> {
             },
             None => [0; 64],
         };
-        self.source()
-            .first(self.order.read.sek, self.order.read.channel, root, &key, 0)?
-            .map(|(key, value)| match value {
-                Value::Rendered(fact) => Ok((order_key(key)?, fact)),
-                _ => Err(invalid("operation candidate kind")),
-            })
-            .transpose()
+        self.visible_step(root, key, false)
     }
     pub(crate) fn summary(&self, filter: &Filter) -> Result<(u64, u64)> {
-        let summary = self.source().render_summary(
-            self.order.read.sek,
-            self.order.read.channel,
-            self.root(Some(filter), false)?,
-        )?;
+        let summary = self.visible_summary(self.root(Some(filter), false)?, false, None, false)?;
         Ok((summary.count, summary.newest))
     }
     pub(crate) fn step(
@@ -1111,17 +1292,43 @@ impl RenderView<'_> {
             },
         };
         let root = self.root(filter, display)?;
+        self.visible_step(root, key, backwards)
+    }
+
+    fn visible_step(
+        &self,
+        root: u64,
+        mut key: Key,
+        backwards: bool,
+    ) -> Result<Option<(OrderKey, RenderFact)>> {
         let source = self.source();
-        let item = if backwards {
-            source.last(self.order.read.sek, self.order.read.channel, root, &key, 0)?
-        } else {
-            source.first(self.order.read.sek, self.order.read.channel, root, &key, 0)?
-        };
-        item.map(|(key, value)| match value {
-            Value::Rendered(fact) => Ok((order_key(key)?, fact)),
-            _ => Err(invalid("render page value")),
-        })
-        .transpose()
+        let read = &self.order.read;
+        loop {
+            let item = if backwards {
+                source.last(read.sek, read.channel, root, &key, 0)?
+            } else {
+                source.first(read.sek, read.channel, root, &key, 0)?
+            };
+            let Some((found, Value::Rendered(fact))) = item else {
+                return if item.is_none() {
+                    Ok(None)
+                } else {
+                    Err(invalid("render page value"))
+                };
+            };
+            let cursor = order_key(found)?;
+            if !self.expired(&cursor.1) {
+                return Ok(Some((cursor, fact)));
+            }
+            let Some(next) = (if backwards {
+                predecessor(found)
+            } else {
+                successor(found)
+            }) else {
+                return Ok(None);
+            };
+            key = next;
+        }
     }
     /// The immutable root changes only when the public Session/name input changes.
     pub(crate) fn history_instance(&self) -> [u8; 16] {
@@ -1190,13 +1397,11 @@ impl RenderView<'_> {
         } else {
             0
         };
-        let suffix = self.source().render_range(
-            self.order.read.sek,
-            self.order.read.channel,
+        let suffix = self.visible_summary(
             self.roots().display,
-            &ordered(key),
+            true,
+            Some((&ordered(key), false)),
             false,
-            0,
         )?;
         let earliest = if suffix.earliest.0 < current_epoch {
             0
@@ -1236,7 +1441,11 @@ impl EntryIndex {
         if !order.read.directory.render_ready {
             return Err(invalid("render facts not yet rebuilt"));
         }
-        Ok(RenderView { order })
+        Ok(RenderView {
+            order,
+            expired: Vec::new(),
+            expired_owed: Vec::new(),
+        })
     }
 }
 
@@ -1518,6 +1727,9 @@ impl Write<'_, '_> {
 }
 impl RenderView<'_> {
     pub(crate) fn is_owed(&self, hash: &Digest32) -> Result<bool> {
+        if self.expired_owed.contains(hash) {
+            return Ok(false);
+        }
         match self.source().find_value(
             self.order.read.sek,
             self.order.read.channel,
@@ -1530,30 +1742,22 @@ impl RenderView<'_> {
         }
     }
     pub(crate) fn owed_before(&self, before: Option<OrderKey>) -> Result<u64> {
-        let source = self.source();
-        let summary = match before {
-            Some(key) => source.render_range(
-                self.order.read.sek,
-                self.order.read.channel,
+        let bound = before.map(ordered);
+        Ok(self
+            .visible_summary(
                 self.roots().owed_display,
-                &ordered(key),
                 true,
-                0,
-            )?,
-            None => source.render_summary(
-                self.order.read.sek,
-                self.order.read.channel,
-                self.roots().owed_display,
-            )?,
-        };
-        Ok(summary.count)
+                bound.as_ref().map(|key| (key, true)),
+                true,
+            )?
+            .count)
     }
     pub(crate) fn owed_step(
         &self,
         cursor: Option<OrderKey>,
         backwards: bool,
     ) -> Result<Option<OrderKey>> {
-        let key = match (cursor, backwards) {
+        let mut key = match (cursor, backwards) {
             (None, false) => [0; 64],
             (None, true) => [u8::MAX; 64],
             (Some(key), false) => match successor(ordered(key)) {
@@ -1568,16 +1772,32 @@ impl RenderView<'_> {
         let source = self.source();
         let room = self.order.read.channel;
         let sek = self.order.read.sek;
-        let item = if backwards {
-            source.last(sek, room, self.roots().owed_display, &key, 0)?
-        } else {
-            source.first(sek, room, self.roots().owed_display, &key, 0)?
-        };
-        item.map(|(key, value)| match value {
-            Value::Owed(_) => order_key(key),
-            _ => Err(invalid("owed order value")),
-        })
-        .transpose()
+        loop {
+            let item = if backwards {
+                source.last(sek, room, self.roots().owed_display, &key, 0)?
+            } else {
+                source.first(sek, room, self.roots().owed_display, &key, 0)?
+            };
+            let Some((found, Value::Owed(_))) = item else {
+                return if item.is_none() {
+                    Ok(None)
+                } else {
+                    Err(invalid("owed order value"))
+                };
+            };
+            let cursor = order_key(found)?;
+            if !self.expired_owed.contains(&cursor.1) {
+                return Ok(Some(cursor));
+            }
+            let Some(next) = (if backwards {
+                predecessor(found)
+            } else {
+                successor(found)
+            }) else {
+                return Ok(None);
+            };
+            key = next;
+        }
     }
     pub(crate) fn next_owed_expiry(&self) -> Result<Option<u64>> {
         let item = self.source().first(
@@ -1706,6 +1926,11 @@ impl RenderView<'_> {
         after: Option<Digest32>,
         limit: usize,
     ) -> Result<(Vec<Digest32>, Option<Digest32>)> {
+        let root = if self.expired.is_empty() {
+            0
+        } else {
+            self.root(Some(&Filter::Thread(thread)), false)?
+        };
         let mut key = [0; 64];
         key[..32].copy_from_slice(&thread);
         if let Some(author) = after {
@@ -1730,14 +1955,36 @@ impl RenderView<'_> {
             if found[..32] != thread {
                 break;
             }
-            if !matches!(value, Value::Number(_)) {
+            let Value::Number(count) = value else {
                 return Err(invalid("thread author value"));
+            };
+            let author = found[32..]
+                .try_into()
+                .map_err(|_| invalid("thread author key"))?;
+            let mut removed = 0;
+            for row in &self.expired {
+                if row.author == author {
+                    if let Some(cache) = row.cache {
+                        removed += u64::from(
+                            self.source()
+                                .render_fact(
+                                    self.order.read.sek,
+                                    self.order.read.channel,
+                                    root,
+                                    &ordered((cache, row.hash)),
+                                )?
+                                .is_some(),
+                        );
+                    }
+                }
             }
-            authors.push(
-                found[32..]
-                    .try_into()
-                    .map_err(|_| invalid("thread author key"))?,
-            );
+            if count
+                .checked_sub(removed)
+                .ok_or(invalid("expired thread author count"))?
+                != 0
+            {
+                authors.push(author);
+            }
             let Some(next) = successor(found) else {
                 break;
             };
