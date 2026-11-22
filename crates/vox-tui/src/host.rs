@@ -2009,7 +2009,7 @@ impl Router {
                         if let Some(reg) =
                             crate::wake::registration(paths, &id).filter(|reg| reg.harness == "omp")
                         {
-                            self.watch_harness(node, &reg);
+                            self.watch_harness(node, paths, &reg);
                         }
                     }
                 }
@@ -2306,7 +2306,7 @@ impl Router {
             .ok_or_else(|| failed(format!("no session {session} is registered")))?;
         let joining = self.open_session(node, &handle, &reg, None).await;
         if reg.harness == "omp" {
-            self.watch_harness(node, &reg);
+            self.watch_harness(node, paths, &reg);
         }
         Ok(DaemonFrame::SessionRegistered {
             info: self
@@ -2748,7 +2748,7 @@ impl Router {
                 (Some(h), Some(reg)) => {
                     let joining = self.open_session(&s.node, &h, &reg, None).await;
                     if reg.harness == "omp" {
-                        self.watch_harness(&s.node, &reg);
+                        self.watch_harness(&s.node, paths, &reg);
                     }
                     joining
                 }
@@ -3685,8 +3685,9 @@ impl Router {
         done
     }
 
-    /// Follow registered native activity; Claude Code's comes through its hooks.
-    fn watch_harness(&self, node: &NodeName, s: &crate::wake::Session) {
+    /// Follow registered native activity; Claude Code's comes through its hooks. `paths` are the
+    /// attached node's, so its follower never writes into a directory substituted for it.
+    fn watch_harness(&self, node: &NodeName, paths: &Paths, s: &crate::wake::Session) {
         match s.harness.as_str() {
             "codex" if !s.codex_home.is_empty() => {
                 self.inner
@@ -3699,16 +3700,14 @@ impl Router {
                     .watch(node, &s.session, &s.mirror, &s.token);
             }
             "omp" if !s.mirror.is_empty() => {
-                if let Ok(paths) = self.inner.account.node_paths(node) {
-                    if let Some(saved) = crate::wake::registration(&paths, &s.session) {
-                        if saved.harness == "omp"
-                            && saved.endpoint == s.endpoint
-                            && saved.mirror == s.mirror
-                            && saved.token == s.token
-                            && saved.attention == s.attention
-                        {
-                            self.inner.omp.watch(&paths, node, &saved);
-                        }
+                if let Some(saved) = crate::wake::registration(paths, &s.session) {
+                    if saved.harness == "omp"
+                        && saved.endpoint == s.endpoint
+                        && saved.mirror == s.mirror
+                        && saved.token == s.token
+                        && saved.attention == s.attention
+                    {
+                        self.inner.omp.watch(paths, node, &saved);
                     }
                 }
             }
@@ -3733,10 +3732,6 @@ impl Router {
             return;
         };
         let paths = handle.paths();
-        if let Err(error) = paths.verify_profile() {
-            eprintln!("vox: {error}");
-            return;
-        }
         let Some(reg) = crate::wake::store_name(paths, &expected.session, name) else {
             return;
         };
@@ -3762,10 +3757,6 @@ impl Router {
             return;
         };
         let paths = handle.paths();
-        if let Err(error) = paths.verify_profile() {
-            eprintln!("vox: {error}");
-            return;
-        }
         let Some(reg) = crate::wake::store_name(paths, session, name) else {
             return;
         };
@@ -4237,14 +4228,19 @@ impl Router {
             }
         };
         let generation = attachment.as_ref().map(|(_, generation)| *generation);
-        let paths = self
-            .inner
-            .account
-            .node_paths(node)
-            .map_err(|error| Refusal::Failed {
-                node: node.clone(),
-                why: error.to_string(),
-            })?;
+        // The attached node's paths name the directory it opened, so a replacement is refused.
+        // With no node attached no daemon holds the directory, which is resolved as it is now.
+        let paths = match &attachment {
+            Some((handle, _)) => handle.paths().clone(),
+            None => self
+                .inner
+                .account
+                .node_paths(node)
+                .map_err(|error| Refusal::Failed {
+                    node: node.clone(),
+                    why: error.to_string(),
+                })?,
+        };
         let failed = |why| Refusal::Failed {
             node: node.clone(),
             why: format!("OMP session end was not confirmed: {why}"),
@@ -4857,7 +4853,11 @@ impl Router {
                                         });
                                         // A saved registration is a durable opening obligation.
                                         for session in registered {
-                                            self.watch_harness(node, &session);
+                                            self.watch_harness(
+                                                node,
+                                                opening_handle.paths(),
+                                                &session,
+                                            );
                                             self.watch_title(node, &session);
                                             self.open_registered(
                                                 node,
@@ -4941,7 +4941,7 @@ impl Router {
                 crate::wake::store_checked(&a.paths, &s)
                     .map_err(|error| Self::registration_store_refusal(node, error))?;
                 drop(ending);
-                self.watch_harness(node, &s);
+                self.watch_harness(node, &a.paths, &s);
                 a.sessions.insert(s.session.clone());
                 None
             }
