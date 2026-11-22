@@ -10749,7 +10749,7 @@ fn either_computer_closes_a_half_signed_pairing_at_once() {
         let expiry = approved["pairing"]["expires_ms"].as_u64().unwrap();
         assert!(
             out.contains(&format!("can still complete its side until Unix ms {expiry}"))
-                && out.contains("would then trust this computer's nodes")
+                && out.contains("would then count this computer in its group")
                 && out.contains("This computer will refuse it")
                 && out.contains(&format!("vox computer cancel {operation}")),
             "PRODUCT: signed close omitted the late-completion risk, expiry, local refusal or other-side cancel command: {out}{err}"

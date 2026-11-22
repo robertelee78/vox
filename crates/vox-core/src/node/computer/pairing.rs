@@ -1390,7 +1390,7 @@ impl Management {
         })?;
         if let Some((expires, operation)) = closed_signed {
             let operation = text_id(&operation);
-            *lock(&self.closed_problem) = Some(format!("Incomplete attempt closed on this computer. The other computer can still complete its side until Unix ms {expires}, and would then trust this computer's nodes. This computer will refuse it. Close it there too with: vox computer cancel {operation}. Closing here does not remove trust there."));
+            *lock(&self.closed_problem) = Some(format!("Incomplete attempt closed on this computer. The other computer can still complete its side until Unix ms {expires}, and would then count this computer in its group. This computer will refuse it. Close it there too with: vox computer cancel {operation}. Closing here does not remove trust there."));
         }
         // Cancellation revokes transport even when no policy revision moved.
         self.transport_wake.notify_one();
