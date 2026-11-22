@@ -528,13 +528,15 @@ impl ChannelState {
                 drop(self.local_append_eligible_for(store, false)?);
                 self.ensure_governance_append_eligible_by(store, &me, false, false)?;
                 let millis = seconds.saturating_mul(1_000);
-                if !*steps {
-                    let current = self
-                        .checked_governance(store, now.get())?
-                        .display(&self.genesis)?;
-                    if current.policy.ttl_ms == millis {
-                        return Ok(GovernancePreparation::Unchanged);
-                    }
+                let current = self
+                    .checked_governance(store, now.get())?
+                    .display(&self.genesis)?;
+                if if *steps {
+                    current.step_policy_signed && current.step_ttl_ms == millis
+                } else {
+                    current.policy.ttl_ms == millis
+                } {
+                    return Ok(GovernancePreparation::Unchanged);
                 }
                 if *steps {
                     crate::governance::step_policy::StepPolicyUpdate::build(

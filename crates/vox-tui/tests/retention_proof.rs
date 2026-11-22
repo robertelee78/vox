@@ -1112,53 +1112,37 @@ fn session_steps_expire_after_two_days_unless_the_admin_chose_otherwise() {
             .unwrap()
             .0;
         let room = vox_core::node::link::b32_encode(&cid);
+        let log_count = || {
+            let (ok, out, err) = run(&["status", "--json"], None);
+            assert!(ok, "APPARATUS: status around admin choice: {out}{err}");
+            let status: serde_json::Value = serde_json::from_str(&out).unwrap();
+            status["rooms"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["id"] == room)
+                .and_then(|r| r["log_entries"].as_u64())
+                .expect("APPARATUS: policy room not published")
+        };
+        let before = (name == "equal").then(log_count);
         if let Some(seconds) = seconds {
-            assert!(
-                matches!(
-                    request(Request::SetStepRetention {
-                        channel_id: cid,
-                        seconds
-                    }),
-                    Frame::Ok
-                ),
-                "APPARATUS: explicit {name} step policy"
-            );
+            let seconds = seconds.to_string();
+            let (ok, out, err) = run(&["room", "retention", &room, "--steps", &seconds], None);
+            assert!(ok, "APPARATUS: explicit {name} step policy: {out}{err}");
+            println!("SEEN: vox room retention {name} --steps {seconds}: {out}{err}");
         }
-        if name == "equal" {
-            let (ok, out, err) = run(&["status", "--json"], None);
-            assert!(
-                ok,
-                "APPARATUS: status before repeated admin choice: {out}{err}"
-            );
-            let before: serde_json::Value = serde_json::from_str(&out).unwrap();
-            let count = |v: &serde_json::Value| {
-                v["rooms"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .find(|r| r["id"] == room)
-                    .and_then(|r| r["log_entries"].as_u64())
-                    .expect("APPARATUS: policy room not published")
-            };
-            let before = count(&before);
-            assert!(
-                matches!(
-                    request(Request::SetStepRetention {
-                        channel_id: cid,
-                        seconds: 172800
-                    }),
-                    Frame::Ok
-                ),
-                "APPARATUS: repeat explicit default-equal choice"
-            );
-            let (ok, out, err) = run(&["status", "--json"], None);
-            assert!(
-                ok,
-                "APPARATUS: status after repeated admin choice: {out}{err}"
-            );
-            let after: serde_json::Value = serde_json::from_str(&out).unwrap();
-            if count(&after) != before + 1 {
-                policy_failures.push(format!("explicit default-equal choice must record one signed log entry: before={before}; after={after}"));
+        if let Some(before) = before {
+            let after_first = log_count();
+            println!("SEEN: first default-equal choice: before={before}; after={after_first}");
+            if after_first != before + 1 {
+                policy_failures.push(format!("first explicit default-equal choice must record one signed log entry: before={before}; after={after_first}"));
+            }
+            let (ok, out, err) = run(&["room", "retention", &room, "--steps", "172800"], None);
+            assert!(ok, "APPARATUS: repeat default-equal choice: {out}{err}");
+            let after_repeat = log_count();
+            println!("SEEN: repeated default-equal choice: before={after_first}; after={after_repeat}; {out}{err}");
+            if after_repeat != after_first {
+                policy_failures.push(format!("repeating a signed default-equal choice must add no log entry: before={after_first}; after={after_repeat}"));
             }
         }
         let lifecycle = serde_json::json!({"v":1,"type":"session","from":"ttl-session",
@@ -1256,6 +1240,15 @@ fn session_steps_expire_after_two_days_unless_the_admin_chose_otherwise() {
                 listed.contains("TTL-LIFECYCLE")
             );
         }
+    }
+    if std::env::var_os("VOX_MUTANT_STEPS_EXPLICIT_EQUAL_IGNORED").is_some() {
+        let log =
+            std::fs::read_to_string(dir.join("clock-0.log")).expect("APPARATUS: mutant daemon log");
+        assert!(
+            log.contains("SEEN: steps.explicit_equal_ignored engaged"),
+            "APPARATUS: equal-choice mutant never engaged: {log}"
+        );
+        eprintln!("{log}");
     }
     assert!(
         failures.is_empty(),
