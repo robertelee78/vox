@@ -4419,7 +4419,7 @@ impl RoomTrustJourney {
                 ],
             ),
             Daemon::start(&b, &[], &[]),
-            Daemon::start(&c, &[], &[]),
+            Daemon::start(&c, &[], &[("VOX_TEST_PAIRWISE_OPENING_RECEIPTS", "1")]),
         ];
         for (account, node) in [(&a, "alpha"), (&b, "beta"), (&c, "gamma")] {
             let (ok, out, err) =
@@ -4856,7 +4856,10 @@ fn an_unfinished_room_refuses_only_its_own_posts_then_finishes() {
 #[ignore = "causally held withdrawal; release with test-knobs,optional-proofs"]
 fn an_unfinished_room_releases_no_key_until_its_withdrawal_finishes() {
     watchdog::arm();
-    test_knobs::require(&["VOX_TEST_RG3_HOLD_WITHDRAWAL"]);
+    test_knobs::require(&[
+        "VOX_TEST_RG3_HOLD_WITHDRAWAL",
+        "VOX_TEST_PAIRWISE_OPENING_RECEIPTS",
+    ]);
     let journey = RoomTrustJourney::new(false);
     // Gamma was trusted before the marker but has never joined or received a sender key.
     let queued = std::env::var("VOX_PROOF_RG3_QUEUED_KEY").as_deref() == Ok("1");
@@ -4937,8 +4940,8 @@ fn an_unfinished_room_releases_no_key_until_its_withdrawal_finishes() {
     let after = "rg3-after-withdrawal-key-marker";
     for index in 0..100 {
         if queued {
-            // A rejected queued opening has spent its one-time prekey. The existing signed-
-            // prekey fallback is 30 seconds; keep the counted probes slower than that tail.
+            // Count the same completed exchanges in queued mode; no security downgrade
+            // is accepted merely because the existing 30-second fallback eventually delivers.
             std::thread::sleep(Duration::from_millis(500));
         }
         // Keep alpha's head fixed once its first post is accepted: this proves key delivery,
@@ -5004,6 +5007,28 @@ fn an_unfinished_room_releases_no_key_until_its_withdrawal_finishes() {
     assert!(received,
         "PRODUCT: 100 room requests after release did not finish the withdrawal and deliver the owed key: accepted_posts={accepted_posts}; last_post={last_post:?}; reader={}{}",
         last.1, last.2);
+    if queued {
+        let alpha = journey.a.make_node("alpha");
+        let room = full_room_id(&journey.link, &journey.room);
+        let peer = format!("peer={alpha}");
+        let room = format!("room={room}");
+        let gamma = journey.c.make_node("gamma");
+        let received = journey._daemons[2].said();
+        let openings: Vec<_> = received
+            .lines()
+            .filter(|line| {
+                line.contains("PAIRWISE WIRE RECEIPT")
+                    && line.contains(&peer)
+                    && line.contains(&room)
+            })
+            .collect();
+        assert!(!openings.is_empty(), "APPARATUS: no authenticated pairwise wire opening was recorded for the surviving reader: {received}");
+        let sender = journey._daemons[0].said();
+        assert!(openings.iter().all(|line| line.contains("one_time=Some("))
+                && !sender.lines().any(|line| line.contains("went to its signed prekey")
+                    && line.contains(&gamma[..12])),
+            "PRODUCT: a key queued before withdrawal and refused before writing must reach the surviving member on a one-time prekey, never its signed prekey alone: openings={openings:?}; sender={sender}");
+    }
     eprintln!(
         "RG-3 GREEN: member received no key while withdrawal was held, then received its owed key"
     );

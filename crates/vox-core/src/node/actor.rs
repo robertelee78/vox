@@ -98,6 +98,8 @@ struct Delivery {
     /// Held until these exact retry bytes are no longer needed.
     reservation: DeliveryReservation,
     opening: Digest32,
+    /// Shared with every queued copy until the opening is first written or retired.
+    prekey: Option<prekeys::OneTimeReservation>,
 }
 
 /// A pairwise session this node opened (ADR-004 O2, O3).
@@ -2679,6 +2681,7 @@ struct PairwiseJob {
     /// What the write's outcome tells the actor.
     after: AfterWrite,
     credit: PairwiseCredit,
+    prekey: Option<prekeys::OneTimeReservation>,
 }
 
 /// What a pairwise write's outcome decides.
@@ -2721,19 +2724,12 @@ async fn write_pairwise_jobs(
                 None => return,
             },
         };
-        let send = async {
-            match &job.credit.room_fence {
-                Some(fence) => {
-                    crate::node::pairwise_stream::write_pairwise_fenced(
-                        &job.conn,
-                        &job.frames,
-                        fence,
-                    )
-                    .await
-                }
-                None => crate::node::pairwise_stream::write_pairwise(&job.conn, &job.frames).await,
-            }
-        };
+        let send = crate::node::pairwise_stream::write_pairwise_owned(
+            &job.conn,
+            &job.frames,
+            job.credit.room_fence.as_deref(),
+            job.prekey.as_ref(),
+        );
         let written = tokio::select! {
             biased;
             _ = epoch_changed.changed() => return,
@@ -2968,6 +2964,28 @@ async fn read_pairwise_streams(
                 continue;
             }
         };
+        #[cfg(feature = "test-knobs")]
+        if std::env::var_os("VOX_TEST_PAIRWISE_OPENING_RECEIPTS").is_some() {
+            if let PairwiseFrame::Hello {
+                channel_id,
+                initial,
+            }
+            | PairwiseFrame::RotationHello {
+                channel_id,
+                initial,
+                ..
+            } = &first
+            {
+                if let Ok(initial) = InitialMessage::from_wire(initial) {
+                    eprintln!(
+                        "PAIRWISE WIRE RECEIPT peer={} room={} one_time={:?}",
+                        crate::node::link::b32_encode(&peer),
+                        crate::node::link::b32_encode(channel_id),
+                        initial.one_time_prekey_id
+                    );
+                }
+            }
+        }
         if matches!(first, PairwiseFrame::RecoveryReply { .. })
             || (matches!(first, PairwiseFrame::RecoveryOpen { .. })
                 && !conn.supports_own_recovery())
@@ -11929,6 +11947,19 @@ impl Node {
                 }
                 if let Some(i) = self.initiated.get_mut(&(channel_id, peer)) {
                     i.hello_delivered = false;
+                    if i.reservation
+                        .as_deref()
+                        .is_some_and(|prekey| !prekey.is_named())
+                    {
+                        // This exact opening never crossed the write fence. Other queued
+                        // copies still own its reservation until they finish or drop.
+                        let key = (channel_id, peer);
+                        self.sessions.remove(&key);
+                        self.initiated.remove(&key);
+                        self.accepted_hello.remove(&key);
+                        self.reopen.remove(&key);
+                        self.session_serial.remove(&key);
+                    }
                 }
             }
             NetEvent::ReopenUndelivered {
@@ -11944,6 +11975,16 @@ impl Node {
                 }
                 if let Some(i) = self.initiated.get_mut(&(channel_id, peer)) {
                     i.hello_delivered = false;
+                    if i.reservation
+                        .as_deref()
+                        .is_some_and(|prekey| !prekey.is_named())
+                    {
+                        let key = (channel_id, peer);
+                        self.sessions.remove(&key);
+                        self.initiated.remove(&key);
+                        self.accepted_hello.remove(&key);
+                        self.session_serial.remove(&key);
+                    }
                 }
                 self.reopen.insert((channel_id, peer));
             }
@@ -12483,7 +12524,11 @@ impl Node {
                             .deliveries
                             .get(&delivery)
                             .is_some_and(|d| Some(d.opening) == opening)
-                        && (refused_as(KeyRefusal::UnknownPrekey)
+                        && ((!answered
+                            && self.deliveries.get(&delivery).is_some_and(|d| {
+                                d.prekey.as_ref().is_some_and(|prekey| !prekey.is_named())
+                            }))
+                            || refused_as(KeyRefusal::UnknownPrekey)
                             || refused_as(KeyRefusal::HelloRefused)
                             || refused_as(KeyRefusal::CannotOpen))
                     {
@@ -19151,6 +19196,11 @@ impl Node {
                     epoch: self.delivery_epoch,
                 },
                 credit: job,
+                prekey: self
+                    .initiated
+                    .get(&(channel_id, peer))
+                    .and_then(|opening| opening.reservation.as_deref())
+                    .cloned(),
             });
         }
     }
