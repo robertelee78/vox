@@ -191,8 +191,8 @@ pub(super) fn retain_accepted_join_native(
 
 /// A stored accepted room already owns its reopen keys. Finish its journal handoff so startup
 /// reopens it normally; an acceptance with no stored room still needs the joining passphrase.
-/// A room whose records do not agree is left as it was (closed, and `vox room leave` cancels
-/// it): one room's records must never stop the node from starting.
+/// A room whose records do not agree is left as it was: one room's records must never stop
+/// the node from starting.
 pub(super) fn finish_saved_accepted_joins(
     store: &Store,
     signer: &VaultRootSigner,
@@ -214,7 +214,8 @@ pub(super) fn finish_saved_accepted_joins(
                 .get(room)
                 .map(|cleanup| verified_join_rollback(cleanup, signer, *room))
             {
-                None => Some("its cleanup record is missing"),
+                // No cleanup record: startup does not exclude this room, so it reopens.
+                None => continue,
                 Some(Err(_)) => Some("its cleanup record does not verify"),
                 // A later publication of the room may have advanced the record's epoch.
                 Some(Ok(epoch)) if epoch < proposal.epoch => {
@@ -226,7 +227,7 @@ pub(super) fn finish_saved_accepted_joins(
         if let Some(reason) = unfit {
             eprintln!(
                 "vox node: room {} stays closed after its interrupted join: {reason}; \
-                 `vox room leave` cancels it",
+                 its saved join records disagree",
                 crate::node::link::b32_encode(room)
             );
             continue;
