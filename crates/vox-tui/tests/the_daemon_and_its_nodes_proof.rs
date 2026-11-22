@@ -61,6 +61,8 @@ mod test_knobs;
 #[cfg(target_os = "linux")]
 #[path = "support/optional_proof.rs"]
 mod optional_proof;
+#[path = "support/typed.rs"]
+mod typed;
 #[cfg(target_os = "linux")]
 optional_proof::not_run!(a_systemd_user_unit_recovers_foreign_signals_and_honors_product_stop);
 
@@ -1799,6 +1801,344 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
         "PRODUCT: signed out, node default's rooms and messages must stay: attached again by hand \
          ({ok}: {out}{err}) its room must still read \"before the restart\"\nlog:\n{log}"
     );
+}
+
+/// A kernel without keyrings never refuses typed unlock, lock or forgetting.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "Linux namespace, seccomp or emulator with an unavailable user keyring; run in release"]
+fn a_linux_unavailable_keyring_keeps_unlock_ready_without_a_disk_secret() {
+    typed::require_disposable_keyring();
+    watchdog::arm();
+    let probe_name = format!("vox-rg11-unavailable-probe-{}", std::process::id());
+    let probe = Command::new("keyctl")
+        .args(["add", "user", &probe_name, "scratch", "@u"])
+        .output()
+        .expect("APPARATUS: probe the unavailable user keyring");
+    if probe.status.success() {
+        let key = String::from_utf8_lossy(&probe.stdout).trim().to_owned();
+        let _ = Command::new("keyctl").args(["revoke", &key]).status();
+        let _ = Command::new("keyctl").args(["unlink", &key, "@u"]).status();
+    }
+    let refusal = String::from_utf8_lossy(&probe.stderr);
+    eprintln!("Unavailable kernel keyring prerequisite: {refusal}");
+    assert!(
+        !probe.status.success()
+            && ["Function not implemented", "Operation not supported",]
+                .iter()
+                .any(|reason| refusal.contains(reason)),
+        "APPARATUS: this preservation proof needs an unavailable user keyring: {refusal}"
+    );
+    let a = Account::new();
+    struct Cleanup<'a>(&'a Account);
+    impl Drop for Cleanup<'_> {
+        fn drop(&mut self) {
+            if let Some(pid) = self.0.lock_pid() {
+                let _ = Command::new("/bin/kill")
+                    .args(["-TERM", &pid.to_string()])
+                    .status();
+            }
+        }
+    }
+    let _cleanup = Cleanup(&a);
+    a.make_node("default");
+    std::fs::remove_file(a._tmp.path().join("identity.pass")).unwrap();
+    let mut unlock = a.cmd(&["node", "unlock", "default"]);
+    unlock.env_remove("VOX_IDENTITY_PASSPHRASE");
+    let (ok, text) = typed::typed(&unlock, PASS);
+    eprintln!(
+        "Typed unlock without a keyring: {}",
+        text.replace(PASS, "[redacted]")
+    );
+    assert!(
+        ok && text.contains("Ready") && text.contains("not remembered") && text.contains("kernel keyring"),
+        "PRODUCT: an unavailable keyring must leave typed unlock successful and Ready, saying it is not remembered: {}",
+        text.replace(PASS, "[redacted]")
+    );
+    let mut status = a.cmd(&["status", "--node", "default", "--json"]);
+    status.env_remove("VOX_IDENTITY_PASSPHRASE");
+    let out = status.output().unwrap();
+    assert!(
+        out.status.success()
+            && serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["status"]
+                == "Ready",
+        "PRODUCT: failed remembering must not lock this daemon's Ready node"
+    );
+    fn no_plaintext(path: &Path) -> bool {
+        std::fs::read_dir(path).unwrap().all(|entry| {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                no_plaintext(&path)
+            } else if path.is_file() {
+                !std::fs::read(path)
+                    .unwrap()
+                    .windows(PASS.len())
+                    .any(|w| w == PASS.as_bytes())
+            } else {
+                true
+            }
+        })
+    }
+    assert!(
+        no_plaintext(a._tmp.path()),
+        "PRODUCT: unavailable keyring must not fall back to a plaintext secret on disk"
+    );
+    stop_pid(a.lock_pid().unwrap());
+    let mut restart = a.cmd(&["daemon", "--detach"]);
+    restart.env_remove("VOX_IDENTITY_PASSPHRASE");
+    assert!(
+        restart.output().unwrap().status.success(),
+        "APPARATUS: scratch daemon restart"
+    );
+    let mut status = a.cmd(&["status", "--node", "default"]);
+    status.env_remove("VOX_IDENTITY_PASSPHRASE");
+    let out = status.output().unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    eprintln!("Restart without a keyring: {text}");
+    assert!(
+        out.status.success() && text.contains("Locked") && text.contains("vox node unlock"),
+        "PRODUCT: without a kernel key or chosen file, restart must say Locked and the unlock command: {text}"
+    );
+    for args in [
+        ["node", "lock", "default"],
+        ["node", "forget-passphrase", "default"],
+    ] {
+        let mut command = a.cmd(&args);
+        command.env_remove("VOX_IDENTITY_PASSPHRASE");
+        let out = command.output().unwrap();
+        assert!(
+            out.status.success(),
+            "PRODUCT: an unavailable keyring must not refuse {args:?}: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// RG-11: a daemon from another login session reads a uid-owned, not possessed, kernel key.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "Linux kernel keyring and real typed unlock; run in release"]
+fn a_linux_typed_unlock_survives_another_sessions_daemon() {
+    typed::require_disposable_keyring();
+    fn fresh_session(a: &Account, args: &[&str]) -> Command {
+        let base = a.cmd(args);
+        let mut command = Command::new("/usr/bin/keyctl");
+        command
+            .args([
+                "session",
+                "-",
+                "/bin/sh",
+                "-c",
+                "keyctl clear @s && exec \"$@\"",
+                "sh",
+            ])
+            .arg(VOX)
+            .args(args)
+            .env_clear();
+        for (key, value) in base.get_envs() {
+            if let Some(value) = value {
+                command.env(key, value);
+            }
+        }
+        command.env_remove("VOX_IDENTITY_PASSPHRASE");
+        command
+    }
+    fn ready(a: &Account) -> (bool, String) {
+        let out = fresh_session(a, &["status", "--node", "default", "--json"])
+            .output()
+            .expect("APPARATUS: status in a new session");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let ready = out.status.success()
+            && serde_json::from_slice::<serde_json::Value>(&out.stdout)
+                .ok()
+                .is_some_and(|value| value["status"] == "Ready");
+        (ready, text)
+    }
+    fn settled_ready(a: &Account) -> bool {
+        let started = Instant::now();
+        loop {
+            let (ready, text) = ready(a);
+            if ready {
+                return true;
+            }
+            if text
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .any(|value| value["status"] == "Locked")
+            {
+                return false;
+            }
+            assert!(started.elapsed() < Duration::from_secs(60),
+                "APPARATUS: daemon never reported terminal Ready or Locked; no product verdict: {text}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    watchdog::arm();
+    let a = Account::new();
+    struct Cleanup<'a>(&'a Account);
+    impl Drop for Cleanup<'_> {
+        fn drop(&mut self) {
+            if let Some(pid) = self.0.lock_pid() {
+                let _ = Command::new("/bin/kill")
+                    .args(["-TERM", &pid.to_string()])
+                    .status();
+            }
+            use sha2::{Digest as _, Sha256};
+            let account = self
+                .0
+                .data
+                .join("nodes/default")
+                .to_string_lossy()
+                .into_owned();
+            let name = format!("us.vox.node:{:x}", Sha256::digest(account.as_bytes()));
+            if let Ok(found) = Command::new("keyctl")
+                .args(["search", "@u", "user", &name])
+                .output()
+            {
+                if found.status.success() {
+                    let key = String::from_utf8_lossy(&found.stdout).trim().to_owned();
+                    let _ = Command::new("keyctl").args(["revoke", &key]).status();
+                    let _ = Command::new("keyctl").args(["unlink", &key, "@u"]).status();
+                }
+            }
+        }
+    }
+    let _cleanup = Cleanup(&a);
+    a.make_node("default");
+    // Account's general staging file is not selected or available to this typed unlock.
+    std::fs::remove_file(a._tmp.path().join("identity.pass")).unwrap();
+    let (ok, text) = typed::typed(&fresh_session(&a, &["node", "unlock", "default"]), PASS);
+    eprintln!("Typed unlock: {}", text.replace(PASS, "[redacted]"));
+    assert!(
+        ok && text.contains("Ready"),
+        "APPARATUS: typed Linux unlock did not become Ready: {text}"
+    );
+    let pid = a.lock_pid().expect("APPARATUS: typed unlock daemon");
+    stop_pid(pid);
+    let out = fresh_session(&a, &["daemon", "--detach"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "APPARATUS: new-session daemon start: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        settled_ready(&a),
+        "PRODUCT: typed unlock must survive a daemon in a new, empty session keyring: {}; {}",
+        ready(&a).1,
+        a.log()
+    );
+    eprintln!(
+        "PASS linux.typed_unlock_survives_new_session_daemon: {}",
+        ready(&a).1
+    );
+
+    // A crash has the same key lifetime as an orderly restart.
+    let pid = a.lock_pid().unwrap();
+    Command::new("/bin/kill")
+        .args(["-KILL", &pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(
+        wait_until(Duration::from_secs(15), || !alive(pid)),
+        "APPARATUS: crashed daemon is still running"
+    );
+    let out = fresh_session(&a, &["daemon", "--detach"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "APPARATUS: daemon after crash: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        settled_ready(&a),
+        "PRODUCT: typed unlock must survive a crashed daemon: {}; {}",
+        ready(&a).1,
+        a.log()
+    );
+    eprintln!("PASS linux.typed_unlock_survives_crash: {}", ready(&a).1);
+
+    stop_pid(a.lock_pid().unwrap());
+    // Remove only this scratch node's key, never another key of the container user. Losing
+    // this boot-scoped credential stages what reboot does without rebooting the shared VM.
+    use sha2::{Digest as _, Sha256};
+    let account = a.data.join("nodes/default").to_string_lossy().into_owned();
+    let name = format!("us.vox.node:{:x}", Sha256::digest(account.as_bytes()));
+    let found = Command::new("keyctl")
+        .args(["search", "@u", "user", &name])
+        .output()
+        .unwrap();
+    assert!(
+        found.status.success(),
+        "APPARATUS: this node's boot-scoped key was not found: {}",
+        String::from_utf8_lossy(&found.stderr)
+    );
+    let key = String::from_utf8_lossy(&found.stdout).trim().to_owned();
+    let removed = Command::new("keyctl")
+        .args(["unlink", &key, "@u"])
+        .output()
+        .unwrap();
+    assert!(
+        removed.status.success(),
+        "APPARATUS: could not clear this scratch boot credential"
+    );
+    let out = fresh_session(&a, &["daemon", "--detach"]).output().unwrap();
+    assert!(out.status.success(), "APPARATUS: daemon after key loss");
+    let out = fresh_session(&a, &["status", "--node", "default"])
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("Locked") && text.contains("vox node unlock") && text.contains("default"),
+        "PRODUCT: after reboot without a chosen file, status must say Locked and how to unlock: {text}");
+    eprintln!("PASS linux.lost_boot_key_says_locked_and_unlock_command: {text}");
+    let pass = a._tmp.path().join("chosen.pass");
+    std::fs::write(&pass, format!("{PASS}\n")).unwrap();
+    let out = fresh_session(
+        &a,
+        &[
+            "node",
+            "unlock",
+            "default",
+            "--passphrase-file",
+            pass.to_str().unwrap(),
+        ],
+    )
+    .output()
+    .unwrap();
+    assert!(
+        out.status.success(),
+        "APPARATUS: chosen-file unlock: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    stop_pid(a.lock_pid().unwrap());
+    let out = fresh_session(&a, &["daemon", "--detach"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "APPARATUS: daemon with chosen-file recovery"
+    );
+    assert!(
+        settled_ready(&a),
+        "PRODUCT: after losing the boot key, the chosen file must restore Ready: {}; {}",
+        ready(&a).1,
+        a.log()
+    );
+    eprintln!(
+        "PASS linux.chosen_file_restores_ready_after_boot_key_loss: {}",
+        ready(&a).1
+    );
+    let _ = a.run(&["node", "lock", "default"], "");
+    stop_pid(a.lock_pid().unwrap());
 }
 
 /// RG-9: real systemd in the authorized disposable container, not an in-process supervisor.

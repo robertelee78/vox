@@ -1,9 +1,13 @@
 # Install and update
 
-Applies to Vox v0.4.24.
+Applies to Vox v0.4.31.
 
 Vox runs on Linux on x86_64, and on Macs with Apple Silicon and macOS 13 or later. On a Mac it
 comes as `Vox.app`, with `vox` inside it.
+
+On Linux, Vox needs glibc 2.28 or newer: Ubuntu 20.04, Debian 10, RHEL 8,
+and everything newer. On an older system the installer says so and installs nothing; where it
+can tell before downloading, it downloads nothing.
 
 ## Install Vox
 
@@ -25,6 +29,17 @@ the release record before it installs anything.
 On a Mac without Apple Silicon, or before macOS 13, the installer stops before it downloads
 anything. It refuses to replace a `Vox.app` it did not install. Never bypass a failed integrity
 or signature check.
+
+On Linux it runs the candidate from its partial name before replacing anything, with a
+20-second bound where GNU timeout is available. A refused candidate leaves the installed
+command and its retained previous unchanged and shows the loader's words and the reason.
+Update and rollback also refuse a binary that does not run on this machine before replacing
+the working command.
+
+After a cut-short Linux install, run the installer again. A successful rerun removes the old
+fixed-name partial and partials whose installer process has ended, without touching a running
+installer's candidate. If a leftover cannot be removed, it names that file and asks you to remove
+it when the directory is writable.
 
 The installer also runs `vox shell-setup`, which adds a marked block to your zsh, bash or fish
 startup file for `PATH` and tab completion. Open a new terminal afterwards.
@@ -78,6 +93,12 @@ Run the command on the computer named by the block to resume that node's rooms a
 nodes that were already Locked are not listed as a new interruption. Unlocking does not promise
 that a passphrase will be remembered for another restart. A daemon started in a terminal ends;
 its replacement runs detached on the same configured address and anchors.
+
+On Linux, a typed unlock keeps the secret only in the kernel keyring, so daemon restarts and
+crashes do not ask again. A reboot clears that keyring: the node is Locked and
+`vox status` names its unlock command. To recover without typing after a reboot, choose your
+own persistent passphrase file and run `vox node unlock NAME --passphrase-file /path/to/file`.
+Vox remembers that path, never writes a passphrase file itself, and uses no TPM credential.
 
 On a Mac, update and rollback quit and relaunch the app from the installation being changed if
 it was running. They preserve that app's profile even when the updater uses different data,
@@ -149,6 +170,11 @@ That lasts until the host restarts. To keep it, put the line `net.core.rmem_max 
 file such as `/etc/sysctl.d/90-vox.conf` and run `sysctl --system`. On a Mac, Podman runs
 containers in a Linux virtual machine: check its value with
 `podman machine ssh sysctl net.core.rmem_max`.
+
+On a short host, the Linux installer writes that one file when run as root, runs
+`sysctl --system`, and reports success only after reading the kernel's value back. Otherwise
+it prints the two commands to run as root and continues installing. A container cannot change
+the host's cap; run those commands in the Linux host's own namespace.
 
 ## Remove Vox
 

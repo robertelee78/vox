@@ -21,10 +21,11 @@
 //!
 //! The real HOME is kept only for [`real_home`] (and XDG_DATA_HOME for [`real_xdg_data_home`]):
 //! the live-model sandbox reads its OpenCode credentials from there and plants its canary there.
-//! Two tools a proof starts need the operator's own setup, and get only that, never HOME:
+//! Three tools a proof starts need the operator's own setup, and get only that, never HOME:
 //! [`real_toolchain`] gives `cargo` the operator's rustup and cargo homes (else the rustup proxy
-//! finds no toolchain and downloads one), and [`real_gh`] gives `gh` the operator's gh config
-//! directory (else it has no login).
+//! finds no toolchain and downloads one), [`real_gh`] gives `gh` the operator's gh config
+//! directory (else it has no login), and [`real_podman`] gives `podman` the operator's list of
+//! connections (else it knows no machine and looks for a local socket that is not there).
 //!
 //! [`check`] proves it once per proof process: a child reports its HOME and writes
 //! `$HOME/.vox-proof-sentinel`, and the sentinel must land in the temporary HOME and never in
@@ -263,6 +264,24 @@ pub fn real_gh(cmd: &mut std::process::Command) -> &mut std::process::Command {
             .or_else(|| real_home().map(|h| h.join(".config/gh")));
         if let Some(dir) = dir {
             cmd.env("GH_CONFIG_DIR", dir);
+        }
+    }
+    cmd
+}
+
+/// Give `cmd` (a `podman`) the operator's Podman connection list, which names the machine it
+/// talks to. Only that file, never HOME: without it podman under the temporary HOME lists no
+/// connection and tries a local socket that does not exist.
+#[allow(dead_code)]
+pub fn real_podman(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    if std::env::var_os("PODMAN_CONNECTIONS_CONF").is_none_or(|v| v.is_empty()) {
+        let file = REAL_XDG_CONFIG_HOME
+            .get()
+            .and_then(|c| c.as_deref())
+            .map(|c| c.join("containers/podman-connections.json"))
+            .or_else(|| real_home().map(|h| h.join(".config/containers/podman-connections.json")));
+        if let Some(file) = file.filter(|file| file.is_file()) {
+            cmd.env("PODMAN_CONNECTIONS_CONF", file);
         }
     }
     cmd

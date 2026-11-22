@@ -1634,15 +1634,19 @@ impl Router {
             return Err(refusal);
         }
         if let Err(e) = stored {
-            self.forget_unrecorded_keychain(&account).await.map_err(|cleanup| {
-                failed(format!("node {node} is Ready, but its passphrase could not be stored ({e}) or cleaned up ({cleanup}); correct the Keychain problem and retry"))
-            })?;
+            let cleanup = self.forget_unrecorded_keychain(&account).await;
+            if let Err(cleanup) = cleanup {
+                g.notes.push(format!(
+                    "node {node} is Ready, but not remembered: its passphrase could not be stored by this system: {e}; cleanup could not be confirmed: {cleanup}"
+                ));
+                return Ok((g.info, g.notes));
+            }
             g.notes.push(if e == crate::keychain::NO_KEYCHAIN {
                 format!("node {node} is Ready; {e}")
             } else {
                 format!(
                     "node {node} is Ready, but not remembered: its passphrase could not be stored \
-                     in the Keychain: {e}"
+                     by this system: {e}"
                 )
             });
         }
@@ -4580,8 +4584,8 @@ impl Router {
                 Ok(p) => (Some(p), Vec::new()),
                 Err(e) => {
                     eprintln!(
-                        "vox daemon: could not make remembered node {node} Ready: its passphrase in the \
-                         Keychain: {e}"
+                        "vox daemon: could not make remembered node {node} Ready: its saved \
+                         passphrase: {e}"
                     );
                     self.needs_passphrase(node).await;
                     return;
