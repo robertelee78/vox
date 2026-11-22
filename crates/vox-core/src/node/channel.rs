@@ -3098,6 +3098,7 @@ impl ChannelState {
         // The actor establishes current governance and this node's retention settings
         // before sweeping or refreshing. The constructor's placeholder policies must
         // never reset an already completed durable projection on an ordinary restart.
+        store.pack_small_room_rows(channel_id)?;
         Ok(room)
     }
 

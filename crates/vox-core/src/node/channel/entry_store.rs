@@ -22,6 +22,24 @@ use crate::node::store::{Batch, Snapshot, Store};
 const PAGE_BYTES: usize = 16 * 1024;
 const DIRECTORY_BYTES: usize = 1024 * 1024;
 const PAGE_ITEMS: usize = 128;
+// A one-pair redb leaf has a 4-byte header, a 4-byte value offset and a
+// fixed 41-byte SegmentKey. Sealing adds 34 bytes at this size: CBOR array
+// and version (2), nonce bytes and header (13), ciphertext header (3), and
+// the AES-GCM tag (16). Keep the read bounds above for existing pages.
+const PAGE_WRITE_BYTES: usize = 4096 - 4 - 4 - 41 - 34;
+
+fn page_fits_write(page: &Page, encoded_bytes: usize) -> bool {
+    #[cfg(feature = "test-knobs")]
+    if crate::node::computer::fx28_mutant("locator-pages-unbounded") {
+        return match page {
+            Page::Leaf(rows) => rows.len() <= PAGE_ITEMS,
+            Page::Branch(rows) => rows.len() <= PAGE_ITEMS,
+            Page::Ranked(rows) => rows.len() <= PAGE_ITEMS,
+        };
+    }
+    let _ = page;
+    encoded_bytes <= PAGE_WRITE_BYTES
+}
 const CACHE_BYTES: usize = 4 * 1024 * 1024;
 const CACHE_ITEMS: usize = 128;
 /// Plaintext page-cache retention is shared across all rooms/nodes in this process. A full
@@ -1006,7 +1024,24 @@ impl Page {
         }
         .ok_or(invalid("empty entry page"))
     }
-    fn bytes(&self) -> Result<Zeroizing<Vec<u8>>> {
+    fn split(self) -> Result<(Self, Self)> {
+        match self {
+            Self::Leaf(mut rows) if rows.len() > 1 => {
+                let right = rows.split_off(rows.len() / 2);
+                Ok((Self::Leaf(rows), Self::Leaf(right)))
+            }
+            Self::Branch(mut rows) if rows.len() > 1 => {
+                let right = rows.split_off(rows.len() / 2);
+                Ok((Self::Branch(rows), Self::Branch(right)))
+            }
+            Self::Ranked(mut rows) if rows.len() > 1 => {
+                let right = rows.split_off(rows.len() / 2);
+                Ok((Self::Ranked(rows), Self::Ranked(right)))
+            }
+            _ => Err(invalid("entry page row exceeds write bound")),
+        }
+    }
+    fn bytes(&self) -> Zeroizing<Vec<u8>> {
         let mut e = Encoder::new();
         e.array(3).uint(1);
         match self {
@@ -1031,11 +1066,7 @@ impl Page {
                 }
             }
         }
-        let bytes = e.finish();
-        if bytes.len() > PAGE_BYTES {
-            return Err(invalid("entry page exceeds bound"));
-        }
-        Ok(Zeroizing::new(bytes))
+        Zeroizing::new(e.finish())
     }
     fn parse(bytes: &[u8]) -> Result<Self> {
         if bytes.len() > PAGE_BYTES {
@@ -1619,13 +1650,23 @@ impl<'s> Write<'_, 's> {
         }
         Ok(id)
     }
-    fn put_page(&mut self, page: &Page) -> Result<(Key, u64)> {
-        let bytes = page.bytes()?;
+    fn put_encoded_page(&mut self, page: &Page, bytes: &[u8]) -> Result<(Key, u64)> {
         let id = self.allocate()?;
-        let sealed = seal_segment(self.sek, self.kind, id, &bytes)?;
+        let sealed = seal_segment(self.sek, self.kind, id, bytes)?;
         self.batch
             .put_segment(self.channel, self.kind, id, &sealed)?;
         Ok((page.max()?, id))
+    }
+    fn put_split_pages(&mut self, page: Page, parts: &mut Vec<(Key, u64)>) -> Result<()> {
+        let bytes = page.bytes();
+        if page_fits_write(&page, bytes.len()) {
+            parts.push(self.put_encoded_page(&page, &bytes)?);
+            return Ok(());
+        }
+        drop(bytes);
+        let (left, right) = page.split()?;
+        self.put_split_pages(left, parts)?;
+        self.put_split_pages(right, parts)
     }
     fn retire(&mut self, id: u64) -> Result<()> {
         if self.directory.phase == Phase::Building {
@@ -1683,12 +1724,8 @@ impl<'s> Write<'_, 's> {
                         });
                     }
                 }
-                if rows.len() > PAGE_ITEMS {
-                    let right = rows.split_off(rows.len() / 2);
-                    parts.push(self.put_page(&Page::Leaf(rows))?);
-                    parts.push(self.put_page(&Page::Leaf(right))?);
-                } else if !rows.is_empty() {
-                    parts.push(self.put_page(&Page::Leaf(rows))?);
+                if !rows.is_empty() {
+                    self.put_split_pages(Page::Leaf(rows), &mut parts)?;
                 }
             }
             Page::Ranked(_) => return Err(invalid("ranked page in entry tree")),
@@ -1699,12 +1736,8 @@ impl<'s> Write<'_, 's> {
                     .unwrap_or(rows.len() - 1);
                 let children = self.replace(rows[at].1, key, value, depth + 1)?;
                 rows.splice(at..=at, children);
-                if rows.len() > PAGE_ITEMS {
-                    let right = rows.split_off(rows.len() / 2);
-                    parts.push(self.put_page(&Page::Branch(rows))?);
-                    parts.push(self.put_page(&Page::Branch(right))?);
-                } else if !rows.is_empty() {
-                    parts.push(self.put_page(&Page::Branch(rows))?);
+                if !rows.is_empty() {
+                    self.put_split_pages(Page::Branch(rows), &mut parts)?;
                 }
             }
         }
@@ -1735,12 +1768,13 @@ impl<'s> Write<'_, 's> {
         self.retire(root)
     }
     fn change_value(&mut self, root: u64, key: Key, value: Option<Value>) -> Result<u64> {
-        let parts = self.replace(root, key, value, 0)?;
-        match parts.as_slice() {
-            [] => Ok(0),
-            [(_, id)] => Ok(*id),
-            _ => Ok(self.put_page(&Page::Branch(parts))?.1),
+        let mut parts = self.replace(root, key, value, 0)?;
+        while parts.len() > 1 {
+            let mut next = Vec::new();
+            self.put_split_pages(Page::Branch(parts), &mut next)?;
+            parts = next;
         }
+        Ok(parts.first().map_or(0, |(_, id)| *id))
     }
     fn change(&mut self, root: u64, key: Key, value: Option<Locator>) -> Result<u64> {
         self.change_value(root, key, value.map(Value::Entry))
@@ -2476,7 +2510,9 @@ impl Write<'_, '_> {
                         {
                             return Err(invalid("promotion cleanup hash locator"));
                         }
-                        if at.author == p.author && (p.from..=p.through).contains(&at.seq) {
+                        let exceptional = if at.author == p.author
+                            && (p.from..=p.through).contains(&at.seq)
+                        {
                             let sequence_key = position(&at.author, at.seq);
                             let pages = self.provisional_delete_pages(roots.hash, &key, at)?
                                 + self.provisional_delete_pages(
@@ -2484,14 +2520,14 @@ impl Write<'_, '_> {
                                     &sequence_key,
                                     at,
                                 )?;
-                            if !budget.reserve_pair(pages) {
+                            let Some(exceptional) = budget.reserve_pair(pages) else {
                                 if budget.rows == 1 {
                                     return Err(Error::SizeLimitExceeded(
                                         "promotion cleanup storage quantum",
                                     ));
                                 }
                                 break;
-                            }
+                            };
                             self.directory.provisional.hash = self.change(roots.hash, key, None)?;
                             self.directory.provisional.sequence =
                                 self.change(roots.sequence, sequence_key, None)?;
@@ -2501,12 +2537,18 @@ impl Write<'_, '_> {
                                 at.log,
                             )?;
                             p.cursor = p.cursor.saturating_add(1).min(p.through.saturating_add(1));
-                        }
+                            exceptional
+                        } else {
+                            false
+                        };
                         // Every hash key has a zero suffix, so this strictly greater key
                         // exists even for an all-ones hash. Skipped unrelated rows stay intact.
                         let mut next = key;
                         next[63] = 1;
                         p.cleanup_hash = Some(next);
+                        if exceptional {
+                            break;
+                        }
                         continue;
                     }
                     if !budget.reserve_deletes(2) {
@@ -2754,16 +2796,28 @@ impl EntryIndex {
     }
 }
 
-// Cleanup counts actual segment puts/deletes, not just logical entries. Each deletion
-// rewrites at most one page per existing path level (deletion cannot split a page), and
-// removes its old page. Reserve the final Directory write and conservative encoding/key
-// overhead before touching either index. Store engine/WAL pages are not segment rows.
+// Cleanup counts actual segment puts/deletes, not just logical entries. A deletion
+// can split a legacy page as it is rewritten under the encoded write bound. Reserve
+// for the split pages, their old pages and possible new roots, as well as the final
+// Directory write. Store engine/WAL pages are not segment rows.
 const PROVISIONAL_CLEANUP_ENTRIES: usize = 4;
 const CLEANUP_ROWS: usize = 64;
 const CLEANUP_BYTES: usize = 1024 * 1024;
 const CLEANUP_SEAL_OVERHEAD: usize = 64; // AES-GCM nonce/tag plus sealed CBOR framing
 const CLEANUP_KEY_BYTES: usize = 64; // (room, kind, id), conservatively encoded
 const CLEANUP_DIRECTORY_GROWTH: usize = 128; // root/allocator/revision integer growth
+                                             // Each provisional path has at most MAX_DEPTH old pages. A locator row is at
+                                             // most 120 encoded bytes and a branch row at most 76; after one child splits,
+                                             // an old branch has at most 131 rows. Halving twice leaves at most 32 locator
+                                             // rows or 33 branch rows per new page, both below PAGE_WRITE_BYTES. Thus each
+                                             // old page produces at most four puts and one delete, and each index needs at
+                                             // most one new root. Include the directory and spool operations as well.
+const CLEANUP_SINGLE_ROWS: usize = 2 * MAX_DEPTH * 5 + 4;
+const CLEANUP_SINGLE_BYTES: usize = CLEANUP_BYTES
+    + 2 * MAX_DEPTH
+        * (4 * (PAGE_WRITE_BYTES + CLEANUP_SEAL_OVERHEAD + CLEANUP_KEY_BYTES) + CLEANUP_KEY_BYTES)
+    + 2 * (PAGE_WRITE_BYTES + CLEANUP_SEAL_OVERHEAD + CLEANUP_KEY_BYTES)
+    + CLEANUP_KEY_BYTES;
 
 struct ProvisionalCleanupBudget {
     rows: usize,
@@ -2795,18 +2849,27 @@ impl ProvisionalCleanupBudget {
         self.bytes += bytes;
         true
     }
-    fn reserve_pair(&mut self, path_pages: usize) -> bool {
-        // Two operations per page: replacement put + old-page delete. A path that
-        // collapses to empty uses fewer. One further operation deletes the spool record.
-        let rows = path_pages * 2 + 1;
-        let bytes = path_pages * (PAGE_BYTES + CLEANUP_SEAL_OVERHEAD + 2 * CLEANUP_KEY_BYTES)
+    // Returns whether this pair consumes the exceptional single-entry quantum.
+    fn reserve_pair(&mut self, path_pages: usize) -> Option<bool> {
+        let rows = path_pages * 5 + 3;
+        let bytes = path_pages
+            * (4 * (PAGE_WRITE_BYTES + CLEANUP_SEAL_OVERHEAD + CLEANUP_KEY_BYTES)
+                + CLEANUP_KEY_BYTES)
+            + 2 * (PAGE_WRITE_BYTES + CLEANUP_SEAL_OVERHEAD + CLEANUP_KEY_BYTES)
             + CLEANUP_KEY_BYTES;
-        if self.rows + rows > CLEANUP_ROWS || self.bytes + bytes > CLEANUP_BYTES {
-            return false;
+        let total_rows = self.rows + rows;
+        let total_bytes = self.bytes + bytes;
+        let exceptional = total_rows > CLEANUP_ROWS || total_bytes > CLEANUP_BYTES;
+        if exceptional
+            && (self.rows != 1
+                || total_rows > CLEANUP_SINGLE_ROWS
+                || total_bytes > CLEANUP_SINGLE_BYTES)
+        {
+            return None;
         }
-        self.rows += rows;
-        self.bytes += bytes;
-        true
+        self.rows = total_rows;
+        self.bytes = total_bytes;
+        Some(exceptional)
     }
 }
 
@@ -2909,19 +2972,22 @@ impl Write<'_, '_> {
             let sequence_key = position(&at.author, at.seq);
             let pages = self.provisional_delete_pages(roots.hash, &key, at)?
                 + self.provisional_delete_pages(roots.sequence, &sequence_key, at)?;
-            if !budget.reserve_pair(pages) {
+            let Some(exceptional) = budget.reserve_pair(pages) else {
                 if !changed {
                     return Err(Error::SizeLimitExceeded(
                         "provisional cleanup storage quantum",
                     ));
                 }
                 break; // Persist prior progress; this pair has not mutated either tree.
-            }
+            };
             roots.hash = self.change(roots.hash, key, None)?;
             roots.sequence = self.change(roots.sequence, sequence_key, None)?;
             self.batch
                 .delete_segment(self.channel, SegmentKind::ProvisionalLog, at.log)?;
             changed = true;
+            if exceptional {
+                break;
+            }
         }
         if (roots.hash == 0) != (roots.sequence == 0) {
             return Err(invalid("provisional cleanup locator roots disagree"));
