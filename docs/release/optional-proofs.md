@@ -779,19 +779,19 @@ messages read. The app client must expose all69 readers on every message and eve
 relationship. The terminal must open the room and show every reader and peer's trust (#792).
 This expensive proof is optional and blocks neither CI nor release.
 
-### RG-8 computer anchors and terminal guidance
+### RG-8 computer anchors and late pairing closure
 
-The existing `nodes_of_one_daemon_proof` hosts these on-demand real-binary acts:
-`computer_management_uses_anchors_added_after_start`,
-`a_pairing_link_without_a_route_is_refused_at_once`,
-`either_computer_closes_a_half_signed_pairing_at_once`,
-`computer_status_opens_with_where_it_stands_and_the_next_command`, and
-`a_refused_room_pause_names_the_node_and_command_that_can_pause`.
+The existing `nodes_of_one_daemon_proof` hosts two on-demand real-binary acts:
+`computer_management_uses_anchors_added_after_start` stages a real relay and restart;
+`either_computer_closes_a_half_signed_pairing_at_once` waits for each late completion's
+causal exchange outcome, once for each holder, so may take two minutes. Both are compiled
+only with `optional-proofs`, with loud `not_run!` stand-ins otherwise.
 Build once with `cargo test --release -p vox-tui --features test-knobs,optional-proofs --test nodes_of_one_daemon_proof --no-run`,
-then select one function with `-- --ignored --exact --nocapture`.
-Run the anchor restart and immediate-return acts quiet; status and pause guidance assert
-only shipped words and outcomes. Each uses isolated account data/config roots.
-Runtime-added anchors apply to computer management as well as nodes, without a restart.
-Closing a half-signed attempt is local: it retains the signed intent and does not claim
-to revoke trust the other computer may already have recorded.
+then select one function with `-- --ignored --exact --nocapture`. Run these acts quiet.
+Each uses isolated account data/config roots. Closing a half-signed attempt is local:
+the other computer can still complete until expiry; the closer refuses it. Close it on
+both computers to stop the attempt on both.
+
+The seconds-long no-route diagnosis, status guidance and pause/resume guidance acts are
+release-gate proofs, not optional proofs.
 

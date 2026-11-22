@@ -1331,7 +1331,7 @@ impl Management {
                 ));
             }
             if s.cancelled.contains_key(&id) {
-                return Ok(false);
+                return Ok(None);
             }
             let pending_nonce = s.pending.as_ref().and_then(|g| {
                 (g.operation() == id
@@ -1342,7 +1342,7 @@ impl Management {
             });
             let pending = pending_nonce.is_some();
             if s.invitations.iter().any(|i| i.id == id && i.cancelled) {
-                return Ok(false);
+                return Ok(None);
             }
             let locally_approved = pending
                 && s.pending.as_ref().is_some_and(|g| {
@@ -1350,6 +1350,11 @@ impl Management {
                         .ok()
                         .is_some_and(|at| g.approvals[at].is_some())
                 });
+            let signed_attempt = s
+                .pending
+                .as_ref()
+                .filter(|_| locally_approved)
+                .map(|g| (g.expires, g.operation()));
             let mut found = pending;
             for i in &mut s.invitations {
                 if (i.id == id || pending_nonce == Some(i.nonce)) && !i.cancelled {
@@ -1381,10 +1386,11 @@ impl Management {
                     s.receipts.clear();
                 }
             }
-            Ok(locally_approved)
+            Ok(signed_attempt)
         })?;
-        if closed_signed {
-            *lock(&self.closed_problem) = Some("Incomplete attempt closed on this computer. Its signed intent remains retained and cannot activate here. The other computer may have recorded approval; this does not remove trust there.".into());
+        if let Some((expires, operation)) = closed_signed {
+            let operation = text_id(&operation);
+            *lock(&self.closed_problem) = Some(format!("Incomplete attempt closed on this computer. The other computer can still complete its side until Unix ms {expires}, and would then trust this computer's nodes. This computer will refuse it. Close it there too with: vox computer cancel {operation}. Closing here does not remove trust there."));
         }
         // Cancellation revokes transport even when no policy revision moved.
         self.transport_wake.notify_one();

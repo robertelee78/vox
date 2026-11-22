@@ -253,9 +253,9 @@ pub async fn run(command: ComputerCmd) -> Result<(), AppError> {
             )
             .await?;
             if conflict.inviter_approved {
-                eprintln!("On {}, wait until the signed incomplete proposal expires at Unix ms {}; closing it cannot withdraw a signature retained elsewhere.", conflict.peer.name, conflict.expires_ms);
+                eprintln!("On {}, the signed incomplete proposal can be closed now; its retained signature can still be used elsewhere until Unix ms {}.", conflict.peer.name, conflict.expires_ms);
             }
-            eprintln!("On {}, close the old proposal with:\n  {}\nIf it was signed after review, wait until expiry before closing; closing cannot withdraw a retained signature. Then create a fresh invitation with:\n  {}\nBring that fresh invitation here and approve on both computers.",
+            eprintln!("On {}, close the old proposal now with:\n  {}\nClosing cannot withdraw a signature retained elsewhere; close it on both computers. Then create a fresh invitation with:\n  {}\nBring that fresh invitation here and approve on both computers.",
                 conflict.peer.name,
                 vox_text::shell::command(&["vox", "computer", "cancel", &conflict.operation_id]),
                 vox_text::shell::command(&["vox", "computer", "invite"]));

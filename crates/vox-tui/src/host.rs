@@ -2975,20 +2975,19 @@ impl Router {
         ) && me != Some(info.peer)
             && !view.drive.contains(&info.peer)
         {
-            if matches!(
-                &req.action,
-                Action::RoomPause {
-                    paused: Some(_),
-                    ..
-                }
-            ) {
+            if let Action::RoomPause {
+                paused: Some(paused),
+                ..
+            } = &req.action
+            {
+                let action = if *paused { "pause" } else { "resume" };
                 let room = vox_core::node::link::b32_encode(&info.channel_id);
                 let target = me
                     .map(|id| vox_core::node::link::b32_encode(&id))
                     .unwrap_or_else(|| node.as_str().to_owned());
                 let command = |driver: &str| {
                     vox_text::shell::command(&[
-                        "vox", "room", "pause", &room, &target, "--node", driver,
+                        "vox", "room", action, &room, &target, "--node", driver,
                     ])
                 };
                 let status = match self.inner.defaults.computer.status() {
@@ -3018,12 +3017,15 @@ impl Router {
                 });
                 let said = if let Some(driver) = permitted {
                     format!(
-                        "{node} does not accept drive from this node; {} can pause it: {}",
+                        "{node} does not accept drive from this node; {} can {action} it: {}",
                         driver.name,
                         command(&driver.name)
                     )
+                } else if source_computer.is_some() {
+                    format!("{node} does not accept drive from this node; no node of this computer can {action} it; on the computer hosting {node}: {}",
+                        command(node.as_str()))
                 } else {
-                    format!("{node} does not accept drive from this node; no node of this computer can pause it; on the computer hosting {node}: {}",
+                    format!("{node} accepts drive only from nodes it trusts with drive; on the computer hosting {node}: {}",
                         command(node.as_str()))
                 };
                 return Answer {

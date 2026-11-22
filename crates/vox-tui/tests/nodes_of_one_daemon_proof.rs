@@ -46,6 +46,8 @@ optional_proof::not_run!(
     an_unfinished_room_releases_no_key_until_its_withdrawal_finishes,
     a_post_racing_a_trust_revision_is_saved_once,
     a_saved_manual_removal_finishes_while_another_room_posts,
+    computer_management_uses_anchors_added_after_start,
+    either_computer_closes_a_half_signed_pairing_at_once,
 );
 
 use std::io::{Read as _, Write as _};
@@ -10496,6 +10498,7 @@ fn rg8_pair(a: &Account, b: &Account) {
     );
 }
 
+#[cfg(feature = "optional-proofs")]
 #[test]
 #[ignore = "real paired computers and a relay-only restart; run in release with test-knobs"]
 fn computer_management_uses_anchors_added_after_start() {
@@ -10670,6 +10673,7 @@ fn a_pairing_link_without_a_route_is_refused_at_once() {
     );
 }
 
+#[cfg(feature = "optional-proofs")]
 #[test]
 #[ignore = "real uncompleted signed computer proposals; run in release"]
 fn either_computer_closes_a_half_signed_pairing_at_once() {
@@ -10677,6 +10681,12 @@ fn either_computer_closes_a_half_signed_pairing_at_once() {
     for inviter_closes in [false, true] {
         let a = Account::new();
         let b = Account::new();
+        let _left = rg8_ready(&a, "alpha", "127.0.0.1:0");
+        let _right = rg8_ready(&b, "beta", "127.0.0.1:0");
+        let alpha = a.make_node("alpha");
+        let beta = b.make_node("beta");
+        computer(&a, &["personal", "alpha"]);
+        computer(&b, &["personal", "beta"]);
         let offer = computer(&a, &["invite"]);
         let preview = computer(
             &b,
@@ -10684,23 +10694,71 @@ fn either_computer_closes_a_half_signed_pairing_at_once() {
         );
         let operation = preview["pairing"]["operation_id"].as_str().unwrap();
         let holder = if inviter_closes { &a } else { &b };
+        let other = if inviter_closes { &b } else { &a };
+        let (holder_node, other_id) = if inviter_closes {
+            ("alpha", &beta)
+        } else {
+            ("beta", &alpha)
+        };
         let approved = computer(holder, &["approve", operation]);
         assert!(
             approved["pairing"]["approved_here"] == true
                 && approved["pairing"]["approved_there"] == false,
             "APPARATUS: did not stage exactly one signed approval: {approved}"
         );
+        assert!(
+            wait_until(RETURN_WITHIN, || {
+                let seen = computer(other, &["status"]);
+                seen["pairing"]["approved_here"] == false
+                    && seen["pairing"]["approved_there"] == true
+            }),
+            "APPARATUS: the other computer did not retain the holder's signature before close: {}",
+            computer(other, &["status"])
+        );
         let started = Instant::now();
-        let (ok, out, err) = holder.run(&["computer", "cancel", operation, "--json"], "");
+        let (ok, out, err) = holder.run(&["computer", "cancel", operation], "");
         assert!(
             ok && started.elapsed() < Duration::from_secs(2),
             "PRODUCT: holder could not close its half-signed pairing at once, inviter={inviter_closes}: {out}{err}"
         );
+        let expiry = approved["pairing"]["expires_ms"].as_u64().unwrap();
+        assert!(
+            out.contains(&format!("can still complete its side until Unix ms {expiry}"))
+                && out.contains("would then trust this computer's nodes")
+                && out.contains("This computer will refuse it")
+                && out.contains(&format!("vox computer cancel {operation}")),
+            "PRODUCT: signed close omitted the late-completion risk, expiry, local refusal or other-side cancel command: {out}{err}"
+        );
+        let completed = computer(other, &["approve", operation]);
+        assert!(
+            completed["pairing"].is_null()
+                && completed["computers"].as_array().is_some_and(|peers| peers.len() == 2)
+                && matches!(completed["state"].as_str(), Some("applying" | "confirmed" | "expired")),
+            "PRODUCT: the other computer did not complete its enrollment after the local close: {completed}"
+        );
+        assert!(
+            wait_until(RETURN_WITHIN + Duration::from_secs(5), || {
+                matches!(
+                    computer(other, &["status"])["state"].as_str(),
+                    Some("confirmed" | "expired")
+                )
+            }),
+            "PRODUCT: late completion never reported convergence or its causal miss: {}",
+            computer(other, &["status"])
+        );
         let closed = computer(holder, &["status"]);
         assert!(
-            closed["pairing"].is_null(),
-            "PRODUCT: closed proposal still blocks this computer: {closed}"
+            closed["state"] == "individual"
+                && closed["computers"].as_array().is_some_and(|peers| peers.is_empty())
+                && closed["pairing"].is_null(),
+            "PRODUCT: late approval reactivated the locally closed pairing, inviter={inviter_closes}: {closed}"
         );
+        let (ok, trusted, err) = holder.run(&["trust", "list", "--node", holder_node], "");
+        assert!(
+            ok && !trusted.contains(other_id),
+            "PRODUCT: closer gained trust after the other side's late approval: {trusted}{err}"
+        );
+        eprintln!("PRODUCT GREEN: inviter_closes={inviter_closes}; other side completed, closer stayed individual with no pairing or new trust");
         let next = computer(holder, &["invite"]);
         assert!(
             next["invite_link"].is_string(),
@@ -10830,6 +10888,24 @@ fn a_refused_room_pause_names_the_node_and_command_that_can_pause() {
     assert!(
         ok && out.contains("\"paused\":true"),
         "PRODUCT: the refusal's command did not pause beta: {out}{err}"
+    );
+    let command = format!("vox room resume {full_room} {beta} --node alpha");
+    let (ok, out, err) = a.run(&["room", "resume", full_room, &beta, "--node", "agent"], "");
+    let said = format!("{out}{err}");
+    assert!(
+        !ok && said.contains(&command)
+            && !said.contains(&format!("vox room pause {full_room} {beta} --node alpha")),
+        "PRODUCT: refused resume did not name the resume command, or advised pausing instead: {said}"
+    );
+    let (ok, out, err) = a.run(
+        &[
+            "room", "resume", full_room, &beta, "--node", "alpha", "--json",
+        ],
+        "",
+    );
+    assert!(
+        ok && out.contains("\"paused\":false"),
+        "PRODUCT: the refusal's resume command did not resume beta: {out}{err}"
     );
     computer(&b, &["personal", "beta"]);
     assert!(
