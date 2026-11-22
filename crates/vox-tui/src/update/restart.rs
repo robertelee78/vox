@@ -21,10 +21,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use vox_core::node::daemonipc::{
-    DaemonClient, DaemonFrame, DaemonObservation, DaemonRequest, NodeState,
-};
-use vox_core::node::ipc::PROTOCOL_VERSION;
+use vox_core::node::daemonipc::{DaemonClient, DaemonObservation, NodeState};
 use vox_core::node::paths::{Account, NodeName};
 
 /// How long the old daemon is given to stop: it detaches every node first, each within its own
@@ -522,24 +519,13 @@ async fn restart_checked(
         )
         .await?;
     } else {
-        #[cfg(target_os = "linux")]
-        let by_unit = matches!(started, Started::UserUnit(_));
-        #[cfg(not(target_os = "linux"))]
-        let by_unit = false;
-        if !by_unit {
-            if matches!(started, Started::ByClient | Started::ByHand) {
-                let pid = i32::try_from(before.pid)
-                    .ok()
-                    .and_then(rustix::process::Pid::from_raw)
-                    .ok_or_else(|| {
-                        AppError::Usage("the daemon gave an invalid process id".into())
-                    })?;
-                rustix::process::kill_process(pid, rustix::process::Signal::TERM).map_err(|e| {
-                    AppError::Usage(format!("the daemon could not be stopped: {e}"))
-                })?;
-            } else {
-                request_stop(account, before.pid).await?;
-            }
+        if matches!(started, Started::ByClient | Started::ByHand) {
+            let pid = i32::try_from(before.pid)
+                .ok()
+                .and_then(rustix::process::Pid::from_raw)
+                .ok_or_else(|| AppError::Usage("the daemon gave an invalid process id".into()))?;
+            rustix::process::kill_process(pid, rustix::process::Signal::TERM)
+                .map_err(|e| AppError::Usage(format!("the daemon could not be stopped: {e}")))?;
             if !gone_within(before.pid, STOP_WITHIN).await {
                 return Err(AppError::Usage(format!(
                     "the daemon (pid {}) did not stop within {} s; it still runs vox {}",
@@ -599,7 +585,7 @@ async fn start_selected(
         #[cfg(target_os = "macos")]
         Started::LoginItem(target) => {
             let out = Command::new("/bin/launchctl")
-                .args(["kickstart", target])
+                .args(["kickstart", "-k", target])
                 .bounded_output()?;
             if !out.status.success() {
                 return Err(AppError::Usage(format!(
@@ -801,8 +787,11 @@ pub(crate) fn is_managed_daemon(pid: u32) -> bool {
     }
 }
 
+#[cfg(target_os = "macos")]
 async fn request_stop(account: &Account, pid: u32) -> Result<(), crate::app::AppError> {
     use crate::app::AppError;
+    use vox_core::node::daemonipc::{DaemonFrame, DaemonRequest};
+    use vox_core::node::ipc::PROTOCOL_VERSION;
     tokio::time::timeout(STOP_WITHIN, async {
         let greeting = DaemonClient::observe(&account.socket())
             .await
