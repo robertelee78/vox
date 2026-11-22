@@ -48,6 +48,7 @@ use crate::node::ports::{BackoffScope, OutboundService};
 
 mod bounded_sync;
 mod computer;
+mod computer_removal;
 pub use computer::PolicySupersession;
 mod consent_release;
 mod consent_save;
@@ -6547,7 +6548,6 @@ pub struct Node {
     own_key_leave_pending: BTreeMap<Digest32, Arc<()>>,
     own_key_ended_pending: BTreeMap<Digest32, Arc<()>>,
     own_key_untrust_pending: Option<Arc<()>>,
-    own_key_room_set_changed: watch::Sender<()>,
     own_key_computer_pending: std::collections::VecDeque<computer::OwnKeyPolicyWork>,
     own_key_computer_flight: Option<OwnKeyPolicyFlight>,
     /// Peers' acknowledgements of this node's own feed reported by lane rounds, applied on
@@ -6798,8 +6798,6 @@ pub struct Node {
     key_package_rooms: BTreeMap<Digest32, bool>,
     /// Logged package work awaiting the room's governance-ready transition.
     key_package_governance_wait: BTreeSet<Digest32>,
-    /// A selected package whose opening was refused before execution.
-    key_package_unopened: BTreeSet<Digest32>,
     /// A room whose package was refused while its governance refreshed is not selected again
     /// before this instant. The refusal can wait on a member's records, which no local fold
     /// brings, so an unpaced retry repeats the same refusal at once (#1203).
@@ -7388,7 +7386,6 @@ impl Node {
             own_key_leave_pending: BTreeMap::new(),
             own_key_ended_pending: BTreeMap::new(),
             own_key_untrust_pending: None,
-            own_key_room_set_changed: watch::channel(()).0,
             own_key_computer_pending: std::collections::VecDeque::new(),
             own_key_computer_flight: None,
             held_notes: Vec::new(),
@@ -7484,7 +7481,6 @@ impl Node {
             legacy_cleanup_due: std::time::Instant::now(),
             key_package_rooms: BTreeMap::new(),
             key_package_governance_wait: BTreeSet::new(),
-            key_package_unopened: BTreeSet::new(),
             key_package_retry_at: BTreeMap::new(),
             session_upgrade_retry_at: BTreeMap::new(),
             session_control_check_at: preparation_save::SessionControlChecks::default(),
@@ -19895,7 +19891,6 @@ impl Node {
         self.legacy_cleanup_due = std::time::Instant::now();
         self.key_package_rooms.clear();
         self.key_package_governance_wait.clear();
-        self.key_package_unopened.clear();
         self.key_package_retry_at.clear();
         self.session_upgrade_retry_at.clear();
         self.session_control_check_at.clear();
@@ -19907,7 +19902,6 @@ impl Node {
         // Retire queued scanner admission and its wake before dropping room ownership. A
         // physical blocking read retains its own secret guard until it actually exits.
         self.key_body_scan = key_body_scan::Controller::default();
-        self.own_key_room_set_changed.send_replace(());
         let busy: Vec<_> = self.own_key_donor_busy.keys().copied().collect();
         for key in busy {
             self.retire_own_key_donor_busy(key);
@@ -20240,9 +20234,6 @@ impl Node {
         self.own_recovery_rooms.remove(channel_id);
         self.own_recovery_body_debts.remove(channel_id);
         self.own_readable_effects.remove(channel_id);
-        if self.channels.contains_key(channel_id) {
-            self.own_key_room_set_changed.send_replace(());
-        }
         self.retire_parked_private_drive(channel_id, Fault::ChannelNotOpen);
         self.session_ingress_waits
             .retain(|(room, _), _| room != channel_id);
@@ -20853,7 +20844,6 @@ impl Node {
         crate::node::status::SyncBook::note_set_aside(&self.sync_book, channel_id, ch.set_aside());
         let install = || {
             self.role_wake.install(channel_id, &ch.role_owed());
-            self.own_key_room_set_changed.send_replace(());
             if let Some(net) = self.net.as_ref() {
                 net.forget_board_exchange_room(&channel_id);
             }
@@ -24885,6 +24875,12 @@ impl Node {
             &names_here,
             &trusted,
             &self.dismissed_offers,
+            |room, basis| match (&self.computer, &self.profile) {
+                (Some(computer), Some(profile)) => {
+                    computer.suppress_offer(profile.fingerprint(), room, basis)
+                }
+                _ => false,
+            },
         );
         if known.iter().any(|room| !inventory.contains_key(room)) {
             anchor_inventory_error.get_or_insert_with(|| {

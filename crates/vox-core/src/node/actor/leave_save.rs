@@ -1022,7 +1022,6 @@ impl Node {
         }
         self.key_package_rooms.remove(room);
         self.key_package_governance_wait.remove(room);
-        self.key_package_unopened.remove(room);
         self.key_package_retry_at.remove(room);
         self.session_upgrade_retry_at.remove(room);
         self.session_control_check_at.remove(room);
@@ -1036,9 +1035,6 @@ impl Node {
         let preparing = self.cancel_room_preparation(room, Fault::ChannelNotOpen);
         let reopening = self.reopening.remove(room);
         self.reopen_failures.remove(room);
-        if self.channels.contains_key(room) {
-            self.own_key_room_set_changed.send_replace(());
-        }
         self.retire_parked_private_drive(room, Fault::ChannelNotOpen);
         self.session_ingress_waits.retain(|(id, _), _| id != room);
         let removed = self.channels.remove(room);
@@ -1090,7 +1086,6 @@ impl Node {
         self.leave_waiters.retain(|waiter| waiter.room != *room);
         self.key_package_rooms.remove(room);
         self.key_package_governance_wait.remove(room);
-        self.key_package_unopened.remove(room);
         self.key_package_retry_at.remove(room);
         self.session_upgrade_retry_at.remove(room);
         self.session_control_check_at.remove(room);
@@ -1099,9 +1094,6 @@ impl Node {
         self.own_recovery_body_debts.remove(room);
         self.own_readable_effects.remove(room);
         self.governance_work.set_deadline(*room, None);
-        if self.channels.contains_key(room) {
-            self.own_key_room_set_changed.send_replace(());
-        }
         self.retire_parked_private_drive(room, Fault::ChannelNotOpen);
         self.session_ingress_waits.retain(|(id, _), _| id != room);
         self.channels.remove(room);

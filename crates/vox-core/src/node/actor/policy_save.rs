@@ -339,12 +339,17 @@ impl Node {
                 error,
             },
         };
+        self.refresh_reachers().await;
         self.resume_policy_result(resume, pending.reply).await;
     }
 
-    /// The command keeps its old success meaning without retaining the node's policy owner.
-    /// Only the room currently observed is waited for; ordinary governance owns all writes.
-    fn reply_after_room_trust(&mut self, reply: Reply) {
+    /// The reply observes room completion and the original requested consent pass without
+    /// retaining the node's policy owner.
+    fn reply_after_room_trust(
+        &mut self,
+        reply: Reply,
+        consents: Option<oneshot::Receiver<crate::error::Result<()>>>,
+    ) {
         let Some(mut reply) = reply else {
             return;
         };
@@ -378,7 +383,7 @@ impl Node {
                     if channel.trust_reconciled(generation) {
                         break;
                     }
-                    if channel.is_poisoned() {
+                    if channel.is_poisoned() || channel.trust_failed(generation) {
                         let _ = reply.send(Outcome::Failed(Fault::TrustRemovalIncomplete));
                         return;
                     }
@@ -391,6 +396,28 @@ impl Node {
                         }
                         _ = retired.changed() => break,
                         _ = changed => {}
+                    }
+                }
+            }
+            if let Some(consents) = consents {
+                let consent_result = tokio::select! {
+                    biased;
+                    _ = reply.closed() => return,
+                    _ = attachment.changed() => {
+                        let _ = reply.send(Outcome::Failed(Fault::Locked));
+                        return;
+                    }
+                    result = consents => result,
+                };
+                match consent_result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        let _ = reply.send(Outcome::Failed(fault_of(&error)));
+                        return;
+                    }
+                    Err(_) => {
+                        let _ = reply.send(Outcome::Failed(Fault::Internal));
+                        return;
                     }
                 }
             }
@@ -472,8 +499,8 @@ impl Node {
                 source,
                 grant,
             } => {
-                drop((lifetime, source, grant));
-                self.reply_after_room_trust(reply);
+                drop((lifetime, source));
+                self.finish_grant_reply(grant, reply).await;
             }
             PolicyResume::Dismissed { lifetime, result } => {
                 if matches!(&result, Ok(true)) {
@@ -496,7 +523,7 @@ impl Node {
                     self.publish().await;
                 }
                 drop((lifetime, operation));
-                self.reply_after_room_trust(reply);
+                self.reply_after_room_trust(reply, None);
             }
             PolicyResume::Managed {
                 lifetime,
@@ -598,6 +625,7 @@ impl Node {
         }
         // Room withdrawals keep their existing durable PendingLocks and run independently.
         drop(lifetime);
+        self.capture_open_computer_offer_boundaries().await;
         self.computer_expired = expired;
         self.computer_revision
             .store(revision, std::sync::atomic::Ordering::Release);

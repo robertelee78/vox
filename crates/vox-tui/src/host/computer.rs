@@ -27,6 +27,55 @@ fn mark_computer_status_returned_for_proof(returned: Option<std::path::PathBuf>)
 }
 
 impl Router {
+    async fn computer_removal_review(
+        &self,
+        target: &str,
+    ) -> std::result::Result<(Vec<vox_core::node::computer::RemovalRoom>, Vec<Digest32>), String>
+    {
+        let target = vox_core::node::link::fingerprint_input(target, "computer fingerprint")
+            .map_err(|error| error.to_string())?;
+        let targets = self
+            .inner
+            .defaults
+            .computer
+            .computer
+            .nodes_of_computer(target)
+            .map_err(|error| error.to_string())?;
+        let handles: Vec<_> = lock(&self.inner.slots)
+            .values()
+            .filter_map(|slot| {
+                if let Slot::Attached(attached) = slot {
+                    (!attached.handle.view().locked).then(|| attached.handle.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let mut selected = std::collections::BTreeMap::new();
+        let mut checked = Vec::new();
+        for handle in handles {
+            let (node, rows) = handle.computer_removal_rooms(&targets).await?;
+            checked.push(node);
+            for row in rows {
+                let key = (row.room, row.member);
+                match selected.entry(key) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(row);
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut entry) => {
+                        if entry.get().command_node != entry.get().local_node
+                            && row.command_node == row.local_node
+                        {
+                            entry.insert(row);
+                        }
+                    }
+                }
+            }
+        }
+        let mut rows: Vec<_> = selected.into_values().collect();
+        rows.sort();
+        Ok((rows, checked))
+    }
     /// Reconcile the daemon's nodes with computer trust on change, and on no timer (ADR-038
     /// FX-28): when the policy revision moves (a change made here, or a merged exchange that
     /// moved it), and when a node attaches or detaches. Endpoint movement records transport reach
@@ -148,6 +197,14 @@ impl Router {
                 })
                 .collect()
         };
+        for (_, handle, _) in &attached {
+            let handle = handle.clone();
+            self.inner.rt.spawn(async move {
+                if let Err(error) = handle.capture_computer_removals().await {
+                    eprintln!("vox daemon: computer room review pending: {error}");
+                }
+            });
+        }
         for info in self.nodes() {
             let Some((_, handle, generation)) = attached
                 .iter()
@@ -375,7 +432,34 @@ impl Router {
             DaemonRequest::ComputerStatus => {
                 #[cfg(feature = "test-knobs")]
                 let returned = mark_computer_status_accepted_for_proof();
-                let status = management.status();
+                let mut status = management.status();
+                if let Ok(status) = &mut status {
+                    for removal in &mut status.removals {
+                        if !removal
+                            .pending
+                            .iter()
+                            .any(|row| row.command_node == [0; 32])
+                        {
+                            continue;
+                        }
+                        if let Ok((current, _)) =
+                            self.computer_removal_review(&removal.computer).await
+                        {
+                            for row in &mut removal.pending {
+                                if row.command_node != [0; 32] {
+                                    continue;
+                                }
+                                if let Some(open) = current.iter().find(|open| {
+                                    open.room == row.room
+                                        && open.member == row.member
+                                        && open.command_node != [0; 32]
+                                }) {
+                                    row.command_node = open.command_node;
+                                }
+                            }
+                        }
+                    }
+                }
                 #[cfg(feature = "test-knobs")]
                 mark_computer_status_returned_for_proof(returned);
                 status
@@ -384,8 +468,34 @@ impl Router {
             DaemonRequest::ComputerPreview { link } => management.preview(&link).await,
             DaemonRequest::ComputerApprove { operation } => management.approve(&operation),
             DaemonRequest::ComputerCancel { operation } => management.cancel(&operation),
-            DaemonRequest::ComputerRemove { computer, frontier } => {
-                management.remove(&computer, &frontier)
+            DaemonRequest::ComputerRemove {
+                computer,
+                frontier,
+                keep_rooms,
+                rooms,
+            } => {
+                let (current, checked) = match self.computer_removal_review(&computer).await {
+                    Ok(rows) => rows,
+                    Err(error) => return DaemonFrame::ComputerFailed(error),
+                };
+                if frontier.is_empty() {
+                    return match management.status() {
+                        Ok(mut status) => {
+                            status.removal_rooms = current;
+                            match serde_json::to_string(&status) {
+                                Ok(json) => DaemonFrame::ComputerStatus(json),
+                                Err(error) => DaemonFrame::ComputerFailed(error.to_string()),
+                            }
+                        }
+                        Err(error) => DaemonFrame::ComputerFailed(error.to_string()),
+                    };
+                }
+                if rooms.as_ref().is_some_and(|review| review != &current) {
+                    return DaemonFrame::ComputerFailed(
+                        "the rooms changed since you reviewed them; review again".into(),
+                    );
+                }
+                management.remove(&computer, &frontier, keep_rooms, &current, &checked)
             }
             DaemonRequest::ComputerBinding {
                 action,

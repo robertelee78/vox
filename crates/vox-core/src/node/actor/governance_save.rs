@@ -231,8 +231,22 @@ impl Node {
     ) {
         if continuation.attached(self, &room) {
             match continuation.after {
-                After::Trust { .. } => {
-                    self.governance_work.again = true;
+                After::Trust { generation, .. } => {
+                    let instance = Arc::clone(&continuation.instance);
+                    tokio::spawn(async move {
+                        instance.lock().await.mark_trust_failed(generation);
+                    });
+                    self.governance_work.trust_waiting.insert(room);
+                    let retry = self
+                        .now_ms()
+                        .0
+                        .saturating_add(ROOM_RETRY.as_millis() as u64);
+                    let next = self
+                        .governance_work
+                        .deadlines
+                        .get(&room)
+                        .map_or(retry, |at| (*at).min(retry));
+                    self.governance_work.set_deadline(room, Some(next));
                 }
                 After::Sweep(sweep) => {
                     if matches!(
@@ -481,8 +495,19 @@ impl Node {
                     self.reject_owned_governance(room, error, continuation, reply);
                     return;
                 }
+                if !state.matches_trust(&self.trust.trusted()) {
+                    self.governance_work.again = true;
+                    return;
+                }
                 let action = {
                     let channel = continuation.instance.lock().await;
+                    if !self
+                        .capture_room_offer_boundary(&channel, &continuation.lifetime.store)
+                        .unwrap_or(false)
+                    {
+                        self.governance_work.again = true;
+                        return;
+                    }
                     channel
                         .require_governance_ready(&continuation.lifetime.store, self.now_ms())
                         .and_then(|_| state.action(&channel, &continuation.lifetime.store))
@@ -494,6 +519,7 @@ impl Node {
                     Ok(trust_save::ReconcileAction::Withdraw { target }) => {
                         maintenance_save::Work::Consent(consent_save::Work::Withdraw { target })
                     }
+                    #[cfg(feature = "test-knobs")]
                     Ok(trust_save::ReconcileAction::Progress) => {
                         self.governance_work.again = true;
                         return;
@@ -926,8 +952,18 @@ impl Node {
         let cache_only = {
             let channel = continuation.instance.lock().await;
             if turn.ready {
-                self.governance_work
-                    .set_deadline(room, channel.governance_deadline());
+                let deadline = channel
+                    .governance_deadline()
+                    .into_iter()
+                    .chain(
+                        self.governance_work
+                            .deadlines
+                            .get(&room)
+                            .copied()
+                            .filter(|_| self.governance_work.trust_waiting.contains(&room)),
+                    )
+                    .min();
+                self.governance_work.set_deadline(room, deadline);
             }
             channel.legacy_cache_only(&continuation.lifetime.store)
         };
@@ -1133,6 +1169,7 @@ impl Node {
             self.publish().await;
         }
         drop(continuation);
+        self.resume_computer_room_removals(room).await;
         if let Some(reply) = reply {
             let _ = reply.send(Outcome::Done);
         }

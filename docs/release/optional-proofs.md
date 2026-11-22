@@ -30,6 +30,29 @@ over; the existing manual-removal and through-log re-trust journeys cover this p
 Posts that meet a new computer revision before native publication retain their
 original command queue credit until the saved keyring is current; their room's
 withdrawal fence still decides whether they may be written.
+The consent cursor survives every page. A newer trust list restarts only that room's
+reconciliation. Every failed trust turn uses the existing one-second retry while
+ordinary room governance continues; the saved manual command reports incomplete
+withdrawal rather than waiting for a permanent fault. Installing a keyring refreshes service reachers,
+independent of room withdrawal. A new manual grant dials the requested member and
+waits for its existing owed-consent pass before acknowledging the command.
+A closed room with saved withdrawal debt defers authoring Session refresh until its
+preparation trust stage has withdrawn the old reader. It can then open, without
+weakening the record or key fences; the existing closed-room removal proof covers it.
+The post-race act uses the existing text-publication hold to change the durable
+revision before the original post is admitted; the same command must succeed and
+its shipped JSON read must show exactly one copy. At a held withdrawal, a pending
+computer application receipt is judged by other-room post/read progress until the
+receipt is consumed, not by which independent task publishes its marker first.
+The post proof first shows that both removed and surviving readers could read, then
+counts completed other-room exchanges until its own post is accepted, then waits for
+the surviving reader and ten completed exchanges before checking that the
+removed reader sees no post after withdrawal. To stage a key queued before withdrawal,
+set `VOX_PROOF_RG3_QUEUED_KEY=1` for the held-key proof; it uses the existing pairwise
+key hold and retains the same user-facing no-key assertion.
+The focused manual-removal act counts accepted/read other-room posts while the saved
+removal finishes; it judges the terminal result after at most 100 such observations,
+not after an elapsed wait. Its projection-stage mutant must fail that counted claim.
 
 Run each named proof separately, with exclusive build-slot ownership for the hold:
 
@@ -43,7 +66,35 @@ cargo test --release -p vox-tui --features test-knobs,optional-proofs \
 cargo test --release -p vox-tui --features test-knobs,optional-proofs \
   --test nodes_of_one_daemon_proof \
   an_unfinished_room_releases_no_key_until_its_withdrawal_finishes -- --ignored --exact --nocapture
+cargo test --release -p vox-tui --features test-knobs,optional-proofs \
+  --test nodes_of_one_daemon_proof \
+  a_post_racing_a_trust_revision_is_saved_once -- --ignored --exact --nocapture
+cargo test --release -p vox-tui --features test-knobs,optional-proofs \
+  --test nodes_of_one_daemon_proof \
+  a_saved_manual_removal_finishes_while_another_room_posts -- --ignored --exact --nocapture
 ```
+
+### Computer removal (ADR-052 RG-8)
+
+The pairing journey in `nodes_of_one_daemon_proof.rs` also covers saved room choices:
+`computer_removal_resumes_its_saved_room_choices_after_restart`,
+`computer_removal_keeps_rooms_without_offering_removed_nodes`,
+`computer_removal_reconciles_absence_before_a_fresh_join`,
+`computer_removal_checks_a_locked_nodes_rooms_when_it_opens`,
+`computer_removal_names_a_room_without_a_local_admin`, and
+`computer_removal_offers_only_a_fresh_basis`.
+Run one name at a time with
+`cargo test --release -p vox-tui --features test-knobs,optional-proofs --test nodes_of_one_daemon_proof <name> -- --ignored --exact --nocapture`.
+The restart and absence acts use causal holds and require an exclusive proof slot.
+Removal choices are signed inside the existing computer removal event; old three-field
+events keep room memberships. Local completion and rooms checked on first unlock share
+the existing atomic computer snapshot. No separate removal worker or journal is used.
+Each accepted removal also keeps this computer's existing-node offer obligations and
+per-room basis cutoffs in that same snapshot. Until a room's cutoff is captured it
+offers none of that computer's nodes; afterwards only pre-removal bases are suppressed.
+A deliberate fresh join or consent is offered normally. Closed rooms capture before
+their first exchange on reopening; a node created after the removal inherits nothing.
+
 
 ### macOS update recovery (ADR-014 M-29a)
 
@@ -216,6 +267,34 @@ run** for the paging change, and blocks neither CI nor release. CI compiles it. 
 ```sh
 CARGO_BUILD_JOBS=2 cargo test --release -p vox-tui --features optional-proofs --test a_large_room_reads_whole_proof a_hundred_thousand_entry_session_opens_in_one_second_with_bounded_memory -- --ignored --exact --nocapture
 ```
+
+## Agent retry ownership (ADR-052 RG-4)
+
+The optional acts in `agent_hook_proof` drive the generated, shipped OMP extension with
+`support/omp_turn_host.mjs`, the existing recorded-reproduction host stand-in, not a model.
+Each process uses scratch data and config roots. Run one exact act in release with
+`--features test-knobs,optional-proofs -- --ignored --exact <name> --nocapture`:
+
+- `a_native_omp_conversation_survives_a_decided_turn_restart`: physically pauses the replacement
+  daemon during a held turn; later room news must appear once in the same conversation.
+- `a_native_omp_turn_without_a_decision_stays_uncertain`: preserves the undecided refusal.
+- `a_native_omp_conversation_finishes_a_decision_after_a_room_move`: holds a real saved
+  attention receipt across an operator room move; the next hook finishes it and new-room news
+  is shown once. The old Session must be reported ended before that hook.
+- `a_native_omp_conversation_finishes_a_decision_after_a_session_resume`: ends and resumes the conversation's
+  Session in its original room while a decided receipt is pending; the next hook finishes and
+  later news is shown once.
+- `nine_restarted_sessions_wait_for_registration`: nine real hooks contend on the kernel lock.
+- `a_sibling_room_post_is_accepted_after_policy_installation`: holds real sibling startup across policy
+  installation and the room-startup boundary. A sibling room operation is accepted after
+  policy installation, and the pending native Session opens after release without another hook.
+  Its verdict uses the product's response, not a count of status polls.
+- `a_linked_worktree_gets_its_repository_offer_and_names_map_authority`: checks both hook riders.
+
+`key_package_proof` also includes `a_governance_refresh_is_a_retryable_read_refusal` and
+`an_abandoned_key_request_is_selected_again`, run with `test-knobs`. The latter abandons one
+real selected log package before Open; the returning offline member must still read the
+sender's post while direct key sends remain held. No in-process node or live model is used.
 
 ## Busy-room newcomer and paging (ADR-052 RG-1, #1315)
 

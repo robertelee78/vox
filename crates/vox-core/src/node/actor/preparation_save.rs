@@ -701,7 +701,6 @@ impl Node {
                                 // publication.
                                 Some(Stage::Packages) => {
                                     self.key_package_governance_wait.insert(room);
-                                    self.key_package_unopened.insert(room);
                                     prepared.save.resume_after_governance = Some(Stage::Legacy);
                                 }
                                 // Likewise a legacy Session row whose causal past has not
@@ -939,10 +938,21 @@ impl Node {
         // Publish the room before work that needs restored membership or peer history.
         // Its normal governance/Drive owners retain and complete rotation and refresh;
         // closing it here would prevent the readmission or missing history from arriving.
+        // A saved trust withdrawal is settled by Stage::Trust below. Session refresh can
+        // author records, so defer it too rather than refusing the open at its egress fence.
+        let trust_withdrawal = if prepared.save.stage == Stage::Refresh {
+            let signer = self.profile.as_ref().ok_or(Error::AtRestLocked)?.signer()?;
+            crate::node::pending_lock::PendingLocks::load(&store, signer)?
+                .for_room(&id)
+                .any(|target| channel.is_author(&target))
+        } else {
+            false
+        };
         if prepared.save.stage == Stage::Refresh
             && (channel.is_member_removed(&store, &channel.me())?
                 || channel.room_removal_rotation_needed(&store)?
-                || channel.room_removal_drive_rotation_needed(&store)?)
+                || channel.room_removal_drive_rotation_needed(&store)?
+                || trust_withdrawal)
         {
             prepared.save.stage = Stage::Retention(Step::OwedCleanup);
         }
@@ -963,6 +973,10 @@ impl Node {
             prepared.save.stage = Stage::Trust;
         }
         if prepared.save.stage == Stage::Trust {
+            if !self.capture_room_offer_boundary(&channel, &store)? {
+                prepared.save.lifetime = None;
+                return Ok(false);
+            }
             let trusted = self.trust.trusted();
             let scope = if prepared.save.cache_only {
                 trust_save::ReconcileScope::Cache
@@ -1004,6 +1018,7 @@ impl Node {
                     prepared.save.request =
                         Some(Work::Consent(consent_save::Work::Withdraw { target }));
                 }
+                #[cfg(feature = "test-knobs")]
                 trust_save::ReconcileAction::Progress => {
                     prepared.progressed("narrowing its trust", now.get());
                     return Ok(false);
@@ -1045,9 +1060,6 @@ impl Node {
                     Some(Work::Packages(package_save::Work::Select {
                         trust_digest: crate::hash::sha256(&self.trust.to_bytes()),
                         replay: false,
-                        // The prior chain finished or was rejected before this turn.
-                        // Retry an interrupted package from its unchanged durable cursor.
-                        abandon_unopened: true,
                     }))
                 }
                 _ => return Err(Error::Profile("unexpected preparation stage")),

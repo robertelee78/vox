@@ -1010,6 +1010,11 @@ impl PendingText {
         extra: &[(u64, Option<SealedSegment>)],
         boundary: Option<&recovery::AppendBoundary>,
     ) -> Result<()> {
+        let releases_key = matches!(
+            signed_kind,
+            SignedEntryKind::Content | SignedEntryKind::KeyPackage
+        ) || (signed_kind == SignedEntryKind::Governance
+            && crate::wire::parse_frame(&payload)?.tag == crate::wire::StructTag::ConsentGrant);
         let keep_log = kind == EntryKind::Governance || signed_kind == SignedEntryKind::StepPolicy;
         let required = self.required(signed_kind)?;
         let context = self.context(store, signer, &required)?;
@@ -1162,10 +1167,7 @@ impl PendingText {
         // Acquisition and commit are outside every room/actor/key-byte guard. Batch stays on
         // this physical thread, preserving the existing durable received-debt settlement.
         let mut batch = store.batch()?;
-        if matches!(
-            signed_kind,
-            SignedEntryKind::Content | SignedEntryKind::KeyPackage
-        ) {
+        if releases_key {
             self.require_trust_withdrawn(store, signer)?;
         }
         let accepted = self.sek.with(|sek| {

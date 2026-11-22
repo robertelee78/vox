@@ -298,6 +298,12 @@ pub struct ComputerStatus {
     pub binding_actions: Vec<ComputerBindingAction>,
     /// Former members retained as removal history, never acknowledgement of remote erasure.
     pub removed: Vec<ComputerIdentity>,
+    /// Room choices shown by a removal review, checked again before the removal is saved.
+    #[serde(default)]
+    pub removal_rooms: Vec<super::RemovalRoom>,
+    /// Saved local removal choices and outstanding memberships.
+    #[serde(default)]
+    pub removals: Vec<super::RemovalProgress>,
     /// Exact frontier to confirm when removing a computer; stale confirmations are refused.
     pub frontier: String,
     /// Saved local selection, including before a group is formed.
@@ -1785,7 +1791,14 @@ impl Management {
     }
 
     /// Confirm removal against the exact displayed signed frontier and affected roster.
-    pub fn remove(&self, target: &str, expected: &str) -> Result<ComputerStatus> {
+    pub fn remove(
+        &self,
+        target: &str,
+        expected: &str,
+        keep_rooms: bool,
+        rooms: &[super::RemovalRoom],
+        checked_nodes: &[Digest32],
+    ) -> Result<ComputerStatus> {
         let target = crate::node::link::fingerprint_input(target, "computer fingerprint")?;
         self.computer.change(|s| {
             if frontier(s) != expected { return Err(Error::Profile("computer trust changed; review the computer and affected nodes again before removing it")); }
@@ -1794,11 +1807,29 @@ impl Management {
                 (g.computer.fingerprint().ok() == Some(target)).then_some(*id)).collect();
             grants.sort();
             if grants.is_empty() { return Err(Error::Profile("this computer is not an active group member")); }
+            let mut row_count = rooms.len() + s.removal_local.values().map(Vec::len).sum::<usize>();
+            for record in s.history.values() {
+                let event = record.event()?;
+                if event.author == self.computer.signer.fingerprint() {
+                    row_count += event.removal.map_or(0, |removal| removal.rooms.len());
+                }
+            }
+            if row_count > MAX_RECORDS
+                || s.removal_local.len() + checked_nodes.len() > MAX_RECORDS {
+                return Err(Error::Profile(HISTORY_FULL));
+            }
             let mut body = Encoder::new();
-            body.array(3).bytes(&target).array(grants.len());
+            body.array(5).bytes(&target).array(grants.len());
             for grant in grants { body.bytes(&grant); }
             body.bytes(&s.rosters.get(&target).map(Control::id).unwrap_or([0; 32]));
+            #[cfg(feature = "test-knobs")]
+            let keep_rooms = keep_rooms || super::fx28_mutant("removal-choice-not-saved");
+            body.uint(u64::from(keep_rooms));
+            super::removal::put_rooms(&mut body, rooms);
             let event = Control::sign(s, "remove", body.finish(), self.computer.signer.as_ref())?;
+            for node in checked_nodes {
+                s.removal_local.insert((event.id(), *node), Vec::new());
+            }
             s.retain_roster(event)?;
             Ok(())
         })?;
@@ -1852,6 +1883,7 @@ impl Management {
             expired: Computer::revision_expired(&s),
         };
         let mut pending_nodes = lock(&self.unavailable_nodes).clone();
+        pending_nodes.extend(Computer::suppression_pending(&s));
         pending_nodes.extend(
             lock(&self.pending_nodes)
                 .values()
@@ -2096,6 +2128,8 @@ impl Management {
                 .values()
                 .map(ComputerIdentity::of)
                 .collect::<Result<_>>()?,
+            removal_rooms: Vec::new(),
+            removals: Computer::removal_progress(&s, local)?,
             frontier: frontier(&s),
             selected_node: s.selected.as_ref().map(text_id),
             selected_name: s.selected.map(|_| s.selected_name.clone()),

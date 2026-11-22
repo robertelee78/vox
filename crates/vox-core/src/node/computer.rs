@@ -23,11 +23,13 @@ use zeroize::Zeroizing;
 
 mod pairing;
 mod publication_gate;
+mod removal;
 pub use pairing::{
     ComputerApplication, ComputerBindingAction, ComputerGroupConflict, ComputerGroupRetirement,
     ComputerIdentity, ComputerNode, ComputerStatus, ExchangeRecord, Management, PairingPreview,
     COMPUTER_PAIR_WITHIN,
 };
+pub use removal::{RemovalProgress, RemovalRoom};
 
 /// A trust change must either be applied by an attached node or make that node visibly no longer
 /// attached within this long (ADR-038 FX-28).
@@ -853,7 +855,10 @@ impl Control {
                 });
             }
             "remove" => {
-                arity(&mut body, 3)?;
+                let fields = count(&mut body)?;
+                if fields != 3 && fields != 5 {
+                    return Err(bad());
+                }
                 let target = digest(&mut body)?;
                 let mut grants = Vec::new();
                 for _ in 0..count(&mut body)? {
@@ -863,10 +868,24 @@ impl Control {
                     return Err(bad());
                 }
                 let roster = digest(&mut body)?;
+                // Three-field removals predate room eviction and never authorize it.
+                let keep_rooms = fields == 3
+                    || match body.uint()? {
+                        0 => false,
+                        1 => true,
+                        _ => return Err(bad()),
+                    };
+                let rooms = if fields == 5 {
+                    removal::read_rooms(&mut body)?
+                } else {
+                    Vec::new()
+                };
                 removal = Some(Removal {
                     target,
                     grants,
                     roster,
+                    keep_rooms,
+                    rooms,
                 });
             }
             "reach" => {
@@ -964,6 +983,8 @@ struct Removal {
     target: Digest32,
     grants: Vec<Digest32>,
     roster: Digest32,
+    keep_rooms: bool,
+    rooms: Vec<RemovalRoom>,
 }
 
 /// Current authenticated contact facts, carried by the same author chain as membership.
@@ -1151,6 +1172,12 @@ pub(crate) struct State {
     selected_name: String,
     binding_approvals: BTreeMap<Digest32, BindingApproval>,
     retired_groups: BTreeMap<Digest32, Enrollment>,
+    /// Local room results: None is done; Some(creator) names missing removal authority.
+    removal_done: BTreeMap<(Digest32, Digest32), Option<Digest32>>,
+    /// Rooms captured once when a local node not ready during removal next attaches.
+    removal_local: BTreeMap<(Digest32, Digest32), Vec<RemovalRoom>>,
+    /// CJ-11 obligations and immutable per-room offer cuts, folded with the removal.
+    suppression: BTreeMap<Digest32, removal::Suppression>,
 }
 impl State {
     /// Advance the durable journal for a management fact which is exchanged but is not yet an
@@ -1654,6 +1681,7 @@ impl State {
     }
     fn fold_history(&mut self) -> Result<()> {
         let next = self.derive()?;
+        self.capture_suppression(&next.accepted)?;
         let first_activation = self.genesis.as_ref().is_some_and(|g| {
             g.grants.iter().any(|grant| {
                 !self
@@ -1769,7 +1797,7 @@ impl State {
 
     fn body(&self) -> Vec<u8> {
         let mut e = Encoder::for_secrets();
-        e.array(32)
+        e.array(35)
             .bytes(&self.description.encode())
             .uint(self.revision)
             .array(self.invitations.len());
@@ -1924,6 +1952,24 @@ impl State {
         for (node, revision) in &self.application_misses {
             e.array(2).bytes(node).uint(*revision);
         }
+        e.array(self.removal_done.len());
+        for ((event, row), authority) in &self.removal_done {
+            e.array(3).bytes(event).bytes(row).bytes(
+                authority
+                    .as_ref()
+                    .map_or(&[][..], |creator| creator.as_slice()),
+            );
+        }
+        e.array(self.removal_local.len());
+        for ((event, node), rooms) in &self.removal_local {
+            e.array(3).bytes(event).bytes(node);
+            removal::put_rooms(&mut e, rooms);
+        }
+        e.array(self.suppression.len());
+        for (event, suppression) in &self.suppression {
+            e.array(2).bytes(event);
+            suppression.put(&mut e);
+        }
         e.finish()
     }
     fn read(vault: Vec<u8>, body: &[u8]) -> Result<Self> {
@@ -1932,7 +1978,7 @@ impl State {
         // durable pre-keyring application record, inbound/outbound miss distinction, or local
         // node-application miss history.
         let fields = count(&mut d)?;
-        if !(25..=32).contains(&fields) {
+        if !(25..=35).contains(&fields) {
             return Err(bad());
         }
         let description = Description::decode(d.bytes()?)?;
@@ -2293,8 +2339,50 @@ impl State {
                 }
             }
         }
+        let mut removal_done = BTreeMap::new();
+        if fields >= 33 {
+            for _ in 0..count(&mut d)? {
+                arity(&mut d, 3)?;
+                let key = (digest(&mut d)?, digest(&mut d)?);
+                let authority = match d.bytes()? {
+                    [] => None,
+                    bytes => Some(bytes.try_into().map_err(|_| bad())?),
+                };
+                if removal_done.insert(key, authority).is_some() {
+                    return Err(bad());
+                }
+            }
+        }
+        let mut removal_local = BTreeMap::new();
+        if fields >= 34 {
+            for _ in 0..count(&mut d)? {
+                arity(&mut d, 3)?;
+                let key = (digest(&mut d)?, digest(&mut d)?);
+                if removal_local
+                    .insert(key, removal::read_rooms(&mut d)?)
+                    .is_some()
+                {
+                    return Err(bad());
+                }
+            }
+        }
+        let mut suppression = BTreeMap::new();
+        if fields >= 35 {
+            for _ in 0..count(&mut d)? {
+                arity(&mut d, 2)?;
+                if suppression
+                    .insert(digest(&mut d)?, removal::Suppression::read(&mut d)?)
+                    .is_some()
+                {
+                    return Err(bad());
+                }
+            }
+        }
         d.finish()?;
         let mut s = Self {
+            suppression,
+            removal_done,
+            removal_local,
             application_misses,
             received_misses,
             prepared,
@@ -4096,6 +4184,9 @@ impl Computer {
         };
         Description::decode(&description.encode())?;
         let state = State {
+            suppression: BTreeMap::new(),
+            removal_done: BTreeMap::new(),
+            removal_local: BTreeMap::new(),
             intervals: BTreeMap::new(),
             retired_nodes: BTreeMap::new(),
             individual: BTreeMap::new(),

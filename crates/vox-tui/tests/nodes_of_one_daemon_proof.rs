@@ -44,6 +44,14 @@ optional_proof::not_run!(
     a_trust_change_skips_a_left_room_and_additions_refuse_no_posts,
     an_unfinished_room_refuses_only_its_own_posts_then_finishes,
     an_unfinished_room_releases_no_key_until_its_withdrawal_finishes,
+    a_post_racing_a_trust_revision_is_saved_once,
+    a_saved_manual_removal_finishes_while_another_room_posts,
+    computer_removal_resumes_its_saved_room_choices_after_restart,
+    computer_removal_keeps_rooms_without_offering_removed_nodes,
+    computer_removal_reconciles_absence_before_a_fresh_join,
+    computer_removal_checks_a_locked_nodes_rooms_when_it_opens,
+    computer_removal_offers_only_a_fresh_basis,
+    computer_removal_names_a_room_without_a_local_admin,
 );
 
 use std::io::{Read as _, Write as _};
@@ -4361,6 +4369,7 @@ struct RoomTrustJourney {
     healthy: String,
     link: String,
     hold: PathBuf,
+    queued_key: PathBuf,
 }
 
 #[cfg(feature = "optional-proofs")]
@@ -4373,11 +4382,22 @@ impl RoomTrustJourney {
         let beta = b.make_node("beta");
         let gamma = c.make_node("gamma");
         let hold = a.data.join("rg3-withdrawal");
+        let queued_key = a.data.join("rg3-queued-key");
         let daemons = vec![
             Daemon::start(
                 &a,
                 &[],
-                &[("VOX_TEST_RG3_HOLD_WITHDRAWAL", hold.to_str().unwrap())],
+                &[
+                    ("VOX_TEST_RG3_HOLD_WITHDRAWAL", hold.to_str().unwrap()),
+                    (
+                        "VOX_TEST_HOLD_COMPUTER_EVICTION",
+                        a.data.join("rg8-eviction").to_str().unwrap(),
+                    ),
+                    (
+                        "VOX_TEST_HOLD_PAIRWISE_KEY_FILE",
+                        queued_key.to_str().unwrap(),
+                    ),
+                ],
             ),
             Daemon::start(&b, &[], &[]),
             Daemon::start(&c, &[], &[]),
@@ -4486,6 +4506,7 @@ impl RoomTrustJourney {
             healthy,
             link,
             hold,
+            queued_key,
         }
     }
 
@@ -4496,7 +4517,13 @@ impl RoomTrustJourney {
             .to_owned();
         computer(
             &self.a,
-            &["remove", &self.beta_computer, "--confirm", &frontier],
+            &[
+                "remove",
+                &self.beta_computer,
+                "--confirm",
+                &frontier,
+                "--keep-rooms",
+            ],
         );
         assert!(
             wait_until(CHANGE_SHOWN_WITHIN, || {
@@ -4519,6 +4546,7 @@ impl RoomTrustJourney {
     }
 
     fn assert_current(&self) {
+        let deadline = Instant::now() + RETURN_WITHIN;
         loop {
             let status = computer(&self.a, &["status"]);
             let local = &status["this_computer"]["fingerprint"];
@@ -4532,6 +4560,18 @@ impl RoomTrustJourney {
                 });
             if current {
                 return;
+            }
+            if self.hold.with_extension("engaged").is_file() {
+                // The actor has sent its application reply, but the computer task can still
+                // be consuming it when the independent room reaches this hold. Judge that
+                // interval by a real post/read, not by the scheduling order of two tasks.
+                self.assert_healthy_posts("rg3-post-before-application-receipt");
+                assert!(
+                    Instant::now() < deadline,
+                    "APPARATUS: other-room posts progressed but the local application receipt did not settle: {status}"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
             }
             // The group-wide state also waits for other computers. Judge this node at its
             // held room boundary, or its reported left-room failure, not remote convergence.
@@ -4548,6 +4588,11 @@ impl RoomTrustJourney {
                 !self.hold.with_extension("engaged").is_file() && !left_failed,
                 "PRODUCT: alpha's saved keyring is not current at its unfinished-room boundary: {status}"
             );
+            assert!(
+                Instant::now() < deadline,
+                "APPARATUS: local application receipt did not settle before staging withdrawal: {status}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
         }
     }
 
@@ -4646,6 +4691,66 @@ fn an_unfinished_room_refuses_only_its_own_posts_then_finishes() {
     watchdog::arm();
     test_knobs::require(&["VOX_TEST_RG3_HOLD_WITHDRAWAL"]);
     let journey = RoomTrustJourney::new(false);
+    let (ok, out, err) = journey.c.run(
+        &[
+            "room",
+            "join",
+            &journey.link,
+            "--node",
+            "gamma",
+            "--passphrase-file",
+            "-",
+        ],
+        ROOM_PASS,
+    );
+    assert!(
+        ok,
+        "APPARATUS: surviving reader joins before withdrawal: {out}{err}"
+    );
+    let gamma = journey.c.make_node("gamma");
+    let alpha = journey.a.make_node("alpha");
+    let (ok, out, err) = journey.b.run(
+        &[
+            "trust",
+            "add",
+            &alpha,
+            "--name",
+            "alpha-kept-manually",
+            "--node",
+            "beta",
+        ],
+        "",
+    );
+    assert!(
+        ok,
+        "APPARATUS: preserve beta's chosen trust in the author: {out}{err}"
+    );
+    for (account, node, peer, name) in [
+        (&journey.c, "gamma", journey.beta.as_str(), "beta"),
+        (&journey.b, "beta", gamma.as_str(), "gamma"),
+    ] {
+        let (ok, out, err) =
+            account.run(&["trust", "add", peer, "--name", name, "--node", node], "");
+        assert!(
+            ok,
+            "APPARATUS: trust the surviving room exchange: {out}{err}"
+        );
+    }
+    assert!(
+        wait_until(RETURN_WITHIN, || {
+            journey
+                .b
+                .run(&["room", "read", &journey.room, "--node", "beta"], "")
+                .1
+                .contains("rg3-before-withdrawal")
+                && journey
+                    .c
+                    .run(&["room", "read", &journey.room, "--node", "gamma"], "")
+                    .1
+                    .contains("rg3-before-withdrawal")
+        }),
+        "APPARATUS: both removed and surviving readers must read the pre-withdrawal marker"
+    );
     journey.hold_withdrawal();
     journey.assert_healthy_posts("rg3-other-room-during-withdrawal");
     let text = "rg3-must-not-be-posted-before-withdrawal";
@@ -4665,18 +4770,65 @@ fn an_unfinished_room_refuses_only_its_own_posts_then_finishes() {
     std::fs::remove_file(&journey.hold).unwrap();
     let after = "rg3-after-room-withdrawal";
     let mut last = (false, String::new(), String::new());
-    assert!(wait_until(RETURN_WITHIN, || {
-        last = journey.a.run(&["room", "post", &journey.room, after, "--node", "alpha"], "");
-        last.0
-    }), "PRODUCT: releasing the room did not finish its existing withdrawal without another policy event: {}{}",
-        last.1, last.2);
-    let (ok, shown, err) = journey
-        .b
-        .run(&["room", "read", &journey.room, "--node", "beta"], "");
+    let mut released = false;
+    let mut exchanges = 0;
+    for index in 0..100 {
+        last = journey.a.run(
+            &["room", "post", &journey.room, after, "--node", "alpha"],
+            "",
+        );
+        if last.0 {
+            released = true;
+            break;
+        }
+        journey.assert_healthy_posts(&format!("rg3-release-progress-{index}"));
+        exchanges += 1;
+        std::thread::sleep(Duration::from_millis(25));
+    }
     assert!(
-        ok && !shown.contains(after),
-        "PRODUCT: removed computer read a post encrypted after withdrawal: {shown}{err}"
+        released,
+        "PRODUCT: the released room still refused its post after another room accepted and read {exchanges} posts: {}{}",
+        last.1,
+        last.2
     );
+    assert!(
+        wait_until(RETURN_WITHIN, || {
+            journey
+                .c
+                .run(&["room", "read", &journey.room, "--node", "gamma"], "")
+                .1
+                .contains(after)
+        }),
+        "APPARATUS: the surviving reader never read the acknowledged post after withdrawal"
+    );
+    for index in 0..10 {
+        let probe = format!("rg3-beta-after-withdrawal-{index}");
+        let (ok, out, err) = journey.b.run(
+            &["room", "post", &journey.room, &probe, "--node", "beta"],
+            "",
+        );
+        assert!(
+            ok,
+            "APPARATUS: removed reader's room probe was refused: {out}{err}"
+        );
+        assert!(
+            wait_until(RETURN_WITHIN, || {
+                journey
+                    .c
+                    .run(&["room", "read", &journey.room, "--node", "gamma"], "")
+                    .1
+                    .contains(&probe)
+            }),
+            "APPARATUS: surviving reader did not acknowledge the removed reader's probe"
+        );
+        let (ok, shown, err) = journey
+            .b
+            .run(&["room", "read", &journey.room, "--node", "beta"], "");
+        assert!(
+            ok && !shown.contains(after),
+            "PRODUCT: removed computer read a post encrypted after withdrawal: {shown}{err}"
+        );
+    }
     eprintln!("RG-3 GREEN: only the unfinished room refused posts; withdrawal resumed without restart or policy event");
 }
 
@@ -4688,7 +4840,13 @@ fn an_unfinished_room_releases_no_key_until_its_withdrawal_finishes() {
     test_knobs::require(&["VOX_TEST_RG3_HOLD_WITHDRAWAL"]);
     let journey = RoomTrustJourney::new(false);
     // Gamma was trusted before the marker but has never joined or received a sender key.
-    journey.hold_withdrawal();
+    let queued = std::env::var("VOX_PROOF_RG3_QUEUED_KEY").as_deref() == Ok("1");
+    if queued {
+        test_knobs::require(&["VOX_TEST_HOLD_PAIRWISE_KEY_FILE"]);
+        std::fs::write(&journey.queued_key, journey.c.make_node("gamma")).unwrap();
+    } else {
+        journey.hold_withdrawal();
+    }
     journey.assert_healthy_posts("rg3-key-request-does-not-block-other-room");
     let (ok, out, err) = journey.c.run(
         &[
@@ -4706,6 +4864,15 @@ fn an_unfinished_room_releases_no_key_until_its_withdrawal_finishes() {
         ok,
         "APPARATUS: trusted member could not join the held room to request its key: {out}{err}"
     );
+    if queued {
+        read_daemon_marker(
+            &journey.queued_key.with_extension("engaged"),
+            journey.a.lock_pid().expect("APPARATUS: alpha daemon PID"),
+            "a key queued before the trust withdrawal",
+        );
+        journey.hold_withdrawal();
+        std::fs::remove_file(&journey.queued_key).unwrap();
+    }
     // Ten completed room exchanges prove the member keeps asking, rather than treating one
     // empty immediate read as a key refusal. Each author acknowledgement is a product read.
     for index in 0..10 {
@@ -4718,6 +4885,7 @@ fn an_unfinished_room_releases_no_key_until_its_withdrawal_finishes() {
             ok,
             "APPARATUS: key-requesting member could not post its probe: {out}{err}"
         );
+        let exchange_deadline = Instant::now() + RETURN_WITHIN;
         loop {
             let (ok, shown, err) = journey
                 .a
@@ -4729,6 +4897,11 @@ fn an_unfinished_room_releases_no_key_until_its_withdrawal_finishes() {
             if shown.contains(&probe) {
                 break;
             }
+            assert!(
+                Instant::now() < exchange_deadline,
+                "APPARATUS: the author never acknowledged the requesting member's probe"
+            );
+            std::thread::sleep(Duration::from_millis(50));
         }
         let (ok, shown, err) = journey
             .c
@@ -4737,12 +4910,18 @@ fn an_unfinished_room_releases_no_key_until_its_withdrawal_finishes() {
             "PRODUCT: unfinished room released its sender key before withdrawal finished: {shown}{err}");
     }
     std::fs::remove_file(&journey.hold).unwrap();
+    let recovery_started = Instant::now();
     let mut received = false;
     let mut last = (false, String::new(), String::new());
     let mut last_post = (false, String::new(), String::new());
     let mut accepted_posts = 0;
     let after = "rg3-after-withdrawal-key-marker";
     for index in 0..100 {
+        if queued {
+            // A rejected queued opening has spent its one-time prekey. The existing signed-
+            // prekey fallback is 30 seconds; keep the counted probes slower than that tail.
+            std::thread::sleep(Duration::from_millis(500));
+        }
         // Keep alpha's head fixed once its first post is accepted: this proves key delivery,
         // not the separate moving-head history-fetch claim. Count completed room exchanges.
         if accepted_posts == 0 {
@@ -4758,6 +4937,7 @@ fn an_unfinished_room_releases_no_key_until_its_withdrawal_finishes() {
             "",
         );
         assert!(ok, "APPARATUS: key request probe was refused: {out}{err}");
+        let exchange_deadline = Instant::now() + RETURN_WITHIN;
         loop {
             let (ok, shown, err) = journey
                 .a
@@ -4769,12 +4949,31 @@ fn an_unfinished_room_releases_no_key_until_its_withdrawal_finishes() {
             if shown.contains(&probe) {
                 break;
             }
+            assert!(
+                Instant::now() < exchange_deadline,
+                "APPARATUS: the author never acknowledged the post-withdrawal probe"
+            );
+            std::thread::sleep(Duration::from_millis(50));
         }
         last = journey
             .c
             .run(&["room", "read", &journey.room, "--node", "gamma"], "");
         if last.0 && last.1.contains("rg3-before-withdrawal") && last.1.contains(after) {
             received = true;
+            if queued {
+                eprintln!(
+                    "[RG-3 queued recovery] both markers shown after {} completed requests in {:?}",
+                    index + 1,
+                    recovery_started.elapsed()
+                );
+                for line in journey._daemons[0].said().lines().filter(|line| {
+                    line.contains("room authorization changed")
+                        || line.contains("one-time prekey")
+                        || line.contains("signed prekey")
+                }) {
+                    eprintln!("[RG-3 queued sender] {line}");
+                }
+            }
             break;
         }
     }
@@ -4788,6 +4987,538 @@ fn an_unfinished_room_releases_no_key_until_its_withdrawal_finishes() {
         last.1, last.2);
     eprintln!(
         "RG-3 GREEN: member received no key while withdrawal was held, then received its owed key"
+    );
+}
+
+/// The existing publication hold parks only beta's actor. Alpha changes the computer policy
+/// while that exact original post is held; the terminal result and beta's read judge the race.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "causally held post publication; release with test-knobs,optional-proofs"]
+fn a_post_racing_a_trust_revision_is_saved_once() {
+    watchdog::arm();
+    test_knobs::require(&["VOX_TEST_HOLD_TEXT_APPEND_PUBLICATION"]);
+    let a = Account::new();
+    let b = Account::new();
+    a.make_node("alpha");
+    a.make_node("gamma");
+    b.make_node("beta");
+    let arm = b.data.join("rg3-post-arm");
+    let engaged = b.data.join("rg3-post-held");
+    let release = b.data.join("rg3-post-release.sock");
+    let spec = format!(
+        "beta\t{}\t{}\t{}",
+        arm.display(),
+        engaged.display(),
+        release.display()
+    );
+    let _da = Daemon::start(&a, &["--node", "alpha"], &[]);
+    let db = Daemon::start(
+        &b,
+        &["--node", "beta"],
+        &[("VOX_TEST_HOLD_TEXT_APPEND_PUBLICATION", &spec)],
+    );
+    let (ok, out, err) = a.run(&["node", "unlock", "gamma", "--passphrase-file", "-"], PASS);
+    assert!(ok, "APPARATUS: attach gamma: {out}{err}");
+    computer(&a, &["personal", "alpha"]);
+    computer(&b, &["personal", "beta"]);
+    let offer = computer(&a, &["invite"]);
+    let preview = computer(
+        &b,
+        &["pair", offer["invite_link"].as_str().unwrap(), "--preview"],
+    );
+    let operation = preview["pairing"]["operation_id"].as_str().unwrap();
+    computer(&b, &["approve", operation]);
+    computer(&a, &["approve", operation]);
+    assert!(
+        wait_until(CHANGE_SHOWN_WITHIN, || {
+            computer(&a, &["status"])["state"] == "confirmed"
+                && computer(&b, &["status"])["state"] == "confirmed"
+        }),
+        "APPARATUS: pairing did not settle before the post race"
+    );
+    let room = make_room(&b, "beta");
+    let before = computer(&b, &["status"])["revision"].as_u64().unwrap();
+    std::fs::write(&arm, b"hold the original post\n").unwrap();
+    const TEXT: &str = "rg3-post-kept-across-a-trust-revision";
+    let mut post = b
+        .cmd(&["room", "post", &room, TEXT, "--node", "beta"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("APPARATUS: start the original shipped post");
+    wait_for_command_marker(
+        &engaged,
+        &mut post,
+        db.child.id(),
+        Instant::now() + RETURN_WITHIN,
+        "the original post before publication admission",
+    );
+    computer(&a, &["personal", "gamma"]);
+    assert!(
+        wait_until(RETURN_WITHIN, || {
+            computer(&b, &["status"])["revision"]
+                .as_u64()
+                .is_some_and(|revision| revision > before)
+        }) && engaged.is_file(),
+        "APPARATUS: durable trust revision did not change while the exact post was held"
+    );
+    std::os::unix::net::UnixStream::connect(&release)
+        .expect("APPARATUS: release the original post");
+    let posted = post
+        .wait_with_output()
+        .expect("APPARATUS: collect the original shipped post");
+    assert!(
+        posted.status.success(),
+        "PRODUCT: the original post racing a trust revision was refused: stdout {}; stderr {}",
+        String::from_utf8_lossy(&posted.stdout),
+        String::from_utf8_lossy(&posted.stderr)
+    );
+    let (ok, shown, err) = b.run(&["room", "read", &room, "--node", "beta", "--json"], "");
+    let copies = shown
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|row| row["text"] == TEXT)
+        .count();
+    assert!(
+        ok && copies == 1,
+        "PRODUCT: the acknowledged original post was not saved exactly once: copies={copies}; {shown}{err}"
+    );
+}
+
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "counted manual-removal progress; release with test-knobs,optional-proofs"]
+fn a_saved_manual_removal_finishes_while_another_room_posts() {
+    watchdog::arm();
+    let journey = RoomTrustJourney::new(false);
+    let gamma = journey.c.make_node("gamma");
+    let (ok, out, err) = journey.c.run(
+        &[
+            "room",
+            "join",
+            &journey.link,
+            "--node",
+            "gamma",
+            "--passphrase-file",
+            "-",
+        ],
+        ROOM_PASS,
+    );
+    assert!(
+        ok,
+        "APPARATUS: independent manually trusted reader joins: {out}{err}"
+    );
+    assert!(
+        wait_until(RETURN_WITHIN, || {
+            journey
+                .c
+                .run(&["room", "read", &journey.room, "--node", "gamma"], "")
+                .1
+                .contains("rg3-before-withdrawal")
+        }),
+        "APPARATUS: the independent reader never received its consent before removal"
+    );
+    let mut command = typed::spawn(
+        &journey
+            .a
+            .cmd(&["trust", "remove", &gamma, "--node", "alpha"]),
+        PASS,
+    );
+    assert!(
+        wait_until(RETURN_WITHIN, || {
+            grant_words(&journey.a, "alpha", &gamma).is_none()
+        }),
+        "APPARATUS: the terminal removal never reached the saved-keyring premise"
+    );
+    let mut completed = false;
+    let mut posts = 0;
+    for index in 0..100 {
+        if command
+            .try_wait()
+            .expect("APPARATUS: inspect terminal removal")
+            .is_some()
+        {
+            completed = true;
+            break;
+        }
+        journey.assert_healthy_posts(&format!("rg3-removal-progress-{index}"));
+        posts += 1;
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    completed |= command
+        .try_wait()
+        .expect("APPARATUS: inspect terminal removal")
+        .is_some();
+    if !completed {
+        // End only this proof's daemon, so its terminal client is collected even on the
+        // counted failure. Neither the cleanup nor its elapsed time decides the verdict.
+        stop_pid(journey._daemons[0].child.id());
+    }
+    let output = command
+        .wait_with_output()
+        .expect("APPARATUS: collect terminal removal");
+    let shown = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        completed && output.status.success() && shown.contains("TYPED-EXIT 0"),
+        "PRODUCT: a saved manual removal did not finish while another room accepted and read {posts} posts: {shown}; {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// RG-8: the saved removal precedes room work; a restart owes the same evictions.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "two paired computers and a causal withdrawal hold; release with test-knobs,optional-proofs"]
+fn computer_removal_resumes_its_saved_room_choices_after_restart() {
+    let mut journey = RoomTrustJourney::new(false);
+    let outside = make_room(&journey.c, "gamma");
+    let outside_link = removal_link(&journey.c, "gamma", &outside);
+    removal_join(&journey.a, "alpha", &outside_link);
+    removal_join(&journey.b, "beta", &outside_link);
+    std::fs::write(&journey.hold, full_room_id(&journey.link, &journey.room)).unwrap();
+    let frontier = computer(&journey.a, &["status"])["frontier"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (ok, out, err) = journey.a.run(
+        &[
+            "computer",
+            "remove",
+            &journey.beta_computer,
+            "--confirm",
+            &frontier,
+        ],
+        "",
+    );
+    assert!(ok, "PRODUCT: computer removal failed: {out}{err}");
+    read_daemon_marker(
+        &journey.hold.with_extension("engaged"),
+        journey.a.lock_pid().unwrap(),
+        "saved removal before room eviction",
+    );
+    let (ok, members, err) = journey
+        .a
+        .run(&["room", "roster", &journey.room, "--node", "alpha"], "");
+    assert!(
+        ok && members.contains(&journey.beta),
+        "APPARATUS: crash boundary did not retain beta's membership: {members}{err}"
+    );
+    let pid = journey.a.lock_pid().unwrap();
+    let status = Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success(), "APPARATUS: crash scratch daemon");
+    assert!(
+        wait_until(ACTOR_WITHIN, || daemons_of(&journey.a.data).is_empty()),
+        "APPARATUS: crashed daemon still holds scratch profile"
+    );
+    std::fs::remove_file(&journey.hold).unwrap();
+    let eviction = journey.a.data.join("rg8-eviction");
+    std::fs::write(
+        &eviction,
+        format!("{}\tafter", full_room_id(&journey.link, &journey.room)),
+    )
+    .unwrap();
+    journey._daemons.push(Daemon::start(
+        &journey.a,
+        &[],
+        &[(
+            "VOX_TEST_HOLD_COMPUTER_EVICTION",
+            eviction.to_str().unwrap(),
+        )],
+    ));
+    let (ok, out, err) = journey
+        .a
+        .run(&["node", "unlock", "alpha", "--passphrase-file", "-"], PASS);
+    assert!(ok, "APPARATUS: restart alpha: {out}{err}");
+    removal_wait_room_open(&journey.a, "alpha", &journey.room);
+    let settled = wait_until(RETURN_WITHIN, || {
+        let (ok, members, _) = journey
+            .a
+            .run(&["room", "roster", &journey.room, "--node", "alpha"], "");
+        ok && !members.contains(&journey.beta)
+    });
+    let (ok, members, err) = journey
+        .a
+        .run(&["room", "roster", &journey.room, "--node", "alpha"], "");
+    assert!(ok, "APPARATUS: restart eviction cannot be judged because its roster was refused: {members}{err}");
+    assert!(settled && !members.contains(&journey.beta),
+        "PRODUCT: saved computer removal left beta in its administered room after restart: {members}{err}; status={}",
+        computer(&journey.a, &["status"]));
+    let (ok, offers, err) = journey.a.run(&["trust", "offers", "--node", "alpha"], "");
+    assert!(
+        ok && !offers.contains(&journey.beta),
+        "PRODUCT: removed computer's node offered after restart: {offers}{err}"
+    );
+    read_daemon_marker(
+        &eviction.with_extension("engaged"),
+        journey.a.lock_pid().unwrap(),
+        "eviction committed before its local completion mark",
+    );
+    let pid = journey.a.lock_pid().unwrap();
+    assert!(
+        Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success(),
+        "APPARATUS: crash after committed eviction"
+    );
+    assert!(
+        wait_until(ACTOR_WITHIN, || daemons_of(&journey.a.data).is_empty()),
+        "APPARATUS: second crashed daemon still holds scratch profile"
+    );
+    std::fs::remove_file(&eviction).unwrap();
+    journey._daemons.push(Daemon::start(&journey.a, &[], &[]));
+    let (ok, out, err) = journey
+        .a
+        .run(&["node", "unlock", "alpha", "--passphrase-file", "-"], PASS);
+    assert!(ok, "APPARATUS: restart after eviction: {out}{err}");
+    removal_wait_room_open(&journey.a, "alpha", &journey.room);
+    assert!(
+        wait_until(RETURN_WITHIN, || {
+            let status = computer(&journey.a, &["status"]);
+            status["removals"].as_array().is_some_and(|rows| {
+                rows.iter().all(|removal| {
+                    removal["pending"].as_array().is_some_and(|pending| {
+                        pending.iter().all(|row| {
+                            row["room"]
+                                != serde_json::to_value(
+                                    vox_core::node::link::b32_decode(
+                                        &full_room_id(&journey.link, &journey.room),
+                                        "room",
+                                    )
+                                    .unwrap(),
+                                )
+                                .unwrap()
+                        })
+                    })
+                })
+            })
+        }),
+        "PRODUCT: committed eviction was not reconciled after restart: {}",
+        computer(&journey.a, &["status"])
+    );
+    let (ok, status, err) = journey.a.run(&["computer", "status"], "");
+    assert!(
+        ok && status.contains(&full_room_id(&outside_link, &outside))
+            && status.contains(&journey.beta)
+            && status.contains("no local node may evict")
+            && status.contains("vox room remove-member"),
+        "PRODUCT: status did not name the unauthorised room, node and command: {status}{err}"
+    );
+}
+
+/// RG-8: the interactive question is asked once, and keeping rooms never restores offers.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "two paired computers; release with test-knobs,optional-proofs"]
+fn computer_removal_keeps_rooms_without_offering_removed_nodes() {
+    let mut journey = RoomTrustJourney::new(false);
+    let (ok, out, question) = journey.a.run(
+        &["computer", "remove", &journey.beta_computer, "--keep-rooms"],
+        "y\n",
+    );
+    assert!(
+        ok && question.matches("[y/N]").count() == 1
+            && question.contains(&journey.beta)
+            && question.contains("keep membership"),
+        "PRODUCT: removal did not ask once with the reviewed node and room choice: {out}{question}"
+    );
+    assert!(
+        wait_until(CHANGE_SHOWN_WITHIN, || grant_words(
+            &journey.a,
+            "alpha",
+            &journey.beta
+        )
+        .is_none()),
+        "PRODUCT: removal kept the computer's trust grant"
+    );
+    stop_pid(journey.a.lock_pid().unwrap());
+    journey._daemons.push(Daemon::start(&journey.a, &[], &[]));
+    let (ok, out, err) = journey
+        .a
+        .run(&["node", "unlock", "alpha", "--passphrase-file", "-"], PASS);
+    assert!(
+        ok,
+        "APPARATUS: restart after keeping room memberships: {out}{err}"
+    );
+    removal_wait_room_open(&journey.a, "alpha", &journey.room);
+    let (ok, members, err) = journey
+        .a
+        .run(&["room", "roster", &journey.room, "--node", "alpha"], "");
+    assert!(
+        ok && members.contains(&journey.beta),
+        "PRODUCT: --keep-rooms evicted beta: {members}{err}"
+    );
+    let (ok, offers, err) = journey.a.run(&["trust", "offers", "--node", "alpha"], "");
+    assert!(
+        ok && !offers.contains(&journey.beta),
+        "PRODUCT: removed computer's node offered despite --keep-rooms: {offers}{err}"
+    );
+}
+
+#[cfg(feature = "optional-proofs")]
+fn removal_join(account: &Account, node: &str, link: &str) {
+    let mut last = String::new();
+    let mut fault = None;
+    let joined = wait_until(RETURN_WITHIN, || {
+        let (ok, out, err) = account.run(
+            &[
+                "room",
+                "join",
+                link,
+                "--node",
+                node,
+                "--passphrase-file",
+                "-",
+            ],
+            ROOM_PASS,
+        );
+        last = format!("{out}{err}");
+        if ok {
+            return true;
+        }
+        if !last.contains("Session cleanup is still pending; no deletion started for this request")
+        {
+            fault = Some(last.clone());
+            return true;
+        }
+        false
+    });
+    assert!(joined && fault.is_none(),
+        "APPARATUS: {node} did not finish the removal-room admission after the product's cleanup-not-ready reply: {last}");
+}
+
+#[cfg(feature = "optional-proofs")]
+fn removal_link(account: &Account, node: &str, room: &str) -> String {
+    let (ok, out, err) = account.run(&["room", "link", room, "--node", node], "");
+    assert!(ok, "APPARATUS: removal room link: {out}{err}");
+    out.lines()
+        .find(|line| line.starts_with("vox://"))
+        .unwrap()
+        .to_owned()
+}
+
+/// A roster absence completes the old removal, not a future fresh admission.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "paired computers with a staged departure; release with test-knobs,optional-proofs"]
+fn computer_removal_reconciles_absence_before_a_fresh_join() {
+    let journey = RoomTrustJourney::new(false);
+    let link = removal_link(&journey.a, "alpha", &journey.healthy);
+    removal_join(&journey.b, "beta", &link);
+    let eviction = journey.a.data.join("rg8-eviction");
+    std::fs::write(
+        &eviction,
+        format!("{}\tbefore", full_room_id(&link, &journey.healthy)),
+    )
+    .unwrap();
+    std::fs::write(&journey.hold, full_room_id(&journey.link, &journey.room)).unwrap();
+    let frontier = computer(&journey.a, &["status"])["frontier"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    computer(
+        &journey.a,
+        &["remove", &journey.beta_computer, "--confirm", &frontier],
+    );
+    read_daemon_marker(
+        &journey.hold.with_extension("engaged"),
+        journey.a.lock_pid().unwrap(),
+        "saved removal before its second-room eviction",
+    );
+    let (ok, out, err) = journey
+        .b
+        .run(&["room", "leave", &journey.healthy, "--node", "beta"], "");
+    assert!(ok, "APPARATUS: beta leaves before eviction: {out}{err}");
+    assert!(
+        wait_until(RETURN_WITHIN, || !journey
+            .a
+            .run(&["room", "roster", &journey.healthy, "--node", "alpha"], "")
+            .1
+            .contains(&journey.beta)),
+        "APPARATUS: alpha did not observe beta's departure"
+    );
+    std::fs::remove_file(&eviction).unwrap();
+    // The room's ordinary command advances its existing governance continuation.
+    journey.assert_healthy_posts("removal-observes-absence");
+    let status = computer(&journey.a, &["status"]);
+    assert!(
+        status["removals"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty()),
+        "PRODUCT: the computer removal has no durable room result: {status}"
+    );
+    read_daemon_marker(
+        &eviction.with_extension("observed"),
+        journey.a.lock_pid().unwrap(),
+        "the existing room continuation observed beta's absence",
+    );
+    removal_join(&journey.b, "beta", &link);
+    // Give the old removal twenty actual room turns, not a timed quiet window.
+    for index in 0..20 {
+        journey.assert_healthy_posts(&format!("fresh-admission-after-removal-{index}"));
+    }
+    let (ok, members, err) = journey
+        .a
+        .run(&["room", "roster", &journey.healthy, "--node", "alpha"], "");
+    assert!(
+        ok && members.contains(&journey.beta),
+        "PRODUCT: the old computer removal evicted a fresh admission: {members}{err}"
+    );
+    std::fs::remove_file(&journey.hold).unwrap();
+}
+
+/// A locked local node is named until its own rooms can be checked, then evicts by its normal path.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "paired computers and a locked local admin; release with test-knobs,optional-proofs"]
+fn computer_removal_checks_a_locked_nodes_rooms_when_it_opens() {
+    let journey = RoomTrustJourney::new(false);
+    let delta = journey.a.make_node("delta");
+    let (ok, out, err) = journey
+        .a
+        .run(&["node", "unlock", "delta", "--passphrase-file", "-"], PASS);
+    assert!(ok, "APPARATUS: unlock delta: {out}{err}");
+    let room = make_room(&journey.a, "delta");
+    let link = removal_link(&journey.a, "delta", &room);
+    removal_join(&journey.b, "beta", &link);
+    let (ok, out, err) = journey.a.run(&["node", "lock", "delta"], "");
+    assert!(ok, "APPARATUS: lock local room admin: {out}{err}");
+    let frontier = computer(&journey.a, &["status"])["frontier"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    computer(
+        &journey.a,
+        &["remove", &journey.beta_computer, "--confirm", &frontier],
+    );
+    let (ok, status, err) = journey.a.run(&["computer", "status"], "");
+    assert!(
+        ok && status.contains(&delta) && status.contains("have not been checked yet"),
+        "PRODUCT: status hid the locked node's unchecked rooms: {status}{err}"
+    );
+    let (ok, out, err) = journey
+        .a
+        .run(&["node", "unlock", "delta", "--passphrase-file", "-"], PASS);
+    assert!(ok, "APPARATUS: reopen local admin: {out}{err}");
+    removal_wait_room_open(&journey.a, "delta", &room);
+    assert!(
+        wait_until(RETURN_WITHIN, || {
+            let (ok, members, _) = journey
+                .a
+                .run(&["room", "roster", &room, "--node", "delta"], "");
+            ok && !members.contains(&journey.beta)
+        }),
+        "PRODUCT: removed computer's node remained in the reopened locked admin's room: {}",
+        journey
+            .a
+            .run(&["room", "roster", &room, "--node", "delta"], "")
+            .1
     );
 }
 
@@ -5460,6 +6191,7 @@ fn enrolled_computers_follow_node_changes_and_retire_removed_authority() {
             &b_id,
             "--confirm",
             status["frontier"].as_str().unwrap(),
+            "--keep-rooms",
         ],
     );
     assert!(
@@ -5572,6 +6304,7 @@ fn enrolled_computers_follow_node_changes_and_retire_removed_authority() {
                 target,
                 "--confirm",
                 status["frontier"].as_str().unwrap(),
+                "--keep-rooms",
             ],
         );
         if target == &a_id {
@@ -9565,7 +10298,14 @@ fn stale_rekey_is_not_delivered(
     std::fs::write(rekey_engaged.with_extension("target"), &c_id)
         .expect("APPARATUS: arm the exact third-Computer removal writer");
     let mut removal = b
-        .cmd(&["computer", "remove", &c_id, "--confirm", frontier])
+        .cmd(&[
+            "computer",
+            "remove",
+            &c_id,
+            "--confirm",
+            frontier,
+            "--keep-rooms",
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -9712,6 +10452,7 @@ fn stale_rekey_is_not_delivered(
             &a_id,
             "--confirm",
             status["frontier"].as_str().unwrap_or_default(),
+            "--keep-rooms",
         ],
     );
     assert!(
@@ -10097,4 +10838,127 @@ fn daemon_alive(pid: u32) -> bool {
         .output()
         .unwrap_or_else(|e| panic!("APPARATUS: could not inspect daemon pid {pid}: {e}"));
     out.status.success() && !out.stdout.is_empty()
+}
+/// CJ-11: an old basis stays suppressed while a deliberate fresh admission can be trusted.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "two paired computers and a fresh room admission; release with test-knobs,optional-proofs"]
+fn computer_removal_offers_only_a_fresh_basis() {
+    let journey = RoomTrustJourney::new(false);
+    let link = removal_link(&journey.a, "alpha", &journey.healthy);
+    removal_join(&journey.b, "beta", &link);
+    assert!(
+        wait_until(RETURN_WITHIN, || journey
+            .a
+            .run(&["room", "roster", &journey.healthy, "--node", "alpha"], "")
+            .1
+            .contains(&journey.beta)),
+        "APPARATUS: beta's old membership was not visible before removal"
+    );
+    let frontier = computer(&journey.a, &["status"])["frontier"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    computer(
+        &journey.a,
+        &[
+            "remove",
+            &journey.beta_computer,
+            "--confirm",
+            &frontier,
+            "--keep-rooms",
+        ],
+    );
+    assert!(
+        wait_until(CHANGE_SHOWN_WITHIN, || grant_words(
+            &journey.a,
+            "alpha",
+            &journey.beta
+        )
+        .is_none()),
+        "APPARATUS: removal did not reach the saved keyring"
+    );
+    let (ok, old, err) = journey.a.run(&["trust", "offers", "--node", "alpha"], "");
+    assert!(
+        ok && !old.contains(&journey.beta),
+        "PRODUCT: the kept room offered the removed computer's old basis again: {old}{err}"
+    );
+    let (ok, out, err) = journey
+        .b
+        .run(&["room", "leave", &journey.healthy, "--node", "beta"], "");
+    assert!(
+        ok,
+        "APPARATUS: beta leaves before its fresh admission: {out}{err}"
+    );
+    assert!(
+        wait_until(RETURN_WITHIN, || !journey
+            .a
+            .run(&["room", "roster", &journey.healthy, "--node", "alpha"], "")
+            .1
+            .contains(&journey.beta)),
+        "APPARATUS: alpha never observed the departure"
+    );
+    removal_join(&journey.b, "beta", &link);
+    let mut shown = String::new();
+    let offered = wait_until(RETURN_WITHIN, || {
+        let (ok, out, err) = journey.a.run(&["trust", "offers", "--node", "alpha"], "");
+        shown = format!("{out}{err}");
+        ok && shown.contains(&journey.beta)
+    });
+    assert!(
+        offered,
+        "PRODUCT: a fresh admission was not offered for trust: {shown}"
+    );
+    let rooms = shown
+        .lines()
+        .find(|line| line.starts_with("  in "))
+        .unwrap_or("");
+    assert!(rooms.contains("healthy") && !rooms.contains("\"alpha\""),
+        "PRODUCT: the offer did not separate the fresh healthy basis from the old kept alpha basis: {shown}");
+}
+
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "paired computers and a room administered elsewhere; release with test-knobs,optional-proofs"]
+fn computer_removal_names_a_room_without_a_local_admin() {
+    let journey = RoomTrustJourney::new(false);
+    let room = make_room(&journey.c, "gamma");
+    let link = removal_link(&journey.c, "gamma", &room);
+    removal_join(&journey.a, "alpha", &link);
+    removal_join(&journey.b, "beta", &link);
+    assert!(
+        wait_until(RETURN_WITHIN, || journey
+            .a
+            .run(&["room", "roster", &room, "--node", "alpha"], "")
+            .1
+            .contains(&journey.beta)),
+        "APPARATUS: the unauthorised room did not show beta before removal"
+    );
+    let frontier = computer(&journey.a, &["status"])["frontier"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    computer(
+        &journey.a,
+        &["remove", &journey.beta_computer, "--confirm", &frontier],
+    );
+    let (ok, shown, err) = journey.a.run(&["computer", "status"], "");
+    assert!(
+        ok && shown.contains(&full_room_id(&link, &room))
+            && shown.contains(&journey.beta)
+            && shown.contains("no local node may evict")
+            && shown.contains("vox room remove-member"),
+        "PRODUCT: the unadministered room, removed node and command were not named: {shown}{err}"
+    );
+}
+
+#[cfg(feature = "optional-proofs")]
+fn removal_wait_room_open(account: &Account, node: &str, room: &str) {
+    let mut last = String::new();
+    let opened = wait_until(RETURN_WITHIN, || {
+        let (ok, out, err) = account.run(&["room", "roster", room, "--node", node], "");
+        last = format!("{out}{err}");
+        ok
+    });
+    assert!(opened, "APPARATUS: {node}'s restarted room {room} did not expose a readable roster; product reported: {last}");
 }

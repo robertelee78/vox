@@ -426,7 +426,10 @@ pub(super) struct Reconcile {
 
 pub(super) enum ReconcileAction {
     Trust(Work),
-    Withdraw { target: Digest32 },
+    Withdraw {
+        target: Digest32,
+    },
+    #[cfg(feature = "test-knobs")]
     Progress,
     Complete,
 }
@@ -499,7 +502,7 @@ impl Reconcile {
                     return self.action(channel, store);
                 } else if let Some(after) = page.next {
                     self.consent_after = Some(after);
-                    ReconcileAction::Progress
+                    return self.action(channel, store);
                 } else {
                     self.stage = ReconcileStage::Marks;
                     ReconcileAction::Trust(Work(TrustWrite::MarkDecisions))
@@ -621,6 +624,7 @@ impl Node {
         for (target, had_drive) in saved.changed_drive {
             self.note_capability(target, had_drive);
         }
+        self.governance_work.trust_waiting.clear();
         self.governance_work.pending = true;
         self.governance_work.again = true;
     }
