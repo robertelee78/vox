@@ -801,7 +801,6 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
                 format!("not delivered to {label}: {}", b.str("why"))
             }
             "omp-reset" => b.str("text").to_owned(),
-            "unreadable" => b.str("text").to_owned(),
             "omp-disclosure" => {
                 details.push(("details".into(), b.str("text").to_owned()));
                 if b.fields.get("incomplete").and_then(Value::as_bool) == Some(true) {

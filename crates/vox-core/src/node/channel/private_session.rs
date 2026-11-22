@@ -741,24 +741,14 @@ impl Stored {
                     "private Session metadata contains body",
                 ));
             }
-            match reopen(&record, &key) {
-                Ok(content) => {
-                    if metadata.created_millis != content.created_millis
-                        || metadata.session_id != content.session_id
-                    {
-                        return Err(Error::MalformedAtRest("private Session metadata binding"));
-                    }
-                    metadata.body = content.body;
-                }
-                Err(_) => {
-                    // A damaged opener is visible in its place, not an empty page
-                    // or a fabricated successful activity. Other rows still read.
-                    metadata.body = serde_json::json!({
-                        "v": 1, "session": metadata.session_id, "kind": "unreadable",
-                        "text": "This Session step could not be opened from this node's store; read it on another authorized member."
-                    }).to_string();
-                }
+            let content = reopen(&record, &key)
+                .map_err(|_| Error::MalformedAtRest("private Session opener"))?;
+            if metadata.created_millis != content.created_millis
+                || metadata.session_id != content.session_id
+            {
+                return Err(Error::MalformedAtRest("private Session metadata binding"));
             }
+            metadata.body = content.body;
             Some(key)
         } else {
             None

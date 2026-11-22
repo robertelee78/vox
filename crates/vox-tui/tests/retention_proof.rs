@@ -1227,11 +1227,50 @@ fn private_session_steps_store_one_body_and_reopen_after_rotation() {
         );
     }
 
+    // The hashes of the wires the stopped driver keeps as private Session rows.
+    let driver_rows = || {
+        use vox_core::atrest::idfactor::SignatureIdentityFactor;
+        use vox_core::atrest::store::{open_segment, SegmentKind};
+        use vox_core::cbor::Decoder;
+        use vox_core::node::profile::Profile;
+        let mut profile = Profile::open(paths(&b)).expect("APPARATUS: stopped driver profile");
+        profile
+            .unlock(IDENTITY.as_bytes())
+            .expect("APPARATUS: driver unlock");
+        let signer = profile.signer_arc().unwrap();
+        let sek = profile
+            .store()
+            .get_sek_wrap(&id)
+            .unwrap()
+            .unwrap()
+            .unwrap_sek(
+                &SignatureIdentityFactor::new(&*signer),
+                &id,
+                ROOMPASS.as_bytes(),
+            )
+            .unwrap();
+        profile
+            .store()
+            .segments(&id, SegmentKind::PrivateSession)
+            .unwrap()
+            .into_iter()
+            .map(|(position, sealed)| {
+                let bytes =
+                    open_segment(&sek, SegmentKind::PrivateSession, position, &sealed).unwrap();
+                let mut d = Decoder::new(&bytes);
+                d.array().unwrap();
+                d.uint().unwrap();
+                vox_core::hash::sha256(d.bytes().unwrap())
+            })
+            .collect::<Vec<_>>()
+    };
+
     // An actual member's stopped profile supplies the apparatus identity and the
     // exact next ciphertexts. Only the running recipient decides acceptance.
     drop(driver.take());
-    let pending = (4..9).map(|seq| append(seq, 256).1).collect::<Vec<_>>();
+    let pending = (4..11).map(|seq| append(seq, 256).1).collect::<Vec<_>>();
     drop(author.take());
+    let mut tampered = Vec::new();
     {
         use vox_core::atrest::idfactor::SignatureIdentityFactor;
         use vox_core::atrest::store::{open_segment, SegmentKind};
@@ -1276,13 +1315,13 @@ fn private_session_steps_store_one_body_and_reopen_after_rotation() {
         let wires = wires
             .into_iter()
             .rev()
-            .take(5)
+            .take(7)
             .collect::<Vec<_>>()
             .into_iter()
             .rev()
             .map(|(_, wire)| wire)
             .collect::<Vec<_>>();
-        assert_eq!(wires.len(), 5, "APPARATUS: five withheld steps");
+        assert_eq!(wires.len(), 7, "APPARATUS: seven withheld steps");
         driver = Some(daemon_on(
             &b,
             "tamper-driver",
@@ -1371,14 +1410,30 @@ fn private_session_steps_store_one_body_and_reopen_after_rotation() {
                 }
             }
         });
+        let signature_of = |wire: &[u8]| {
+            let mut d = Decoder::new(wire);
+            d.array().unwrap();
+            d.uint().unwrap();
+            d.bytes().unwrap();
+            d.bytes().unwrap();
+            d.bytes().unwrap().to_vec()
+        };
         let mut position = 0;
         let _ = asks
             .recv_timeout(Duration::from_secs(90))
             .expect("APPARATUS: recipient did not ask authenticated peer");
-        for (arm, (wire, text)) in ["root-signature", "header", "room", "author", "ciphertext"]
-            .into_iter()
-            .zip(wires.into_iter().zip(pending))
-        {
+        // `splice` puts the genuine signature of the withheld next step on this step's
+        // genuine message: only a signature that covers the message refuses it.
+        let arms = [
+            "root-signature",
+            "header",
+            "room",
+            "author",
+            "ciphertext",
+            "splice",
+        ];
+        for (index, arm) in arms.into_iter().enumerate() {
+            let (wire, text) = (wires[index].clone(), pending[index].clone());
             let mut d = Decoder::new(&wire);
             assert_eq!(d.array().unwrap(), 4, "APPARATUS: private envelope");
             let version = d.uint().unwrap();
@@ -1405,6 +1460,7 @@ fn private_session_steps_store_one_body_and_reopen_after_rotation() {
                 "author" => header.author_id = victim,
                 "ciphertext" => ciphertext[0] ^= 1,
                 "root-signature" => signature[0] ^= 1,
+                "splice" => signature = signature_of(&wires[index + 1]),
                 _ => unreachable!(),
             }
             let mut m = Encoder::new();
@@ -1417,8 +1473,10 @@ fn private_session_steps_store_one_body_and_reopen_after_rotation() {
                 .bytes(&room_bytes)
                 .bytes(&m.finish())
                 .bytes(&signature);
+            let forged = e.finish();
+            tampered.push(vox_core::hash::sha256(&forged));
             position += 1;
-            responses.send((position, e.finish())).unwrap();
+            responses.send((position, forged)).unwrap();
             let (incarnation, after) = asks
                 .recv_timeout(Duration::from_secs(90))
                 .expect("APPARATUS: recipient did not finish its tampered-page decision");
@@ -1443,10 +1501,37 @@ fn private_session_steps_store_one_body_and_reopen_after_rotation() {
                 .recv_timeout(Duration::from_secs(90))
                 .expect("APPARATUS: recipient did not request next live page");
         }
+        // The step whose signature was spliced is still read whole as it was written.
+        position += 1;
+        responses.send((position, wires[6].clone())).unwrap();
+        expected.push(pending[6].clone());
+        wait_replies(&b, &expected);
+        eprintln!("PRODUCT TAMPER RECEIPT: the step whose signature was spliced read whole");
         drop(responses);
         serving.abort();
         drop((endpoint, attack_rt, profile));
     }
+    drop(driver.take());
+    let stored = driver_rows();
+    assert!(
+        tampered.iter().all(|hash| !stored.contains(hash))
+            && authored.borrow().iter().all(|hash| stored
+                .iter()
+                .filter(|row| *row == hash)
+                .count()
+                == 1),
+        "PRODUCT: recipient store does not hold each genuine step once and no forged step: \
+         forged={tampered:?}, genuine={:?}, stored={stored:?}",
+        authored.borrow()
+    );
+    eprintln!("PRODUCT TAMPER RECEIPT: recipient stored each genuine step once, no forged step");
+    driver = Some(daemon_on(
+        &b,
+        "after-tamper-driver",
+        &format!("{IDENTITY}\n{ROOMPASS}\n"),
+        &driver_at,
+    ));
+    attached(&b, "after-tamper-driver");
     author = Some(daemon_on(
         &a,
         "after-tamper",
@@ -1457,7 +1542,7 @@ fn private_session_steps_store_one_body_and_reopen_after_rotation() {
     wait_replies(&a, &expected);
     let (ok, out, err) = vox(&a, &["trust", "read", driver_fp], None);
     assert!(ok, "PRODUCT (staging): drive withdrawal: {out}{err}");
-    let (_, post_rotation) = append(9, 1024);
+    let (_, post_rotation) = append(11, 1024);
     expected.push(post_rotation);
     wait_replies(&a, &expected);
     drop(author.take());
@@ -1469,92 +1554,6 @@ fn private_session_steps_store_one_body_and_reopen_after_rotation() {
     ));
     attached(&a, "past-generation");
     wait_replies(&a, &expected);
-    drop(author.take());
-    {
-        use vox_core::atrest::idfactor::SignatureIdentityFactor;
-        use vox_core::atrest::store::{open_segment, seal_segment, SegmentKind};
-        use vox_core::cbor::{Decoder, Encoder};
-        use vox_core::node::profile::Profile;
-        let mut profile = Profile::open(paths(&a)).expect("APPARATUS: stopped corruption target");
-        profile.unlock(IDENTITY.as_bytes()).unwrap();
-        let signer = profile.signer_arc().unwrap();
-        let sek = profile
-            .store()
-            .get_sek_wrap(&id)
-            .unwrap()
-            .unwrap()
-            .unwrap_sek(
-                &SignatureIdentityFactor::new(&*signer),
-                &id,
-                ROOMPASS.as_bytes(),
-            )
-            .unwrap();
-        let (position, sealed) = profile
-            .store()
-            .segments(&id, SegmentKind::PrivateSession)
-            .unwrap()
-            .into_iter()
-            .find(|(position, sealed)| {
-                let bytes =
-                    open_segment(&sek, SegmentKind::PrivateSession, *position, sealed).unwrap();
-                let mut d = Decoder::new(&bytes);
-                d.array().unwrap();
-                d.uint().unwrap();
-                vox_core::hash::sha256(d.bytes().unwrap()) == authored.borrow()[1]
-            })
-            .expect("APPARATUS: step chosen for damaged opener");
-        let bytes = open_segment(&sek, SegmentKind::PrivateSession, position, &sealed).unwrap();
-        let mut d = Decoder::new(&bytes);
-        assert_eq!(
-            (d.array().unwrap(), d.uint().unwrap()),
-            (8, 3),
-            "PRODUCT: new stored row has no versioned opener"
-        );
-        let wire = d.bytes().unwrap();
-        let metadata = d.bytes().unwrap();
-        let seen = d.uint().unwrap();
-        let instance = d.bytes().unwrap();
-        let arrival = d.uint().unwrap();
-        let identity = d.bytes().unwrap();
-        let mut key = d.bytes().unwrap().to_vec();
-        d.finish().unwrap();
-        key[0] ^= 1;
-        let mut e = Encoder::new();
-        e.array(8)
-            .uint(3)
-            .bytes(wire)
-            .bytes(metadata)
-            .uint(seen)
-            .bytes(instance)
-            .uint(arrival)
-            .bytes(identity)
-            .bytes(&key);
-        let damaged =
-            seal_segment(&sek, SegmentKind::PrivateSession, position, &e.finish()).unwrap();
-        profile
-            .store()
-            .put_segment(&id, SegmentKind::PrivateSession, position, &damaged)
-            .unwrap();
-    }
-    author = Some(daemon_on(
-        &a,
-        "damaged-opener",
-        &format!("{IDENTITY}\n{ROOMPASS}\n"),
-        &author_at,
-    ));
-    attached(&a, "damaged-opener");
-    let began = Instant::now();
-    loop {
-        let shown = vox(&a, &["room", "session", &room, session, "--json"], None);
-        if shown.0 && shown.1.contains("could not be opened") && shown.1.contains("ONE-BODY-9-") {
-            break;
-        }
-        assert!(
-            began.elapsed() < Duration::from_secs(180),
-            "PRODUCT: unreadable step hid the rest of its page instead of saying why: {shown:?}"
-        );
-        std::thread::sleep(Duration::from_millis(250));
-    }
     post(&a, &room, "AFTER-DRIVE-WITHDRAWAL");
     until(
         &b,
@@ -1639,41 +1638,9 @@ fn private_session_steps_store_one_body_and_reopen_after_rotation() {
         "PRODUCT: removed author's Session became readable"
     );
     let retained_authored = || {
-        use vox_core::atrest::idfactor::SignatureIdentityFactor;
-        use vox_core::atrest::store::{open_segment, SegmentKind};
-        use vox_core::cbor::Decoder;
-        use vox_core::node::profile::Profile;
-        let mut profile = Profile::open(paths(&b)).expect("APPARATUS: stopped driver profile");
-        profile
-            .unlock(IDENTITY.as_bytes())
-            .expect("APPARATUS: driver unlock");
-        let signer = profile.signer_arc().unwrap();
-        let sek = profile
-            .store()
-            .get_sek_wrap(&id)
-            .unwrap()
-            .unwrap()
-            .unwrap_sek(
-                &SignatureIdentityFactor::new(&*signer),
-                &id,
-                ROOMPASS.as_bytes(),
-            )
-            .unwrap();
-        profile
-            .store()
-            .segments(&id, SegmentKind::PrivateSession)
-            .unwrap()
-            .into_iter()
-            .filter(|(position, sealed)| {
-                let bytes =
-                    open_segment(&sek, SegmentKind::PrivateSession, *position, sealed).unwrap();
-                let mut d = Decoder::new(&bytes);
-                d.array().unwrap();
-                d.uint().unwrap();
-                authored
-                    .borrow()
-                    .contains(&vox_core::hash::sha256(d.bytes().unwrap()))
-            })
+        driver_rows()
+            .iter()
+            .filter(|hash| authored.borrow().contains(hash))
             .count()
     };
     drop(driver.take());

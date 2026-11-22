@@ -376,10 +376,6 @@ pub(crate) async fn read_ask(recv: &mut RecvStream) -> Result<Ask> {
         query: Query::read(&mut d)?,
     };
     d.finish()?;
-    #[cfg(feature = "test-knobs")]
-    if std::env::var_os("VOX_TEST_PRIVATE_ASK_RECEIPT").is_some() {
-        eprintln!("vox proof private ask: after={}", ask.cursor.after);
-    }
     Ok(ask)
 }
 

@@ -704,8 +704,8 @@ Two scratch daemons append different-sized Session steps, read identical complet
 restart, and rotate the drive generation. The author must still read the old steps;
 the member downgraded to read must not read the Session. Stopped-store measurements
 require one row per step, one stored byte per body byte, and one signature's fixed cost.
+A wire peer holding the author's identity then offers forged steps: one changed bit in the
+signature, header, room, author or ciphertext, and one step's genuine signature on the
+message of the step before it. The recipient must show and store none of them, and still
+read every genuine step.
 This proof is optional; without the feature it prints OPTIONAL PROOF NOT RUN.
-
-The mixed-version measurement uses `VOX_TEST_PRIVATE_ASK_RECEIPT` in a `test-knobs`
-daemon to count actual private-page asks at the serving node. It prints only the
-requested cursor, never ciphertext, plaintext or an opener; a shipped build has no knob.
