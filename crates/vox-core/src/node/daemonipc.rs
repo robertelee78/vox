@@ -2285,22 +2285,65 @@ impl DaemonClient {
     async fn greet(path: &std::path::Path, waiting: Option<fn()>) -> Result<DaemonObservation> {
         use crate::error::IpcHandshake;
         use crate::node::ipc::{connect_own, read_frame, silent, ANSWER_WITHIN, PROTOCOL_VERSION};
-        let greeted = tokio::time::timeout(ANSWER_WITHIN, async {
-            let mut stream = connect_own(path).await?;
-            let hello = read_frame(&mut stream).await?;
-            Ok::<_, Error>((stream, hello))
-        });
-        tokio::pin!(greeted);
-        let (stream, hello) = tokio::select! {
-            out = &mut greeted => out,
-            () = tokio::time::sleep(crate::node::profile::LOCK_PATIENCE), if waiting.is_some() => {
-                if let Some(say) = waiting {
-                    say();
+        let mut unreachable = None;
+        let answer = {
+            let greeted = tokio::time::timeout(ANSWER_WITHIN, async {
+                let mut restart = None;
+                let mut stream = loop {
+                    match connect_own(path).await {
+                        Ok(stream) => break stream,
+                        Err(error @ Error::Ipc(IpcHandshake::Unreachable { .. })) => {
+                            // A replacement owns admission before stopping the old daemon. Readers
+                            // wait for its socket too, without starting a competing daemon.
+                            if restart.is_none() {
+                                restart = match std::fs::File::open(
+                                    path.with_file_name("restart-lock"),
+                                ) {
+                                    Ok(file) => Some(file),
+                                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                        return Err(error)
+                                    }
+                                    Err(e) => {
+                                        return Err(Error::Ipc(IpcHandshake::Refused {
+                                            reason: format!("cannot check the daemon restart: {e}"),
+                                        }))
+                                    }
+                                };
+                            }
+                            let Some(file) = restart.as_ref() else {
+                                return Err(error);
+                            };
+                            match file.try_lock_shared() {
+                                Ok(()) => break connect_own(path).await?,
+                                Err(std::fs::TryLockError::WouldBlock) => {}
+                                Err(std::fs::TryLockError::Error(e)) => {
+                                    return Err(Error::Ipc(IpcHandshake::Refused {
+                                        reason: format!("cannot check the daemon restart: {e}"),
+                                    }))
+                                }
+                            }
+                            unreachable = Some(error);
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                };
+                unreachable = None;
+                let hello = read_frame(&mut stream).await?;
+                Ok::<_, Error>((stream, hello))
+            });
+            tokio::pin!(greeted);
+            tokio::select! {
+                out = &mut greeted => out,
+                () = tokio::time::sleep(crate::node::profile::LOCK_PATIENCE), if waiting.is_some() => {
+                    if let Some(say) = waiting {
+                        say();
+                    }
+                    greeted.await
                 }
-                greeted.await
             }
-        }
-        .map_err(|_| silent())??;
+        };
+        let (stream, hello) = answer.map_err(|_| unreachable.unwrap_or_else(silent))??;
         let Some(hello) = hello else {
             return Err(Error::Ipc(IpcHandshake::ClosedBeforeHello));
         };

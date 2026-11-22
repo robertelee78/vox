@@ -17,6 +17,22 @@ They are kept "at the ready for troubleshooting". When a user reports one of the
   - A product failure fails as the product's verdict.
 - **CI compiles them on every run and never runs them.** The CI step is "Compile optional proofs (not run; troubleshooting kit)": `cargo test --release -p vox-tui --features optional-proofs --no-run`, with `-D warnings`. A change that breaks one is caught at once, not on the day it is needed.
 
+### Reading during a daemon restart (ADR-052 RG-9)
+
+The daemon journey stages a real restart with its old node's stop held by a file. A room read,
+status, room list and node list issued in the socket gap wait for the single replacement.
+A separate act kills the unmanaged restarter during that held stop and observes a serving
+replacement before any client that could start a daemon. Both use private profile roots.
+
+```sh
+cargo test --release -p vox-tui --features test-knobs \
+  --test the_daemon_and_its_nodes_proof \
+  a_room_read_during_restart_waits_for_one_replacement -- --ignored --exact --nocapture
+cargo test --release -p vox-tui --features test-knobs \
+  --test the_daemon_and_its_nodes_proof \
+  a_restart_caller_killed_during_stop_leaves_a_daemon_serving -- --ignored --exact --nocapture
+```
+
 ### Managed daemon recovery (ADR-052 RG-9)
 
 The optional Linux systemd journey in `the_daemon_and_its_nodes_proof.rs` supplies a minimal

@@ -1935,6 +1935,269 @@ fn a_product_stop_exits_zero_and_foreign_signals_exit_for_the_manager() {
     );
 }
 
+/// The room read is issued while no daemon can answer, not after a client has healed a gap.
+#[cfg(feature = "test-knobs")]
+#[test]
+#[ignore = "real daemon processes and production Argon2id; run in release"]
+fn a_room_read_during_restart_waits_for_one_replacement() {
+    restart_with_a_staged_stop(false);
+}
+
+/// No healing client runs until the replacement is observed serving after its caller dies.
+#[cfg(feature = "test-knobs")]
+#[test]
+#[ignore = "real daemon processes and production Argon2id; run in release"]
+fn a_restart_caller_killed_during_stop_leaves_a_daemon_serving() {
+    restart_with_a_staged_stop(true);
+}
+
+#[cfg(feature = "test-knobs")]
+fn restart_with_a_staged_stop(killed: bool) {
+    use vox_core::node::daemonipc::DaemonClient;
+    struct Actors {
+        children: Vec<Child>,
+        data: PathBuf,
+        hold: PathBuf,
+    }
+    impl Drop for Actors {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.hold);
+            for child in &mut self.children {
+                if child.try_wait().ok().flatten().is_none() {
+                    let _ = Command::new("kill")
+                        .args(["-CONT", &child.id().to_string()])
+                        .status();
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+            for pid in daemons_of(&self.data) {
+                let _ = Command::new("kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .status();
+            }
+        }
+    }
+    fn signal(pid: u32, what: &str) {
+        assert!(
+            Command::new("kill")
+                .args([what, &pid.to_string()])
+                .status()
+                .unwrap()
+                .success(),
+            "APPARATUS: {what} to owned pid {pid}"
+        );
+    }
+    fn output(a: &Account, name: &str, args: &[&str]) -> (Child, PathBuf) {
+        let path = a._tmp.path().join(name);
+        let file = std::fs::File::create(&path).unwrap();
+        let child = a
+            .cmd(args)
+            .stdout(file.try_clone().unwrap())
+            .stderr(file)
+            .spawn()
+            .unwrap();
+        (child, path)
+    }
+    watchdog::arm();
+    test_knobs::require(&["VOX_TEST_STOP_HOLD_NODE", "VOX_TEST_STOP_HOLD_FILE"]);
+    let a = Account::new();
+    a.make_node("default");
+    let hold = a._tmp.path().join("hold-stop");
+    std::fs::write(&hold, "").unwrap();
+    let pass = a._tmp.path().join("identity.pass");
+    let mut old = Daemon::start(
+        &a,
+        &[
+            "--node",
+            "default",
+            "--keep",
+            "--passphrase-file",
+            pass.to_str().unwrap(),
+        ],
+        &[
+            ("VOX_TEST_STOP_HOLD_NODE", "default"),
+            ("VOX_TEST_STOP_HOLD_FILE", hold.to_str().unwrap()),
+        ],
+    );
+    let mut actors = Actors {
+        children: Vec::new(),
+        data: a.data.clone(),
+        hold,
+    };
+    assert!(
+        wait_until(Duration::from_secs(60), || old
+            .said()
+            .contains("control socket")),
+        "APPARATUS: initial daemon never served: {}",
+        old.said()
+    );
+    let room = make_room(&a, "default");
+    let (ok, out, err) = a.run(
+        &["room", "post", &room, "news across the causal restart"],
+        "",
+    );
+    assert!(ok, "APPARATUS: post before restart: {out}{err}");
+    let from = a.log().len();
+    let (caller, caller_out) = output(&a, "restart.out", &["daemon", "--restart"]);
+    let caller_pid = caller.id();
+    actors.children.push(caller);
+    assert!(
+        wait_until(Duration::from_secs(30), || old
+            .said()
+            .contains("test holding stop of node default")),
+        "APPARATUS: old daemon never reached its held stop: {}\n{}",
+        old.said(),
+        std::fs::read_to_string(&caller_out).unwrap_or_default()
+    );
+    let replacement = daemons_of(&a.data)
+        .into_iter()
+        .find(|pid| *pid != old.child.id() && *pid != caller_pid);
+    eprintln!(
+        "[proof] held old pid {}, caller {caller_pid}, replacement already started {replacement:?}",
+        old.child.id()
+    );
+    if killed {
+        actors.children[0].kill().unwrap();
+        let status = actors.children[0].wait().unwrap();
+        eprintln!("[proof] killed restart caller {caller_pid}: {status}");
+    } else {
+        signal(caller_pid, "-STOP");
+        if let Some(pid) = replacement {
+            signal(pid, "-STOP");
+        }
+    }
+    std::fs::remove_file(&actors.hold).unwrap();
+    assert!(
+        wait_until(Duration::from_secs(30), || old
+            .child
+            .try_wait()
+            .unwrap()
+            .is_some()),
+        "APPARATUS: released old daemon never exited: {}",
+        old.said()
+    );
+    let account = vox_core::node::paths::Account::of(Some(&a.data), Some(&a.cfg)).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let observe = || {
+        runtime
+            .block_on(DaemonClient::observe(&account.socket()))
+            .ok()
+    };
+    if killed {
+        let mut greeting = None;
+        let served = wait_until(Duration::from_secs(45), || {
+            greeting = observe();
+            greeting.as_ref().is_some_and(|d| d.pid != old.child.id())
+        });
+        let living = daemons_of(&a.data);
+        eprintln!("[proof] before any healing client: greeting {greeting:?}, scratch daemon pids {living:?}\n{}", a.log());
+        assert!(
+            served,
+            "PRODUCT: killed restarter left no serving replacement after the old daemon exited; \
+             observed {greeting:?}, daemon pids {living:?}\n{}",
+            a.log()
+        );
+    } else {
+        assert!(
+            std::os::unix::net::UnixStream::connect(account.socket()).is_err(),
+            "APPARATUS: replacement was not held before it served"
+        );
+        let commands = [
+            ("read", vec!["room", "read", room.as_str()]),
+            ("status", vec!["status", "--json"]),
+            ("rooms", vec!["room", "list"]),
+            ("nodes", vec!["node", "list"]),
+        ];
+        let mut calls = Vec::new();
+        for (name, args) in commands {
+            let (client, client_out) = output(&a, &format!("during-{name}.out"), &args);
+            actors.children.push(client);
+            calls.push((name, client_out));
+        }
+        for (index, (name, path)) in calls.iter().enumerate() {
+            // Status uses the greeting without a waiting callback. It was issued in this
+            // same unbound window; its actual answer is checked after the replacement serves.
+            if *name == "status" {
+                if actors.children[index + 1].try_wait().unwrap().is_none() {
+                    signal(actors.children[index + 1].id(), "-STOP");
+                }
+                continue;
+            }
+            assert!(
+                wait_until(Duration::from_secs(5), || {
+                    let said = std::fs::read_to_string(path).unwrap_or_default();
+                    said.contains("vox: waiting")
+                        || actors.children[index + 1].try_wait().unwrap().is_some()
+                }),
+                "APPARATUS: {name} neither waited nor answered in the staged gap"
+            );
+            if actors.children[index + 1].try_wait().unwrap().is_none() {
+                signal(actors.children[index + 1].id(), "-STOP");
+            }
+        }
+        if let Some(pid) = replacement {
+            signal(pid, "-CONT");
+        }
+        signal(caller_pid, "-CONT");
+        let mut ready = String::new();
+        assert!(
+            wait_until(Duration::from_secs(60), || {
+                let (ok, out, err) = a.run(&["room", "read", &room], "");
+                ready = format!("{out}{err}");
+                ok && ready.contains("news across the causal restart")
+            }),
+            "APPARATUS: replacement never finished remembered-room preparation: {ready}"
+        );
+        for (index, (name, path)) in calls.iter().enumerate() {
+            if actors.children[index + 1].try_wait().unwrap().is_none() {
+                signal(actors.children[index + 1].id(), "-CONT");
+            }
+            let status = actors.children[index + 1].wait().unwrap();
+            let said = std::fs::read_to_string(path).unwrap_or_default();
+            eprintln!("[proof] {name} issued in no-daemon gap: {status}: {said}");
+            assert!(status.success(),
+                "PRODUCT: {name} issued during restart did not receive its answer: {status}: {said}");
+            assert!(
+                name != &"read" || said.contains("news across the causal restart"),
+                "PRODUCT: room read issued during restart lost its news: {said}"
+            );
+            assert!(
+                *name == "status" || said.contains("vox: waiting"),
+                "PRODUCT: {name} did not wait during the held restart: {said}"
+            );
+        }
+        let restart_status = actors.children[0].wait().unwrap();
+        assert!(
+            restart_status.success(),
+            "PRODUCT: restart failed: {}",
+            std::fs::read_to_string(&caller_out).unwrap_or_default()
+        );
+    }
+    let mut result = (false, String::new(), String::new());
+    let ready = wait_until(Duration::from_secs(60), || {
+        result = a.run(&["room", "read", &room], "");
+        result.0 && result.1.contains("news across the causal restart")
+    });
+    let (ok, news, err) = result;
+    let log = a.log();
+    let generations = log
+        .get(from..)
+        .unwrap_or("")
+        .matches("vox daemon: serving (pid ")
+        .count();
+    eprintln!("[proof] caller killed={killed}; replacement generations={generations}; room read {ok}: {news}{err}\n{log}");
+    assert!(
+        ready && ok && news.contains("news across the causal restart"),
+        "PRODUCT: replacement did not serve the remembered room: {news}{err}"
+    );
+    assert_eq!(generations, 1,
+        "PRODUCT: restart must create exactly one replacement generation, got {generations}:\n{log}");
+}
+
 /// RG-9: a client arriving in a restart waits for its owner, even if the caller dies.
 #[cfg(feature = "test-knobs")]
 #[test]
