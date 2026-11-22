@@ -101,6 +101,8 @@ fn vox_with(
     cmd.args(args)
         .env("VOX_DATA_DIR", dir)
         .env("VOX_CONFIG_DIR", dir.join("cfg"))
+        .env("VOX_TEST_KEYCHAIN", attach::keychain(dir))
+        .env("VOX_PROXY", "127.0.0.1:0")
         .env_remove("VOX_ROOM")
         .stdin(if stdin.is_some() {
             Stdio::piped()
@@ -156,6 +158,8 @@ fn daemon_on(dir: &Path, tag: &str, stdin_lines: &str, listen: &str) -> Daemon {
         .args(["daemon", "--listen", listen])
         .env("VOX_DATA_DIR", dir)
         .env("VOX_CONFIG_DIR", dir.join("cfg"))
+        .env("VOX_TEST_KEYCHAIN", attach::keychain(dir))
+        .env("VOX_PROXY", "127.0.0.1:0")
         .env_remove("VOX_ROOM")
         .stdin(Stdio::piped())
         .stdout(Stdio::from(out))
@@ -935,4 +939,691 @@ fn a_member_who_joins_after_messages_expired_catches_up() {
         "PRODUCT: carol shows {owed} expired messages as not received yet: she waits on bodies no \
          member can supply"
     );
+}
+
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(
+    fetching_keeps_serving_proofs_out_of_the_store,
+    opening_a_room_reclaims_old_serving_proofs_across_interruption,
+);
+
+#[cfg(feature = "optional-proofs")]
+mod proof_rows {
+    use super::*;
+    use vox_core::atrest::idfactor::SignatureIdentityFactor;
+    use vox_core::atrest::sek::Sek;
+    use vox_core::atrest::store::{open_segment, seal_segment, SegmentKind};
+    use vox_core::cbor::{Decoder, Encoder, Value};
+    use vox_core::hash::{sha256, Digest32};
+    use vox_core::log::history::{Descriptor, SignedHead, TreeBinding};
+    use vox_core::node::paths::Paths;
+    use vox_core::node::profile::Profile;
+    use vox_core::node::store::Store;
+
+    fn encode_binding(binding: TreeBinding, e: &mut Encoder) {
+        e.array(4)
+            .uint(2)
+            .bytes(&binding.room)
+            .uint(binding.scope as u64)
+            .bytes(&binding.author);
+    }
+    fn decode_binding(d: &mut Decoder<'_>) -> vox_core::Result<TreeBinding> {
+        assert_eq!(d.array().unwrap(), 4, "APPARATUS: binding arity");
+        assert_eq!(d.uint().unwrap(), 2, "APPARATUS: binding version");
+        Ok(TreeBinding {
+            room: d.bytes()?.try_into().unwrap(),
+            scope: vox_core::log::history::LogScope::decode(d.uint()?)?,
+            author: d.bytes()?.try_into().unwrap(),
+        })
+    }
+
+    fn post(dir: &Path, room: &str, text: &str) {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let (ok, _, err) = vox(dir, &["room", "post", room, text], None);
+            if ok {
+                return;
+            }
+            assert!(
+                err.contains("that room is preparing its saved history"),
+                "PRODUCT (staging): post {text}: {err}"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "APPARATUS: reopened poster never finished preparation: {err}"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    fn array(value: &Value) -> &[Value] {
+        let Value::Array(value) = value else {
+            panic!("APPARATUS: expected a canonical array: {value:?}");
+        };
+        value
+    }
+    fn array_mut(value: &mut Value) -> &mut Vec<Value> {
+        let Value::Array(value) = value else {
+            panic!("APPARATUS: expected a canonical array");
+        };
+        value
+    }
+    fn number(value: &Value) -> u64 {
+        let Value::Uint(value) = value else {
+            panic!("APPARATUS: expected an integer: {value:?}");
+        };
+        *value
+    }
+    fn bytes(value: &Value) -> &[u8] {
+        let Value::Bytes(value) = value else {
+            panic!("APPARATUS: expected bytes: {value:?}");
+        };
+        value
+    }
+    fn profile(dir: &Path) -> Profile {
+        let paths = Paths::resolve("default", Some(dir), Some(&dir.join("cfg")))
+            .expect("APPARATUS: scratch profile paths");
+        let mut profile = Profile::open(paths).expect("APPARATUS: stopped scratch profile");
+        profile
+            .unlock(IDENTITY.as_bytes())
+            .expect("APPARATUS: unlock stopped scratch profile");
+        profile
+    }
+    fn sek(profile: &Profile, room: &Digest32) -> Sek {
+        let signer = profile.signer().expect("APPARATUS: scratch signer");
+        profile
+            .store()
+            .get_sek_wrap(room)
+            .unwrap()
+            .expect("APPARATUS: scratch room key")
+            .unwrap_sek(
+                &SignatureIdentityFactor::new(signer),
+                room,
+                ROOMPASS.as_bytes(),
+            )
+            .expect("APPARATUS: unwrap scratch room key")
+    }
+    fn wire(store: &Store, sek: &Sek, room: &Digest32, id: u64) -> zeroize::Zeroizing<Vec<u8>> {
+        let segment = store
+            .get_segment(room, SegmentKind::EntryIndex, id)
+            .unwrap()
+            .expect("APPARATUS: indexed record exists");
+        open_segment(sek, SegmentKind::EntryIndex, id, &segment).unwrap()
+    }
+    fn decoded(store: &Store, sek: &Sek, room: &Digest32, id: u64) -> Value {
+        Value::from_canonical_slice(&wire(store, sek, room, id))
+            .expect("APPARATUS: canonical stored record")
+    }
+    fn tree(
+        store: &Store,
+        sek: &Sek,
+        room: &Digest32,
+        root: u64,
+        pages: &mut Vec<u64>,
+        rows: &mut Vec<Value>,
+    ) {
+        if root == 0 {
+            return;
+        }
+        pages.push(root);
+        let page = decoded(store, sek, room, root);
+        let page = array(&page);
+        assert_eq!(page.len(), 3, "APPARATUS: index page shape");
+        assert_eq!(number(&page[0]), 1, "APPARATUS: index page version");
+        match number(&page[1]) {
+            0 => rows.extend_from_slice(array(&page[2])),
+            1 => {
+                for row in array(&page[2]) {
+                    tree(store, sek, room, number(&array(row)[1]), pages, rows);
+                }
+            }
+            other => panic!("APPARATUS: unexpected object-tree page kind {other}"),
+        }
+    }
+    fn roots(directory: &Value) -> &[Value] {
+        let active = array(&array(directory)[1]);
+        assert_eq!(active.len(), 16, "APPARATUS: current root layout");
+        let sparse = array(&active[15]);
+        assert_eq!(sparse.len(), 25, "APPARATUS: current sparse layout");
+        sparse
+    }
+    fn full_room(dir: &Path, short: &str) -> Digest32 {
+        let (ok, said, err) = vox(dir, &["status", "--json"], None);
+        assert!(ok, "PRODUCT (staging): status: {err}");
+        let status: serde_json::Value = serde_json::from_str(&said).unwrap();
+        let id = status["rooms"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|room| room["id"].as_str())
+            .find(|id| id.starts_with(short))
+            .unwrap_or_else(|| panic!("PRODUCT (staging): room missing in {said}"));
+        vox_core::node::link::b32_decode(id, "proof room").unwrap()
+    }
+    fn copy_tree(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let kind = entry.file_type().unwrap();
+            if kind.is_dir() {
+                copy_tree(&entry.path(), &to.join(entry.file_name()));
+            } else if kind.is_file() {
+                std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+            }
+        }
+    }
+    // Inspect a stopped COPY, decoding the object-index kind and its entire old value, not a
+    // ciphertext-length histogram. Every other typed object remains separately counted.
+    fn counts(dir: &Path, room: &Digest32) -> std::collections::BTreeMap<u8, usize> {
+        let copy = tempfile::tempdir().unwrap();
+        copy_tree(dir, copy.path());
+        let profile = profile(copy.path());
+        let sek = sek(&profile, room);
+        let directory = decoded(profile.store(), &sek, room, 0);
+        let mut objects = Vec::new();
+        tree(
+            profile.store(),
+            &sek,
+            room,
+            number(&roots(&directory)[0]),
+            &mut Vec::new(),
+            &mut objects,
+        );
+        let mut counts = std::collections::BTreeMap::new();
+        for row in objects {
+            let row = array(&row);
+            let key = bytes(&row[0]);
+            assert_eq!(key.len(), 64, "APPARATUS: object key width");
+            let kind = key[32];
+            *counts.entry(kind).or_default() += 1;
+            if kind != 9 {
+                continue;
+            }
+            let at = array(&row[1]);
+            assert_eq!(at.len(), 2, "APPARATUS: object locator shape");
+            assert_eq!(number(&at[0]), 1, "APPARATUS: numeric object locator");
+            let value = decoded(profile.store(), &sek, room, number(&at[1]));
+            let wire = value.to_canonical_vec().unwrap();
+            let mut d = Decoder::new(&wire);
+            assert_eq!(d.array().unwrap(), 5, "APPARATUS: ProofRange shape");
+            assert_eq!(d.uint().unwrap(), 1, "APPARATUS: ProofRange version");
+            let head: Digest32 = d.bytes().unwrap().try_into().unwrap();
+            let binding = decode_binding(&mut d).unwrap();
+            assert_eq!(binding.room, *room, "APPARATUS: ProofRange room");
+            let start = d.uint().unwrap();
+            let descriptor = Descriptor::decode(&mut d).unwrap();
+            d.finish().unwrap();
+            let mut e = Encoder::new();
+            e.array(5).bytes(b"vox/proof-serving-range/v1").bytes(&head);
+            encode_binding(binding, &mut e);
+            e.uint(start).uint(descriptor.leaves);
+            assert_eq!(
+                &key[..32],
+                sha256(&e.finish()),
+                "APPARATUS: exact cache key"
+            );
+        }
+        eprintln!("STOPPED-STORE {dir:?}: decoded object kinds {counts:?}");
+        counts
+    }
+    fn no_rows(dir: &Path, room: &Digest32) {
+        let count = counts(dir, room).get(&9).copied().unwrap_or(0);
+        assert_eq!(
+            count, 0,
+            "PRODUCT: fetching left {count} decoded ProofRange rows in the real room store"
+        );
+    }
+    // Test-side old-store/eviction apparatus. It rewrites only the named derived tree, keeping
+    // every other directory field and every signed entry, header, witness and receipt intact.
+    #[allow(clippy::too_many_arguments)] // Exact stopped-store transaction inputs, not product API.
+    fn replace_tree(
+        store: &Store,
+        sek: &Sek,
+        room: &Digest32,
+        sparse_slot: usize,
+        mut directory: Value,
+        pages: &[u64],
+        mut rows: Vec<Value>,
+        records: Vec<(u64, Value)>,
+    ) {
+        rows.sort_by(|a, b| bytes(&array(a)[0]).cmp(bytes(&array(b)[0])));
+        let mut next = number(&array(&directory)[3]);
+        let mut new_pages = Vec::new();
+        let mut level = Vec::new();
+        for chunk in rows.chunks(64) {
+            let id = next;
+            next += 1;
+            new_pages.push((
+                id,
+                Value::Array(vec![
+                    Value::Uint(1),
+                    Value::Uint(0),
+                    Value::Array(chunk.to_vec()),
+                ]),
+            ));
+            level.push(Value::Array(vec![
+                array(chunk.last().unwrap())[0].clone(),
+                Value::Uint(id),
+            ]));
+        }
+        while level.len() > 1 {
+            let mut parent = Vec::new();
+            for chunk in level.chunks(64) {
+                let id = next;
+                next += 1;
+                new_pages.push((
+                    id,
+                    Value::Array(vec![
+                        Value::Uint(1),
+                        Value::Uint(1),
+                        Value::Array(chunk.to_vec()),
+                    ]),
+                ));
+                parent.push(Value::Array(vec![
+                    array(chunk.last().unwrap())[0].clone(),
+                    Value::Uint(id),
+                ]));
+            }
+            level = parent;
+        }
+        let root = level.first().map_or(0, |row| number(&array(row)[1]));
+        let active = &mut array_mut(&mut directory)[1];
+        array_mut(&mut array_mut(active)[15])[sparse_slot] = Value::Uint(root);
+        array_mut(&mut directory)[3] = Value::Uint(next);
+        let revision = number(&array(&directory)[5]);
+        array_mut(&mut directory)[5] = Value::Uint(revision + 1);
+        let mut batch = store.batch().unwrap();
+        for id in pages {
+            batch
+                .delete_segment(room, SegmentKind::EntryIndex, *id)
+                .unwrap();
+        }
+        for (id, value) in records
+            .into_iter()
+            .chain(new_pages)
+            .chain(std::iter::once((0, directory)))
+        {
+            let plain = value.to_canonical_vec().unwrap();
+            let sealed = seal_segment(sek, SegmentKind::EntryIndex, id, &plain).unwrap();
+            batch
+                .put_segment(room, SegmentKind::EntryIndex, id, &sealed)
+                .unwrap();
+        }
+        batch.commit().unwrap();
+    }
+    fn seed_old_rows(dir: &Path, room: &Digest32) -> usize {
+        let profile = profile(dir);
+        let sek = sek(&profile, room);
+        let mut directory = decoded(profile.store(), &sek, room, 0);
+        let mut pages = Vec::new();
+        let mut objects = Vec::new();
+        tree(
+            profile.store(),
+            &sek,
+            room,
+            number(&roots(&directory)[0]),
+            &mut pages,
+            &mut objects,
+        );
+        let existing = objects
+            .iter()
+            .filter(|row| bytes(&array(row)[0])[32] == 9)
+            .count();
+        if existing > 32 {
+            return existing;
+        }
+        objects.retain(|row| bytes(&array(row)[0])[32] != 9);
+        let mut records = Vec::new();
+        let mut next = number(&array(&directory)[3]);
+        let mut ranges = Vec::new();
+        tree(
+            profile.store(),
+            &sek,
+            room,
+            number(&roots(&directory)[5]),
+            &mut Vec::new(),
+            &mut ranges,
+        );
+        let mut seeded = std::collections::BTreeSet::new();
+        for row in objects.clone() {
+            let row = array(&row);
+            if bytes(&row[0])[32] != 1 {
+                continue;
+            }
+            let head_wire = wire(profile.store(), &sek, room, number(&array(&row[1])[1]));
+            let head = SignedHead::from_wire(&head_wire).unwrap();
+            if head.root.leaves == 0 {
+                continue;
+            }
+            let mut descriptors = vec![(1, head.root)];
+            for range in &ranges {
+                let row = array(range);
+                let key = bytes(&row[0]);
+                if key[..32] != head.binding.author || key[48] != head.binding.scope as u8 {
+                    continue;
+                }
+                let start = u64::from_be_bytes(key[32..40].try_into().unwrap());
+                let leaves = u64::from_be_bytes(key[40..48].try_into().unwrap());
+                if leaves != 1 || start > head.root.leaves {
+                    continue;
+                }
+                let range_wire = wire(profile.store(), &sek, room, number(&array(&row[1])[1]));
+                let mut d = Decoder::new(&range_wire);
+                let descriptor = Descriptor::decode(&mut d).unwrap();
+                d.finish().unwrap();
+                descriptors.push((start, descriptor));
+            }
+            for (start, descriptor) in descriptors {
+                let mut key = Encoder::new();
+                key.array(5)
+                    .bytes(b"vox/proof-serving-range/v1")
+                    .bytes(&head.id());
+                encode_binding(head.binding, &mut key);
+                key.uint(start).uint(descriptor.leaves);
+                let digest = sha256(&key.finish());
+                if !seeded.insert(digest) {
+                    continue;
+                }
+                let mut object = digest.to_vec();
+                object.push(9);
+                object.resize(64, 0);
+                let mut value = Encoder::new();
+                value.array(5).uint(1).bytes(&head.id());
+                encode_binding(head.binding, &mut value);
+                value.uint(start);
+                descriptor.encode(&mut value);
+                records.push((next, Value::from_canonical_slice(&value.finish()).unwrap()));
+                objects.push(Value::Array(vec![
+                    Value::Bytes(object),
+                    Value::Array(vec![Value::Uint(1), Value::Uint(next)]),
+                ]));
+                next += 1;
+            }
+        }
+        let count = records.len();
+        assert!(count > 32, "APPARATUS: seed spans multiple cleanup batches");
+        array_mut(&mut directory)[3] = Value::Uint(next);
+        replace_tree(
+            profile.store(),
+            &sek,
+            room,
+            0,
+            directory,
+            &pages,
+            objects,
+            records,
+        );
+        count
+    }
+    fn evict_nonprefix_ranges(dir: &Path, room: &Digest32) {
+        let profile = profile(dir);
+        let sek = sek(&profile, room);
+        let directory = decoded(profile.store(), &sek, room, 0);
+        let mut pages = Vec::new();
+        let mut ranges = Vec::new();
+        tree(
+            profile.store(),
+            &sek,
+            room,
+            number(&roots(&directory)[5]),
+            &mut pages,
+            &mut ranges,
+        );
+        let before = ranges.len();
+        // Prefix ranges are acceptance witnesses and stay. Only redundant non-prefix serving
+        // subtrees are evicted, so a cache miss must use committed source-header reconstruction.
+        ranges.retain(|row| {
+            let key = bytes(&array(row)[0]);
+            u64::from_be_bytes(key[32..40].try_into().unwrap()) == 1
+        });
+        assert!(
+            before > ranges.len(),
+            "APPARATUS: non-prefix ranges existed"
+        );
+        eprintln!(
+            "EVICTED {} redundant non-prefix ranges",
+            before - ranges.len()
+        );
+        replace_tree(
+            profile.store(),
+            &sek,
+            room,
+            5,
+            directory,
+            &pages,
+            ranges,
+            Vec::new(),
+        );
+    }
+    fn all_texts(dir: &Path, room: &str) -> Vec<String> {
+        let mut before: Option<String> = None;
+        let mut texts = Vec::new();
+        let ready_deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let mut args = vec!["room", "read", room, "--json", "--limit", "32"];
+            if let Some(cursor) = before.as_deref() {
+                args.extend(["--before", cursor]);
+            }
+            let (ok, said, err) = vox(dir, &args, None);
+            if !ok && err.contains("that room is preparing its saved history") {
+                assert!(
+                    Instant::now() < ready_deadline,
+                    "APPARATUS: reopened room did not finish preparation: {err}"
+                );
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
+            }
+            if !ok && err.contains("the room changed while reading; refresh and retry") {
+                before = None;
+                texts.clear();
+                continue;
+            }
+            assert!(ok, "PRODUCT: historical paging: {err}");
+            let rows: Vec<serde_json::Value> = said
+                .lines()
+                .filter(|line| !line.is_empty())
+                .map(|line| serde_json::from_str(line).expect("APPARATUS: JSON room row"))
+                .collect();
+            if rows.is_empty() {
+                break;
+            }
+            let next = rows[0]["entry_hash"]
+                .as_str()
+                .expect("PRODUCT: page has a cursor")
+                .to_owned();
+            assert_ne!(
+                before.as_ref(),
+                Some(&next),
+                "PRODUCT: paging repeated its cursor"
+            );
+            before = Some(next);
+            texts.extend(
+                rows.iter()
+                    .filter_map(|row| row["text"].as_str().map(str::to_owned)),
+            );
+            if rows.len() < 32 {
+                break;
+            }
+        }
+        texts
+    }
+    fn await_count(dir: &Path, room: &str, total: usize) {
+        let seen = std::cell::Cell::new(0);
+        assert!(
+            within(120, || {
+                seen.set(count(&all_texts(dir, room), "PROOF-CACHE-"));
+                seen.get() == total
+            }),
+            "PRODUCT: receiver shows {}/{total} acknowledged messages",
+            seen.get()
+        );
+    }
+    fn all_messages(dir: &Path, room: &str, total: usize) {
+        let seen = count(&all_texts(dir, room), "PROOF-CACHE-");
+        assert_eq!(
+            seen, total,
+            "PRODUCT: paging back returned {seen}/{total} acknowledged messages"
+        );
+    }
+    fn held_daemon(dir: &Path, tag: &str, listen: &str, variable: &str, hold: &Path) -> Daemon {
+        let mut child = Command::new(VOX)
+            .args(["daemon", "--listen", listen])
+            .env("VOX_DATA_DIR", dir)
+            .env("VOX_CONFIG_DIR", dir.join("cfg"))
+            .env("VOX_TEST_KEYCHAIN", attach::keychain(dir))
+            .env("VOX_PROXY", "127.0.0.1:0")
+            .env(variable, hold)
+            .stdin(Stdio::piped())
+            .stdout(std::fs::File::create(dir.join(format!("daemon-{tag}.out"))).unwrap())
+            .stderr(std::fs::File::create(dir.join(format!("daemon-{tag}.err"))).unwrap())
+            .spawn()
+            .unwrap();
+        writeln!(child.stdin.take().unwrap(), "{IDENTITY}").unwrap();
+        Daemon(child)
+    }
+    fn fresh() -> (
+        tempfile::TempDir,
+        PathBuf,
+        PathBuf,
+        Daemon,
+        Daemon,
+        String,
+        Digest32,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b) = pair(tmp.path());
+        let ad = daemon(&a, "a", &format!("{IDENTITY}\n"));
+        let bd = daemon(&b, "b", &format!("{IDENTITY}\n"));
+        attached(&a, "a");
+        attached(&b, "b");
+        let room = room(&a, &b);
+        let id = full_room(&a, &room);
+        (tmp, a, b, ad, bd, room, id)
+    }
+    pub(super) fn fetch() {
+        let (_tmp, a, b, ad, bd, room, id) = fresh();
+        for i in 0..100 {
+            post(&a, &room, &format!("PROOF-CACHE-{i:04}"));
+            if i % 10 == 9 {
+                await_count(&b, &room, i + 1);
+            }
+        }
+        let alisten = listening(&a);
+        let blisten = listening(&b);
+        drop(ad);
+        drop(bd);
+        no_rows(&a, &id);
+        no_rows(&b, &id);
+        let ad = daemon_on(&a, "a-post", &format!("{IDENTITY}\n"), &alisten);
+        attached(&a, "a-post");
+        for i in 100..140 {
+            post(&a, &room, &format!("PROOF-CACHE-{i:04}"));
+        }
+        drop(ad);
+        evict_nonprefix_ranges(&a, &id);
+        let ad = daemon_on(&a, "a-restart", &format!("{IDENTITY}\n"), &alisten);
+        attached(&a, "a-restart");
+        for attempt in 0..2 {
+            let hold = b.join(format!("fetch-{attempt}.hold"));
+            std::fs::write(&hold, b"abandon verified fetch before bodies").unwrap();
+            let bd = held_daemon(
+                &b,
+                &format!("b-abandon-{attempt}"),
+                &blisten,
+                "VOX_TEST_HOLD_VERIFIED_FETCH",
+                &hold,
+            );
+            assert!(
+                within(120, || hold.with_extension("verified").exists()),
+                "APPARATUS: no completed fetch proof was available to abandon"
+            );
+            let held = count(&all_texts(&b, &room), "PROOF-CACHE-");
+            assert!(
+                held < 140,
+                "APPARATUS: fetch abandonment was staged after all message bodies arrived"
+            );
+            eprintln!("ABANDONED verified fetch: receiver shows {held}/140 message bodies");
+            drop(bd);
+            std::fs::remove_file(hold).unwrap();
+            no_rows(&b, &id);
+        }
+        let bd = daemon_on(&b, "b-restart", &format!("{IDENTITY}\n"), &blisten);
+        attached(&b, "b-restart");
+        await_count(&b, &room, 140);
+        all_messages(&a, &room, 140);
+        all_messages(&b, &room, 140);
+        drop(ad);
+        drop(bd);
+        no_rows(&a, &id);
+        no_rows(&b, &id);
+    }
+    pub(super) fn cleanup() {
+        let (_tmp, a, b, ad, bd, room, id) = fresh();
+        for i in 0..80 {
+            post(&a, &room, &format!("PROOF-CACHE-{i:04}"));
+        }
+        await_count(&b, &room, 80);
+        let alisten = listening(&a);
+        let blisten = listening(&b);
+        drop(ad);
+        drop(bd);
+        seed_old_rows(&a, &id);
+        let before = counts(&a, &id);
+        assert!(before.get(&9).copied().unwrap_or(0) > 32);
+        let ad = daemon_on(&a, "a-clean", &format!("{IDENTITY}\n"), &alisten);
+        attached(&a, "a-clean");
+        all_messages(&a, &room, 80);
+        drop(ad);
+        no_rows(&a, &id);
+        let after = counts(&a, &id);
+        for (kind, count) in before.iter().filter(|(kind, _)| **kind != 9 && **kind != 4) {
+            assert!(
+                after.get(kind).copied().unwrap_or(0) >= *count,
+                "PRODUCT: cleanup deleted non-cache object kind {kind}: {before:?} -> {after:?}"
+            );
+        }
+        let seeded = seed_old_rows(&a, &id);
+        let hold = a.join("proof-cleanup.hold");
+        std::fs::write(&hold, b"hold after one committed batch").unwrap();
+        let ad = held_daemon(
+            &a,
+            "a-interrupt",
+            &alisten,
+            "VOX_TEST_HOLD_PROOF_CACHE_CLEANUP",
+            &hold,
+        );
+        assert!(
+            within(120, || hold.with_extension("committed").exists()),
+            "APPARATUS: room-open cleanup never reached a committed cache batch"
+        );
+        drop(ad);
+        let interrupted = counts(&a, &id).get(&9).copied().unwrap_or(0);
+        assert!(interrupted > 0 && interrupted < seeded,
+            "PRODUCT: interrupted cleanup committed no bounded progress: {interrupted}/{seeded} rows remain");
+        std::fs::remove_file(hold).unwrap();
+        let ad = daemon_on(&a, "a-final", &format!("{IDENTITY}\n"), &alisten);
+        let bd = daemon_on(&b, "b-final", &format!("{IDENTITY}\n"), &blisten);
+        attached(&a, "a-final");
+        attached(&b, "b-final");
+        all_messages(&a, &room, 80);
+        all_messages(&b, &room, 80);
+        drop(ad);
+        drop(bd);
+        no_rows(&a, &id);
+    }
+}
+
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "real pair, changing signed heads, store inspection and restart paging"]
+fn fetching_keeps_serving_proofs_out_of_the_store() {
+    proof_rows::fetch();
+}
+
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "real pair and interrupted bounded old-store cleanup"]
+fn opening_a_room_reclaims_old_serving_proofs_across_interruption() {
+    proof_rows::cleanup();
 }

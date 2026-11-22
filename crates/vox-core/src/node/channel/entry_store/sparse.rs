@@ -12,6 +12,58 @@ use crate::log::history::{
     MAX_CONTEXT_BYTES, MAX_FRAME_BYTES, MAX_HEADER_BYTES,
 };
 
+// One pool for every room, Store and read snapshot in the daemon. Descriptors are immutable
+// serving math, never acceptance authority. Neither hits nor replacements change FIFO order.
+const PROOF_CACHE_ENTRIES: usize = 8 * 1024;
+const PROOF_CACHE_BYTES: usize = 8 * 1024 * 1024;
+struct ProofCache {
+    ranges: std::collections::HashMap<Digest32, Descriptor>,
+    fifo: VecDeque<Digest32>,
+}
+// Reserve twice the entry cap, so eviction churn stays below half the table's load limit
+// and tombstone cleanup rehashes rather than growing. Charge two complete backing tables
+// (including transient rehash storage), control bytes/alignment, the FIFO and the container.
+const PROOF_CACHE_CHARGE: usize =
+    8 * PROOF_CACHE_ENTRIES * (std::mem::size_of::<(Digest32, Descriptor)>() + 1)
+        + 128
+        + PROOF_CACHE_ENTRIES * std::mem::size_of::<Digest32>()
+        + std::mem::size_of::<ProofCache>();
+const _: () = assert!(PROOF_CACHE_CHARGE <= PROOF_CACHE_BYTES);
+static PROOF_CACHE: std::sync::Mutex<Option<ProofCache>> = std::sync::Mutex::new(None);
+
+pub(crate) fn cache_history_proof_range(
+    head: Digest32,
+    binding: TreeBinding,
+    start: u64,
+    descriptor: Descriptor,
+) -> Result<()> {
+    descriptor.validate()?;
+    let key = proof_range_key(&head, binding, start, descriptor.leaves)?;
+    let mut guard = PROOF_CACHE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let cache = guard.get_or_insert_with(|| ProofCache {
+        ranges: std::collections::HashMap::with_capacity(2 * PROOF_CACHE_ENTRIES),
+        fifo: VecDeque::with_capacity(PROOF_CACHE_ENTRIES),
+    });
+    if let Some(old) = cache.ranges.get(&key) {
+        if *old != descriptor {
+            return Err(invalid("conflicting proof-serving range"));
+        }
+        return Ok(());
+    }
+    if cache.fifo.len() == PROOF_CACHE_ENTRIES {
+        let oldest = cache
+            .fifo
+            .pop_front()
+            .ok_or_else(|| invalid("proof cache FIFO is empty"))?;
+        cache.ranges.remove(&oldest);
+    }
+    cache.ranges.insert(key, descriptor);
+    cache.fifo.push_back(key);
+    Ok(())
+}
+
 /// Locally signed material verified by the same v2 proof primitives. Only the final
 /// contiguous publication transaction may attach it to the newly active roots.
 pub(crate) struct LocalHistoryPublication<'a> {
@@ -1505,6 +1557,14 @@ impl Read<'_> {
             return Err(invalid("proof-serving range room"));
         }
         let key = proof_range_key(head, binding, start, leaves)?;
+        if let Some(value) = PROOF_CACHE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .and_then(|cache| cache.ranges.get(&key).copied())
+        {
+            return Ok(Some(value));
+        }
         self.history_object(ObjectKind::ProofRange, &key)?
             .map(|bytes| decode_proof_range(&bytes, head, binding, start, leaves))
             .transpose()
@@ -2503,40 +2563,43 @@ impl Write<'_, '_> {
             self.change_value(root, key, Some(Value::Number(id)))?;
         Ok(())
     }
-    /// Cache only a fully verified proof node or a deterministic reconstruction from
-    /// independently committed canonical sources. This does not change prefix acceptance.
-    pub(crate) fn keep_history_proof_range(
+    /// Scan at most sixteen object locators, deleting only the obsolete serving-cache kind.
+    /// The object and its index reference retire in the same room transaction.
+    pub(super) fn cleanup_history_proof_ranges(
         &mut self,
-        head: Digest32,
-        binding: TreeBinding,
-        start: u64,
-        descriptor: Descriptor,
-    ) -> Result<()> {
+        mut after: Option<Key>,
+    ) -> Result<(bool, Option<Key>, bool)> {
         self.require_sparse_idle()?;
-        if binding.room != *self.channel {
-            return Err(invalid("proof-serving range room"));
-        }
-        descriptor.validate()?;
-        let key = proof_range_key(&head, binding, start, descriptor.leaves)?;
-        if let Some(id) = Source::Batch(self.batch).number(
-            self.sek,
-            self.channel,
-            self.directory.active.sparse.objects,
-            &object_key(ObjectKind::ProofRange, &key),
-        )? {
-            let bytes =
-                Source::Batch(self.batch).sparse_record(self.sek, self.channel, id, STATE_BYTES)?;
-            if decode_proof_range(&bytes, &head, binding, start, descriptor.leaves)? != descriptor {
-                return Err(invalid("conflicting proof-serving range"));
+        let mut changed = false;
+        for _ in 0..16 {
+            let seek = match after {
+                Some(key) => match dag_facts::successor(key) {
+                    Some(next) => next,
+                    None => return Ok((true, None, changed)),
+                },
+                None => [0; 64],
+            };
+            let root = self.directory.active.sparse.objects;
+            let Some((key, value)) =
+                Source::Batch(self.batch).first(self.sek, self.channel, root, &seek, 0)?
+            else {
+                return Ok((true, None, changed));
+            };
+            after = Some(key);
+            if key[32] != ObjectKind::ProofRange as u8 {
+                continue;
             }
-            return Ok(());
+            if key[33..] != [0; 31] {
+                return Err(invalid("proof-serving object key"));
+            }
+            let Value::Number(id) = value else {
+                return Err(invalid("proof-serving object locator"));
+            };
+            self.retire(id)?;
+            self.directory.active.sparse.objects = self.change_value(root, key, None)?;
+            changed = true;
         }
-        let mut e = Encoder::new();
-        e.array(5).uint(1).bytes(&head);
-        binding.encode(&mut e);
-        e.uint(start);
-        descriptor.encode(&mut e);
-        self.save_history_object(ObjectKind::ProofRange, key, &e.finish())
+        Ok((false, after, changed))
     }
     fn save_sparse_author(&mut self, binding: TreeBinding, state: AuthorState) -> Result<()> {
         if binding.room != *self.channel {

@@ -721,3 +721,27 @@ Seventy shipped nodes share one scratch daemon, join a room, trust each other an
 messages read. The app client must expose all69 readers on every message and every trust
 relationship. The terminal must open the room and show every reader and peer's trust (#792).
 This expensive proof is optional and blocks neither CI nor release.
+
+### Fetch-serving cache and old-room cleanup (ADR-052 RG-13)
+
+Fetch proof descriptors share one daemon-wide FIFO cache capped below 8 MiB, including keys,
+values and container/rehash allocation. They are not written to the store. Canonical prefix
+ranges, source headers, contexts, witnesses and receipts remain durable. Opening a room removes
+only that room's old ProofRange objects and index references in bounded atomic batches;
+interruption leaves completed batches applied and the next open resumes by an idempotent scan.
+Locked/unopened rooms are not converted by a whole-store startup pass.
+
+Both optional journeys extend `retention_proof.rs` and use private scratch profiles/Keychains:
+
+```sh
+cargo test --release -p vox-tui --features test-knobs,optional-proofs --test retention_proof \
+  fetching_keeps_serving_proofs_out_of_the_store -- --exact --ignored --nocapture
+cargo test --release -p vox-tui --features test-knobs,optional-proofs --test retention_proof \
+  opening_a_room_reclaims_old_serving_proofs_across_interruption -- --exact --ignored --nocapture
+```
+
+The first exchanges messages across changing signed heads, abandons verified fetches, restarts
+both members and pages back through every acknowledged message while decoded stopped-store
+ProofRange counts stay zero. Its independent mutants restore admission writes or reconstruction
+writes. The second seeds the old serving-row shape in a real stopped room, opens it, interrupts
+after a committed cleanup batch and reopens it, preserving other object kinds and readable history.
