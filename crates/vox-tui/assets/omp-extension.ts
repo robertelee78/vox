@@ -260,7 +260,7 @@ export default function vox(pi) {
         const acknowledged = enveloped && code === 0
         // The native decision is final; reacquisition finishes its saved bookkeeping.
         if (op.record) op.record.state = op.decision === "commit" ? "committed" : "cancelled"
-        if (!acknowledged && enveloped) {
+        if (!acknowledged && enveloped && refusal !== "permanent") {
           confirmed = false
           if (scheduleRetry()) report("finishing the saved context decision; reacquiring registration")
         }
