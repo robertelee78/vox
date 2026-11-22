@@ -1440,6 +1440,7 @@ impl PendingUpgrade {
                 let saved = Stored {
                     record,
                     row: cached,
+                    opener: None,
                     first_seen: tracked.first_seen_ms,
                     attention_after: None,
                 };
@@ -1523,8 +1524,8 @@ impl PendingUpgrade {
         ))?;
         let iteration = record.message.header.iteration;
         let mut next_receiver = ReceiverChain::from_state(&receiver.to_state())?;
-        let plaintext = if receiver.can_open_iteration(iteration) {
-            Zeroizing::new(next_receiver.decrypt(&record.message)?)
+        let (plaintext, opener) = if receiver.can_open_iteration(iteration) {
+            next_receiver.decrypt_private(&record.message)?
         } else {
             let Some(gap) = iteration.checked_sub(receiver.history_release_binding().0) else {
                 return Err(Error::StreamRefused(
@@ -1536,8 +1537,9 @@ impl PendingUpgrade {
                     "private Session history release unavailable",
                 ));
             }
-            Zeroizing::new(receiver.decrypt_retained(&record.message)?)
+            receiver.decrypt_private_retained(&record.message)?
         };
+        let plaintext = Zeroizing::new(plaintext);
         let Decoded::Session(content) = crate::node::content::decode(&plaintext)? else {
             return Err(Error::MalformedBundle("private Session content kind"));
         };
@@ -1551,6 +1553,7 @@ impl PendingUpgrade {
         let saved = Stored {
             record,
             row: Some(row),
+            opener: Some(opener),
             first_seen: known.as_ref().map_or(self.now, |saved| saved.first_seen),
             attention_after: None,
         };
@@ -2170,7 +2173,7 @@ impl PendingUpgrade {
         let iteration = record.message.header.iteration;
         let plain = if receiver.can_open_iteration(iteration) {
             let mut next = ReceiverChain::from_state(&receiver.to_state())?;
-            Zeroizing::new(next.decrypt(&record.message)?)
+            Zeroizing::new(next.decrypt_private(&record.message)?.0)
         } else {
             let Some(gap) = iteration.checked_sub(receiver.history_release_binding().0) else {
                 return Ok(None);
@@ -2181,7 +2184,7 @@ impl PendingUpgrade {
             {
                 return Ok(None);
             }
-            Zeroizing::new(receiver.decrypt_retained(&record.message)?)
+            Zeroizing::new(receiver.decrypt_private_retained(&record.message)?.0)
         };
         let Decoded::Session(content) = crate::node::content::decode(&plain)? else {
             return Err(Error::MalformedBundle("private Session content kind"));

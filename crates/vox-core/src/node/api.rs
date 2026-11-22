@@ -842,7 +842,7 @@ pub struct NodeView {
     /// The open channels' detail, in channelID order, less the rooms this identity left.
     pub open_channels: Vec<ChannelDetail>,
     /// Rooms this identity left whose departure no other member has taken yet (ADR-023
-    /// RL-8.1a), in channelID order: held hidden until one has, or for seven days, then
+    /// RL-8.1a), in channelID order: held hidden until one has, or for two days, then
     /// deleted. Nothing else of them is published; `vox status` names them as leaving.
     pub leaving: Vec<LeavingRoom>,
     /// Rooms this node deleted for having ended for everyone (V030-08, #1206), oldest noted
@@ -1148,7 +1148,7 @@ pub enum NodeCommand {
     /// and the room's board withdrawal are durable (the decider, 2026-11-11: "a node should be
     /// able to leave a room whenever it wants"). The room is gone for the person from then on;
     /// this node holds it hidden, listed in `vox status` as leaving, until another member has
-    /// the departure, or for seven days, then deletes it (the decider, 2026-10-03: "leave
+    /// the departure, or for two days, then deletes it (the decider, 2026-10-03: "leave
     /// deletes it").
     LeaveRoom {
         /// The channelID.

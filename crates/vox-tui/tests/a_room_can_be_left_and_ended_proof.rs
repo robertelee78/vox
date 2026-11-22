@@ -681,6 +681,11 @@ fn an_admin_removes_one_member_and_the_creator_readmits_it_forward_only() {
         back,
         "APPARATUS: full-history control rejoin did not reach its sender: {roster:?}"
     );
+    let restart_before_post = std::env::var_os("VOX_PROOF_FX62_RESTART_REJOIN").is_some();
+    if restart_before_post {
+        dave.restart_daemon(&tmp.path().join("dave-rejoined-restart.err"));
+        eprintln!("[proof] FX62 never-removed-full: restarted rejoined dave before its first post");
+    }
     // Own-history recovery is the #1163 prerequisite, not roster propagation; use the
     // same patience as its existing recovery consumers rather than WITHIN's leave window.
     let (writable, post) = poll(
@@ -689,7 +694,8 @@ fn an_admin_removes_one_member_and_the_creator_readmits_it_forward_only() {
         support::TIMEOUT,
         |o| o.ok,
     );
-    if !writable
+    if !restart_before_post
+        && !writable
         && post
             .stderr
             .contains("this node's record of its own history in this room is behind")
@@ -1376,7 +1382,31 @@ fn a_room_left_leaves_nothing_on_the_node() {
          what it did after: {:?}",
         o.stdout
     );
-    // ADR-023 RL-8.1 / RL-8.4 permits the checkpoint, not content, keys or passphrase.
+    unavailable(&room.workers[0], &id);
+    let bob = &room.workers[1];
+    let (gone, o2) = poll(bob, &["room", "roster", &id], WITHIN, |o| {
+        o.ok && !o.stdout.contains(&alice_fp)
+    });
+    assert!(
+        gone,
+        "PRODUCT: {WITHIN:?} after alice left, bob's roster still names her: {o2:?}"
+    );
+    // Receipt-driven deletion is asynchronous; absence for the person is immediate.
+    // The separate offline-member arm proves deletion even without a receipt after two days.
+    support::until(
+        &room.workers[0],
+        None,
+        "the acknowledged departure's copy deleted",
+        &["status", "--json"],
+        |out| {
+            out.ok
+                && serde_json::from_str::<serde_json::Value>(&out.stdout).is_ok_and(|status| {
+                    status["leaving"]
+                        .as_array()
+                        .is_some_and(|rooms| rooms.iter().all(|held| held["id"] != id))
+                })
+        },
+    );
     erased(&mut room.workers[0], &id, &cid, true);
     room.workers[0].stop_daemon_cleanly();
     let after = std::fs::read(room.workers[0].paths.store_file())
@@ -1386,14 +1416,6 @@ fn a_room_left_leaves_nothing_on_the_node() {
         "PRODUCT: Alice's deleted sealed SEK wrap remains physically present after Leave"
     );
     room.workers[0].restart_daemon(&tmp.path().join("alice-after-physical-erasure.err"));
-    let bob = &room.workers[1];
-    let (gone, o2) = poll(bob, &["room", "roster", &id], WITHIN, |o| {
-        o.ok && !o.stdout.contains(&alice_fp)
-    });
-    assert!(
-        gone,
-        "PRODUCT: {WITHIN:?} after alice left, bob's roster still names her: {o2:?}"
-    );
 
     eprintln!("[proof] leave: no live room rows or SEK wrap, including its deleted sealed bytes, or readable room after restart");
 }
@@ -1609,13 +1631,18 @@ fn rejoin_ended_with_status(worker: &Worker, link: &str) -> Out {
         String::from_utf8_lossy(&output.stdout)
     );
     let joined = finish(&mut join, join_deadline, "vox room join for an ended room");
-    Out {
+    let out = Out {
         ok: joined.status.success(),
         code: joined.status.code(),
         stdout: String::from_utf8_lossy(&joined.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&joined.stderr).into_owned(),
         argv: format!("{} room join --passphrase-file - {link}", worker.exe),
-    }
+    };
+    eprintln!(
+        "[receipt] {} -> exit {:?}\n  stdout: {}\n  stderr: {}",
+        out.argv, out.code, out.stdout, out.stderr
+    );
+    out
 }
 
 fn end_while_away(delegated: bool) {
@@ -2343,7 +2370,7 @@ fn the_tui_leaves_and_ends() {
     );
     eprintln!("[proof] tui: a non-creator's :end is refused as the CLI refuses it: {tui}");
 
-    room.workers[2].stop_daemon();
+    room.workers[2].stop_daemon_cleanly();
     tui_verb(&room.workers[2], "leave", Duration::from_secs(15));
     let carol = room.workers[2].b32();
     for w in &room.workers[..2] {
@@ -2371,6 +2398,8 @@ fn the_tui_leaves_and_ends() {
         "PRODUCT: {GONE:?} after alice's :end in the TUI, bob's `vox room list` still names the \
          room: {o:?}"
     );
+    // The authenticated End must still erase Bob's public author continuity.
+    erased(&mut room.workers[1], &id, &cid, false);
     eprintln!("[proof] tui: :leave and :end each did what the CLI verb does");
 }
 
@@ -2490,6 +2519,282 @@ fn an_ended_room_can_be_left_at_once() {
         "PRODUCT: ended-room leave described a departure instead of local deletion: {left:?}"
     );
     erased(alice, &room.id, &room.cid, false);
+}
+
+/// A stopped product's sealed room rows, used to check retention without opening its content.
+#[cfg(feature = "test-knobs")]
+fn retained_room_rows(w: &Worker, cid: &[u8; 32]) -> Vec<(u8, u64, Vec<u8>)> {
+    let db = redb::Database::builder()
+        .open_read_only(w.paths.store_file())
+        .expect("APPARATUS: open stopped hidden-room store");
+    let read = db.begin_read().expect("APPARATUS: read hidden-room store");
+    let mut rows = Vec::new();
+    for name in ["segments", "small_segments"] {
+        let table = match read.open_table(redb::TableDefinition::<([u8; 32], u8, u64), &[u8]>::new(
+            name,
+        )) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => continue,
+            Err(error) => panic!("APPARATUS: open hidden-room {name}: {error}"),
+        };
+        rows.extend(
+            table
+                .range((*cid, 0, 0)..=(*cid, u8::MAX, u64::MAX))
+                .expect("APPARATUS: room row range")
+                .map(|row| {
+                    let (key, value) = row.expect("APPARATUS: room row");
+                    let (_, kind, index) = key.value();
+                    (kind, index, value.value().to_vec())
+                }),
+        );
+    }
+    rows
+}
+
+/// Inspect a crash-consistent copy without restarting the daemon being measured.
+#[cfg(feature = "test-knobs")]
+fn live_retained_room_rows(w: &Worker, cid: &[u8; 32]) -> Vec<(u8, u64, Vec<u8>)> {
+    struct Resume(u32);
+    impl Drop for Resume {
+        fn drop(&mut self) {
+            let result = std::process::Command::new("kill")
+                .args(["-CONT", &self.0.to_string()])
+                .status();
+            assert!(
+                result.is_ok_and(|status| status.success()),
+                "APPARATUS: resume the owned snapshot daemon"
+            );
+        }
+    }
+    let pid = w.daemon_pid().expect("APPARATUS: owned snapshot daemon");
+    assert!(
+        std::process::Command::new("kill")
+            .args(["-STOP", &pid.to_string()])
+            .status()
+            .expect("APPARATUS: suspend owned daemon")
+            .success(),
+        "APPARATUS: suspend owned daemon for snapshot"
+    );
+    let resume = Resume(pid);
+    loop {
+        let state = std::process::Command::new("ps")
+            .args(["-o", "state=", "-p", &pid.to_string()])
+            .output()
+            .expect("APPARATUS: inspect owned daemon suspension");
+        assert!(state.status.success(), "APPARATUS: snapshot daemon exited");
+        if String::from_utf8_lossy(&state.stdout).contains('T') {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    let tmp = tempfile::tempdir().expect("APPARATUS: snapshot directory");
+    let path = tmp.path().join("snapshot.redb");
+    std::fs::copy(w.paths.store_file(), &path).expect("APPARATUS: copy suspended store");
+    drop(resume);
+    // Opening the disposable copy permits redb's normal interrupted-write recovery.
+    // It neither opens nor changes the running product's database.
+    let db = redb::Database::create(path).expect("APPARATUS: open store snapshot");
+    let read = db.begin_read().expect("APPARATUS: read store snapshot");
+    let mut rows = Vec::new();
+    for name in ["segments", "small_segments"] {
+        let table = match read.open_table(redb::TableDefinition::<([u8; 32], u8, u64), &[u8]>::new(
+            name,
+        )) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => continue,
+            Err(error) => panic!("APPARATUS: open snapshot {name}: {error}"),
+        };
+        rows.extend(
+            table
+                .range((*cid, 0, 0)..=(*cid, u8::MAX, u64::MAX))
+                .expect("APPARATUS: snapshot room row range")
+                .map(|row| {
+                    let (key, value) = row.expect("APPARATUS: snapshot room row");
+                    let (_, kind, index) = key.value();
+                    (kind, index, value.value().to_vec())
+                }),
+        );
+    }
+    rows
+}
+
+/// The deadline is independent of the trust-change row-integrity claim.
+#[cfg(feature = "test-knobs")]
+#[test]
+#[ignore = "real daemons and a two-day product clock step; run in release"]
+fn a_left_rooms_hidden_copy_expires_after_two_days() {
+    left_copy_lifecycle(false);
+}
+
+#[cfg(feature = "test-knobs")]
+#[test]
+#[ignore = "real daemons, a hidden left room and a trust change; run in release"]
+fn a_trust_change_preserves_a_left_rooms_hidden_copy() {
+    left_copy_lifecycle(true);
+}
+
+#[cfg(feature = "test-knobs")]
+fn left_copy_lifecycle(trust_only: bool) {
+    watchdog::arm();
+    let rt = runtime();
+    let tmp = support::diagnostic_tempdir();
+    let mut room = room_of(&rt, tmp.path(), &["alice", "bob"]);
+    let bob_id = room.workers[1].b32();
+    room.workers[1].stop_daemon_cleanly();
+    let alice = &mut room.workers[0];
+    setup(alice, &["room", "leave", &room.id]);
+    unavailable(alice, &room.id);
+    let hidden = setup(alice, &["status", "--json"]);
+    let hidden: serde_json::Value =
+        serde_json::from_str(&hidden.stdout).expect("APPARATUS: status JSON");
+    assert!(
+        hidden["rooms"].as_array().is_some_and(Vec::is_empty),
+        "PRODUCT: left room was shown or counted as an active room: {hidden}"
+    );
+    alice.stop_daemon_cleanly();
+    let retained = retained_room_rows(alice, &room.cid);
+    assert!(
+        !retained.is_empty(),
+        "PRODUCT: the hidden copy was deleted at once instead of retained for two days"
+    );
+    alice.restart_daemon_as(
+        support::VOX,
+        &[("VOX_TEST_CLOCK_STEP_MS", "86400000")],
+        &tmp.path().join("alice.one-day.err"),
+    );
+    support::until(
+        alice,
+        None,
+        "startup finished reopening the hidden left room",
+        &["status", "--json"],
+        |out| {
+            out.ok
+                && serde_json::from_str::<serde_json::Value>(&out.stdout).is_ok_and(|status| {
+                    status["preparing"].as_array().is_some_and(Vec::is_empty)
+                        && status["rooms"].as_array().is_some_and(Vec::is_empty)
+                        && status["leaving"]
+                            .as_array()
+                            .is_some_and(|rooms| rooms.iter().any(|held| held["id"] == room.id))
+                })
+        },
+    );
+    // The acknowledged post flushes startup's derived saves before the first file snapshot.
+    alice
+        .vox_in(
+            None,
+            &[
+                "room",
+                "create",
+                "--name",
+                "still-writable",
+                "--passphrase-file",
+                "-",
+            ],
+            Some(support::ROOM_PASS),
+        )
+        .expect_ok("create a live room before the trust change");
+    let list = setup(alice, &["room", "list"]);
+    let live = list
+        .stdout
+        .lines()
+        .find(|line| line.contains("still-writable"))
+        .and_then(|line| line.split_whitespace().next())
+        .expect("APPARATUS: healthy room id");
+    setup(
+        alice,
+        &["room", "post", live, "trust did not refuse this post"],
+    );
+    let retained_before_trust = trust_only.then(|| live_retained_room_rows(alice, &room.cid));
+    if trust_only {
+        setup(
+            alice,
+            &[
+                "trust",
+                "remove",
+                &bob_id,
+                "--identity-passphrase-file",
+                alice.pass.to_str().expect("APPARATUS: passphrase path"),
+            ],
+        );
+        setup(
+            alice,
+            &[
+                "trust",
+                "add",
+                &bob_id,
+                "--name",
+                "bob",
+                "--identity-passphrase-file",
+                alice.pass.to_str().expect("APPARATUS: passphrase path"),
+            ],
+        );
+        support::until(
+            alice,
+            None,
+            "trust change finished",
+            &["status", "--json"],
+            |out| {
+                out.ok
+                    && serde_json::from_str::<serde_json::Value>(&out.stdout)
+                        .is_ok_and(|status| status["governance_pending"] == false)
+            },
+        );
+    }
+    if trust_only {
+        assert_eq!(
+            live_retained_room_rows(alice, &room.cid),
+            retained_before_trust.expect("APPARATUS: trust snapshot"),
+            "PRODUCT: trust rewrote the hidden room's stored rows"
+        );
+        unavailable(alice, &room.id);
+        let healthy = setup(alice, &["room", "read", live]);
+        assert!(
+            healthy.stdout.contains("trust did not refuse this post"),
+            "PRODUCT: trust change lost another room's post: {healthy:?}"
+        );
+        eprintln!("[proof] trust completed without changing the hidden copy in one daemon session");
+        return;
+    }
+    alice.stop_daemon_cleanly();
+    alice.restart_daemon_as(
+        support::VOX,
+        &[("VOX_TEST_CLOCK_STEP_MS", "172801000")],
+        &tmp.path().join("alice.two-days.err"),
+    );
+    let clock = setup(alice, &["status", "--json"]);
+    let clock: serde_json::Value =
+        serde_json::from_str(&clock.stdout).expect("APPARATUS: stepped status JSON");
+    let wall = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("APPARATUS: system clock")
+        .as_millis() as u64;
+    assert!(
+        clock["now_ms"]
+            .as_u64()
+            .is_some_and(|now| now >= wall + 172_800_000),
+        "APPARATUS: product clock did not step past two days: {clock}"
+    );
+    // Wait for the product's purge, but let the physical copy decide the expiry verdict,
+    // including on the seven-day baseline and the never-delete mutant.
+    let (expired, expiry_status) = poll(alice, &["status", "--json"], WITHIN, |out| {
+        out.ok
+            && serde_json::from_str::<serde_json::Value>(&out.stdout).is_ok_and(|status| {
+                status["leaving"]
+                    .as_array()
+                    .is_some_and(|rooms| rooms.iter().all(|held| held["id"] != room.id))
+            })
+    });
+    let healthy = setup(alice, &["room", "read", live]);
+    assert!(
+        healthy.stdout.contains("trust did not refuse this post"),
+        "PRODUCT: expiry damaged another room's acknowledged post: {healthy:?}"
+    );
+    erased(alice, &room.id, &room.cid, true);
+    assert!(
+        expired,
+        "PRODUCT: hidden copy expired but status still listed it as leaving after two days: {expiry_status:?}"
+    );
+    eprintln!("[proof] after two days the hidden copy is gone and the healthy room reads whole");
 }
 
 /// RG-14: invalid stores are preserved; inaccessible good stores keep their identity and rooms.

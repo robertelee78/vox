@@ -48,6 +48,9 @@ const ALL_CACHE_BYTES: usize = 64 * 1024 * 1024;
 static CACHE_USED: AtomicUsize = AtomicUsize::new(0);
 const MAX_DEPTH: usize = 64;
 const DIRECTORY: u64 = 0;
+// One completion bit in the existing sealed per-room KeyMaterial namespace, not a
+// directory/schema change. Present with canonical CBOR uint(1) only after the whole scan.
+const SEG_PROOF_CACHE_CLEANED: u64 = 30;
 type Key = [u8; 64];
 
 mod dag_facts;
@@ -2634,6 +2637,79 @@ impl EntryIndex {
         Ok(false)
     }
 
+    /// An opening room may first owe several publication-recovery quanta. Reclaim its old
+    /// serving cache only once those roots are idle, including the deferred startup path.
+    fn cleanup_old_history_proof_ranges(
+        &self,
+        store: &Store,
+        sek: &Sek,
+        channel: &Digest32,
+    ) -> Result<()> {
+        if let Some(segment) = store.snapshot()?.get_segment_bounded(
+            channel,
+            SegmentKind::KeyMaterial,
+            SEG_PROOF_CACHE_CLEANED,
+            1,
+        )? {
+            let marker = open_segment(
+                sek,
+                SegmentKind::KeyMaterial,
+                SEG_PROOF_CACHE_CLEANED,
+                &segment,
+            )?;
+            if marker.as_slice() != [1] {
+                return Err(invalid("proof cache cleanup completion marker"));
+            }
+            return Ok(());
+        }
+        let mut after = None;
+        loop {
+            let mut batch = store.batch()?;
+            // Reclamation must survive interruption, not wait for an unrelated future flush.
+            let mut writer = self.write(&mut batch, sek, channel)?;
+            if writer.directory.phase != Phase::Idle || !writer.directory.active.sparse.enabled {
+                return Ok(());
+            }
+            let (done, next, changed) = writer.cleanup_history_proof_ranges(after)?;
+            if done {
+                let marker =
+                    seal_segment(sek, SegmentKind::KeyMaterial, SEG_PROOF_CACHE_CLEANED, &[1])?;
+                writer.batch.put_segment(
+                    channel,
+                    SegmentKind::KeyMaterial,
+                    SEG_PROOF_CACHE_CLEANED,
+                    &marker,
+                )?;
+            }
+            if changed || done {
+                if changed {
+                    writer.seal()?;
+                }
+                batch.commit()?;
+                self.committed();
+                #[cfg(feature = "test-knobs")]
+                if let Some(path) = std::env::var_os("VOX_TEST_HOLD_PROOF_CACHE_CLEANUP") {
+                    let path = std::path::PathBuf::from(path);
+                    std::fs::write(
+                        path.with_extension("committed"),
+                        b"room cache batch committed",
+                    )
+                    .map_err(|error| Error::Storage {
+                        op: "proof cleanup marker",
+                        detail: error.to_string(),
+                    })?;
+                    while path.exists() {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                }
+            }
+            if done {
+                return Ok(());
+            }
+            after = next;
+        }
+    }
+
     pub(crate) fn prepare_owned(
         &self,
         store: &Store,
@@ -2735,6 +2811,9 @@ impl EntryIndex {
             }
             after = next;
         }
+        if preserved {
+            self.cleanup_old_history_proof_ranges(store, sek, channel)?;
+        }
         self.provisional_hidden.set(false);
         let read = self.read(store, sek, channel)?;
         Ok(if read.directory.retired_provisional == Roots::default() {
@@ -2780,11 +2859,16 @@ impl EntryIndex {
         let retired = writer.directory.retired_provisional != Roots::default();
         if changed {
             writer.seal()?;
+            drop(writer);
             batch.commit()?;
             self.committed();
+        } else {
+            drop(writer);
+            drop(batch);
         }
         if current_ready {
             self.provisional_hidden.set(false);
+            self.cleanup_old_history_proof_ranges(store, sek, channel)?;
             Ok(if retired {
                 Preparation::ReadyWithCleanup
             } else {
