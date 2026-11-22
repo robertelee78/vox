@@ -35,6 +35,7 @@ fn source(bytes: &[u8]) -> Result<Source> {
 }
 
 fn put_source(index: &mut Write<'_, '_>, source: Source, body: &str) -> Result<()> {
+    super::locality::backfill_source(index, source, body)?;
     let logical = crate::node::sessions::is_record(body).then(|| {
         hash_key(&sha256_concat(&[
             b"vox/session-record/v1",
@@ -192,12 +193,14 @@ fn assemble(index: &mut Write<'_, '_>, source: Source, body: &str) -> Result<()>
         };
         let mut e = Encoder::new();
         part.put(&mut e);
+        let part_key = Part::key(&bundle.first.position.hash, bundle.bytes);
         let part_id = index.put_descriptor(&e.finish())?;
         index.set(
             Tree::Parts,
             Part::key(&bundle.first.position.hash, bundle.bytes),
             Some(part_id),
         )?;
+        super::locality::backfill_part(index, source, body, part_key, part_id)?;
     }
     bundle.bytes = bundle
         .bytes
@@ -226,16 +229,16 @@ fn assemble(index: &mut Write<'_, '_>, source: Source, body: &str) -> Result<()>
     Ok(())
 }
 
-struct Event {
-    source: Source,
+pub(super) struct Event {
+    pub source: Source,
     kind: u8,
-    id: String,
+    pub id: String,
     name: Option<Field>,
     harness: Option<Field>,
     cwd: Option<Field>,
 }
 impl Event {
-    fn bytes(&self) -> Vec<u8> {
+    pub fn bytes(&self) -> Vec<u8> {
         let mut e = Encoder::new();
         e.array(6);
         self.source.put(&mut e);
@@ -248,7 +251,7 @@ impl Event {
         }
         e.finish()
     }
-    fn read(bytes: &[u8]) -> Result<Self> {
+    pub fn read(bytes: &[u8]) -> Result<Self> {
         let mut d = Decoder::new(bytes);
         let fields = d.array()?;
         if !matches!(fields, 5 | 6) {
@@ -371,7 +374,7 @@ fn opening_fingerprint_add(
     Ok(())
 }
 
-fn fold(index: &mut Write<'_, '_>, event: Event) -> Result<()> {
+pub(super) fn fold(index: &mut Write<'_, '_>, event: Event) -> Result<()> {
     let group = hash_key(&sha256_concat(&[
         b"vox/session-projection/id/v1",
         &event.source.author,
@@ -447,7 +450,9 @@ fn fold(index: &mut Write<'_, '_>, event: Event) -> Result<()> {
         index.replace_descriptor(id, &bytes)?;
         id
     } else {
-        index.put_descriptor(&bytes)?
+        let id = index.put_descriptor(&bytes)?;
+        super::locality::backfill_opening(index, &row, id)?;
+        id
     };
     if !new {
         if let Some(old) = old_opening.filter(|old| *old != row.opening.position.hash) {
@@ -485,6 +490,7 @@ fn fold(index: &mut Write<'_, '_>, event: Event) -> Result<()> {
     let mut key = [0; 64];
     key[..8].copy_from_slice(&id.to_be_bytes());
     index.set(Tree::Openings, key, Some(id))?;
+    super::locality::chronological(index, &row, id, true, false)?;
     let mut key = [0; 64];
     key[..32].copy_from_slice(&row.node);
     key[32..40].copy_from_slice(&id.to_be_bytes());
@@ -563,8 +569,19 @@ pub(super) fn advance_owned(
             work.cursor = None;
             work.cleanup = 0;
         }
-    } else if index.header.published != Some(current) || !fingerprint_ready {
-        index.header.building = Some(Building::new(current.0, current.1));
+    } else if index.header.published != Some(current)
+        || !fingerprint_ready
+        || !header.locality
+        || index.next(Tree::MetadataDirty, None)?.is_some()
+    {
+        let mut work = Building::new(current.0, current.1);
+        if header.locality && fingerprint_ready {
+            if let Some((target, _)) = index.next(Tree::MetadataDirty, None)? {
+                work.target = Some(target);
+                work.phase = 2;
+            }
+        }
+        index.header.building = Some(work);
         started = true;
     } else {
         return Ok(false);
@@ -635,6 +652,27 @@ pub(super) fn advance_owned(
                 cursor = Some(position.key());
             }
         }
+        2 if state.target.is_some() => {
+            let target = state
+                .target
+                .ok_or_else(|| invalid("Session target missing"))?;
+            for _ in 0..WORK_ROWS {
+                let Some((key, source)) = super::locality::next_source(&index, &target, cursor)?
+                else {
+                    advance_phase(&mut index, 3)?;
+                    break;
+                };
+                if let Some(body) = captured
+                    .as_ref()
+                    .map(|read| read.source(source))
+                    .transpose()?
+                    .flatten()
+                {
+                    put_source(&mut index, source, &body)?;
+                }
+                cursor = Some(key);
+            }
+        }
         2 => {
             if let Some(read) = &captured {
                 for _ in 0..WORK_ROWS {
@@ -680,6 +718,9 @@ pub(super) fn advance_owned(
                 let envelope = EnvelopeRef::read(&mut d)?;
                 d.finish()?;
                 if let Some(event) = interpret(&read, envelope)? {
+                    if let Some(body) = read.source(envelope.first)? {
+                        super::locality::backfill_event(&mut index, envelope.first, &body, &event)?;
+                    }
                     let id = index.put_descriptor(&event.bytes())?;
                     index.set(Tree::Events, key, Some(id))?;
                 }
@@ -687,6 +728,9 @@ pub(super) fn advance_owned(
             } else {
                 advance_phase(&mut index, 5)?;
             }
+        }
+        5 if state.target.is_some() => {
+            advance_phase(&mut index, 6)?;
         }
         5 => {
             for _ in 0..WORK_ROWS {
@@ -704,6 +748,14 @@ pub(super) fn advance_owned(
                 }
                 cursor = Some(key);
             }
+        }
+        6 if state.target.is_some() => {
+            super::locality::publish(
+                &mut index,
+                state
+                    .target
+                    .ok_or_else(|| invalid("Session target missing"))?,
+            )?;
         }
         6 => {
             index.set(

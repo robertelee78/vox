@@ -82,9 +82,15 @@ pub(super) enum Tree {
     FloorAuthorization,
     /// Bounded selection of signed, currently authorized recipient floors.
     FloorSelection,
+    MetadataUnits,
+    MetadataDirty,
+    MetadataEvents,
+    MetadataOpenings,
+    ChronOpenings,
+    ChronOpenSessions,
 }
 
-const TREES: usize = 41;
+const TREES: usize = 47;
 
 impl Tree {
     fn index(self) -> usize {
@@ -130,6 +136,12 @@ impl Tree {
             Self::FloorReplay => 38,
             Self::FloorAuthorization => 39,
             Self::FloorSelection => 40,
+            Self::MetadataUnits => 41,
+            Self::MetadataDirty => 42,
+            Self::MetadataEvents => 43,
+            Self::MetadataOpenings => 44,
+            Self::ChronOpenings => 45,
+            Self::ChronOpenSessions => 46,
         }
     }
 }
@@ -149,8 +161,10 @@ pub(super) struct Header {
     pub private_generation: u64,
     pub activity_generation: u64,
     pub published: Option<(u64, u64)>,
+    pub publication: u64,
     pub building: Option<Building>,
     pub activity: ActivityState,
+    pub locality: bool,
 }
 
 /// Fixed-size progress, never a list of sources, fields, or pages. Work roots stay
@@ -163,6 +177,7 @@ pub(super) struct Building {
     pub cursor: Option<Key>,
     roots: [u64; TREES],
     pub cleanup: usize,
+    pub target: Option<Key>,
 }
 
 impl Building {
@@ -174,6 +189,7 @@ impl Building {
             cursor: None,
             roots: [0; TREES],
             cleanup: 0,
+            target: None,
         }
     }
 }
@@ -190,8 +206,10 @@ impl Default for Header {
             private_generation: 0,
             activity_generation: 0,
             published: None,
+            publication: 0,
             building: None,
             activity: ActivityState::default(),
+            locality: false,
         }
     }
 }
@@ -199,8 +217,8 @@ impl Default for Header {
 impl Header {
     fn bytes(&self) -> Zeroizing<Vec<u8>> {
         let mut e = Encoder::new();
-        e.array(12)
-            .uint(1)
+        e.array(14)
+            .uint(2)
             .uint(self.next)
             .uint(self.revision)
             .array(TREES);
@@ -224,7 +242,7 @@ impl Header {
         }
         e.array(usize::from(self.building.is_some()));
         if let Some(work) = &self.building {
-            e.array(6)
+            e.array(7)
                 .uint(work.public)
                 .uint(work.private)
                 .uint(u64::from(work.phase))
@@ -233,15 +251,18 @@ impl Header {
             for root in work.roots {
                 e.uint(root);
             }
-            e.uint(work.cleanup as u64);
+            e.uint(work.cleanup as u64)
+                .bytes(work.target.as_ref().map_or(&[][..], |key| &key[..]));
         }
         self.activity.put(&mut e);
+        e.uint(u64::from(self.locality)).uint(self.publication);
         Zeroizing::new(e.finish())
     }
 
     fn read(bytes: &[u8]) -> Result<Self> {
         let mut d = Decoder::new(bytes);
-        if d.array()? != 12 || d.uint()? != 1 {
+        let shape = (d.array()?, d.uint()?);
+        if !matches!(shape, (12, 1) | (14, 2)) {
             return Err(invalid("Session index header version"));
         }
         let next = d.uint()?;
@@ -252,7 +273,7 @@ impl Header {
         if next == 0
             || !matches!(
                 stored_trees,
-                26 | 29 | 30 | 35 | 36 | 37 | 38 | 39 | 40 | TREES
+                26 | 29 | 30 | 35 | 36 | 37 | 38 | 39 | 40 | 41 | 45 | TREES
             )
         {
             return Err(invalid("Session index header roots"));
@@ -305,7 +326,8 @@ impl Header {
         let mut building = match d.array()? {
             0 => None,
             1 => {
-                if d.array()? != 6 {
+                let fields = d.array()?;
+                if fields != if shape.1 == 1 { 6 } else { 7 } {
                     return Err(invalid("Session build state"));
                 }
                 let public = d.uint()?;
@@ -337,6 +359,17 @@ impl Header {
                 if cleanup > TREES {
                     return Err(invalid("Session cleanup index"));
                 }
+                let target = if fields == 7 {
+                    match d.bytes()? {
+                        [] => None,
+                        key => Some(
+                            key.try_into()
+                                .map_err(|_| invalid("Session metadata target"))?,
+                        ),
+                    }
+                } else {
+                    None
+                };
                 Some(Building {
                     public,
                     private,
@@ -344,17 +377,37 @@ impl Header {
                     cursor,
                     roots,
                     cleanup,
+                    target,
                 })
             }
             _ => return Err(invalid("Session build state option")),
         };
         let activity = ActivityState::read(&mut d, next)?;
+        let locality = if shape.1 == 2 {
+            match d.uint()? {
+                0 => false,
+                1 => true,
+                _ => return Err(invalid("Session metadata locator readiness")),
+            }
+        } else {
+            false
+        };
+        let publication = if shape.1 == 2 { d.uint()? } else { 0 };
         d.finish()?;
         if stored_trees < 36 {
             // Preserve all original private locators and bodies. The new derived open-only
             // selector is unpublished until the existing bounded metadata fold fills it.
             ready = false;
             published = None;
+            if let Some(work) = &mut building {
+                work.phase = 7;
+                work.cursor = None;
+                work.cleanup = 0;
+            }
+        }
+        if shape.1 == 1 {
+            // An old partial fold has no source/group membership for its earlier turns.
+            // Retire only that unpublished work; the old published projection stays readable.
             if let Some(work) = &mut building {
                 work.phase = 7;
                 work.cursor = None;
@@ -373,6 +426,8 @@ impl Header {
             published,
             building,
             activity,
+            locality,
+            publication,
         })
     }
 }
@@ -425,6 +480,10 @@ impl<'a> Read<'a> {
 
     pub fn waiting_find(&self, root: u64, key: &Key) -> Result<Option<u64>> {
         session_tree::Read::snapshot(self.snapshot, self.sek, self.room, KIND).find(root, key)
+    }
+    pub fn nested_next(&self, root: u64, after: Option<Key>) -> Result<Option<(Key, u64)>> {
+        session_tree::Read::snapshot(self.snapshot, self.sek, self.room, KIND)
+            .first_after(root, after)
     }
     fn activity_root(&self, tree: ActivityTree) -> u64 {
         self.header.activity.roots[tree.index()]
@@ -746,6 +805,26 @@ impl<'a, 's> Write<'a, 's> {
         self.working = true;
         Ok(self)
     }
+    pub fn canonical_next(&self, tree: Tree, after: Option<Key>) -> Result<Option<(Key, u64)>> {
+        session_tree::Read::batch(self.batch, self.sek, self.room, KIND)
+            .first_after(self.header.roots[tree.index()], after)
+    }
+    pub fn canonical_find(&self, tree: Tree, key: &Key) -> Result<Option<u64>> {
+        session_tree::Read::batch(self.batch, self.sek, self.room, KIND)
+            .find(self.header.roots[tree.index()], key)
+    }
+
+    pub fn canonical_set(&mut self, tree: Tree, key: Key, value: Option<u64>) -> Result<()> {
+        let working = self.working;
+        self.working = false;
+        let result = self.set(tree, key, value);
+        self.working = working;
+        result
+    }
+
+    pub fn nested_next(&self, root: u64, after: Option<Key>) -> Result<Option<(Key, u64)>> {
+        self.waiting_next(root, after)
+    }
 
     pub(super) fn root(&self, tree: Tree) -> Result<u64> {
         if self.working {
@@ -836,6 +915,12 @@ impl<'a, 's> Write<'a, 's> {
             Tree::OpenCounts,
             Tree::OpenSessions,
             Tree::Lifecycle,
+            Tree::MetadataUnits,
+            Tree::MetadataDirty,
+            Tree::MetadataEvents,
+            Tree::MetadataOpenings,
+            Tree::ChronOpenings,
+            Tree::ChronOpenSessions,
         ] {
             std::mem::swap(
                 &mut self.header.roots[tree.index()],
@@ -843,7 +928,13 @@ impl<'a, 's> Write<'a, 's> {
             );
         }
         self.header.published = Some((work.public, work.private));
+        self.header.publication = self
+            .header
+            .publication
+            .checked_add(1)
+            .ok_or_else(|| invalid("Session publication exhausted"))?;
         self.header.ready = true;
+        self.header.locality = true;
         work.phase = 7;
         work.cursor = None;
         work.cleanup = 0;
@@ -895,6 +986,12 @@ impl<'a, 's> Write<'a, 's> {
             Tree::FloorReplay,
             Tree::FloorAuthorization,
             Tree::FloorSelection,
+            Tree::MetadataUnits,
+            Tree::MetadataDirty,
+            Tree::MetadataEvents,
+            Tree::MetadataOpenings,
+            Tree::ChronOpenings,
+            Tree::ChronOpenSessions,
         ];
         self.working = true;
         for _ in 0..limit {
@@ -910,6 +1007,9 @@ impl<'a, 's> Write<'a, 's> {
                 return Ok(true);
             };
             if let Some((key, id)) = self.next(tree, None)? {
+                if super::locality::cleanup(self, tree, key, id)? {
+                    continue;
+                }
                 self.set(tree, key, None)?;
                 if !matches!(
                     tree,
@@ -930,6 +1030,7 @@ impl<'a, 's> Write<'a, 's> {
                         | Tree::ActivityCreated
                         | Tree::Lifecycle
                         | Tree::FloorSelf
+                        | Tree::MetadataDirty
                 ) {
                     self.delete_descriptor(id)?;
                 }

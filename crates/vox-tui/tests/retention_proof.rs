@@ -54,6 +54,11 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+#[cfg(target_os = "macos")]
+optional_proof::not_run!(a_session_change_rewrites_only_that_session);
+
 #[path = "support/attach.rs"]
 mod attach;
 #[path = "support/ports.rs"]
@@ -935,4 +940,567 @@ fn a_member_who_joins_after_messages_expired_catches_up() {
         "PRODUCT: carol shows {owed} expired messages as not received yet: she waits on bodies no \
          member can supply"
     );
+}
+
+/// A metadata change is measured only after the binary publishes the complete Session
+/// listing. Allocations are sealed SessionIndex ids, not physical pages; OS write bytes
+/// are reported separately. Plain private activity is a different input and is measured too.
+/// Mutant: rebuild every Session on every candidate revision.
+#[cfg(all(feature = "optional-proofs", target_os = "macos"))]
+#[test]
+#[ignore = "real binary with 100 and 1500 unrelated Sessions; run in release with test-knobs"]
+fn a_session_change_rewrites_only_that_session() {
+    use redb::{ReadableDatabase, ReadableTable, TableDefinition};
+    use vox_core::node::ipc::{Frame, IpcClient, NodeSocket, Request};
+    use vox_core::node::paths::{NodeName, Paths};
+    watchdog::arm();
+    let evidence = std::env::var_os("RG13_SESSION_LOCAL_EVIDENCE")
+        .map(PathBuf::from)
+        .expect("APPARATUS: RG13_SESSION_LOCAL_EVIDENCE receipt directory");
+    std::fs::create_dir_all(&evidence).expect("APPARATUS: receipt directory");
+    let tmp = tempfile::tempdir_in(&evidence).expect("APPARATUS: scratch profile");
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("cfg")).expect("APPARATUS: scratch config");
+    let (ok, out, err) = vox(root, &["id"], None);
+    assert!(ok, "APPARATUS: identity staging: {out}{err}");
+    let keychain = attach::keychain(root);
+    let pass = root.join("identity.pass");
+    std::fs::write(&pass, IDENTITY).expect("APPARATUS: identity passphrase");
+    let launch = |tag: &str, clock_step: i64| {
+        let child = Command::new(VOX)
+            .args(["daemon", "--listen", "127.0.0.1:0", "--passphrase-file"])
+            .arg(&pass)
+            .env("VOX_DATA_DIR", root)
+            .env("VOX_CONFIG_DIR", root.join("cfg"))
+            .env("VOX_TEST_KEYCHAIN", &keychain)
+            .env("VOX_PROXY", "127.0.0.1:0")
+            .env("VOX_TEST_CLOCK_STEP_MS", clock_step.to_string())
+            .env_remove("VOX_NODE")
+            .env_remove("VOX_ROOM")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(
+                std::fs::File::create(evidence.join(format!("{tag}.daemon.log")))
+                    .expect("APPARATUS: daemon log"),
+            )
+            .spawn()
+            .expect("APPARATUS: scratch daemon");
+        let daemon = Daemon(child);
+        attached(root, tag);
+        daemon
+    };
+    let running = launch("initial", 0);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("APPARATUS: IPC runtime");
+    let paths = Paths::resolve("default", Some(root), Some(&root.join("cfg")))
+        .expect("APPARATUS: scratch paths");
+    // Decode only the allocator field of the copied product header. The highest live
+    // row id misses pages allocated and retired during cleanup, so it is not a count.
+    let vault = vox_core::atrest::vault::IdentityVault::from_canonical_slice(
+        &std::fs::read(paths.vault_file()).expect("APPARATUS: scratch identity vault"),
+    )
+    .expect("APPARATUS: scratch vault format");
+    let signer = vault
+        .unlock_signer(IDENTITY.as_bytes())
+        .expect("APPARATUS: scratch vault unlock");
+    let mut client = rt
+        .block_on(IpcClient::open_at(&NodeSocket::one_shot(
+            paths.account().socket(),
+            NodeName::parse("default").expect("APPARATUS: node name"),
+        )))
+        .expect("APPARATUS: daemon IPC");
+    let request = |client: &mut IpcClient, request: Request| {
+        let deadline = Instant::now() + Duration::from_secs(300);
+        loop {
+            let frame = rt
+                .block_on(client.request(&request))
+                .expect("APPARATUS: IPC request");
+            // These replies explicitly report that this request made no change, or ask the
+            // caller to wait for governance. The product fact, not a guessed sleep, gates staging.
+            let retry = matches!(&frame, Frame::Error { reason } if
+                reason.contains("permissions are still being read") ||
+                reason.contains("room governance is refreshing") ||
+                reason == &vox_core::node::api::Fault::RoomChangePending.to_string());
+            if !retry {
+                return frame;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "APPARATUS: governance never became ready: {frame:?}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    let disk_writes = || {
+        libproc::libproc::pid_rusage::pidrusage::<libproc::libproc::pid_rusage::RUsageInfoV2>(
+            i32::try_from(running.0.id()).expect("APPARATUS: daemon PID"),
+        )
+        .expect("APPARATUS: daemon OS write counter")
+        .ri_diskio_byteswritten
+    };
+    let sample = |cid: &[u8; 32], tag: &str| {
+        let copy = evidence.join(format!("{tag}.redb"));
+        std::fs::copy(paths.store_file(), &copy).expect("APPARATUS: durable store copy");
+        let db = redb::Database::open(&copy).expect("APPARATUS: copied product store");
+        let txn = db.begin_read().expect("APPARATUS: copied read transaction");
+        let table = txn
+            .open_table(TableDefinition::<([u8; 32], u8, u64), &[u8]>::new(
+                "segments",
+            ))
+            .expect("APPARATUS: product segments");
+        let mut bytes = 0u64;
+        for row in table.iter().expect("APPARATUS: product rows") {
+            let (key, value) = row.expect("APPARATUS: product row");
+            let (room, kind, _) = key.value();
+            if &room == cid && kind == 14 {
+                bytes += value.value().len() as u64;
+            }
+        }
+        drop(table);
+        drop(txn);
+        drop(db);
+        let stored = vox_core::node::store::Store::open_read_only(&copy)
+            .expect("APPARATUS: copied store reader");
+        let wrap = stored
+            .get_sek_wrap(cid)
+            .expect("APPARATUS: room wrap read")
+            .expect("APPARATUS: room wrap");
+        let sek = wrap
+            .unwrap_sek(
+                &vox_core::atrest::idfactor::SignatureIdentityFactor::new(&signer),
+                cid,
+                ROOMPASS.as_bytes(),
+            )
+            .expect("APPARATUS: scratch room key");
+        let segment = stored
+            .get_segment(cid, vox_core::atrest::store::SegmentKind::SessionIndex, 0)
+            .expect("APPARATUS: copied Session header read")
+            .expect("APPARATUS: copied Session header");
+        let header = vox_core::atrest::store::open_segment(
+            &sek,
+            vox_core::atrest::store::SegmentKind::SessionIndex,
+            0,
+            &segment,
+        )
+        .expect("APPARATUS: copied Session header authentication");
+        let mut d = vox_core::cbor::Decoder::new(&header);
+        let shape = (
+            d.array().expect("APPARATUS: header arity"),
+            d.uint().expect("APPARATUS: header version"),
+        );
+        assert!(
+            matches!(shape, (12, 1) | (14, 2)),
+            "APPARATUS: unsupported copied header {shape:?}"
+        );
+        let next = d.uint().expect("APPARATUS: exact Session allocator");
+        (next, bytes)
+    };
+    let mut measured = Vec::new();
+    let mut preserved = Vec::new();
+    for n in [100usize, 1500] {
+        let name = format!("local-{n}");
+        let (ok, out, err) = vox(
+            root,
+            &["room", "create", "--name", &name, "--passphrase-file", "-"],
+            Some(ROOMPASS),
+        );
+        assert!(ok, "APPARATUS: room staging: {out}{err}");
+        let Frame::Rooms { rooms } = request(&mut client, Request::Rooms { after: None }) else {
+            panic!("APPARATUS: room listing");
+        };
+        let cid = rooms
+            .iter()
+            .find(|(_, label, ..)| label == &name)
+            .expect("APPARATUS: created room")
+            .0;
+        let room = vox_core::node::link::b32_encode(&cid);
+        let metadata = |id: &str, name: &str| {
+            serde_json::json!({
+            "v":1,"type":"session","from":id,"body":"","at":{"session_name":name},
+            "data":{"session":{"harness":"rg13 locality"}}})
+            .to_string()
+        };
+        for i in 0..=n {
+            let frame = request(
+                &mut client,
+                Request::Post {
+                    channel_id: cid,
+                    text: metadata(&format!("other-{i:04}"), &format!("Other {i:04}")),
+                    card: false,
+                },
+            );
+            assert!(
+                matches!(frame, Frame::Ok),
+                "APPARATUS: seed {n}/{i}: {frame:?}"
+            );
+        }
+        let heads = |needle: &str| {
+            let deadline = Instant::now() + Duration::from_secs(1200);
+            loop {
+                let (ok, out, err) = vox(root, &["room", "sessions", &room, "--json"], None);
+                let rows: Vec<serde_json::Value> = out
+                    .lines()
+                    .filter_map(|l| serde_json::from_str(l).ok())
+                    .collect();
+                if ok
+                    && rows.len() == n + 1
+                    && out.contains(needle)
+                    && !err.contains("provisional")
+                    && !err.contains("fetching")
+                {
+                    return rows;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "APPARATUS: complete Session publication not reached n={n}: {out}{err}"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        };
+        heads("Other 0000");
+        let append = |client: &mut IpcClient, id: &str, body: String| {
+            let frame = request(
+                client,
+                Request::AppendSession {
+                    channel_id: cid,
+                    session_id: id.to_owned(),
+                    body,
+                },
+            );
+            assert!(
+                matches!(frame, Frame::Appended { .. }),
+                "APPARATUS: append: {frame:?}"
+            );
+        };
+        let step = |seq| {
+            serde_json::json!({"v":1,"session":"other-0000","kind":"reply",
+            "seq":seq,"text":format!("TARGET-STEP-{seq} with literal session_name prose")})
+            .to_string()
+        };
+        append(
+            &mut client,
+            "other-0001",
+            serde_json::json!({"v":1,"session":"other-0001",
+            "kind":"reply","seq":1,"text":"UNCHANGED-STEP"})
+            .to_string(),
+        );
+        append(&mut client, "other-0000", step(1));
+        append(&mut client, "other-0000", step(2));
+        let read_step = |id: &str, needle: &str| {
+            let deadline = Instant::now() + Duration::from_secs(300);
+            loop {
+                let _ = vox(root, &["room", "sessions", &room, "--json"], None);
+                let (ok, out, err) = vox(root, &["room", "session", &room, id, "--json"], None);
+                if ok && out.contains(needle) {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "APPARATUS: Session step not readable: {out}{err}"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        };
+        read_step("other-0000", "TARGET-STEP-2");
+        read_step("other-0001", "UNCHANGED-STEP");
+        let unchanged = |rows: Vec<serde_json::Value>| {
+            assert!(
+                rows.windows(2)
+                    .all(|rows| rows[0]["opened_millis"].as_u64()
+                        <= rows[1]["opened_millis"].as_u64()),
+                "PRODUCT: Session listing is not oldest opening first"
+            );
+            rows.into_iter()
+                .filter(|row| row["id"] != "other-0000")
+                .collect::<Vec<_>>()
+        };
+        let before_heads = unchanged(heads("Other 0000"));
+        // A normal durable post fences the product's derived roots. Sample only after
+        // complete public publication and after retired-root work has stopped allocating.
+        let settle = |tag: &str| {
+            post(root, &room, "RG13-DURABILITY-FENCE");
+            let deadline = Instant::now() + Duration::from_secs(300);
+            let mut prior = None;
+            let mut stable = 0;
+            loop {
+                let current = sample(&cid, tag);
+                if prior == Some(current) {
+                    stable += 1;
+                } else {
+                    stable = 0;
+                }
+                if stable == 3 {
+                    return current;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "APPARATUS: derived cleanup never settled"
+                );
+                prior = Some(current);
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        };
+        let before = settle(&format!("n{n}-step-before"));
+        let writes = disk_writes();
+        append(&mut client, "other-0000", step(3));
+        read_step("other-0000", "TARGET-STEP-3");
+        let after = settle(&format!("n{n}-step-after"));
+        let step_delta = after.0 - before.0;
+        let step_bytes = disk_writes() - writes;
+        let before = after;
+        let writes = disk_writes();
+        append(
+            &mut client,
+            "other-0000",
+            metadata("other-0000", "CHANGED-TARGET"),
+        );
+        let after_heads = heads("CHANGED-TARGET");
+        assert_eq!(
+            unchanged(after_heads),
+            before_heads,
+            "PRODUCT: changing one Session changed unrelated Session names or state"
+        );
+        let after = settle(&format!("n{n}-name-after"));
+        let name_delta = after.0 - before.0;
+        let name_bytes = disk_writes() - writes;
+        let receipt = serde_json::json!({"unrelated_sessions":n,"ordinary_step_allocations":step_delta,
+            "ordinary_step_os_write_bytes":step_bytes,"name_change_allocations":name_delta,
+            "name_change_os_write_bytes":name_bytes,"session_index_value_bytes":after.1});
+        std::fs::write(evidence.join(format!("n{n}.json")), receipt.to_string())
+            .expect("APPARATUS: measurement receipt");
+        eprintln!("RG13 SESSION LOCALITY {receipt}");
+        measured.push((step_delta, name_delta));
+        // A late/out-of-order multipart dependency is not a Session until its complete
+        // canonical body hashes correctly. Replaying it must preserve unrelated heads.
+        let large_name = format!("MULTIPART-{n}-{}", "m".repeat(2400));
+        let inner = metadata("other-0000", &large_name);
+        let tag = vox_core::node::link::b32_encode(&vox_core::hash::sha256(inner.as_bytes()));
+        let outer = serde_json::json!({"v":1,"type":"session","body":inner,
+            "data":{"session_parts":tag}});
+        let parts = vox_agentcomms::activity::split(
+            outer
+                .as_object()
+                .expect("APPARATUS: multipart object")
+                .clone(),
+            "body",
+            512,
+        );
+        assert!(
+            parts.len() > 1,
+            "APPARATUS: multipart staging did not split"
+        );
+        for part in parts.iter().rev().chain(parts.iter()) {
+            append(&mut client, "other-0000", part.clone());
+        }
+        let complete = heads(&large_name);
+        assert_eq!(
+            unchanged(complete),
+            before_heads,
+            "PRODUCT: reordered multipart metadata changed another Session"
+        );
+        eprintln!("RG13 canonical reordered multipart n={n}: complete name and unchanged peers");
+        preserved.push((room, before_heads));
+    }
+    let (ok, out, err) = vox(
+        root,
+        &[
+            "room",
+            "create",
+            "--name",
+            "removal",
+            "--passphrase-file",
+            "-",
+        ],
+        Some(ROOMPASS),
+    );
+    assert!(ok, "APPARATUS: removal room: {out}{err}");
+    let Frame::Rooms { rooms } = request(&mut client, Request::Rooms { after: None }) else {
+        panic!("APPARATUS: removal room listing");
+    };
+    let removal_id = rooms
+        .iter()
+        .find(|(_, name, ..)| name == "removal")
+        .expect("APPARATUS: removal id")
+        .0;
+    let removal = vox_core::node::link::b32_encode(&removal_id);
+    let old = serde_json::json!({"v":1,"type":"session","from":"expired","body":"",
+        "at":{"session_name":"EXPIRED-METADATA"}});
+    assert!(
+        matches!(
+            request(
+                &mut client,
+                Request::Post {
+                    channel_id: removal_id,
+                    text: old.to_string(),
+                    card: false
+                }
+            ),
+            Frame::Ok
+        ),
+        "APPARATUS: removal source"
+    );
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        let (ok, out, err) = vox(root, &["room", "sessions", &removal, "--json"], None);
+        if ok && out.contains("EXPIRED-METADATA") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "APPARATUS: removal source publication: {out}{err}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let policy = request(
+        &mut client,
+        Request::SetRetention {
+            channel_id: removal_id,
+            ttl: 3600,
+        },
+    );
+    assert!(
+        !matches!(policy, Frame::Error { .. }),
+        "APPARATUS: removal retention: {policy:?}"
+    );
+    post(root, &removal, "REMOVAL-DURABILITY-FENCE");
+    drop(client);
+    drop(running);
+    let restarted = launch("restarted", 7_200_000);
+    for (room, expected) in preserved {
+        let deadline = Instant::now() + Duration::from_secs(300);
+        loop {
+            let (ok, out, err) = vox(root, &["room", "sessions", &room, "--json"], None);
+            let rows: Vec<serde_json::Value> = out
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .filter(|row: &serde_json::Value| row["id"] != "other-0000")
+                .collect();
+            if ok
+                && rows.len() == expected.len()
+                && !err.contains("provisional")
+                && !err.contains("fetching")
+            {
+                assert_eq!(
+                    rows, expected,
+                    "PRODUCT: restart changed unrelated Sessions"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "APPARATUS: restart Session publication: {out}{err}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        loop {
+            let _ = vox(root, &["room", "sessions", &room, "--json"], None);
+            let (ok, out, err) = vox(
+                root,
+                &["room", "session", &room, "other-0001", "--json"],
+                None,
+            );
+            if ok {
+                assert!(
+                    out.contains("UNCHANGED-STEP"),
+                    "PRODUCT: unchanged Session's saved step did not survive restart: {out}{err}"
+                );
+                break;
+            }
+            assert!(
+                err.contains("Sessions changed; refresh the listing") && Instant::now() < deadline,
+                "APPARATUS: restart Session read did not reach its current listing: {out}{err}"
+            );
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        let (ok, out, err) = vox(root, &["room", "sessions", &removal, "--json"], None);
+        if ok && out.trim().is_empty() && !err.contains("provisional") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT: expired Session metadata survived source removal: {out}{err}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    eprintln!("RG13 canonical removal: expired source no longer publishes a Session");
+    let (ok, out, err) = vox(
+        root,
+        &[
+            "room",
+            "create",
+            "--name",
+            "reordered-time",
+            "--passphrase-file",
+            "-",
+        ],
+        Some(ROOMPASS),
+    );
+    assert!(ok, "APPARATUS: reordered room: {out}{err}");
+    let (ok, out, err) = vox(root, &["room", "list"], None);
+    assert!(ok, "APPARATUS: reordered room listing: {out}{err}");
+    let reordered = out
+        .lines()
+        .find(|line| line.contains("reordered-time"))
+        .and_then(|line| line.split_whitespace().next())
+        .expect("APPARATUS: reordered room id")
+        .to_owned();
+    let metadata = |name: &str| {
+        serde_json::json!({"v":1,"type":"session","from":"ordered","body":"",
+        "at":{"session_name":name}})
+        .to_string()
+    };
+    post(root, &reordered, &metadata("CANONICAL-LATER"));
+    drop(restarted);
+    let _final = launch("earlier-clock", 0);
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        let (ok, out, err) = vox(root, &["room", "sessions", &reordered, "--json"], None);
+        if ok && out.contains("CANONICAL-LATER") && !err.contains("provisional") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "APPARATUS: reordered room has not reopened before its next post: {out}{err}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    post(root, &reordered, &metadata("ARRIVED-LATE-BUT-EARLIER"));
+    post(root, &reordered, "REORDERED-DURABILITY-FENCE");
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        let (ok, out, err) = vox(root, &["room", "sessions", &reordered, "--json"], None);
+        if ok && out.contains("CANONICAL-LATER") && !err.contains("provisional") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT: metadata followed arrival rather than canonical time: {out}{err}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    eprintln!("RG13 canonical order: later event wins despite earlier event arriving last");
+    for (column, label) in [
+        (0, "ordinary private step"),
+        (1, "private lifecycle/name change"),
+    ] {
+        let small = if column == 0 {
+            measured[0].0
+        } else {
+            measured[0].1
+        };
+        let large = if column == 0 {
+            measured[1].0
+        } else {
+            measured[1].1
+        };
+        assert!(
+            large <= small.saturating_mul(3).saturating_add(256),
+            "PRODUCT: {label} rewrote unrelated Sessions: 100={small} allocations; 1500={large}; \
+            only the target and logarithmic shared paths may change"
+        );
+    }
 }
