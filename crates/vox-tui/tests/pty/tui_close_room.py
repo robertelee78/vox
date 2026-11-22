@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""tui_close_room.py <vox> <data_dir> <config_dir> <identity_pass> <room_pass> <tag> [<member>]
+"""tui_close_room.py <vox> <data_dir> <config_dir> <identity_pass> <room_pass> <tag> [<member>] [<node>] [open]
 
 Closes a profile's only room through the shipped `vox tui`, as a person would: unlock, open the
 room, `:close`. It is the one way to close a room on purpose (a daemon reopens every room it held
@@ -40,6 +40,8 @@ VOX, DATA, CFG, IDPASS, ROOMPASS, TAG = sys.argv[1:7]
 # member the owner trusts. What the TUI answered, and the member's row after it, are printed for
 # the caller to judge; the close goes on either way, so the caller can also see what the node did.
 GRANT = sys.argv[7] if len(sys.argv) > 7 else None
+NODE = sys.argv[8] if len(sys.argv) > 8 else None
+OPEN_ONLY = len(sys.argv) > 9 and sys.argv[9] == "open"
 BUDGET = int(os.environ.get("VOX_PTY_BUDGET_SECS", "180"))
 if pyte is None:
     print(f"{TAG} APPARATUS: pyte is not importable (install it, or set VOX_PYTE_PATH)")
@@ -107,7 +109,7 @@ try:
     # attached: …` either way, and it is looked for on the whole screen: the notes a node says
     # as it attaches (an anchors file it skipped, say) can push it above the bottom rows.
     stage("attach")
-    tui = Tui([VOX, "tui", "--listen", "127.0.0.1:0"], env)
+    tui = Tui([VOX, "tui", "--listen", "127.0.0.1:0"] + (["--node", NODE] if NODE else []), env)
     tui.pump(3)
     if tui.closed:
         # Gone before it asked for anything: the product stopped, and its screen says why.
@@ -126,6 +128,16 @@ try:
     if "passphrase" in tui.text().lower():
         # Closed on this node: the TUI asks for the room's passphrase to open it.
         key(ROOMPASS + "\r", 6)
+    if OPEN_ONLY:
+        # The first Enter can select the saved room as its retained view arrives.
+        # Open that now-visible selection, rather than treating selection as opening.
+        if "No room open" in tui.text():
+            key(":open\r", 3)
+            if "passphrase" in tui.text().lower():
+                key(ROOMPASS + "\r", 6)
+        if not tui.until(lambda: bool(pane(tui.display(), "Members")), 60):
+            give(1, f"RED: the room never showed its Members pane:\n{tui.text()}")
+        give(0, "PASS the TUI opened its room")
     if GRANT:
         stage(":consent grant")
         focus("Members")

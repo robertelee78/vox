@@ -54,8 +54,25 @@ impl Lifetime {
         {
             return Some(publish());
         }
+        #[cfg(feature = "test-knobs")]
+        if self.stale_proof() {
+            return Some(publish());
+        }
         ((self.publication.is_some() || self.exclusive.is_some()) && self.authority.current())
             .then(publish)
+    }
+
+    /// Test apparatus: a governance turn's publication taken by a `stale-removal-window`
+    /// mutant, which every currency check of this lifetime lets through.
+    #[cfg(feature = "test-knobs")]
+    fn stale_proof(&self) -> bool {
+        self.publication
+            .as_ref()
+            .is_some_and(|publication| publication.stale_proof)
+    }
+    #[cfg(not(feature = "test-knobs"))]
+    fn stale_proof(&self) -> bool {
+        false
     }
 }
 
@@ -684,6 +701,12 @@ impl Node {
             );
             return false;
         };
+        // Mutant: let only this node's governance turn past the policy currency gate.
+        #[cfg(feature = "test-knobs")]
+        let stale_turn = matches!(&continuation, Continuation::Governance(next) if next.is_turn())
+            && !authority.current()
+            && (crate::node::computer::fx28_mutant("stale-removal-window")
+                || crate::node::computer::fx28_mutant("stale-removal-window-unchecked"));
         let original_secret = match &continuation {
             Continuation::Private(next) => next.secret(),
             Continuation::Leave(next) => next.secret(),
@@ -780,7 +803,15 @@ impl Node {
             let lifetime = match retained {
                 Some(held) => held,
                 None => {
-                    let publication = match authority.try_acquire_publication() {
+                    #[cfg(feature = "test-knobs")]
+                    let acquired = if stale_turn {
+                        Ok(authority.try_acquire_unchecked_publication_for_proof())
+                    } else {
+                        authority.try_acquire_publication()
+                    };
+                    #[cfg(not(feature = "test-knobs"))]
+                    let acquired = authority.try_acquire_publication();
+                    let publication = match acquired {
                         Ok(Some(publication)) => publication,
                         Ok(None) => {
                             return (
@@ -807,7 +838,10 @@ impl Node {
                 let input_owner = Arc::clone(&worker_owner);
                 let (prepared, input_epoch, input_instance) = loop {
                     let mut channel = worker_instance.blocking_lock();
-                    if held.publication.is_some() && !held.authority.current() {
+                    if held.publication.is_some()
+                        && !held.authority.current()
+                        && !held.stale_proof()
+                    {
                         return Err(Error::ComputerPolicySuperseded);
                     }
                     if *attachment.borrow() != epoch {
@@ -866,7 +900,10 @@ impl Node {
                         )
                     },
                     move |_| {
-                        if check_held.publication.is_some() && !check_held.authority.current() {
+                        if check_held.publication.is_some()
+                            && !check_held.authority.current()
+                            && !check_held.stale_proof()
+                        {
                             return Err(Error::ComputerPolicySuperseded);
                         }
                         if *check_attachment.borrow() != epoch {
