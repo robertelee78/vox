@@ -37,6 +37,12 @@ pub(super) struct Continuation<L = Option<Arc<maintenance_save::Lifetime>>> {
 
 pub(super) type Retained = Continuation<Arc<maintenance_save::Lifetime>>;
 
+/// An owed Computer boundary parks the exact trust cursor, not another initial deletion.
+pub(super) struct TrustRetry {
+    pub(super) continuation: Continuation,
+    pub(super) reply: Option<oneshot::Sender<Outcome>>,
+}
+
 impl From<Retained> for Continuation {
     fn from(next: Retained) -> Self {
         Self {
@@ -114,6 +120,10 @@ enum CleanupTurn {
 
 enum After {
     Turn(Turn),
+    Trust {
+        state: trust_save::Reconcile,
+        generation: u64,
+    },
     Sweep(Sweep),
     Admin(governance::Removal),
     Cleanup {
@@ -138,6 +148,23 @@ impl Continuation {
             }),
         }
     }
+    pub(super) fn trust(
+        instance: SharedChannel,
+        attachment: u64,
+        trusted: BTreeSet<Digest32>,
+        generation: u64,
+    ) -> Self {
+        Self {
+            instance,
+            attachment,
+            lifetime: None,
+            after: After::Trust {
+                state: trust_save::Reconcile::new(trusted, trust_save::ReconcileScope::Preparation),
+                generation,
+            },
+        }
+    }
+
     pub(super) fn admin(
         instance: SharedChannel,
         attachment: u64,
@@ -210,6 +237,23 @@ impl Node {
     ) {
         if continuation.attached(self, &room) {
             match continuation.after {
+                After::Trust { generation, .. } => {
+                    let instance = Arc::clone(&continuation.instance);
+                    tokio::spawn(async move {
+                        instance.lock().await.mark_trust_failed(generation);
+                    });
+                    self.governance_work.trust_waiting.insert(room, None);
+                    let retry = self
+                        .now_ms()
+                        .0
+                        .saturating_add(ROOM_RETRY.as_millis() as u64);
+                    let next = self
+                        .governance_work
+                        .deadlines
+                        .get(&room)
+                        .map_or(retry, |at| (*at).min(retry));
+                    self.governance_work.set_deadline(room, Some(next));
+                }
                 After::Sweep(sweep) => {
                     if matches!(
                         sweep.stage,
@@ -309,6 +353,18 @@ impl Node {
         let saved = match result {
             Ok(saved) => saved,
             Err(error) => {
+                if matches!(&continuation.after, After::Trust { .. })
+                    && ChannelState::governance_refreshing(&error)
+                {
+                    self.continue_governance_save(
+                        room,
+                        maintenance_save::Work::Projection(ProjectionWork::Governance),
+                        continuation,
+                        reply,
+                    )
+                    .await;
+                    return;
+                }
                 if matches!(error, Error::ComputerPolicySuperseded)
                     && matches!(&continuation.after, After::Turn(_))
                 {
@@ -402,6 +458,131 @@ impl Node {
             }
         };
         match &mut continuation.after {
+            After::Trust { state, generation } => {
+                let applied = match saved {
+                    maintenance_save::Saved::Projection(ProjectionProgress::Governance(
+                        progress,
+                    )) => {
+                        if !progress.ready && progress.pending {
+                            self.continue_governance_save(
+                                room,
+                                maintenance_save::Work::Projection(ProjectionWork::Governance),
+                                continuation,
+                                reply,
+                            )
+                            .await;
+                            return;
+                        }
+                        if progress.ready {
+                            Ok(())
+                        } else {
+                            Err(Error::Profile(
+                                "room governance projection stopped before readiness",
+                            ))
+                        }
+                    }
+                    maintenance_save::Saved::Trust(saved) => state.saved(&saved),
+                    maintenance_save::Saved::Consent(consent_save::Effect::Consent(saved)) => {
+                        if let crate::node::channel::pending_text::consent::ConsentSaved::Withdrawn(
+                            Some(revocation),
+                        ) = &saved
+                        {
+                            self.note_completed_untrust(
+                                room,
+                                revocation.body.target_id,
+                                revocation.body.new_chain_id,
+                            );
+                        }
+                        state.withdrawn(&saved)
+                    }
+                    _ => Err(Error::Profile("unexpected room trust completion")),
+                };
+                if let Err(error) = applied {
+                    self.reject_owned_governance(room, error, continuation, reply);
+                    return;
+                }
+                if !state.matches_trust(&self.trust.trusted()) {
+                    self.governance_work.again = true;
+                    return;
+                }
+                let action = {
+                    let channel = continuation.instance.lock().await;
+                    match self.capture_room_offer_boundary(&channel, &continuation.lifetime.store) {
+                        Ok(true) => channel
+                            .require_governance_ready(&continuation.lifetime.store, self.now_ms())
+                            .and_then(|_| state.action(&channel, &continuation.lifetime.store))
+                            .map(Some),
+                        Ok(false) => Ok(None),
+                        Err(error) => Err(error),
+                    }
+                };
+                let action = match action {
+                    Ok(Some(action)) => Ok(action),
+                    Ok(None) => {
+                        let Retained {
+                            instance,
+                            attachment,
+                            lifetime,
+                            after,
+                        } = continuation;
+                        drop(lifetime);
+                        self.governance_work.trust_waiting.insert(
+                            room,
+                            Some(TrustRetry {
+                                continuation: Continuation {
+                                    instance,
+                                    attachment,
+                                    lifetime: None,
+                                    after,
+                                },
+                                reply,
+                            }),
+                        );
+                        self.retry_computer_room_removal(room);
+                        return;
+                    }
+                    Err(error) => Err(error),
+                };
+                let work = match action {
+                    Ok(trust_save::ReconcileAction::Trust(work)) => {
+                        maintenance_save::Work::Trust(work)
+                    }
+                    Ok(trust_save::ReconcileAction::Withdraw { target }) => {
+                        maintenance_save::Work::Consent(consent_save::Work::Withdraw { target })
+                    }
+                    #[cfg(feature = "test-knobs")]
+                    Ok(trust_save::ReconcileAction::Progress) => {
+                        self.governance_work.again = true;
+                        return;
+                    }
+                    Ok(trust_save::ReconcileAction::Complete) => {
+                        let mut channel = continuation.instance.lock().await;
+                        channel.mark_trust_reconciled(*generation);
+                        channel.release_held_packages();
+                        drop(channel);
+                        self.ingress_room_progress(room, session_save::IngressProgress::Authority);
+                        self.key_package_rooms.entry(room).or_insert(false);
+                        self.governance_work.wake_room(room);
+                        self.redeliver_now = true;
+                        drop(continuation);
+                        let _ = self.refresh_reachers_causal(None, Some(room)).await;
+                        self.begin_owned_private_drive(room, false, None, None, None)
+                            .await;
+                        return;
+                    }
+                    Err(error) if ChannelState::governance_refreshing(&error) => {
+                        // Trust deletion/withdrawal can retire the projection. Refresh it without
+                        // restarting DeleteInitial and invalidating the same view again.
+                        maintenance_save::Work::Projection(ProjectionWork::Governance)
+                    }
+                    Err(error) => {
+                        self.reject_owned_governance(room, error, continuation, reply);
+                        return;
+                    }
+                };
+                self.continue_governance_save(room, work, continuation, reply)
+                    .await;
+            }
             After::Admin(_) => {
                 self.finish_governance_admin(room, saved, continuation, reply)
                     .await
@@ -802,8 +983,18 @@ impl Node {
         let cache_only = {
             let channel = continuation.instance.lock().await;
             if turn.ready {
-                self.governance_work
-                    .set_deadline(room, channel.governance_deadline());
+                let deadline = channel
+                    .governance_deadline()
+                    .into_iter()
+                    .chain(
+                        self.governance_work
+                            .deadlines
+                            .get(&room)
+                            .copied()
+                            .filter(|_| self.governance_work.trust_waiting.contains_key(&room)),
+                    )
+                    .min();
+                self.governance_work.set_deadline(room, deadline);
             }
             channel.legacy_cache_only(&continuation.lifetime.store)
         };
@@ -1009,6 +1200,7 @@ impl Node {
             self.publish().await;
         }
         drop(continuation);
+        self.resume_computer_room_removals(room).await;
         if let Some(reply) = reply {
             let _ = reply.send(Outcome::Done);
         }

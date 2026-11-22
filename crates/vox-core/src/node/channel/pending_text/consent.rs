@@ -484,7 +484,13 @@ impl PendingConsent {
         let failure = result
             .as_ref()
             .err()
-            .filter(|error| !governance::refreshing(error))
+            .filter(|error| {
+                !governance::refreshing(error)
+                    && !matches!(
+                        error,
+                        Error::Profile("this room's trust withdrawal is incomplete")
+                    )
+            })
             .map(ToString::to_string);
         let hash = self.append.committed.last().map(Entry::entry_hash);
         let (package, release) = match self.action {
@@ -534,6 +540,7 @@ impl PendingConsent {
     ) -> Result<ConsentSaved> {
         match &mut self.action {
             Action::Issue(issue) => {
+                self.append.require_trust_withdrawn(store, signer)?;
                 let Issuance {
                     target,
                     skdm,
@@ -561,6 +568,7 @@ impl PendingConsent {
                     // Read after writer admission: parallel room saves must not overwrite a
                     // newer pending-consent map with a captured actor snapshot.
                     let mut batch = store.batch()?;
+                    self.append.require_trust_withdrawn(store, signer)?;
                     let mut held = PendingConsents::load(store, signer)?;
                     if held.remove(&self.append.room, target) {
                         held.queue_save(&mut batch, signer)?;

@@ -3571,8 +3571,13 @@ impl VoxClient {
         frontier: String,
     ) -> Result<crate::ComputerStatus, VoxError> {
         vox_core::node::computer::operator_only().map_err(|e| failed(e.to_string()))?;
-        self.computer_request(DaemonRequest::ComputerRemove { computer, frontier })
-            .await
+        self.computer_request(DaemonRequest::ComputerRemove {
+            computer,
+            frontier,
+            keep_rooms: false,
+            rooms: None,
+        })
+        .await
     }
     /// Produce one expiring invitation for an operator.
     pub async fn begin_computer_pairing(&self) -> Result<crate::ComputerStatus, VoxError> {

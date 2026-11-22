@@ -57,7 +57,12 @@
 //! then an `Open`) and **freezes** it. That frozen session is the attacker's pre-rotation pairwise
 //! state. It answers each delivery as dave's node does, from his prekey ring, and republishes his
 //! bundle on alice's board after each one it takes; a replay of a delivery it took is answered
-//! `KEY_TAKEN` without opening anything, as his node answers it (W-3). When alice removes bob, in every room:
+//! `KEY_TAKEN` without opening anything, as his node answers it (W-3). At take-over the stand-in
+//! publishes dave's current bundle on alice's board once and waits until her board shows it in
+//! every room, as a continuing dave would have it there: his stopped daemon's last republish can
+//! still be in flight, and a stale bundle names a one-time prekey another member already consumed.
+//! It never accepts a reused one-time prekey, because a delivery at last-resort grade must not
+//! count as naming one of its own. When alice removes bob, in every room:
 //! - (a) the rotated key reaches dave in an `OP_ROTATION_HELLO`, never in the long-lived session;
 //! - (b) the frozen session does not open it;
 //! - (c) the fresh session its own opening names, built from dave's ring, does, and it is alice's
@@ -373,11 +378,30 @@ fn until(what: &str, within: Duration, ok: impl Fn() -> bool) -> bool {
     false
 }
 
+struct PreservePrekeyReceipts(PathBuf);
+
+impl Drop for PreservePrekeyReceipts {
+    fn drop(&mut self) {
+        let Some(out) = std::env::var_os("VOX_PROOF_PREKEY_EVIDENCE") else {
+            return;
+        };
+        let out = PathBuf::from(out);
+        std::fs::create_dir_all(&out).expect("APPARATUS: retain prekey evidence directory");
+        for name in ["alice", "bob", "carol", "dave"] {
+            let log = format!("{name}.daemon.err");
+            if let Err(error) = std::fs::copy(self.0.join(&log), out.join(&log)) {
+                eprintln!("APPARATUS: could not retain {log}: {error}");
+            }
+        }
+    }
+}
+
 #[test]
 #[ignore = "an anchor and three daemons with production Argon2id; CI runs it in release"]
 fn removing_one_member_rotates_the_key_in_every_shared_room_and_keeps_the_others_whole() {
     watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: a tempdir");
+    let _receipts = PreservePrekeyReceipts(tmp.path().to_path_buf());
     let (_anchor, spec) = anchor(tmp.path());
     let alice = member(tmp.path(), "alice", &spec);
     let bob = member(tmp.path(), "bob", &spec);
@@ -810,7 +834,56 @@ impl Dave {
             alice: alice_id,
         };
         d.serve();
+        d.carry_bundle_forward();
         d
+    }
+
+    /// A continuing dave's bundle on alice's board names the one-time prekey he last published,
+    /// not yet consumed. His stopped daemon's last republish may not have reached her board, so
+    /// the stand-in publishes his current bundle once and waits until her board shows it in every
+    /// room.
+    fn carry_bundle_forward(&self) {
+        use vox_core::identity::composite::RootSigner as _;
+        let me = self.signer.fingerprint();
+        // Read at every check: a delivery the stand-in takes meanwhile consumes the next one.
+        let current = || {
+            self.rt
+                .block_on(async {
+                    self.ring
+                        .lock()
+                        .await
+                        .bundle(&self.signer.public_key())
+                        .expect("APPARATUS: dave's bundle")
+                })
+                .one_time_prekey
+                .map(|otp| otp.prekey_id)
+        };
+        self.publish(None);
+        let shown = || -> Vec<Option<u64>> {
+            self.rooms
+                .iter()
+                .map(|room| {
+                    self.rt
+                        .block_on(board_bundle(&self.conn, room, &me))
+                        .and_then(|b| b.prekey_bundle.one_time_prekey.map(|otp| otp.prekey_id))
+                })
+                .collect()
+        };
+        let carried = until(
+            "alice's board holds dave's current bundle in every room",
+            Duration::from_secs(30),
+            || {
+                let current = current();
+                shown().iter().all(|otp| *otp == current)
+            },
+        );
+        assert!(
+            carried,
+            "APPARATUS: at take-over dave's stand-in published his current bundle (one-time prekey \
+             {:?}), and alice's board still shows {:?} in his rooms",
+            current(),
+            shown()
+        );
     }
 
     /// Take every pairwise stream alice opens to dave, on a task of its own.

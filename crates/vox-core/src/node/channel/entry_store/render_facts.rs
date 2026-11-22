@@ -433,10 +433,18 @@ impl Source<'_> {
 }
 
 impl Write<'_, '_> {
-    fn put_ranked(&mut self, page: &Page) -> Result<(Key, u64, Summary)> {
-        let summary = page.rendered_summary()?;
-        let (key, id) = self.put_page(page)?;
-        Ok((key, id, summary))
+    fn put_split_ranked(&mut self, page: Page, parts: &mut Vec<(Key, u64, Summary)>) -> Result<()> {
+        let bytes = page.bytes();
+        if page_fits_write(&page, bytes.len()) {
+            let summary = page.rendered_summary()?;
+            let (key, id) = self.put_encoded_page(&page, &bytes)?;
+            parts.push((key, id, summary));
+            return Ok(());
+        }
+        drop(bytes);
+        let (left, right) = page.split()?;
+        self.put_split_ranked(left, parts)?;
+        self.put_split_ranked(right, parts)
     }
     fn replace_rendered(
         &mut self,
@@ -471,12 +479,8 @@ impl Write<'_, '_> {
                         }
                     }
                 }
-                if rows.len() > PAGE_ITEMS {
-                    let right = rows.split_off(rows.len() / 2);
-                    parts.push(self.put_ranked(&Page::Leaf(rows))?);
-                    parts.push(self.put_ranked(&Page::Leaf(right))?);
-                } else if !rows.is_empty() {
-                    parts.push(self.put_ranked(&Page::Leaf(rows))?);
+                if !rows.is_empty() {
+                    self.put_split_ranked(Page::Leaf(rows), &mut parts)?;
                 }
             }
             Page::Ranked(mut rows) => {
@@ -486,12 +490,8 @@ impl Write<'_, '_> {
                     .unwrap_or(rows.len() - 1);
                 let children = self.replace_rendered(rows[at].1, key, value, depth + 1)?;
                 rows.splice(at..=at, children);
-                if rows.len() > PAGE_ITEMS {
-                    let right = rows.split_off(rows.len() / 2);
-                    parts.push(self.put_ranked(&Page::Ranked(rows))?);
-                    parts.push(self.put_ranked(&Page::Ranked(right))?);
-                } else if !rows.is_empty() {
-                    parts.push(self.put_ranked(&Page::Ranked(rows))?);
+                if !rows.is_empty() {
+                    self.put_split_ranked(Page::Ranked(rows), &mut parts)?;
                 }
             }
             Page::Branch(_) => return Err(invalid("unranked render tree")),
@@ -502,12 +502,13 @@ impl Write<'_, '_> {
         Ok(parts)
     }
     fn change_ranked(&mut self, root: u64, key: Key, value: Option<Value>) -> Result<u64> {
-        let parts = self.replace_rendered(root, key, value, 0)?;
-        match parts.as_slice() {
-            [] => Ok(0),
-            [(_, id, _)] => Ok(*id),
-            _ => Ok(self.put_ranked(&Page::Ranked(parts))?.1),
+        let mut parts = self.replace_rendered(root, key, value, 0)?;
+        while parts.len() > 1 {
+            let mut next = Vec::new();
+            self.put_split_ranked(Page::Ranked(parts), &mut next)?;
+            parts = next;
         }
+        Ok(parts.first().map_or(0, |(_, id, _)| *id))
     }
     fn change_rendered(&mut self, root: u64, key: Key, value: Option<RenderFact>) -> Result<u64> {
         self.change_ranked(root, key, value.map(Value::Rendered))

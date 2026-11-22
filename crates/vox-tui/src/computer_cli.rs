@@ -41,7 +41,10 @@ pub enum ComputerCmd {
         computer: String,
         /// Exact frontier from computer status, confirming its computer and affected nodes.
         #[arg(long)]
-        confirm: String,
+        confirm: Option<String>,
+        /// Keep the removed computer's nodes in their rooms.
+        #[arg(long)]
+        keep_rooms: bool,
         #[command(flatten)]
         account: AccountArgs,
         #[arg(long)]
@@ -145,17 +148,12 @@ pub async fn run(command: ComputerCmd) -> Result<(), AppError> {
         ComputerCmd::Remove {
             computer,
             confirm,
+            keep_rooms,
             account,
             json,
-        } => (
-            account,
-            json,
-            DaemonRequest::ComputerRemove {
-                computer,
-                frontier: confirm,
-            },
-            false,
-        ),
+        } => {
+            return remove(computer, confirm, keep_rooms, account, json).await;
+        }
         ComputerCmd::Status { account, json, .. } => {
             (account, json, DaemonRequest::ComputerStatus, false)
         }
@@ -253,9 +251,9 @@ pub async fn run(command: ComputerCmd) -> Result<(), AppError> {
             )
             .await?;
             if conflict.inviter_approved {
-                eprintln!("On {}, wait until the signed incomplete proposal expires at Unix ms {}; closing it cannot withdraw a signature retained elsewhere.", conflict.peer.name, conflict.expires_ms);
+                eprintln!("On {}, the signed incomplete proposal can be closed now; its retained signature can still be used elsewhere until Unix ms {}.", conflict.peer.name, conflict.expires_ms);
             }
-            eprintln!("On {}, close the old proposal with:\n  {}\nIf it was signed after review, wait until expiry before closing; closing cannot withdraw a retained signature. Then create a fresh invitation with:\n  {}\nBring that fresh invitation here and approve on both computers.",
+            eprintln!("On {}, close the old proposal now with:\n  {}\nClosing cannot withdraw a signature retained elsewhere; close it on both computers. Then create a fresh invitation with:\n  {}\nBring that fresh invitation here and approve on both computers.",
                 conflict.peer.name,
                 vox_text::shell::command(&["vox", "computer", "cancel", &conflict.operation_id]),
                 vox_text::shell::command(&["vox", "computer", "invite"]));
@@ -279,6 +277,90 @@ pub async fn run(command: ComputerCmd) -> Result<(), AppError> {
         }
     }
     show(&status, json, false, details, include_invitation)
+}
+
+async fn remove(
+    target: String,
+    confirmed: Option<String>,
+    keep_rooms: bool,
+    account: AccountArgs,
+    json: bool,
+) -> Result<(), AppError> {
+    let root = vox_core::node::paths::Account::of(
+        account.data_dir.as_deref(),
+        account.config_dir.as_deref(),
+    )?;
+    vox_core::node::layout::refuse_old_layout(&root)?;
+    crate::daemon_client::ensure_daemon(&root, account.listen, &account.anchors).await?;
+    let mut client = DaemonClient::open(&root.socket()).await?;
+    let status = ask(&mut client, DaemonRequest::ComputerStatus).await?;
+    let matches: Vec<_> = status
+        .computers
+        .iter()
+        .filter(|computer| computer.fingerprint == target || computer.name == target)
+        .collect();
+    let [computer] = matches.as_slice() else {
+        return Err(AppError::Usage("name one active computer by its unique name or full fingerprint from vox computer status --details".into()));
+    };
+    let target = computer.fingerprint.clone();
+    let mut preview = DaemonClient::open(&root.socket()).await?;
+    let status = ask(
+        &mut preview,
+        DaemonRequest::ComputerRemove {
+            computer: target.clone(),
+            frontier: String::new(),
+            keep_rooms,
+            rooms: None,
+        },
+    )
+    .await?;
+    let rooms = status.removal_rooms.clone();
+    if confirmed.is_none() {
+        eprintln!(
+            "Remove computer {} ({}) and its nodes:",
+            computer.name, target
+        );
+        for node in status.nodes.iter().filter(|node| node.computer == target) {
+            eprintln!(
+                "  {} ({}) loses computer Read and Drive and will not be offered for trust again.",
+                node.name, node.fingerprint
+            );
+        }
+        for row in &rooms {
+            eprintln!(
+                "  {} in room {}: {}.",
+                vox_core::node::link::b32_encode(&row.member),
+                vox_core::node::link::b32_encode(&row.room),
+                if keep_rooms {
+                    "keep membership"
+                } else if row.command_node == [0; 32] {
+                    "check membership and authority when this room opens"
+                } else if row.local_node == row.command_node {
+                    "evict through vox room remove-member"
+                } else {
+                    "ask the creator or an admin to remove this member"
+                }
+            );
+        }
+        eprintln!("Received data is not erased; unreachable computers apply the removal later. Only the room creator can readmit an evicted member.");
+        if !confirm("Remove this computer with these room choices? [y/N] ").await? {
+            return Err(AppError::Usage(
+                "computer removal declined; nothing was removed".into(),
+            ));
+        }
+    }
+    let mut client = DaemonClient::open(&root.socket()).await?;
+    let status = ask(
+        &mut client,
+        DaemonRequest::ComputerRemove {
+            computer: target,
+            frontier: confirmed.unwrap_or(status.frontier),
+            keep_rooms,
+            rooms: Some(rooms),
+        },
+    )
+    .await?;
+    show(&status, json, false, false, false)
 }
 async fn confirm(prompt: &'static str) -> Result<bool, AppError> {
     tokio::task::spawn_blocking(move || -> std::io::Result<bool> {
@@ -336,6 +418,88 @@ fn show(
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64);
+    match status.state.as_str() {
+        "individual" => {
+            println!("This computer is not in a group.");
+            println!("Next: vox computer invite — add another computer.");
+        }
+        "needs-approval" => {
+            println!("This computer needs your pairing approval.");
+            if let Some(pairing) = &status.pairing {
+                println!(
+                    "Next: {}",
+                    vox_text::shell::command(&[
+                        "vox",
+                        "computer",
+                        "approve",
+                        &pairing.operation_id
+                    ])
+                );
+            }
+        }
+        "waiting" => {
+            if status
+                .pairing
+                .as_ref()
+                .is_some_and(|pairing| pairing.approved_here)
+            {
+                println!("This computer approved pairing; the other approval has not arrived.");
+            } else {
+                println!("This computer is waiting for pairing.");
+            }
+            if let Some(operation) = status
+                .pairing
+                .as_ref()
+                .map(|pairing| pairing.operation_id.as_str())
+                .or(status.invite_id.as_deref())
+            {
+                println!(
+                    "Next: {} — close this attempt here, or finish approval on the other computer.",
+                    vox_text::shell::command(&["vox", "computer", "cancel", operation])
+                );
+            }
+        }
+        "confirmed" => {
+            let peers: Vec<_> = status
+                .computers
+                .iter()
+                .filter(|computer| computer.fingerprint != status.this_computer.fingerprint)
+                .map(|computer| computer.name.as_str())
+                .collect();
+            println!("This computer is in a group with {}.", peers.join(", "));
+            println!("Next: vox computer invite — add a computer; vox computer status --details — review this group.");
+        }
+        "removed" => {
+            println!("This computer was removed from its group.");
+            println!("Next: vox computer retire — review and finish local retirement.");
+        }
+        "group-conflict" => {
+            println!("This computer has a pairing proposal from another group.");
+            if let Some(conflict) = &status.conflict {
+                println!(
+                    "Next: {} — keep this group and close the proposal.",
+                    vox_text::shell::command(&[
+                        "vox",
+                        "computer",
+                        "cancel",
+                        &conflict.operation_id
+                    ])
+                );
+            }
+        }
+        "expired" => {
+            println!("This computer's group change did not finish; the last convergence deadline was missed.");
+            println!("Next: vox computer status --details — read the failed computer and cause; pairing again does not erase that miss.");
+        }
+        "applying" => {
+            println!("This computer is in a group; application is still pending.");
+            println!("Next: vox computer status --details — read which nodes or computers are pending and why.");
+        }
+        _ => {
+            println!("This computer's trust cannot be applied safely.");
+            println!("Next: vox computer status --details — read the retained authority or storage failure.");
+        }
+    }
     if details || status.pairing.is_some() {
         println!(
             "{}  {}\ninstallation {}\ncomputer trust: {}\npolicy revision {}",
@@ -352,6 +516,54 @@ fn show(
         );
     }
     println!("{}", status.policy);
+    for removal in &status.removals {
+        if removal.keep_rooms {
+            println!(
+                "Computer {} removed; room memberships kept (--keep-rooms).",
+                removal.computer
+            );
+        }
+        for node in &removal.unchecked_nodes {
+            let acting = format!("fp:{node}");
+            println!(
+                "Rooms on locked node {node} have not been checked yet. Next: {}",
+                vox_text::shell::command(&["vox", "node", "unlock", &acting])
+            );
+        }
+        for row in &removal.pending {
+            let room = vox_core::node::link::b32_encode(&row.room);
+            let node = vox_core::node::link::b32_encode(&row.member);
+            if row.command_node == [0; 32] {
+                let acting = format!("fp:{}", vox_core::node::link::b32_encode(&row.local_node));
+                println!("Room {room}, node {node}: membership removal waits until this room opens. Next: {}",
+                    vox_text::shell::command(&["vox", "room", "open", &room, "--node", &acting]));
+                continue;
+            }
+            let acting = format!("fp:{}", vox_core::node::link::b32_encode(&row.command_node));
+            if row.member == row.command_node {
+                println!("Room {room}, node {node}: no local node may evict the room creator. On that node: {}",
+                    vox_text::shell::command(&["vox", "room", "leave", &room, "--node", &acting]));
+                continue;
+            }
+            println!(
+                "Room {room}, node {node}: {}. Next: {}",
+                if row.command_node == row.local_node {
+                    "removal pending; it resumes when this room can proceed"
+                } else {
+                    "no local node may evict; ask the creator or an admin"
+                },
+                vox_text::shell::command(&[
+                    "vox",
+                    "room",
+                    "remove-member",
+                    &room,
+                    &node,
+                    "--node",
+                    &acting
+                ])
+            );
+        }
+    }
     if let Some(conflict) = &status.conflict {
         println!("Authenticated computer {} · {}\ninstallation {} is already in a different established group.",
             conflict.peer.name, conflict.peer.fingerprint, conflict.peer.installation);
@@ -364,7 +576,7 @@ fn show(
             println!("  {item}");
         }
         if conflict.inviter_approved {
-            println!("The inviter already signed the proposal; wait until Unix ms {} before closing it there. Closing cannot withdraw an already-recorded signature.", conflict.expires_ms);
+            println!("The inviter already signed the proposal. Closing it here cannot withdraw that signature on the other computer.");
         }
         if conflict.expires_ms <= now_ms {
             println!("The proposal expired. On {}, close it with {} and create a fresh invitation with {}.",
