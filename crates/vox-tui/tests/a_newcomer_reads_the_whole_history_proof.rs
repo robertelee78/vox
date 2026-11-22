@@ -10115,8 +10115,22 @@ mod rg1 {
         );
         let _bob = start(&bob, "127.0.0.1:0", None);
         returning_reader_ready(&bob, &id);
+        let connecting = Instant::now();
+        loop {
+            let report = status(&bob, &id);
+            if member(&report, &alice.b32()).is_some_and(|row| row["connected"] == true) {
+                break;
+            }
+            assert!(
+                connecting.elapsed() < Duration::from_secs(240),
+                "APPARATUS: returning reader never reported its author connected: {report}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
         let mut demand = None::<usize>;
         let mut answered = None::<Value>;
+        let mut request = None::<String>;
+        let mut unrecorded = 0;
         let mut stalled = 0;
         let mut before = None::<String>;
         let mut numbered = BTreeMap::<usize, Value>::new();
@@ -10189,6 +10203,7 @@ mod rg1 {
                 let requested = bob.vox(None, &args);
                 requested.expect_ok("returning reader history request");
                 demand = Some(first);
+                request = None;
             } else {
                 let status = bob.vox(
                     None,
@@ -10196,18 +10211,42 @@ mod rg1 {
                 );
                 status.expect_ok("returning reader history status");
                 let status = status.json();
+                let Some(answer_request) = status["request"].as_str() else {
+                    // No recorded request answered this ask. Do not turn cached or leftover
+                    // terminal status into one of the three missing-page answers.
+                    unrecorded += 1;
+                    if unrecorded == 20 {
+                        let report = self::status(&bob, &id);
+                        assert!(
+                            member(&report, &alice.b32())
+                                .is_some_and(|row| row["connected"] == true),
+                            "APPARATUS: author disconnected during history request staging: {report}"
+                        );
+                        panic!(
+                            "RED PRODUCT: history request never recorded after {unrecorded} asks \
+                             while the author is connected; history status: {status}"
+                        );
+                    }
+                    demand = None;
+                    std::thread::sleep(Duration::from_millis(100));
+                    continue;
+                };
+                let issued = request.get_or_insert_with(|| answer_request.to_owned());
+                if answer_request != issued.as_str() {
+                    // A different operation cannot answer this pass's exact request.
+                    std::thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+                unrecorded = 0;
                 let phase = status["status"]["phase"]
                     .as_str()
                     .unwrap_or_else(|| panic!("PRODUCT: history status has no phase: {status}"));
-                if phase == "more" && !status["request"].is_null() {
+                if phase == "more" {
                     bob.vox(None, &["room", "read", &id, "--history", "resume"])
                         .expect_ok("returning reader history resume");
-                } else if matches!(
-                    phase,
-                    "complete" | "unavailable" | "paused" | "cached" | "more"
-                ) {
-                    // Read the resulting page once more before judging the terminal answer:
-                    // its last row may have arrived after this iteration's first read.
+                } else if matches!(phase, "complete" | "unavailable" | "paused" | "cached") {
+                    // This terminal answer carries this pass's recorded request id. Read its
+                    // resulting page once more before judging the answer.
                     answered = Some(status);
                 }
             }
