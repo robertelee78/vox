@@ -2336,7 +2336,7 @@ fn the_tui_leaves_and_ends() {
     );
     eprintln!("[proof] tui: a non-creator's :end is refused as the CLI refuses it: {tui}");
 
-    room.workers[2].stop_daemon();
+    room.workers[2].stop_daemon_cleanly();
     tui_verb(&room.workers[2], "leave", Duration::from_secs(15));
     let carol = room.workers[2].b32();
     for w in &room.workers[..2] {
@@ -2364,6 +2364,8 @@ fn the_tui_leaves_and_ends() {
         "PRODUCT: {GONE:?} after alice's :end in the TUI, bob's `vox room list` still names the \
          room: {o:?}"
     );
+    // The authenticated End must still erase Bob's public author continuity.
+    erased(&mut room.workers[1], &id, &cid, false);
     eprintln!("[proof] tui: :leave and :end each did what the CLI verb does");
 }
 
