@@ -86,6 +86,18 @@
 //! no longer ends the transport failure streak. The second failure then extends the first one's
 //! streak past 30 s, the port stops for 30 s, and the marker arrives late. Alice's daemon says
 //! when the mutant first keeps a streak; the act requires that line when the mutant is asked for.
+//!
+//! # Third act: a member that keeps refusing is retried less and less often
+//! [`a_peer_that_keeps_refusing_is_retried_less_and_less_often`]: ending the streak on an answer
+//! must not stop a member that answers nothing from being paced. Bob refuses every history
+//! stream for the whole act (the same knob, never removed) and Alice posts once. From Alice's
+//! first failed session to Bob, her `vox status --json` is read every 250 ms for
+//! [`REFUSING_WINDOW`]: her row for Bob must show `backoff` `unreachable` with `failures` of at
+//! least [`REFUSING_STREAK`] at some read, and her `failed` count for him must rise by at most
+//! [`REFUSING_MOST`] over the window (the doubling 200 ms to 8 s pacing fails about seven times in
+//! 20 s; a port retried every 200 ms fails several times that). The red is `PRODUCT` with the
+//! streak and count she showed. Mutation: a streak that every returned turn resets, even one
+//! that never reached Bob (528d25bfd's rule), holds it at one failure.
 
 #![cfg(unix)]
 
@@ -114,6 +126,12 @@ const STREAK_BOUND: Duration = Duration::from_secs(10);
 const HEALTHY_POSTS: usize = 35;
 /// What Alice's daemon says when `VOX_MUTANT_TRANSPORT_STREAK` first keeps a streak.
 const STREAK_MUTANT_LINE: &str = "VOX_MUTANT_TRANSPORT_STREAK engaged";
+/// How long Alice's status is read while Bob keeps refusing.
+const REFUSING_WINDOW: Duration = Duration::from_secs(20);
+/// The unreachable streak Alice's status must reach for a Bob who keeps refusing.
+const REFUSING_STREAK: u64 = 3;
+/// The most failed sessions to Bob Alice may count over [`REFUSING_WINDOW`].
+const REFUSING_MOST: u64 = 12;
 
 /// The runner's own clock: a thread that sleeps 10 ms at a time and keeps the most it overslept.
 /// It measures whether this process was scheduled, never vox: a slow vox does not move it, so a
@@ -536,4 +554,98 @@ fn a_peer_that_failed_twice_half_a_minute_apart_still_delivers_in_seconds() {
              {second_seen}; at {STREAK_BOUND:?}: {late_seen:?}"
         );
     }
+}
+
+#[test]
+#[ignore = "two real daemons with production Argon2id, about a minute; CI runs it in release"]
+fn a_peer_that_keeps_refusing_is_retried_less_and_less_often() {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
+    let root = tmp.path();
+    let refuse = root.join("bob-refuses-history");
+    let refuse_text = refuse
+        .to_str()
+        .expect("APPARATUS: the scratch path is not UTF-8")
+        .to_owned();
+    let alice = Member::new(root, "alice");
+    let bob = Member::new(root, "bob");
+    alice.trust(&bob);
+    bob.trust(&alice);
+    let alice_d = alice.daemon_with(&[]);
+    let bob_d = bob.daemon_with(&[("VOX_TEST_REFUSE_HISTORY_FILE", &refuse_text)]);
+    let room = alice.create("pair");
+    bob.join(&alice.invite(&room), "pair");
+    let mut ra = alice.reader();
+    let mut rb = bob.reader();
+    let (ca, cb) = (ra.room(&room), rb.room(&room));
+
+    let start = Instant::now();
+    let mut n = 0;
+    loop {
+        n += 1;
+        alice.post(&room, &format!("warm alice {n}"));
+        bob.post(&room, &format!("warm bob {n}"));
+        std::thread::sleep(Duration::from_millis(500));
+        if ra.texts(ca).iter().any(|t| t.starts_with("warm bob"))
+            && rb.texts(cb).iter().any(|t| t.starts_with("warm alice"))
+        {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(90),
+            "APPARATUS (staging not reached): the pair never read each other in 90 s\nalice:\n{}\nbob:\n{}",
+            alice_d.transcript(),
+            bob_d.transcript()
+        );
+    }
+    std::thread::sleep(Duration::from_secs(1));
+
+    // Bob refuses from now to the end; Alice's post gives her port to him work.
+    let before = counter(&alice.status(), "failed", Some(&bob.fp));
+    std::fs::write(&refuse, b"refuse").expect("APPARATUS: could not write bob's refusal file");
+    alice.post(&room, "refusing: alice posts while bob refuses");
+    let began = Instant::now();
+    let mut first = None;
+    while began.elapsed() < Duration::from_secs(28) {
+        let status = alice.status();
+        if counter(&status, "failed", Some(&bob.fp)) > before {
+            first = Some(status);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let Some(first) = first else {
+        panic!(
+            "APPARATUS (staging not reached): alice's session to bob did not fail within 28 s \
+             while he refused his history streams"
+        );
+    };
+    let at_first = counter(&first, "failed", Some(&bob.fp));
+    let window = Instant::now();
+    let (mut streak, mut last) = (0, first);
+    while window.elapsed() < REFUSING_WINDOW {
+        let status = alice.status();
+        let backoff = &peer_row(&status["sync"], &bob.fp)["backoff"];
+        if backoff["kind"] == "unreachable" {
+            streak = streak.max(backoff["failures"].as_u64().unwrap_or(0));
+        }
+        last = status;
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let failed = counter(&last, "failed", Some(&bob.fp)).saturating_sub(at_first);
+    let _ = std::fs::remove_file(&refuse);
+    println!(
+        "[proof] refusing: over {REFUSING_WINDOW:?} after her first failed session to bob, \
+         alice's status showed an unreachable streak of at most {streak} and {failed} more failed \
+         sessions to him; her port at the end: {}",
+        port_seen(&last, &bob.fp)
+    );
+    assert!(
+        streak >= REFUSING_STREAK && failed <= REFUSING_MOST,
+        "PRODUCT: bob refused every history stream, and over {REFUSING_WINDOW:?} alice's status \
+         showed an unreachable streak of at most {streak} (at least {REFUSING_STREAK} expected) \
+         and {failed} failed sessions to him (at most {REFUSING_MOST} expected): her port to a \
+         member that answers nothing is not paced; at the end: {}",
+        port_seen(&last, &bob.fp)
+    );
 }

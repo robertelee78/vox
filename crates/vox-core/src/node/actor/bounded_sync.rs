@@ -3517,26 +3517,6 @@ impl Node {
                         false
                     }
                 });
-            // A turn that returned without failure ends the port's transport failure streak, as
-            // a successful session does. Otherwise two transport failures half a minute apart,
-            // with any number of answered turns between, pace every later single failure as a
-            // sustained one: 30 s or more with the whole port stopped while the peer serves.
-            if returned.failure.is_none() {
-                if let Some(backoff) = self
-                    .ports
-                    .get_mut(&(work.room, work.peer))
-                    .and_then(|port| port.transport_backoff.as_mut())
-                    .filter(|backoff| backoff.failures > 0)
-                {
-                    #[cfg(feature = "test-knobs")]
-                    let kept = transport_streak_mutant();
-                    #[cfg(not(feature = "test-knobs"))]
-                    let kept = false;
-                    if !kept {
-                        backoff.failures = 0;
-                    }
-                }
-            }
             // The physical Background position is free on every returned outcome, including
             // stale, failed and local-retry exits. Reconsider only the eligible opposite service;
             // this is a capacity wake, not Public request or generation credit.
@@ -3574,6 +3554,32 @@ impl Node {
                         // A worker can return Busy after the canonical refresh scanned parked
                         // owners. Recheck before retaining its now-obsolete capability.
                         flow.authorization_changed = true;
+                    }
+                }
+            }
+            // An exchange the peer answered on this still-current attempt ends the port's
+            // transport failure streak, as a clean session the peer opened does (`Dir::In` in
+            // `actor.rs`, which clears the transport backoff). Without it, two transport failures
+            // half a minute apart, with any number of answered exchanges between, pace every later
+            // single failure as a sustained one: 30 s or more with the whole port stopped while
+            // the peer serves. A turn that only read locally (a fresh flow's initialization), a
+            // stale or pre-empted one, proves nothing about the peer and leaves the streak, so a
+            // peer that fails every exchange still escalates. `until` and the status book's
+            // `backoff` are left as they are on purpose: a pause already running is not cut
+            // short, and status keeps naming the pacing in force until it expires.
+            if valid && flow.peer_answered() {
+                if let Some(backoff) = self
+                    .ports
+                    .get_mut(&(work.room, work.peer))
+                    .and_then(|port| port.transport_backoff.as_mut())
+                    .filter(|backoff| backoff.failures > 0)
+                {
+                    #[cfg(feature = "test-knobs")]
+                    let kept = transport_streak_mutant();
+                    #[cfg(not(feature = "test-knobs"))]
+                    let kept = false;
+                    if !kept {
+                        backoff.failures = 0;
                     }
                 }
             }
