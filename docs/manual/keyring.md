@@ -366,19 +366,22 @@ roster cannot undo the removal, and the same computer cannot be enrolled into th
 
 To put two former group members A and B together again after A removes B, retire the old group
 locally on B with `vox computer retire`. On A, use `vox computer remove` with A's own full
-fingerprint from `vox computer status --details`, then run `vox computer retire` there too.
-Review and confirm each removal and retirement. Have B make a fresh `vox computer invite`; use
-its link with `vox computer pair` on A and approve the reviewed pairing on both computers. This
-creates a new group, not a restoration of the old one.
+fingerprint from `vox computer status --details` and `--keep-rooms`, then run
+`vox computer retire` there too. Without `--keep-rooms`, a removal evicts the removed nodes from
+rooms where this computer's node is an admin, and names the other rooms for their creator or an
+admin. When a computer removes itself, the removed nodes are its own. Review and confirm each
+removal and retirement. Have B make a fresh `vox computer invite`; use its link with
+`vox computer pair` on A and approve the reviewed pairing on both computers. This creates a new
+group, not a restoration of the old one.
 
-For a group of three or more, first decide which computers will move to the new group. Each
-moving computer must be removed from the old group and retire it locally. An active computer can
-remove the others and itself last, or each can remove itself. Pair the first two retired
-computers to create the new group, then enroll each other moving computer with a fresh
-invitation and two-sided approval. Computers not moving can keep the old group: they need not
-remove themselves or retire, but they no longer share computer-policy Read and Drive with the
-computers that left. Reuniting ALL the former members with the removed computer requires moving
-them ALL to a new group.
+Only this two-computer route has been run end to end. For a group of three or more, the same
+rules apply. First decide which computers will move to the new group. Only those computers
+leave: each moving computer is removed from the old group, with `--keep-rooms`, and retires it
+locally. Each one joins the new group by a fresh `vox computer invite` and approval on both
+computers. Computers not moving can keep the old group: they need not remove themselves or
+retire, but they no longer share computer-policy Read and Drive with the computers that left.
+Reuniting ALL the former members with the removed computer requires moving them ALL to a new
+group.
 
 Retirement preserves computer and node identities, local data and signed history, and removes
 covered grants before new pairing. It neither erases data nor claims revocation on unreachable

@@ -343,13 +343,7 @@ async fn remove(
             );
         }
         eprintln!("Received data is not erased; unreachable computers apply the removal later. Only the room creator can readmit an evicted member.");
-        #[cfg(feature = "test-knobs")]
-        let warn = !vox_core::node::computer::fx28_mutant("remove-without-way-back-warning");
-        #[cfg(not(feature = "test-knobs"))]
-        let warn = true;
-        if warn {
-            eprintln!("This computer cannot be added back to this group. To put it in a group with any remaining computer again, both must leave and retire this group, then pair into a new group; computers that stay here will no longer share computer trust with them.");
-        }
+        eprintln!("This computer cannot be added back to this group. To put it in a group with any remaining computer again, both must leave and retire this group, then pair into a new group; computers that stay here will no longer share computer trust with them.");
         if !confirm("Remove this computer with these room choices? [y/N] ").await? {
             return Err(AppError::Usage(
                 "computer removal declined; nothing was removed".into(),

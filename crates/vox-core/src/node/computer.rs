@@ -52,7 +52,7 @@ pub const COMPUTER_QUIET_EXCHANGE_AFTER: Duration = Duration::from_secs(60);
 /// not contain the variable or mode names; each mode is run separately so one red cannot satisfy
 /// another claim's mutant.
 #[cfg(feature = "test-knobs")]
-pub fn fx28_mutant(named: &str) -> bool {
+pub(crate) fn fx28_mutant(named: &str) -> bool {
     let engaged = std::env::var("VOX_TEST_FX28_MUTANT").as_deref() == Ok(named);
     if engaged {
         eprintln!("[vox mutant] engaged {named}");

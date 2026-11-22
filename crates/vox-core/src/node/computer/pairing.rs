@@ -4989,12 +4989,6 @@ fn group_offer(s: &State) -> Result<Vec<u8>> {
     if let Some(genesis) = &s.genesis {
         let local = s.description.fingerprint()?;
         if s.grant(&local).is_none() || !s.quarantined.is_empty() || !s.history_complete() {
-            #[cfg(feature = "test-knobs")]
-            if crate::node::computer::fx28_mutant("refusal-without-next-command") {
-                return Err(Error::Profile(
-                    "this computer's group authority is removed or suspended",
-                ));
-            }
             // The same refusal covers quarantine and incomplete history: retiring is advised
             // only for the removed case.
             return Err(Error::Profile(
