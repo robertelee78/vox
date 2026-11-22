@@ -90,6 +90,29 @@ cargo test --release -p vox-tui --features test-knobs,optional-proofs \
   a_saved_manual_removal_finishes_while_another_room_posts -- --ignored --exact --nocapture
 ```
 
+### Computer removal (ADR-052 RG-8)
+
+The pairing journey in `nodes_of_one_daemon_proof.rs` also covers saved room choices:
+`computer_removal_resumes_its_saved_room_choices_after_restart`,
+`computer_removal_keeps_rooms_without_offering_removed_nodes`,
+`computer_removal_reconciles_absence_before_a_fresh_join`,
+`computer_removal_checks_a_locked_nodes_rooms_when_it_opens`,
+`computer_removal_names_a_room_without_a_local_admin`, and
+`computer_removal_offers_only_a_fresh_basis`.
+Run one name at a time with
+`cargo test --release -p vox-tui --features test-knobs,optional-proofs --test nodes_of_one_daemon_proof <name> -- --ignored --exact --nocapture`.
+The restart and absence acts use causal holds and require an exclusive proof slot.
+Removal choices are local state saved atomically with the unchanged three-field signed
+computer removal event. An event with no local choice keeps room memberships. Choices,
+completion and rooms checked on first unlock share the existing computer snapshot;
+unfinished work uses the room's existing one-second governance retry, not a separate
+removal worker or journal.
+Each accepted removal also keeps this computer's existing-node offer obligations and
+per-room basis cutoffs in that same snapshot. Until a room's cutoff is captured it
+offers none of that computer's nodes; afterwards only pre-removal bases are suppressed.
+A deliberate fresh join or consent is offered normally. Closed rooms capture before
+their first exchange on reopening; a node created after the removal inherits nothing.
+
 ### Linux kernel-keyring proofs
 
 The dedicated typed-unlock, restart and unavailable-keyring journeys must run as a disposable

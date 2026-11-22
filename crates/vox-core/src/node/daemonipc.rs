@@ -284,6 +284,10 @@ pub enum DaemonRequest {
         computer: String,
         /// Exact displayed frontier.
         frontier: String,
+        /// Retain room membership instead of evicting the computer's nodes.
+        keep_rooms: bool,
+        /// Reviewed room scope; absent for an already-confirmed script/app request.
+        rooms: Option<Vec<crate::node::computer::RemovalRoom>>,
     },
     /// Operator-approved source release or destination transfer/recovery.
     ComputerBinding {
@@ -1469,11 +1473,18 @@ impl Opening {
                 DaemonRequest::ComputerPersonal { node } => {
                     e.array(2).uint(T_REQ_COMPUTER_PERSONAL).text(node);
                 }
-                DaemonRequest::ComputerRemove { computer, frontier } => {
-                    e.array(3)
+                DaemonRequest::ComputerRemove {
+                    computer,
+                    frontier,
+                    keep_rooms,
+                    rooms,
+                } => {
+                    e.array(5)
                         .uint(T_REQ_COMPUTER_REMOVE)
                         .text(computer)
-                        .text(frontier);
+                        .text(frontier)
+                        .uint(u64::from(*keep_rooms));
+                    crate::node::computer::RemovalRoom::put_review(&mut e, rooms);
                 }
                 DaemonRequest::Stop => {
                     e.array(1).uint(T_REQ_STOP);
@@ -1677,9 +1688,15 @@ impl Opening {
             (T_REQ_COMPUTER_PERSONAL, 2) => Opening::Daemon(DaemonRequest::ComputerPersonal {
                 node: text(&mut d, "selected node")?,
             }),
-            (T_REQ_COMPUTER_REMOVE, 3) => Opening::Daemon(DaemonRequest::ComputerRemove {
+            (T_REQ_COMPUTER_REMOVE, 5) => Opening::Daemon(DaemonRequest::ComputerRemove {
                 computer: text(&mut d, "computer fingerprint")?,
                 frontier: text(&mut d, "computer frontier")?,
+                keep_rooms: match d.uint()? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(Error::MalformedIpc("computer removal choice")),
+                },
+                rooms: crate::node::computer::RemovalRoom::read_review(&mut d)?,
             }),
             (T_REQ_COMPUTER_STATUS, 1) => Opening::Daemon(DaemonRequest::ComputerStatus),
             (T_REQ_COMPUTER_BEGIN, 1) => Opening::Daemon(DaemonRequest::ComputerBegin),

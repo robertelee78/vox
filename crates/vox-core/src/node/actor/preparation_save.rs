@@ -974,6 +974,23 @@ impl Node {
             prepared.save.stage = Stage::Trust;
         }
         if prepared.save.stage == Stage::Trust {
+            match self.capture_room_offer_boundary(&channel, &store) {
+                Ok(true) => {}
+                Ok(false) => {
+                    prepared.save.lifetime = None;
+                    prepared.wait_on("saving its computer removal boundary", now.get());
+                    return Ok(false);
+                }
+                Err(error) if ChannelState::governance_refreshing(&error) => {
+                    prepared.save.lifetime = None;
+                    prepared.save.resume_after_governance = Some(Stage::Trust);
+                    prepared.save.stage = Stage::Governance;
+                    prepared.save.request = Some(Work::Projection(ProjectionWork::Governance));
+                    prepared.wait_on(stage_wait(Stage::Governance), now.get());
+                    return Ok(false);
+                }
+                Err(error) => return Err(error),
+            }
             let trusted = self.trust.trusted();
             let scope = if prepared.save.cache_only {
                 trust_save::ReconcileScope::Cache

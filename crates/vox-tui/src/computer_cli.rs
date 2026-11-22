@@ -41,7 +41,10 @@ pub enum ComputerCmd {
         computer: String,
         /// Exact frontier from computer status, confirming its computer and affected nodes.
         #[arg(long)]
-        confirm: String,
+        confirm: Option<String>,
+        /// Keep the removed computer's nodes in their rooms.
+        #[arg(long)]
+        keep_rooms: bool,
         #[command(flatten)]
         account: AccountArgs,
         #[arg(long)]
@@ -145,17 +148,12 @@ pub async fn run(command: ComputerCmd) -> Result<(), AppError> {
         ComputerCmd::Remove {
             computer,
             confirm,
+            keep_rooms,
             account,
             json,
-        } => (
-            account,
-            json,
-            DaemonRequest::ComputerRemove {
-                computer,
-                frontier: confirm,
-            },
-            false,
-        ),
+        } => {
+            return remove(computer, confirm, keep_rooms, account, json).await;
+        }
         ComputerCmd::Status { account, json, .. } => {
             (account, json, DaemonRequest::ComputerStatus, false)
         }
@@ -279,6 +277,90 @@ pub async fn run(command: ComputerCmd) -> Result<(), AppError> {
         }
     }
     show(&status, json, false, details, include_invitation)
+}
+
+async fn remove(
+    target: String,
+    confirmed: Option<String>,
+    keep_rooms: bool,
+    account: AccountArgs,
+    json: bool,
+) -> Result<(), AppError> {
+    let root = vox_core::node::paths::Account::of(
+        account.data_dir.as_deref(),
+        account.config_dir.as_deref(),
+    )?;
+    vox_core::node::layout::refuse_old_layout(&root)?;
+    crate::daemon_client::ensure_daemon(&root, account.listen, &account.anchors).await?;
+    let mut client = DaemonClient::open(&root.socket()).await?;
+    let status = ask(&mut client, DaemonRequest::ComputerStatus).await?;
+    let matches: Vec<_> = status
+        .computers
+        .iter()
+        .filter(|computer| computer.fingerprint == target || computer.name == target)
+        .collect();
+    let [computer] = matches.as_slice() else {
+        return Err(AppError::Usage("name one active computer by its unique name or full fingerprint from vox computer status --details".into()));
+    };
+    let target = computer.fingerprint.clone();
+    let mut preview = DaemonClient::open(&root.socket()).await?;
+    let status = ask(
+        &mut preview,
+        DaemonRequest::ComputerRemove {
+            computer: target.clone(),
+            frontier: String::new(),
+            keep_rooms,
+            rooms: None,
+        },
+    )
+    .await?;
+    let rooms = status.removal_rooms.clone();
+    if confirmed.is_none() {
+        eprintln!(
+            "Remove computer {} ({}) and its nodes:",
+            computer.name, target
+        );
+        for node in status.nodes.iter().filter(|node| node.computer == target) {
+            eprintln!(
+                "  {} ({}) loses computer Read and Drive and will not be offered for trust again.",
+                node.name, node.fingerprint
+            );
+        }
+        for row in &rooms {
+            eprintln!(
+                "  {} in room {}: {}.",
+                vox_core::node::link::b32_encode(&row.member),
+                vox_core::node::link::b32_encode(&row.room),
+                if keep_rooms {
+                    "keep membership"
+                } else if row.command_node == [0; 32] {
+                    "check membership and authority when this room opens"
+                } else if row.local_node == row.command_node {
+                    "evict through vox room remove-member"
+                } else {
+                    "ask the creator or an admin to remove this member"
+                }
+            );
+        }
+        eprintln!("Received data is not erased; unreachable computers apply the removal later. Only the room creator can readmit an evicted member.");
+        if !confirm("Remove this computer with these room choices? [y/N] ").await? {
+            return Err(AppError::Usage(
+                "computer removal declined; nothing was removed".into(),
+            ));
+        }
+    }
+    let mut client = DaemonClient::open(&root.socket()).await?;
+    let status = ask(
+        &mut client,
+        DaemonRequest::ComputerRemove {
+            computer: target,
+            frontier: confirmed.unwrap_or(status.frontier),
+            keep_rooms,
+            rooms: Some(rooms),
+        },
+    )
+    .await?;
+    show(&status, json, false, false, false)
 }
 async fn confirm(prompt: &'static str) -> Result<bool, AppError> {
     tokio::task::spawn_blocking(move || -> std::io::Result<bool> {
@@ -434,6 +516,54 @@ fn show(
         );
     }
     println!("{}", status.policy);
+    for removal in &status.removals {
+        if removal.keep_rooms {
+            println!(
+                "Computer {} removed; room memberships kept (--keep-rooms).",
+                removal.computer
+            );
+        }
+        for node in &removal.unchecked_nodes {
+            let acting = format!("fp:{node}");
+            println!(
+                "Rooms on locked node {node} have not been checked yet. Next: {}",
+                vox_text::shell::command(&["vox", "node", "unlock", &acting])
+            );
+        }
+        for row in &removal.pending {
+            let room = vox_core::node::link::b32_encode(&row.room);
+            let node = vox_core::node::link::b32_encode(&row.member);
+            if row.command_node == [0; 32] {
+                let acting = format!("fp:{}", vox_core::node::link::b32_encode(&row.local_node));
+                println!("Room {room}, node {node}: membership removal waits until this room opens. Next: {}",
+                    vox_text::shell::command(&["vox", "room", "open", &room, "--node", &acting]));
+                continue;
+            }
+            let acting = format!("fp:{}", vox_core::node::link::b32_encode(&row.command_node));
+            if row.member == row.command_node {
+                println!("Room {room}, node {node}: no local node may evict the room creator. On that node: {}",
+                    vox_text::shell::command(&["vox", "room", "leave", &room, "--node", &acting]));
+                continue;
+            }
+            println!(
+                "Room {room}, node {node}: {}. Next: {}",
+                if row.command_node == row.local_node {
+                    "removal pending; it resumes when this room can proceed"
+                } else {
+                    "no local node may evict; ask the creator or an admin"
+                },
+                vox_text::shell::command(&[
+                    "vox",
+                    "room",
+                    "remove-member",
+                    &room,
+                    &node,
+                    "--node",
+                    &acting
+                ])
+            );
+        }
+    }
     if let Some(conflict) = &status.conflict {
         println!("Authenticated computer {} · {}\ninstallation {} is already in a different established group.",
             conflict.peer.name, conflict.peer.fingerprint, conflict.peer.installation);
