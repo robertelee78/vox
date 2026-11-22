@@ -68,10 +68,8 @@ const SEK_WRAPS: TableDefinition<Digest32, &[u8]> = TableDefinition::new("sek_wr
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const META_SCHEMA: &str = "schema_version";
 
-// redb starts small and doubles; avoid reclaiming ordinary small-store growth slack.
+// redb can double a compacted file on its next write; reclaim only excess above that slack.
 const MIN_COMPACTION_RECLAIM_BYTES: u64 = 64 * 1024 * 1024;
-// Bound unlock work: larger live stores wait until retention brings them below this cap.
-const MAX_COMPACTION_USED_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Successful store-backend flush calls across this process, including opening, recovery and
 /// rewrite files. Count the completed I/O, not transactions classified as durable.
@@ -1614,10 +1612,7 @@ impl Store {
         else {
             return Ok(false);
         };
-        if file_bytes <= twice_used
-            || file_bytes - used_bytes < MIN_COMPACTION_RECLAIM_BYTES
-            || used_bytes > MAX_COMPACTION_USED_BYTES
-        {
+        if file_bytes <= twice_used || file_bytes - twice_used < MIN_COMPACTION_RECLAIM_BYTES {
             return Ok(false);
         }
         notice(file_bytes, used_bytes);

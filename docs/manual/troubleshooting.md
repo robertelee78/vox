@@ -278,17 +278,25 @@ history remains available while the room recovers.
 **Confirm:** the room can save a new post again, and `vox room read` shows that post together
 with its previously saved messages.
 
-## Startup says it is reclaiming unused store space
+## Startup says it is giving back disk space
 
-After verifying an identity, the daemon compacts its store in place when the file is more
-than twice its reachable allocated page bytes, including metadata, and reclaiming the unused
-space would return at least 64 MiB, and it holds at most 256 MiB. Larger live stores
-are left alone until retention reduces what they hold. Smaller stores keep their ordinary
-growth slack. The foreground daemon and its log say `reclaiming unused store space in place`
-before starting. That node becomes Ready when compaction finishes, then its rooms reopen.
-On one measured Mac, unlocking a file holding 249 MB took 1.73 seconds with compaction,
-and 0.30 seconds without; disk speed and store shape affect this, not just file size.
+After verifying an identity, the daemon compacts its store in place when the file exceeds
+twice its allocator-used bytes, including metadata, by at least 64 MiB. This keeps the
+engine's ordinary growth slack. There is no limit on how much the store holds.
+`vox status` and a waiting command say `giving back disk space`, with the file bytes and
+bytes held. The node becomes Ready when compaction finishes, then its rooms reopen.
+A waiting command prints the reason once; agent hooks retain their existing bounded wait.
+Restart and update report that the daemon is running while this named startup work continues;
+they do not call the node Ready or treat disk-space reclamation as a failed handoff.
+On one measured Mac, unlocking a file holding 610 MB took 11.35 seconds with compaction,
+and 0.51 seconds without; disk speed and store shape affect this, not just file size.
+A start after an interrupted cleanup repeats it: one 2.6 GB file holding 300 MB reached
+Ready in 7.9 seconds, and every retained acknowledged row read back.
 There is no second store file or replacement rename. A locked identity is not compacted.
+
+The engine can grow beyond twice its previous size for a single very large allocation.
+Vox has no global stored-row limit below 64 MiB, so the floor is not a universal promise
+that a later unlock never compacts again; normal growth and retained-data changes matter.
 
 If compaction cannot run or fails, the daemon log names the node and the storage error, and
 startup continues using the last committed store. Compaction is optional, not a reason to

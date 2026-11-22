@@ -188,6 +188,7 @@ fn run(
     argon2: Argon2Profile,
     decisions: &DecisionLog,
     events: &broadcast::Sender<NodeEvent>,
+    startup_work: Option<&(dyn Fn(Option<super::StartupWork>) + Send + Sync)>,
 ) -> (Option<Profile>, std::result::Result<(), Fault>) {
     let waiting = || {
         let _ = events.send(NodeEvent::WaitingForProfile);
@@ -244,9 +245,16 @@ fn run(
             .unwrap_or_else(|| "<unreadable>".into());
         if let Err(error) = profile.compact_store(|file, used| {
             let note = format!(
-                "node {name}: reclaiming unused store space in place ({file} bytes, {used} used); \
-                 this node becomes Ready when compaction finishes; a large store can take a while"
+                "node {name}: giving back disk space (file {file} bytes, holds {used} bytes); \
+                 this node becomes Ready when compaction finishes"
             );
+            if let Some(publish) = startup_work {
+                publish(Some(super::StartupWork {
+                    reason: note.clone(),
+                    file_bytes: file,
+                    held_bytes: used,
+                }));
+            }
             eprintln!("vox daemon: {note}");
             let _ = events.send(NodeEvent::NodeNote { note });
         }) {
@@ -254,6 +262,9 @@ fn run(
                 format!("node {name}: store compaction skipped: {error}; continuing startup");
             eprintln!("vox daemon: {note}");
             let _ = events.send(NodeEvent::NodeNote { note });
+        }
+        if let Some(publish) = startup_work {
+            publish(None);
         }
     }
     (Some(profile), Ok(()))
@@ -446,6 +457,7 @@ impl Node {
         let paths = self.paths.clone();
         let now = self.now_ms().get();
         let argon2 = self.argon2;
+        let startup_work = self.on_startup_work.clone();
         let decisions = self.decisions.clone();
         let worker_decisions = decisions.clone();
         let events = self.event_tx.clone();
@@ -459,8 +471,15 @@ impl Node {
                 let unlock_decisions = worker_decisions.clone();
                 let unlock_events = events.clone();
                 let (profile, unlocked, secret) = tokio::task::spawn_blocking(move || {
-                    let (profile, unlocked) =
-                        run(work, paths, now, argon2, &unlock_decisions, &unlock_events);
+                    let (profile, unlocked) = run(
+                        work,
+                        paths,
+                        now,
+                        argon2,
+                        &unlock_decisions,
+                        &unlock_events,
+                        startup_work.as_deref(),
+                    );
                     (profile, unlocked, secret)
                 })
                 .await?;

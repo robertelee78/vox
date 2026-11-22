@@ -2417,9 +2417,11 @@ impl WriteTransaction {
         table_tree.relocate_tables(&relocation_map)?;
         #[cfg(feature = "vox-test-knobs")]
         if progress && let Some(marker) = std::env::var_os("VOX_TEST_COMPACT_RELOCATED") {
-            std::fs::write(marker, "table pages relocated before commit")
+            std::fs::write(&marker, "table pages relocated before commit")
                 .map_err(crate::StorageError::from)?;
-            loop { std::thread::park(); }
+            while std::path::Path::new(&marker).exists() {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
         }
         system_table_tree.relocate_tables(&relocation_map)?;
 
