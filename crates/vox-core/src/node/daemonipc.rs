@@ -2229,7 +2229,8 @@ impl DaemonClient {
     /// The updater holds this greeting while it waits for remembered nodes, so a newly
     /// restarted detached daemon with no Ready node cannot retire as idle underneath it.
     pub async fn observe_held(path: &std::path::Path) -> Result<DaemonObservation> {
-        let d = Self::greet(path, None).await?;
+        // An observer may already own restart admission; only ordinary clients wait for it.
+        let d = Self::greet(path, None, false).await?;
         // A restart may signal this process. Bind the Hello pid to the kernel's peer identity,
         // rather than trusting a number supplied in the greeting or in a stale lock file.
         let peer = d
@@ -2267,7 +2268,7 @@ impl DaemonClient {
     /// # Errors
     /// As [`DaemonClient::open`].
     pub async fn open_noting(path: &std::path::Path, waiting: Option<fn()>) -> Result<Self> {
-        let daemon = Self::greet(path, waiting).await?;
+        let daemon = Self::greet(path, waiting, true).await?;
         if daemon.protocol != crate::node::ipc::PROTOCOL_VERSION {
             return Err(Error::Ipc(crate::error::IpcHandshake::Protocol {
                 mine: crate::node::ipc::PROTOCOL_VERSION,
@@ -2282,25 +2283,74 @@ impl DaemonClient {
         })
     }
 
-    async fn greet(path: &std::path::Path, waiting: Option<fn()>) -> Result<DaemonObservation> {
+    async fn greet(
+        path: &std::path::Path,
+        waiting: Option<fn()>,
+        wait_for_restart: bool,
+    ) -> Result<DaemonObservation> {
         use crate::error::IpcHandshake;
         use crate::node::ipc::{connect_own, read_frame, silent, ANSWER_WITHIN, PROTOCOL_VERSION};
-        let greeted = tokio::time::timeout(ANSWER_WITHIN, async {
-            let mut stream = connect_own(path).await?;
-            let hello = read_frame(&mut stream).await?;
-            Ok::<_, Error>((stream, hello))
-        });
-        tokio::pin!(greeted);
-        let (stream, hello) = tokio::select! {
-            out = &mut greeted => out,
-            () = tokio::time::sleep(crate::node::profile::LOCK_PATIENCE), if waiting.is_some() => {
-                if let Some(say) = waiting {
-                    say();
+        let mut unreachable = None;
+        let answer = {
+            let greeted = tokio::time::timeout(ANSWER_WITHIN, async {
+                let mut restart = None;
+                let mut stream = loop {
+                    match connect_own(path).await {
+                        Ok(stream) => break stream,
+                        Err(error @ Error::Ipc(IpcHandshake::Unreachable { .. }))
+                            if wait_for_restart =>
+                        {
+                            // A replacement owns admission before stopping the old daemon. Readers
+                            // wait for its socket too, without starting a competing daemon.
+                            if restart.is_none() {
+                                restart = match std::fs::File::open(
+                                    path.with_file_name("restart-lock"),
+                                ) {
+                                    Ok(file) => Some(file),
+                                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                        return Err(error)
+                                    }
+                                    Err(e) => {
+                                        return Err(Error::Ipc(IpcHandshake::Refused {
+                                            reason: format!("cannot check the daemon restart: {e}"),
+                                        }))
+                                    }
+                                };
+                            }
+                            let Some(file) = restart.as_ref() else {
+                                return Err(error);
+                            };
+                            match file.try_lock_shared() {
+                                Ok(()) => break connect_own(path).await?,
+                                Err(std::fs::TryLockError::WouldBlock) => {}
+                                Err(std::fs::TryLockError::Error(e)) => {
+                                    return Err(Error::Ipc(IpcHandshake::Refused {
+                                        reason: format!("cannot check the daemon restart: {e}"),
+                                    }))
+                                }
+                            }
+                            unreachable = Some(error);
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                };
+                unreachable = None;
+                let hello = read_frame(&mut stream).await?;
+                Ok::<_, Error>((stream, hello))
+            });
+            tokio::pin!(greeted);
+            tokio::select! {
+                out = &mut greeted => out,
+                () = tokio::time::sleep(crate::node::profile::LOCK_PATIENCE), if waiting.is_some() => {
+                    if let Some(say) = waiting {
+                        say();
+                    }
+                    greeted.await
                 }
-                greeted.await
             }
-        }
-        .map_err(|_| silent())??;
+        };
+        let (stream, hello) = answer.map_err(|_| unreachable.unwrap_or_else(silent))??;
         let Some(hello) = hello else {
             return Err(Error::Ipc(IpcHandshake::ClosedBeforeHello));
         };
