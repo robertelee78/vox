@@ -339,13 +339,6 @@ pub fn one_shot(paths: &Paths) -> Result<NodeSocket, AppError> {
 }
 
 /// What a verb says on stderr, once, when the daemon has not greeted it within a second.
-#[cfg(target_os = "macos")]
-pub const DAEMON_WAITING: &str = "vox: waiting: the vox daemon here has not answered yet — it may \
-     be busy (moving or unlocking a node), finishing a daemon restart, or stopped (Ctrl-Z, which goes on once resumed); this \
-     waits up to 10 s for a greeting; a managed restart is followed while its service manager progresses";
-
-/// What a verb says on stderr, once, when the daemon has not greeted it within a second.
-#[cfg(not(target_os = "macos"))]
 pub const DAEMON_WAITING: &str = "vox: waiting: the vox daemon here has not answered yet — it may \
      be busy (moving or unlocking a node), finishing a daemon restart, or stopped (Ctrl-Z, which goes on once resumed); this \
      waits up to 10 s for a greeting";
@@ -382,7 +375,7 @@ pub async fn open(at: &NodeSocket) -> Result<IpcClient, AppError> {
         };
         let previous = *pid;
         manager
-            .wait(&at.path, Some(previous), at.waiting, began)
+            .wait(&at.path, Some(previous), at.waiting.is_some(), began)
             .await?;
         #[cfg(feature = "test-knobs")]
         if let Some(dir) = std::env::var_os("VOX_TEST_HOLD_AFTER_MANAGED_GREETING") {

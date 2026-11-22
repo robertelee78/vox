@@ -1023,7 +1023,7 @@ impl DaemonManager {
         &self,
         socket: &Path,
         previous: Option<u32>,
-        waiting: Option<fn()>,
+        announce: bool,
         began: Instant,
     ) -> Result<(), crate::app::AppError> {
         use crate::app::AppError;
@@ -1083,8 +1083,8 @@ impl DaemonManager {
                 return Err(Self::not_ready(previous, current));
             }
             if !announced && began.elapsed() >= vox_core::node::profile::LOCK_PATIENCE {
-                if let Some(waiting) = waiting {
-                    waiting();
+                if announce {
+                    eprintln!("vox: waiting for the login item to replace the daemon");
                 }
                 announced = true;
             }
@@ -1128,6 +1128,14 @@ pub(crate) fn managed_daemon(pid: u32) -> Option<DaemonManager> {
 pub(crate) async fn pending_login_item(
     account: &Account,
 ) -> Result<Option<DaemonManager>, crate::app::AppError> {
+    #[cfg(feature = "test-knobs")]
+    if let Some(path) = std::env::var_os("VOX_TEST_LOGIN_ITEM_CHECK_HOLD") {
+        let path = std::path::PathBuf::from(path);
+        std::fs::write(path.with_extension("entered"), b"checking login item")?;
+        while path.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
     let target = format!("gui/{}/{LOGIN_ITEM}", rustix::process::getuid().as_raw());
     let out = tokio::process::Command::new("/bin/launchctl")
         .args(["print", &target])
@@ -1197,9 +1205,7 @@ pub(crate) async fn pending_login_item(
     if !section.is_empty() || !value_for.is_empty() || environments != 3 || !saw_arguments {
         return Ok(None);
     }
-    let data = argument_data.or(data);
-    let config = argument_config.or(config);
-    let home = if data.is_none() || config.is_none() {
+    let home = if argument_data.or(data).is_none() || argument_config.or(config).is_none() {
         job_home.map(std::path::PathBuf::from).or_else(|| {
             nix::unistd::User::from_uid(nix::unistd::Uid::current())
                 .ok()
@@ -1209,26 +1215,25 @@ pub(crate) async fn pending_login_item(
     } else {
         None
     };
-    let default = |xdg: Option<&str>| {
-        xdg.filter(|value| !value.is_empty())
-            .map(|value| std::path::PathBuf::from(value).join("vox"))
-            .or_else(|| {
-                home.as_ref()
-                    .map(|p| p.join("Library/Application Support/vox"))
-            })
+    let resolved = vox_core::node::paths::roots_with(
+        argument_data.map(Path::new),
+        argument_config.map(Path::new),
+        |name| match name {
+            "VOX_DATA_DIR" => data.map(Into::into),
+            "VOX_CONFIG_DIR" => config.map(Into::into),
+            "XDG_DATA_HOME" => xdg_data.map(Into::into),
+            "XDG_CONFIG_HOME" => xdg_config.map(Into::into),
+            "HOME" => home.as_ref().map(|path| path.as_os_str().to_owned()),
+            _ => None,
+        },
+    );
+    let Ok((data, config)) = resolved else {
+        return Ok(None);
     };
-    let data = data
-        .map(std::path::PathBuf::from)
-        .or_else(|| default(xdg_data));
-    let config = config
-        .map(std::path::PathBuf::from)
-        .or_else(|| default(xdg_config));
-    if !data
-        .as_ref()
-        .is_some_and(|p| p.is_absolute() && *p == account.data_root)
-        || !config
-            .as_ref()
-            .is_some_and(|p| p.is_absolute() && *p == account.config_dir)
+    if !data.is_absolute()
+        || data != account.data_root
+        || !config.is_absolute()
+        || config != account.config_dir
     {
         return Ok(None);
     }

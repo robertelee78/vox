@@ -229,6 +229,15 @@ login item has a spawn pending, rather than race it with a client daemon.
 Hooks do not take the managed command wait: their node clients retain the original
 greeting/refusal path, and a pending managed spawn gives the existing bounded `Starting`
 answer inside the hook's existing 500ms startup patience.
+The managed wait names the login item's replacement without quoting the unrelated ten-second
+greeting bound. If a hook's login-item check itself exceeds that patience, it says the check did
+not finish and no daemon was started, rather than promising a restart.
+The guest `--restart-vm` route accepts `VOX_PROOF_SHIPPED_DEFAULTS=1` with
+`VOX_PROOF_PENDING_START=1`: the shipped job has only its helper path adapted, and uses the guest
+user's default roots. The act preserves and restores any prior guest root. `VOX_PROOF_SLOW_HOOK_CHECK=1`
+holds only the check (`test-knobs`) with no loaded job and checks the real hook's truthful answer;
+`VOX_PROOF_ROOT_PRECEDENCE=1` also creates and lists distinct nodes through XDG, environment and
+explicit root precedence. Product and manager root resolution share `vox-core::node::paths::roots_with`.
 The managed-client wait is built and proven for the macOS login item only. Linux keeps its
 existing immediate stopping refusal; there is no new systemd progress observer. Vox ships no
 user unit. The existing disposable Linux proof supplies `Restart=on-failure`, `RestartSec=1`.

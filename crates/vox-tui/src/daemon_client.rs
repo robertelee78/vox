@@ -95,14 +95,7 @@ pub async fn ensure_daemon(
             "the login item did not answer the daemon startup check within 10 s; no daemon was started. Check Keep Running in Vox.app and the daemon log, then retry.".into(),
         ))??;
         if let Some(manager) = manager {
-            manager
-                .wait(
-                    &socket,
-                    None,
-                    Some(crate::client::say_daemon_waiting),
-                    began,
-                )
-                .await?;
+            manager.wait(&socket, None, true, began).await?;
             return Ok(Daemon::Running);
         }
     }
@@ -168,9 +161,13 @@ pub async fn ensure_daemon_for_hook(
             tokio::time::timeout(HOOK_WITHIN.saturating_sub(began.elapsed()), check).await;
         match manager {
             Ok(Ok(None)) => {}
-            Ok(Ok(Some(_))) | Err(_) => {
+            Ok(Ok(Some(_))) => {
                 eprintln!("vox: waiting for the daemon restart");
                 return Ok(HookDaemon::Starting);
+            }
+            Err(_) => {
+                eprintln!("vox: the login-item startup check did not finish; no daemon was started; retry on the next turn");
+                return Ok(HookDaemon::Unanswered);
             }
             Ok(Err(e)) => return Err(e),
         }
