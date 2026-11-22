@@ -245,7 +245,8 @@ impl ChannelState {
                 }
                 let mut owed = Vec::new();
                 if state.pending {
-                    let (positions, next) = read.missing_page(state.cursor, 64)?;
+                    let (positions, next) =
+                        read.missing_page(state.cursor, entry_store::DUE_ENTRIES)?;
                     let mut through = false;
                     for (author, seq) in positions {
                         if state.through.is_some_and(|end| (author, seq) > end) {
@@ -288,7 +289,8 @@ impl ChannelState {
                 }
             }
             Step::Prune => {
-                let (selected, _) = read.retention_due(now_ms, retention.0, retention.1, 64)?;
+                let (selected, _) =
+                    read.retention_due(now_ms, retention.0, retention.1, entry_store::DUE_ENTRIES)?;
                 let mut due = Vec::new();
                 let mut bytes = 0usize;
                 for (hash, tracked) in selected {
@@ -297,7 +299,9 @@ impl ChannelState {
                         .get_by_hash(&read, &hash)?
                         .ok_or(Error::MalformedAtRest("pruned entry missing"))?;
                     let size = entry.payload.as_ref().map_or(0, Vec::len);
-                    if !due.is_empty() && bytes.saturating_add(size) > 1024 * 1024 {
+                    if !due.is_empty()
+                        && bytes.saturating_add(size) > entry_store::DUE_PAYLOAD_BYTES
+                    {
                         break;
                     }
                     bytes = bytes.saturating_add(size);
@@ -613,6 +617,19 @@ impl ChannelState {
 impl PendingRetention {
     /// Only the native owned worker calls this. No actor, room or Computer state lock is held.
     pub(crate) fn save(mut self, store: &Store) -> CompletedRetention {
+        #[cfg(feature = "test-knobs")]
+        if matches!(&self.work, Work::Prune { due, .. } if !due.is_empty()) {
+            if let Some(path) = std::env::var_os("VOX_TEST_HOLD_EXPIRY_PRUNE_FILE") {
+                let path = std::path::PathBuf::from(path);
+                if path.exists() {
+                    let _ =
+                        std::fs::write(path.with_extension("engaged"), b"expiry prune admitted");
+                    while path.exists() {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                }
+            }
+        }
         let mut committed = false;
         let mut body_changes = 0;
         let mut display_changed = false;
@@ -669,7 +686,7 @@ impl PendingRetention {
                         index.set_owed(*hash, *visibility)?;
                         changed = true;
                     }
-                    for _ in 0..64 {
+                    for _ in 0..entry_store::DUE_ENTRIES {
                         let Some(hash) = index.first_expired_owed(self.now)? else {
                             break;
                         };

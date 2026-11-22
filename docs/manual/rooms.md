@@ -134,8 +134,10 @@ what arrived after it, including late messages from members who were offline. `-
 gives what was done to the room, such as a rename or a retention change.
 
 A newly created room builds its first saved-history projection before it is shown as readable.
-Later projection or expiry work can still answer `the room is refreshing saved history; retry`;
-that answer does not mean the node is downloading the room's whole history.
+Later projection work or an expiry backlog larger than one sweep can still answer
+`the room is refreshing saved history; retry`; that answer does not mean the node is downloading
+the room's whole history. Within one sweep, reads exclude expired messages and report exact
+pages and totals without waiting for physical deletion.
 
 A row that reads `(not received yet)` is a message whose text your node is still waiting for. See
 [a message says not received yet](troubleshooting.md#a-message-says-not-received-yet).

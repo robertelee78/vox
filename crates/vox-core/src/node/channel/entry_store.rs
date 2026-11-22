@@ -65,6 +65,7 @@ use restart::RestartState;
 pub(crate) mod session_tree;
 pub use dag_facts::OrderView;
 pub(crate) use render_facts::{Filter, RenderFact, RenderView};
+pub(crate) use retention_facts::{DUE_ENTRIES, DUE_PAYLOAD_BYTES};
 
 fn flag(d: &mut Decoder<'_>) -> Result<bool> {
     match d.uint()? {

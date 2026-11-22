@@ -167,6 +167,11 @@ fn daemon_on(dir: &Path, tag: &str, stdin_lines: &str, listen: &str) -> Daemon {
         .env("VOX_CONFIG_DIR", dir.join("cfg"))
         .env("VOX_TEST_KEYCHAIN", attach::keychain(dir))
         .env("VOX_PROXY", "127.0.0.1:0")
+        .env(
+            "VOX_TEST_EXPIRY_MUTANT",
+            std::env::var("VOX_MUTANT_EXPIRY").unwrap_or_default(),
+        )
+        .env("VOX_TEST_HOLD_EXPIRY_PRUNE_FILE", dir.join("hold-expiry"))
         .env_remove("VOX_ROOM")
         .env_remove("VOX_NODE")
         .env_remove("VOX_SESSION")
@@ -950,6 +955,523 @@ fn a_member_who_joins_after_messages_expired_catches_up() {
     );
 }
 
+/// Reads remain usable while ordinary messages expire in a room that is still receiving posts.
+/// Every command is the shipped binary; the one-second lifetime is an ordinary admin choice.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "real binary, one-second message lifetime and continuing posts; run in release"]
+fn a_room_stays_readable_while_messages_keep_expiring() {
+    watchdog::arm();
+    let scratch = tempfile::tempdir().expect("APPARATUS: expiry profile");
+    let dir = scratch.path();
+    std::fs::create_dir_all(dir.join("cfg")).expect("APPARATUS: expiry config");
+    let (ok, _, err) = vox(dir, &["id"], None);
+    assert!(ok, "PRODUCT (staging): identity refused: {err}");
+    let _daemon = daemon(dir, "expiry", &format!("{IDENTITY}\n"));
+    attached(dir, "expiry");
+    let (ok, _, err) = vox(
+        dir,
+        &[
+            "room",
+            "create",
+            "--name",
+            "expiry",
+            "--passphrase-file",
+            "-",
+        ],
+        Some(&format!("{ROOMPASS}\n")),
+    );
+    assert!(ok, "PRODUCT (staging): create refused: {err}");
+    let (ok, _, err) = vox(
+        dir,
+        &["room", "read", "expiry", "--json", "--limit", "25"],
+        None,
+    );
+    assert!(
+        ok,
+        "PRODUCT (staging): read before the lifetime change refused: {err}"
+    );
+    let (ok, out, err) = vox(dir, &["room", "retention", "expiry", "1"], None);
+    println!("[proof] one-second message policy: ok={ok} stdout={out:?} stderr={err:?}");
+    assert!(
+        ok,
+        "PRODUCT (staging): one-second lifetime refused: {out}{err}"
+    );
+    // Settle the empty room's policy first: this arm measures ordinary expiry, not a policy
+    // rebuild or a backlog larger than one sweep. Only 48 small messages are ever posted.
+    let mut settled = false;
+    for _ in 0..512 {
+        let (ok, out, err) = vox(
+            dir,
+            &["room", "read", "expiry", "--json", "--limit", "25"],
+            None,
+        );
+        if ok {
+            assert!(
+                out.is_empty(),
+                "APPARATUS: empty expiry room already had rows: {out}"
+            );
+            settled = true;
+            break;
+        }
+        assert!(
+            err.contains("the room is refreshing saved history; retry"),
+            "PRODUCT (staging): empty policy did not settle: {err}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(settled, "APPARATUS: empty room policy never settled");
+    let mut primed = 0;
+    for i in 0..12 {
+        post(dir, "expiry", &format!("expiry-before-{i}"));
+        primed += 1;
+    }
+    println!("[proof] policy settled; {primed} initial messages accepted; no old-room backlog");
+
+    let began = Instant::now();
+    let mut readings = Vec::new();
+    std::thread::scope(|scope| {
+        let writer = scope.spawn(|| {
+            let started = Instant::now();
+            let mut accepted = 0;
+            for i in 0..36 {
+                post(dir, "expiry", &format!("expiry-active-{i}"));
+                accepted += 1;
+                std::thread::sleep(Duration::from_millis(40));
+            }
+            (accepted, started.elapsed())
+        });
+        loop {
+            let before = began.elapsed();
+            let at_ms = now_ms();
+            let (ok, out, err) = vox(
+                dir,
+                &["room", "read", "expiry", "--json", "--limit", "25"],
+                None,
+            );
+            let after = began.elapsed();
+            println!(
+                "[proof] expiry read {}: at={before:?} answered={after:?} ok={ok} stderr={err:?}",
+                readings.len()
+            );
+            readings.push((ok, before, after, out, err, at_ms));
+            if writer.is_finished() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let (accepted, span) = writer
+            .join()
+            .expect("PRODUCT: posting stopped while messages expired");
+        println!("[proof] continuing writer: {accepted} posts accepted in {span:?}; rate={} posts/s; total accepted={}", f64::from(accepted) / span.as_secs_f64(), primed + accepted);
+    });
+    let mut recovered = false;
+    for _ in 0..512 {
+        let before = began.elapsed();
+        let at_ms = now_ms();
+        let (ok, out, err) = vox(
+            dir,
+            &["room", "read", "expiry", "--json", "--limit", "25"],
+            None,
+        );
+        let after = began.elapsed();
+        println!(
+            "[proof] expiry tail read {}: at={before:?} answered={after:?} ok={ok} stderr={err:?}",
+            readings.len()
+        );
+        readings.push((ok, before, after, out, err, at_ms));
+        if ok {
+            recovered = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let mut refusing_since = None;
+    let mut longest = Duration::ZERO;
+    for (ok, _, answered, ..) in &readings {
+        if *ok {
+            if let Some(first) = refusing_since.take() {
+                longest = longest.max(answered.saturating_sub(first));
+            }
+        } else if refusing_since.is_none() {
+            refusing_since = Some(*answered);
+        }
+    }
+    println!("[proof] longest observed refusal-to-answered-read interval={longest:?}; recovered={recovered}");
+    let refused: Vec<_> = readings.iter().filter(|(ok, ..)| !ok).collect();
+    if let Some(first) = refused.first() {
+        let answered = readings
+            .iter()
+            .find(|(ok, before, ..)| *ok && *before >= first.2);
+        println!(
+            "[proof] expiry observations: {} reads, {} refused; first refusal answered at {:?}; first later answered read {:?}; refusal-to-answer {:?}",
+            readings.len(), refused.len(), first.2,
+            answered.map(|row| row.2),
+            answered.map(|row| row.2.saturating_sub(first.2))
+        );
+    } else {
+        println!(
+            "[proof] expiry observations: {} reads, none refused",
+            readings.len()
+        );
+    }
+    if std::env::var_os("VOX_MUTANT_EXPIRY").is_some() {
+        let log = std::fs::read_to_string(dir.join("daemon-expiry.err")).unwrap();
+        for line in log
+            .lines()
+            .filter(|line| line.contains("test-knobs: expiry"))
+        {
+            println!("[daemon] {line}");
+        }
+        assert!(
+            log.contains("test-knobs: expiry"),
+            "APPARATUS: expiry mutant never engaged"
+        );
+    }
+    assert!(
+        recovered && refused.is_empty(),
+        "PRODUCT: reads were refused while messages kept expiring: {refused:?}"
+    );
+    assert!(
+        readings
+            .iter()
+            .all(|(_, _, _, out, _, at_ms)| out.lines().all(|line| {
+                serde_json::from_str::<serde_json::Value>(line).is_ok_and(|row| {
+                    row["created_millis"]
+                        .as_u64()
+                        .is_some_and(|created| created.saturating_add(1_000) > *at_ms)
+                })
+            })),
+        "PRODUCT: an answered expiry read contained invalid JSON or an already expired message"
+    );
+
+    // Quiesce, then hold one already-admitted prune on its native owner. The saved
+    // projection still contains the three known bodies, so a skip-only count cannot pass.
+    let mut empty = false;
+    for _ in 0..512 {
+        let (ok, out, err) = vox(
+            dir,
+            &["room", "read", "expiry", "--json", "--limit", "128"],
+            None,
+        );
+        assert!(ok, "PRODUCT: expiry quiescence refused: {err}");
+        if out.is_empty() {
+            empty = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(empty, "APPARATUS: continuing messages did not all expire");
+    use vox_core::node::ipc::{Frame, IpcClient, NodeSocket, Request};
+    use vox_core::node::paths::{NodeName, Paths};
+    let paths = Paths::resolve("default", Some(dir), Some(&dir.join("cfg"))).unwrap();
+    let socket = NodeSocket::one_shot(
+        paths.account().socket(),
+        NodeName::parse("default").unwrap(),
+    );
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut client = rt
+        .block_on(IpcClient::open_at(&socket))
+        .expect("APPARATUS: expiry IPC");
+    let mut request = |request: Request| {
+        rt.block_on(client.request(&request))
+            .expect("APPARATUS: expiry reply")
+    };
+    let Frame::Rooms { rooms } = request(Request::Rooms { after: None }) else {
+        panic!("APPARATUS: expiry room listing")
+    };
+    let cid = rooms
+        .iter()
+        .find(|(_, label, ..)| label == "expiry")
+        .unwrap()
+        .0;
+    post(dir, "expiry", "expiry-thread-root");
+    let Frame::RoomPage { rows, .. } = request(Request::RoomPage {
+        channel_id: cid,
+        before: None,
+        limit: 128,
+    }) else {
+        panic!("PRODUCT: initial expiry page refused")
+    };
+    let root = rows
+        .iter()
+        .find(|row| row.text == "expiry-thread-root")
+        .expect("PRODUCT: posted root absent")
+        .entry_hash;
+    for n in 0..2 {
+        let body = serde_json::json!({"v":1,"type":"say","hops":8,"body":format!("expiry-reply-{n}"),"thread":vox_core::node::link::b32_encode(&root)}).to_string();
+        post(dir, "expiry", &body);
+    }
+    let initial_count = request(Request::Count {
+        channel_id: cid,
+        since: None,
+    });
+    assert!(
+        matches!(initial_count, Frame::Count { n: 3, .. }),
+        "PRODUCT: three acknowledged posts did not count as three: {initial_count:?}"
+    );
+    let Frame::RoomPage {
+        rows: known,
+        older: 0,
+        ..
+    } = request(Request::RoomPage {
+        channel_id: cid,
+        before: None,
+        limit: 128,
+    })
+    else {
+        panic!("PRODUCT: bookkeeping page refused")
+    };
+    assert_eq!(
+        known.len(),
+        3,
+        "PRODUCT: expiry bookkeeping omitted an acknowledged post"
+    );
+    let last_expiry = known
+        .iter()
+        .map(|row| row.created_millis.saturating_add(1_000))
+        .max()
+        .unwrap();
+    std::fs::write(dir.join("hold-expiry"), b"hold one native prune").unwrap();
+    for _ in 0..512 {
+        if dir.join("hold-expiry.engaged").exists() && now_ms() >= last_expiry {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        dir.join("hold-expiry.engaged").exists(),
+        "APPARATUS: native prune hold never engaged"
+    );
+    assert!(
+        now_ms() >= last_expiry,
+        "APPARATUS: known bodies not due yet"
+    );
+    let counted = request(Request::Count {
+        channel_id: cid,
+        since: None,
+    });
+    println!("[proof] three acknowledged bodies all due before physical prune: {counted:?}");
+    assert!(
+        matches!(counted, Frame::Count { n: 0, last: None }),
+        "PRODUCT: due bodies still count before pruning: {counted:?}"
+    );
+    let page = request(Request::RoomPage {
+        channel_id: cid,
+        before: None,
+        limit: 1,
+    });
+    assert!(
+        matches!(&page, Frame::RoomPage { rows, older: 0, .. } if rows.is_empty()),
+        "PRODUCT: exact expired page/totals wrong: {page:?}"
+    );
+    let summary = request(Request::ThreadSummary {
+        channel_id: cid,
+        root,
+        after_author: None,
+    });
+    assert!(
+        matches!(&summary, Frame::ThreadSummary { reply_count: 0, last_reply_millis: 0, authors, next_author: None } if authors.is_empty()),
+        "PRODUCT: expired thread summary wrong: {summary:?}"
+    );
+    let thread = request(Request::ThreadPage {
+        channel_id: cid,
+        root,
+        before: None,
+        after: None,
+    });
+    assert!(
+        matches!(&thread, Frame::ThreadPage { rows, before: None, after: None } if rows.is_empty()),
+        "PRODUCT: expired thread page wrong: {thread:?}"
+    );
+    std::fs::remove_file(dir.join("hold-expiry")).unwrap();
+    assert!(
+        read(dir, "expiry").is_empty(),
+        "PRODUCT: quiesced read differs from the bounded due-set read"
+    );
+
+    // Stop with a policy whose old bodies will all expire while the daemon is down.
+    // Reopening may prune one quantum, but cannot erase this larger backlog in one turn.
+    let (ok, _, err) = vox(dir, &["room", "retention", "expiry", "0"], None);
+    assert!(ok, "PRODUCT (staging): restore forever lifetime: {err}");
+    for _ in 0..512 {
+        if vox(dir, &["room", "read", "expiry"], None).0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    for n in 0..512 {
+        post(dir, "expiry", &format!("expiry-backlog-{n}"));
+    }
+    let (ok, _, err) = vox(dir, &["room", "retention", "expiry", "1"], None);
+    assert!(ok, "PRODUCT (staging): backlog lifetime refused: {err}");
+    drop(client);
+    drop(_daemon);
+    std::thread::sleep(Duration::from_millis(1_100));
+    let _reopened = daemon(dir, "expiry-backlog", &format!("{IDENTITY}\n{ROOMPASS}\n"));
+    attached(dir, "expiry-backlog");
+    let mut listed = false;
+    for _ in 0..512 {
+        let (ok, out, _) = vox(dir, &["room", "list"], None);
+        if ok
+            && out
+                .lines()
+                .any(|line| line.split_whitespace().nth(1) == Some("expiry"))
+        {
+            listed = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        listed,
+        "APPARATUS: restarted daemon never listed the backlog room"
+    );
+    let (ok, out, err) = vox(dir, &["room", "read", "expiry", "--json"], None);
+    println!("[proof] stopped-daemon backlog first read: ok={ok} stdout={out:?} stderr={err:?}");
+    assert!(
+        !ok && err.contains("the room is refreshing saved history; retry"),
+        "PRODUCT: a backlog beyond one sweep must retain today's refusal: {out}{err}"
+    );
+    let mut caught_up = false;
+    for _ in 0..512 {
+        let (ok, out, err) = vox(dir, &["room", "read", "expiry", "--json"], None);
+        if ok {
+            assert!(
+                out.is_empty(),
+                "PRODUCT: backlog read showed expired text: {out}"
+            );
+            caught_up = true;
+            break;
+        }
+        assert!(
+            err.contains("the room is refreshing saved history; retry"),
+            "PRODUCT: backlog changed its refusal: {err}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        caught_up,
+        "PRODUCT: stopped-daemon expiry backlog never became readable"
+    );
+}
+
+/// The hook's continuation API must skip one native sweep of already-expired bodies.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "real binary, production one-second expiry and a test-knobs native prune hold; release"]
+fn a_hook_continuation_read_skips_expired_messages() {
+    watchdog::arm();
+    use vox_core::node::ipc::{Frame, IpcClient, NodeSocket, Request};
+    use vox_core::node::paths::{NodeName, Paths};
+    let scratch = tempfile::tempdir().expect("APPARATUS: hook expiry profile");
+    let dir = scratch.path();
+    std::fs::create_dir_all(dir.join("cfg")).unwrap();
+    let (ok, _, err) = vox(dir, &["id"], None);
+    assert!(ok, "PRODUCT (staging): hook expiry identity: {err}");
+    let _daemon = daemon(dir, "hook-expiry", &format!("{IDENTITY}\n"));
+    attached(dir, "hook-expiry");
+    let (ok, _, err) = vox(
+        dir,
+        &[
+            "room",
+            "create",
+            "--name",
+            "hook-expiry",
+            "--passphrase-file",
+            "-",
+        ],
+        Some(&format!("{ROOMPASS}\n")),
+    );
+    assert!(ok, "PRODUCT (staging): hook expiry room: {err}");
+    let (ok, _, err) = vox(dir, &["room", "retention", "hook-expiry", "1"], None);
+    assert!(ok, "PRODUCT (staging): hook expiry lifetime: {err}");
+    let mut settled = false;
+    for _ in 0..512 {
+        let (ok, out, err) = vox(dir, &["room", "read", "hook-expiry", "--json"], None);
+        if ok {
+            assert!(out.is_empty(), "APPARATUS: hook scene not empty");
+            settled = true;
+            break;
+        }
+        assert!(
+            err.contains("the room is refreshing saved history; retry"),
+            "PRODUCT (staging): hook policy did not settle: {err}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(settled, "APPARATUS: empty hook policy never settled");
+    let paths = Paths::resolve("default", Some(dir), Some(&dir.join("cfg"))).unwrap();
+    let socket = NodeSocket::one_shot(
+        paths.account().socket(),
+        NodeName::parse("default").unwrap(),
+    );
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut client = rt.block_on(IpcClient::open_at(&socket)).unwrap();
+    let Frame::Rooms { rooms } = rt
+        .block_on(client.request(&Request::Rooms { after: None }))
+        .unwrap()
+    else {
+        panic!("APPARATUS: hook room listing")
+    };
+    let cid = rooms
+        .iter()
+        .find(|(_, label, ..)| label == "hook-expiry")
+        .unwrap()
+        .0;
+    post(dir, "hook-expiry", "HOOK-BODY-MUST-EXPIRE");
+    let query = Request::Read {
+        channel_id: cid,
+        since: None,
+        after: None,
+        limit: 25,
+    };
+    let Frame::Rows { rows } = rt.block_on(client.request(&query)).unwrap() else {
+        panic!("PRODUCT: live hook body could not be read")
+    };
+    assert_eq!(rows.len(), 1, "PRODUCT: posted hook body absent");
+    let expiry = rows[0].created_millis.saturating_add(1_000);
+    std::fs::write(dir.join("hold-expiry"), b"hold native expiry").unwrap();
+    for _ in 0..512 {
+        if dir.join("hold-expiry.engaged").exists() && now_ms() >= expiry {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        dir.join("hold-expiry.engaged").exists() && now_ms() >= expiry,
+        "APPARATUS: hook body never became due on its held native owner"
+    );
+    let reply = rt
+        .block_on(client.request(&query))
+        .expect("APPARATUS: held expiry reply");
+    println!("[proof] hook Request::Read across one held expiry: {reply:?}");
+    if std::env::var_os("VOX_MUTANT_EXPIRY").is_some() {
+        let log = std::fs::read_to_string(dir.join("daemon-hook-expiry.err")).unwrap();
+        for line in log
+            .lines()
+            .filter(|line| line.contains("test-knobs: expiry"))
+        {
+            println!("[daemon] {line}");
+        }
+        assert!(
+            log.contains("test-knobs: expiry"),
+            "APPARATUS: hook expiry mutant never engaged"
+        );
+    }
+    assert!(
+        matches!(&reply, Frame::Rows { rows } if rows.is_empty()),
+        "PRODUCT: the hook continuation read refused or showed an expired body: {reply:?}"
+    );
+    std::fs::remove_file(dir.join("hold-expiry")).unwrap();
+}
+
 #[path = "support/optional_proof.rs"]
 mod optional_proof;
 optional_proof::not_run!(
@@ -958,6 +1480,8 @@ optional_proof::not_run!(
     a_session_change_rewrites_only_that_session,
     an_existing_session_index_keeps_its_listing_when_upgraded,
     private_session_steps_store_one_body_and_reopen_after_rotation,
+    a_room_stays_readable_while_messages_keep_expiring,
+    a_hook_continuation_read_skips_expired_messages,
 );
 
 #[cfg(feature = "optional-proofs")]
