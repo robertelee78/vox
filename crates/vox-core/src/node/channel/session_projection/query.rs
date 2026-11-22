@@ -54,7 +54,7 @@ fn opening_fingerprint(read: &Read<'_>, author: &Digest32) -> Result<Option<Dige
 pub(crate) struct Revision {
     incarnation: Arc<std::sync::atomic::AtomicU64>,
     /// The inputs the published fold was built from; `None` before any fold has published.
-    published: Option<(u64, u64)>,
+    published: Option<(u64, u64, u64)>,
     /// The known and the refreshing drive authors, as one hash ([`drive_basis`]).
     drive: Digest32,
     member: Option<Digest32>,
@@ -332,6 +332,44 @@ fn next(
     open_only: bool,
     retired_remaining: &mut usize,
 ) -> Answer<Option<(u64, Descriptor)>> {
+    if read.header.locality {
+        let mut cursor = if after == 0 {
+            None
+        } else {
+            Some(descriptor(read, after)?.position.key())
+        };
+        loop {
+            let mut candidate = None;
+            for author in authors {
+                let root = read
+                    .find(
+                        if open_only {
+                            Tree::ChronOpenSessions
+                        } else {
+                            Tree::ChronOpenings
+                        },
+                        &hash_key(author),
+                    )?
+                    .unwrap_or(0);
+                if let Some((position, id)) = read.nested_next(root, cursor)? {
+                    if candidate.is_none_or(|(old, _)| position < old) {
+                        candidate = Some((position, id));
+                    }
+                }
+            }
+            let Some((position, id)) = candidate else {
+                return Ok(None);
+            };
+            if let Some(row) = live_descriptor(read, id)? {
+                return Ok(Some((id, row)));
+            }
+            *retired_remaining = retired_remaining.saturating_sub(1);
+            if *retired_remaining == 0 {
+                return Err(Failure::Request(REFRESHING));
+            }
+            cursor = Some(position);
+        }
+    }
     loop {
         let mut next = None;
         // Choose the minimum using only locators. Metadata/body validation belongs to that
@@ -450,6 +488,7 @@ impl ChannelState {
         // Completing bounded repair changes what the next query can return even
         // without another incoming row. Publish that transition to every client.
         if let Some(read) = &read {
+            h.update(read.header.publication.to_be_bytes());
             h.update([u8::from(read.header.activity.ready)]);
             h.update(read.header.activity.applied.to_be_bytes());
             h.update(read.header.activity.invalidated.to_be_bytes());
@@ -591,7 +630,17 @@ impl ChannelState {
         let read = Read::existing(view.snapshot(), &self.sek, &self.channel_id)?
             .map(|read| read.with_sources(self, view, now));
         let public = view.session_revision();
-        let published = read.as_ref().and_then(|read| read.header.published);
+        let published = read.as_ref().and_then(|read| {
+            read.header
+                .published
+                .map(|(public, private)| (public, private, read.header.publication))
+        });
+        let dirty = read
+            .as_ref()
+            .map(|read| read.next(Tree::MetadataDirty, None))
+            .transpose()?
+            .flatten()
+            .is_some();
         // The published fold is the answer. It is provisional while the fold is behind
         // the room's inputs or has never published, and while a saved-Session upgrade,
         // restore, import or pending render runs: rows may still be added. What was
@@ -601,7 +650,8 @@ impl ChannelState {
         let provisional = read.as_ref().is_none_or(|read| {
             !read.header.ready
                 || read.header.published != Some((public, read.header.private_generation))
-        }) || self.needs_session_upgrade();
+        }) || dirty
+            || self.needs_session_upgrade();
         if matches!(&query, Query::SelectionRevision) {
             let mut hash = Sha256::new();
             hash.update(b"vox/session-selection/v1");
@@ -614,9 +664,10 @@ impl ChannelState {
             );
             hash.update(self.legacy_sessions.display_revision().to_be_bytes());
             hash.update([u8::from(published.is_some())]);
-            if let Some((public, private)) = published {
+            if let Some((public, private, publication)) = published {
                 hash.update(public.to_be_bytes());
                 hash.update(private.to_be_bytes());
+                hash.update(publication.to_be_bytes());
             }
             hash.update(drive_basis(&authors, &refreshing));
             hash.update([u8::from(read.as_ref().is_some_and(|r| r.header.ready))]);

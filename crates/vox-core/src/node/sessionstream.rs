@@ -10,7 +10,7 @@ use quinn::{RecvStream, SendStream};
 
 use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
-use crate::group::message::GroupMessage;
+use crate::group::message::{GroupMessage, PrivateMessage};
 use crate::hash::{sha256, Digest32, COMPOSITE_SIG_LEN};
 use crate::identity::composite::{CompositePublicKey, CompositeSignature, RootSigner};
 use crate::log::entry::Entry;
@@ -20,6 +20,7 @@ use crate::transport::quic::VoxConnection;
 use crate::transport::streams::{open_typed, StreamKind};
 
 const DOMAIN: &[u8] = b"vox/private-session/v1";
+const COMPACT_DOMAIN: &[u8] = b"vox/private-session/v3";
 pub(crate) const MAX_RECORD: usize = 96 * 1024;
 pub(crate) const PAGE_RECORDS: usize = 32;
 pub(crate) const MAX_PAGE: usize = 1024 * 1024;
@@ -34,7 +35,7 @@ pub(crate) const CURRENT_PAGE_ENVELOPE: usize = 2 * PAGE_ENVELOPE;
 
 pub(crate) struct Record {
     pub room: Digest32,
-    pub message: GroupMessage,
+    pub message: PrivateMessage,
     proof: Proof,
 }
 
@@ -45,15 +46,20 @@ enum Proof {
 }
 
 impl Record {
-    fn signing_input(room: &Digest32, message: &GroupMessage) -> Vec<u8> {
+    fn signing_input(room: &Digest32, message: &PrivateMessage) -> Vec<u8> {
         let mut e = Encoder::new();
-        e.array(2).bytes(room).bytes(&message.to_wire());
-        let mut bytes = DOMAIN.to_vec();
+        e.array(2).bytes(room).bytes(&message.wire());
+        let mut bytes = if message.is_compact() {
+            COMPACT_DOMAIN
+        } else {
+            DOMAIN
+        }
+        .to_vec();
         bytes.extend(e.finish());
         bytes
     }
 
-    pub fn new(signer: &dyn RootSigner, room: Digest32, message: GroupMessage) -> Result<Self> {
+    pub fn new(signer: &dyn RootSigner, room: Digest32, message: PrivateMessage) -> Result<Self> {
         if message.header.author_id != signer.fingerprint()
             || message.header.channel_id != crate::node::drive::drive_channel(&room)
         {
@@ -76,7 +82,7 @@ impl Record {
         )?;
         Ok(Self {
             room: entry.skeleton.channel_id,
-            message,
+            message: PrivateMessage::from_group(message),
             proof: Proof::Legacy(Box::new(entry)),
         })
     }
@@ -86,9 +92,9 @@ impl Record {
         match &self.proof {
             Proof::Private(signature) => {
                 e.array(4)
-                    .uint(1)
+                    .uint(if self.message.is_compact() { 3 } else { 1 })
                     .bytes(&self.room)
-                    .bytes(&self.message.to_wire())
+                    .bytes(&self.message.wire())
                     .bytes(&signature.to_bytes());
             }
             Proof::Legacy(entry) => {
@@ -106,7 +112,20 @@ impl Record {
         let record = match (d.array()?, d.uint()?) {
             (4, 1) => {
                 let room = digest(&mut d)?;
-                let message = GroupMessage::from_wire(d.bytes()?)?;
+                let message = PrivateMessage::from_group(GroupMessage::from_wire(d.bytes()?)?);
+                let signature: [u8; COMPOSITE_SIG_LEN] = d
+                    .bytes()?
+                    .try_into()
+                    .map_err(|_| Error::InvalidSignatureEncoding)?;
+                Self {
+                    room,
+                    message,
+                    proof: Proof::Private(Box::new(CompositeSignature::from_bytes(&signature)?)),
+                }
+            }
+            (4, 3) => {
+                let room = digest(&mut d)?;
+                let message = PrivateMessage::read_compact(d.bytes()?)?;
                 let signature: [u8; COMPOSITE_SIG_LEN] = d
                     .bytes()?
                     .try_into()
