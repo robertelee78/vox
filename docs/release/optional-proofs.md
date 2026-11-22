@@ -139,6 +139,20 @@ This route requires the existing stopped `vox-app-proofs` guest, snapshots suppl
 does not resize it, and leaves it stopped. It stages a private node, requires a launchd-owned
 replacement before any healing client, checks `vox status`, and sends public control Stop.
 
+The same prebuilt runner's `--restart-vm` route kills a real `vox daemon --restart` caller
+while its old node's stop is held by a file. It requires one launchd replacement before any
+healing client, the daemon's own clean SIGTERM-stop words, and a successful status on that PID:
+
+```sh
+python3 scripts/app-proofs-vm.py --restart-vm /absolute/prebuilt/vox \
+  apps/macos/Bundle/LaunchAgents/us.vox.daemon.plist /absolute/receipt-directory
+```
+
+Build with `test-knobs` for the hold. It uses the same scratch bindings and always boots out
+the owned job and stops the guest. A login-item restart is one `launchctl kickstart -k`;
+the shipped job gives its daemon 35 seconds to finish stopping. It restarts a loaded job, not
+an absent one. A failed request is reported with launchctl's error.
+
 ### macOS update recovery (ADR-014 M-29a)
 
 For a newer release, `vox update` downloads and verifies its updater before transferring the
