@@ -2948,6 +2948,17 @@ impl Computer {
         Ok(Some(ComputerPublication { _lease: lease }))
     }
 
+    /// Test apparatus for the `stale-removal-window` mutants: the read lease without the policy
+    /// currency check, so a governance turn can run while this node's policy is unapplied.
+    #[cfg(feature = "test-knobs")]
+    pub(crate) fn try_acquire_publication_unchecked_for_proof(
+        &self,
+    ) -> Option<ComputerPublication> {
+        Some(ComputerPublication {
+            _lease: self.publications.try_read()?,
+        })
+    }
+
     /// Exact durable policy projection current at this instant. Callers carry both fields through
     /// delayed work; expiry can move without a new operator-policy revision.
     pub fn policy_target(&self) -> ComputerPolicyTarget {

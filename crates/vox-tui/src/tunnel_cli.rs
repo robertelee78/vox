@@ -700,6 +700,14 @@ pub(crate) fn say_if_it_explains_a_failure(ev: &NodeEvent) {
 pub(crate) fn say_failure_for_node(ev: &NodeEvent, node: Option<&str>) {
     let prefix = node.map_or_else(|| "vox".to_owned(), |name| format!("vox: node {name}"));
     match ev {
+        NodeEvent::ChannelOpened { channel_id } => {
+            if let Some(node) = node {
+                println!(
+                    "vox daemon: holding room {} open (node {node})",
+                    vox_core::node::link::b32_encode(channel_id)
+                );
+            }
+        }
         NodeEvent::PeerUnreachable { peer, why } => {
             eprintln!(
                 "{prefix}: could not reach {} — {why}",

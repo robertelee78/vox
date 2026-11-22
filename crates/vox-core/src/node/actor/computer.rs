@@ -100,6 +100,9 @@ pub(super) enum ComputerAuthority {
 
 pub(super) struct ComputerPublication {
     _managed: Option<crate::node::computer::ComputerPublication>,
+    /// Test apparatus: taken by a `stale-removal-window` mutant without the currency check.
+    #[cfg(feature = "test-knobs")]
+    pub(super) stale_proof: bool,
 }
 
 impl ComputerAuthority {
@@ -119,7 +122,11 @@ impl ComputerAuthority {
                     .await?,
             ),
         };
-        Some(ComputerPublication { _managed: managed })
+        Some(ComputerPublication {
+            _managed: managed,
+            #[cfg(feature = "test-knobs")]
+            stale_proof: false,
+        })
     }
 
     pub(super) fn try_acquire_publication(
@@ -141,7 +148,29 @@ impl ComputerAuthority {
                 Some(publication)
             }
         };
-        Ok(Some(ComputerPublication { _managed: managed }))
+        Ok(Some(ComputerPublication {
+            _managed: managed,
+            #[cfg(feature = "test-knobs")]
+            stale_proof: false,
+        }))
+    }
+
+    /// Test apparatus for the `stale-removal-window` mutants: `try_acquire_publication` without
+    /// its policy currency check. `None` means the lease is busy, as there.
+    #[cfg(feature = "test-knobs")]
+    pub(super) fn try_acquire_unchecked_publication_for_proof(
+        &self,
+    ) -> Option<ComputerPublication> {
+        let managed = match self {
+            Self::Unmanaged => None,
+            Self::Managed { computer, .. } => {
+                Some(computer.try_acquire_publication_unchecked_for_proof()?)
+            }
+        };
+        Some(ComputerPublication {
+            _managed: managed,
+            stale_proof: true,
+        })
     }
 
     /// Only a changed durable target is a supersession. A blocked or failed Computer authority,

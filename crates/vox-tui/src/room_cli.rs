@@ -135,6 +135,22 @@ fn held_since(since_secs: u64) -> String {
 /// A closed room is reported as closed rather than "unknown": the two are
 /// different problems and an operator fixes them differently.
 pub(crate) async fn room_of(client: &mut IpcClient, prefix: &str) -> Result<Digest32, AppError> {
+    room_of_readiness(client, prefix, true).await
+}
+
+/// State-only commands report preparation without waiting for it.
+pub(crate) async fn room_of_now(
+    client: &mut IpcClient,
+    prefix: &str,
+) -> Result<Digest32, AppError> {
+    room_of_readiness(client, prefix, false).await
+}
+
+async fn room_of_readiness(
+    client: &mut IpcClient,
+    prefix: &str,
+    wait_for_preparing: bool,
+) -> Result<Digest32, AppError> {
     let rooms = rooms_of(client).await?;
     if rooms.is_empty() {
         if let Some(ended) = ended_room_said(client, prefix).await {
@@ -170,15 +186,29 @@ pub(crate) async fn room_of(client: &mut IpcClient, prefix: &str) -> Result<Dige
     // A closed room's name is sealed in its manifest, so a node that has not opened it does
     // not know it: the name here is empty, and printing it said `room "" is not open` (#208).
     // Named by the id the operator typed a prefix of, and by its name only when there is one.
-    if let Some((_, name, false, _, preparing, waiting, open_failure)) =
-        rooms.into_iter().find(|(r, ..)| *r == id)
-    {
+    let mut row = rooms.into_iter().find(|(r, ..)| *r == id);
+    let mut waiting_since = None;
+    loop {
+        let Some((_, name, open, _, preparing, waiting, open_failure)) = row else {
+            return Err(ended_room_said(client, prefix)
+                .await
+                .unwrap_or_else(|| room_closed(&id, "")));
+        };
+        if open {
+            return Ok(id);
+        }
         if let Some(reason) = open_failure {
             return Err(AppError::Usage(reason));
         }
-        if preparing {
-            // With what it waits for, when the daemon has said (#991): a stuck room and a
-            // slow one read differently.
+        if !preparing {
+            return Err(room_closed(&id, &name));
+        }
+        if !wait_for_preparing
+            || waiting_since.is_some_and(|began| {
+                std::time::Instant::now().duration_since(began)
+                    >= crate::daemon_client::START_WITHIN
+            })
+        {
             return Err(AppError::Usage(match waiting {
                 Some((what, since)) => format!(
                     "{}; it waits for {what}, {}",
@@ -188,9 +218,20 @@ pub(crate) async fn room_of(client: &mut IpcClient, prefix: &str) -> Result<Dige
                 None => vox_core::node::api::Fault::RoomPreparing.explain().into(),
             }));
         }
-        return Err(room_closed(&id, &name));
+        if waiting_since.is_none() {
+            waiting_since = Some(std::time::Instant::now());
+            let room = room_said(&id, &name);
+            match waiting {
+                Some((what, since)) => eprintln!(
+                    "vox: waiting for {room} to finish preparing; it waits for {what}, {}",
+                    vox_core::node::status::since_text(since)
+                ),
+                None => eprintln!("vox: waiting for {room} to finish preparing"),
+            }
+        }
+        tokio::time::sleep(crate::daemon_client::NODE_WAIT_POLL).await;
+        row = rooms_of(client).await?.into_iter().find(|(r, ..)| *r == id);
     }
-    Ok(id)
 }
 
 /// What a verb says of a room this node deleted for having ended for everyone (V030-08, #1206),
