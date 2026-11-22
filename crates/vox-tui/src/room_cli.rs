@@ -303,7 +303,7 @@ pub async fn list(paths: &Paths) -> Result<(), AppError> {
             "{}  {shown}{}{}",
             short(id),
             match (open_failure, *preparing, waiting) {
-                (Some(reason), _, _) => format!("  [failed: {reason}]"),
+                (Some(reason), _, _) => format!("  [closed: {reason}]"),
                 (None, true, Some((what, since))) => format!(
                     "  [preparing history: waiting for {what}, {}]",
                     vox_core::node::status::since_text(*since)
@@ -318,6 +318,14 @@ pub async fn list(paths: &Paths) -> Result<(), AppError> {
                 format!("  [{over}]")
             }
         );
+        if open_failure.is_some() {
+            let node = crate::client::name_of(paths)?;
+            let join = vox_text::shell::node_command(&["vox", "room", "join"], node.as_str());
+            println!(
+                "  To reopen it once the cause above is fixed, run `{join}` with this room's \
+                 address and passphrase (another member's `vox room link` prints the address)."
+            );
+        }
     }
     for name in &clashing {
         println!(
