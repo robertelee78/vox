@@ -97,6 +97,54 @@ offers none of that computer's nodes; afterwards only pre-removal bases are supp
 A deliberate fresh join or consent is offered normally. Closed rooms capture before
 their first exchange on reopening; a node created after the removal inherits nothing.
 
+### Linux kernel-keyring proofs
+
+The dedicated typed-unlock, restart and unavailable-keyring journeys must run as a disposable
+container user, with `VOX_PROOF_DISPOSABLE_KEYRING=1` set by the container runner. Use a fresh
+UID and check `keyctl show @u` before and after each proof. A killed proof can leave a test key
+until reboot and use that UID's key quota; remove the container and its user after the run.
+For example, inside a disposable Linux build container as its fresh, dedicated UID:
+`keyctl show @u; VOX_PROOF_DISPOSABLE_KEYRING=1 cargo test --release -p vox-tui --features test-knobs --test the_daemon_and_its_nodes_proof a_linux_typed_unlock_survives_another_sessions_daemon -- --ignored --exact --nocapture; keyctl show @u`.
+The container runner must check the two keyring listings even if the proof fails.
+
+Other proofs that type a Linux unlock or setup can also store a test key in the user's keyring.
+They remove their own keys on normal exit, but a killed proof can leave one. Inspect with
+`keyctl list @u`; after identifying the exact `us.vox.node:<digest>` for the scratch node,
+remove only that serial with `keyctl unlink <serial> @u`. Do not clear the user's keyring.
+
+### Managed daemon recovery (ADR-052 RG-9)
+
+The optional Linux systemd journey in `the_daemon_and_its_nodes_proof.rs` supplies a minimal
+`Restart=on-failure` user unit with private profile roots, then removes it. Vox ships no
+systemd unit or manual enrollment instructions. A managed daemon stopped by a signal exits 71
+after clean shutdown; explicit product Stop exits 0. The journey checks recovery independently
+of client auto-start.
+
+```sh
+cargo test --release -p vox-tui --features optional-proofs,test-knobs \
+  --test the_daemon_and_its_nodes_proof \
+  a_systemd_user_unit_recovers_foreign_signals_and_honors_product_stop \
+  -- --ignored --exact --nocapture
+```
+
+Run it only inside its disposable `vox-rg9-…` container with a real systemd user session and
+`VOX_PROOF_SYSTEMD_CONTAINER` naming that container. There is no `vox daemon stop` subcommand;
+the proof sends the existing public control Stop request.
+
+The macOS guest journey loads the bundle's shipped launch agent with scratch bindings and
+boots it out even on failure. This establishes keep-alive behavior, not signed SMAppService
+enrollment or approval; those belong to the release journey.
+
+For the recovery-only guest journey, first build the helper in a shared build hold, then run:
+
+```sh
+python3 scripts/app-proofs-vm.py --recovery-vm /absolute/prebuilt/vox \
+  apps/macos/Bundle/LaunchAgents/us.vox.daemon.plist /absolute/receipt-directory
+```
+
+This route requires the existing stopped `vox-app-proofs` guest, snapshots supplied artifacts,
+does not resize it, and leaves it stopped. It stages a private node, requires a launchd-owned
+replacement before any healing client, checks `vox status`, and sends public control Stop.
 
 ### macOS update recovery (ADR-014 M-29a)
 
@@ -760,7 +808,7 @@ decides the PRODUCT verdict. This is an on-demand diagnostic, not CI or a releas
 | `an_idle_node_stays_on_its_board_proof::a_round_to_one_anchor_does_not_put_off_the_others` | One flapping anchor makes you unfindable on the others. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test an_idle_node_stays_on_its_board_proof -- --ignored --exact a_round_to_one_anchor_does_not_put_off_the_others` | time | (in the figure above) |
 | `a_relayed_pair_finds_a_direct_path_proof::a_relayed_pair_finds_a_direct_path_once_one_becomes_possible` | A relayed connection never upgrades to a direct one. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test a_relayed_pair_finds_a_direct_path_proof -- --ignored --exact a_relayed_pair_finds_a_direct_path_once_one_becomes_possible` | time (two 60 s retries) | 138 s / 137 s |
 | `a_displaced_relay_is_let_go_proof::a_relayed_path_a_direct_one_displaced_is_let_go_after_its_grace` | An anchor keeps carrying relays for pairs that went direct. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test a_displaced_relay_is_let_go_proof -- --ignored --exact a_relayed_path_a_direct_one_displaced_is_let_go_after_its_grace` | time (a 60 s grace) | 82 s / 83 s |
-| `every_member_is_back_after_an_anchor_restart_proof::every_member_is_back_after_an_anchor_restart` | After an anchor restarts, some members stay disconnected for many seconds, or a member refused by a busy anchor is told of a bad signature instead of "the peer is busy". | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test every_member_is_back_after_an_anchor_restart_proof -- --ignored --exact every_member_is_back_after_an_anchor_restart` | 300 real `vox daemon`s and one `vox node` on one machine (about 300 processes); run it alone | about 4 min in release (176–223 s measured on macOS); not timed on CI |
+| `every_member_is_back_after_an_anchor_restart_proof::every_member_is_back_after_an_anchor_restart` | After an anchor restarts, some members stay disconnected, or its management listener refuses node identity requests before startup attaches the anchor. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test every_member_is_back_after_an_anchor_restart_proof -- --ignored --exact every_member_is_back_after_an_anchor_restart` | 32 real `vox daemon`s and one `vox node`, 16 members per source IP; run alone after building. Startup acceptance waits for initial attachments, including management-only startup; mutant starts acceptance during management registration again. | about a minute in release; not timed on CI |
 | `a_room_takes_every_joiner_proof::every_joiner_of_a_three_hundred_member_room_gets_in` | Joining a large room fails with "the anchor could not be reached" while the anchor is up: a busy anchor closed the connection the join was fetching the room over (V210-104, #299). | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test a_room_takes_every_joiner_proof -- --ignored --exact every_joiner_of_a_three_hundred_member_room_gets_in` | an anchor, a host and 301 one-shot `vox connect` joins, four at a time; run it alone. A rate claim: the defect failed 1–2% of joins, so when hunting it, run it up to three times | about 8 min in release; not timed on CI |
 | `a_room_of_about_500_members_works_proof::a_room_of_about_500_members_works` | A room of about 500 members does not work: a join is refused, a post does not reach every member, or a stopped member does not catch up (PRD-001 R2). | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test a_room_of_about_500_members_works_proof -- --ignored --exact a_room_of_about_500_members_works` | an anchor, a host and about 500 real `vox daemon`s on one machine; run it alone, in a terminal that stays open | 1.5 to 2.5 hours in release; not timed on CI |
 | `an_anchor_that_restarts_is_redialled_promptly_proof::a_connection_held_only_through_the_stopped_anchor_says_so` | When the anchor a host's only path ran through stops, the message about the host blames a liveness probe instead of saying the path ran through the stopped anchor (V210-93). | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test an_anchor_that_restarts_is_redialled_promptly_proof -- --ignored --exact a_connection_held_only_through_the_stopped_anchor_says_so` | a real machine with IPv4 and IPv6 loopback; it says CANNOT MEASURE when the forward did not hold the relayed connection as its host's | not timed here |
@@ -803,3 +851,117 @@ Seventy shipped nodes share one scratch daemon, join a room, trust each other an
 messages read. The app client must expose all69 readers on every message and every trust
 relationship. The terminal must open the room and show every reader and peer's trust (#792).
 This expensive proof is optional and blocks neither CI nor release.
+
+### Linux release installation (ADR-051, RG-11)
+
+Build the Linux dist with `scripts/build-linux-release.sh /absolute/path/to/linux-dist`.
+The release workflow and this wrapper run `scripts/linux-release-steps.sh` in the same
+digest-pinned manylinux glibc 2.28 x86_64 image. Add the release's own `install.sh` to that
+dist before running the asset proof. All container starts, builds and proof runs on the
+shared proof host go through its build slot.
+
+The release workflow's `workflow_dispatch` candidate-only mode runs that same Linux job
+after checking the requested commit, alongside the signed Mac candidates. Its
+`vox-candidate-normal-x86_64-unknown-linux-gnu` artifact includes the six Linux release
+files and that commit's `install.sh`; candidate-only mode publishes no release.
+
+```sh
+for proof in the_linux_release_asset_installs_only_where_it_runs \
+  the_linux_release_installer_refuses_below_its_floor \
+  the_linux_release_installer_names_a_missing_loader; do
+  VOX_PROOF_DIST=/absolute/path/to/release-assets cargo test --release -p vox-tui \
+    --features optional-proofs,test-knobs --test install_sh_proof \
+    "$proof" -- --ignored --exact --nocapture
+done
+```
+
+These optional proofs drive the supplied installer and asset as an ordinary user in five
+disposable `linux/amd64` container acts, each limited to four CPUs and 8 GiB. Digests are
+pinned inline: AlmaLinux 8 is the glibc 2.28 floor; Ubuntu 22.04 (2.35) is one supported
+system above it and matches the reported install failure; Ubuntu 18.04 (2.27) is below
+the floor, once with working `getconf` and once with it unavailable; Alpine 3.20 has no
+GNU loader. It records image, architecture, kernel, libc, command output and wall time,
+and removes its containers and images it pulled. A remote Podman connection must be the
+already-running `podman-machine-default`; the proof forwards only its loopback release
+server port into that VM. No profile or home directory is mounted. Without
+`optional-proofs`, the usual loud `OPTIONAL PROOF NOT RUN` stand-in is compiled instead.
+Under amd64 emulation, `/proc/<pid>/exe` can name QEMU rather than Vox. The asset
+proof records that symlink without treating it as the guest program's identity, and
+checks the launched Vox path in the daemon's kernel argv.
+
+Arm (f), a shipped asset updating from a stand-in release server, is not run: shipped
+Vox takes releases from GitHub only and contains no release-source test knob.
+Arm (e) proves the same updater code on a `test-knobs` build and blocks; the real release
+source is exercised only when a later release exists.
+
+The blocking source journeys run as x86_64 Linux in an emulated container on an arm64
+host, not natively as arm64 (which has no Linux release target). The emulated harness is
+release-built: a debug harness run under QEMU was interrupted after 46 minutes without
+a verdict, and release mode avoids unoptimized fixture hashing. This apparatus choice does
+not change the real x86_64 product, installer or release floor.
+Emulated executions use shared slots only; time-bound arms are not judged under emulation.
+Measure the smallest arm first and keep holds near 20 minutes. A longer single arm needs
+its measured apparatus cost reported before another run, not a false product-time verdict.
+
+```sh
+cargo test --release -p vox-tui --features test-knobs --test install_sh_proof \
+  install_sh_installs_what_it_verified_and_refuses_what_it_could_not -- --exact --nocapture
+VOX_PROOF_NEXT_BINARY=/absolute/path/to/9.x/vox cargo test --release -p vox-tui \
+  --features test-knobs --test update_proof \
+  an_update_restarts_its_daemon_and_uses_a_different_local_version -- --ignored --exact --nocapture
+```
+
+Build the fixture from a copy of the same tree with the workspace version's first
+character changed to `9` (0.4.31 becomes 9.4.31), using
+`cargo build --release --bin vox --features vox-tui/test-knobs`. Record the image digest,
+`uname -m`, VM kernel and build wall times with both journeys' claim lists.
+
+The Linux kernel-keyring proof crosses login-session boundaries and also checks a lost
+boot credential and a chosen persistent passphrase file:
+
+```sh
+cargo test --release -p vox-tui --features test-knobs --test the_daemon_and_its_nodes_proof \
+  a_linux_typed_unlock_survives_another_sessions_daemon -- --ignored --exact --nocapture
+```
+
+For a typed unlock across the actual Linux update, use the same compiled `9.x` fixture:
+
+```sh
+VOX_PROOF_NEXT_BINARY=/absolute/path/to/9.x/vox cargo test --release -p vox-tui \
+  --features test-knobs --test update_proof a_linux_typed_unlock_stays_ready_after_update \
+  -- --ignored --exact --nocapture
+```
+
+It needs `python3` (the existing typed-terminal driver) and `keyctl`. In a container,
+`--security-opt seccomp=unconfined` permits `add_key` and `keyctl`, which the default
+container profile refuses; this changes syscall access, not keyring lifetime, uid
+permissions, cross-session visibility or the user-visible Ready/Locked assertions.
+It clears only a newly created session keyring and removes only its scratch node's
+boot credential, never another user's or another node's key.
+
+Rootless Linux user namespaces can refuse the per-user keyring with `ENOKEY`, even with
+seccomp disabled. The Ready-after-restart proof needs an ordinary uid in the initial user
+namespace and a successful `keyctl add user <scratch-name> <scratch-value> @u` precondition.
+An existing rootful Podman connection to the authorized machine can supply that container;
+do not change the machine's rootful setting or default connection.
+
+The Linux store creates its key in a temporary thread keyring while setting uid-only
+permissions, then links it into the user keyring and drops the thread reference. Creating
+it directly in an unpossessed user keyring does not grant the caller permission to change
+the key's default permissions.
+
+Run this preservation proof where `@u` is unavailable: a rootless namespace, an ordinary
+container's default seccomp profile, or QEMU returning `ENOSYS`:
+
+```sh
+cargo test --release -p vox-tui --features test-knobs --test the_daemon_and_its_nodes_proof \
+  a_linux_unavailable_keyring_keeps_unlock_ready_without_a_disk_secret -- --ignored --exact --nocapture
+```
+
+It checks successful typed unlock with the actual not-remembered reason, Ready for that
+daemon's lifetime, no plaintext fallback, Locked with the unlock command after restart,
+and successful lock and forget-passphrase. An unavailable keyring (`ENOKEY`, `ENOSYS`,
+`EPERM`, `EACCES` or `EOPNOTSUPP` while finding a key) has nothing this process can
+remember or forget. A failure to revoke or unlink a key found in a working keyring
+remains an error. Retention itself cannot be judged under QEMU's missing keyring syscalls;
+run its typed-update triplet natively with both genuinely compiled native versions.
