@@ -954,14 +954,10 @@ pub(crate) fn join_advice(fault: Option<Fault>) -> &'static str {
         Some(Fault::MembersBusy) => Fault::MembersBusy.explain(),
         Some(Fault::RoomFull) => Fault::RoomFull.explain(),
         Some(Fault::NotAdmittedAfterJoin) => Fault::NotAdmittedAfterJoin.explain(),
-        // Measured, not assumed: a wrong room passphrase against a LIVE member arrives
-        // here as `Refused`, not as `WrongPassphrase` — the passphrase is proved to the
-        // responder, so it is the responder that says no. Leading with "the refusal is
-        // the thing to chase" was true and useless at the one moment a person most
-        // needs a suggestion. Name the likely cause first, without pretending it is the
-        // only one.
+        // A generic refusal includes remote save failures. It establishes neither a bad
+        // passphrase nor a trust decision.
         Some(Fault::Refused) => {
-            "a member answered and refused the join\n       usually the room passphrase is wrong — it is checked by them, not by you,\n       so a typo arrives here rather than as a passphrase error\n       if you are sure of it, they may have revoked you, or be on a different room"
+            "a member answered but did not accept the join; no specific cause was received\n       check the room passphrase you typed as one possible cause\n       ask that member to check its disk, vox status and daemon log, then retry\n       this refusal does not establish a passphrase or trust cause"
         }
         Some(Fault::NotNetworked) => {
             "this node is not networked, or its identity is locked\n       nothing about the room is in question"
