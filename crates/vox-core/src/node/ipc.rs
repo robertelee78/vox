@@ -9787,7 +9787,9 @@ async fn open_as_attached(
     at: &NodeSocket,
 ) -> Result<(UnixStream, Option<Digest32>, Digest32, Vec<String>)> {
     use crate::node::daemonipc::{DaemonClient, DaemonFrame, Opening};
-    let DaemonClient { mut stream, .. } = DaemonClient::open_noting(&at.path, at.waiting).await?;
+    let DaemonClient {
+        mut stream, pid, ..
+    } = DaemonClient::open_noting(&at.path, at.waiting).await?;
     // Wiped once sent: it may carry the identity passphrase (C-6).
     let opening = zeroize::Zeroizing::new(Opening::Use(at.using.clone()).to_bytes());
     if let Err(e) = write_frame(&mut stream, &opening).await {
@@ -9810,6 +9812,9 @@ async fn open_as_attached(
                 }));
             }
             Ok((stream, me, attachment, notes))
+        }
+        DaemonFrame::Refused(crate::node::daemonipc::Refusal::Stopping) => {
+            Err(Error::Ipc(IpcHandshake::DaemonStopping { pid }))
         }
         DaemonFrame::Refused(r) => Err(Error::Ipc(IpcHandshake::Refused {
             reason: r.to_string(),

@@ -1436,6 +1436,137 @@ final class FirstRunProof: XCTestCase {
         }
     }
 
+    /// RG-7: the room row repeats the daemon's verdict, not an invented healthy state.
+    func testRoomRowSaysNotReceivingForAConnectedMember() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let appPath = env["VOX_PROOF_APP"], let scratchPath = env["VOX_PROOF_SCRATCH"],
+              let knobs = env["VOX_PROOF_KNOBS_VOX"], !knobs.isEmpty else {
+            throw Apparatus("the documented app runner must supply the isolated app, scratch and test-knobs binary")
+        }
+        let vox = URL(fileURLWithPath: appPath).appendingPathComponent("Contents/Helpers/vox").path
+        let root = URL(fileURLWithPath: scratchPath).appendingPathComponent("not-receiving")
+        guard stager.run(["/bin/mkdir", "-p", root.path], env: [:]).status == 0 else {
+            throw Apparatus("cannot create the room-row proof's scratch directory")
+        }
+        let hasKnob = stager.run(["/usr/bin/python3", "-c",
+            "import sys; b=open(sys.argv[1],'rb').read(); sys.exit(0 if all(k in b for k in [b'VOX_TEST_KEYCHAIN',b'VOX_TEST_UNAVAILABLE_HEAD_FILE']) else 1)", knobs], env: [:])
+        guard hasKnob.status == 0 else { throw Apparatus("the private Keychain and head-refusal test knobs are required") }
+        func account(_ name: String) throws -> [String: String] {
+            let keychain = root.appendingPathComponent("\(name).keychain-db").path
+            let made = stager.run(["/usr/bin/security", "create-keychain", "-p", "", keychain], env: ["HOME": root.path])
+            guard made.status == 0 else { throw Apparatus("cannot create \(name)'s scratch Keychain: \(made.out)") }
+            return ["VOX_DATA_DIR": root.appendingPathComponent("\(name)-data").path,
+                    "VOX_CONFIG_DIR": root.appendingPathComponent("\(name)-config").path,
+                    "VOX_PROXY": "127.0.0.1:0", "VOX_TEST_KEYCHAIN": keychain]
+        }
+        let aliceEnv = try account("alice")
+        var bobEnv = try account("bob")
+        let marker = root.appendingPathComponent("unavailable-head").path
+        bobEnv["VOX_TEST_UNAVAILABLE_HEAD_FILE"] = marker
+        daemon = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: aliceEnv,
+                           until: "vox daemon: control socket")
+        peer = try start(knobs, ["daemon", "--listen", "127.0.0.1:0"], env: bobEnv,
+                         until: "vox daemon: control socket")
+        let identityPass = root.appendingPathComponent("identity.pass").path
+        let roomPass = root.appendingPathComponent("room.pass").path
+        try stager.write(Data("proof identity\n".utf8), to: identityPass)
+        try stager.write(Data("proof room\n".utf8), to: roomPass)
+        for (name, accountEnv) in [("alice", aliceEnv), ("bob", bobEnv)] {
+            try staged(vox, ["node", "create", name],
+                       env: accountEnv.merging(["VOX_IDENTITY_PASSPHRASE": "proof identity"]) { $1 })
+            try staged(vox, ["node", "attach", name, "--passphrase-file", identityPass], env: accountEnv)
+        }
+        let aliceFp = try line(staged(vox, ["id", "--node", "alice"], env: aliceEnv)) { $0.count == 52 }
+        let bobFp = try line(staged(vox, ["id", "--node", "bob"], env: bobEnv)) { $0.count == 52 }
+        try staged(vox, ["room", "create", "--node", "alice", "--passphrase-file", roomPass,
+                         "--name", "delivery"], env: aliceEnv)
+        try staged(vox, ["room", "create", "--node", "alice", "--passphrase-file", roomPass,
+                         "--name", "healthy"], env: aliceEnv)
+        let room = try line(staged(vox, ["room", "list", "--node", "alice"], env: aliceEnv)) {
+            $0.contains(" delivery")
+        }.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
+        let link = try line(staged(vox, ["room", "link", "--node", "alice", room], env: aliceEnv)) {
+            $0.hasPrefix("vox://")
+        }
+        try staged(vox, ["room", "join", "--node", "bob", "--passphrase-file", roomPass, link], env: bobEnv)
+        try stagedTrustChange(vox, ["trust", "add", "--node", "alice", bobFp, "--name", "bob",
+                                   "--identity-passphrase-file", identityPass], env: aliceEnv)
+        try stagedTrustChange(vox, ["trust", "add", "--node", "bob", aliceFp, "--name", "alice",
+                                   "--identity-passphrase-file", identityPass], env: bobEnv)
+        try staged(vox, ["room", "post", "--node", "bob", room, "RG7-RECEIVED"], env: bobEnv)
+        let receivedUntil = Date().addingTimeInterval(120)
+        var received = false
+        while Date() < receivedUntil {
+            let read = run(vox, ["room", "read", "--node", "alice", room, "--json"], env: aliceEnv)
+            received = read.status == 0 && read.out.contains("RG7-RECEIVED")
+            if received { break }
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        guard received else { throw Apparatus("Alice never received Bob's seed message; the connected-but-not-receiving act was not staged") }
+        try stager.write(Data("\(bobFp) \(aliceFp)\n".utf8), to: marker)
+        for number in 1...20 {
+            try staged(vox, ["room", "post", "--node", "bob", room, "RG7-WITHHELD-\(number)"], env: bobEnv)
+        }
+        let verdictUntil = Date().addingTimeInterval(120)
+        var fullRoom = ""
+        var statusText = ""
+        var expectedNotice = ""
+        var healthyID = ""
+        while Date() < verdictUntil {
+            let report = run(vox, ["status", "--node", "alice", "--json"], env: aliceEnv)
+            statusText = report.out
+            let json = (try? JSONSerialization.jsonObject(with: Data(report.out.utf8))) as? [String: Any]
+            if report.status == 0,
+               let rooms = json?["rooms"] as? [[String: Any]],
+               let observed = rooms.first(where: { ($0["name"] as? String) == "delivery" }),
+               (observed["not_receiving"] as? Bool) == true,
+               let members = observed["members"] as? [[String: Any]],
+               members.contains(where: { ($0["id"] as? String) == bobFp && ($0["connected"] as? Bool) == true }) {
+                fullRoom = observed["id"] as? String ?? ""
+                let notices = json?["unhealthy"] as? [[String: Any]] ?? []
+                expectedNotice = notices.first {
+                    ($0["key"] as? String) == "room-not-receiving:\(fullRoom)"
+                }?["message"] as? String ?? ""
+                guard let healthy = rooms.first(where: { ($0["name"] as? String) == "healthy" }),
+                      let id = healthy["id"] as? String else {
+                    throw Apparatus("the staged healthy room was absent from status: \(report.out)")
+                }
+                healthyID = id
+                XCTAssertEqual(healthy["not_receiving"] as? Bool, false,
+                               "PRODUCT: a healthy single-member room must not read not receiving: \(report.out)")
+                break
+            }
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        guard !fullRoom.isEmpty, !expectedNotice.isEmpty else {
+            throw Apparatus("the daemon never reported a connected, not-receiving room notice: \(statusText)")
+        }
+        let cli = try staged(vox, ["status", "--node", "alice"], env: aliceEnv)
+        XCTAssertTrue(cli.contains(expectedNotice),
+                      "PRODUCT: vox status must print the daemon's room notice unchanged: \(expectedNotice); status: \(cli)")
+        let read = try staged(vox, ["room", "read", "--node", "alice", room, "--json"], env: aliceEnv)
+        guard !read.contains("RG7-WITHHELD-") else { throw Apparatus("the head-refusal act served a withheld post: \(read)") }
+        try stager.write(Data("no\n".utf8), to: aliceEnv["VOX_CONFIG_DIR"]! + "/app/login-item")
+        try staged(vox, ["computer", "personal", "alice"], env: aliceEnv)
+        let ui = voxApp(appPath)
+        ui.launchEnvironment = aliceEnv.merging(["HOME": root.appendingPathComponent("home").path]) { $1 }
+        try launchVox(ui, appPath, env: ui.launchEnvironment, scratch: scratchPath)
+        defer { ui.terminate() }
+        guard present(ui, Key.id("attached"), timeout: 60, "the app must attach as the staged reader") else { return }
+        let row = Key.id("room-health-\(fullRoom)")
+        print("[proof] daemon's room verdict: \(statusText)")
+        guard let health = words(ui, row, timeout: 30,
+                                "the room row must show the same not receiving words as vox status: \(expectedNotice)",
+                                until: { $0 == expectedNotice }, sibling: Key.id("room-delivery")) else { return }
+        print("[proof] room-health-\(fullRoom): \(health)")
+        XCTAssertTrue(health.contains(String(bobFp.prefix(12))),
+                      "PRODUCT: the room row must name the member whose posts are not received: \(health)")
+        guard present(ui, Key.id("room-healthy"), timeout: 10,
+                      "the healthy room must be shown alongside the affected room") else { return }
+        XCTAssertNil(locate(ui, Key.id("room-health-\(healthyID)")),
+                     "PRODUCT: the healthy room must show no health warning; \(onScreen(ui))")
+    }
+
     /// The window's side columns (v0.4.1, the decider: "I should also be able to resize it, and
     /// resize the one on the right too"), alone. Staged by `vox`: alice attached, with one room,
     /// chosen before; Keep Running not chosen. Dragging the inspector's divider changes its width,

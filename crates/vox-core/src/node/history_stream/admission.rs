@@ -450,8 +450,11 @@ pub(super) fn advance(
         for (_, context) in &generated {
             index.keep_history_context(context)?;
         }
+        Ok(())
+    };
+    let cache_ranges = || -> Result<()> {
         for (start, descriptor) in &ranges {
-            index.keep_history_proof_range(
+            entry_store::sparse::cache_history_proof_range(
                 binding.head,
                 crate::log::history::TreeBinding {
                     room: binding.room,
@@ -461,6 +464,21 @@ pub(super) fn advance(
                 *start,
                 *descriptor,
             )?;
+        }
+        #[cfg(feature = "test-knobs")]
+        if !ranges.is_empty() {
+            if let Some(path) = std::env::var_os("VOX_TEST_HOLD_VERIFIED_FETCH") {
+                let path = std::path::PathBuf::from(path);
+                std::fs::write(path.with_extension("verified"), binding.head).map_err(|error| {
+                    Error::Storage {
+                        op: "verified fetch marker",
+                        detail: error.to_string(),
+                    }
+                })?;
+                while path.exists() {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
         }
         Ok(())
     };
@@ -472,6 +490,7 @@ pub(super) fn advance(
                 index.keep_history_inclusion_receipt(&included)?;
                 index.finish_history_verifier_cursor(*binding)
             })?;
+            cache_ranges()?;
             room.note_role_progress(binding.author, binding.from);
             combine_parent(
                 room,
@@ -489,6 +508,7 @@ pub(super) fn advance(
                 index.keep_history_prefix_receipt(&prefix)?;
                 index.finish_history_verifier_cursor(*binding)
             })?;
+            cache_ranges()?;
             combine_parent(
                 room,
                 store,
@@ -524,6 +544,7 @@ pub(super) fn advance(
                     }
                     Ok(())
                 })?;
+                cache_ranges()?;
                 return Ok(match promote_head(room, store, committed, binding.head)? {
                     Advanced::Complete => Advanced::Progress,
                     other => other,
@@ -536,6 +557,7 @@ pub(super) fn advance(
                 }
                 index.finish_history_verifier_cursor(*binding)
             })?;
+            cache_ranges()?;
             Ok(Advanced::Complete)
         }
     }

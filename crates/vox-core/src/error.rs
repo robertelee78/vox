@@ -273,7 +273,7 @@ pub enum Error {
     /// rung is always the slowest and so always wins that race — the operator is then
     /// told about a timeout while the rung that knew the real answer is discarded
     /// (ADR-018 §8b: whatever knows why must say why).
-    #[error("peer unreachable — {0}")]
+    #[error("connection not established — {0}")]
     LadderExhausted(String),
 
     /// A QUIC handshake failed for a reason other than authentication: the peer refused or
@@ -702,6 +702,12 @@ pub enum IpcHandshake {
     Stuck {
         /// How long the ping was given.
         secs: u64,
+    },
+    /// A daemon refused `Use` while stopping; its greeting identifies the process.
+    #[error("the daemon is stopping")]
+    DaemonStopping {
+        /// The process that refused the opening, not permission to signal it.
+        pid: u32,
     },
     /// The daemon answered the connection's `Use` with a refusal (ADR-026 C-2): the node is not
     /// attached for a one-shot verb, there is no such node, a wrong passphrase. Its words say what

@@ -3628,7 +3628,7 @@ impl Node {
                         }
                     },
                 );
-                self.note_lane_sync(work.room, work.peer);
+                self.note_lane_sync(work.room, work.peer, receipt.brought);
             }
             if let Some(seq) = flow.mine_held.take() {
                 // The peer's word on how far it holds this node's feed (ADR-028 R-6), recorded
@@ -3953,13 +3953,8 @@ impl Node {
                         counts.backoff = None;
                     },
                 );
+                self.note_lane_sync(work.room, work.peer, flow.brought);
                 flow.brought = std::mem::take(&mut flow.route_origin_brought);
-                // A round the lane completed is a completed sync for `vox status` (PRD-001
-                // R35), as a session's clean report was before ADR-037. Without this every
-                // lane-served room read "last sync never" and, after ten minutes, "no completed
-                // sync" while its counters climbed into the thousands (the decider's daemon,
-                // 2026-10-19).
-                self.note_lane_sync(work.room, work.peer);
                 let origin_room =
                     crate::node::ports::RoomRef::Channel(Arc::downgrade(&flow.shared));
                 let origin_live = self
@@ -4325,12 +4320,7 @@ impl Node {
                         }
                     },
                 );
-                // A round the lane completed is a completed sync for `vox status` (PRD-001
-                // R35), as a session's clean report was before ADR-037. Without this every
-                // lane-served room read "last sync never" and, after ten minutes, "no completed
-                // sync" while its counters climbed into the thousands (the decider's daemon,
-                // 2026-10-19).
-                self.note_lane_sync(work.room, work.peer);
+                self.note_lane_sync(work.room, work.peer, brought);
             } else {
                 let waiting = flow.waiting;
                 let body_progress = flow.body_progress;
@@ -4376,9 +4366,11 @@ impl Node {
         self.bounded_sync.poll_cleanup();
     }
 
-    /// Records a lane round that completed cleanly as this room's, and this peer's, last
-    /// completed sync, for `vox status` (PRD-001 R35).
-    fn note_lane_sync(&mut self, room: Digest32, peer: Digest32) {
+    /// A clean transport round is not a completed sync unless it brought something in.
+    fn note_lane_sync(&mut self, room: Digest32, peer: Digest32, brought: bool) {
+        if !brought {
+            return;
+        }
         let now = self.now_ms().get();
         self.status.room_synced.insert(room, now);
         self.status.member_synced.insert(peer, now);
@@ -4392,6 +4384,12 @@ impl Node {
         store: Arc<Store>,
         conn: Arc<VoxConnection>,
     ) -> bool {
+        // A proof provider can serve inventories and refuse entries without racing the
+        // reader's fetched hint with its own unsolicited announcement.
+        #[cfg(feature = "test-knobs")]
+        if std::env::var_os("VOX_TEST_RESPOND_ONLY").is_some() {
+            return false;
+        }
         let (room, peer, service) = port;
         if self.own_key_leave_pending.contains_key(&room)
             || self.own_key_ended_pending.contains_key(&room)

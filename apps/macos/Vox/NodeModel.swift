@@ -1160,7 +1160,7 @@ final class NodeModel: ObservableObject {
 
     func roomHealth(_ room: String) -> String? {
         guard daemonReachable else { return nil }
-        let messages = health.filter { $0.key == "room-store:\(room)" || $0.key.hasPrefix("sync-failing:\(room):") }
+        let messages = health.filter { $0.key == "room-store:\(room)" || $0.key == "room-not-receiving:\(room)" || $0.key.hasPrefix("sync-failing:\(room):") }
             .map(\.message)
         return messages.isEmpty ? nil : messages.joined(separator: " ")
     }

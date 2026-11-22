@@ -197,16 +197,100 @@ version string is not a next-release binary. Their release fixture serves that e
 helper and tag-pinned app records. Native app launch/registration claims remain in the signed
 guest journey below; the controlled CLI bundle fixture does not establish them.
 
+The prebuilt `--bundle-vm` route runs the existing controlled update journey in the stopped
+`vox-app-proofs` guest. Supply the genuinely compiled next-version helper and the prebuilt
+`update_proof` executable from the same source state:
+
+```sh
+VOX_PROOF_NEXT_BINARY=/absolute/vox-next \
+VOX_PROOF_UPDATE_HARNESS=/absolute/update-proof \
+VOX_PROOF_BUNDLE_AFTER_SWAP=1 \
+python3 scripts/app-proofs-vm.py --bundle-vm /absolute/prebuilt/vox \
+  apps/macos/Bundle/LaunchAgents/us.vox.daemon.plist /absolute/receipt-directory
+```
+
+Build the helper and proof with `test-knobs,optional-proofs` before the guest execution.
+The journey holds before exchange, kills the updater's process group, reads the saved room,
+then interrupts the published update before the manager request and uses ordinary `vox update`
+to finish the existing journal. It also reads during the manager's held stop, including an
+explicit `vox daemon --restart` whose caller is killed. All processes, the launch agent and
+profile belong to scratch; the outer runner boots out the job and stops the guest on failure.
+Take `/tmp/vox-guest.lock` for each run, releasing it only after the guest is stopped.
+
+`VOX_PROOF_BUNDLE_PRECOMMIT=1` selects the existing abort-after-exchange condition and checks
+that the old daemon keeps serving and ordinary offline recovery restores the original release.
+`VOX_PROOF_BUNDLE_UNMANAGED=1` instead runs the existing controlled-bundle update with its
+client-started daemon and no login item.
+
+The CLI preserves a stopping refusal's daemon PID internally and confirms login-item ownership.
+It observes one replacement without starting a daemon. The whole wait has one cap: launchd's
+printed exit timeout plus minimum runtime plus the existing ten-second greeting patience.
+Phase changes never reset it. A missing, disabled or inactive job ends the wait, as does the
+run count passing the first replacement without a greeting. Missing or changed manager fields
+fall back to the old fixed ten seconds. End-of-wait advice describes the current state;
+a deliberately stopped job does not promise a future replacement.
+When no socket answers, startup-capable clients also check whether the matching account's
+login item has a spawn pending, rather than race it with a client daemon.
+Hooks do not take the managed command wait: their node clients retain the original
+greeting/refusal path, and a pending managed spawn gives the existing bounded `Starting`
+answer inside the hook's existing 500ms startup patience.
+The managed wait names the login item's replacement without quoting the unrelated ten-second
+greeting bound. If a hook's login-item check itself exceeds that patience, it says the check did
+not finish and no daemon was started, rather than promising a restart.
+The guest `--restart-vm` route accepts `VOX_PROOF_SHIPPED_DEFAULTS=1` with
+`VOX_PROOF_PENDING_START=1`: the shipped job has only its helper path adapted, and uses the guest
+user's default roots. The act preserves and restores any prior guest root. `VOX_PROOF_SLOW_HOOK_CHECK=1`
+holds only the check (`test-knobs`) with no loaded job and checks the real hook's truthful answer;
+`VOX_PROOF_ROOT_PRECEDENCE=1` also creates and lists distinct nodes through XDG, environment and
+explicit root precedence. Product and manager root resolution share `vox-core::node::paths::roots_with`.
+The managed-client wait is built and proven for the macOS login item only. Linux keeps its
+existing immediate stopping refusal; there is no new systemd progress observer. Vox ships no
+user unit. The existing disposable Linux proof supplies `Restart=on-failure`, `RestartSec=1`.
+There is no wire-frame change: an older daemon gives its existing refusal, and an older client
+keeps its existing behavior.
+
+The same prebuilt managed route stages absent manager fields and removes the owned job while
+the client waits; the real client's exit1 must name the stopped daemon and missing replacement:
+
+```sh
+VOX_PROOF_REMOVE_MANAGER=1 VOX_PROOF_MANAGER_FIELDS_ABSENT=1 \
+python3 scripts/app-proofs-vm.py --restart-vm /absolute/prebuilt/vox \
+  apps/macos/Bundle/LaunchAgents/us.vox.daemon.plist /absolute/receipt-directory
+```
+
+On that same `--restart-vm` route, `VOX_PROOF_FAIL_REPLACEMENT=1` occupies a private listen port
+and makes subsequent managed launches use it; the real daemon exits before greeting, and
+the waiting client must end with the failed-replacement words rather than follow a respawn loop.
+`VOX_PROOF_PENDING_START=1` issues `vox daemon --detach` during a young job's scheduled spawn;
+it must use the one login-item generation, never create a competing daemon.
+
+Build with `test-knobs` for this field-absence staging, which changes no product wait rule.
+An unpaused read can reach the replacement while its room prepares saved history and exit1
+with `that room is preparing its saved history`. This act keeps the waiting read live through
+the manager's phases, then holds it only after the replacement's greeting and before Use.
+It waits on the public saved-room result and releases that same read. Preparation observations
+and greeting-to-readiness intervals are printed; no room-readiness product behavior is changed.
+
+Item 46's cached-flag clause has NO change in this release. A genuine native-app probe found
+the captured AppKit flag stale after quit, while the fresh lookup returned nil and the kernel
+process was a zombie. Current `still()` already guards this divergence through its nil check.
+A force-quit probe found the fresh flag still false/non-nil while the paused process stayed live.
+Neither requested unguarded divergence was produced; the owner's original trigger remains
+UNKNOWN. Whether RG-9 closes with this clause unbuilt is the owner's decision.
+
+
 On macOS, daemon restart recognizes a kernel zombie state or native process-lookup `ESRCH`
 as stopped even if the terminal or service-manager parent has not reaped the PID yet.
 A live process, permission refusal, or unknown query failure is still waited for; this does
 not change the existing shutdown bound.
 
 Before filesystem commit, the updater preserves and round-trip-verifies the source as an
-authenticated rollback archive. It stops the captured app/daemon, exchanges intact bundles,
-and retires the displaced tree before allowing new-version startup. A precommit refusal restores
-the source from that verified archive, not from a possibly partially deleted tree. A postcommit
-handoff failure resumes unfinished work without an implicit downgrade.
+authenticated rollback archive. It quits the captured app and exchanges intact bundles while
+the old daemon still serves. A login item is replaced by one manager-owned `kickstart -k` after
+retirement; without a login item the captured daemon is stopped after exchange. The displaced
+tree is retired before new-version startup. A precommit refusal restores the source from its
+verified archive, not a possibly partially deleted tree. A postcommit handoff failure resumes
+unfinished work without an implicit downgrade.
 
 A signed update/identifier-launch/rollback measurement must retain both release bundles'
 original signed helpers, verify the restored signature and unchanged signed plist, inspect exact
@@ -643,6 +727,14 @@ or login item is involved. A fixture that is not older is an `APPARATUS` refusal
 | `nodes_of_one_daemon_proof::two_paired_computers_that_are_idle_exchange_nothing` | Idle paired computers keep exchanging unchanged histories, re-derive bindings, fail to reconcile siblings while one actor is held, replace policy during a held admitted join, or leave a refused pre-lease join on a real board after restart. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test nodes_of_one_daemon_proof -- --ignored --exact two_paired_computers_that_are_idle_exchange_nothing --nocapture` | a real machine; run alone | several minutes; not timed in CI |
 | `a_post_answers_promptly_while_a_peer_posts_proof::status_and_posts_answer_while_ten_sessions_step` | Status or posts lag behind agent Session saves. Holds one exact Session's durable transaction while ten real hooks step; status must answer within 1 s and every post within 5 s. Also holds an attention commit while Session, admin and hook pause-status reads wait; status must still answer within 1 s before release. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test a_post_answers_promptly_while_a_peer_posts_proof -- --ignored --exact status_and_posts_answer_while_ten_sessions_step --nocapture` | a real machine; run alone | latency measured, not timed in CI |
 | `a_daemon_reopens_its_rooms_proof::a_restarted_room_drives_its_session_refresh_to_ready` | A retained room reopens slowly while it replays its own and other authors' Session lifecycle records. Stages all 257 heads from each author, then requires automatic public room readiness within 5 s without polling to wake the replay. The test-only receipt counts opened records, not index-only visits; zero-open batches can still walk the index. Only an apparatus positive-share check reads the count; readiness is measured from the public room-open event. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test a_daemon_reopens_its_rooms_proof -- --ignored --exact a_restarted_room_drives_its_session_refresh_to_ready --nocapture` | two real daemons and a real wire client; run alone | restart within 5 s |
+| `retention_proof::a_session_change_rewrites_only_that_session` | One Session's metadata change rewrites unrelated Sessions. Bounds complete-publication OS writes at 100 and 1,500 unrelated Sessions, encrypted index bytes per Session, and unchanged ordered listings/steps across restart. Allocator values are printed diagnostics only. | `RG13_SESSION_LOCAL_EVIDENCE=/absolute/scratch/receipts cargo test --release -p vox-tui --features optional-proofs,test-knobs --test retention_proof -- --ignored --exact a_session_change_rewrites_only_that_session --nocapture` | macOS daemon OS write counter; real scratch daemon and product store copies |
+| `retention_proof::an_existing_session_index_keeps_its_listing_when_upgraded` | A base-written Session index preserves its exact oldest-first listing on the first fixed read and after lazy backfill; a later rename has bounded OS writes. | `RG13_SESSION_BASE_VOX=/absolute/path/to/c5b12cef4/vox RG13_SESSION_FRESH_RECEIPTS=/absolute/path/to/fresh/receipts RG13_SESSION_LOCAL_EVIDENCE=/absolute/scratch/upgrade cargo test --release -p vox-tui --features optional-proofs,test-knobs --test retention_proof -- --ignored --exact an_existing_session_index_keeps_its_listing_when_upgraded --nocapture` | macOS; pinned base binary; test-knobs backfill staging; run quiet |
+
+The Session index takes about 0.9 KB more per Session; a Session change no longer rewrites
+the index of every Session in the room. Opened rooms lazily backfill the version-2 derived
+index while retaining their previous readable projection. After that header is written,
+v0.4.30 refuses the room's Session index (`Session index header version`); downgrade is
+not supported.
 
 For the constructor boundary independently of the full journey, set
 `VOX_PROOF_STEP=constructor-re-admission` on that command. This selector is not a substitute
@@ -851,7 +943,9 @@ decides the PRODUCT verdict. This is an on-demand diagnostic, not CI or a releas
 
 | Proof | Helps troubleshoot | Run | Needs | Time |
 |---|---|---|---|---|
-| `notify_proof::a_room_that_cannot_sync_notifies_once_and_once_when_it_syncs_again` | A room that has gone ten minutes without a completed sync is never said, is said more than once, or is never said to have recovered (PRD-001 R37). alice's only other member and the anchor are stopped; one notification names the room once the condition starts, and one "recovered" once the anchor is back. | `cargo test --release -p vox-tui --features optional-proofs --test notify_proof -- --ignored --exact a_room_that_cannot_sync_notifies_once_and_once_when_it_syncs_again` | nothing beyond `vox` | over ten minutes (the condition takes `STALE_SYNC_SECS`) |
+| `notify_proof::a_room_that_cannot_sync_notifies_once_and_once_when_it_syncs_again` | A disconnected room with no new sync entries for ten minutes is never said, is said more than once, or is never said to have recovered (PRD-001 R37). Alice's only other member and anchor stop; one desktop notice names the stale room, then one recovery follows Bob reconnecting, posting, and Alice reading the new post. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test notify_proof -- --ignored --exact a_room_that_cannot_sync_notifies_once_and_once_when_it_syncs_again` | nothing beyond `vox` | over ten minutes (`STALE_SYNC_MS`) |
+| `vox_status_shows_the_node_proof::a_stalled_author_is_not_hidden_by_other_members_new_entries` | A held author's live-window deficit loses its `not receiving` verdict when another member's posts arrive. The proof-only hold leaves the author's persisted window unchanged while allowing other providers' other-author tasks to finish; this is not a proof of shipped slow-peer scheduling isolation. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test vox_status_shows_the_node_proof a_stalled_author_is_not_hidden_by_other_members_new_entries -- --ignored --exact --nocapture` | three scratch members, minute-spaced other-member posts | 60–130 s of observation, plus setup |
+| `vox_status_shows_the_node_proof::status_names_a_connected_member_whose_posts_are_not_received` | A hint-only inventory falsely refreshes last sync, or a connected author's withheld posts never produce the room's `not receiving` verdict. Both initial feeds are fully received and both daemons cleanly stopped; the provider restarts refusing heads and only responding, so the fresh reader fetches new hints without any new entry. Status must keep its receipt clock unchanged and describe live entries not held, not claim nothing arrived between samples. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test vox_status_shows_the_node_proof status_names_a_connected_member_whose_posts_are_not_received -- --ignored --exact --nocapture` | two scratch members, head refusal and respond-only test knobs | over 60 s of observation, plus setup |
 | `a_join_outlives_its_displaced_path_proof::a_join_outlives_its_displaced_path` | A slow join fails when the network path changes under it. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test a_join_outlives_its_displaced_path_proof -- --ignored --exact a_join_outlives_its_displaced_path` | time (a 300 s join grind) | 314 s / 315 s |
 | `a_slow_joiner_gets_in_or_is_told_why_proof::a_joiner_slower_than_the_old_patience_gets_in` | A slow machine can't get into a room. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test a_slow_joiner_gets_in_or_is_told_why_proof -- --ignored --exact a_joiner_slower_than_the_old_patience_gets_in` | time (a 150 s grind) | 488 s / 490 s for both, run together |
 | `a_slow_joiner_gets_in_or_is_told_why_proof::a_joiner_slower_than_the_patience_is_told_why` | A machine too slow to join gets no explanation. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test a_slow_joiner_gets_in_or_is_told_why_proof -- --ignored --exact a_joiner_slower_than_the_patience_is_told_why` | time (a 485 s grind; run it alone so other work does not distort it) | (in the figure above) |
@@ -908,6 +1002,20 @@ Seventy shipped nodes share one scratch daemon, join a room, trust each other an
 messages read. The app client must expose all69 readers on every message and every trust
 relationship. The terminal must open the room and show every reader and peer's trust (#792).
 This expensive proof is optional and blocks neither CI nor release.
+
+### Private Session record storage (ADR-052 RG-13)
+
+`cargo test --release -p vox-tui --features test-knobs,optional-proofs --test retention_proof private_session_steps_store_one_body_and_reopen_after_rotation -- --exact --ignored --nocapture`
+
+Two scratch daemons append different-sized Session steps, read identical complete pages,
+restart, and rotate the drive generation. The author must still read the old steps;
+the member downgraded to read must not read the Session. Stopped-store measurements
+require one row per step, one stored byte per body byte, and one signature's fixed cost.
+A wire peer holding the author's identity then offers forged steps: one changed bit in the
+signature, header, room, author or ciphertext, and one step's genuine signature on the
+message of the step before it. The recipient must show and store none of them, and still
+read every genuine step.
+This proof is optional; without the feature it prints OPTIONAL PROOF NOT RUN.
 
 ### RG-8 computer anchors and late pairing closure
 
@@ -1038,3 +1146,32 @@ and successful lock and forget-passphrase. An unavailable keyring (`ENOKEY`, `EN
 remember or forget. A failure to revoke or unlink a key found in a working keyring
 remains an error. Retention itself cannot be judged under QEMU's missing keyring syscalls;
 run its typed-update triplet natively with both genuinely compiled native versions.
+
+### Fetch-serving cache and old-room cleanup (ADR-052 RG-13)
+
+Fetch proof descriptors share one daemon-wide FIFO cache capped below 8 MiB, including keys,
+values and container/rehash allocation. They are not written to the store. Canonical prefix
+ranges, source headers, contexts, witnesses and receipts remain durable. Opening a room removes
+only that room's old ProofRange objects and index references in bounded atomic batches;
+interruption leaves completed batches applied and the next open resumes by an idempotent scan.
+Completion is recorded once as one sealed bit (CBOR uint 1) in the existing per-room
+KeyMaterial segment namespace, slot 30; subsequent opens read that bit and do not scan
+the object tree. No directory or store-format version changes. Locked/unopened rooms
+are not converted by a whole-store startup pass.
+
+Both optional journeys extend `retention_proof.rs` and use private scratch profiles/Keychains:
+
+```sh
+cargo test --release -p vox-tui --features test-knobs,optional-proofs --test retention_proof \
+  fetching_keeps_serving_proofs_out_of_the_store -- --exact --ignored --nocapture
+cargo test --release -p vox-tui --features test-knobs,optional-proofs --test retention_proof \
+  opening_a_room_reclaims_old_serving_proofs_across_interruption -- --exact --ignored --nocapture
+```
+
+The first exchanges messages across changing signed heads, abandons verified fetches, restarts
+both members and pages back through every acknowledged message while decoded stopped-store
+ProofRange counts stay zero. Its independent mutants restore admission writes or reconstruction
+writes. The second seeds the old serving-row shape in a real stopped room, opens it, interrupts
+after a committed cleanup batch and reopens it, preserving other object kinds and readable
+history. A second open preserves planted stopped-store canaries, proving the completed room
+does not scan again; each row-count observation also records the store's file length.

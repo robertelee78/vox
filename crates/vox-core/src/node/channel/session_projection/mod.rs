@@ -26,6 +26,7 @@ mod activity_query;
 mod activity_state;
 mod build;
 mod files;
+pub(in crate::node::channel) mod locality;
 mod metadata;
 mod pending;
 mod query;
