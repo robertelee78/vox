@@ -623,6 +623,17 @@ pub enum GovernancePage {
     },
 }
 
+/// Feed positions already kept for one member, projected together for status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeedCoverage {
+    /// The member whose feed these positions describe.
+    pub member: Digest32,
+    /// The contiguous-from-entry-one prefix; older on-demand gaps stop it.
+    pub verified_through: Option<u64>,
+    /// Selected live-window upper bound and positions still to walk; none before selection.
+    pub live_window: Option<(u64, u64)>,
+}
+
 /// An open channel's full state for display.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelDetail {
@@ -737,8 +748,10 @@ pub struct ChannelDetail {
     pub held: Vec<(Digest32, u64)>,
     /// Last authenticated position each member said it holds in this node's feed.
     pub held_through: Vec<(Digest32, u64)>,
-    /// Last authenticated, role-complete position this node holds in each member's feed.
+    /// Latest rendered message position this node can show for each member.
     pub holds_through: Vec<(Digest32, u64)>,
+    /// Contiguous-prefix and current-live-window receipt positions, not message counts.
+    pub feed_coverage: Vec<FeedCoverage>,
     /// The nodes whose Sessions this node can read inside here (ADR-029 SC-2), sorted: itself, and
     /// each node whose drive key it holds. What a Session's `can_drive` is said from.
     pub drive_from: Vec<Digest32>,

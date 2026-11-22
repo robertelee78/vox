@@ -97,8 +97,10 @@ The pairing journey in `nodes_of_one_daemon_proof.rs` also covers saved room cho
 `computer_removal_keeps_rooms_without_offering_removed_nodes`,
 `computer_removal_reconciles_absence_before_a_fresh_join`,
 `computer_removal_checks_a_locked_nodes_rooms_when_it_opens`,
-`computer_removal_names_a_room_without_a_local_admin`, and
-`computer_removal_offers_only_a_fresh_basis`.
+`computer_removal_names_a_room_without_a_local_admin`,
+`computer_removal_offers_only_a_fresh_basis`,
+`a_fresh_admission_survives_a_still_pending_computer_eviction`, and
+`computer_removal_evicts_before_old_trust_can_be_called_new`.
 Run one name at a time with
 `cargo test --release -p vox-tui --features test-knobs,optional-proofs --test nodes_of_one_daemon_proof <name> -- --ignored --exact --nocapture`.
 The restart and absence acts use causal holds and require an exclusive proof slot.
@@ -107,6 +109,16 @@ computer removal event. An event with no local choice keeps room memberships. Ch
 completion and rooms checked on first unlock share the existing computer snapshot;
 unfinished work uses the room's existing one-second governance retry, not a separate
 removal worker or journal.
+A pending eviction finishes without evicting a node this computer presently trusts
+again, individually or through its current computer group. The finished row disappears
+from status. A fresh admission alone is not enough in a room closed at removal: the
+saved removal has no room-feed frontier with which to date that admission.
+"Trusts again" counts only once this node has applied the current computer policy; until
+then the row retries on that same deadline and stays pending in status.
+`computer_removal_evicts_before_old_trust_can_be_called_new` runs a governance turn while
+the removal's policy send is held. Its mutants, selected with `VOX_MUTANT_FX28`:
+`stale-removal-window` lets only that turn past the policy gate (expected green);
+`stale-removal-window-unchecked` also drops the applied-policy condition (expected red).
 Each accepted removal also keeps this computer's existing-node offer obligations and
 per-room basis cutoffs in that same snapshot. Until a room's cutoff is captured it
 offers none of that computer's nodes; afterwards only pre-removal bases are suppressed.
@@ -938,7 +950,9 @@ decides the PRODUCT verdict. This is an on-demand diagnostic, not CI or a releas
 
 | Proof | Helps troubleshoot | Run | Needs | Time |
 |---|---|---|---|---|
-| `notify_proof::a_room_that_cannot_sync_notifies_once_and_once_when_it_syncs_again` | A room that has gone ten minutes without a completed sync is never said, is said more than once, or is never said to have recovered (PRD-001 R37). alice's only other member and the anchor are stopped; one notification names the room once the condition starts, and one "recovered" once the anchor is back. | `cargo test --release -p vox-tui --features optional-proofs --test notify_proof -- --ignored --exact a_room_that_cannot_sync_notifies_once_and_once_when_it_syncs_again` | nothing beyond `vox` | over ten minutes (the condition takes `STALE_SYNC_SECS`) |
+| `notify_proof::a_room_that_cannot_sync_notifies_once_and_once_when_it_syncs_again` | A disconnected room with no new sync entries for ten minutes is never said, is said more than once, or is never said to have recovered (PRD-001 R37). Alice's only other member and anchor stop; one desktop notice names the stale room, then one recovery follows Bob reconnecting, posting, and Alice reading the new post. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test notify_proof -- --ignored --exact a_room_that_cannot_sync_notifies_once_and_once_when_it_syncs_again` | nothing beyond `vox` | over ten minutes (`STALE_SYNC_MS`) |
+| `vox_status_shows_the_node_proof::a_stalled_author_is_not_hidden_by_other_members_new_entries` | A held author's live-window deficit loses its `not receiving` verdict when another member's posts arrive. The proof-only hold leaves the author's persisted window unchanged while allowing other providers' other-author tasks to finish; this is not a proof of shipped slow-peer scheduling isolation. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test vox_status_shows_the_node_proof a_stalled_author_is_not_hidden_by_other_members_new_entries -- --ignored --exact --nocapture` | three scratch members, minute-spaced other-member posts | 60–130 s of observation, plus setup |
+| `vox_status_shows_the_node_proof::status_names_a_connected_member_whose_posts_are_not_received` | A hint-only inventory falsely refreshes last sync, or a connected author's withheld posts never produce the room's `not receiving` verdict. Both initial feeds are fully received and both daemons cleanly stopped; the provider restarts refusing heads and only responding, so the fresh reader fetches new hints without any new entry. Status must keep its receipt clock unchanged and describe live entries not held, not claim nothing arrived between samples. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test vox_status_shows_the_node_proof status_names_a_connected_member_whose_posts_are_not_received -- --ignored --exact --nocapture` | two scratch members, head refusal and respond-only test knobs | over 60 s of observation, plus setup |
 | `a_join_outlives_its_displaced_path_proof::a_join_outlives_its_displaced_path` | A slow join fails when the network path changes under it. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test a_join_outlives_its_displaced_path_proof -- --ignored --exact a_join_outlives_its_displaced_path` | time (a 300 s join grind) | 314 s / 315 s |
 | `a_slow_joiner_gets_in_or_is_told_why_proof::a_joiner_slower_than_the_old_patience_gets_in` | A slow machine can't get into a room. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test a_slow_joiner_gets_in_or_is_told_why_proof -- --ignored --exact a_joiner_slower_than_the_old_patience_gets_in` | time (a 150 s grind) | 488 s / 490 s for both, run together |
 | `a_slow_joiner_gets_in_or_is_told_why_proof::a_joiner_slower_than_the_patience_is_told_why` | A machine too slow to join gets no explanation. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test a_slow_joiner_gets_in_or_is_told_why_proof -- --ignored --exact a_joiner_slower_than_the_patience_is_told_why` | time (a 485 s grind; run it alone so other work does not distort it) | (in the figure above) |

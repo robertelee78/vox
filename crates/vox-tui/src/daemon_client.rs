@@ -14,7 +14,7 @@ use vox_core::node::paths::Account;
 
 use crate::app::AppError;
 
-/// How long a client waits for a daemon it started to answer (S-2).
+/// How long a client waits for a daemon it started, or for a room first seen preparing.
 pub const START_WITHIN: Duration = Duration::from_secs(15);
 
 /// Cadence for a client checking whether the node has become available.

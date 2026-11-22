@@ -709,7 +709,10 @@ impl ChannelState {
             self.pending_text = None;
             if poison {
                 self.poisoned = true;
-                self.save_error = Some("authored save worker stopped".to_owned());
+                self.save_error.get_or_insert_with(|| {
+                    "room save did not complete; check vox status and reopen this room before posting again"
+                        .to_owned()
+                });
             }
             self.history_publication_changed.notify_waiters();
         }
@@ -758,8 +761,8 @@ impl PendingText {
                 (failure, Some(error))
             }
             Err(_) => (
-                Some("authored save worker stopped".to_owned()),
-                Some(Error::Profile("authored save worker stopped")),
+                Some("room save did not complete; check vox status and reopen this room before posting again".to_owned()),
+                Some(Error::Profile("room save did not complete; check vox status and reopen this room before posting again")),
             ),
         };
         let result = match self.durable_text.take() {
@@ -796,7 +799,7 @@ impl PendingText {
             }));
         let result = match work {
             Ok(result) => result.map(|hash| Saved::Governance(Some(hash))),
-            Err(_) => Err(Error::Profile("authored save worker stopped")),
+            Err(_) => Err(Error::Profile("room save did not complete; check vox status and reopen this room before posting again")),
         };
         self.complete_control(result)
     }
