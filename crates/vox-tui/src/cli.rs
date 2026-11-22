@@ -2455,6 +2455,8 @@ enum Cmd {
     /// their sync, peers and their paths, tunnels, datagram and app counters, and the sync
     /// counters per room and peer: sessions opened, admitted, refused, completed,
     /// partial and failed, and any backoff.
+    /// Includes every node's store-file size and available filesystem bytes, even when
+    /// that node is Locked or detached; unreadable figures say why they are unavailable.
     Status(StatusArgs),
     /// Every retained decision by this node, newest first; --json prints one event per line.
     Decisions(StatusArgs),
