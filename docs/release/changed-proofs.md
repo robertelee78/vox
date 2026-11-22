@@ -119,3 +119,17 @@ are registered through the public hook before the operation acts. The separate
 `an_agent_session_is_checked_from_both_sides_proof::the_doctor_explains_incompatible_claim_rules`
 act expects advice about matching claim rules, not matching package versions; it
 does not depend on the full journey's Claude wiring or process-provenance staging.
+
+## A materialized accepted join reopens after a crash
+
+A verified join saved with its room wrap and reopen keys completes its retained
+admission handoff at startup. It then follows ordinary room reopening, including
+settlement and delivery of consented keys. An acceptance with no saved room still
+needs the person's join passphrase; a refused or abandoned join is not restored.
+
+The existing complete syscall crash sweep is
+`a_crash_after_a_consent_still_delivers_the_key_proof::a_crash_in_a_consent_whose_member_key_is_held_still_delivers_it`.
+Run it explicitly in the required build slot:
+`cargo test --release -p vox-tui --features test-knobs,optional-proofs --test a_crash_after_a_consent_still_delivers_the_key_proof a_crash_in_a_consent_whose_member_key_is_held_still_delivers_it -- --ignored --exact --nocapture`.
+It kills the serving daemon at each store boundary of the join and following
+consent, restarts it, and requires the member to read the next post.

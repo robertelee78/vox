@@ -189,6 +189,44 @@ pub(super) fn retain_accepted_join_native(
     batch.commit()
 }
 
+/// A stored accepted room already owns its reopen keys. Finish its journal handoff so startup
+/// reopens it normally; an acceptance with no stored room still needs the joining passphrase.
+pub(super) fn finish_saved_accepted_joins(
+    store: &Store,
+    signer: &VaultRootSigner,
+) -> crate::error::Result<BTreeMap<Digest32, AcceptedJoin>> {
+    let mut batch = store.batch()?;
+    let mut accepted = load_accepted_joins(store, signer)?;
+    let open = OpenRooms::load(store, signer)?;
+    let mut unfinished = load_journal(store, PENDING_JOIN_CLEANUP_META_KEY)?;
+    let mut changed = false;
+    for (room, _) in open.rooms() {
+        let Some(join) = accepted.get(room) else {
+            continue;
+        };
+        if store.get_sek_wrap(room)?.as_ref() != Some(&join.wrap) {
+            return Err(Error::Profile("accepted join wrap changed"));
+        }
+        let proposal = crate::node::joinstream::AdmissionProposal::from_body(&join.proposal)?;
+        let cleanup = unfinished
+            .get(room)
+            .ok_or(Error::Profile("accepted join cleanup missing"))?;
+        verify_join_rollback(cleanup, signer, *room, proposal.epoch)?;
+        accepted.remove(room);
+        unfinished.remove(room);
+        changed = true;
+    }
+    if changed {
+        queue_accepted_joins(&mut batch, signer, &accepted)?;
+        batch.put_meta(
+            PENDING_JOIN_CLEANUP_META_KEY,
+            &pending_withdrawals_bytes(&unfinished)?,
+        )?;
+        batch.commit()?;
+    }
+    Ok(accepted)
+}
+
 /// One room's owned reopen keys, never a replacement snapshot of the shared map.
 pub(super) enum MapChange {
     Remember {
