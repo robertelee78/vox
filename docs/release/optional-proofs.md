@@ -78,7 +78,8 @@ python3 scripts/app-proofs-vm.py --restart-vm /absolute/prebuilt/vox \
 
 Build with `test-knobs` for the hold. It uses the same scratch bindings and always boots out
 the owned job and stops the guest. A login-item restart is one `launchctl kickstart -k`;
-it restarts a loaded job, not an absent one. A failed request is reported with launchctl's error.
+the shipped job gives its daemon 35 seconds to finish stopping. It restarts a loaded job, not
+an absent one. A failed request is reported with launchctl's error.
 
 ### macOS update recovery (ADR-014 M-29a)
 

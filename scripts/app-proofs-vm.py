@@ -163,6 +163,7 @@ def managed_guest_proof():
         if ready() != (first, first_runs):
             raise RuntimeError("APPARATUS: staging did not retain the initial managed daemon")
         if mode == "restart":
+            restart_log_start = daemon_log.stat().st_size if daemon_log.exists() else 0
             with caller_log.open("w+") as output:
                 restarter = subprocess.Popen([str(helper), "daemon", "--restart"], env=env,
                                              stdin=subprocess.DEVNULL, stdout=output,
@@ -198,7 +199,7 @@ def managed_guest_proof():
                     raise RuntimeError(f"PRODUCT: killed caller left launchd inactive with exit 0 and no greeting: {text}")
             second, second_runs = until("managed replacement after caller death", restarted, restart_timeout)
             print(f"[proof] replacement before any client:\n{state()[2]}", flush=True)
-            stopped_log = daemon_log.read_text()
+            stopped_log = daemon_log.read_bytes()[restart_log_start:].decode(errors="replace")
             print(f"[proof] daemon log through replacement:\n{stopped_log}", flush=True)
             if "stopped by SIGTERM" not in stopped_log:
                 raise RuntimeError("PRODUCT: launchd replaced the daemon without its clean "
