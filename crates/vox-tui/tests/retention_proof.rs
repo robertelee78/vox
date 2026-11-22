@@ -6,7 +6,8 @@
 //! message leaves nothing visible; its signed skeleton stays so sync and fork detection keep
 //! working. This is look and feel, not a security property.
 //!
-//! Real seconds, small durations, no faked clocks: the waits below are the durations themselves.
+//! Message-retention journeys use real durations. The RG-13 Session-step journey uses the
+//! test-only clock to observe days of retention without waiting days.
 //!
 //! **Proof 3 (retroactive), and a node keeping more follows the room:** 40 messages, a pause, 60
 //! more; the admin sets the room to 30 s. bob's node keeps **a week** (the `retention` file in its
@@ -60,6 +61,10 @@ mod attach;
 mod ports;
 #[path = "support/typed.rs"]
 mod typed;
+
+#[cfg(feature = "test-knobs")]
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -934,5 +939,327 @@ fn a_member_who_joins_after_messages_expired_catches_up() {
         owed, 0,
         "PRODUCT: carol shows {owed} expired messages as not received yet: she waits on bodies no \
          member can supply"
+    );
+}
+
+/// RG-13: implicit steps last two days; signed admin choices and lifecycle survive.
+#[cfg(feature = "test-knobs")]
+#[test]
+#[ignore = "real binary, private Session records and test-knobs clock; run in release"]
+fn session_steps_expire_after_two_days_unless_the_admin_chose_otherwise() {
+    use vox_core::node::ipc::{Frame, IpcClient, NodeSocket, Request};
+    use vox_core::node::paths::{NodeName, Paths};
+    watchdog::arm();
+    test_knobs::require(&["VOX_TEST_CLOCK_STEP_MS"]);
+    let scratch = tempfile::tempdir().expect("APPARATUS: retention profile");
+    let dir = scratch.path();
+    std::fs::create_dir_all(dir.join("cfg")).expect("APPARATUS: retention config");
+    let keychain = attach::keychain(dir);
+    let command = || {
+        let mut cmd = Command::new(VOX);
+        cmd.env("VOX_DATA_DIR", dir)
+            .env("VOX_CONFIG_DIR", dir.join("cfg"))
+            .env("VOX_TEST_KEYCHAIN", &keychain)
+            .env("VOX_PROXY", "127.0.0.1:0")
+            .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
+            .env_remove("VOX_NODE")
+            .env_remove("VOX_ROOM");
+        cmd
+    };
+    let run = |args: &[&str], input: Option<&str>| {
+        let mut child = command()
+            .args(args)
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("APPARATUS: retention CLI");
+        if let Some(input) = input {
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(input.as_bytes())
+                .unwrap();
+        }
+        let out = child
+            .wait_with_output()
+            .expect("APPARATUS: retention CLI output");
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let (ok, out, err) = run(&["id"], None);
+    assert!(ok, "APPARATUS: protected node: {out}{err}");
+    let launch = |offset: u64| {
+        let log = std::fs::File::create(dir.join(format!("clock-{offset}.log"))).unwrap();
+        let mut child = command()
+            .args(["daemon", "--listen", "127.0.0.1:0"])
+            .env("VOX_TEST_CLOCK_STEP_MS", offset.to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(log)
+            .spawn()
+            .expect("APPARATUS: retention daemon");
+        writeln!(child.stdin.take().unwrap(), "{IDENTITY}").unwrap();
+        let daemon = Daemon(child);
+        let began = Instant::now();
+        loop {
+            let (ok, out, err) = run(&["status", "--json"], None);
+            if ok
+                && serde_json::from_str::<serde_json::Value>(&out)
+                    .is_ok_and(|v| v["status"] == "Ready")
+            {
+                break;
+            }
+            assert!(
+                began.elapsed() < Duration::from_secs(60),
+                "APPARATUS: clock-stepped daemon not Ready: {out}{err}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        daemon
+    };
+    let mut daemon = launch(0);
+    let paths = Paths::resolve("default", Some(dir), Some(&dir.join("cfg"))).unwrap();
+    let socket = NodeSocket::one_shot(
+        paths.account().socket(),
+        NodeName::parse("default").unwrap(),
+    );
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let request = |request: Request| {
+        let mut client = rt
+            .block_on(IpcClient::open_at(&socket))
+            .expect("APPARATUS: room IPC");
+        let began = Instant::now();
+        loop {
+            let reply = rt
+                .block_on(client.request(&request))
+                .expect("APPARATUS: room IPC reply");
+            if !matches!(&reply, Frame::Error { reason } if
+                reason.contains("permissions are still being read") ||
+                reason.contains("room governance is refreshing"))
+            {
+                return reply;
+            }
+            assert!(
+                began.elapsed() < Duration::from_secs(120),
+                "APPARATUS: policy staging never became ready: {reply:?}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let read_session = |room: &str| {
+        let began = Instant::now();
+        loop {
+            let (ok, listed, err) = run(&["room", "sessions", room, "--json"], None);
+            if !ok {
+                assert!(
+                    err.contains("room is preparing its saved history")
+                        && began.elapsed() < Duration::from_secs(120),
+                    "APPARATUS: Session listing never became available: {listed}{err}"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            if listed.contains("ttl-session") {
+                let (ok, shown, err) =
+                    run(&["room", "session", room, "ttl-session", "--json"], None);
+                if ok {
+                    return (listed, shown);
+                }
+                assert!(
+                    err.contains("Sessions changed") || err.contains("refresh the listing"),
+                    "APPARATUS: Session read refused, not expiry: {shown}{err}"
+                );
+            }
+            assert!(
+                began.elapsed() < Duration::from_secs(120),
+                "APPARATUS: Session projection did not publish: {listed}{err}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let mut rooms = Vec::new();
+    let mut policy_failures = Vec::new();
+    for (name, seconds) in [
+        ("default", None),
+        ("seven", Some(604800)),
+        ("short", Some(86400)),
+        ("forever", Some(0)),
+        ("equal", Some(172800)),
+    ] {
+        let (ok, out, err) = run(
+            &["room", "create", "--name", name, "--passphrase-file", "-"],
+            Some("retention room passphrase\n"),
+        );
+        assert!(ok, "APPARATUS: create {name}: {out}{err}");
+        let Frame::Rooms { rooms: listed } = request(Request::Rooms { after: None }) else {
+            panic!("APPARATUS: rooms did not return a listing");
+        };
+        let cid = listed
+            .iter()
+            .find(|(_, label, ..)| label == name)
+            .unwrap()
+            .0;
+        let room = vox_core::node::link::b32_encode(&cid);
+        if let Some(seconds) = seconds {
+            assert!(
+                matches!(
+                    request(Request::SetStepRetention {
+                        channel_id: cid,
+                        seconds
+                    }),
+                    Frame::Ok
+                ),
+                "APPARATUS: explicit {name} step policy"
+            );
+        }
+        if name == "equal" {
+            let (ok, out, err) = run(&["status", "--json"], None);
+            assert!(
+                ok,
+                "APPARATUS: status before repeated admin choice: {out}{err}"
+            );
+            let before: serde_json::Value = serde_json::from_str(&out).unwrap();
+            let count = |v: &serde_json::Value| {
+                v["rooms"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|r| r["id"] == room)
+                    .and_then(|r| r["log_entries"].as_u64())
+                    .expect("APPARATUS: policy room not published")
+            };
+            let before = count(&before);
+            assert!(
+                matches!(
+                    request(Request::SetStepRetention {
+                        channel_id: cid,
+                        seconds: 172800
+                    }),
+                    Frame::Ok
+                ),
+                "APPARATUS: repeat explicit default-equal choice"
+            );
+            let (ok, out, err) = run(&["status", "--json"], None);
+            assert!(
+                ok,
+                "APPARATUS: status after repeated admin choice: {out}{err}"
+            );
+            let after: serde_json::Value = serde_json::from_str(&out).unwrap();
+            if count(&after) != before + 1 {
+                policy_failures.push(format!("explicit default-equal choice must record one signed log entry: before={before}; after={after}"));
+            }
+        }
+        let lifecycle = serde_json::json!({"v":1,"type":"session","from":"ttl-session",
+            "body":"","at":{"session_name":"TTL-LIFECYCLE"},
+            "data":{"session":{"harness":"rg13-retention"}}})
+        .to_string();
+        let activity = serde_json::json!({"v":1,"session":"ttl-session","kind":"reply",
+            "seq":1,"text":"TTL-ACTIVITY"})
+        .to_string();
+        for body in [lifecycle, activity] {
+            let result = request(Request::AppendSession {
+                channel_id: cid,
+                session_id: "ttl-session".to_owned(),
+                body,
+            });
+            assert!(
+                matches!(result, Frame::Appended { .. }),
+                "APPARATUS: real private Session append: {result:?}"
+            );
+        }
+        assert!(
+            matches!(
+                request(Request::Post {
+                    channel_id: cid,
+                    text: "ORDINARY-FOREVER".to_owned(),
+                    card: false
+                }),
+                Frame::Ok
+            ),
+            "APPARATUS: ordinary message control"
+        );
+        let began = Instant::now();
+        loop {
+            let (listed, shown) = read_session(&room);
+            if listed.contains("TTL-LIFECYCLE") && shown.contains("TTL-ACTIVITY") {
+                break;
+            }
+            assert!(
+                began.elapsed() < Duration::from_secs(120),
+                "APPARATUS: activities/lifecycle were not initially readable: {listed}{shown}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        rooms.push((name, room));
+    }
+    let mut failures = policy_failures;
+    for offset in [86_400_001, 172_800_001] {
+        drop(daemon);
+        daemon = launch(offset);
+        for (name, room) in &rooms {
+            let (listed, shown) = read_session(room);
+            // A room can finish reopening after the first daemon Ready report.
+            let (ok, status, err) = run(&["status", "--json"], None);
+            assert!(
+                ok,
+                "APPARATUS: status after the room's Session listing: {status}{err}"
+            );
+            let status: serde_json::Value = serde_json::from_str(&status).unwrap();
+            let expected_activity = *name == "seven"
+                || *name == "forever"
+                || ((*name == "default" || *name == "equal") && offset < 172_800_001);
+            if shown.contains("TTL-ACTIVITY") != expected_activity {
+                failures.push(format!(
+                    "{name} at +{offset}ms activity expected={expected_activity}: {shown}"
+                ));
+            }
+            if !listed.contains("TTL-LIFECYCLE") {
+                failures.push(format!("{name} lost lifecycle: {listed}"));
+            }
+            let report = status["rooms"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["id"] == *room)
+                .expect("PRODUCT: status omitted a retained room");
+            let ttl = match *name {
+                "default" | "equal" => 172800,
+                "seven" => 604800,
+                "short" => 86400,
+                _ => 0,
+            };
+            if report["step_retention"] != ttl || report["retention"] != 0 {
+                failures.push(format!(
+                    "{name} status step TTL must be {ttl}, messages forever: {report}"
+                ));
+            }
+            let (ok, ordinary, err) = run(&["room", "read", room, "--json"], None);
+            assert!(ok, "APPARATUS: ordinary message read: {ordinary}{err}");
+            if !ordinary.contains("ORDINARY-FOREVER") {
+                failures.push(format!("{name} changed ordinary retention: {ordinary}"));
+            }
+            eprintln!(
+                "OBSERVATION +{offset}ms {name}: activity={} lifecycle={} status={report}",
+                shown.contains("TTL-ACTIVITY"),
+                listed.contains("TTL-LIFECYCLE")
+            );
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "PRODUCT: Session-step retention failed:\n{}",
+        failures.join("\n")
     );
 }
