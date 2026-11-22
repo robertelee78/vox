@@ -1362,6 +1362,7 @@ pub struct ChannelState {
     /// Current local trust used only to filter accepted-cache recovery reads.
     legacy_cache_trusted: Option<BTreeSet<Digest32>>,
     trust_reconciled_generation: u64,
+    trust_failed_generation: Option<u64>,
     /// Bounded cursors over retained key-package log rows and admitted-author drive hints.
     /// The actor opens one returned package at a time using its prekey ring.
     key_packages: key_package_queue::Queue,
@@ -2317,6 +2318,7 @@ impl ChannelState {
             legacy_preparation: entry_store::Preparation::Ready,
             legacy_cache_trusted: None,
             trust_reconciled_generation: 0,
+            trust_failed_generation: None,
             key_packages: key_package_queue::Queue::new(1),
             receivers: BTreeMap::new(),
             services: BTreeMap::new(),
@@ -2960,6 +2962,7 @@ impl ChannelState {
             legacy_preparation,
             legacy_cache_trusted: None,
             trust_reconciled_generation: 0,
+            trust_failed_generation: None,
             key_packages,
             receivers,
             services,
@@ -3453,6 +3456,7 @@ impl ChannelState {
             legacy_preparation: entry_store::Preparation::Ready,
             legacy_cache_trusted: None,
             trust_reconciled_generation: 0,
+            trust_failed_generation: None,
             key_packages: key_package_queue::Queue::new(1),
             receivers: BTreeMap::new(),
             services: BTreeMap::new(),

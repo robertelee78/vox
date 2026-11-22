@@ -231,28 +231,22 @@ impl Node {
     ) {
         if continuation.attached(self, &room) {
             match continuation.after {
-                After::Trust { .. } => {
+                After::Trust { generation, .. } => {
+                    let instance = Arc::clone(&continuation.instance);
+                    tokio::spawn(async move {
+                        instance.lock().await.mark_trust_failed(generation);
+                    });
                     self.governance_work.trust_waiting.insert(room);
-                    if ChannelState::governance_refreshing(&error)
-                        || ChannelState::legacy_classification_refreshing(&error)
-                        || matches!(
-                            error,
-                            Error::ComputerPolicySuperseded
-                                | Error::Profile("current computer trust is unavailable")
-                                | Error::Profile("room publication is busy; retry this operation")
-                        )
-                    {
-                        let retry = self
-                            .now_ms()
-                            .0
-                            .saturating_add(ROOM_RETRY.as_millis() as u64);
-                        let next = self
-                            .governance_work
-                            .deadlines
-                            .get(&room)
-                            .map_or(retry, |at| (*at).min(retry));
-                        self.governance_work.set_deadline(room, Some(next));
-                    }
+                    let retry = self
+                        .now_ms()
+                        .0
+                        .saturating_add(ROOM_RETRY.as_millis() as u64);
+                    let next = self
+                        .governance_work
+                        .deadlines
+                        .get(&room)
+                        .map_or(retry, |at| (*at).min(retry));
+                    self.governance_work.set_deadline(room, Some(next));
                 }
                 After::Sweep(sweep) => {
                     if matches!(
@@ -518,6 +512,7 @@ impl Node {
                     Ok(trust_save::ReconcileAction::Withdraw { target }) => {
                         maintenance_save::Work::Consent(consent_save::Work::Withdraw { target })
                     }
+                    #[cfg(feature = "test-knobs")]
                     Ok(trust_save::ReconcileAction::Progress) => {
                         self.governance_work.again = true;
                         return;
@@ -950,8 +945,18 @@ impl Node {
         let cache_only = {
             let channel = continuation.instance.lock().await;
             if turn.ready {
-                self.governance_work
-                    .set_deadline(room, channel.governance_deadline());
+                let deadline = channel
+                    .governance_deadline()
+                    .into_iter()
+                    .chain(
+                        self.governance_work
+                            .deadlines
+                            .get(&room)
+                            .copied()
+                            .filter(|_| self.governance_work.trust_waiting.contains(&room)),
+                    )
+                    .min();
+                self.governance_work.set_deadline(room, deadline);
             }
             channel.legacy_cache_only(&continuation.lifetime.store)
         };

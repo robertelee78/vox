@@ -342,7 +342,9 @@ fn a_member_removed_while_its_room_was_closed_is_acted_on_when_it_opens() {
     let line = attached(&bob, "bob-3");
     assert!(
         !line.lines().any(|l| l.contains("[closed]")),
-        "PRODUCT (staging): `vox daemon`, given room C's passphrase, did not open C: {line}"
+        "PRODUCT (staging): `vox daemon`, given room C's passphrase, did not open C: {line}\nstdout:\n{}\nstderr:\n{}",
+        std::fs::read_to_string(bob.join("daemon-bob-3.out")).unwrap_or_default(),
+        std::fs::read_to_string(bob.join("daemon-bob-3.err")).unwrap_or_default()
     );
 
     // ---- (a) alice's posts after the removal stay unreadable to bob ---------------------------

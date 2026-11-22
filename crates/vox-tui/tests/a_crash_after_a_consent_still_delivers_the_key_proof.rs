@@ -89,8 +89,9 @@ const HOLD: Duration = Duration::from_secs(10);
 const PAST_THE_END: Duration = Duration::from_secs(8);
 /// How long alice's store must go unflushed before a kill point is armed.
 const QUIET: Duration = Duration::from_secs(3);
-/// A consent is a handful of transactions; a sweep longer than this measures something else.
-const MAX_POINTS: u64 = 16;
+/// A trust decision is its consent and the room's own staged trust work (RG-3): a few dozen
+/// transactions. A sweep that has not reached the end by this many measures something else.
+const MAX_POINTS: u64 = 48;
 /// Fewer kill points than this inside a consent cannot have visited every boundary in it.
 const MIN_KILLS: u64 = 3;
 /// The held-key arm's sweep: a join and the consent after it are many more transactions than a

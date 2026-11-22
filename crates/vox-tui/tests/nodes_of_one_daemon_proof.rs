@@ -4754,15 +4754,24 @@ fn an_unfinished_room_refuses_only_its_own_posts_then_finishes() {
     std::fs::remove_file(&journey.hold).unwrap();
     let after = "rg3-after-room-withdrawal";
     let mut last = (false, String::new(), String::new());
+    let mut released = false;
+    let mut exchanges = 0;
+    for index in 0..100 {
+        last = journey.a.run(
+            &["room", "post", &journey.room, after, "--node", "alpha"],
+            "",
+        );
+        if last.0 {
+            released = true;
+            break;
+        }
+        journey.assert_healthy_posts(&format!("rg3-release-progress-{index}"));
+        exchanges += 1;
+        std::thread::sleep(Duration::from_millis(25));
+    }
     assert!(
-        wait_until(RETURN_WITHIN, || {
-            last = journey.a.run(
-                &["room", "post", &journey.room, after, "--node", "alpha"],
-                "",
-            );
-            last.0
-        }),
-        "APPARATUS: the released room never reached the post-removal read premise: {}{}",
+        released,
+        "PRODUCT: the released room still refused its post after another room accepted and read {exchanges} posts: {}{}",
         last.1,
         last.2
     );
@@ -4885,6 +4894,7 @@ fn an_unfinished_room_releases_no_key_until_its_withdrawal_finishes() {
             "PRODUCT: unfinished room released its sender key before withdrawal finished: {shown}{err}");
     }
     std::fs::remove_file(&journey.hold).unwrap();
+    let recovery_started = Instant::now();
     let mut received = false;
     let mut last = (false, String::new(), String::new());
     let mut last_post = (false, String::new(), String::new());
@@ -4934,6 +4944,20 @@ fn an_unfinished_room_releases_no_key_until_its_withdrawal_finishes() {
             .run(&["room", "read", &journey.room, "--node", "gamma"], "");
         if last.0 && last.1.contains("rg3-before-withdrawal") && last.1.contains(after) {
             received = true;
+            if queued {
+                eprintln!(
+                    "[RG-3 queued recovery] both markers shown after {} completed requests in {:?}",
+                    index + 1,
+                    recovery_started.elapsed()
+                );
+                for line in journey._daemons[0].said().lines().filter(|line| {
+                    line.contains("room authorization changed")
+                        || line.contains("one-time prekey")
+                        || line.contains("signed prekey")
+                }) {
+                    eprintln!("[RG-3 queued sender] {line}");
+                }
+            }
             break;
         }
     }

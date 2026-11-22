@@ -346,10 +346,11 @@ impl Node {
             return;
         };
         let generation = self.trust_generation;
-        if channel.is_poisoned() || self.governance_work.trust_waiting.contains(&room) {
+        if channel.is_poisoned() {
             return;
         }
-        if !channel.trust_reconciled(generation)
+        if !self.governance_work.trust_waiting.contains(&room)
+            && !channel.trust_reconciled(generation)
             && self.profile.as_ref().is_some_and(|profile| {
                 channel
                     .require_governance_ready(profile.store(), self.now_ms())
