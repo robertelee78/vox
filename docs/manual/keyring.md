@@ -359,11 +359,33 @@ Construct `vox computer remove` with the intended computer's full fingerprint fr
 status, and its current frontier in `--confirm`. Both values come from the actual status;
 neither is a reusable example.
 
-This withdraws all trust in that computer's nodes, including individual grants made before
+Removing a computer withdraws trust in its nodes, including individual grants made before
 pairing. Remaining computers apply the removal when they receive it; pending does not mean
-confirmed. This cannot erase messages or files the removed computer already received. Restart
-or an old roster cannot restore it. Bringing it back requires a fresh two-sided enrollment.
-After removal you can instead make a deliberate new individual grant with `vox trust add`.
+confirmed. This cannot erase messages or files already received. Restarting or replaying an old
+roster cannot undo the removal, and the same computer cannot be enrolled into that group again.
+
+To put two former group members A and B together again after A removes B, retire the old group
+locally on B with `vox computer retire`. On A, use `vox computer remove` with A's own full
+fingerprint from `vox computer status --details`, then run `vox computer retire` there too.
+Review and confirm each removal and retirement. Have B make a fresh `vox computer invite`; use
+its link with `vox computer pair` on A and approve the reviewed pairing on both computers. This
+creates a new group, not a restoration of the old one.
+
+For a group of three or more, first decide which computers will move to the new group. Each
+moving computer must be removed from the old group and retire it locally. An active computer can
+remove the others and itself last, or each can remove itself. Pair the first two retired
+computers to create the new group, then enroll each other moving computer with a fresh
+invitation and two-sided approval. Computers not moving can keep the old group: they need not
+remove themselves or retire, but they no longer share computer-policy Read and Drive with the
+computers that left. Reuniting ALL the former members with the removed computer requires moving
+them ALL to a new group.
+
+Retirement preserves computer and node identities, local data and signed history, and removes
+covered grants before new pairing. It neither erases data nor claims revocation on unreachable
+computers. New computer pairing does not join rooms or restore room membership or consent. If
+you only want to trust one of the removed computer's nodes again without replacing the computer
+group, make a deliberate new individual grant with `vox trust add`; that does not re-enroll its
+computer.
 
 While a received removal is being applied, a room read can say `computer policy is refreshing;
 retry`. Check `vox computer status` for the pending application; do not repeat the removal,
@@ -386,12 +408,6 @@ binding. No command guesses ownership from a name or copied fingerprint. If the 
 manager is lost, remove it first, then explicitly approve recovery on the destination with
 `vox computer binding recover` with the actual node fingerprint and the current destination
 frontier in `--confirm`. Recovery retains the old binding and removal evidence. If a node key was compromised, use a new node identity instead.
-
-If this computer has been removed and the old group cannot be continued, use
-`vox computer retire`. Review the computers and covered authority and confirm explicitly;
-Vox checks that the reviewed state has not changed before retiring it locally. This preserves
-identities, data and signed history and removes covered grants before a fresh pairing. It does
-not erase data or claim revocation on unreachable computers.
 
 ## Trust from the TUI
 

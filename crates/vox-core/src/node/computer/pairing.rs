@@ -2756,10 +2756,14 @@ impl Management {
         pop::verify(&proof, &auth_context, &transcript, &link.target)?;
         let remote_offer = d.bytes()?.to_vec();
         d.finish()?;
-        self.apply_discovery_removal(&remote_offer, link.target, deadline)?;
+        self.apply_discovery_removal(&remote_offer, link.target, deadline)
+            .map_err(invitation_refusal)?;
         let (remote_group, local_offer) = {
             let s = lock(&self.computer.state);
-            (validate_offer(&s, &remote_offer)?, group_offer(&s)?)
+            (
+                validate_offer(&s, &remote_offer).map_err(invitation_refusal)?,
+                group_offer(&s)?,
+            )
         };
         if remote_group
             .as_ref()
@@ -4985,8 +4989,16 @@ fn group_offer(s: &State) -> Result<Vec<u8>> {
     if let Some(genesis) = &s.genesis {
         let local = s.description.fingerprint()?;
         if s.grant(&local).is_none() || !s.quarantined.is_empty() || !s.history_complete() {
+            #[cfg(feature = "test-knobs")]
+            if crate::node::computer::fx28_mutant("refusal-without-next-command") {
+                return Err(Error::Profile(
+                    "this computer's group authority is removed or suspended",
+                ));
+            }
+            // The same refusal covers quarantine and incomplete history: retiring is advised
+            // only for the removed case.
             return Err(Error::Profile(
-                "this computer's group authority is removed or suspended",
+                "this computer's group authority is removed or suspended; run vox computer status --details. If it was removed, run vox computer retire here; a former group member must also leave and retire the old group before you pair into a new one",
             ));
         }
         e.array(2).bytes(&genesis.encode());
@@ -5014,6 +5026,19 @@ fn group_offer(s: &State) -> Result<Vec<u8>> {
     Ok(e.finish())
 }
 
+/// `validate_offer`'s refusal of an offered group retired on this computer, or an invalid one.
+const RETIRED_OR_INVALID_GROUP: &str = "this computer group was retired or is invalid";
+
+/// The redeemer reads that refusal about the invitation it holds, so it says what to do with it.
+fn invitation_refusal(e: Error) -> Error {
+    match e {
+        Error::Profile(RETIRED_OR_INVALID_GROUP) => Error::Profile(
+            "this invitation offers a group retired on this computer, or an invalid group; nothing was paired. If it is your former group, the computer you want to pair with must leave it and run vox computer retire before you pair into a new group; otherwise discard this invitation and request a valid one",
+        ),
+        e => e,
+    }
+}
+
 /// Verify signed ancestry in a detached state, including locally retained same-group evidence.
 fn validate_offer(s: &State, bytes: &[u8]) -> Result<Option<State>> {
     let mut d = Decoder::new(bytes);
@@ -5030,9 +5055,7 @@ fn validate_offer(s: &State, bytes: &[u8]) -> Result<Option<State>> {
     genesis.verify(true)?;
     let group = genesis.incarnation();
     if genesis.group.is_some() || s.retired_groups.contains_key(&group) {
-        return Err(Error::Profile(
-            "this computer group was retired or is invalid",
-        ));
+        return Err(Error::Profile(RETIRED_OR_INVALID_GROUP));
     }
     if s.genesis
         .as_ref()
