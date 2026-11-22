@@ -303,7 +303,7 @@ pub async fn list(paths: &Paths) -> Result<(), AppError> {
             "{}  {shown}{}{}",
             short(id),
             match (open_failure, *preparing, waiting) {
-                (Some(reason), _, _) => format!("  [failed: {reason}]"),
+                (Some(reason), _, _) => format!("  [closed: {reason}]"),
                 (None, true, Some((what, since))) => format!(
                     "  [preparing history: waiting for {what}, {}]",
                     vox_core::node::status::since_text(*since)
@@ -318,6 +318,14 @@ pub async fn list(paths: &Paths) -> Result<(), AppError> {
                 format!("  [{over}]")
             }
         );
+        if open_failure.is_some() {
+            let node = crate::client::name_of(paths)?;
+            let join = vox_text::shell::node_command(&["vox", "room", "join"], node.as_str());
+            println!(
+                "  To reopen it once the cause above is fixed, run `{join}` with this room's \
+                 address and passphrase (another member's `vox room link` prints the address)."
+            );
+        }
     }
     for name in &clashing {
         println!(
@@ -655,6 +663,7 @@ pub(crate) async fn post_structured(
     };
     for reserved in [
         vox_agentcomms::version::VOX_KEY,
+        vox_agentcomms::version::CLAIMS_KEY,
         vox_agentcomms::ops::OP_KEY,
         THREAD_TAGS_KEY,
     ] {
@@ -3315,8 +3324,8 @@ fn parse_cursor(s: &str) -> Result<Digest32, AppError> {
 //
 // - **the owner is `(author, session)`** — two sessions on one harness are two owners,
 //   so every verb needs a session and refuses without one;
-// - **every operation is stamped with this binary's version** and a worker refuses to
-//   coordinate at all while any participant runs another — exit 3, naming it;
+// - **every operation is stamped with its claim-rules number** and a worker refuses to
+//   coordinate while a participant uses other rules — exit 3, naming it;
 // - **every operation carries an operation id**, so a retry is one operation and a
 //   conflicting reuse is explicit — exit 4;
 // - **a handoff names a fingerprint**, never a petname a reader resolves differently,
@@ -3945,7 +3954,7 @@ async fn agreement(
         }
         let posted = coord::posted_of(&rows);
         let now = coord::now_millis();
-        let own = claim::fold(&posted, coord::VERSION, now);
+        let own = claim::fold(&posted, vox_agentcomms::version::CLAIM_RULES, now);
         let mut why = Vec::new();
         for (member, stands) in &report.members {
             let reason = match stands {
@@ -3958,7 +3967,7 @@ async fn agreement(
                         .filter(|p| !absent.contains(&p.entry_hash))
                         .cloned()
                         .collect();
-                    match claim::fold(&theirs, coord::VERSION, now)
+                    match claim::fold(&theirs, vox_agentcomms::version::CLAIM_RULES, now)
                         .resources
                         .get(resource)
                     {
@@ -4526,7 +4535,7 @@ pub async fn board(
                                 "last_millis": p.last_millis, "entry_hash": claim::b32(&p.entry_hash)})
                             )?;
                         } else if p.stamp != vox_agentcomms::version::Stamp::Match {
-                            writeln!(out, "work coordination refused: worker {} session {} last announced vox {} at {}; required {}",
+                            writeln!(out, "work coordination refused: worker {} session {} last announced claim rules {} at {}; required {}",
                                 crate::ident::name_of(&p.author), session_name(&p.session), p.stamp.describe(&page.version), millis_as_time(p.last_millis), page.version)?;
                         }
                         count += 1;

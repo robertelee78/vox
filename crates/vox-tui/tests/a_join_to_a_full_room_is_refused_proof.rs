@@ -23,6 +23,13 @@
 //! The joins that filled it are claims too: each exited 0 and the host answered it, admitting
 //! before accepting into the store its roster reads, so a member it does not list is `PRODUCT:`.
 //!
+//! **A lost admission answer stays uncertain**
+//! ([`a_lost_admission_answer_remains_uncertain`]): the responder is stopped at the existing
+//! test-only admission gate, after the joiner prepared rollback but before any admission answer.
+//! The joiner must say remote admission may have occurred and give its withdrawal/retry advice,
+//! never call the lost exchange a definite refusal. The gate marker stages the loss; the
+//! assertions read only the real join command's words.
+//!
 //! **A member that accepts the passphrase and then cannot admit the joiner says so**
 //! ([`a_join_a_member_cannot_admit_says_why`]): a host that was locked or closing mid-join, or
 //! could not write its store, refused its joiner with the refusal a wrong passphrase gets, so the
@@ -178,6 +185,53 @@ fn a_join_to_a_full_room_is_refused() {
         "PRODUCT: after the refused join the host's roster lists {} (want {CAP}, the newcomer not \
          among them)\n{after:?}",
         after.len()
+    );
+}
+
+/// The joiner cannot infer a refusal from losing its responder after rollback preparation.
+#[test]
+#[ignore = "real binaries and production Argon2id: the release gate runs it"]
+fn a_lost_admission_answer_remains_uncertain() {
+    watchdog::arm();
+    test_knobs::require(&[GATE]);
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
+    let root = tmp.path();
+    let (_anchor, spec) = anchor(root);
+    let gate = root.join("lost-answer");
+    let gate_s = gate.to_str().expect("APPARATUS: a UTF-8 gate path");
+    let host = Member::new(root, "host");
+    let host_d = host.daemon_with_anchor(Some(&spec), &[(GATE, gate_s)]);
+    let room = host.create("lost-answer");
+    let link = host.invite(&room);
+    let late = Member::new(root, "late");
+    let _late_d = late.daemon(Some(&spec));
+    let (ok, said) = std::thread::scope(|s| {
+        let joining = s.spawn(|| join(&late, &link));
+        held_at_gate(root, "lost-answer.reached.", 1);
+        drop(host_d);
+        joining
+            .join()
+            .unwrap_or_else(|error| std::panic::resume_unwind(error))
+    });
+    println!("[proof] the join whose admission answer was lost exited ok={ok}:\n{said}");
+    assert!(
+        !ok,
+        "PRODUCT: the responder supplied no admission answer, but the join reported success:\n{said}"
+    );
+    for want in [
+        "remote admission may have occurred, but its acceptance could not be verified and saved",
+        "this node queued its own withdrawal",
+        "retry with a fresh authenticated join",
+    ] {
+        assert!(
+            said.contains(want),
+            "PRODUCT: the lost admission answer did not retain uncertainty/recovery advice \
+             {want:?}:\n{said}"
+        );
+    }
+    assert!(
+        !said.contains("so you were not admitted"),
+        "PRODUCT: a lost admission answer was called a definite refusal:\n{said}"
     );
 }
 

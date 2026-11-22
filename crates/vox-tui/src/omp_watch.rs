@@ -1,13 +1,27 @@
-//! Read-only daemon availability observation and OMP lifetime ownership.
+//! Daemon availability observation and OMP lifetime ownership.
 use crate::omp_fence::{FenceError, Owner};
 use crate::wake::AttentionRoute;
 use std::io::{BufRead, Read, Write};
+use std::sync::{
+    atomic::{AtomicU32, Ordering},
+    Arc,
+};
 use std::time::Duration;
 use tokio::sync::mpsc;
-use vox_core::node::daemonipc::{DaemonClient, DaemonFrame, DaemonRequest, NodeState};
+use vox_core::node::daemonipc::{
+    DaemonClient, DaemonEvent, DaemonFrame, DaemonRequest, DetachCause, NodeState,
+};
 use vox_core::node::paths::{Account, NodeName};
 
 const DEADLINE: Duration = Duration::from_secs(2);
+#[cfg(feature = "test-knobs")]
+fn ready_interval() -> u64 {
+    std::env::var("VOX_TEST_WATCH_READY_INTERVAL_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|seconds| (1..=30).contains(seconds))
+        .unwrap_or(30)
+}
 const MAX_LINE: u64 = 65536;
 
 #[derive(serde::Deserialize)]
@@ -73,45 +87,69 @@ fn pin(
     owner.pin(&vox_core::node::link::b32_encode(&fp))?;
     Ok(Some(fp))
 }
-fn selected(
-    client: &DaemonClient,
+async fn selected(
+    client: &mut DaemonClient,
     node: &NodeName,
     fingerprint: &vox_core::hash::Digest32,
-) -> bool {
-    client.attached.iter().any(|entry| {
-        entry.name == *node
-            && entry.state == NodeState::Attached
-            && entry.fingerprint.as_ref() == Some(fingerprint)
-    })
+    stopping_pid: &AtomicU32,
+) -> Result<bool, ProbeError> {
+    if stopping_pid.load(Ordering::Relaxed) != client.pid {
+        stopping_pid.store(0, Ordering::Relaxed);
+    }
+    let entry = client.attached.iter().find(|entry| entry.name == *node);
+    if entry.is_some_and(|entry| {
+        entry.state == NodeState::Attached && entry.fingerprint.as_ref() == Some(fingerprint)
+    }) {
+        return Ok(true);
+    }
+    if stopping_pid.load(Ordering::Relaxed) == client.pid {
+        return Err(ProbeError::Stopping);
+    }
+    if entry.is_some() {
+        return Ok(false);
+    }
+    // Hello lists only attached nodes. Ask this daemon whether ours is starting or stopping.
+    match tokio::time::timeout(DEADLINE, client.request(DaemonRequest::Nodes)).await {
+        Ok(Ok(DaemonFrame::Nodes(nodes))) => {
+            let entry = nodes.iter().find(|entry| entry.name == *node);
+            if entry.is_some_and(|entry| {
+                matches!(entry.state, NodeState::Attaching | NodeState::Detaching)
+            }) {
+                return Err(ProbeError::Attaching);
+            }
+            Ok(entry.is_some_and(|entry| {
+                entry.state == NodeState::Attached
+                    && entry.fingerprint.as_ref() == Some(fingerprint)
+            }))
+        }
+        _ => Err(ProbeError::Unavailable),
+    }
 }
 #[derive(Clone, Copy)]
 enum ProbeError {
     Unavailable,
     Mismatch,
+    Attaching,
+    Stopping,
 }
 async fn open(account: &Account) -> Result<DaemonClient, ProbeError> {
-    // Observe the authenticated pid/version before applying the strict open check.
+    // The control protocol, not the release number, decides compatibility.
     let greeting = tokio::time::timeout(DEADLINE, DaemonClient::observe(&account.socket())).await;
     match greeting {
-        Ok(Ok(g))
-            if g.protocol != vox_core::node::ipc::PROTOCOL_VERSION
-                || g.version != env!("CARGO_PKG_VERSION") =>
-        {
+        Ok(Ok(g)) if g.protocol != vox_core::node::ipc::PROTOCOL_VERSION => {
             return Err(ProbeError::Mismatch)
         }
         Ok(Ok(_)) => (),
-        Ok(Err(vox_core::error::Error::Ipc(
-            vox_core::error::IpcHandshake::Protocol { .. }
-            | vox_core::error::IpcHandshake::Version { .. },
-        ))) => return Err(ProbeError::Mismatch),
+        Ok(Err(vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Protocol {
+            ..
+        }))) => return Err(ProbeError::Mismatch),
         _ => return Err(ProbeError::Unavailable),
     }
     match tokio::time::timeout(DEADLINE, DaemonClient::open(&account.socket())).await {
         Ok(Ok(client)) => Ok(client),
-        Ok(Err(vox_core::error::Error::Ipc(
-            vox_core::error::IpcHandshake::Protocol { .. }
-            | vox_core::error::IpcHandshake::Version { .. },
-        ))) => Err(ProbeError::Mismatch),
+        Ok(Err(vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Protocol {
+            ..
+        }))) => Err(ProbeError::Mismatch),
         _ => Err(ProbeError::Unavailable),
     }
 }
@@ -131,9 +169,12 @@ async fn snapshot(
     node: &NodeName,
     fp: &vox_core::hash::Digest32,
     subscription: &mut Option<Subscription>,
+    stopping_pid: &Arc<AtomicU32>,
+    probe_pid: &mut Option<u32>,
 ) -> Result<bool, ProbeError> {
-    let initial = open(account).await?;
-    if !selected(&initial, node, fp) {
+    let mut initial = open(account).await?;
+    *probe_pid = Some(initial.pid);
+    if !selected(&mut initial, node, fp, stopping_pid).await? {
         *subscription = None;
         return Ok(false);
     }
@@ -144,8 +185,18 @@ async fn snapshot(
         match tokio::time::timeout(DEADLINE, sub.request(DaemonRequest::Subscribe)).await {
             Ok(Ok(DaemonFrame::Ok)) => {
                 let (tx, events) = mpsc::channel(1);
+                let stopping_pid = Arc::clone(stopping_pid);
                 let task = tokio::spawn(async move {
-                    while let Ok(Some(DaemonFrame::Event(_))) = sub.next().await {
+                    while let Ok(Some(DaemonFrame::Event(event))) = sub.next().await {
+                        if matches!(
+                            event,
+                            DaemonEvent::Detached {
+                                cause: DetachCause::DaemonStopping,
+                                ..
+                            }
+                        ) {
+                            stopping_pid.store(pid, Ordering::Relaxed);
+                        }
                         let _ = tx.try_send(());
                     }
                 });
@@ -160,11 +211,12 @@ async fn snapshot(
         if tokio::time::Instant::now() >= until {
             return Err(ProbeError::Unavailable);
         }
-        let fresh = open(account).await?;
+        let mut fresh = open(account).await?;
+        *probe_pid = Some(fresh.pid);
         if subscription.as_ref().is_none_or(|sub| sub.pid != fresh.pid) {
             return Err(ProbeError::Unavailable);
         }
-        let ready = selected(&fresh, node, fp);
+        let ready = selected(&mut fresh, node, fp, stopping_pid).await?;
         drop(fresh);
         let Some(sub) = subscription.as_mut() else {
             return Err(ProbeError::Unavailable);
@@ -233,7 +285,11 @@ pub(crate) async fn run(
     let mut observed = false;
     let mut last_command = 0u64;
     let mut subscription: Option<Subscription> = None;
-    let mut pinned = pin(&owner, &account, &node).ok().flatten();
+    // The stopping daemon can still answer after removing our node. Keep its pid
+    // across subscription teardown; a replacement may genuinely have a locked node.
+    // An OS-reused pid could name a later daemon; this is not a durable process identity.
+    let stopping_pid = Arc::new(AtomicU32::new(0));
+    let mut pinned = None;
     let mut delay = 0u64;
     let mut backoff = 1u64;
     let mut snapshot_id: Option<String> = None;
@@ -271,12 +327,29 @@ pub(crate) async fn run(
                 }
             }
             event = async { match subscription.as_mut() { Some(sub) => sub.events.recv().await, None => std::future::pending().await } } => {
-                match event { Some(()) => delay = 0, None => { subscription = None; delay = backoff; backoff = (backoff * 2).min(30); if !output(serde_json::json!({"type":"unavailable","reason":"unavailable"})) { return 1; } } }
+                match event { Some(()) => delay = 0, None => { subscription = None; delay = backoff; backoff = (backoff * 2).min(30); if !output(serde_json::json!({"type":"unavailable","reason":"reconnecting"})) { return 1; } } }
             }
             _ = &mut timer => {
-                if pinned.is_none() { pinned = pin(&owner, &account, &node).ok().flatten(); }
+                // The saved pin survives helper succession. Never replace it with a rebuilt node.
+                let pin_result = match pinned {
+                    Some(fp) => match fingerprint(&account, &node) {
+                        Some(now) if now != fp => Err(FenceError::Invalid),
+                        now => Ok(now),
+                    },
+                    None => pin(&owner, &account, &node),
+                };
+                if matches!(pin_result, Err(FenceError::Invalid)) {
+                    if owner.set_compatible(false).is_err() || owner.revoke().is_err() {
+                        delay = 1;
+                        continue;
+                    }
+                    output(serde_json::json!({"type":"unavailable","reason":"identity-changed"}));
+                    return 77;
+                }
+                if pinned.is_none() { pinned = pin_result.ok().flatten(); }
+                let mut probe_pid = None;
                 let result = match pinned {
-                    Some(fp) if fingerprint(&account, &node) == Some(fp) => snapshot(&account, &node, &fp, &mut subscription).await,
+                    Some(fp) if pin_result == Ok(Some(fp)) => snapshot(&account, &node, &fp, &mut subscription, &stopping_pid, &mut probe_pid).await,
                     _ => { subscription = None; match open(&account).await { Err(e) => Err(e), Ok(_) => Ok(false) } }
                 };
                 if !matches!(result, Err(ProbeError::Mismatch)) && !compatible {
@@ -305,7 +378,11 @@ pub(crate) async fn run(
 
                         if let Some(id) = snapshot_id.take() { if !ack(&id, Ok(())) { return 1; } }
                         if !output(serde_json::json!({"type":"ready"})) { return 1; }
-                        delay = 30; backoff = 1;
+                        backoff = 1;
+                        #[cfg(not(feature = "test-knobs"))]
+                        { delay = 30; }
+                        #[cfg(feature = "test-knobs")]
+                        { delay = ready_interval(); }
                     }
                     other => {
                         subscription = None;
@@ -316,7 +393,13 @@ pub(crate) async fn run(
                         }
                         if mismatch { saw_mismatch = true; }
                         if let Some(id) = snapshot_id.take() { if !ack(&id, Err("unavailable")) { return 1; } }
-                        if !output(serde_json::json!({"type":"unavailable","reason":if mismatch { "mismatch" } else { "unavailable" }})) { return 1; }
+                        let reason = match other {
+                            Ok(false) => "node-not-ready",
+                            Err(ProbeError::Mismatch) => "mismatch",
+                            Err(ProbeError::Attaching | ProbeError::Stopping) => "reconnecting",
+                            _ => "unavailable",
+                        };
+                        if !output(serde_json::json!({"type":"unavailable","reason":reason,"pid":probe_pid})) { return 1; }
                         if mismatch && !mismatch_consumed { return 76; }
                         delay = backoff; backoff = (backoff * 2).min(30);
                     }

@@ -364,7 +364,7 @@ fn hook_commands(path: &Path, event: &str) -> Result<Vec<String>, String> {
         .collect())
 }
 
-/// One check per event: an entry running `vox agent hook`, once, at user scope.
+/// Check the ordinary handler and Claude's disjoint native-attention handler separately.
 fn claude_hooks(node: &vox_core::node::paths::NodeName) -> Vec<Check> {
     let Some(dir) = dir_of("CLAUDE_CONFIG_DIR", ".claude") else {
         return vec![warn(
@@ -384,22 +384,33 @@ fn claude_hooks(node: &vox_core::node::paths::NodeName) -> Vec<Check> {
         .unwrap_or_default();
     claude_events()
         .iter()
-        .map(|event| {
-            let id = format!("claude-hook {event}");
+        .flat_map(|event| {
+            std::iter::once((event, false))
+                .chain((event == "UserPromptSubmit").then_some((event, true)))
+        })
+        .map(|(event, native)| {
+            let mode = if native { " --native-attention" } else { "" };
+            let id = format!(
+                "claude-hook {event}{}",
+                if native { " native attention" } else { "" }
+            );
+            let matches_mode = |command: &String| {
+                command.split_whitespace().any(|arg| arg == "--native-attention") == native
+            };
             if !dir.exists() {
                 return ok(
                     id,
                     format!("Claude Code is not set up here (no {})", dir.display()),
                 );
             }
-            let user_commands = match hook_commands(&user, event) {
-                Ok(c) => c,
+            let user_commands: Vec<String> = match hook_commands(&user, event) {
+                Ok(c) => c.into_iter().filter(matches_mode).collect(),
                 Err(e) => return fail(id, e, format!("make {} valid JSON", user.display())),
             };
             let at_user = user_commands.len();
             let mut at_project = Vec::new();
             for p in &project {
-                match hook_commands(p, event).map(|c| c.len()) {
+                match hook_commands(p, event).map(|c| c.into_iter().filter(matches_mode).count()) {
                     Ok(0) => {}
                     Ok(n) => at_project.push((p, n)),
                     Err(e) => return fail(id, e, format!("make {} valid JSON", p.display())),
@@ -413,20 +424,20 @@ fn claude_hooks(node: &vox_core::node::paths::NodeName) -> Vec<Check> {
                     None => ok(
                         id,
                         format!(
-                            "runs `vox agent hook --node {node}` once, from {}",
+                            "runs `vox agent hook --node {node}{mode}` once, from {}",
                             user.display()
                         ),
                     ),
                     Some(why) => fail(
                         id,
-                        format!("the `vox agent hook` entry in {} {why}", user.display()),
+                        format!("the `vox agent hook{mode}` entry in {} {why}", user.display()),
                         format!("replace it with what `{plugin}` prints"),
                     ),
                 },
                 (_, 0) => warn(
                     id,
                     format!(
-                        "no `vox agent hook` entry for {event} in {}",
+                        "no `vox agent hook{mode}` entry for {event} in {}",
                         user.display()
                     ),
                     format!("merge what `{plugin}` prints into {}", user.display()),
@@ -434,7 +445,7 @@ fn claude_hooks(node: &vox_core::node::paths::NodeName) -> Vec<Check> {
                 (0, _) => warn(
                     id,
                     format!(
-                        "`vox agent hook` runs on {event} only at project scope ({}): a session \
+                        "`vox agent hook{mode}` runs on {event} only at project scope ({}): a session \
                          started anywhere else is not wired up",
                         at_project
                             .iter()
@@ -447,8 +458,8 @@ fn claude_hooks(node: &vox_core::node::paths::NodeName) -> Vec<Check> {
                 (_, n) => fail(
                     id,
                     format!(
-                        "`vox agent hook` runs {n} times on every {event} ({at_user} in {}{}): \
-                         each message is given to the model {n} times",
+                        "`vox agent hook{mode}` runs {n} times on every {event} ({at_user} in {}{}): \
+                         each matching prompt is given to the model {n} times",
                         user.display(),
                         at_project
                             .iter()
@@ -456,7 +467,7 @@ fn claude_hooks(node: &vox_core::node::paths::NodeName) -> Vec<Check> {
                             .collect::<String>()
                     ),
                     format!(
-                        "keep one entry, in {}, and remove the others",
+                        "keep one `vox agent hook{mode}` entry, in {}, and remove the others",
                         user.display()
                     ),
                 ),
@@ -989,8 +1000,7 @@ async fn trust(client: &mut IpcClient, channel_id: Digest32) -> Vec<Check> {
 
 // ---------------------------------------------------------------- versions
 
-/// Every other working session's version stamp against this vox's: work coordination is refused
-/// across versions (ADR-021 §5).
+/// Other working sessions must use the same claim rules (ADR-052 RG-10).
 async fn versions(client: &mut IpcClient, channel_id: Digest32) -> Vec<Check> {
     let snap = match crate::coord::snapshot(client, channel_id).await {
         Ok(s) => s,
@@ -1007,7 +1017,7 @@ async fn versions(client: &mut IpcClient, channel_id: Digest32) -> Vec<Check> {
         return vec![ok(
             "versions",
             format!(
-                "no other session has announced a version here; this is vox {}",
+                "no other session has announced claim rules here; this uses claim rules {}",
                 table.mine
             ),
         )];
@@ -1025,7 +1035,7 @@ async fn versions(client: &mut IpcClient, channel_id: Digest32) -> Vec<Check> {
                 vox_agentcomms::version::Stamp::Match => ok(
                     id,
                     format!(
-                        "last announced vox {} at {}",
+                        "last announced claim rules {} at {}",
                         table.mine,
                         crate::room_cli::millis_as_time(p.last_millis)
                     ),
@@ -1033,12 +1043,12 @@ async fn versions(client: &mut IpcClient, channel_id: Digest32) -> Vec<Check> {
                 other => warn(
                     id,
                     format!(
-                        "last announced vox {} at {}, this is vox {}: work coordination is refused until they match",
+                        "last announced claim rules {} at {}, this uses claim rules {}: work coordination is refused until they match",
                         other.describe(&table.mine),
                         crate::room_cli::millis_as_time(p.last_millis),
                         table.mine
                     ),
-                    "run the same vox on every machine in the room",
+                    "update workers that use different claim rules and let them announce again",
                 ),
             }
         })
