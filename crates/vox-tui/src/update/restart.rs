@@ -272,11 +272,7 @@ pub(super) fn stop_captured_daemon(
                 if !same_daemon_process(expected, &daemon_process(current.pid)?) {
                     return Err(AppError::Usage("daemon changed before it could be stopped".into()));
                 }
-                let pid = i32::try_from(expected.pid).ok()
-                    .and_then(rustix::process::Pid::from_raw)
-                    .ok_or_else(|| AppError::Usage("invalid daemon process id".into()))?;
-                rustix::process::kill_process(pid, rustix::process::Signal::TERM)
-                    .map_err(|e| AppError::Usage(format!("the captured daemon could not be stopped: {e}")))?;
+                request_stop(account, expected.pid).await?;
                 if !gone_within(expected.pid, STOP_WITHIN).await {
                     return Err(AppError::Usage(format!(
                         "the captured daemon (pid {}) did not stop within {} s",
@@ -479,9 +475,8 @@ async fn restart_checked(
         .iter()
         .map(|n| n.name.clone())
         .collect::<Vec<_>>();
-    // The updater process still runs its original release after the binary is replaced. It
-    // can ask its matching daemon for the names of services/forwards about to end. A repair
-    // from a different release reads Hello only, as every other mismatched client must.
+    // The updater still runs its original release after replacement. Conservatively ask
+    // only a matching release for held names; a repair across releases reads Hello only.
     let held = if before.version == env!("CARGO_PKG_VERSION") {
         match tokio::time::timeout(Duration::from_secs(10), held_names(account, &attached)).await {
             Ok(Ok(names)) => names,
@@ -502,12 +497,6 @@ async fn restart_checked(
         Vec::new()
     };
 
-    // A normal termination signal follows the daemon's own bounded shutdown path. Its pid
-    // came from this user's authenticated control socket, never a stale lock-file pid.
-    #[cfg(target_os = "linux")]
-    let by_unit = matches!(started, Started::UserUnit(_));
-    #[cfg(not(target_os = "linux"))]
-    let by_unit = false;
     // This binary and newer releases understand --replace-pid. An older rollback target may
     // not. A development build paired with an unmodified release of the same version is not
     // supported by this comparison; release versions change when the feature ships.
@@ -528,7 +517,7 @@ async fn restart_checked(
         )
         .await?;
     } else {
-        if !by_unit {
+        if matches!(started, Started::ByClient | Started::ByHand) {
             let pid = i32::try_from(before.pid)
                 .ok()
                 .and_then(rustix::process::Pid::from_raw)
@@ -594,7 +583,7 @@ async fn start_selected(
         #[cfg(target_os = "macos")]
         Started::LoginItem(target) => {
             let out = Command::new("/bin/launchctl")
-                .args(["kickstart", target])
+                .args(["kickstart", "-k", target])
                 .bounded_output()?;
             if !out.status.success() {
                 return Err(AppError::Usage(format!(
@@ -783,6 +772,67 @@ async fn gone_within(pid: u32, bound: Duration) -> bool {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// Only a systemd unit needs an ownership probe; macOS login items identify themselves.
+pub(crate) fn is_managed_daemon(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    return user_unit(pid).is_some();
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn request_stop(account: &Account, pid: u32) -> Result<(), crate::app::AppError> {
+    use crate::app::AppError;
+    use vox_core::node::daemonipc::{DaemonFrame, DaemonRequest};
+    use vox_core::node::ipc::PROTOCOL_VERSION;
+    tokio::time::timeout(STOP_WITHIN, async {
+        let greeting = DaemonClient::observe(&account.socket())
+            .await
+            .map_err(|e| AppError::Usage(format!("cannot confirm the daemon to stop: {e}")))?;
+        if greeting.pid != pid {
+            return Err(AppError::Usage(
+                "the daemon changed before the stop request; it was not stopped".into(),
+            ));
+        }
+        if greeting.protocol != PROTOCOL_VERSION {
+            // Released daemons on older protocols predate managed exit 71: TERM exits zero.
+            let process = i32::try_from(pid)
+                .ok()
+                .and_then(rustix::process::Pid::from_raw)
+                .ok_or_else(|| AppError::Usage("the daemon gave an invalid process id".into()))?;
+            return rustix::process::kill_process(process, rustix::process::Signal::TERM)
+                .map_err(|e| AppError::Usage(format!("the daemon could not be stopped: {e}")));
+        }
+        let mut client = DaemonClient::open(&account.socket())
+            .await
+            .map_err(|e| AppError::Usage(format!("cannot request the daemon stop: {e}")))?;
+        if client.pid != pid {
+            return Err(AppError::Usage(
+                "the daemon changed before the stop request; it was not stopped".into(),
+            ));
+        }
+        match client.request(DaemonRequest::Stop).await {
+            Ok(DaemonFrame::Ok) => Ok(()),
+            Ok(reply) => Err(AppError::Usage(format!(
+                "the daemon refused the stop request: {reply:?}"
+            ))),
+            Err(e) => Err(AppError::Usage(format!(
+                "the daemon did not acknowledge the stop request: {e}"
+            ))),
+        }
+    })
+    .await
+    .map_err(|_| {
+        AppError::Usage(format!(
+            "the daemon did not acknowledge the stop request within {} s",
+            STOP_WITHIN.as_secs()
+        ))
+    })?
 }
 
 /// How the daemon `pid` was started: by launchd's login item or a systemd user unit when either

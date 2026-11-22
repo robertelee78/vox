@@ -34,23 +34,11 @@ impl GrantChange {
     pub(in crate::node::actor) fn individual_choice(&self) -> bool {
         matches!(self, Self::Trust { .. } | Self::Capability { .. })
     }
-    pub(in crate::node::actor) fn needs_decision(&self, trust: &Keyring) -> bool {
-        match self {
-            Self::Trust { target, .. } => !trust.is_trusted(target),
-            Self::Local { target, .. } => {
-                !trust.is_trusted(target) && !trust.local_removals().contains(target)
-            }
-            _ => false,
-        }
-    }
 }
 
 pub(crate) struct GrantSaved {
     pub(in crate::node::actor) target: Digest32,
     pub(in crate::node::actor) newly: bool,
-    pub(in crate::node::actor) decision: Option<Stamp>,
-    pub(in crate::node::actor) announce_support: bool,
-    pub(in crate::node::actor) capability_only: bool,
 }
 
 pub(super) fn run(
@@ -127,11 +115,9 @@ pub(super) fn run(
     }
     // The stamp and keyring cannot be separated by a crash. Read order and locks only AFTER
     // writer admission; room-held deletion completions cannot be lost to an old replacement map.
-    let changes = if !was {
-        ConsentOrder::queue_policy(&mut batch, signer, &[], &[target], floor)?
-    } else {
-        Vec::new()
-    };
+    if !was {
+        ConsentOrder::queue_policy(&mut batch, signer, &[], &[target], floor)?;
+    }
     if !capability_only {
         let mut locks = PendingLocks::load(store, signer)?;
         if locks.forget(&target) {
@@ -143,11 +129,6 @@ pub(super) fn run(
     let grant = GrantSaved {
         target,
         newly: !was,
-        decision: changes
-            .iter()
-            .find_map(|(peer, stamp)| (*peer == target).then_some(*stamp)),
-        announce_support: capability_only || !was || trust.has_drive(&target) != had_drive,
-        capability_only,
     };
     Ok(PolicySaved {
         trust,

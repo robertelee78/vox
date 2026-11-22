@@ -60,8 +60,8 @@
 //! - a member's redial after a failed anchor dial stretched (the first wait 30 s instead of 1) →
 //!   red on the bound after the outage. Doubling the cap alone (`ANCHOR_UNREACHED_REDIAL_SECS` =
 //!   30) does not go red with 32 members: their waits never grow past a few seconds in 40 s.
-//! - the presence's accept loop started when its port is bound, not with the first attach
-//!   (`NetPresence::start` spawning it) → red on the refusals while the anchor started.
+//! - management-role registration starts the shared presence accept loop before startup node
+//!   attachment → red on the refusals while the anchor starts (found-red 6).
 //!
 //! **Needs a `test-knobs` build** (`VOX_TEST_DAEMON_SERVE_DELAY_MS`); run it with
 //! `--features test-knobs,optional-proofs`.
@@ -305,8 +305,9 @@ fn every_member_is_back_after_an_anchor_restart() {
     );
 
     // ---- nobody was turned away while the anchor started ------------------------------------------
-    // Bound and not yet attached, the anchor has nobody to answer for: a dial then must wait to be
-    // answered, not be refused as if the anchor were not there.
+    // Management has its own identity on this socket; registering it must not start answering
+    // node identity requests before startup attaches the anchor. A refusal is logged as an
+    // authentication failure, even though the member later retries and reconnects.
     let while_starting: Vec<String> = daemons
         .iter()
         .flat_map(|d| {

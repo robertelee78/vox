@@ -348,6 +348,10 @@ pub(crate) struct Flow {
     /// This turn returned one of the two retryable coded peer refusals after restoring its exact
     /// ordinary continuation. The announcement scalar is deliberately separate provenance.
     peer_busy_retry: bool,
+    /// The peer answered an exchange of this turn: `exchange` returned its coded status. Only
+    /// that ends the port's transport failure streak; a local-only turn proves nothing about
+    /// the peer.
+    peer_answered: bool,
     slots: Arc<BodySlots>,
     owners: [Option<RequestId>; 3],
     /// A durable body chunk moved in this flow's last turn: the waiting slice is
@@ -590,6 +594,7 @@ impl Flow {
             announcement_active: false,
             ordinary_turn_due: false,
             peer_busy_retry: false,
+            peer_answered: false,
             slots,
             owners: [None, None, None],
             body_progress: false,
@@ -837,6 +842,7 @@ impl Flow {
             announcement_active: false,
             ordinary_turn_due: false,
             peer_busy_retry: false,
+            peer_answered: false,
             live_context: None,
             control_context: control,
             live: None,
@@ -1309,6 +1315,11 @@ impl Flow {
     /// A pending announcement alone can never satisfy this predicate.
     pub(crate) fn take_peer_busy_retry(&mut self) -> bool {
         std::mem::take(&mut self.peer_busy_retry) && self.ordinary_pending()
+    }
+
+    /// Whether the peer answered an exchange of the turn that just returned.
+    pub(crate) fn peer_answered(&self) -> bool {
+        self.peer_answered
     }
 
     /// Prepend one real inventory exchange to this retained foreground owner. A failed prefix
@@ -1930,6 +1941,7 @@ impl Flow {
         self.announcement_error = false;
         self.announcement_active = false;
         self.peer_busy_retry = false;
+        self.peer_answered = false;
         // Local slices run back to back inside one turn; a slice that needs the wire, waits,
         // errs or spends the slice budget ends it. Each slice used to be a turn of its own,
         // and a turn costs an actor round trip (~10 ms): one body took ~30 slices, so a
@@ -2966,6 +2978,7 @@ impl Flow {
                     deadline,
                 )
                 .await?;
+                self.peer_answered = true;
                 if matches!(
                     result.status,
                     Status::BodyNotHeld | Status::EvidenceUnavailable

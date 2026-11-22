@@ -284,6 +284,10 @@ pub enum DaemonRequest {
         computer: String,
         /// Exact displayed frontier.
         frontier: String,
+        /// Retain room membership instead of evicting the computer's nodes.
+        keep_rooms: bool,
+        /// Reviewed room scope; absent for an already-confirmed script/app request.
+        rooms: Option<Vec<crate::node::computer::RemovalRoom>>,
     },
     /// Operator-approved source release or destination transfer/recovery.
     ComputerBinding {
@@ -1469,11 +1473,18 @@ impl Opening {
                 DaemonRequest::ComputerPersonal { node } => {
                     e.array(2).uint(T_REQ_COMPUTER_PERSONAL).text(node);
                 }
-                DaemonRequest::ComputerRemove { computer, frontier } => {
-                    e.array(3)
+                DaemonRequest::ComputerRemove {
+                    computer,
+                    frontier,
+                    keep_rooms,
+                    rooms,
+                } => {
+                    e.array(5)
                         .uint(T_REQ_COMPUTER_REMOVE)
                         .text(computer)
-                        .text(frontier);
+                        .text(frontier)
+                        .uint(u64::from(*keep_rooms));
+                    crate::node::computer::RemovalRoom::put_review(&mut e, rooms);
                 }
                 DaemonRequest::Stop => {
                     e.array(1).uint(T_REQ_STOP);
@@ -1677,9 +1688,15 @@ impl Opening {
             (T_REQ_COMPUTER_PERSONAL, 2) => Opening::Daemon(DaemonRequest::ComputerPersonal {
                 node: text(&mut d, "selected node")?,
             }),
-            (T_REQ_COMPUTER_REMOVE, 3) => Opening::Daemon(DaemonRequest::ComputerRemove {
+            (T_REQ_COMPUTER_REMOVE, 5) => Opening::Daemon(DaemonRequest::ComputerRemove {
                 computer: text(&mut d, "computer fingerprint")?,
                 frontier: text(&mut d, "computer frontier")?,
+                keep_rooms: match d.uint()? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(Error::MalformedIpc("computer removal choice")),
+                },
+                rooms: crate::node::computer::RemovalRoom::read_review(&mut d)?,
             }),
             (T_REQ_COMPUTER_STATUS, 1) => Opening::Daemon(DaemonRequest::ComputerStatus),
             (T_REQ_COMPUTER_BEGIN, 1) => Opening::Daemon(DaemonRequest::ComputerBegin),
@@ -2229,7 +2246,8 @@ impl DaemonClient {
     /// The updater holds this greeting while it waits for remembered nodes, so a newly
     /// restarted detached daemon with no Ready node cannot retire as idle underneath it.
     pub async fn observe_held(path: &std::path::Path) -> Result<DaemonObservation> {
-        let d = Self::greet(path, None).await?;
+        // An observer may already own restart admission; only ordinary clients wait for it.
+        let d = Self::greet(path, None, false).await?;
         // A restart may signal this process. Bind the Hello pid to the kernel's peer identity,
         // rather than trusting a number supplied in the greeting or in a stale lock file.
         let peer = d
@@ -2267,17 +2285,11 @@ impl DaemonClient {
     /// # Errors
     /// As [`DaemonClient::open`].
     pub async fn open_noting(path: &std::path::Path, waiting: Option<fn()>) -> Result<Self> {
-        let daemon = Self::greet(path, waiting).await?;
+        let daemon = Self::greet(path, waiting, true).await?;
         if daemon.protocol != crate::node::ipc::PROTOCOL_VERSION {
             return Err(Error::Ipc(crate::error::IpcHandshake::Protocol {
                 mine: crate::node::ipc::PROTOCOL_VERSION,
                 theirs: daemon.protocol,
-            }));
-        }
-        if daemon.version != env!("CARGO_PKG_VERSION") {
-            return Err(Error::Ipc(crate::error::IpcHandshake::Version {
-                mine: env!("CARGO_PKG_VERSION").into(),
-                theirs: daemon.version,
             }));
         }
         Ok(Self {
@@ -2288,25 +2300,74 @@ impl DaemonClient {
         })
     }
 
-    async fn greet(path: &std::path::Path, waiting: Option<fn()>) -> Result<DaemonObservation> {
+    async fn greet(
+        path: &std::path::Path,
+        waiting: Option<fn()>,
+        wait_for_restart: bool,
+    ) -> Result<DaemonObservation> {
         use crate::error::IpcHandshake;
         use crate::node::ipc::{connect_own, read_frame, silent, ANSWER_WITHIN, PROTOCOL_VERSION};
-        let greeted = tokio::time::timeout(ANSWER_WITHIN, async {
-            let mut stream = connect_own(path).await?;
-            let hello = read_frame(&mut stream).await?;
-            Ok::<_, Error>((stream, hello))
-        });
-        tokio::pin!(greeted);
-        let (stream, hello) = tokio::select! {
-            out = &mut greeted => out,
-            () = tokio::time::sleep(crate::node::profile::LOCK_PATIENCE), if waiting.is_some() => {
-                if let Some(say) = waiting {
-                    say();
+        let mut unreachable = None;
+        let answer = {
+            let greeted = tokio::time::timeout(ANSWER_WITHIN, async {
+                let mut restart = None;
+                let mut stream = loop {
+                    match connect_own(path).await {
+                        Ok(stream) => break stream,
+                        Err(error @ Error::Ipc(IpcHandshake::Unreachable { .. }))
+                            if wait_for_restart =>
+                        {
+                            // A replacement owns admission before stopping the old daemon. Readers
+                            // wait for its socket too, without starting a competing daemon.
+                            if restart.is_none() {
+                                restart = match std::fs::File::open(
+                                    path.with_file_name("restart-lock"),
+                                ) {
+                                    Ok(file) => Some(file),
+                                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                        return Err(error)
+                                    }
+                                    Err(e) => {
+                                        return Err(Error::Ipc(IpcHandshake::Refused {
+                                            reason: format!("cannot check the daemon restart: {e}"),
+                                        }))
+                                    }
+                                };
+                            }
+                            let Some(file) = restart.as_ref() else {
+                                return Err(error);
+                            };
+                            match file.try_lock_shared() {
+                                Ok(()) => break connect_own(path).await?,
+                                Err(std::fs::TryLockError::WouldBlock) => {}
+                                Err(std::fs::TryLockError::Error(e)) => {
+                                    return Err(Error::Ipc(IpcHandshake::Refused {
+                                        reason: format!("cannot check the daemon restart: {e}"),
+                                    }))
+                                }
+                            }
+                            unreachable = Some(error);
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                };
+                unreachable = None;
+                let hello = read_frame(&mut stream).await?;
+                Ok::<_, Error>((stream, hello))
+            });
+            tokio::pin!(greeted);
+            tokio::select! {
+                out = &mut greeted => out,
+                () = tokio::time::sleep(crate::node::profile::LOCK_PATIENCE), if waiting.is_some() => {
+                    if let Some(say) = waiting {
+                        say();
+                    }
+                    greeted.await
                 }
-                greeted.await
             }
-        }
-        .map_err(|_| silent())??;
+        };
+        let (stream, hello) = answer.map_err(|_| unreachable.unwrap_or_else(silent))??;
         let Some(hello) = hello else {
             return Err(Error::Ipc(IpcHandshake::ClosedBeforeHello));
         };
@@ -2431,7 +2492,6 @@ pub fn unreached(socket: &std::path::Path, node: Option<&str>, e: crate::error::
             )
         }
         Error::Ipc(IpcHandshake::Refused { reason }) => reason,
-        Error::Ipc(h @ IpcHandshake::Version { .. }) => h.to_string(),
         Error::Ipc(h @ IpcHandshake::ClosedBeforeHello) => {
             format!("the daemon's socket at {path} accepted, but {h}: it may be stopping. Try again.")
         }

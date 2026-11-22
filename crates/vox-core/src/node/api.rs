@@ -752,9 +752,6 @@ pub struct ChannelDetail {
     pub holds_through: Vec<(Digest32, u64)>,
     /// Contiguous-prefix and current-live-window receipt positions, not message counts.
     pub feed_coverage: Vec<FeedCoverage>,
-    /// What this node's person has not read here, oldest first
-    /// ([`crate::node::channel::ChannelState::unread`]): what a client counts at its start.
-    pub unread: Vec<Digest32>,
     /// The nodes whose Sessions this node can read inside here (ADR-029 SC-2), sorted: itself, and
     /// each node whose drive key it holds. What a Session's `can_drive` is said from.
     pub drive_from: Vec<Digest32>,
@@ -805,7 +802,7 @@ impl RoomRemovalGuard {
             return Some(step());
         }
         self.resource
-            .with_removal_fence(&self.room, self.generation, step)
+            .with_removal_fence(&self.room, self.generation, None, step)
     }
 }
 
@@ -1864,7 +1861,7 @@ impl Fault {
                 "a previous change to this room is still being applied; this request made no change\n       wait for its answer before changing the room again"
             }
             Fault::TrustRemovalIncomplete => {
-                "trust was removed, but at least one room could not finish its withdrawal; its saved work remains pending\n       restart the node to finish narrowing before using that room"
+                "this room's trust withdrawal is incomplete; the trust change was saved\n       wait for this room to finish before posting or requesting a key"
             }
             Fault::PostBusy => {
                 "this node already has too many posts waiting; this message was not posted\n       wait for those posts to finish, then try again"

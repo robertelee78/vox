@@ -219,6 +219,24 @@ type RetirementKey = crate::node::history_budget::RetirementKey;
 type RetirementLedger = crate::node::history_budget::RetirementLedger;
 type RetirementEntry = crate::node::history_budget::RetirementEntry;
 
+/// `VOX_MUTANT_TRANSPORT_STREAK`: an answered turn leaves the transport failure streak as it was.
+/// Says so once on stderr when it first keeps a streak.
+#[cfg(feature = "test-knobs")]
+fn transport_streak_mutant() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("VOX_MUTANT_TRANSPORT_STREAK").is_some());
+    static SAID: std::sync::Once = std::sync::Once::new();
+    if *ON {
+        SAID.call_once(|| {
+            eprintln!(
+                "vox: VOX_MUTANT_TRANSPORT_STREAK engaged: an answered turn kept the transport \
+                 failure streak"
+            );
+        });
+    }
+    *ON
+}
+
 fn retirement_key(flow: &Flow) -> RetirementKey {
     RetirementKey {
         actor: flow.actor_incarnation(),
@@ -563,9 +581,7 @@ struct Running {
     archive: Option<(stream::RequestId, Digest32)>,
     lane: crate::node::history_budget::Lane,
     retirement_key: RetirementKey,
-    policy_retire: Option<RequestId>,
-    /// Set by the hint-turn timer before it retires the fence: the turn was cut short for a
-    /// newer head, and what it published is handled like a policy-retired turn's, not discarded.
+    /// Set by the hint-turn timer before it retires the fence; completed publications survive.
     preempted: Arc<std::sync::atomic::AtomicBool>,
     fence: Arc<crate::transport::stream_transport::Fence>,
     /// Exclusive ownership stays outside the fallible worker future. The supervised outer task
@@ -907,7 +923,6 @@ pub(super) struct Controller {
     retiring: VecDeque<Flow>,
     cleanup: Option<Cleanup>,
     retirement_waiting: BTreeMap<RetirementKey, RetirementWaiting>,
-    policy_retirement: Option<RetirementKey>,
     retirement_failed: std::collections::BTreeSet<RetirementKey>,
     /// The synchronous old-controller driver must not compete with the replacement actor
     /// for the shared actor Notify's single retained permit.
@@ -1857,9 +1872,6 @@ impl Controller {
             Ok(RetirementStep::Done) => {
                 self.retirement_waiting.remove(&key);
                 self.retirement_failed.remove(&key);
-                if self.policy_retirement == Some(key) {
-                    self.policy_retirement = None;
-                }
                 clear_retirement_error(&self.retirement_ledger, key);
             }
             Ok(RetirementStep::Progress) => self.retiring.push_back(flow),
@@ -1970,10 +1982,9 @@ impl Controller {
             let key = retirement_key(candidate);
             !self.retirement_waiting.contains_key(&key)
                 && !self.retirement_failed.contains(&key)
-                && (self.policy_retirement == Some(key)
-                    || awaited_publications.iter().any(|(waiting_room, owner)| {
-                        *waiting_room == candidate.room && candidate.owns_request(*owner)
-                    }))
+                && awaited_publications.iter().any(|(waiting_room, owner)| {
+                    *waiting_room == candidate.room && candidate.owns_request(*owner)
+                })
         });
         let Some(at) = owner.or_else(|| {
             self.retiring.iter().position(|candidate| {
@@ -2147,7 +2158,6 @@ impl Controller {
             cleanup: None,
             retirement_waiting: BTreeMap::new(),
             retirement_failed: BTreeSet::new(),
-            policy_retirement: None,
             retirement_changed: Arc::clone(&self.retirement_changed),
             retirement_ledger: Arc::clone(&self.retirement_ledger),
             completion_wake: Arc::clone(&self.completion_wake),
@@ -3093,158 +3103,6 @@ impl Node {
         )
     }
 
-    /// Transfer only the Flow identified by a room's durable publication binding.
-    pub(super) fn retire_policy_publication(
-        &mut self,
-        room: Digest32,
-        instance: [u8; 16],
-        request: RequestId,
-        root: RequestId,
-    ) -> crate::error::Result<()> {
-        let matches = |key: &RetirementKey| {
-            key.room == room && key.instance == instance && key.request == root
-        };
-        let running = self
-            .bounded_sync
-            .running
-            .iter()
-            .flatten()
-            .filter(|work| matches(&work.retirement_key))
-            .count();
-        let ready = self
-            .bounded_sync
-            .ready
-            .iter()
-            .flatten()
-            .filter(|flow| matches(&retirement_key(flow)))
-            .count();
-        let deferred = self
-            .bounded_sync
-            .deferred
-            .iter()
-            .filter(|flow| matches(&retirement_key(flow)))
-            .count();
-        let retiring = self
-            .bounded_sync
-            .retiring
-            .iter()
-            .filter(|flow| matches(&retirement_key(flow)))
-            .count();
-        let cleanup = usize::from(
-            self.bounded_sync
-                .cleanup
-                .as_ref()
-                .is_some_and(|cleanup| matches(&cleanup.key)),
-        );
-        if running + ready + deferred + retiring + cleanup != 1 {
-            return Err(Error::Profile(
-                "history publication has no unique Flow owner",
-            ));
-        }
-        if let Some(work) = self
-            .bounded_sync
-            .running
-            .iter_mut()
-            .flatten()
-            .find(|work| matches(&work.retirement_key))
-        {
-            self.bounded_sync.policy_retirement = Some(work.retirement_key);
-            work.policy_retire = Some(request);
-            work.fence.retire();
-            return Ok(());
-        }
-        if let Some(slot) = self.bounded_sync.ready.iter_mut().find(|slot| {
-            slot.as_ref()
-                .is_some_and(|flow| matches(&retirement_key(flow)))
-        }) {
-            if !slot.as_ref().is_some_and(|flow| flow.owns_request(request)) {
-                return Err(Error::Profile(
-                    "history publication request differs from its Flow",
-                ));
-            }
-            let Some(mut flow) = slot.take() else {
-                return Err(Error::Profile(
-                    "matched ready history publication Flow disappeared",
-                ));
-            };
-            self.bounded_sync.policy_retirement = Some(retirement_key(&flow));
-            self.settle_archive_exit(
-                &mut flow,
-                "Computer policy changed during history publication",
-            );
-            self.dispose_rearming_hint(flow);
-            return Ok(());
-        }
-        if let Some(at) = self
-            .bounded_sync
-            .deferred
-            .iter()
-            .position(|flow| matches(&retirement_key(flow)))
-        {
-            if !self.bounded_sync.deferred[at].owns_request(request) {
-                return Err(Error::Profile(
-                    "history publication request differs from its Flow",
-                ));
-            }
-            let Some(mut flow) = self.bounded_sync.deferred.remove(at) else {
-                return Err(Error::Profile(
-                    "matched deferred history publication Flow disappeared",
-                ));
-            };
-            self.bounded_sync.policy_retirement = Some(retirement_key(&flow));
-            self.settle_archive_exit(
-                &mut flow,
-                "Computer policy changed during history publication",
-            );
-            self.dispose_rearming_hint(flow);
-            return Ok(());
-        }
-        if let Some(flow) = self
-            .bounded_sync
-            .retiring
-            .iter()
-            .find(|flow| matches(&retirement_key(flow)))
-        {
-            if !flow.owns_request(request) {
-                return Err(Error::Profile(
-                    "history publication request differs from its retiring Flow",
-                ));
-            }
-        }
-        let Some(key) = self
-            .bounded_sync
-            .retiring
-            .iter()
-            .find(|flow| matches(&retirement_key(flow)))
-            .map(retirement_key)
-            .or_else(|| {
-                self.bounded_sync
-                    .cleanup
-                    .as_ref()
-                    .filter(|cleanup| matches(&cleanup.key))
-                    .map(|cleanup| cleanup.key)
-            })
-        else {
-            return Err(Error::Profile(
-                "matched history publication retirement owner disappeared",
-            ));
-        };
-        if self.bounded_sync.retirement_failed.contains(&key) {
-            return Err(Error::Profile(
-                "history publication retirement requires recovery",
-            ));
-        }
-        self.bounded_sync.policy_retirement = Some(key);
-        self.bounded_sync.poll_cleanup();
-        Ok(())
-    }
-
-    pub(super) fn policy_publication_retirement_failed(&self) -> bool {
-        self.bounded_sync
-            .policy_retirement
-            .is_some_and(|key| self.bounded_sync.retirement_failed.contains(&key))
-    }
-
     /// Resume the exact retained Flow that owns a durable room publication. A waiter knows the
     /// request identity from disk; routing that causal edge to the owner's port avoids both a
     /// room-wide wake storm and retrying the waiter while the only productive Flow sleeps.
@@ -3539,6 +3397,32 @@ impl Node {
                     }
                 }
             }
+            // An exchange the peer answered on this still-current attempt ends the port's
+            // transport failure streak, as a clean session the peer opened does (`Dir::In` in
+            // `actor.rs`, which clears the transport backoff). Without it, two transport failures
+            // half a minute apart, with any number of answered exchanges between, pace every later
+            // single failure as a sustained one: 30 s or more with the whole port stopped while
+            // the peer serves. A turn that only read locally (a fresh flow's initialization), a
+            // stale or pre-empted one, proves nothing about the peer and leaves the streak, so a
+            // peer that fails every exchange still escalates. `until` and the status book's
+            // `backoff` are left as they are on purpose: a pause already running is not cut
+            // short, and status keeps naming the pacing in force until it expires.
+            if valid && flow.peer_answered() {
+                if let Some(backoff) = self
+                    .ports
+                    .get_mut(&(work.room, work.peer))
+                    .and_then(|port| port.transport_backoff.as_mut())
+                    .filter(|backoff| backoff.failures > 0)
+                {
+                    #[cfg(feature = "test-knobs")]
+                    let kept = transport_streak_mutant();
+                    #[cfg(not(feature = "test-knobs"))]
+                    let kept = false;
+                    if !kept {
+                        backoff.failures = 0;
+                    }
+                }
+            }
             if valid {
                 if let Some(response) = flow.unavailable_response.take() {
                     if let Some(port) = self.ports.get_mut(&(work.room, work.peer)) {
@@ -3615,7 +3499,6 @@ impl Node {
             // held note, an external root) happened and is signalled, as after a policy retire.
             if flow.authorization_changed
                 || flow.local_retry.is_some()
-                || work.policy_retire.is_some()
                 || work.preempted.load(Ordering::SeqCst)
             {
                 if let Some(seq) = flow.mine_held.take() {
@@ -5826,7 +5709,6 @@ impl Node {
             archive,
             lane,
             retirement_key: running_retirement_key,
-            policy_retire: None,
             preempted,
             fence,
             flow,

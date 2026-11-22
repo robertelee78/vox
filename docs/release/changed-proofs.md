@@ -87,3 +87,66 @@ This composition does not inherit unchanged fingerprints blindly: newer Ready/Lo
 behavior and app menu apparatus change relevant inputs. Those differences are reported,
 not concealed by rebinding old observations as new runtime evidence. No integration-only
 fixer-green replay is required or claimed.
+
+## Version and conversation identity proofs (ADR-052 RG-10)
+
+The targeted release proofs use private profiles and the shipped `vox` executable.
+`update_proof` takes `VOX_PROOF_NEXT_BINARY`, a genuinely compiled `test-knobs`
+`vox` with the workspace version's first character replaced by `9`; binary string
+patches are not a release fixture. Its two selected functions are:
+
+- `a_client_uses_another_package_version_with_the_same_control_protocol`
+- `a_claim_is_still_held_after_the_package_version_changes`
+
+`the_daemon_and_its_nodes_proof` runs the generated native extension through a
+Node.js event driver, with real Vox hooks and its availability watcher:
+
+- `a_conversation_refuses_a_rebuilt_node_under_the_same_name`
+- `a_conversation_reports_one_reconnecting_line_when_its_daemon_restarts`
+
+Run each explicitly with
+`cargo test --release -p vox-tui --features test-knobs --test FILE FUNCTION -- --ignored --exact --nocapture`
+under the execution environment's required build slot. The node-rebuild proof stops
+the old daemon before replacing the node directory; it does not prove safety of
+store rewriting across a replaced directory (RG-10 item 3).
+
+The former package-version refusal acts in `work_version_proof` are removed.
+`claims_use_their_rules_and_keep_the_v0430_package_stamp` reads the actual board
+after differently stamped signed claims: other claim rules have no effect, while
+the package-only `0.4.30` stamp still holds its claim. Operation/retry and renewal
+wire fixtures now carry the same `claims` stamp as the CLI. Their sending sessions
+are registered through the public hook before the operation acts. The separate
+`an_agent_session_is_checked_from_both_sides_proof::the_doctor_explains_incompatible_claim_rules`
+act expects advice about matching claim rules, not matching package versions; it
+does not depend on the full journey's Claude wiring or process-provenance staging.
+
+RG-10's profile-replacement proof is
+`the_daemon_and_its_nodes_proof::a_room_leave_refuses_a_replaced_profile_directory`.
+It leaves the daemon running, substitutes the node directory, and requires leave,
+pause and a new agent hook to refuse without changing the replacement. The hook
+must create neither a session registration nor its lock there. A `SessionEnd`
+for a registration the replacement holds of its own must then leave the
+replacement unchanged: no `sessions.lock`, the registration kept. Every session
+registration writer takes the registration lock, and the lock checks the
+profile directory first. The directory checks cover an operator replacing a
+profile, not an attacker racing filesystem calls. The long-path Unix socket
+fallback is unchanged.
+
+`work_version_proof::legacy_claim_retry_survives_package_stamp_change` retries a
+v0.4.30 claim through the CLI using its original operation ID. Package metadata
+does not change compatible operation content; different claim rules still do.
+This does not migrate operation projections written by earlier binaries.
+
+## A materialized accepted join reopens after a crash
+
+A verified join saved with its room wrap and reopen keys completes its retained
+admission handoff at startup. It then follows ordinary room reopening, including
+settlement and delivery of consented keys. An acceptance with no saved room still
+needs the person's join passphrase; a refused or abandoned join is not restored.
+
+The existing complete syscall crash sweep is
+`a_crash_after_a_consent_still_delivers_the_key_proof::a_crash_in_a_consent_whose_member_key_is_held_still_delivers_it`.
+Run it explicitly in the required build slot:
+`cargo test --release -p vox-tui --features test-knobs,optional-proofs --test a_crash_after_a_consent_still_delivers_the_key_proof a_crash_in_a_consent_whose_member_key_is_held_still_delivers_it -- --ignored --exact --nocapture`.
+It kills the serving daemon at each store boundary of the join and following
+consent, restarts it, and requires the member to read the next post.

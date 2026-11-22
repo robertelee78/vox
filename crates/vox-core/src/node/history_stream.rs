@@ -144,6 +144,22 @@ pub(crate) async fn serve(
     // served the peer nothing it lacked, and is an `empty` round in `vox status --json`
     // (ADR-038 FX-29); any other query is an object the peer asked for because it lacked it.
     let mut served_object = false;
+    // `VOX_TEST_REFUSE_HISTORY_FILE`: while the named file exists this node refuses every bounded
+    // history stream it is asked to serve, resetting it with `TransportFailed` and leaving the
+    // connection up: a peer's transport hiccup, for the proofs.
+    #[cfg(feature = "test-knobs")]
+    if std::env::var_os("VOX_TEST_REFUSE_HISTORY_FILE")
+        .is_some_and(|path| std::path::Path::new(&path).exists())
+    {
+        io.abort(crate::wire::WireError::TransportFailed);
+        return (
+            Err(Error::Unreachable(
+                "history refused by VOX_TEST_REFUSE_HISTORY_FILE",
+            )),
+            false,
+            false,
+        );
+    }
     let result = serve_request(
         &source,
         &mut io,

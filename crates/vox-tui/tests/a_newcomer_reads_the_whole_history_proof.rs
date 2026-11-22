@@ -89,6 +89,7 @@ optional_proof::not_run!(
     a_busy_room_newcomer_reads_every_member_with_a_paused_member,
     a_busy_room_newcomer_reads_every_member_with_a_delayed_path,
     the_busy_room_reader_finds_the_first_of_five_thousand_rows,
+    a_returning_reader_eight_thousand_entries_behind_reads_and_pages_back,
 );
 
 #[path = "support/test_knobs.rs"]
@@ -9653,6 +9654,15 @@ fn the_busy_room_reader_finds_the_first_of_five_thousand_rows() {
     rg1::paging_check();
 }
 
+/// ADR-052 RG-6: a member returns after 8,000 acknowledged posts, reads the newest window and
+/// pages back explicitly. This does not exercise a Live request below that bounded window.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "eight thousand CLI posts and two real daemons; optional"]
+fn a_returning_reader_eight_thousand_entries_behind_reads_and_pages_back() {
+    rg1::returning_reader();
+}
+
 #[cfg(feature = "optional-proofs")]
 #[path = "support/port_forward.rs"]
 mod port_forward;
@@ -10010,6 +10020,226 @@ mod rg1 {
             "GREEN: RG-1 first of 5,000 rows found in {pages} pages; run={:?}; daemons=1",
             started.elapsed()
         );
+    }
+
+    /// A room/governance wait arranges the journey; its deadline never pronounces a product red.
+    fn returning_reader_ready(w: &Worker, id: &str) {
+        let started = Instant::now();
+        loop {
+            let listed = w.vox(None, &["room", "list"]);
+            let open = listed.ok
+                && listed.stdout.lines().any(|line| {
+                    line.trim_start().starts_with(&id[..12]) && !line.contains("[preparing")
+                });
+            if open {
+                let governance = w.vox(
+                    None,
+                    &["room", "read", id, "--json", "--notices", "--limit", "1"],
+                );
+                if governance.ok {
+                    return;
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(240),
+                    "APPARATUS: {} did not reach current room governance for staging: {governance:?}",
+                    w.name
+                );
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(240),
+                "APPARATUS: {} did not open its room for staging: {listed:?}",
+                w.name
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    pub(super) fn returning_reader() {
+        const POSTS: usize = 8000;
+        let root = root();
+        free_disk(root.path());
+        let exe = binary();
+        let alice = room::worker_as(root.path(), "behind-author", &exe);
+        let bob = room::worker_as(root.path(), "behind-reader", &exe);
+        let _alice = start(&alice, "127.0.0.1:0", None);
+        let bob_daemon = start(&bob, "127.0.0.1:0", None);
+        for (w, peer) in [(&alice, &bob), (&bob, &alice)] {
+            w.vox_env(
+                None,
+                &[("VOX_IDENTITY_PASSPHRASE", room::ID_PASS)],
+                &["trust", "add", &peer.b32(), "--name", &peer.name],
+                None,
+            )
+            .expect_ok("mutual trust before the room");
+        }
+        let id = create(&alice);
+        let link = alice.vox(None, &["room", "link", &id]);
+        link.expect_ok("returning-reader room link");
+        bob.vox_in(
+            None,
+            &["room", "join", "--passphrase-file", "-", link.stdout.trim()],
+            Some(room::ROOM_PASS),
+        )
+        .expect_ok("reader joins before going away");
+        post(&alice, &id, "RG6-before-away", true);
+        returning_reader_ready(&bob, &id);
+        let staging = Instant::now();
+        while !read(&bob, &id, Some("RG6-before-away"))
+            .0
+            .contains("RG6-before-away")
+        {
+            assert!(
+                staging.elapsed() < Duration::from_secs(240),
+                "APPARATUS: reader never showed the pre-away staging post"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        bob_daemon.stop();
+        for n in 1..=POSTS {
+            post(&alice, &id, &format!("RG6-away-{n:04}"), true);
+        }
+        eprintln!(
+            "[RG-6] {POSTS} posts acknowledged while reader stopped; first return starts now"
+        );
+        let _bob = start(&bob, "127.0.0.1:0", None);
+        returning_reader_ready(&bob, &id);
+        let connecting = Instant::now();
+        loop {
+            let report = status(&bob, &id);
+            if member(&report, &alice.b32()).is_some_and(|row| row["connected"] == true) {
+                break;
+            }
+            assert!(
+                connecting.elapsed() < Duration::from_secs(240),
+                "APPARATUS: returning reader never reported its author connected: {report}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let mut demand = None::<usize>;
+        let mut answered = None::<Value>;
+        let mut request = None::<String>;
+        let mut unrecorded = 0;
+        let mut stalled = 0;
+        let mut before = None::<String>;
+        let mut numbered = BTreeMap::<usize, Value>::new();
+        loop {
+            let mut args = vec!["room", "read", &id, "--json", "--limit", "200"];
+            if let Some(before) = &before {
+                args.extend(["--before", before]);
+            }
+            let shown = bob.vox(None, &args);
+            shown.expect_ok("returning reader page");
+            for row in shown.ndjson() {
+                if let Some(n) = row["text"]
+                    .as_str()
+                    .and_then(|text| text.strip_prefix("RG6-away-"))
+                    .and_then(|n| n.parse().ok())
+                {
+                    numbered.insert(n, row);
+                }
+            }
+            let mut first = POSTS + 1;
+            while first > 1 && numbered.contains_key(&(first - 1)) {
+                first -= 1;
+            }
+            if let Some(status) = answered.take() {
+                let floor = demand
+                    .take()
+                    .expect("APPARATUS: terminal answer has no request");
+                assert!(
+                    first <= POSTS || status["status"]["phase"] != "complete",
+                    "RED PRODUCT: completed newest history still does not show RG6-away-{POSTS:04}; \
+                     history status: {status}"
+                );
+                stalled = if first < floor { 0 } else { stalled + 1 };
+                assert!(
+                    stalled < 3,
+                    "RED PRODUCT: the page below RG6-away-{floor:04} never arrived after \
+                     {stalled} answered requests; oldest shown post remains RG6-away-{first:04}; \
+                     history status: {status}"
+                );
+            }
+            eprintln!(
+                "[RG-6] returning reader shows {} posts; recent suffix={first}..={POSTS}",
+                numbered.len()
+            );
+            if first == 1 {
+                let (texts, pages, _) = read(&bob, &id, None);
+                assert!(
+                    pages > 1 && (1..=POSTS).all(|n| texts.contains(&format!("RG6-away-{n:04}"))),
+                    "RED PRODUCT: final paged read lacks acknowledged posts; pages={pages}, texts={texts:?}"
+                );
+                eprintln!(
+                    "GREEN: returning reader shows last post and pages back to all {POSTS} posts"
+                );
+                break;
+            }
+            if demand.is_none() {
+                let mut args = vec!["room", "read", &id, "--history"];
+                if first <= POSTS {
+                    // The pre-away row is an old cached island, not this recent suffix's boundary.
+                    before = Some(
+                        numbered[&first]["entry_hash"]
+                            .as_str()
+                            .expect("PRODUCT: rendered row has no history cursor")
+                            .to_owned(),
+                    );
+                    args.extend(["older", "--before", before.as_deref().expect("cursor set")]);
+                } else {
+                    args.push("newest");
+                }
+                let requested = bob.vox(None, &args);
+                requested.expect_ok("returning reader history request");
+                demand = Some(first);
+                request = None;
+            } else {
+                let status = bob.vox(
+                    None,
+                    &["room", "read", &id, "--json", "--history", "status"],
+                );
+                status.expect_ok("returning reader history status");
+                let status = status.json();
+                let Some(answer_request) = status["request"].as_str() else {
+                    // No recorded request answered this ask. Do not turn cached or leftover
+                    // terminal status into one of the three missing-page answers.
+                    unrecorded += 1;
+                    if unrecorded == 20 {
+                        let report = self::status(&bob, &id);
+                        assert!(
+                            member(&report, &alice.b32())
+                                .is_some_and(|row| row["connected"] == true),
+                            "APPARATUS: author disconnected during history request staging: {report}"
+                        );
+                        panic!(
+                            "RED PRODUCT: history request never recorded after {unrecorded} asks \
+                             while the author is connected; history status: {status}"
+                        );
+                    }
+                    demand = None;
+                    std::thread::sleep(Duration::from_millis(100));
+                    continue;
+                };
+                let issued = request.get_or_insert_with(|| answer_request.to_owned());
+                if answer_request != issued.as_str() {
+                    // A different operation cannot answer this pass's exact request.
+                    std::thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+                unrecorded = 0;
+                let phase = status["status"]["phase"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("PRODUCT: history status has no phase: {status}"));
+                if phase == "more" {
+                    bob.vox(None, &["room", "read", &id, "--history", "resume"])
+                        .expect_ok("returning reader history resume");
+                } else if matches!(phase, "complete" | "unavailable" | "paused" | "cached") {
+                    // This terminal answer carries this pass's recorded request id. Read its
+                    // resulting page once more before judging the answer.
+                    answered = Some(status);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 
     /// The prototype's OMP Session stand-in, with the same watcher ownership and bridge events.

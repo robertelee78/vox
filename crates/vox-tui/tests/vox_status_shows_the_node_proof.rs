@@ -969,15 +969,14 @@ fn observe_reselection_without_walk(
     }
 }
 
-/// RG-7: an answering member advertises twenty new posts but refuses its head evidence.
-/// Inventory rounds still finish; none of those rounds is receipt of a readable message.
+/// RG-7: a fresh live-window selection alone must not postpone a stalled receipt alarm.
 /// Attach explicitly: this tests receipts, not automatic saved-room recovery (ledger entry 40).
 #[cfg(feature = "test-knobs")]
 #[test]
 #[ignore = "real binaries and production Argon2id; run in release with test-knobs"]
-fn status_names_a_connected_member_whose_posts_are_not_received() {
+fn a_reselected_window_does_not_restart_a_stalled_receipt_observation() {
     watchdog::arm();
-    test_knobs::require(&["VOX_TEST_UNAVAILABLE_HEAD_FILE"]);
+    test_knobs::require(&["VOX_TEST_HOLD_LIVE_WINDOW_FILE"]);
     let sink = UdpSocket::bind("127.0.0.1:0").expect("APPARATUS: service port");
     let port = sink.local_addr().expect("APPARATUS: bound service").port();
     let mut w = World::new(port, true);
@@ -994,12 +993,11 @@ fn status_names_a_connected_member_whose_posts_are_not_received() {
     };
     drop(w.host.take());
     world::reap_daemon(&w.host_dir);
-    let marker = w.tmp.path().join("unavailable-head");
     let pass = w.tmp.path().join("daemon-passphrases");
     std::fs::write(&pass, format!("{}\n{}\n", world::IDENTITY, w.passphrase))
         .expect("APPARATUS: scratch passphrase file");
     let mut author = world::VoxProc::spawn_env(
-        "withholding-author",
+        "reselection-author",
         &w.host_dir,
         &args(&[
             "daemon",
@@ -1010,7 +1008,7 @@ fn status_names_a_connected_member_whose_posts_are_not_received() {
             "--listen",
             "127.0.0.1:0",
         ]),
-        &[("VOX_TEST_UNAVAILABLE_HEAD_FILE", &world::utf8(&marker))],
+        &[],
     );
     author.expect_line("author's room open", |line| {
         line.starts_with("vox daemon: holding room") && line.contains(&w.room)
@@ -1051,44 +1049,199 @@ fn status_names_a_connected_member_whose_posts_are_not_received() {
     local_attach::Root::at(&w.guest_dir, world::IDENTITY).attach("default");
     run(
         &w.host_dir,
-        &["room", "post", &w.room, "received-before-withholding"],
+        &["room", "post", &w.room, "received-before-reselection"],
     );
     loop {
         let read = run(&w.guest_dir, &["room", "read", &w.room, "--json"]);
-        if read.contains("received-before-withholding") {
+        if read.contains("received-before-reselection") {
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
     observe_reselection_without_walk(&w, &hold, &mut reader);
-    let completed = |v: &Value| -> u64 {
+    drop(author);
+}
+
+/// RG-7: a fresh receipt clock cannot advance during exchanges that serve no new entries.
+/// Fully receive both initial feeds, stop both daemons through their control protocol, enable
+/// head refusal, and restart the reader while its sole room peer is still stopped. Thus no
+/// previously admitted flow or commit can land after the clock observation starts.
+/// Attach explicitly: this tests receipts, not automatic saved-room recovery (ledger entry 40).
+#[cfg(feature = "test-knobs")]
+#[test]
+#[ignore = "real binaries and production Argon2id; run in release with test-knobs"]
+fn status_names_a_connected_member_whose_posts_are_not_received() {
+    use vox_core::node::daemonipc::{DaemonClient, DaemonFrame, DaemonRequest};
+    watchdog::arm();
+    test_knobs::require(&["VOX_TEST_UNAVAILABLE_HEAD_FILE"]);
+    let sink = UdpSocket::bind("127.0.0.1:0").expect("APPARATUS: service port");
+    let mut w = World::new(
+        sink.local_addr()
+            .expect("APPARATUS: service address")
+            .port(),
+        true,
+    );
+    let run = |data: &std::path::Path, argv: &[&str]| {
+        let (ok, out, err) = vox_once(data, &args(argv));
+        assert!(ok, "APPARATUS: vox {argv:?} failed: {out}{err}");
+        out
+    };
+    local_attach::Root::at(&w.guest_dir, world::IDENTITY).attach("default");
+    run(
+        &w.guest_dir,
+        &["trust", "add", &w.host_fp, "--name", "author"],
+    );
+    run(
+        &w.host_dir,
+        &["room", "post", &w.room, "clock-before-restart"],
+    );
+    let full = Instant::now() + Duration::from_secs(120);
+    loop {
+        let read = run(&w.guest_dir, &["room", "read", &w.room, "--json"]);
+        let host = status_json(&w.host_dir, "clock author fully received");
+        let guest = status_json(&w.guest_dir, "clock reader fully received");
+        let coverage = |v: &Value, peer: &str| {
+            v["rooms"][0]["members"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["id"] == peer)
+                .map(|m| {
+                    (
+                        m["connected"] == true,
+                        m["verified_through"].as_u64().unwrap_or(0),
+                    )
+                })
+                .unwrap_or((false, 0))
+        };
+        let host_head = host["rooms"][0]["own_feed_through"].as_u64().unwrap();
+        let guest_head = guest["rooms"][0]["own_feed_through"].as_u64().unwrap();
+        let (host_connected, host_holds) = coverage(&host, &w.guest_fp);
+        let (guest_connected, guest_holds) = coverage(&guest, &w.host_fp);
+        if read.contains("clock-before-restart")
+            && host_connected
+            && guest_connected
+            && host_holds >= guest_head
+            && guest_holds >= host_head
+        {
+            eprintln!("[proof] fully received before retirement: author head={host_head}, reader holds={guest_holds}; reader head={guest_head}, author holds={host_holds}");
+            break;
+        }
+        assert!(Instant::now() < full, "APPARATUS: the two initial feeds were not fully received before restart: {host}\n{guest}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    for data in [&w.host_dir, &w.guest_dir] {
+        let paths =
+            vox_core::node::paths::Paths::resolve("default", Some(data), Some(&data.join("cfg")))
+                .unwrap();
+        let config = paths.own_config_path("config").unwrap();
+        let mut settings = std::fs::read_to_string(&config).unwrap_or_default();
+        settings.push_str("\nnotify = off\n");
+        std::fs::write(config, settings).expect("APPARATUS: disable scratch notification sampler");
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let stop = |data: &std::path::Path| {
+        let account =
+            vox_core::node::paths::Account::of(Some(data), Some(&data.join("cfg"))).unwrap();
+        let lock =
+            std::fs::File::open(data.join(".daemon/lock")).expect("APPARATUS: owned daemon lock");
+        let answer = runtime.block_on(async {
+            let mut client = DaemonClient::open(&account.socket())
+                .await
+                .expect("APPARATUS: open owned daemon control");
+            client
+                .request(DaemonRequest::Stop)
+                .await
+                .expect("APPARATUS: clean stop request")
+        });
+        assert!(
+            matches!(answer, DaemonFrame::Ok),
+            "APPARATUS: owned daemon refused clean stop: {answer:?}"
+        );
+        let bound = Instant::now() + Duration::from_secs(45);
+        loop {
+            match lock.try_lock() {
+                Ok(()) => {
+                    lock.unlock().unwrap();
+                    break;
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {}
+                Err(error) => panic!("APPARATUS: cannot observe completed clean shutdown: {error}"),
+            }
+            assert!(
+                Instant::now() < bound,
+                "APPARATUS: owned daemon did not finish clean shutdown"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    stop(&w.guest_dir);
+    stop(&w.host_dir);
+    drop(w.host.take());
+    let pass = w.tmp.path().join("clock-daemon-passphrases");
+    std::fs::write(&pass, format!("{}\n{}\n", world::IDENTITY, w.passphrase))
+        .expect("APPARATUS: scratch passphrases");
+    let marker = w.tmp.path().join("clock-head-refusal");
+    std::fs::write(&marker, format!("{} {}\n", w.host_fp, w.guest_fp))
+        .expect("APPARATUS: refusal before either restart");
+    let spawn = |name: &str, data: &std::path::Path, anchor: &str, env: &[(&str, &str)]| {
+        world::VoxProc::spawn_env(
+            name,
+            data,
+            &args(&[
+                "daemon",
+                "--passphrase-file",
+                &world::utf8(&pass),
+                "--anchor",
+                anchor,
+                "--listen",
+                "127.0.0.1:0",
+            ]),
+            env,
+        )
+    };
+    let mut reader = spawn("clock-reader", &w.guest_dir, &w.guest_anchor, &[]);
+    reader.expect_line("fresh reader control socket", |line| {
+        line.starts_with("vox daemon: control socket ")
+    });
+    local_attach::Root::at(&w.guest_dir, world::IDENTITY).attach("default");
+    let before = status_json(&w.guest_dir, "fresh clock before the only provider starts");
+    let peers = before["rooms"][0]["members"].as_array().unwrap();
+    assert!(
+        peers.len() == 2
+            && peers
+                .iter()
+                .all(|m| m["me"] == true || m["connected"] == false),
+        "APPARATUS: the fresh reader has another source of room entries: {before}"
+    );
+    receipt_mutant_witness(&before, Some(&mut reader));
+    assert!(
+        before["rooms"][0]["last_sync_ms"].is_null(),
+        "PRODUCT: a fresh reader reported a receipt before its only provider was running: {before}"
+    );
+    let fetched = |v: &Value| -> u64 {
         v["sync"]
             .as_array()
             .into_iter()
             .flatten()
-            .filter(|lane| lane["peer"] == w.host_fp)
-            .filter_map(|lane| lane["completed"].as_u64())
+            .filter(|row| row["peer"] == w.host_fp)
+            .filter_map(|row| row["fetched_completed"].as_u64())
             .sum()
     };
-    // Let all earlier nonempty rounds finish before the exact observation boundary.
-    let initial = status_json(&w.guest_dir, "reader");
-    let settled = completed(&initial) + 3;
-    let before = loop {
-        let current = status_json(&w.guest_dir, "reader");
-        if completed(&current) >= settled
-            && current["rooms"][0]["members"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|m| m["id"] == w.host_fp && m["connected"] == true)
-        {
-            break current;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    };
-    receipt_mutant_witness(&before, None);
-    std::fs::write(&marker, format!("{} {}\n", w.host_fp, w.guest_fp))
-        .expect("APPARATUS: activate head refusal");
+    let cycles = fetched(&before);
+    let mut author = spawn(
+        "clock-refusing-author",
+        &w.host_dir,
+        &w.host_anchor,
+        &[("VOX_TEST_UNAVAILABLE_HEAD_FILE", &world::utf8(&marker))],
+    );
+    author.expect_line("refusing author control socket", |line| {
+        line.starts_with("vox daemon: control socket ")
+    });
+    local_attach::Root::at(&w.host_dir, world::IDENTITY).attach("default");
     for number in 1..=20 {
         run(
             &w.host_dir,
@@ -1100,69 +1253,53 @@ fn status_names_a_connected_member_whose_posts_are_not_received() {
             ],
         );
     }
-    let cycles = completed(&before);
-    let observation_start = status_json(&w.guest_dir, "withheld observation")["now_ms"]
+    let start = status_json(&w.guest_dir, "withheld clock observation")["now_ms"]
         .as_u64()
-        .expect("APPARATUS: status clock");
+        .unwrap();
     let bound = Instant::now() + Duration::from_secs(180);
     let after = loop {
-        let current = status_json(&w.guest_dir, "reader");
-        let text = status_text(&w.guest_dir, "reader");
-        if completed(&current) >= cycles + 3 && text.contains("not receiving") {
+        let current = status_json(&w.guest_dir, "empty fetched rounds");
+        let text = status_text(&w.guest_dir, "empty fetched rounds");
+        if fetched(&current) >= cycles + 3 && text.contains("not receiving") {
             break current;
         }
-        let member = current["rooms"][0]["members"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|member| member["id"] == w.host_fp)
-            .expect("APPARATUS: author");
-        let elapsed = current["now_ms"]
-            .as_u64()
-            .unwrap()
-            .saturating_sub(observation_start);
+        let elapsed = current["now_ms"].as_u64().unwrap().saturating_sub(start);
         let threshold = current["not_receiving_after_ms"].as_u64().unwrap_or(60_000);
-        assert!(
-            elapsed <= threshold * 2 + 10_000,
-            "PRODUCT: withheld author's >=20-entry deficit did not raise not receiving within two product thresholds; elapsed={elapsed}, threshold={threshold}, member={member}, status:\n{text}"
-        );
+        assert!(elapsed <= threshold * 2 + 10_000,
+            "PRODUCT: connected author's withheld entries did not raise not receiving within two product thresholds: {current}");
         assert!(
             Instant::now() < bound,
-            "APPARATUS: status clock did not reach the observation bound: {current}"
+            "APPARATUS: product clock did not advance to the observation bound: {current}"
         );
         std::thread::sleep(Duration::from_millis(500));
     };
     let read = run(&w.guest_dir, &["room", "read", &w.room, "--json"]);
     assert!(
         !read.contains("withheld-post-"),
-        "APPARATUS: head-refusing member nevertheless served the withheld posts: {read}"
+        "APPARATUS: refusal did not withhold the new posts: {read}"
     );
-    let text = status_text(&w.guest_dir, "reader");
-    eprintln!("[proof] after twenty advertised posts and three completed rounds:\n{text}\n{after}");
-    assert!(
-        text.contains("not receiving"),
-        "PRODUCT: connected author posted twenty messages, reader shows none, yet status \
-         does not say not receiving:\n{text}"
+    receipt_mutant_witness(&after, Some(&mut reader));
+    eprintln!(
+        "[proof] fresh clock after three refused fetched rounds: before={} after={}\n{after}",
+        before["rooms"][0]["last_sync_ms"], after["rooms"][0]["last_sync_ms"]
     );
-    assert_eq!(
-        after["rooms"][0]["last_sync_ms"], before["rooms"][0]["last_sync_ms"],
-        "PRODUCT: empty rounds advanced the room's completed sync:\n{text}"
-    );
+    assert_eq!(after["rooms"][0]["last_sync_ms"], before["rooms"][0]["last_sync_ms"],
+        "PRODUCT: fresh receipt clock advanced although its only provider refused all unseen heads and every earlier flow was retired: {after}");
+    let text = status_text(&w.guest_dir, "withheld reader");
     for member in after["rooms"][0]["members"].as_array().unwrap() {
         let id = member["id"].as_str().unwrap();
         if member["me"] == true {
             assert!(
                 member["holds_through"].is_null(),
-                "PRODUCT: the reader authored no messages, but status counted its setup headers as shown messages:\n{text}"
+                "PRODUCT: setup headers were reported as shown messages: {text}"
             );
         }
         assert!(
             text.lines().any(|line| line.contains(&id[..12])
                 && line.contains("latest shown message at feed entry")),
-            "PRODUCT: room status does not name received message coverage for {id}:\n{text}"
+            "PRODUCT: status does not name received message coverage: {text}"
         );
     }
-    drop(author);
 }
 
 /// Absence of a received consent is a local observation, not a remote trust decision.
@@ -1869,4 +2006,186 @@ fn sparse_live_window_reads_healthy(scene: WindowScene) {
     assert!(!text.contains("not receiving") && text.contains("healthy: nothing needs attention"),
         "PRODUCT: reader offline={offline} holds its live window, but status counts the unrequested archive as missing:\n{text}");
     drop(restarted);
+}
+
+/// RG-13: disk usage belongs to the whole account, not only its selected Ready node.
+#[test]
+#[ignore = "real binary, two scratch stores and production Argon2id; run in release with test-knobs"]
+fn status_shows_every_store_and_its_filesystems_free_bytes() {
+    use vox_core::node::paths::{NodeName, Paths};
+    watchdog::arm();
+    let scratch = StatusNodes(tempfile::tempdir().expect("APPARATUS: store-size profile"));
+    let dir = scratch.0.path();
+    std::fs::create_dir_all(dir.join("home")).unwrap();
+    let run = |args: &[&str], input: &str| {
+        let (ok, out, err) = node_command(dir, args, input);
+        assert!(ok, "APPARATUS: vox {args:?}: {out}{err}");
+        out
+    };
+    run(
+        &[
+            "node",
+            "create",
+            "small",
+            "--listen",
+            "127.0.0.1:0",
+            "--passphrase-file",
+            "-",
+        ],
+        "\n",
+    );
+    run(
+        &[
+            "node",
+            "create",
+            "large",
+            "--listen",
+            "127.0.0.1:0",
+            "--passphrase-file",
+            "-",
+        ],
+        "large secret\n",
+    );
+    run(
+        &["node", "unlock", "large", "--passphrase-file", "-"],
+        "large secret\n",
+    );
+    run(
+        &[
+            "room",
+            "create",
+            "--node",
+            "large",
+            "--name",
+            "large-room",
+            "--passphrase-file",
+            "-",
+        ],
+        "room secret\n",
+    );
+    for n in 0..8 {
+        run(
+            &[
+                "room",
+                "post",
+                "--node",
+                "large",
+                "large-room",
+                &format!("store-size-{n}-{}", "x".repeat(4096)),
+            ],
+            "",
+        );
+    }
+    run(&["node", "lock", "large"], "");
+    let locked = run(&["status", "--node", "large", "--json"], "");
+    let locked: Value = serde_json::from_str(&locked).unwrap();
+    assert_eq!(
+        locked["status"], "Locked",
+        "APPARATUS: large store is not Locked: {locked}"
+    );
+    let account = Paths::resolve("small", Some(dir), Some(&dir.join("cfg")))
+        .unwrap()
+        .account();
+    let stores: Vec<_> = ["small", "large"]
+        .into_iter()
+        .map(|name| {
+            let path = account
+                .node_paths_as_they_are(&NodeName::parse(name).unwrap())
+                .store_file();
+            (name, path)
+        })
+        .collect();
+    let lengths: Vec<_> = stores
+        .iter()
+        .map(|(_, p)| std::fs::metadata(p).unwrap().len())
+        .collect();
+    assert_ne!(
+        lengths[0], lengths[1],
+        "APPARATUS: distinct store sizes were not staged"
+    );
+    let free = |path: &std::path::Path| {
+        let stat = rustix::fs::statvfs(path).expect("APPARATUS: fresh OS free-space sample");
+        #[allow(clippy::useless_conversion, clippy::unnecessary_fallible_conversions)]
+        let unit = u64::try_from(stat.f_frsize).unwrap();
+        stat.f_bavail.saturating_mul(unit)
+    };
+    for selected in ["small", "large"] {
+        let before: Vec<_> = stores.iter().map(|(_, p)| free(p)).collect();
+        let out = run(&["status", "--node", selected, "--json"], "");
+        let report: Value = serde_json::from_str(&out).expect("PRODUCT: status JSON");
+        let rows = report["stores"].as_array().unwrap_or_else(|| {
+            panic!(
+                "PRODUCT: status must report all account stores, including Locked large: {report}"
+            )
+        });
+        assert_eq!(
+            rows.len(),
+            2,
+            "PRODUCT: selected {selected} omitted an account store: {report}"
+        );
+        for (index, (name, path)) in stores.iter().enumerate() {
+            let row = rows
+                .iter()
+                .find(|row| row["node"] == *name)
+                .unwrap_or_else(|| panic!("PRODUCT: status omitted store {name}: {report}"));
+            let actual = std::fs::metadata(path).unwrap().len();
+            assert_eq!(
+                row["file_bytes"].as_u64(),
+                Some(actual),
+                "PRODUCT: {name} file length differs from the OS: {row}; actual={actual}"
+            );
+            assert_eq!(
+                row["path"].as_str(),
+                path.to_str(),
+                "PRODUCT: wrong store path: {row}"
+            );
+            let after = free(path);
+            let reported = row["free_bytes"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("PRODUCT: {name} free bytes unavailable: {row}"));
+            let tolerance = 64 * 1024 * 1024;
+            assert!(reported > 0 &&
+                reported >= before[index].min(after).saturating_sub(tolerance) &&
+                reported <= before[index].max(after).saturating_add(tolerance),
+                "PRODUCT: {name} free bytes disagree with fresh OS samples: {row}; before={} after={after}", before[index]);
+        }
+        let plain = run(&["status", "--node", selected], "");
+        for (name, path) in &stores {
+            assert!(
+                plain.contains(name) && plain.contains(path.to_string_lossy().as_ref()),
+                "PRODUCT: plain status must name {name}'s store: {plain}"
+            );
+        }
+        assert!(
+            plain.contains("free disk") && plain.contains("bytes"),
+            "PRODUCT: plain status must show store and free-disk bytes: {plain}"
+        );
+        eprintln!("OBSERVATION selected={selected}: {out}\n{plain}");
+    }
+    // A Locked store has no writer. Hide only this proof's file to stage unavailable metadata.
+    let missing = &stores[1].1;
+    let saved = missing.with_extension("proof-held");
+    std::fs::rename(missing, &saved).expect("APPARATUS: hide own Locked store");
+    let out = run(&["status", "--node", "small", "--json"], "");
+    let plain = run(&["status", "--node", "small"], "");
+    std::fs::rename(&saved, missing).expect("APPARATUS: restore own Locked store");
+    let report: Value = serde_json::from_str(&out).unwrap();
+    let row = report["stores"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["node"] == "large")
+        .expect("PRODUCT: missing store omitted");
+    assert!(
+        row["file_bytes"].is_null() && row["file_error"].as_str().is_some_and(|s| !s.is_empty()),
+        "PRODUCT: unreadable store must be unavailable with its reason, never zero: {row}"
+    );
+    assert!(
+        row["free_bytes"].is_null() && row["free_error"].as_str().is_some_and(|s| !s.is_empty()),
+        "PRODUCT: unavailable filesystem sample must retain its reason: {row}"
+    );
+    assert!(
+        plain.contains("unavailable") && plain.contains("large"),
+        "PRODUCT: plain status hides the unreadable store reason: {plain}"
+    );
 }

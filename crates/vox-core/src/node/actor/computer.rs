@@ -15,7 +15,6 @@ pub(super) struct OwnKeyPolicyWork {
     pub(super) owner: Arc<()>,
     pub(super) guard: ComputerPolicyGuard,
     pub(super) reply: tokio::sync::oneshot::Sender<crate::error::Result<()>>,
-    pub(super) targets: Vec<Digest32>,
 }
 
 pub(super) struct KeyringApplication {
@@ -656,6 +655,92 @@ impl Node {
 }
 
 impl NodeHandle {
+    /// Capture a newly unlocked node's remembered rooms for removals made while it was locked.
+    pub async fn capture_computer_removals(&self) -> crate::error::Result<()> {
+        let Some(computer) = self.computer.clone() else {
+            return Ok(());
+        };
+        let view = self.view();
+        if view.locked {
+            return Ok(());
+        }
+        let Some(identity) = view.identity else {
+            return Ok(());
+        };
+        let rooms: Vec<_> = view
+            .channels
+            .into_iter()
+            .map(|room| room.channel_id)
+            .collect();
+        tokio::task::spawn_blocking(move || {
+            computer.capture_removal_rooms(identity.fingerprint, &rooms)
+        })
+        .await
+        .map_err(|_| Error::Profile("computer room review stopped before saving"))?
+    }
+    /// Review memberships through the same checked authority query used by room commands.
+    pub async fn computer_removal_rooms(
+        &self,
+        targets: &std::collections::BTreeSet<Digest32>,
+    ) -> std::result::Result<(Digest32, Vec<crate::node::computer::RemovalRoom>), String> {
+        let view = self.view();
+        let me = view.identity.as_ref().ok_or("node is locked")?.fingerprint;
+        let mut rows = Vec::new();
+        for room in &view.open_channels {
+            let members: Vec<_> = room
+                .members
+                .iter()
+                .filter(|node| targets.contains(*node))
+                .copied()
+                .collect();
+            if members.is_empty() {
+                continue;
+            }
+            let answer = self
+                .room_history(
+                    room.channel_id,
+                    crate::node::channel::history::Query::Governance(
+                        crate::node::api::GovernanceQuery::Admin { target: me },
+                    ),
+                )
+                .await?;
+            let crate::node::channel::history::Reply::Governance(
+                crate::node::api::GovernancePage::Admin {
+                    admin, revision, ..
+                },
+            ) = answer
+            else {
+                return Err("room authority query did not answer".into());
+            };
+            for member in members {
+                rows.push(crate::node::computer::RemovalRoom {
+                    room: room.channel_id,
+                    member,
+                    local_node: me,
+                    command_node: if admin && room.creator != member {
+                        me
+                    } else {
+                        room.creator
+                    },
+                    revision,
+                });
+            }
+        }
+        // A closed room has no readable roster. Review these as candidates, then reconcile
+        // against its first checked roster when the existing reopen continuation runs.
+        for room in view.channels.iter().filter(|room| !room.open) {
+            for member in targets {
+                rows.push(crate::node::computer::RemovalRoom {
+                    room: room.channel_id,
+                    member: *member,
+                    local_node: me,
+                    command_node: [0; 32],
+                    revision: 0,
+                });
+            }
+        }
+        Ok((me, rows))
+    }
     /// The actor-owned startup boundary, read once by the daemon after Unlock/startup completes.
     /// Its identity is authoritative for headless actors whose `NodeView` intentionally has no
     /// vault identity.
