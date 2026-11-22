@@ -27,11 +27,14 @@
 //! 2. **Losing drive changes the key** (SC-2b). Alice downgrades bob to read (`vox trust read`).
 //!    Bob's node opens none of the entries alice's Session writes afterwards and still reads
 //!    alice's messages to the room. He is shown at most the Session's row he held, with
-//!    `can_drive: false` (ADR-029 CL-3, SC-3), and his `vox room session` is refused with `this
-//!    node cannot read that Session` (manual: "When Drive is taken back … CLI private queries
-//!    refuse"); none of its steps shows in his timeline. On the wire, neither alice nor a relay
-//!    serves him anything of it, including after his restart. Its session-address target is
-//!    refused, node-only messages still work, and the owner keeps its own Session.
+//!    `can_drive: false` (ADR-029 CL-3, SC-3): a node lists `can_drive` for the authors whose
+//!    current drive key it holds, so this is his own node saying the key it has is no longer
+//!    alice's. His `vox room session` is refused with `this node cannot read that Session`
+//!    (manual: "When Drive is taken back … CLI private queries refuse"); none of its steps shows
+//!    in his timeline. On the wire, neither alice nor a relay serves him anything of it,
+//!    including after his restart (a holder that resets his ask refuses it and serves nothing).
+//!    Its session-address target is refused, node-only messages still work, and the owner keeps
+//!    its own Session.
 //!
 //! 5. **A burst of key-packages names a fresh one-time prekey each** (ADR-030 P-3). With a
 //!    Session of alice's in two rooms, alice gives carol drive (`vox trust drive`): carol is owed
@@ -65,6 +68,8 @@
 //! - **Return retained Sessions as drivable without current drive** (claim 2): the listing's
 //!   per-row `can_drive` in `session_projection/query.rs` is always true. Bob's listing after the
 //!   downgrade fails (`the room's Sessions changed; refresh the listing`): red PRODUCT in claim 2.
+//!   The flag `vox room sessions --json` prints (`sessions` in `room_cli.rs`) always true: bob's
+//!   row after the downgrade says `can_drive` true: red PRODUCT on the row check.
 //! - **Answer a Session read without current drive** (claim 2): `readable` in
 //!   `session_projection/query.rs` admits every author not refreshing. Bob's `vox room session` is
 //!   not refused with `this node cannot read that Session`: red PRODUCT.
@@ -81,9 +86,10 @@
 //! - **A package's one-time prekey not noted** (claim 5): the `refused_otps.note` after the seal
 //!   in `post_key_package` in `crates/vox-core/src/node/actor.rs` removed. Both packages name one
 //!   prekey, and carol's node uses one: red PRODUCT.
-//! - **No rotation on losing drive** (claim 2): `rotate_drive_if_lost` in
-//!   `crates/vox-core/src/node/channel.rs` returns the lost members without changing the key. Bob's
-//!   node opens the entries written after his downgrade: red PRODUCT.
+//! - **No rotation on losing drive** (claim 2): `rotated` in `run_inner` of
+//!   `crates/vox-core/src/node/channel/pending_session.rs` is never true. Bob's node still holds
+//!   alice's current key: after the downgrade it lists her Session with `can_drive` true and
+//!   opens his earlier steps: red PRODUCT on the row check.
 //! - **Write an opening/end as ordinary room text** (#740): the read-only/revoked member's
 //!   `vox room read --json` exposes that lifecycle record: red PRODUCT.
 //! - **No lifecycle refresh on a new drive grant** (claim 6): Dave reads fresh chat but the
@@ -1283,7 +1289,9 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
     // The relay has the missed step. The regranted member asks both it and the owner before
     // any new step is written: neither may backfill even encrypted earlier records. A regrant
     // begins a new readable interval with its own opening record; the probe's allowed set is
-    // the member's own listing, so it asks once that listing names the new opening.
+    // the member's own listing, so it asks once that listing names the new opening (an owner
+    // serving that opening earlier would be judged against the old one). The holders may still
+    // reset his ask then, even with the new opening listed: refused, nothing served.
     assert!(
         until(Duration::from_secs(60), || listed_opening(&rt, &dave, id)
             .is_some_and(|opening| opening != dave_opening_before)),
@@ -1504,7 +1512,7 @@ fn private_wire_refused(member: &mut Member, holders: &[&Member], room: [u8; 32]
         VoxEndpoint::bind(signer, "127.0.0.1:0".parse().unwrap())
             .expect("APPARATUS: private wire peer binds")
     });
-    for (name, addr, fingerprint) in targets {
+    'holders: for (name, addr, fingerprint) in targets {
         let connection = rt
             .block_on(endpoint.connect(addr, fingerprint, raw_sync::now()))
             .expect("APPARATUS: private wire peer connects to holder");
@@ -1512,10 +1520,17 @@ fn private_wire_refused(member: &mut Member, holders: &[&Member], room: [u8; 32]
         let mut after = 0;
         let mut finished = false;
         for _ in 0..32 {
-            let bytes = rt.block_on(async {
+            // A holder that resets or stops the ask refuses it on purpose
+            // (`transport::streams::refuse`) and serves nothing on it: no record outside the
+            // member's grant. The pages it answered before the refusal were judged as they came.
+            let refused = |e: vox_core::error::Error, what: &str| match e {
+                vox_core::error::Error::PeerRefused(code) => code,
+                e => panic!("{what}: {e:?}"),
+            };
+            let page = rt.block_on(async {
                 let (mut send, mut recv) = open_typed(&connection, StreamKind::Session)
                     .await
-                    .expect("APPARATUS: private wire peer opens stream");
+                    .map_err(|e| refused(e, "APPARATUS: private wire peer opens stream"))?;
                 // The private Session ask, version 2: the room, its epoch, the donor cursor and
                 // the query, here the live tail (`sessionstream::read_ask`).
                 let mut e = Encoder::new();
@@ -1529,14 +1544,29 @@ fn private_wire_refused(member: &mut Member, holders: &[&Member], room: [u8; 32]
                     .uint(0);
                 write_frame(&mut send, &e.finish())
                     .await
-                    .expect("APPARATUS: private wire peer asks");
+                    .map_err(|e| refused(e, "APPARATUS: private wire peer asks"))?;
                 send.finish()
                     .expect("APPARATUS: private wire peer finishes request");
-                read_frame(&mut recv, 4 * 1024 * 1024)
-                    .await
-                    .expect("PRODUCT: member's private Session page exchange failed")
-                    .expect("PRODUCT: member received no private Session response")
+                Ok::<_, vox_core::wire::WireError>(
+                    read_frame(&mut recv, 4 * 1024 * 1024)
+                        .await
+                        .map_err(|e| {
+                            refused(e, "PRODUCT: member's private Session page exchange failed")
+                        })?
+                        .expect("PRODUCT: member received no private Session response"),
+                )
             });
+            let bytes = match page {
+                Ok(bytes) => bytes,
+                Err(code) => {
+                    eprintln!(
+                        "[proof] {name} refused {}'s private Session ask ({code:?}): it served \
+                         nothing outside the member's current grant",
+                        member.name
+                    );
+                    continue 'holders;
+                }
+            };
             // The answer, version 2: cursor, more, the records each with its position, and the
             // locator hints (`sessionstream::answer`).
             let mut d = Decoder::new(&bytes);
