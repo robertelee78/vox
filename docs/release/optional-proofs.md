@@ -565,6 +565,14 @@ or login item is involved. A fixture that is not older is an `APPARATUS` refusal
 | `nodes_of_one_daemon_proof::two_paired_computers_that_are_idle_exchange_nothing` | Idle paired computers keep exchanging unchanged histories, re-derive bindings, fail to reconcile siblings while one actor is held, replace policy during a held admitted join, or leave a refused pre-lease join on a real board after restart. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test nodes_of_one_daemon_proof -- --ignored --exact two_paired_computers_that_are_idle_exchange_nothing --nocapture` | a real machine; run alone | several minutes; not timed in CI |
 | `a_post_answers_promptly_while_a_peer_posts_proof::status_and_posts_answer_while_ten_sessions_step` | Status or posts lag behind agent Session saves. Holds one exact Session's durable transaction while ten real hooks step; status must answer within 1 s and every post within 5 s. Also holds an attention commit while Session, admin and hook pause-status reads wait; status must still answer within 1 s before release. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test a_post_answers_promptly_while_a_peer_posts_proof -- --ignored --exact status_and_posts_answer_while_ten_sessions_step --nocapture` | a real machine; run alone | latency measured, not timed in CI |
 | `a_daemon_reopens_its_rooms_proof::a_restarted_room_drives_its_session_refresh_to_ready` | A retained room reopens slowly while it replays its own and other authors' Session lifecycle records. Stages all 257 heads from each author, then requires automatic public room readiness within 5 s without polling to wake the replay. The test-only receipt counts opened records, not index-only visits; zero-open batches can still walk the index. Only an apparatus positive-share check reads the count; readiness is measured from the public room-open event. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test a_daemon_reopens_its_rooms_proof -- --ignored --exact a_restarted_room_drives_its_session_refresh_to_ready --nocapture` | two real daemons and a real wire client; run alone | restart within 5 s |
+| `retention_proof::a_session_change_rewrites_only_that_session` | One Session's metadata change rewrites unrelated Sessions. Bounds complete-publication OS writes at 100 and 1,500 unrelated Sessions, encrypted index bytes per Session, and unchanged ordered listings/steps across restart. Allocator values are printed diagnostics only. | `RG13_SESSION_LOCAL_EVIDENCE=/absolute/scratch/receipts cargo test --release -p vox-tui --features optional-proofs,test-knobs --test retention_proof -- --ignored --exact a_session_change_rewrites_only_that_session --nocapture` | macOS daemon OS write counter; real scratch daemon and product store copies |
+| `retention_proof::an_existing_session_index_keeps_its_listing_when_upgraded` | A base-written Session index preserves its exact oldest-first listing on the first fixed read and after lazy backfill; a later rename has bounded OS writes. | `RG13_SESSION_BASE_VOX=/absolute/path/to/c5b12cef4/vox RG13_SESSION_FRESH_RECEIPTS=/absolute/path/to/fresh/receipts RG13_SESSION_LOCAL_EVIDENCE=/absolute/scratch/upgrade cargo test --release -p vox-tui --features optional-proofs,test-knobs --test retention_proof -- --ignored --exact an_existing_session_index_keeps_its_listing_when_upgraded --nocapture` | macOS; pinned base binary; test-knobs backfill staging; run quiet |
+
+The Session index takes about 0.9 KB more per Session; a Session change no longer rewrites
+the index of every Session in the room. Opened rooms lazily backfill the version-2 derived
+index while retaining their previous readable projection. After that header is written,
+v0.4.30 refuses the room's Session index (`Session index header version`); downgrade is
+not supported.
 
 For the constructor boundary independently of the full journey, set
 `VOX_PROOF_STEP=constructor-re-admission` on that command. This selector is not a substitute
@@ -958,3 +966,32 @@ and successful lock and forget-passphrase. An unavailable keyring (`ENOKEY`, `EN
 remember or forget. A failure to revoke or unlink a key found in a working keyring
 remains an error. Retention itself cannot be judged under QEMU's missing keyring syscalls;
 run its typed-update triplet natively with both genuinely compiled native versions.
+
+### Fetch-serving cache and old-room cleanup (ADR-052 RG-13)
+
+Fetch proof descriptors share one daemon-wide FIFO cache capped below 8 MiB, including keys,
+values and container/rehash allocation. They are not written to the store. Canonical prefix
+ranges, source headers, contexts, witnesses and receipts remain durable. Opening a room removes
+only that room's old ProofRange objects and index references in bounded atomic batches;
+interruption leaves completed batches applied and the next open resumes by an idempotent scan.
+Completion is recorded once as one sealed bit (CBOR uint 1) in the existing per-room
+KeyMaterial segment namespace, slot 30; subsequent opens read that bit and do not scan
+the object tree. No directory or store-format version changes. Locked/unopened rooms
+are not converted by a whole-store startup pass.
+
+Both optional journeys extend `retention_proof.rs` and use private scratch profiles/Keychains:
+
+```sh
+cargo test --release -p vox-tui --features test-knobs,optional-proofs --test retention_proof \
+  fetching_keeps_serving_proofs_out_of_the_store -- --exact --ignored --nocapture
+cargo test --release -p vox-tui --features test-knobs,optional-proofs --test retention_proof \
+  opening_a_room_reclaims_old_serving_proofs_across_interruption -- --exact --ignored --nocapture
+```
+
+The first exchanges messages across changing signed heads, abandons verified fetches, restarts
+both members and pages back through every acknowledged message while decoded stopped-store
+ProofRange counts stay zero. Its independent mutants restore admission writes or reconstruction
+writes. The second seeds the old serving-row shape in a real stopped room, opens it, interrupts
+after a committed cleanup batch and reopens it, preserving other object kinds and readable
+history. A second open preserves planted stopped-store canaries, proving the completed room
+does not scan again; each row-count observation also records the store's file length.

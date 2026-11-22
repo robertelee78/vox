@@ -106,6 +106,8 @@ fn vox_with(
     cmd.args(args)
         .env("VOX_DATA_DIR", dir)
         .env("VOX_CONFIG_DIR", dir.join("cfg"))
+        .env("VOX_TEST_KEYCHAIN", attach::keychain(dir))
+        .env("VOX_PROXY", "127.0.0.1:0")
         .env_remove("VOX_ROOM")
         .env_remove("VOX_NODE")
         .env_remove("VOX_SESSION")
@@ -163,6 +165,8 @@ fn daemon_on(dir: &Path, tag: &str, stdin_lines: &str, listen: &str) -> Daemon {
         .args(["daemon", "--listen", listen])
         .env("VOX_DATA_DIR", dir)
         .env("VOX_CONFIG_DIR", dir.join("cfg"))
+        .env("VOX_TEST_KEYCHAIN", attach::keychain(dir))
+        .env("VOX_PROXY", "127.0.0.1:0")
         .env_remove("VOX_ROOM")
         .env_remove("VOX_NODE")
         .env_remove("VOX_SESSION")
@@ -944,6 +948,729 @@ fn a_member_who_joins_after_messages_expired_catches_up() {
         "PRODUCT: carol shows {owed} expired messages as not received yet: she waits on bodies no \
          member can supply"
     );
+}
+
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(
+    fetching_keeps_serving_proofs_out_of_the_store,
+    opening_a_room_reclaims_old_serving_proofs_across_interruption,
+    a_session_change_rewrites_only_that_session,
+    an_existing_session_index_keeps_its_listing_when_upgraded,
+    private_session_steps_store_one_body_and_reopen_after_rotation,
+);
+
+#[cfg(feature = "optional-proofs")]
+mod proof_rows {
+    use super::*;
+    use vox_core::atrest::idfactor::SignatureIdentityFactor;
+    use vox_core::atrest::sek::Sek;
+    use vox_core::atrest::store::{open_segment, seal_segment, SegmentKind};
+    use vox_core::cbor::{Decoder, Encoder, Value};
+    use vox_core::hash::{sha256, Digest32};
+    use vox_core::log::history::{Descriptor, SignedHead, TreeBinding};
+    use vox_core::node::paths::Paths;
+    use vox_core::node::profile::Profile;
+    use vox_core::node::store::Store;
+
+    const PROOF_CACHE_CLEANED: u64 = 30;
+
+    fn encode_binding(binding: TreeBinding, e: &mut Encoder) {
+        e.array(4)
+            .uint(2)
+            .bytes(&binding.room)
+            .uint(binding.scope as u64)
+            .bytes(&binding.author);
+    }
+    fn decode_binding(d: &mut Decoder<'_>) -> vox_core::Result<TreeBinding> {
+        assert_eq!(d.array().unwrap(), 4, "APPARATUS: binding arity");
+        assert_eq!(d.uint().unwrap(), 2, "APPARATUS: binding version");
+        Ok(TreeBinding {
+            room: d.bytes()?.try_into().unwrap(),
+            scope: vox_core::log::history::LogScope::decode(d.uint()?)?,
+            author: d.bytes()?.try_into().unwrap(),
+        })
+    }
+
+    fn post(dir: &Path, room: &str, text: &str) {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let (ok, _, err) = vox(dir, &["room", "post", room, text], None);
+            if ok {
+                return;
+            }
+            assert!(
+                err.contains("that room is preparing its saved history"),
+                "PRODUCT (staging): post {text}: {err}"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "APPARATUS: reopened poster never finished preparation: {err}"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    fn array(value: &Value) -> &[Value] {
+        let Value::Array(value) = value else {
+            panic!("APPARATUS: expected a canonical array: {value:?}");
+        };
+        value
+    }
+    fn array_mut(value: &mut Value) -> &mut Vec<Value> {
+        let Value::Array(value) = value else {
+            panic!("APPARATUS: expected a canonical array");
+        };
+        value
+    }
+    fn number(value: &Value) -> u64 {
+        let Value::Uint(value) = value else {
+            panic!("APPARATUS: expected an integer: {value:?}");
+        };
+        *value
+    }
+    fn bytes(value: &Value) -> &[u8] {
+        let Value::Bytes(value) = value else {
+            panic!("APPARATUS: expected bytes: {value:?}");
+        };
+        value
+    }
+    fn profile(dir: &Path) -> Profile {
+        let paths = Paths::resolve("default", Some(dir), Some(&dir.join("cfg")))
+            .expect("APPARATUS: scratch profile paths");
+        let mut profile = Profile::open(paths).expect("APPARATUS: stopped scratch profile");
+        profile
+            .unlock(IDENTITY.as_bytes())
+            .expect("APPARATUS: unlock stopped scratch profile");
+        profile
+    }
+    fn sek(profile: &Profile, room: &Digest32) -> Sek {
+        let signer = profile.signer().expect("APPARATUS: scratch signer");
+        profile
+            .store()
+            .get_sek_wrap(room)
+            .unwrap()
+            .expect("APPARATUS: scratch room key")
+            .unwrap_sek(
+                &SignatureIdentityFactor::new(signer),
+                room,
+                ROOMPASS.as_bytes(),
+            )
+            .expect("APPARATUS: unwrap scratch room key")
+    }
+    fn wire(store: &Store, sek: &Sek, room: &Digest32, id: u64) -> zeroize::Zeroizing<Vec<u8>> {
+        let segment = store
+            .get_segment(room, SegmentKind::EntryIndex, id)
+            .unwrap()
+            .expect("APPARATUS: indexed record exists");
+        open_segment(sek, SegmentKind::EntryIndex, id, &segment).unwrap()
+    }
+    fn decoded(store: &Store, sek: &Sek, room: &Digest32, id: u64) -> Value {
+        Value::from_canonical_slice(&wire(store, sek, room, id))
+            .expect("APPARATUS: canonical stored record")
+    }
+    fn tree(
+        store: &Store,
+        sek: &Sek,
+        room: &Digest32,
+        root: u64,
+        pages: &mut Vec<u64>,
+        rows: &mut Vec<Value>,
+    ) {
+        if root == 0 {
+            return;
+        }
+        pages.push(root);
+        let page = decoded(store, sek, room, root);
+        let page = array(&page);
+        assert_eq!(page.len(), 3, "APPARATUS: index page shape");
+        assert_eq!(number(&page[0]), 1, "APPARATUS: index page version");
+        match number(&page[1]) {
+            0 => rows.extend_from_slice(array(&page[2])),
+            1 => {
+                for row in array(&page[2]) {
+                    tree(store, sek, room, number(&array(row)[1]), pages, rows);
+                }
+            }
+            other => panic!("APPARATUS: unexpected object-tree page kind {other}"),
+        }
+    }
+    fn roots(directory: &Value) -> &[Value] {
+        let active = array(&array(directory)[1]);
+        assert_eq!(active.len(), 16, "APPARATUS: current root layout");
+        let sparse = array(&active[15]);
+        assert_eq!(sparse.len(), 25, "APPARATUS: current sparse layout");
+        sparse
+    }
+    fn full_room(dir: &Path, short: &str) -> Digest32 {
+        let (ok, said, err) = vox(dir, &["status", "--json"], None);
+        assert!(ok, "PRODUCT (staging): status: {err}");
+        let status: serde_json::Value = serde_json::from_str(&said).unwrap();
+        let id = status["rooms"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|room| room["id"].as_str())
+            .find(|id| id.starts_with(short))
+            .unwrap_or_else(|| panic!("PRODUCT (staging): room missing in {said}"));
+        vox_core::node::link::b32_decode(id, "proof room").unwrap()
+    }
+    fn copy_tree(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let kind = entry.file_type().unwrap();
+            if kind.is_dir() {
+                copy_tree(&entry.path(), &to.join(entry.file_name()));
+            } else if kind.is_file() {
+                std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+            }
+        }
+    }
+    // Inspect a stopped COPY, decoding the object-index kind and its entire old value, not a
+    // ciphertext-length histogram. Every other typed object remains separately counted.
+    fn counts(dir: &Path, room: &Digest32) -> std::collections::BTreeMap<u8, usize> {
+        let copy = tempfile::tempdir().unwrap();
+        copy_tree(dir, copy.path());
+        let profile = profile(copy.path());
+        let sek = sek(&profile, room);
+        let directory = decoded(profile.store(), &sek, room, 0);
+        let mut objects = Vec::new();
+        tree(
+            profile.store(),
+            &sek,
+            room,
+            number(&roots(&directory)[0]),
+            &mut Vec::new(),
+            &mut objects,
+        );
+        let mut counts = std::collections::BTreeMap::new();
+        for row in objects {
+            let row = array(&row);
+            let key = bytes(&row[0]);
+            assert_eq!(key.len(), 64, "APPARATUS: object key width");
+            let kind = key[32];
+            *counts.entry(kind).or_default() += 1;
+            if kind != 9 {
+                continue;
+            }
+            let at = array(&row[1]);
+            assert_eq!(at.len(), 2, "APPARATUS: object locator shape");
+            assert_eq!(number(&at[0]), 1, "APPARATUS: numeric object locator");
+            let value = decoded(profile.store(), &sek, room, number(&at[1]));
+            let wire = value.to_canonical_vec().unwrap();
+            let mut d = Decoder::new(&wire);
+            assert_eq!(d.array().unwrap(), 5, "APPARATUS: ProofRange shape");
+            assert_eq!(d.uint().unwrap(), 1, "APPARATUS: ProofRange version");
+            let head: Digest32 = d.bytes().unwrap().try_into().unwrap();
+            let binding = decode_binding(&mut d).unwrap();
+            assert_eq!(binding.room, *room, "APPARATUS: ProofRange room");
+            let start = d.uint().unwrap();
+            let descriptor = Descriptor::decode(&mut d).unwrap();
+            d.finish().unwrap();
+            let mut e = Encoder::new();
+            e.array(5).bytes(b"vox/proof-serving-range/v1").bytes(&head);
+            encode_binding(binding, &mut e);
+            e.uint(start).uint(descriptor.leaves);
+            assert_eq!(
+                &key[..32],
+                sha256(&e.finish()),
+                "APPARATUS: exact cache key"
+            );
+        }
+        let file_bytes = std::fs::metadata(profile.paths().store_file())
+            .unwrap()
+            .len();
+        eprintln!(
+            "STOPPED-STORE {dir:?}: file bytes {file_bytes}; decoded object kinds {counts:?}"
+        );
+        counts
+    }
+    fn no_rows(dir: &Path, room: &Digest32) {
+        let count = counts(dir, room).get(&9).copied().unwrap_or(0);
+        assert_eq!(
+            count, 0,
+            "PRODUCT: fetching left {count} decoded ProofRange rows in the real room store"
+        );
+    }
+    // Test-side old-store/eviction apparatus. It rewrites only the named derived tree, keeping
+    // every other directory field and every signed entry, header, witness and receipt intact.
+    #[allow(clippy::too_many_arguments)] // Exact stopped-store transaction inputs, not product API.
+    fn replace_tree(
+        store: &Store,
+        sek: &Sek,
+        room: &Digest32,
+        sparse_slot: usize,
+        mut directory: Value,
+        pages: &[u64],
+        mut rows: Vec<Value>,
+        records: Vec<(u64, Value)>,
+    ) {
+        rows.sort_by(|a, b| bytes(&array(a)[0]).cmp(bytes(&array(b)[0])));
+        let mut next = number(&array(&directory)[3]);
+        let mut new_pages = Vec::new();
+        let mut level = Vec::new();
+        for chunk in rows.chunks(64) {
+            let id = next;
+            next += 1;
+            new_pages.push((
+                id,
+                Value::Array(vec![
+                    Value::Uint(1),
+                    Value::Uint(0),
+                    Value::Array(chunk.to_vec()),
+                ]),
+            ));
+            level.push(Value::Array(vec![
+                array(chunk.last().unwrap())[0].clone(),
+                Value::Uint(id),
+            ]));
+        }
+        while level.len() > 1 {
+            let mut parent = Vec::new();
+            for chunk in level.chunks(64) {
+                let id = next;
+                next += 1;
+                new_pages.push((
+                    id,
+                    Value::Array(vec![
+                        Value::Uint(1),
+                        Value::Uint(1),
+                        Value::Array(chunk.to_vec()),
+                    ]),
+                ));
+                parent.push(Value::Array(vec![
+                    array(chunk.last().unwrap())[0].clone(),
+                    Value::Uint(id),
+                ]));
+            }
+            level = parent;
+        }
+        let root = level.first().map_or(0, |row| number(&array(row)[1]));
+        let active = &mut array_mut(&mut directory)[1];
+        array_mut(&mut array_mut(active)[15])[sparse_slot] = Value::Uint(root);
+        array_mut(&mut directory)[3] = Value::Uint(next);
+        let revision = number(&array(&directory)[5]);
+        array_mut(&mut directory)[5] = Value::Uint(revision + 1);
+        let mut batch = store.batch().unwrap();
+        for id in pages {
+            batch
+                .delete_segment(room, SegmentKind::EntryIndex, *id)
+                .unwrap();
+        }
+        for (id, value) in records
+            .into_iter()
+            .chain(new_pages)
+            .chain(std::iter::once((0, directory)))
+        {
+            let plain = value.to_canonical_vec().unwrap();
+            let sealed = seal_segment(sek, SegmentKind::EntryIndex, id, &plain).unwrap();
+            batch
+                .put_segment(room, SegmentKind::EntryIndex, id, &sealed)
+                .unwrap();
+        }
+        batch.commit().unwrap();
+    }
+    fn seed_old_rows(dir: &Path, room: &Digest32) -> usize {
+        let profile = profile(dir);
+        // This fixture represents a pre-conversion room, not a new cache writer.
+        profile
+            .store()
+            .delete_segment(room, SegmentKind::KeyMaterial, PROOF_CACHE_CLEANED)
+            .unwrap();
+        let sek = sek(&profile, room);
+        let mut directory = decoded(profile.store(), &sek, room, 0);
+        let mut pages = Vec::new();
+        let mut objects = Vec::new();
+        tree(
+            profile.store(),
+            &sek,
+            room,
+            number(&roots(&directory)[0]),
+            &mut pages,
+            &mut objects,
+        );
+        let existing = objects
+            .iter()
+            .filter(|row| bytes(&array(row)[0])[32] == 9)
+            .count();
+        if existing > 32 {
+            return existing;
+        }
+        objects.retain(|row| bytes(&array(row)[0])[32] != 9);
+        let mut records = Vec::new();
+        let mut next = number(&array(&directory)[3]);
+        let mut ranges = Vec::new();
+        tree(
+            profile.store(),
+            &sek,
+            room,
+            number(&roots(&directory)[5]),
+            &mut Vec::new(),
+            &mut ranges,
+        );
+        let mut seeded = std::collections::BTreeSet::new();
+        for row in objects.clone() {
+            let row = array(&row);
+            if bytes(&row[0])[32] != 1 {
+                continue;
+            }
+            let head_wire = wire(profile.store(), &sek, room, number(&array(&row[1])[1]));
+            let head = SignedHead::from_wire(&head_wire).unwrap();
+            if head.root.leaves == 0 {
+                continue;
+            }
+            let mut descriptors = vec![(1, head.root)];
+            for range in &ranges {
+                let row = array(range);
+                let key = bytes(&row[0]);
+                if key[..32] != head.binding.author || key[48] != head.binding.scope as u8 {
+                    continue;
+                }
+                let start = u64::from_be_bytes(key[32..40].try_into().unwrap());
+                let leaves = u64::from_be_bytes(key[40..48].try_into().unwrap());
+                if leaves != 1 || start > head.root.leaves {
+                    continue;
+                }
+                let range_wire = wire(profile.store(), &sek, room, number(&array(&row[1])[1]));
+                let mut d = Decoder::new(&range_wire);
+                let descriptor = Descriptor::decode(&mut d).unwrap();
+                d.finish().unwrap();
+                descriptors.push((start, descriptor));
+            }
+            for (start, descriptor) in descriptors {
+                let mut key = Encoder::new();
+                key.array(5)
+                    .bytes(b"vox/proof-serving-range/v1")
+                    .bytes(&head.id());
+                encode_binding(head.binding, &mut key);
+                key.uint(start).uint(descriptor.leaves);
+                let digest = sha256(&key.finish());
+                if !seeded.insert(digest) {
+                    continue;
+                }
+                let mut object = digest.to_vec();
+                object.push(9);
+                object.resize(64, 0);
+                let mut value = Encoder::new();
+                value.array(5).uint(1).bytes(&head.id());
+                encode_binding(head.binding, &mut value);
+                value.uint(start);
+                descriptor.encode(&mut value);
+                records.push((next, Value::from_canonical_slice(&value.finish()).unwrap()));
+                objects.push(Value::Array(vec![
+                    Value::Bytes(object),
+                    Value::Array(vec![Value::Uint(1), Value::Uint(next)]),
+                ]));
+                next += 1;
+            }
+        }
+        let count = records.len();
+        assert!(count > 32, "APPARATUS: seed spans multiple cleanup batches");
+        array_mut(&mut directory)[3] = Value::Uint(next);
+        replace_tree(
+            profile.store(),
+            &sek,
+            room,
+            0,
+            directory,
+            &pages,
+            objects,
+            records,
+        );
+        count
+    }
+    fn evict_nonprefix_ranges(dir: &Path, room: &Digest32) {
+        let profile = profile(dir);
+        let sek = sek(&profile, room);
+        let directory = decoded(profile.store(), &sek, room, 0);
+        let mut pages = Vec::new();
+        let mut ranges = Vec::new();
+        tree(
+            profile.store(),
+            &sek,
+            room,
+            number(&roots(&directory)[5]),
+            &mut pages,
+            &mut ranges,
+        );
+        let before = ranges.len();
+        // Prefix ranges are acceptance witnesses and stay. Only redundant non-prefix serving
+        // subtrees are evicted, so a cache miss must use committed source-header reconstruction.
+        ranges.retain(|row| {
+            let key = bytes(&array(row)[0]);
+            u64::from_be_bytes(key[32..40].try_into().unwrap()) == 1
+        });
+        assert!(
+            before > ranges.len(),
+            "APPARATUS: non-prefix ranges existed"
+        );
+        eprintln!(
+            "EVICTED {} redundant non-prefix ranges",
+            before - ranges.len()
+        );
+        replace_tree(
+            profile.store(),
+            &sek,
+            room,
+            5,
+            directory,
+            &pages,
+            ranges,
+            Vec::new(),
+        );
+    }
+    fn all_texts(dir: &Path, room: &str) -> Vec<String> {
+        let mut before: Option<String> = None;
+        let mut texts = Vec::new();
+        let ready_deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let mut args = vec!["room", "read", room, "--json", "--limit", "32"];
+            if let Some(cursor) = before.as_deref() {
+                args.extend(["--before", cursor]);
+            }
+            let (ok, said, err) = vox(dir, &args, None);
+            if !ok && err.contains("that room is preparing its saved history") {
+                assert!(
+                    Instant::now() < ready_deadline,
+                    "APPARATUS: reopened room did not finish preparation: {err}"
+                );
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
+            }
+            if !ok && err.contains("the room changed while reading; refresh and retry") {
+                before = None;
+                texts.clear();
+                continue;
+            }
+            assert!(ok, "PRODUCT: historical paging: {err}");
+            let rows: Vec<serde_json::Value> = said
+                .lines()
+                .filter(|line| !line.is_empty())
+                .map(|line| serde_json::from_str(line).expect("APPARATUS: JSON room row"))
+                .collect();
+            if rows.is_empty() {
+                break;
+            }
+            let next = rows[0]["entry_hash"]
+                .as_str()
+                .expect("PRODUCT: page has a cursor")
+                .to_owned();
+            assert_ne!(
+                before.as_ref(),
+                Some(&next),
+                "PRODUCT: paging repeated its cursor"
+            );
+            before = Some(next);
+            texts.extend(
+                rows.iter()
+                    .filter_map(|row| row["text"].as_str().map(str::to_owned)),
+            );
+            if rows.len() < 32 {
+                break;
+            }
+        }
+        texts
+    }
+    fn await_count(dir: &Path, room: &str, total: usize) {
+        let seen = std::cell::Cell::new(0);
+        assert!(
+            within(120, || {
+                seen.set(count(&all_texts(dir, room), "PROOF-CACHE-"));
+                seen.get() == total
+            }),
+            "PRODUCT: receiver shows {}/{total} acknowledged messages",
+            seen.get()
+        );
+    }
+    fn all_messages(dir: &Path, room: &str, total: usize) {
+        let seen = count(&all_texts(dir, room), "PROOF-CACHE-");
+        assert_eq!(
+            seen, total,
+            "PRODUCT: paging back returned {seen}/{total} acknowledged messages"
+        );
+    }
+    fn held_daemon(dir: &Path, tag: &str, listen: &str, variable: &str, hold: &Path) -> Daemon {
+        let mut child = Command::new(VOX)
+            .args(["daemon", "--listen", listen])
+            .env("VOX_DATA_DIR", dir)
+            .env("VOX_CONFIG_DIR", dir.join("cfg"))
+            .env("VOX_TEST_KEYCHAIN", attach::keychain(dir))
+            .env("VOX_PROXY", "127.0.0.1:0")
+            .env(variable, hold)
+            .stdin(Stdio::piped())
+            .stdout(std::fs::File::create(dir.join(format!("daemon-{tag}.out"))).unwrap())
+            .stderr(std::fs::File::create(dir.join(format!("daemon-{tag}.err"))).unwrap())
+            .spawn()
+            .unwrap();
+        writeln!(child.stdin.take().unwrap(), "{IDENTITY}").unwrap();
+        Daemon(child)
+    }
+    fn fresh() -> (
+        tempfile::TempDir,
+        PathBuf,
+        PathBuf,
+        Daemon,
+        Daemon,
+        String,
+        Digest32,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b) = pair(tmp.path());
+        let ad = daemon(&a, "a", &format!("{IDENTITY}\n"));
+        let bd = daemon(&b, "b", &format!("{IDENTITY}\n"));
+        attached(&a, "a");
+        attached(&b, "b");
+        let room = room(&a, &b);
+        let id = full_room(&a, &room);
+        (tmp, a, b, ad, bd, room, id)
+    }
+    pub(super) fn fetch() {
+        let (_tmp, a, b, ad, bd, room, id) = fresh();
+        for i in 0..100 {
+            post(&a, &room, &format!("PROOF-CACHE-{i:04}"));
+            if i % 10 == 9 {
+                await_count(&b, &room, i + 1);
+            }
+        }
+        let alisten = listening(&a);
+        let blisten = listening(&b);
+        drop(ad);
+        drop(bd);
+        no_rows(&a, &id);
+        no_rows(&b, &id);
+        let ad = daemon_on(&a, "a-post", &format!("{IDENTITY}\n"), &alisten);
+        attached(&a, "a-post");
+        for i in 100..140 {
+            post(&a, &room, &format!("PROOF-CACHE-{i:04}"));
+        }
+        drop(ad);
+        evict_nonprefix_ranges(&a, &id);
+        let ad = daemon_on(&a, "a-restart", &format!("{IDENTITY}\n"), &alisten);
+        attached(&a, "a-restart");
+        for attempt in 0..2 {
+            let hold = b.join(format!("fetch-{attempt}.hold"));
+            std::fs::write(&hold, b"abandon verified fetch before bodies").unwrap();
+            let bd = held_daemon(
+                &b,
+                &format!("b-abandon-{attempt}"),
+                &blisten,
+                "VOX_TEST_HOLD_VERIFIED_FETCH",
+                &hold,
+            );
+            assert!(
+                within(120, || hold.with_extension("verified").exists()),
+                "APPARATUS: no completed fetch proof was available to abandon"
+            );
+            let held = count(&all_texts(&b, &room), "PROOF-CACHE-");
+            assert!(
+                held < 140,
+                "APPARATUS: fetch abandonment was staged after all message bodies arrived"
+            );
+            eprintln!("ABANDONED verified fetch: receiver shows {held}/140 message bodies");
+            drop(bd);
+            std::fs::remove_file(hold).unwrap();
+            no_rows(&b, &id);
+        }
+        let bd = daemon_on(&b, "b-restart", &format!("{IDENTITY}\n"), &blisten);
+        attached(&b, "b-restart");
+        await_count(&b, &room, 140);
+        all_messages(&a, &room, 140);
+        all_messages(&b, &room, 140);
+        drop(ad);
+        drop(bd);
+        no_rows(&a, &id);
+        no_rows(&b, &id);
+    }
+    pub(super) fn cleanup() {
+        let (_tmp, a, b, ad, bd, room, id) = fresh();
+        for i in 0..80 {
+            post(&a, &room, &format!("PROOF-CACHE-{i:04}"));
+        }
+        await_count(&b, &room, 80);
+        let alisten = listening(&a);
+        let blisten = listening(&b);
+        drop(ad);
+        drop(bd);
+        seed_old_rows(&a, &id);
+        let before = counts(&a, &id);
+        assert!(before.get(&9).copied().unwrap_or(0) > 32);
+        let ad = daemon_on(&a, "a-clean", &format!("{IDENTITY}\n"), &alisten);
+        attached(&a, "a-clean");
+        all_messages(&a, &room, 80);
+        drop(ad);
+        no_rows(&a, &id);
+        let after = counts(&a, &id);
+        for (kind, count) in before.iter().filter(|(kind, _)| **kind != 9 && **kind != 4) {
+            assert!(
+                after.get(kind).copied().unwrap_or(0) >= *count,
+                "PRODUCT: cleanup deleted non-cache object kind {kind}: {before:?} -> {after:?}"
+            );
+        }
+        // Keep the product's completed-conversion marker, if it has one. Planting old rows
+        // after it makes a rescan observable: a completed room must leave these canaries alone.
+        let completed_marker = profile(&a)
+            .store()
+            .get_segment(&id, SegmentKind::KeyMaterial, PROOF_CACHE_CLEANED)
+            .unwrap();
+        let canaries = seed_old_rows(&a, &id);
+        if let Some(marker) = completed_marker {
+            profile(&a)
+                .store()
+                .put_segment(&id, SegmentKind::KeyMaterial, PROOF_CACHE_CLEANED, &marker)
+                .unwrap();
+        }
+        let ad = daemon_on(&a, "a-second-open", &format!("{IDENTITY}\n"), &alisten);
+        attached(&a, "a-second-open");
+        all_messages(&a, &room, 80);
+        drop(ad);
+        let retained = counts(&a, &id).get(&9).copied().unwrap_or(0);
+        assert_eq!(retained, canaries,
+            "PRODUCT: a completed room rescanned its old-proof object tree on second open: {retained}/{canaries} canaries remain");
+        eprintln!("SECOND OPEN: retained {retained} store canaries; no cleanup scan");
+        let seeded = seed_old_rows(&a, &id);
+        let hold = a.join("proof-cleanup.hold");
+        std::fs::write(&hold, b"hold after one committed batch").unwrap();
+        let ad = held_daemon(
+            &a,
+            "a-interrupt",
+            &alisten,
+            "VOX_TEST_HOLD_PROOF_CACHE_CLEANUP",
+            &hold,
+        );
+        assert!(
+            within(120, || hold.with_extension("committed").exists()),
+            "APPARATUS: room-open cleanup never reached a committed cache batch"
+        );
+        drop(ad);
+        let interrupted = counts(&a, &id).get(&9).copied().unwrap_or(0);
+        assert!(interrupted > 0 && interrupted < seeded,
+            "PRODUCT: interrupted cleanup committed no bounded progress: {interrupted}/{seeded} rows remain");
+        std::fs::remove_file(hold).unwrap();
+        let ad = daemon_on(&a, "a-final", &format!("{IDENTITY}\n"), &alisten);
+        let bd = daemon_on(&b, "b-final", &format!("{IDENTITY}\n"), &blisten);
+        attached(&a, "a-final");
+        attached(&b, "b-final");
+        all_messages(&a, &room, 80);
+        all_messages(&b, &room, 80);
+        drop(ad);
+        drop(bd);
+        no_rows(&a, &id);
+    }
+}
+
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "real pair, changing signed heads, store inspection and restart paging"]
+fn fetching_keeps_serving_proofs_out_of_the_store() {
+    proof_rows::fetch();
+}
+
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "real pair and interrupted bounded old-store cleanup"]
+fn opening_a_room_reclaims_old_serving_proofs_across_interruption() {
+    proof_rows::cleanup();
 }
 
 /// RG-13: implicit steps last two days; signed admin choices and lifecycle survive.
@@ -2163,10 +2890,6 @@ fn a_failed_small_row_move_keeps_the_room_readable_and_retries() {
     assert_small_rows_share(&small_row_paths(&root).store_file());
 }
 
-#[path = "support/optional_proof.rs"]
-mod optional_proof;
-optional_proof::not_run!(private_session_steps_store_one_body_and_reopen_after_rotation);
-
 #[cfg(feature = "optional-proofs")]
 #[path = "../../vox-core/tests/support/raw_sync.rs"]
 mod private_raw_sync;
@@ -2907,4 +3630,981 @@ fn private_session_steps_store_one_body_and_reopen_after_rotation() {
         "PRODUCT: removed author's expired rows and their in-row openers remain on this node"
     );
     drop((author, driver));
+}
+
+/// A metadata change is measured only after the binary publishes the complete Session
+/// listing. Allocations are sealed SessionIndex ids, not physical pages; OS write bytes
+/// are reported separately. Plain private activity is a different input and is measured too.
+/// Mutant: rebuild every Session on every candidate revision.
+#[cfg(all(feature = "optional-proofs", target_os = "macos"))]
+#[test]
+#[ignore = "real binary with 100 and 1500 unrelated Sessions; run in release with test-knobs"]
+fn a_session_change_rewrites_only_that_session() {
+    use redb::{ReadableDatabase, ReadableTable, TableDefinition};
+    use vox_core::node::ipc::{Frame, IpcClient, NodeSocket, Request};
+    use vox_core::node::paths::{NodeName, Paths};
+    watchdog::arm();
+    let evidence = std::env::var_os("RG13_SESSION_LOCAL_EVIDENCE")
+        .map(PathBuf::from)
+        .expect("APPARATUS: RG13_SESSION_LOCAL_EVIDENCE receipt directory");
+    std::fs::create_dir_all(&evidence).expect("APPARATUS: receipt directory");
+    let tmp = tempfile::tempdir_in(&evidence).expect("APPARATUS: scratch profile");
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("cfg")).expect("APPARATUS: scratch config");
+    let (ok, out, err) = vox(root, &["id"], None);
+    assert!(ok, "APPARATUS: identity staging: {out}{err}");
+    let keychain = attach::keychain(root);
+    let pass = root.join("identity.pass");
+    std::fs::write(&pass, IDENTITY).expect("APPARATUS: identity passphrase");
+    let launch = |tag: &str, clock_step: i64| {
+        let child = Command::new(VOX)
+            .args(["daemon", "--listen", "127.0.0.1:0", "--passphrase-file"])
+            .arg(&pass)
+            .env("VOX_DATA_DIR", root)
+            .env("VOX_CONFIG_DIR", root.join("cfg"))
+            .env("VOX_TEST_KEYCHAIN", &keychain)
+            .env("VOX_PROXY", "127.0.0.1:0")
+            .env("VOX_TEST_CLOCK_STEP_MS", clock_step.to_string())
+            .env_remove("VOX_NODE")
+            .env_remove("VOX_ROOM")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(
+                std::fs::File::create(evidence.join(format!("{tag}.daemon.log")))
+                    .expect("APPARATUS: daemon log"),
+            )
+            .spawn()
+            .expect("APPARATUS: scratch daemon");
+        let daemon = Daemon(child);
+        attached(root, tag);
+        daemon
+    };
+    let running = launch("initial", 0);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("APPARATUS: IPC runtime");
+    let paths = Paths::resolve("default", Some(root), Some(&root.join("cfg")))
+        .expect("APPARATUS: scratch paths");
+    // Decode only the allocator field of the copied product header. The highest live
+    // row id misses pages allocated and retired during cleanup, so it is not a count.
+    let vault = vox_core::atrest::vault::IdentityVault::from_canonical_slice(
+        &std::fs::read(paths.vault_file()).expect("APPARATUS: scratch identity vault"),
+    )
+    .expect("APPARATUS: scratch vault format");
+    let signer = vault
+        .unlock_signer(IDENTITY.as_bytes())
+        .expect("APPARATUS: scratch vault unlock");
+    let mut client = rt
+        .block_on(IpcClient::open_at(&NodeSocket::one_shot(
+            paths.account().socket(),
+            NodeName::parse("default").expect("APPARATUS: node name"),
+        )))
+        .expect("APPARATUS: daemon IPC");
+    let request = |client: &mut IpcClient, request: Request| {
+        let deadline = Instant::now() + Duration::from_secs(300);
+        loop {
+            let frame = rt
+                .block_on(client.request(&request))
+                .expect("APPARATUS: IPC request");
+            // These replies explicitly report that this request made no change, or ask the
+            // caller to wait for governance. The product fact, not a guessed sleep, gates staging.
+            let retry = matches!(&frame, Frame::Error { reason } if
+                reason.contains("permissions are still being read") ||
+                reason.contains("room governance is refreshing") ||
+                reason == &vox_core::node::api::Fault::RoomChangePending.to_string());
+            if !retry {
+                return frame;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "APPARATUS: governance never became ready: {frame:?}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    let disk_writes = || {
+        libproc::libproc::pid_rusage::pidrusage::<libproc::libproc::pid_rusage::RUsageInfoV2>(
+            i32::try_from(running.0.id()).expect("APPARATUS: daemon PID"),
+        )
+        .expect("APPARATUS: daemon OS write counter")
+        .ri_diskio_byteswritten
+    };
+    let sample = |cid: &[u8; 32], tag: &str| {
+        let copy = evidence.join(format!("{tag}.redb"));
+        std::fs::copy(paths.store_file(), &copy).expect("APPARATUS: durable store copy");
+        let db = redb::Database::open(&copy).expect("APPARATUS: copied product store");
+        let txn = db.begin_read().expect("APPARATUS: copied read transaction");
+        let table = txn
+            .open_table(TableDefinition::<([u8; 32], u8, u64), &[u8]>::new(
+                "segments",
+            ))
+            .expect("APPARATUS: product segments");
+        let mut bytes = 0u64;
+        for row in table.iter().expect("APPARATUS: product rows") {
+            let (key, value) = row.expect("APPARATUS: product row");
+            let (room, kind, _) = key.value();
+            if &room == cid && kind == 14 {
+                bytes += value.value().len() as u64;
+            }
+        }
+        drop(table);
+        drop(txn);
+        drop(db);
+        let stored = vox_core::node::store::Store::open_read_only(&copy)
+            .expect("APPARATUS: copied store reader");
+        let wrap = stored
+            .get_sek_wrap(cid)
+            .expect("APPARATUS: room wrap read")
+            .expect("APPARATUS: room wrap");
+        let sek = wrap
+            .unwrap_sek(
+                &vox_core::atrest::idfactor::SignatureIdentityFactor::new(&signer),
+                cid,
+                ROOMPASS.as_bytes(),
+            )
+            .expect("APPARATUS: scratch room key");
+        let segment = stored
+            .get_segment(cid, vox_core::atrest::store::SegmentKind::SessionIndex, 0)
+            .expect("APPARATUS: copied Session header read")
+            .expect("APPARATUS: copied Session header");
+        let header = vox_core::atrest::store::open_segment(
+            &sek,
+            vox_core::atrest::store::SegmentKind::SessionIndex,
+            0,
+            &segment,
+        )
+        .expect("APPARATUS: copied Session header authentication");
+        let mut d = vox_core::cbor::Decoder::new(&header);
+        let shape = (
+            d.array().expect("APPARATUS: header arity"),
+            d.uint().expect("APPARATUS: header version"),
+        );
+        assert!(
+            matches!(shape, (12, 1) | (14, 2)),
+            "APPARATUS: unsupported copied header {shape:?}"
+        );
+        let next = d.uint().expect("APPARATUS: exact Session allocator");
+        (next, bytes)
+    };
+    let mut measured = Vec::new();
+    let mut index_costs = Vec::new();
+    let mut preserved = Vec::new();
+    for n in [100usize, 1500] {
+        let name = format!("local-{n}");
+        let (ok, out, err) = vox(
+            root,
+            &["room", "create", "--name", &name, "--passphrase-file", "-"],
+            Some(ROOMPASS),
+        );
+        assert!(ok, "APPARATUS: room staging: {out}{err}");
+        let Frame::Rooms { rooms } = request(&mut client, Request::Rooms { after: None }) else {
+            panic!("APPARATUS: room listing");
+        };
+        let cid = rooms
+            .iter()
+            .find(|(_, label, ..)| label == &name)
+            .expect("APPARATUS: created room")
+            .0;
+        let room = vox_core::node::link::b32_encode(&cid);
+        let metadata = |id: &str, name: &str| {
+            serde_json::json!({
+            "v":1,"type":"session","from":id,"body":"","at":{"session_name":name},
+            "data":{"session":{"harness":"rg13 locality"}}})
+            .to_string()
+        };
+        for i in 0..=n {
+            let frame = request(
+                &mut client,
+                Request::Post {
+                    channel_id: cid,
+                    text: metadata(&format!("other-{i:04}"), &format!("Other {i:04}")),
+                    card: false,
+                },
+            );
+            assert!(
+                matches!(frame, Frame::Ok),
+                "APPARATUS: seed {n}/{i}: {frame:?}"
+            );
+        }
+        let heads = |needle: &str| {
+            let deadline = Instant::now() + Duration::from_secs(1200);
+            loop {
+                let (ok, out, err) = vox(root, &["room", "sessions", &room, "--json"], None);
+                let rows: Vec<serde_json::Value> = out
+                    .lines()
+                    .filter_map(|l| serde_json::from_str(l).ok())
+                    .collect();
+                if ok
+                    && rows.len() == n + 1
+                    && out.contains(needle)
+                    && !err.contains("provisional")
+                    && !err.contains("fetching")
+                {
+                    return rows;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "APPARATUS: complete Session publication not reached n={n}: {out}{err}"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        };
+        heads("Other 0000");
+        let append = |client: &mut IpcClient, id: &str, body: String| {
+            let frame = request(
+                client,
+                Request::AppendSession {
+                    channel_id: cid,
+                    session_id: id.to_owned(),
+                    body,
+                },
+            );
+            assert!(
+                matches!(frame, Frame::Appended { .. }),
+                "APPARATUS: append: {frame:?}"
+            );
+        };
+        let step = |seq| {
+            serde_json::json!({"v":1,"session":"other-0000","kind":"reply",
+            "seq":seq,"text":format!("TARGET-STEP-{seq} with literal session_name prose")})
+            .to_string()
+        };
+        append(
+            &mut client,
+            "other-0001",
+            serde_json::json!({"v":1,"session":"other-0001",
+            "kind":"reply","seq":1,"text":"UNCHANGED-STEP"})
+            .to_string(),
+        );
+        append(&mut client, "other-0000", step(1));
+        append(&mut client, "other-0000", step(2));
+        let read_step = |id: &str, needle: &str| {
+            let deadline = Instant::now() + Duration::from_secs(300);
+            loop {
+                let _ = vox(root, &["room", "sessions", &room, "--json"], None);
+                let (ok, out, err) = vox(root, &["room", "session", &room, id, "--json"], None);
+                if ok && out.contains(needle) {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "APPARATUS: Session step not readable: {out}{err}"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        };
+        read_step("other-0000", "TARGET-STEP-2");
+        read_step("other-0001", "UNCHANGED-STEP");
+        let unchanged = |rows: Vec<serde_json::Value>| {
+            assert!(
+                rows.windows(2)
+                    .all(|rows| rows[0]["opened_millis"].as_u64()
+                        <= rows[1]["opened_millis"].as_u64()),
+                "PRODUCT: Session listing is not oldest opening first"
+            );
+            rows.into_iter()
+                .filter(|row| row["id"] != "other-0000")
+                .collect::<Vec<_>>()
+        };
+        let before_heads = unchanged(heads("Other 0000"));
+        // A normal durable post fences the product's derived roots. Sample only after
+        // complete public publication and after retired-root work has stopped allocating.
+        let settle = |tag: &str| {
+            post(root, &room, "RG13-DURABILITY-FENCE");
+            let deadline = Instant::now() + Duration::from_secs(300);
+            let mut prior = None;
+            let mut stable = 0;
+            loop {
+                let current = sample(&cid, tag);
+                if prior == Some(current) {
+                    stable += 1;
+                } else {
+                    stable = 0;
+                }
+                if stable == 3 {
+                    return current;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "APPARATUS: derived cleanup never settled"
+                );
+                prior = Some(current);
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        };
+        let before = settle(&format!("n{n}-step-before"));
+        let writes = disk_writes();
+        append(&mut client, "other-0000", step(3));
+        read_step("other-0000", "TARGET-STEP-3");
+        let after = settle(&format!("n{n}-step-after"));
+        let step_delta = after.0 - before.0;
+        let step_bytes = disk_writes() - writes;
+        let before = after;
+        let writes = disk_writes();
+        append(
+            &mut client,
+            "other-0000",
+            metadata("other-0000", "CHANGED-TARGET"),
+        );
+        let after_heads = heads("CHANGED-TARGET");
+        assert_eq!(
+            unchanged(after_heads),
+            before_heads,
+            "PRODUCT: changing one Session changed unrelated Session names or state"
+        );
+        let after = settle(&format!("n{n}-name-after"));
+        let name_delta = after.0 - before.0;
+        let name_bytes = disk_writes() - writes;
+        let receipt = serde_json::json!({"unrelated_sessions":n,"ordinary_step_allocations":step_delta,
+            "ordinary_step_os_write_bytes":step_bytes,"name_change_allocations":name_delta,
+            "name_change_os_write_bytes":name_bytes,"session_index_value_bytes":after.1});
+        std::fs::write(evidence.join(format!("n{n}.json")), receipt.to_string())
+            .expect("APPARATUS: measurement receipt");
+        eprintln!("RG13 SESSION LOCALITY {receipt}");
+        measured.push((step_bytes, name_bytes));
+        eprintln!(
+            "RG13 INDEX COST n={n}: encrypted_index_bytes={} bytes_per_session={:.3}",
+            after.1,
+            after.1 as f64 / (n + 1) as f64
+        );
+        index_costs.push((n, after.1));
+        // A late/out-of-order multipart dependency is not a Session until its complete
+        // canonical body hashes correctly. Replaying it must preserve unrelated heads.
+        let large_name = format!("MULTIPART-{n}-{}", "m".repeat(2400));
+        let inner = metadata("other-0000", &large_name);
+        let tag = vox_core::node::link::b32_encode(&vox_core::hash::sha256(inner.as_bytes()));
+        let outer = serde_json::json!({"v":1,"type":"session","body":inner,
+            "data":{"session_parts":tag}});
+        let parts = vox_agentcomms::activity::split(
+            outer
+                .as_object()
+                .expect("APPARATUS: multipart object")
+                .clone(),
+            "body",
+            512,
+        );
+        assert!(
+            parts.len() > 1,
+            "APPARATUS: multipart staging did not split"
+        );
+        for part in parts.iter().rev().chain(parts.iter()) {
+            append(&mut client, "other-0000", part.clone());
+        }
+        let complete = heads(&large_name);
+        assert_eq!(
+            unchanged(complete),
+            before_heads,
+            "PRODUCT: reordered multipart metadata changed another Session"
+        );
+        eprintln!("RG13 canonical reordered multipart n={n}: complete name and unchanged peers");
+        preserved.push((room, before_heads));
+    }
+    let (ok, out, err) = vox(
+        root,
+        &[
+            "room",
+            "create",
+            "--name",
+            "removal",
+            "--passphrase-file",
+            "-",
+        ],
+        Some(ROOMPASS),
+    );
+    assert!(ok, "APPARATUS: removal room: {out}{err}");
+    let Frame::Rooms { rooms } = request(&mut client, Request::Rooms { after: None }) else {
+        panic!("APPARATUS: removal room listing");
+    };
+    let removal_id = rooms
+        .iter()
+        .find(|(_, name, ..)| name == "removal")
+        .expect("APPARATUS: removal id")
+        .0;
+    let removal = vox_core::node::link::b32_encode(&removal_id);
+    let old = serde_json::json!({"v":1,"type":"session","from":"expired","body":"",
+        "at":{"session_name":"EXPIRED-METADATA"}});
+    assert!(
+        matches!(
+            request(
+                &mut client,
+                Request::Post {
+                    channel_id: removal_id,
+                    text: old.to_string(),
+                    card: false
+                }
+            ),
+            Frame::Ok
+        ),
+        "APPARATUS: removal source"
+    );
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        let (ok, out, err) = vox(root, &["room", "sessions", &removal, "--json"], None);
+        if ok && out.contains("EXPIRED-METADATA") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "APPARATUS: removal source publication: {out}{err}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let policy = request(
+        &mut client,
+        Request::SetRetention {
+            channel_id: removal_id,
+            ttl: 3600,
+        },
+    );
+    assert!(
+        !matches!(policy, Frame::Error { .. }),
+        "APPARATUS: removal retention: {policy:?}"
+    );
+    post(root, &removal, "REMOVAL-DURABILITY-FENCE");
+    drop(client);
+    drop(running);
+    let restarted = launch("restarted", 7_200_000);
+    for (room, expected) in preserved {
+        let deadline = Instant::now() + Duration::from_secs(300);
+        loop {
+            let (ok, out, err) = vox(root, &["room", "sessions", &room, "--json"], None);
+            let rows: Vec<serde_json::Value> = out
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .filter(|row: &serde_json::Value| row["id"] != "other-0000")
+                .collect();
+            if ok
+                && rows.len() == expected.len()
+                && !err.contains("provisional")
+                && !err.contains("fetching")
+            {
+                assert_eq!(
+                    rows, expected,
+                    "PRODUCT: restart changed unrelated Sessions"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "APPARATUS: restart Session publication: {out}{err}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        loop {
+            let _ = vox(root, &["room", "sessions", &room, "--json"], None);
+            let (ok, out, err) = vox(
+                root,
+                &["room", "session", &room, "other-0001", "--json"],
+                None,
+            );
+            if ok {
+                assert!(
+                    out.contains("UNCHANGED-STEP"),
+                    "PRODUCT: unchanged Session's saved step did not survive restart: {out}{err}"
+                );
+                break;
+            }
+            assert!(
+                err.contains("Sessions changed; refresh the listing") && Instant::now() < deadline,
+                "APPARATUS: restart Session read did not reach its current listing: {out}{err}"
+            );
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        let (ok, out, err) = vox(root, &["room", "sessions", &removal, "--json"], None);
+        if ok && out.trim().is_empty() && !err.contains("provisional") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT: expired Session metadata survived source removal: {out}{err}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    eprintln!("RG13 canonical removal: expired source no longer publishes a Session");
+    let (ok, out, err) = vox(
+        root,
+        &[
+            "room",
+            "create",
+            "--name",
+            "reordered-time",
+            "--passphrase-file",
+            "-",
+        ],
+        Some(ROOMPASS),
+    );
+    assert!(ok, "APPARATUS: reordered room: {out}{err}");
+    let (ok, out, err) = vox(root, &["room", "list"], None);
+    assert!(ok, "APPARATUS: reordered room listing: {out}{err}");
+    let reordered = out
+        .lines()
+        .find(|line| line.contains("reordered-time"))
+        .and_then(|line| line.split_whitespace().next())
+        .expect("APPARATUS: reordered room id")
+        .to_owned();
+    let metadata = |name: &str| {
+        serde_json::json!({"v":1,"type":"session","from":"ordered","body":"",
+        "at":{"session_name":name}})
+        .to_string()
+    };
+    post(root, &reordered, &metadata("CANONICAL-LATER"));
+    drop(restarted);
+    let _final = launch("earlier-clock", 0);
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        let (ok, out, err) = vox(root, &["room", "sessions", &reordered, "--json"], None);
+        if ok && out.contains("CANONICAL-LATER") && !err.contains("provisional") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "APPARATUS: reordered room has not reopened before its next post: {out}{err}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    post(root, &reordered, &metadata("ARRIVED-LATE-BUT-EARLIER"));
+    post(root, &reordered, "REORDERED-DURABILITY-FENCE");
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        let (ok, out, err) = vox(root, &["room", "sessions", &reordered, "--json"], None);
+        if ok && out.contains("CANONICAL-LATER") && !err.contains("provisional") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT: metadata followed arrival rather than canonical time: {out}{err}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    eprintln!("RG13 canonical order: later event wins despite earlier event arriving last");
+    let mut failures = Vec::new();
+    for (column, label) in [
+        (0, "ordinary private step"),
+        (1, "private lifecycle/name change"),
+    ] {
+        let small = if column == 0 {
+            measured[0].0
+        } else {
+            measured[0].1
+        };
+        let large = if column == 0 {
+            measured[1].0
+        } else {
+            measured[1].1
+        };
+        let bound = small.saturating_mul(3).saturating_add(256 * 1024);
+        eprintln!("RG13 OUTSIDE {label}: 100={small} OS-write bytes; 1500={large}; bound={bound}; passed={}", large <= bound);
+        if large > bound {
+            failures.push(format!("PRODUCT: {label} rewrote unrelated Sessions: 100={small} OS-write bytes; 1500={large}; bound={bound}"));
+        }
+    }
+    for &(n, bytes) in &index_costs {
+        let bound = 2100 * (n as u64 + 1);
+        if bytes > bound {
+            failures.push(format!("PRODUCT: encrypted Session index exceeds 2100 bytes per Session at {n} unrelated Sessions: {bytes} bytes; bound={bound}"));
+        }
+    }
+    let (small_n, small_bytes) = index_costs[0];
+    let (large_n, large_bytes) = index_costs[1];
+    if u128::from(large_bytes) * (small_n as u128 + 1) * 100
+        > u128::from(small_bytes) * (large_n as u128 + 1) * 103
+    {
+        failures.push("PRODUCT: encrypted index bytes per Session grew by more than 3% between 100 and 1500 unrelated Sessions".to_owned());
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The first fixed read must preserve the base binary's published order, even while
+/// lazy membership backfill is held before it takes a writer. The hold/receipt are
+/// apparatus only; verdicts are the binary's listing and the daemon's OS write bytes.
+#[cfg(all(feature = "optional-proofs", target_os = "macos"))]
+#[test]
+#[ignore = "BASE-to-fixed real binary upgrade; run in release with test-knobs"]
+fn an_existing_session_index_keeps_its_listing_when_upgraded() {
+    watchdog::arm();
+    let evidence = std::env::var_os("RG13_SESSION_LOCAL_EVIDENCE")
+        .map(PathBuf::from)
+        .expect("APPARATUS: upgrade receipt directory");
+    let base = std::env::var_os("RG13_SESSION_BASE_VOX")
+        .map(PathBuf::from)
+        .expect("APPARATUS: pinned c5b12cef4 binary");
+    let fresh = std::env::var_os("RG13_SESSION_FRESH_RECEIPTS")
+        .map(PathBuf::from)
+        .expect("APPARATUS: fresh fixed outside measurements");
+    std::fs::create_dir_all(&evidence).expect("APPARATUS: upgrade receipts");
+    let mut tmp = tempfile::tempdir_in(&evidence).expect("APPARATUS: upgrade scratch profile");
+    tmp.disable_cleanup(true);
+    eprintln!(
+        "RG13 UPGRADE retained scratch profile {}",
+        tmp.path().display()
+    );
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("cfg")).expect("APPARATUS: upgrade config");
+    let keychain = attach::keychain(root);
+    let pass = root.join("identity.pass");
+    std::fs::write(&pass, IDENTITY).expect("APPARATUS: upgrade passphrase");
+    let run = |exe: &Path, argv: &[&str], input: Option<&str>| {
+        let mut child = Command::new(exe)
+            .args(argv)
+            .env("VOX_DATA_DIR", root)
+            .env("VOX_CONFIG_DIR", root.join("cfg"))
+            .env("VOX_TEST_KEYCHAIN", &keychain)
+            .env("VOX_PROXY", "127.0.0.1:0")
+            .env_remove("VOX_NODE")
+            .env_remove("VOX_ROOM")
+            .env_remove("VOX_SESSION")
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("APPARATUS: upgrade CLI");
+        if let Some(input) = input {
+            child
+                .stdin
+                .take()
+                .expect("APPARATUS: upgrade stdin")
+                .write_all(input.as_bytes())
+                .expect("APPARATUS: upgrade CLI input");
+        }
+        let out = child
+            .wait_with_output()
+            .expect("APPARATUS: upgrade CLI result");
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let fixed = Path::new(VOX);
+    let id = run(
+        &base,
+        &[
+            "id",
+            "--identity-passphrase-file",
+            pass.to_str().expect("APPARATUS: pass path"),
+        ],
+        None,
+    );
+    assert!(id.0, "APPARATUS: base identity: {id:?}");
+    let launch = |exe: &Path, tag: &str, hold: bool| {
+        let mut command = Command::new(exe);
+        command
+            .args(["daemon", "--listen", "127.0.0.1:0", "--passphrase-file"])
+            .arg(&pass)
+            .env("VOX_DATA_DIR", root)
+            .env("VOX_CONFIG_DIR", root.join("cfg"))
+            .env("VOX_TEST_KEYCHAIN", &keychain)
+            .env("VOX_PROXY", "127.0.0.1:0")
+            .env_remove("VOX_NODE")
+            .env_remove("VOX_ROOM")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(
+                std::fs::File::create(evidence.join(format!("upgrade-{tag}.daemon.log")))
+                    .expect("APPARATUS: upgrade daemon log"),
+            );
+        if hold {
+            command.env("VOX_TEST_HOLD_SESSION_BACKFILL", root.join("backfill"));
+        }
+        Daemon(command.spawn().expect("APPARATUS: upgrade daemon"))
+    };
+    let base_daemon = launch(&base, "base", false);
+    let deadline = Instant::now() + Duration::from_secs(240);
+    loop {
+        let listed = run(&base, &["room", "list"], None);
+        if listed.0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "APPARATUS: base daemon not ready: {listed:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let created = run(
+        &base,
+        &[
+            "room",
+            "create",
+            "--name",
+            "upgrade",
+            "--passphrase-file",
+            "-",
+        ],
+        Some(ROOMPASS),
+    );
+    assert!(created.0, "APPARATUS: base room: {created:?}");
+    let listed = run(&base, &["room", "list"], None);
+    assert!(listed.0, "APPARATUS: base room listing: {listed:?}");
+    let room = listed
+        .1
+        .lines()
+        .find(|line| line.contains("upgrade"))
+        .and_then(|line| line.split_whitespace().next())
+        .expect("APPARATUS: upgrade room id")
+        .to_owned();
+    let metadata = |i: usize, name: &str| {
+        serde_json::json!({"v":1,"type":"session",
+        "from":format!("upgrade-{i:04}"),"body":"","at":{"session_name":name},
+        "data":{"session":{"harness":"rg13 upgrade"}}})
+        .to_string()
+    };
+    for i in 0..=100 {
+        let posted = run(
+            &base,
+            &[
+                "room",
+                "post",
+                &room,
+                &metadata(i, &format!("Upgrade {i:04}")),
+            ],
+            None,
+        );
+        assert!(posted.0, "APPARATUS: base Session {i}: {posted:?}");
+    }
+    // The terminal's room label/id is abbreviated. Scope the hold by the full room
+    // identity returned by the BASE daemon, not by that display abbreviation.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let paths =
+        vox_core::node::paths::Paths::resolve("default", Some(root), Some(&root.join("cfg")))
+            .unwrap();
+    let mut client = rt
+        .block_on(vox_core::node::ipc::IpcClient::open_at(
+            &vox_core::node::ipc::NodeSocket::one_shot(
+                paths.account().socket(),
+                vox_core::node::paths::NodeName::parse("default").unwrap(),
+            ),
+        ))
+        .unwrap();
+    let rooms = rt
+        .block_on(client.request(&vox_core::node::ipc::Request::Rooms { after: None }))
+        .expect("APPARATUS: base full room identities");
+    let vox_core::node::ipc::Frame::Rooms { rooms } = rooms else {
+        panic!("APPARATUS: base full room listing frame");
+    };
+    let cid = rooms
+        .iter()
+        .find(|(_, name, ..)| name == "upgrade")
+        .expect("APPARATUS: base full upgrade room")
+        .0;
+    let full_room = vox_core::node::link::b32_encode(&cid);
+    drop(client);
+    let parse = |output: &(bool, String, String)| -> Vec<serde_json::Value> {
+        output
+            .1
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_str(line).expect("APPARATUS: Session JSON line"))
+            .collect()
+    };
+    let deadline = Instant::now() + Duration::from_secs(300);
+    let golden = loop {
+        let shown = run(&base, &["room", "sessions", &room, "--json"], None);
+        if shown.0 && !shown.2.contains("provisional") {
+            let rows = parse(&shown);
+            if rows.len() == 101 {
+                break rows;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "APPARATUS: base publication incomplete: {shown:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(
+        golden
+            .windows(2)
+            .all(|pair| pair[0]["opened_millis"].as_u64() <= pair[1]["opened_millis"].as_u64()),
+        "APPARATUS: base fixture was not oldest opening first"
+    );
+    let fence = run(
+        &base,
+        &["room", "post", &room, "UPGRADE-BASE-DURABILITY-FENCE"],
+        None,
+    );
+    assert!(fence.0, "APPARATUS: base durable fixture: {fence:?}");
+    std::fs::write(
+        evidence.join("upgrade-base-listing.json"),
+        serde_json::to_vec(&golden).unwrap(),
+    )
+    .expect("APPARATUS: base listing receipt");
+    drop(base_daemon);
+    let hold = root.join("backfill");
+    std::fs::create_dir(&hold).expect("APPARATUS: backfill staging directory");
+    std::fs::write(hold.join("arm"), &full_room).expect("APPARATUS: arm exact room backfill");
+    let daemon = launch(fixed, "fixed", true);
+    struct Release(PathBuf);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            let _ = std::fs::write(self.0.join("release"), "");
+        }
+    }
+    let release = Release(hold.clone());
+    let deadline = Instant::now() + Duration::from_secs(300);
+    while !hold.join("engaged").exists() {
+        if Instant::now() >= deadline {
+            let status = run(fixed, &["status", "--json"], None);
+            panic!(
+                "APPARATUS: base index did not reach held backfill; status={status:?}; log={}",
+                std::fs::read_to_string(evidence.join("upgrade-fixed.daemon.log"))
+                    .unwrap_or_default()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        std::fs::read_to_string(hold.join("engaged")).unwrap(),
+        full_room,
+        "APPARATUS: a different room engaged the backfill hold"
+    );
+    let first = run(fixed, &["room", "sessions", &room, "--json"], None);
+    eprintln!(
+        "RG13 UPGRADE first read while backfill held: ok={} rows={} log={}",
+        first.0,
+        first.1.lines().count(),
+        std::fs::read_to_string(evidence.join("upgrade-fixed.daemon.log")).unwrap_or_default()
+    );
+    assert!(
+        first.0,
+        "PRODUCT: first fixed read refused the base Session listing: {first:?}"
+    );
+    assert_eq!(
+        parse(&first),
+        golden,
+        "PRODUCT: first fixed read changed the base's oldest-first Session listing"
+    );
+    drop(release);
+    let deadline = Instant::now() + Duration::from_secs(300);
+    while !hold.join("published").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "APPARATUS: backfill did not report complete publication; log={}",
+            std::fs::read_to_string(evidence.join("upgrade-fixed.daemon.log")).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let after = loop {
+        let after = run(fixed, &["room", "sessions", &room, "--json"], None);
+        if after.0 {
+            break after;
+        }
+        // Publication can invalidate a multi-page read between its stamp and rows.
+        // Follow only that explicit read-only retry; never treat a refused write as saved.
+        assert!(
+            after
+                .2
+                .contains("Sessions changed while listing; run the command again")
+                && Instant::now() < deadline,
+            "PRODUCT: completed backfill refused its listing: {after:?}"
+        );
+    };
+    assert_eq!(
+        parse(&after),
+        golden,
+        "PRODUCT: published backfill changed the base's oldest-first Session listing"
+    );
+    eprintln!(
+        "RG13 UPGRADE first and published listings identical: {} oldest-first Sessions",
+        golden.len()
+    );
+    let writes = || {
+        libproc::libproc::pid_rusage::pidrusage::<libproc::libproc::pid_rusage::RUsageInfoV2>(
+            i32::try_from(daemon.0.id()).unwrap(),
+        )
+        .expect("APPARATUS: upgraded daemon write counter")
+        .ri_diskio_byteswritten
+    };
+    // Let retired backfill pages leave the writer before measuring an ordinary rename.
+    // The durable product store's file bytes are outside data, not an allocator verdict.
+    let paths =
+        vox_core::node::paths::Paths::resolve("default", Some(root), Some(&root.join("cfg")))
+            .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(300);
+    let mut prior = None;
+    let mut stable = 0;
+    loop {
+        let metadata =
+            std::fs::metadata(paths.store_file()).expect("APPARATUS: upgraded store metadata");
+        let current = (
+            metadata.len(),
+            metadata
+                .modified()
+                .expect("APPARATUS: store modification time"),
+        );
+        if prior == Some(current) {
+            stable += 1;
+        } else {
+            stable = 0;
+        }
+        if stable == 5 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "APPARATUS: backfill cleanup did not settle"
+        );
+        prior = Some(current);
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let before = writes();
+    let renamed = run(
+        fixed,
+        &["room", "post", &room, &metadata(0, "UPGRADED-TARGET")],
+        None,
+    );
+    assert!(
+        renamed.0,
+        "PRODUCT: upgraded room refused a rename: {renamed:?}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        let shown = run(fixed, &["room", "sessions", &room, "--json"], None);
+        if shown.0 && shown.1.contains("UPGRADED-TARGET") && !shown.2.contains("provisional") {
+            let rows = parse(&shown);
+            let unchanged = |rows: Vec<serde_json::Value>| {
+                rows.into_iter()
+                    .filter(|row| row["id"] != "upgrade-0000")
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                unchanged(rows),
+                unchanged(golden),
+                "PRODUCT: upgraded rename changed other Sessions or order"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT: upgraded rename did not appear in its Session listing: {shown:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let fence = run(
+        fixed,
+        &["room", "post", &room, "UPGRADE-RENAME-DURABILITY-FENCE"],
+        None,
+    );
+    assert!(fence.0, "APPARATUS: upgrade rename fence: {fence:?}");
+    let bytes = writes() - before;
+    let fresh: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(fresh.join("n100.json")).expect("APPARATUS: fresh outside measurements"),
+    )
+    .expect("APPARATUS: fresh metrics JSON");
+    let reference = fresh["name_change_os_write_bytes"]
+        .as_u64()
+        .expect("APPARATUS: fresh name write bytes");
+    let bound = reference.saturating_mul(3).saturating_add(256 * 1024);
+    eprintln!("RG13 UPGRADE rename OS-write bytes={bytes} fresh100={reference} bound={bound}");
+    assert!(bytes<=bound,"PRODUCT: rename after upgrading the base index rewrote unrelated Sessions: {bytes} OS-write bytes; bound={bound}");
 }
