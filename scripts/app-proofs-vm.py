@@ -29,7 +29,7 @@ def managed_guest_proof():
         raise RuntimeError("managed daemon proof requires a virtual Mac guest")
     app, scratch = map(Path, sys.argv[2:4])
     mode = sys.argv[4]
-    if mode != "recovery":
+    if mode not in ("recovery", "restart"):
         raise RuntimeError("unknown managed guest proof mode")
     helper = app / "Contents/Helpers/vox"
     source = app / "Contents/Library/LaunchAgents/us.vox.daemon.plist"
@@ -58,6 +58,12 @@ def managed_guest_proof():
     plist = fixture / "job.plist"
     env = {"HOME": str(fixture), "VOX_DATA_DIR": str(fixture / "data"),
            "VOX_CONFIG_DIR": str(fixture / "config"), "VOX_LISTEN": "127.0.0.1:0"}
+    hold = fixture / "stop-hold"
+    daemon_log = fixture / "daemon.stderr"
+    if mode == "restart":
+        hold.touch()
+        env["VOX_TEST_STOP_HOLD_NODE"] = "default"
+        env["VOX_TEST_STOP_HOLD_FILE"] = str(hold)
     for path in (fixture / "data", fixture / "config"):
         path.mkdir()
     job = plistlib.loads(source.read_bytes())
@@ -67,9 +73,13 @@ def managed_guest_proof():
     job["Program"] = str(helper)
     job["ProgramArguments"][0] = str(helper)
     job["EnvironmentVariables"] = env
+    if mode == "restart":
+        job["StandardErrorPath"] = str(daemon_log)
     plist.write_bytes(plistlib.dumps(job))
     control = fixture / "data/.daemon/vox.sock"
     owned = False
+    restarter = None
+    caller_log = fixture / "restart-caller.log"
     def interrupted(_sig, _frame):
         raise KeyboardInterrupt
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
@@ -83,13 +93,15 @@ def managed_guest_proof():
         if not runs:
             raise RuntimeError(f"cannot read launchd run count: {answer.stdout}")
         return (int(pid.group(1)) if pid else None, int(runs.group(1)), answer.stdout)
-    def until(description, predicate):
+    def until(description, predicate, on_timeout=None):
         deadline = time.monotonic() + 90
         while time.monotonic() < deadline:
             value = predicate()
             if value:
                 return value
             time.sleep(.02)
+        if on_timeout is not None:
+            on_timeout()
         raise RuntimeError(f"APPARATUS: watchdog while awaiting {description}; {state()[2]}")
     def frame(s):
         def read(n):
@@ -150,6 +162,56 @@ def managed_guest_proof():
                 raise RuntimeError(f"APPARATUS: could not stage node: {staged.stdout}{staged.stderr}")
         if ready() != (first, first_runs):
             raise RuntimeError("APPARATUS: staging did not retain the initial managed daemon")
+        if mode == "restart":
+            with caller_log.open("w+") as output:
+                restarter = subprocess.Popen([str(helper), "daemon", "--restart"], env=env,
+                                             stdin=subprocess.DEVNULL, stdout=output,
+                                             stderr=subprocess.STDOUT)
+                def held():
+                    if daemon_log.exists() and "test holding stop of node default" in daemon_log.read_text():
+                        return True
+                    if restarter.poll() is not None:
+                        output.flush()
+                        raise RuntimeError(f"APPARATUS: restart caller exited before daemon held stop: "
+                                           f"{caller_log.read_text()}")
+                    pid, runs, text = state()
+                    if pid != first or runs != first_runs:
+                        raise RuntimeError(f"APPARATUS: initial daemon changed before stop hold: {text}")
+                    return False
+                until("daemon stop hold", held)
+                print(f"[proof] daemon stop hold reached:\n{daemon_log.read_text()}", flush=True)
+                if restarter.poll() is not None:
+                    raise RuntimeError("APPARATUS: restart caller exited before it could be killed")
+                restarter.kill()
+                restarter.wait()
+                print(f"[proof] killed restart caller exit={restarter.returncode}", flush=True)
+            hold.unlink(missing_ok=True)
+            def restarted():
+                pid, runs, text = state()
+                hello = greeting()
+                if runs > first_runs + 1 or (pid and pid != first and runs != first_runs + 1):
+                    raise RuntimeError(f"PRODUCT: restart created more than one replacement run: {text}")
+                return (pid, runs) if pid and pid != first and runs == first_runs + 1 and hello == pid else None
+            def restart_timeout():
+                pid, _, text = state()
+                if not pid and re.search(r"last exit code = 0\b", text) and greeting() is None:
+                    raise RuntimeError(f"PRODUCT: killed caller left launchd inactive with exit 0 and no greeting: {text}")
+            second, second_runs = until("managed replacement after caller death", restarted, restart_timeout)
+            print(f"[proof] replacement before any client:\n{state()[2]}", flush=True)
+            stopped_log = daemon_log.read_text()
+            print(f"[proof] daemon log through replacement:\n{stopped_log}", flush=True)
+            if "stopped by SIGTERM" not in stopped_log:
+                raise RuntimeError("PRODUCT: launchd replaced the daemon without its clean "
+                                   f"stopped-by-SIGTERM line:\n{stopped_log}")
+            status = subprocess.run([str(helper), "status", "--node", "default"], env=env,
+                                    capture_output=True, text=True, timeout=90)
+            print(f"[proof] vox status exit={status.returncode}\n{status.stdout}{status.stderr}", flush=True)
+            if status.returncode or not status.stdout.lower().startswith("node "):
+                raise RuntimeError(f"PRODUCT: status failed after restart: {status.stdout}{status.stderr}")
+            current, runs, text = state()
+            if current != second or runs != second_runs or greeting() != second:
+                raise RuntimeError(f"PRODUCT: status did not use the single replacement daemon: {text}")
+            return
         os.kill(first, signal.SIGTERM)
         def recovered():
             pid, runs, text = state()
@@ -190,11 +252,17 @@ def managed_guest_proof():
         print(f"[proof] explicit Stop: launchd reports exit 0, no pid, {stopped_runs} runs")
         print(f"[proof] stopped launchd state:\n{state()[2]}", flush=True)
     finally:
+        if restarter is not None and restarter.poll() is None:
+            restarter.kill()
+            restarter.wait()
+        hold.unlink(missing_ok=True)
         if owned:
             result = launch("bootout", domain, str(plist))
             if result.returncode and launch("print", target).returncode == 0:
                 raise RuntimeError(f"APPARATUS: could not boot out owned job: {result.stderr}")
             print("[proof] owned launchd job booted out", flush=True)
+        if restarter is not None and caller_log.exists():
+            print(f"[proof] restart caller output:\n{caller_log.read_text()}", flush=True)
         shutil.rmtree(fixture)
         marker.unlink(missing_ok=True)
 
@@ -204,9 +272,10 @@ def run(argv, **kwargs):
 
 
 def main():
-    recovery = len(sys.argv) == 5 and sys.argv[1] == "--recovery-vm"
-    if sys.argv[1:2] == ["--recovery-vm"] and not recovery:
-        raise RuntimeError("--recovery-vm needs helper, shipped plist and receipt directory")
+    mode = sys.argv[1] if len(sys.argv) > 1 else ""
+    recovery = len(sys.argv) == 5 and mode in ("--recovery-vm", "--restart-vm")
+    if mode in ("--recovery-vm", "--restart-vm") and not recovery:
+        raise RuntimeError(f"{mode} needs helper, shipped plist and receipt directory")
     root = Path(__file__).resolve().parent.parent
     tart = os.environ.get("VOX_TART", "tart")
     vm = os.environ.get("VOX_PROOF_VM", "vox-app-proofs")
@@ -281,7 +350,8 @@ def recovery_guest(ssh, options, destination, out):
             "chmod 700 " + shlex.quote(app + "/Contents/Helpers/vox") + "; "
             "echo $$ > " + shlex.quote(guest + "/proof.pid") + "; "
             "exec env VOX_PROOF_VM_GUEST=1 /usr/bin/python3 " + shlex.quote(guest + "/proof.py")
-            + " --managed-guest-proof " + shlex.quote(app) + " " + shlex.quote(guest) + " recovery"
+            + " --managed-guest-proof " + shlex.quote(app) + " " + shlex.quote(guest)
+            + (" restart" if sys.argv[1] == "--restart-vm" else " recovery")
         )
         proc = subprocess.Popen([*ssh, command])
         result = proc.wait()
