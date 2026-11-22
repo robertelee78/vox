@@ -696,9 +696,9 @@ fn a_room_held_closed_is_opened_by_joining_it_again() {
 }
 
 /// **A room the daemon does not reopen says why** (#412): a remembered room whose reopen fails
-/// is held closed, and both its listing and a refused read retain the daemon's reason. The log
-/// also names the room and what refused it. The failure is driven by `VOX_TEST_REOPEN_FAILS`
-/// (test-knobs only), which makes every reopen fail with the reason it carries.
+/// is held closed, and both its listing and a refused read retain the daemon's reason. The
+/// listing says how to reopen it; running that command opens it for a post. The log also names
+/// the room and what refused it. `VOX_TEST_REOPEN_FAILS` drives the failure (test-knobs only).
 ///
 /// **The note is said before the unlock's answer**, and the daemon used to take the answer first
 /// about one run in ten and never read it: the log stayed silent. `VOX_TEST_ANSWER_FIRST`
@@ -732,6 +732,8 @@ fn a_room_that_does_not_reopen_says_why() {
         .find(|w| w.len() >= 8 && w.chars().all(|c| c.is_ascii_alphanumeric()))
         .map(str::to_owned)
         .expect("PRODUCT (staging): no room id in alice's `room list`");
+    let (ok, address, err) = vox(&alice, &["room", "link", &room], None);
+    assert!(ok, "PRODUCT (staging): the room's recovery address: {err}");
     drop(first);
 
     let why = "the test knob refused it";
@@ -750,8 +752,25 @@ fn a_room_that_does_not_reopen_says_why() {
             ("VOX_TEST_ANSWER_FIRST", &first_answer),
         ],
     );
+    attached(&alice, "alice");
+    // A successful list can precede the failed reopen. Observe its published refusal first,
+    // then ask for the list; an earlier snapshot is not evidence of a stuck preparation.
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let (ok, _, err) = vox(&alice, &["room", "read", &room], None);
+        if !ok && err.contains(why) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "APPARATUS: the forced reopen refusal was not observed before checking its listing: \
+             ok={ok}, {err}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
     let listed = attached(&alice, "alice");
-    let said = std::fs::read_to_string(alice.join("daemon-alice.err")).unwrap_or_default();
+    let said = std::fs::read_to_string(alice.join("daemon-alice.err"))
+        .expect("APPARATUS: read the daemon's reopen-failure output");
     let note = said
         .lines()
         .find(|l| l.contains("did not reopen") && l.contains(&room[..12]))
@@ -762,12 +781,40 @@ fn a_room_that_does_not_reopen_says_why() {
         "PRODUCT: a room that did not reopen was not named in the daemon's log with why:\n{said}"
     );
     assert!(
-        listed.contains(why),
-        "PRODUCT: the closed room listing lost the daemon's reopen failure:\n{listed}"
+        listed.contains(&format!("[closed: {why}]")) && !listed.contains("[preparing history"),
+        "PRODUCT: the room listing must say it is closed and retain the daemon's reopen failure, \
+         not tell the person to wait:\n{listed}"
     );
+    let reopen = listed
+        .split('`')
+        .find(|part| part.starts_with("vox room join "))
+        .unwrap_or_else(|| {
+            panic!("PRODUCT: the failed room listing names no command to reopen it:\n{listed}")
+        });
     let (ok, _, err) = vox(&alice, &["room", "read", &room], None);
     assert!(
         !ok && err.contains(why),
         "PRODUCT: reading the failed room did not report the daemon's reopen failure:\n{err}"
+    );
+    let mut args: Vec<&str> = reopen
+        .strip_prefix("vox ")
+        .expect("APPARATUS: the listed command starts with vox")
+        .split_whitespace()
+        .collect();
+    args.extend(["--passphrase-file", "-", address.trim()]);
+    let (ok, out, err) = vox(&alice, &args, Some(&format!("{ROOMPASS}\n")));
+    println!("[proof] running the listing's `{reopen}` with the address: {ok}; {out}{err}");
+    assert!(
+        ok,
+        "PRODUCT: the room listing's reopen command did not reopen it: {out}{err}"
+    );
+    let (ok, _, err) = vox(
+        &alice,
+        &["room", "post", &room, "after listed recovery"],
+        None,
+    );
+    assert!(
+        ok,
+        "PRODUCT: the room reopened by its listing's command cannot accept a post: {err}"
     );
 }

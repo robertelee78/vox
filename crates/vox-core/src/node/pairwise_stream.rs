@@ -370,11 +370,12 @@ impl std::fmt::Debug for RoomSendFence {
     }
 }
 
-/// A queued key frame may not cross a durable room-authorization transition.
-pub(crate) async fn write_pairwise_fenced(
+/// Write an owned opening, marking its prekey only inside the unchanged authorization fence.
+pub(crate) async fn write_pairwise_owned(
     conn: &VoxConnection,
     frames: &[impl AsRef<[u8]>],
-    fence: &RoomSendFence,
+    fence: Option<&RoomSendFence>,
+    prekey: Option<&crate::node::prekeys::OneTimeReservation>,
 ) -> Result<RecvStream> {
     #[cfg(feature = "test-knobs")]
     if let Some(path) = std::env::var_os("VOX_TEST_HOLD_PAIRWISE_KEY_FILE")
@@ -401,6 +402,15 @@ pub(crate) async fn write_pairwise_fenced(
             use std::task::Poll;
             let mut write = std::pin::pin!(write_frame(&mut send, frame.as_ref()));
             std::future::poll_fn(|cx| {
+                let mut poll_write = || {
+                    if let Some(prekey) = prekey {
+                        prekey.mark_named();
+                    }
+                    write.as_mut().poll(cx)
+                };
+                let Some(fence) = fence else {
+                    return poll_write();
+                };
                 #[cfg(feature = "test-knobs")]
                 if std::env::var("VOX_TEST_FX62_MUTANT").as_deref() == Ok("pairwise-equality-only")
                 {
@@ -412,7 +422,7 @@ pub(crate) async fn write_pairwise_fenced(
                         {
                             return Err(Error::StreamRefused("room authorization changed"));
                         }
-                        Ok(write.as_mut().poll(cx))
+                        Ok(poll_write())
                     }) {
                         Ok(result) => result,
                         Err(error) => Poll::Ready(Err(error)),
@@ -425,7 +435,7 @@ pub(crate) async fn write_pairwise_fenced(
                     &fence.room,
                     fence.generation,
                     Some(signer.as_ref()),
-                    || write.as_mut().poll(cx),
+                    poll_write,
                 ) {
                     Some(result) => result,
                     None => Poll::Ready(Err(Error::StreamRefused("room authorization changed"))),
