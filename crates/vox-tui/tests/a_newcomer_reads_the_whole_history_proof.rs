@@ -8729,6 +8729,12 @@ const PREPARING_ROUNDS: u64 = 2;
 /// Found 2026-10-20 on the decider's work Mac (v0.4.7): a room stayed "[preparing history]" for
 /// 20 hours with no words anywhere, re-queued every 50 ms, absent from `vox status`.
 ///
+/// The former governance-fold hold and its unnamed-governance-wait mutant are not claimed here.
+/// Since fe439467c, a peer's current Presence/consent facts are published at acceptance, outside
+/// canonical-history replay; holding that replay no longer keeps this join/post fixture preparing.
+/// The unchanged old arm opens on main too. This arm holds the reopened room's projection turn
+/// instead; it does not claim coverage of a pending canonical-governance fold.
+///
 /// Mutant: the command's room guard refuses immediately instead of waiting; its read and post
 /// then return the preparing refusal without the waiting line.
 #[cfg(feature = "optional-proofs")]
