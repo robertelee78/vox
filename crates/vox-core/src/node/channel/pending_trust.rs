@@ -16,10 +16,6 @@ pub(crate) enum TrustWrite {
         after: Option<Digest32>,
     },
     MarkDecisions,
-    MarkDecision {
-        target: Digest32,
-        decision: Stamp,
-    },
 }
 
 pub(crate) enum TrustSaved {
@@ -78,16 +74,56 @@ impl CompletedTrust {
 }
 
 impl ChannelState {
+    pub(crate) fn trust_reconciled(&self, generation: u64) -> bool {
+        self.has_left(&self.me()) || self.trust_reconciled_generation >= generation
+    }
+
+    pub(crate) fn mark_trust_reconciled(&mut self, generation: u64) {
+        self.trust_reconciled_generation = generation;
+        self.trust_failed_generation = None;
+        self.history_publication_changed.notify_waiters();
+    }
+
+    pub(crate) fn trust_failed(&self, generation: u64) -> bool {
+        self.trust_failed_generation
+            .is_some_and(|failed| failed >= generation)
+    }
+
+    pub(crate) fn mark_trust_failed(&mut self, generation: u64) {
+        if !self.trust_reconciled(generation) {
+            self.trust_failed_generation = Some(
+                self.trust_failed_generation
+                    .map_or(generation, |failed| failed.max(generation)),
+            );
+            self.history_publication_changed.notify_waiters();
+        }
+    }
+
+    /// PendingLocks is committed with the keyring, before any room work is attempted.
+    pub(crate) fn require_trust_withdrawn(
+        &self,
+        store: &Store,
+        signer: &dyn crate::identity::composite::RootSigner,
+    ) -> Result<()> {
+        if self.has_left(&self.me()) {
+            return Err(Error::Profile("this identity has left the room"));
+        }
+        let locks = PendingLocks::load(store, signer)?;
+        for target in locks.for_room(&self.channel_id) {
+            if self.is_author(&target) {
+                return Err(Error::Profile("this room's trust withdrawal is incomplete"));
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn prepare_pending_trust(
         &mut self,
         store: &Arc<Store>,
         owner: Arc<()>,
         write: TrustWrite,
     ) -> Result<PendingTrust> {
-        let marking = matches!(
-            &write,
-            TrustWrite::MarkDecisions | TrustWrite::MarkDecision { .. }
-        );
+        let marking = matches!(&write, TrustWrite::MarkDecisions);
         if self.poisoned && !marking {
             return Err(self.save_failure());
         }
@@ -199,9 +235,6 @@ impl ChannelState {
         if let Some(marks) = marks {
             self.trust_marks = marks;
         }
-        if let Err(error) = &result {
-            self.poison(error);
-        }
         self.release_pending_text(&pending.owner, false);
         result
     }
@@ -283,7 +316,6 @@ impl PendingTrust {
                         let locks = PendingLocks::load(store, signer)?;
                         let mut iter = locks
                             .for_room(&self.room)
-                            .into_iter()
                             .filter(|member| after.is_none_or(|a| *member > a));
                         let mut cursor = *after;
                         for _ in 0..64 {
@@ -309,68 +341,57 @@ impl PendingTrust {
                             done: false,
                         })
                     }
-                    TrustWrite::MarkDecisions | TrustWrite::MarkDecision { .. } => {
-                        self.sek.with(|sek| {
-                            let mut next = match batch.get_segment(
+                    TrustWrite::MarkDecisions => self.sek.with(|sek| {
+                        let mut next = match batch.get_segment(
+                            &self.room,
+                            SegmentKind::KeyMaterial,
+                            SEG_TRUST_MARKS,
+                        )? {
+                            Some(segment) => parse_marks(&open_segment(
+                                sek,
+                                SegmentKind::KeyMaterial,
+                                SEG_TRUST_MARKS,
+                                &segment,
+                            )?)?,
+                            None => BTreeMap::new(),
+                        };
+                        let mut changed = false;
+                        let mut record = |target: Digest32, decision: Stamp| -> Result<()> {
+                            if self.live.is_some_and(|live| live.after(&decision))
+                                || next.get(&target).is_some_and(|mark| mark.0 == decision)
+                            {
+                                return Ok(());
+                            }
+                            if !next.contains_key(&target) && next.len() >= AUTHORS_HARD_LIMIT {
+                                return Err(Error::SizeLimitExceeded("trust marks"));
+                            }
+                            let position = (decision, self.position.0, self.position.1);
+                            next.insert(target, position);
+                            changed = true;
+                            Ok(())
+                        };
+                        let order = crate::node::consent_order::ConsentOrder::load(store, signer)?;
+                        for (target, decision) in order.decisions() {
+                            record(target, decision)?;
+                        }
+                        if changed {
+                            let segment = seal_segment(
+                                sek,
+                                SegmentKind::KeyMaterial,
+                                SEG_TRUST_MARKS,
+                                &marks_bytes(&next),
+                            )?;
+                            batch.put_segment(
                                 &self.room,
                                 SegmentKind::KeyMaterial,
                                 SEG_TRUST_MARKS,
-                            )? {
-                                Some(segment) => parse_marks(&open_segment(
-                                    sek,
-                                    SegmentKind::KeyMaterial,
-                                    SEG_TRUST_MARKS,
-                                    &segment,
-                                )?)?,
-                                None => BTreeMap::new(),
-                            };
-                            let mut changed = false;
-                            let mut record = |target: Digest32, decision: Stamp| -> Result<()> {
-                                if self.live.is_some_and(|live| live.after(&decision))
-                                    || next.get(&target).is_some_and(|mark| mark.0 == decision)
-                                {
-                                    return Ok(());
-                                }
-                                if !next.contains_key(&target) && next.len() >= AUTHORS_HARD_LIMIT {
-                                    return Err(Error::SizeLimitExceeded("trust marks"));
-                                }
-                                let position = (decision, self.position.0, self.position.1);
-                                next.insert(target, position);
-                                changed = true;
-                                Ok(())
-                            };
-                            match &self.write {
-                                TrustWrite::MarkDecision { target, decision } => {
-                                    record(*target, *decision)?
-                                }
-                                _ => {
-                                    let order = crate::node::consent_order::ConsentOrder::load(
-                                        store, signer,
-                                    )?;
-                                    for (target, decision) in order.decisions() {
-                                        record(target, decision)?;
-                                    }
-                                }
-                            }
-                            if changed {
-                                let segment = seal_segment(
-                                    sek,
-                                    SegmentKind::KeyMaterial,
-                                    SEG_TRUST_MARKS,
-                                    &marks_bytes(&next),
-                                )?;
-                                batch.put_segment(
-                                    &self.room,
-                                    SegmentKind::KeyMaterial,
-                                    SEG_TRUST_MARKS,
-                                    &segment,
-                                )?;
-                                batch.commit()?;
-                            }
-                            marks = Some(next);
-                            Ok(TrustSaved::Marked)
-                        })
-                    }
+                                &segment,
+                            )?;
+                            batch.commit()?;
+                        }
+                        marks = Some(next);
+                        Ok(TrustSaved::Marked)
+                    }),
                 }
             }))
             .unwrap_or_else(|_| Err(Error::Profile("trust save worker stopped")));

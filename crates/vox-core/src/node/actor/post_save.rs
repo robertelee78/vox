@@ -332,6 +332,51 @@ impl Node {
             self.retain_store_command(command, reply);
             return;
         }
+        if self.profile.is_none() {
+            let _ = reply.send(Outcome::Failed(Fault::NoIdentity));
+            return;
+        }
+        let Some(authority) = self.computer_authority() else {
+            let _ = reply.send(Outcome::Failed(Fault::ComputerPolicy));
+            return;
+        };
+        #[cfg(feature = "test-knobs")]
+        self.hold_text_append_publication_for_proof().await;
+        #[cfg(feature = "test-knobs")]
+        let skip_publication = crate::node::computer::fx28_mutant("stale-post-authority");
+        #[cfg(not(feature = "test-knobs"))]
+        let skip_publication = false;
+        let text_command = matches!(
+            command,
+            NodeCommand::SendText { .. }
+                | NodeCommand::SendTextAt { .. }
+                | NodeCommand::SendTextAdmitted { .. }
+        );
+        let publication = if skip_publication {
+            None
+        } else {
+            match authority.try_acquire_publication() {
+                Ok(Some(publication)) => Some(publication),
+                Ok(None) if text_command => {
+                    self.retain_store_command(command, reply);
+                    return;
+                }
+                Err(_) if text_command && matches!(authority.superseded(), Ok(true)) => {
+                    // No room work has begun. Keep the original command and queue credit until
+                    // this node has saved the new keyring, then admit it against that policy.
+                    self.retain_store_command(command, reply);
+                    return;
+                }
+                Ok(None) => {
+                    let _ = reply.send(Outcome::Failed(Fault::RoomChangePending));
+                    return;
+                }
+                Err(_) => {
+                    let _ = reply.send(Outcome::Failed(Fault::ComputerPolicy));
+                    return;
+                }
+            }
+        };
         let (text, expected_instance, slot, governance, kind) = match command {
             NodeCommand::SendText { text, .. } => (text, None, None, None, ReplyKind::Text),
             NodeCommand::SendTextAt { text, instance, .. } => {
@@ -453,10 +498,6 @@ impl Node {
             let _ = reply.send(Outcome::Failed(Fault::ChannelNotOpen));
             return;
         };
-        let Some(authority) = self.computer_authority() else {
-            let _ = reply.send(Outcome::Failed(Fault::ComputerPolicy));
-            return;
-        };
         #[cfg(feature = "mutant-sender")]
         let end_authority = matches!(kind, ReplyKind::End).then(|| authority.clone());
         let end_preparation = matches!(kind, ReplyKind::End).then(|| EndPreparation {
@@ -537,25 +578,7 @@ impl Node {
             self.rename_name_reservations
                 .insert(channel_id, name.clone());
         }
-        #[cfg(feature = "test-knobs")]
-        self.hold_text_append_publication_for_proof().await;
         let worker = tokio::spawn(async move {
-            #[cfg(feature = "test-knobs")]
-            let publication = if crate::node::computer::fx28_mutant("stale-post-authority") {
-                None
-            } else {
-                match authority.try_acquire_publication() {
-                    Ok(Some(publication)) => Some(publication),
-                    Ok(None) => return Err(Fault::RoomChangePending),
-                    Err(_) => return Err(Fault::ComputerPolicy),
-                }
-            };
-            #[cfg(not(feature = "test-knobs"))]
-            let publication = match authority.try_acquire_publication() {
-                Ok(Some(publication)) => Some(publication),
-                Ok(None) => return Err(Fault::RoomChangePending),
-                Err(_) => return Err(Fault::ComputerPolicy),
-            };
             // The room's one pending write may be held by a peer's served write (or another
             // local write); every release wakes this edge. Wait for it here, registered so a
             // served write that wakes on the same release stands aside (`history_stream::
@@ -668,6 +691,9 @@ impl Node {
                                 }
                             };
                         }
+                        channel
+                            .require_trust_withdrawn(&worker_store, signer.as_ref())
+                            .map_err(|error| fault_of(&error))?;
                         let now_millis = millis_clock();
                         match channel.prepare_pending_text(
                             &worker_store,

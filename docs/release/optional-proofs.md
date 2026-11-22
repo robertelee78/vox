@@ -17,6 +17,63 @@ They are kept "at the ready for troubleshooting". When a user reports one of the
   - A product failure fails as the product's verdict.
 - **CI compiles them on every run and never runs them.** The CI step is "Compile optional proofs (not run; troubleshooting kit)": `cargo test --release -p vox-tui --features optional-proofs --no-run`, with `-D warnings`. A change that breaks one is caught at once, not on the day it is needed.
 
+### Room-by-room computer trust (ADR-052 RG-3)
+
+The trust journey in `nodes_of_one_daemon_proof.rs` uses scratch computers and
+the real `vox` commands. A departed room must not strand the node's saved keyring;
+adding a paired node must not refuse another room's posts or link. The held-room
+proofs pair the departing computer and trust the requester independently. A causally
+held withdrawal refuses only that room's posts and sender keys, then resumes without
+a restart or another policy event. Manual removal also retains its room's withdrawal
+stage while refreshing permissions, rather than repeatedly starting that withdrawal
+over; the existing manual-removal and through-log re-trust journeys cover this path.
+Posts that meet a new computer revision before native publication retain their
+original command queue credit until the saved keyring is current; their room's
+withdrawal fence still decides whether they may be written.
+The consent cursor survives every page. A newer trust list restarts only that room's
+reconciliation. Every failed trust turn uses the existing one-second retry while
+ordinary room governance continues; the saved manual command reports incomplete
+withdrawal rather than waiting for a permanent fault. Installing a keyring refreshes service reachers,
+independent of room withdrawal. A new manual grant dials the requested member and
+waits for its existing owed-consent pass before acknowledging the command.
+A closed room with saved withdrawal debt defers authoring Session refresh until its
+preparation trust stage has withdrawn the old reader. It can then open, without
+weakening the record or key fences; the existing closed-room removal proof covers it.
+The post-race act uses the existing text-publication hold to change the durable
+revision before the original post is admitted; the same command must succeed and
+its shipped JSON read must show exactly one copy. At a held withdrawal, a pending
+computer application receipt is judged by other-room post/read progress until the
+receipt is consumed, not by which independent task publishes its marker first.
+The post proof first shows that both removed and surviving readers could read, then
+counts completed other-room exchanges until its own post is accepted, then waits for
+the surviving reader and ten completed exchanges before checking that the
+removed reader sees no post after withdrawal. To stage a key queued before withdrawal,
+set `VOX_PROOF_RG3_QUEUED_KEY=1` for the held-key proof; it uses the existing pairwise
+key hold and retains the same user-facing no-key assertion.
+The focused manual-removal act counts accepted/read other-room posts while the saved
+removal finishes; it judges the terminal result after at most 100 such observations,
+not after an elapsed wait. Its projection-stage mutant must fail that counted claim.
+
+Run each named proof separately, with exclusive build-slot ownership for the hold:
+
+```sh
+cargo test --release -p vox-tui --features test-knobs,optional-proofs \
+  --test nodes_of_one_daemon_proof \
+  a_trust_change_skips_a_left_room_and_additions_refuse_no_posts -- --ignored --exact --nocapture
+cargo test --release -p vox-tui --features test-knobs,optional-proofs \
+  --test nodes_of_one_daemon_proof \
+  an_unfinished_room_refuses_only_its_own_posts_then_finishes -- --ignored --exact --nocapture
+cargo test --release -p vox-tui --features test-knobs,optional-proofs \
+  --test nodes_of_one_daemon_proof \
+  an_unfinished_room_releases_no_key_until_its_withdrawal_finishes -- --ignored --exact --nocapture
+cargo test --release -p vox-tui --features test-knobs,optional-proofs \
+  --test nodes_of_one_daemon_proof \
+  a_post_racing_a_trust_revision_is_saved_once -- --ignored --exact --nocapture
+cargo test --release -p vox-tui --features test-knobs,optional-proofs \
+  --test nodes_of_one_daemon_proof \
+  a_saved_manual_removal_finishes_while_another_room_posts -- --ignored --exact --nocapture
+```
+
 ### Linux kernel-keyring proofs
 
 The dedicated typed-unlock, restart and unavailable-keyring journeys must run as a disposable
