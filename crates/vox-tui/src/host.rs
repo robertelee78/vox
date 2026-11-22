@@ -4503,16 +4503,21 @@ impl Router {
     }
 
     /// Attach every node the attach file keeps (L-4), each in the background: a client that asks
-    /// for one meanwhile waits for it, as for any attach.
-    pub fn attach_kept(&self) {
+    /// for one meanwhile waits for it. The returned tasks mark completion of startup attachment.
+    pub fn attach_kept(&self) -> tokio::task::JoinSet<()> {
         let kept = self.mark_kept_attaching();
+        let mut tasks = tokio::task::JoinSet::new();
         for (node, source) in kept {
             let router = self.clone();
-            self.inner.rt.spawn(async move {
-                router.attach_one_kept(&node, source).await;
-                lock(&router.inner.starting).remove(&node);
-            });
+            tasks.spawn_on(
+                async move {
+                    router.attach_one_kept(&node, source).await;
+                    lock(&router.inner.starting).remove(&node);
+                },
+                &self.inner.rt,
+            );
         }
+        tasks
     }
 
     /// List every node the attach file keeps as attaching (#666), and return them with their
@@ -4538,6 +4543,16 @@ impl Router {
 
     /// Attach kept node `node` from its keep `source`, as [`Self::attach_kept`] does each.
     async fn attach_one_kept(&self, node: &NodeName, source: Option<KeepSource>) {
+        // Keep the real startup state visible while a proof observes a replacement daemon.
+        #[cfg(feature = "test-knobs")]
+        if std::env::var("VOX_TEST_ATTACH_HOLD_NODE").as_deref() == Ok(node.as_str()) {
+            if let Some(path) = std::env::var_os("VOX_TEST_ATTACH_HOLD_FILE") {
+                let path = std::path::PathBuf::from(path);
+                while path.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        }
         let (passphrase, rooms) = match &source {
             None | Some(KeepSource::None) => (None, Vec::new()),
             // Off the runtime's workers: a Keychain that asks (locked, or the item made by
@@ -5210,6 +5225,22 @@ impl Router {
         done: watch::Sender<DetachOutcome>,
         cause: DetachCause,
     ) -> Result<(), Refusal> {
+        // Hold node stops at either transition boundary for lifecycle proofs.
+        // Never compiled into the installed binary.
+        #[cfg(feature = "test-knobs")]
+        if matches!(cause, DetachCause::DaemonStopping)
+            && std::env::var("VOX_TEST_STOP_HOLD_PHASE").as_deref() != Ok("event")
+            && std::env::var("VOX_TEST_STOP_HOLD_NODE")
+                .is_ok_and(|held| held == "*" || held == node.as_str())
+        {
+            if let Some(path) = std::env::var_os("VOX_TEST_STOP_HOLD_FILE") {
+                let path = std::path::PathBuf::from(path);
+                eprintln!("vox daemon: test holding stop of node {node}");
+                while path.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        }
         let mut physical_end = a.handle.termination();
         let _ = a.detached.send(true);
         {
@@ -5321,6 +5352,20 @@ impl Router {
             let _ = done.send(Some(Ok(())));
             Ok(())
         };
+        #[cfg(feature = "test-knobs")]
+        if matches!(cause, DetachCause::DaemonStopping)
+            && std::env::var("VOX_TEST_STOP_HOLD_PHASE").as_deref() == Ok("event")
+            && std::env::var("VOX_TEST_STOP_HOLD_NODE")
+                .is_ok_and(|held| held == "*" || held == node.as_str())
+        {
+            if let Some(path) = std::env::var_os("VOX_TEST_STOP_HOLD_FILE") {
+                let path = std::path::PathBuf::from(path);
+                eprintln!("vox daemon: test holding detached event of node {node}");
+                while path.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        }
         if !matches!(cause, DetachCause::DaemonStopping) {
             eprintln!(
                 "vox daemon: node {node} finished its work ({})",
