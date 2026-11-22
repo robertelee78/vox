@@ -340,7 +340,7 @@ pub fn one_shot(paths: &Paths) -> Result<NodeSocket, AppError> {
 
 /// What a verb says on stderr, once, when the daemon has not greeted it within a second.
 pub const DAEMON_WAITING: &str = "vox: waiting: the vox daemon here has not answered yet — it may \
-     be busy (moving or unlocking a node) or stopped (Ctrl-Z, which goes on once resumed); this \
+     be busy (moving or unlocking a node), finishing a daemon restart, or stopped (Ctrl-Z, which goes on once resumed); this \
      waits up to 10 s";
 
 /// Say [`DAEMON_WAITING`]: a verb waiting on the daemon is never silent.

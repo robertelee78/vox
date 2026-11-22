@@ -1936,6 +1936,8 @@ fn a_product_stop_exits_zero_and_foreign_signals_exit_for_the_manager() {
 }
 
 /// The room read is issued while no daemon can answer, not after a client has healed a gap.
+/// Unpaused reads may truthfully report saved history preparing; the fixture lets that finish
+/// before asserting news, while keeping its paused clients below their existing 10 s deadline.
 #[cfg(feature = "test-knobs")]
 #[test]
 #[ignore = "real daemon processes and production Argon2id; run in release"]
@@ -2112,6 +2114,7 @@ fn restart_with_a_staged_stop(killed: bool) {
             ("rooms", vec!["room", "list"]),
             ("nodes", vec!["node", "list"]),
         ];
+        let resume_by = Instant::now() + Duration::from_secs(8);
         let mut calls = Vec::new();
         for (name, args) in commands {
             let (client, client_out) = output(&a, &format!("during-{name}.out"), &args);
@@ -2145,14 +2148,16 @@ fn restart_with_a_staged_stop(killed: bool) {
         signal(caller_pid, "-CONT");
         let mut ready = String::new();
         assert!(
-            wait_until(Duration::from_secs(60), || {
+            wait_until(resume_by.saturating_duration_since(Instant::now()), || {
                 let (ok, out, err) = a.run(&["room", "read", &room], "");
                 ready = format!("{out}{err}");
                 ok && ready.contains("news across the causal restart")
             }),
-            "APPARATUS: replacement never finished remembered-room preparation: {ready}"
+            "APPARATUS: replacement preparation missed the 8 s client-pause budget: {ready}"
         );
         for (index, (name, path)) in calls.iter().enumerate() {
+            assert!(Instant::now() < resume_by,
+                "APPARATUS: client pause exceeded 8 s, too close to the existing 10 s greeting deadline");
             if actors.children[index + 1].try_wait().unwrap().is_none() {
                 signal(actors.children[index + 1].id(), "-CONT");
             }
@@ -2331,15 +2336,22 @@ fn a_restart_owns_its_replacement_while_a_client_waits() {
             || !client_ok
             || !out.contains("already running")
             || !hook.0
-            || !err.contains("waiting for the daemon restart")
-            || !hook.2.contains("waiting for the daemon restart")
+            || !err.contains("daemon restart")
+            || !hook.2.contains("daemon restart")
         {
             stop_pid(replacement);
         }
         assert!(client_ok && out.contains("already running"),
             "PRODUCT: a client during restart started a competing daemon instead of waiting: {out}{err}; restart: {restart}");
         assert!(
-            err.contains("waiting for the daemon restart"),
+            !hook.1.contains("ask the operator to restart")
+                && !hook.2.contains("ask the operator to restart"),
+            "PRODUCT: a prompt during restart incorrectly blamed a broken daemon: {}{}",
+            hook.1,
+            hook.2
+        );
+        assert!(
+            err.contains("daemon restart"),
             "APPARATUS: the client did not arrive during the restart: {out}{err}"
         );
         assert!(
@@ -2350,7 +2362,7 @@ fn a_restart_owns_its_replacement_while_a_client_waits() {
             a.log()
         );
         assert!(
-            hook.2.contains("waiting for the daemon restart"),
+            hook.2.contains("daemon restart"),
             "APPARATUS: the hook did not arrive during the restart: {}{}",
             hook.1,
             hook.2

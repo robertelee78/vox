@@ -2229,7 +2229,8 @@ impl DaemonClient {
     /// The updater holds this greeting while it waits for remembered nodes, so a newly
     /// restarted detached daemon with no Ready node cannot retire as idle underneath it.
     pub async fn observe_held(path: &std::path::Path) -> Result<DaemonObservation> {
-        let d = Self::greet(path, None).await?;
+        // An observer may already own restart admission; only ordinary clients wait for it.
+        let d = Self::greet(path, None, false).await?;
         // A restart may signal this process. Bind the Hello pid to the kernel's peer identity,
         // rather than trusting a number supplied in the greeting or in a stale lock file.
         let peer = d
@@ -2267,7 +2268,7 @@ impl DaemonClient {
     /// # Errors
     /// As [`DaemonClient::open`].
     pub async fn open_noting(path: &std::path::Path, waiting: Option<fn()>) -> Result<Self> {
-        let daemon = Self::greet(path, waiting).await?;
+        let daemon = Self::greet(path, waiting, true).await?;
         if daemon.protocol != crate::node::ipc::PROTOCOL_VERSION {
             return Err(Error::Ipc(crate::error::IpcHandshake::Protocol {
                 mine: crate::node::ipc::PROTOCOL_VERSION,
@@ -2282,7 +2283,11 @@ impl DaemonClient {
         })
     }
 
-    async fn greet(path: &std::path::Path, waiting: Option<fn()>) -> Result<DaemonObservation> {
+    async fn greet(
+        path: &std::path::Path,
+        waiting: Option<fn()>,
+        wait_for_restart: bool,
+    ) -> Result<DaemonObservation> {
         use crate::error::IpcHandshake;
         use crate::node::ipc::{connect_own, read_frame, silent, ANSWER_WITHIN, PROTOCOL_VERSION};
         let mut unreachable = None;
@@ -2292,7 +2297,9 @@ impl DaemonClient {
                 let mut stream = loop {
                     match connect_own(path).await {
                         Ok(stream) => break stream,
-                        Err(error @ Error::Ipc(IpcHandshake::Unreachable { .. })) => {
+                        Err(error @ Error::Ipc(IpcHandshake::Unreachable { .. }))
+                            if wait_for_restart =>
+                        {
                             // A replacement owns admission before stopping the old daemon. Readers
                             // wait for its socket too, without starting a competing daemon.
                             if restart.is_none() {
