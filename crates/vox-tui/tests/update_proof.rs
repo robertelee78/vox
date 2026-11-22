@@ -1166,6 +1166,7 @@ pathlib.Path(target).write_bytes(plistlib.dumps(p))
         );
         std::thread::sleep(std::time::Duration::from_millis(50));
     };
+    let greeted = std::time::Instant::now();
     let old_runs = job.runs();
     println!(
         "[proof] initial pid={old_pid}; runs={old_runs}\n{}",
@@ -1219,16 +1220,40 @@ pathlib.Path(target).write_bytes(plistlib.dumps(p))
         "APPARATUS: staging room post: {}",
         said(&posted)
     );
-    let initial = vox(
-        &link,
-        home,
-        &["room", "read", &room, "--node", "kept"],
-        &env,
-    );
-    assert!(
-        initial.status.success() && said(&initial).contains(message),
-        "APPARATUS: staging room read: {}",
-        said(&initial)
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        let began = greeted.elapsed();
+        let initial = vox(
+            &link,
+            home,
+            &["room", "read", &room, "--node", "kept"],
+            &env,
+        );
+        let text = said(&initial);
+        println!(
+            "[proof] initial room read attempt={attempts}, start={began:?}, answer={:?} since daemon greeting, exit={:?}: {text}",
+            greeted.elapsed(), initial.status.code()
+        );
+        if initial.status.success() && text.contains(message) {
+            println!(
+                "[proof] initial room read first success at {:?} since daemon greeting, attempts={attempts}",
+                greeted.elapsed()
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "APPARATUS: staging room read did not answer within the setup bound: {text}; launchd stderr:\n{}\ndaemon log:\n{}",
+            std::fs::read_to_string(&daemon_log).unwrap_or_default(),
+            std::fs::read_to_string(account.log_file()).unwrap_or_else(|e| format!("unavailable: {e}"))
+        );
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    println!(
+        "[proof] initial room ready; launchd stderr:\n{}\ndaemon log:\n{}",
+        std::fs::read_to_string(&daemon_log).unwrap_or_default(),
+        std::fs::read_to_string(account.log_file()).unwrap_or_else(|e| format!("unavailable: {e}"))
     );
 
     let hold = home.join("publication-hold");
@@ -1405,6 +1430,13 @@ pathlib.Path(target).write_bytes(plistlib.dumps(p))
                     println!("[proof] {label}: saved room ready {:?} after replacement greeting; {:?} after release; observed preparing span={:?}",
                         std::time::Duration::from_nanos(interval), released.elapsed(), preparing.map(|start: std::time::Instant| start.elapsed()));
                     break;
+                }
+                if text.contains("the room is refreshing saved history; retry") {
+                    println!(
+                        "[proof] {label}: public refreshing answer at {:?}, exit={:?}: {text}",
+                        released.elapsed(),
+                        ready.status.code()
+                    );
                 }
                 if text.contains("preparing its saved history") && preparing.is_none() {
                     preparing = Some(std::time::Instant::now());
@@ -1689,6 +1721,11 @@ pathlib.Path(target).write_bytes(plistlib.dumps(p))
             detail,
         );
     }
+    println!(
+        "[proof] final launchd stderr:\n{}\nfinal daemon log:\n{}",
+        std::fs::read_to_string(&daemon_log).unwrap_or_default(),
+        std::fs::read_to_string(account.log_file()).unwrap_or_else(|e| format!("unavailable: {e}"))
+    );
     drop(job);
     dispose("bundle pre-publication proof", &claims, &receipts, false);
 }
