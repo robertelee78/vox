@@ -995,6 +995,10 @@ fn small_row_daemon(root: &Path, marker: Option<&Path>) -> Daemon {
         .env("VOX_DATA_DIR", root)
         .env("VOX_CONFIG_DIR", root.join("cfg"))
         .env("VOX_TEST_KEYCHAIN", attach::keychain(root))
+        .env(
+            "VOX_TEST_SMALL_ROWS_FAIL_FILE",
+            root.join("fail-small-row-move"),
+        )
         .env("VOX_PROXY", "127.0.0.1:0")
         .env_remove("VOX_NODE")
         .env_remove("VOX_ROOM")
@@ -1666,11 +1670,12 @@ fn assert_small_row_integrity(before: &SmallRowSnapshot, after: &SmallRowSnapsho
     for (key, _) in before
         .rows
         .iter()
-        .filter(|(key, _)| matches!(key.1, 1 | 4 | 10))
+        .filter(|(key, _)| !matches!(key.1, 2 | 3 | 11 | 12 | 14 | 15))
     {
         assert!(
             after.rows.contains_key(key),
-            "PRODUCT: accepted record or KeyMaterial was lost during the move: {key:?}"
+            "PRODUCT: stored kind{} key was lost during the move: {key:?}",
+            key.1
         );
     }
     // ProvisionalLog is an unpublished staging spool discarded once accepted or orphaned;
@@ -1754,4 +1759,82 @@ fn old_128_item_locator_pages_read_and_split_when_rewritten() {
         );
     }
     drop(running);
+}
+
+/// A failed optional layout conversion must not hide saved readable history.
+#[test]
+#[ignore = "real binary and a file-armed store write failure; run with test-knobs"]
+fn a_failed_small_row_move_keeps_the_room_readable_and_retries() {
+    watchdog::arm();
+    let fixture = PathBuf::from(
+        std::env::var_os("VOX_PROOF_OLD_STORE")
+            .expect("APPARATUS: supply stopped baseline fixture VOX_PROOF_OLD_STORE"),
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("node");
+    copy_small_row_profile(&fixture, &root);
+    let room = std::fs::read_to_string(root.join("proof-room")).unwrap();
+    let arm = root.join("fail-small-row-move");
+    std::fs::write(&arm, b"fail the optional packing write before commit\n").unwrap();
+    let running = small_row_daemon(&root, None);
+    let log_path = root.join("small-rows-daemon.err");
+    assert!(
+        within(240, || std::fs::read_to_string(&log_path)
+            .unwrap_or_default()
+            .contains("small-row move ENOSPC fault engaged before commit")),
+        "APPARATUS: the packing write failure did not engage in the daemon"
+    );
+    let last = std::cell::RefCell::new(String::new());
+    let readable = std::cell::Cell::new(false);
+    let finished = within(240, || {
+        let (ok, said) = small_row_command(&root, &["room", "read", &room, "--limit", "1"], None);
+        *last.borrow_mut() = said;
+        readable.set(ok);
+        ok || std::fs::read_to_string(&log_path)
+            .unwrap_or_default()
+            .contains("stays closed")
+    });
+    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    eprintln!("MOVE FAILURE DAEMON LOG\n{log}");
+    assert!(
+        finished,
+        "APPARATUS: failed move never reached an open or closed verdict: {}",
+        last.borrow()
+    );
+    assert!(
+        readable.get(),
+        "PRODUCT: a failed optional small-row move kept the room closed: {}",
+        last.borrow()
+    );
+    let shown = small_row_all_messages(&root, &room);
+    for i in 0..160 {
+        assert!(
+            shown.contains(&format!("PACKED-ROW-{i:04}-")),
+            "PRODUCT: failed small-row move hid acknowledged post{i}"
+        );
+    }
+    drop(running);
+    std::fs::remove_file(arm).unwrap();
+    let running = small_row_daemon(&root, None);
+    small_row_ready(&root);
+    let shown = small_row_all_messages(&root, &room);
+    for i in 0..160 {
+        assert!(
+            shown.contains(&format!("PACKED-ROW-{i:04}-")),
+            "PRODUCT: retried small-row move lost acknowledged post{i}"
+        );
+    }
+    // Packing is derived state: an acknowledged own post carries its unflushed
+    // transactions to disk before the deliberately abrupt stop below.
+    let (ok, said) = small_row_command(
+        &root,
+        &["room", "post", &room, "packing-retry-durable"],
+        None,
+    );
+    assert!(
+        ok,
+        "PRODUCT: post after the packing retry was not saved: {said}"
+    );
+    drop(running);
+    assert_small_rows_share(&small_row_paths(&root).store_file());
 }

@@ -3098,7 +3098,12 @@ impl ChannelState {
         // The actor establishes current governance and this node's retention settings
         // before sweeping or refreshing. The constructor's placeholder policies must
         // never reset an already completed durable projection on an ordinary restart.
-        store.pack_small_room_rows(channel_id)?;
+        if let Err(error) = store.pack_small_room_rows(channel_id) {
+            eprintln!(
+                "vox: room {}: its small rows stay where they are for now; packing will be tried when the room next opens: {error}",
+                crate::node::link::b32_encode(channel_id)
+            );
+        }
         Ok(room)
     }
 

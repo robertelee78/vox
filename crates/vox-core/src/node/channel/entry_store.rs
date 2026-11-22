@@ -2806,12 +2806,13 @@ const CLEANUP_BYTES: usize = 1024 * 1024;
 const CLEANUP_SEAL_OVERHEAD: usize = 64; // AES-GCM nonce/tag plus sealed CBOR framing
 const CLEANUP_KEY_BYTES: usize = 64; // (room, kind, id), conservatively encoded
 const CLEANUP_DIRECTORY_GROWTH: usize = 128; // root/allocator/revision integer growth
-                                             // Each provisional path has at most MAX_DEPTH old pages. A locator row is at
-                                             // most 120 encoded bytes and a branch row at most 76; after one child splits,
-                                             // an old branch has at most 131 rows. Halving twice leaves at most 32 locator
-                                             // rows or 33 branch rows per new page, both below PAGE_WRITE_BYTES. Thus each
-                                             // old page produces at most four puts and one delete, and each index needs at
-                                             // most one new root. Include the directory and spool operations as well.
+
+// Each provisional path has at most MAX_DEPTH old pages. A locator row is at
+// most 120 encoded bytes and a branch row at most 76; after one child splits,
+// an old branch has at most 131 rows. Halving twice leaves at most 32 locator
+// rows or 33 branch rows per new page, both below PAGE_WRITE_BYTES. Thus each
+// old page produces at most four puts and one delete, and each index needs at
+// most one new root. Include the directory and spool operations as well.
 const CLEANUP_SINGLE_ROWS: usize = 2 * MAX_DEPTH * 5 + 4;
 const CLEANUP_SINGLE_BYTES: usize = CLEANUP_BYTES
     + 2 * MAX_DEPTH

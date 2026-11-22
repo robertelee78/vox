@@ -1616,6 +1616,15 @@ impl Store {
             if moved_stable && std::env::var_os("VOX_TEST_SMALL_ROWS_COMMITTED").is_some() {
                 batch.ruled();
             }
+            #[cfg(feature = "test-knobs")]
+            if std::env::var_os("VOX_TEST_SMALL_ROWS_FAIL_FILE")
+                .is_some_and(|path| Path::new(&path).exists())
+            {
+                eprintln!("vox: small-row move ENOSPC fault engaged before commit");
+                return Err(storage("pack small rows")(
+                    std::io::Error::from_raw_os_error(28),
+                ));
+            }
             batch.commit()?;
             #[cfg(feature = "test-knobs")]
             if let Some(marker) =
