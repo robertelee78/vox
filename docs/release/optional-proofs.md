@@ -376,6 +376,26 @@ Each process uses scratch data and config roots. Run one exact act in release wi
 real selected log package before Open; the returning offline member must still read the
 sender's post while direct key sends remain held. No in-process node or live model is used.
 
+The same file's `keys_reach_an_offline_member_through_an_always_on_member` and
+`a_key_through_the_log_releases_what_a_direct_one_does` require the offline reader to read
+six posts across a sender-key rotation through a room member it has not trusted. Current,
+authenticated room membership permits carrying the opaque sealed package; only trust in
+the package's author permits installing its key. Restoring the carrier-trust gate in
+`actor/key_body_scan.rs` makes the offline-member assertion red. The existing "Nor by the
+log" arm of `no_consent_without_a_ring_entry_proof` covers an untrusted author, with its
+M5 mutant removing the author-trust filter.
+The direct-versus-log act also requires the log path to retain its exact offline delivery
+while the consent's own governance fold refreshes. Measured from that refresh to B reading
+all six, this took 3.426 seconds with the continuation and 33.729 seconds after dropping it:
+ordinary maintenance eventually recovered the durable debt. The act prints elapsed time
+without a PRODUCT bound. It requires A to finish B's log delivery without another failed
+reach after D reads all six; dropping the continuation makes that structural assertion red
+without weakening the six-post equality.
+The offline-member act waits for the author's renewed consent after rotation and for
+the carrier's role-complete receipt before the author stops. It reads current consent
+from one idempotently repeated addressed post's reach report and the feed positions
+from `vox status --json`; it does not mistake a second failed dial for that receipt.
+
 ## Busy-room newcomer and paging (ADR-052 RG-1, #1315)
 
 `a_newcomer_reads_the_whole_history_proof` includes two variants of the same busy-room

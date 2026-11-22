@@ -161,7 +161,6 @@ impl Node {
                 .key_token(running.peer)
                 .is_some_and(|token| Arc::ptr_eq(&token, &running.token));
             let current_owner = self.role_wake.current(running.room, &running.owner);
-            let trusted = self.trust.is_trusted(&running.peer);
             let connected = self
                 .net
                 .as_ref()
@@ -179,8 +178,7 @@ impl Node {
                             &running.shared,
                         )))
                 });
-            if current_room && current_owner && current_token && trusted && connected && exact_port
-            {
+            if current_room && current_owner && current_token && connected && exact_port {
                 if let Some(port) = self.ports.get_mut(&(running.room, running.peer)) {
                     // Never overwrite a body currently owned by a physical Flow.
                     if port.key_body.is_none() {
@@ -327,7 +325,6 @@ impl Node {
                 if port.key_body.is_some()
                     || port.key_body_initialized
                     || port.key_body_wait.is_some()
-                    || !self.trust.is_trusted(&peer)
                     || self
                         .net
                         .as_ref()
@@ -485,7 +482,11 @@ impl Node {
             let inspected = tokio::task::spawn_blocking(move || {
                 let _held = (secret, job, charge);
                 (|| -> crate::error::Result<ScanResult> {
-                    if !guard.is_member(&peer) || !guard.is_member(&node) {
+                    // A carrier's sealed package is opaque: room membership, not trust in
+                    // the carrier, authorizes retrieval. Opening still checks author trust.
+                    if !guard.room_peer_current(&store, &peer)?
+                        || !guard.room_peer_current(&store, &node)?
+                    {
                         return Ok(ScanResult::Ineligible);
                     }
                     // Subscribe before either read can observe a transient publication boundary.

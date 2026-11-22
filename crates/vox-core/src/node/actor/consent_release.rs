@@ -62,6 +62,7 @@ enum Stage {
         rekey_after: Option<Digest32>,
         history_after: Option<Digest32>,
     },
+    LogRekeyGovernance(Offline),
     Hold(Route),
     Online {
         queue: mpsc::OwnedPermit<PairwiseJob>,
@@ -764,7 +765,9 @@ impl Node {
             return;
         }
         let route = match &continuation.stage {
-            Stage::Offline { route, .. } | Stage::Hold(Route::Offline(route)) => Some(route),
+            Stage::Offline { route, .. }
+            | Stage::Hold(Route::Offline(route))
+            | Stage::LogRekeyGovernance(route) => Some(route),
             Stage::Outbound(stage) => outbound::offline_route(stage),
             _ => None,
         };
@@ -829,7 +832,9 @@ impl Node {
         reply: Reply,
     ) {
         let route = match &continuation.stage {
-            Stage::Offline { route, .. } | Stage::Hold(Route::Offline(route)) => Some(route),
+            Stage::Offline { route, .. }
+            | Stage::Hold(Route::Offline(route))
+            | Stage::LogRekeyGovernance(route) => Some(route),
             Stage::Outbound(stage) => outbound::offline_route(stage),
             _ => None,
         };
@@ -938,7 +943,10 @@ impl Node {
                 return;
             }
         };
-        if matches!(&continuation.stage, Stage::RekeyGovernance { .. }) {
+        if matches!(
+            &continuation.stage,
+            Stage::RekeyGovernance { .. } | Stage::LogRekeyGovernance(_)
+        ) {
             self.finish_rekey_governance(room, saved, lifetime, continuation, reply)
                 .await;
             return;
@@ -1304,36 +1312,7 @@ impl Node {
         let Some(instance) = self.channels.get(&room).cloned() else {
             return;
         };
-        let selected = {
-            let channel = instance.lock().await;
-            let Some(profile) = self.profile.as_ref() else {
-                return;
-            };
-            let Ok(floor) = channel.owed_history_for(profile.store(), &peer) else {
-                return;
-            };
-            let history = floor
-                .and_then(|floor| channel.history_skdms(profile, &peer, floor).ok())
-                .filter(|keys| !keys.is_empty());
-            let Ok(owed) = channel.owed_rekey(profile.store(), &peer) else {
-                return;
-            };
-            let rekey = if history.is_none() && owed {
-                channel.rekey_skdm_for(profile, &peer).ok()
-            } else {
-                None
-            };
-            (history, rekey, channel.sender_generation())
-        };
-        let (history, rekey, generation) = selected;
-        let history_sent = history.is_some();
-        let keys: VecDeque<_> = match (history, rekey) {
-            (Some(keys), _) => keys.into(),
-            (None, Some(key)) => [key].into(),
-            _ => return,
-        };
-        self.key_delivery_settling.insert((room, peer));
-        let continuation = Continuation {
+        let mut continuation = Continuation {
             instance,
             attachment: self.delivery_epoch,
             lifetime,
@@ -1346,6 +1325,59 @@ impl Node {
             prekey: None,
             stage: Stage::Delivered(route),
         };
+        let selected = {
+            let channel = continuation.instance.lock().await;
+            self.profile
+                .as_ref()
+                .ok_or(Error::AtRestLocked)
+                .and_then(|profile| {
+                    let floor = channel.owed_history_for(profile.store(), &peer)?;
+                    let history = floor
+                        .map(|floor| channel.history_skdms(profile, &peer, floor))
+                        .transpose()?
+                        .filter(|keys| !keys.is_empty());
+                    let owed = channel.owed_rekey(profile.store(), &peer)?;
+                    let rekey = if history.is_none() && owed {
+                        Some(channel.rekey_skdm_for(profile, &peer)?)
+                    } else {
+                        None
+                    };
+                    Ok((history, rekey, channel.sender_generation()))
+                })
+        };
+        let (history, rekey, generation) = match selected {
+            Ok(selected) => selected,
+            Err(error) if ChannelState::governance_refreshing(&error) => {
+                // The grant saved the history debt before invalidating its fold. Keep
+                // this exact offline delivery until that fold can select the owed keys.
+                let Stage::Delivered(route) = continuation.stage else {
+                    return;
+                };
+                continuation.stage = Stage::LogRekeyGovernance(route);
+                self.begin_pending_maintenance(
+                    room,
+                    Work::Projection(
+                        crate::node::channel::session_projection::ProjectionWork::Governance,
+                    ),
+                    maintenance_save::Continuation::Consent(continuation),
+                    None,
+                )
+                .await;
+                return;
+            }
+            Err(error) => {
+                self.fail_owned_consent(room, error, continuation, None)
+                    .await;
+                return;
+            }
+        };
+        let history_sent = history.is_some();
+        let keys: VecDeque<_> = match (history, rekey) {
+            (Some(keys), _) => keys.into(),
+            (None, Some(key)) => [key].into(),
+            _ => return,
+        };
+        self.key_delivery_settling.insert((room, peer));
         self.advance_owned_log_keys(room, continuation, keys, history_sent, generation)
             .await;
     }
