@@ -497,8 +497,6 @@ async fn restart_checked(
         Vec::new()
     };
 
-    // Product-managed stops exit zero so the manager does not restart the old helper.
-    // An unmanaged rollback still uses its ordinary termination signal.
     // This binary and newer releases understand --replace-pid. An older rollback target may
     // not. A development build paired with an unmodified release of the same version is not
     // supported by this comparison; release versions change when the feature ships.
