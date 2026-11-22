@@ -312,6 +312,9 @@ fn filters(row: &super::super::Rendered) -> Vec<Filter> {
             .map(Filter::Tag),
     );
     if let Ok(envelope) = vox_agentcomms::envelope::Envelope::parse(&row.text) {
+        if super::super::session_projection::locality::candidate_envelope(&envelope) {
+            out.push(Filter::SessionCandidates);
+        }
         if envelope.re.is_some() || (envelope.urgent && !envelope.to.is_empty()) {
             out.push(Filter::NoticeCandidates);
         }
@@ -322,9 +325,6 @@ fn filters(row: &super::super::Rendered) -> Vec<Filter> {
         {
             out.push(Filter::Thread(root));
         }
-    }
-    if crate::node::sessions::is_record(&row.text) || row.text.contains("session_name") {
-        out.push(Filter::SessionCandidates);
     }
     out
 }
@@ -657,6 +657,14 @@ impl Write<'_, '_> {
         )?;
         for filter in filters(row) {
             if matches!(filter, Filter::SessionCandidates) {
+                super::super::session_projection::locality::observe_public(
+                    self.batch,
+                    self.sek,
+                    self.channel,
+                    row,
+                    clock,
+                    true,
+                )?;
                 roots.rendered.session_candidates = self.change_rendered(
                     roots.rendered.session_candidates,
                     session_key((row.created_millis, clock, hash)),
@@ -733,6 +741,14 @@ impl Write<'_, '_> {
         )?;
         for filter in filters(&row) {
             if matches!(filter, Filter::SessionCandidates) {
+                super::super::session_projection::locality::observe_public(
+                    self.batch,
+                    self.sek,
+                    self.channel,
+                    &row,
+                    clock,
+                    false,
+                )?;
                 roots.rendered.session_candidates = self.change_rendered(
                     roots.rendered.session_candidates,
                     session_key((row.created_millis, clock, *hash)),
@@ -810,6 +826,22 @@ impl Write<'_, '_> {
             self.change_rendered(roots.rendered.display, ordered((new, hash)), Some(fact))?;
         for filter in filters(&row) {
             if matches!(filter, Filter::SessionCandidates) {
+                super::super::session_projection::locality::observe_public(
+                    self.batch,
+                    self.sek,
+                    self.channel,
+                    &row,
+                    old,
+                    false,
+                )?;
+                super::super::session_projection::locality::observe_public(
+                    self.batch,
+                    self.sek,
+                    self.channel,
+                    &row,
+                    new,
+                    true,
+                )?;
                 roots.rendered.session_candidates = self.change_rendered(
                     roots.rendered.session_candidates,
                     session_key((row.created_millis, old, hash)),

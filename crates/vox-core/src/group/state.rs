@@ -29,7 +29,7 @@ use zeroize::Zeroizing;
 
 use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
-use crate::group::message::{GroupMessage, MessageHeader};
+use crate::group::message::{GroupMessage, MessageHeader, PrivateMessage};
 use crate::group::senderkey::{ChainKey, MessageKey, SenderKeySigningKey};
 use crate::group::skdm::Skdm;
 use crate::hash::Digest32;
@@ -215,6 +215,26 @@ impl SenderChain {
     /// one step. The consumed message key is dropped immediately after sealing, so
     /// it cannot be recovered (forward secrecy within the chain).
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<GroupMessage> {
+        Ok(self
+            .encrypt_with(|header, key, signing| {
+                GroupMessage::seal(header, key, signing, plaintext)
+            })?
+            .0)
+    }
+
+    /// Seal a Session record while retaining only this iteration's AEAD message
+    /// key for its sealed local row, never a chain key or a generation secret.
+    pub(crate) fn encrypt_private(
+        &mut self,
+        plaintext: &[u8],
+    ) -> Result<(PrivateMessage, MessageKey)> {
+        self.encrypt_with(|header, key, _| PrivateMessage::seal(header, key, plaintext))
+    }
+
+    fn encrypt_with<T>(
+        &mut self,
+        seal: impl FnOnce(MessageHeader, &MessageKey, &SenderKeySigningKey) -> Result<T>,
+    ) -> Result<(T, MessageKey)> {
         let header = MessageHeader {
             channel_id: self.channel_id,
             epoch: self.epoch,
@@ -222,15 +242,14 @@ impl SenderChain {
             chain_id: self.chain_id,
             iteration: self.next_iteration,
         };
-        let mk = self.chain_key.message_key()?;
-        let msg = GroupMessage::seal(header, &mk, &self.signing_key, plaintext)?;
-        // Advance one-way; the previous chain key is unrecoverable.
+        let key = self.chain_key.message_key()?;
+        let message = seal(header, &key, &self.signing_key)?;
         self.chain_key = self.chain_key.advance()?;
         self.next_iteration = self
             .next_iteration
             .checked_add(1)
             .ok_or(Error::MalformedBundle("sender chain iteration overflow"))?;
-        Ok(msg)
+        Ok((message, key))
     }
 
     /// Build an SKDM that releases this sender key to a recipient identity at the
@@ -594,12 +613,29 @@ impl ReceiverChain {
     ///
     /// On success the used key is deleted (replay at that iteration then fails).
     pub fn decrypt(&mut self, msg: &GroupMessage) -> Result<Vec<u8>> {
-        self.check_binding(&msg.header)?;
-        let iter = msg.header.iteration;
+        self.decrypt_with(&msg.header, |key, signing| msg.open(key, signing))
+    }
+
+    pub(crate) fn decrypt_private(
+        &mut self,
+        msg: &PrivateMessage,
+    ) -> Result<(Vec<u8>, MessageKey)> {
+        self.decrypt_with(&msg.header, |key, signing| {
+            Ok((msg.open(key, signing)?, key.clone()))
+        })
+    }
+
+    fn decrypt_with<T>(
+        &mut self,
+        header: &MessageHeader,
+        mut open: impl FnMut(&MessageKey, &CompositePublicKey) -> Result<T>,
+    ) -> Result<T> {
+        self.check_binding(header)?;
+        let iter = header.iteration;
 
         // Path 1: a cached skipped key for this iteration (out-of-order arrival).
         if let Some(skipped_mk) = self.skipped.get(&iter) {
-            let pt = msg.open(skipped_mk, &self.signing_pubkey)?;
+            let pt = open(skipped_mk, &self.signing_pubkey)?;
             // Authenticated: consume the cached key.
             self.skipped.remove(&iter);
             return Ok(pt);
@@ -637,7 +673,7 @@ impl ReceiverChain {
         let after_target = candidate_ck.advance()?;
 
         // Authenticate against the target message key (signature + AEAD).
-        let pt = msg.open(&target_mk, &self.signing_pubkey)?;
+        let pt = open(&target_mk, &self.signing_pubkey)?;
 
         // Authenticated: commit the advance + cache the skipped keys.
         for (skip_i, mk) in planned_skips {
@@ -667,14 +703,31 @@ impl ReceiverChain {
     /// Callers deduplicate canonical effects before this operation; the authenticated floor,
     /// signature, AEAD and existing derivation bound still apply.
     pub(crate) fn decrypt_retained(&self, msg: &GroupMessage) -> Result<Vec<u8>> {
-        self.check_binding(&msg.header)?;
-        let gap = msg
-            .header
-            .iteration
-            .checked_sub(self.history_iteration)
-            .ok_or(Error::MalformedBundle(
-                "group iteration before history release",
-            ))?;
+        self.retained_with(&msg.header, |key, signing| msg.open(key, signing))
+    }
+
+    pub(crate) fn decrypt_private_retained(
+        &self,
+        msg: &PrivateMessage,
+    ) -> Result<(Vec<u8>, MessageKey)> {
+        self.retained_with(&msg.header, |key, signing| {
+            Ok((msg.open(key, signing)?, key.clone()))
+        })
+    }
+
+    fn retained_with<T>(
+        &self,
+        header: &MessageHeader,
+        mut open: impl FnMut(&MessageKey, &CompositePublicKey) -> Result<T>,
+    ) -> Result<T> {
+        self.check_binding(header)?;
+        let gap =
+            header
+                .iteration
+                .checked_sub(self.history_iteration)
+                .ok_or(Error::MalformedBundle(
+                    "group iteration before history release",
+                ))?;
         if gap > MAX_SKIP {
             return Err(Error::MalformedBundle("group history gap exceeds MAX_SKIP"));
         }
@@ -683,7 +736,7 @@ impl ReceiverChain {
             key = key.advance()?;
         }
         let message_key = key.message_key()?;
-        msg.open(&message_key, &self.signing_pubkey)
+        open(&message_key, &self.signing_pubkey)
     }
 
     /// Keep an earlier authenticated release for history without replacing the advancing live
