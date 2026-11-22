@@ -230,6 +230,7 @@ pub(crate) async fn publication_lock(
     room: Digest32,
     exclusive: bool,
 ) -> Result<std::fs::File, String> {
+    paths.verify_profile().map_err(|error| error.to_string())?;
     let dir = paths.cursor_dir().join("pause-locks");
     vox_core::node::paths::create_private_dir(&dir).map_err(|error| error.to_string())?;
     let path = dir.join(vox_core::node::link::b32_encode(&room));
@@ -243,6 +244,7 @@ pub(crate) async fn publication_lock(
     let file = options.open(path).map_err(|error| error.to_string())?;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {
+        paths.verify_profile().map_err(|error| error.to_string())?;
         let result = if exclusive {
             file.try_lock()
         } else {

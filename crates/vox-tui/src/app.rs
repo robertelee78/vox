@@ -750,7 +750,7 @@ pub fn run_node(
         });
     };
     let router = serving.router.clone();
-    router.attach_kept();
+    let mut attaching = router.attach_kept();
     if let Some(creators) = serve_only {
         println!(
             "vox node: serving only rooms made by the {} identit{} this node trusts",
@@ -769,6 +769,13 @@ pub fn run_node(
     println!("vox node: identity {fp}");
     println!("vox node: control socket {}", account.socket().display());
     let signal = rt.block_on(async {
+        while !attaching.is_empty() {
+            tokio::select! {
+                signal = &mut interrupted => return signal,
+                _ = attaching.join_next() => {}
+            }
+        }
+        serving.presence.accept_management();
         // Addresses are discovered on a task after start-up (a route probe and a
         // gateway request); print the anchor specs once they are known, then serve.
         let mut printed: Vec<String> = Vec::new();

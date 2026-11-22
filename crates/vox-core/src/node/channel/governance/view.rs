@@ -62,6 +62,7 @@ pub(in crate::node::channel) struct Display {
     pub name: Option<String>,
     pub policy: ChannelPolicy,
     pub step_ttl_ms: u64,
+    pub step_policy_signed: bool,
     pub lifecycle: Lifecycle,
     pub anchors: Option<BootstrapSet>,
     pub revision: u64,
@@ -73,6 +74,7 @@ impl Display {
             name: None,
             policy: genesis.body.policy,
             step_ttl_ms: crate::governance::step_policy::DEFAULT_STEP_TTL_MS,
+            step_policy_signed: false,
             lifecycle: Lifecycle::default(),
             anchors: None,
             revision: 0,
@@ -1281,7 +1283,8 @@ impl<'a> View<'a> {
                         .ok_or(invalid("governance retention effect missing"))?;
                 }
                 GovBody::StepPolicyUpdate(policy) if kind == fold::STEPS => {
-                    display.step_ttl_ms = policy.ttl_ms
+                    display.step_ttl_ms = policy.ttl_ms;
+                    display.step_policy_signed = true;
                 }
                 GovBody::Lifecycle(lifecycle) if kind == fold::END => {
                     if !matches!(
