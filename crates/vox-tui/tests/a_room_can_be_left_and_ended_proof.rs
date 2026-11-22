@@ -2522,20 +2522,27 @@ fn retained_room_rows(w: &Worker, cid: &[u8; 32]) -> Vec<(u8, u64, Vec<u8>)> {
         .open_read_only(w.paths.store_file())
         .expect("APPARATUS: open stopped hidden-room store");
     let read = db.begin_read().expect("APPARATUS: read hidden-room store");
-    let table = read
-        .open_table(redb::TableDefinition::<([u8; 32], u8, u64), &[u8]>::new(
-            "segments",
-        ))
-        .expect("APPARATUS: room segments");
-    table
-        .range((*cid, 0, 0)..=(*cid, u8::MAX, u64::MAX))
-        .expect("APPARATUS: room row range")
-        .map(|row| {
-            let (key, value) = row.expect("APPARATUS: room row");
-            let (_, kind, index) = key.value();
-            (kind, index, value.value().to_vec())
-        })
-        .collect()
+    let mut rows = Vec::new();
+    for name in ["segments", "small_segments"] {
+        let table = match read.open_table(redb::TableDefinition::<([u8; 32], u8, u64), &[u8]>::new(
+            name,
+        )) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => continue,
+            Err(error) => panic!("APPARATUS: open hidden-room {name}: {error}"),
+        };
+        rows.extend(
+            table
+                .range((*cid, 0, 0)..=(*cid, u8::MAX, u64::MAX))
+                .expect("APPARATUS: room row range")
+                .map(|row| {
+                    let (key, value) = row.expect("APPARATUS: room row");
+                    let (_, kind, index) = key.value();
+                    (kind, index, value.value().to_vec())
+                }),
+        );
+    }
+    rows
 }
 
 /// Inspect a crash-consistent copy without restarting the daemon being measured.
@@ -2582,20 +2589,27 @@ fn live_retained_room_rows(w: &Worker, cid: &[u8; 32]) -> Vec<(u8, u64, Vec<u8>)
     // It neither opens nor changes the running product's database.
     let db = redb::Database::create(path).expect("APPARATUS: open store snapshot");
     let read = db.begin_read().expect("APPARATUS: read store snapshot");
-    let table = read
-        .open_table(redb::TableDefinition::<([u8; 32], u8, u64), &[u8]>::new(
-            "segments",
-        ))
-        .expect("APPARATUS: snapshot room segments");
-    table
-        .range((*cid, 0, 0)..=(*cid, u8::MAX, u64::MAX))
-        .expect("APPARATUS: snapshot room row range")
-        .map(|row| {
-            let (key, value) = row.expect("APPARATUS: snapshot room row");
-            let (_, kind, index) = key.value();
-            (kind, index, value.value().to_vec())
-        })
-        .collect()
+    let mut rows = Vec::new();
+    for name in ["segments", "small_segments"] {
+        let table = match read.open_table(redb::TableDefinition::<([u8; 32], u8, u64), &[u8]>::new(
+            name,
+        )) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => continue,
+            Err(error) => panic!("APPARATUS: open snapshot {name}: {error}"),
+        };
+        rows.extend(
+            table
+                .range((*cid, 0, 0)..=(*cid, u8::MAX, u64::MAX))
+                .expect("APPARATUS: snapshot room row range")
+                .map(|row| {
+                    let (key, value) = row.expect("APPARATUS: snapshot room row");
+                    let (_, kind, index) = key.value();
+                    (kind, index, value.value().to_vec())
+                }),
+        );
+    }
+    rows
 }
 
 #[cfg(feature = "test-knobs")]
@@ -2831,7 +2845,7 @@ fn left_copy_lifecycle(trust_only: bool) {
     );
     // Wait for the product's purge, but let the physical copy decide the expiry verdict,
     // including on the seven-day baseline and the never-delete mutant.
-    let _ = poll(alice, &["status", "--json"], WITHIN, |out| {
+    let (expired, expiry_status) = poll(alice, &["status", "--json"], WITHIN, |out| {
         out.ok
             && serde_json::from_str::<serde_json::Value>(&out.stdout).is_ok_and(|status| {
                 status["leaving"]
@@ -2845,6 +2859,10 @@ fn left_copy_lifecycle(trust_only: bool) {
         "PRODUCT: expiry damaged another room's acknowledged post: {healthy:?}"
     );
     erased(alice, &room.id, &room.cid, true);
+    assert!(
+        expired,
+        "PRODUCT: hidden copy expired but status still listed it as leaving after two days: {expiry_status:?}"
+    );
     eprintln!("[proof] after two days the hidden copy is gone and the healthy room reads whole");
 }
 
