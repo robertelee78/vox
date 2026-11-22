@@ -303,7 +303,7 @@ pub async fn list(paths: &Paths) -> Result<(), AppError> {
             "{}  {shown}{}{}",
             short(id),
             match (open_failure, *preparing, waiting) {
-                (Some(reason), _, _) => format!("  [failed: {reason}]"),
+                (Some(reason), _, _) => format!("  [closed: {reason}]"),
                 (None, true, Some((what, since))) => format!(
                     "  [preparing history: waiting for {what}, {}]",
                     vox_core::node::status::since_text(*since)
@@ -318,6 +318,14 @@ pub async fn list(paths: &Paths) -> Result<(), AppError> {
                 format!("  [{over}]")
             }
         );
+        if open_failure.is_some() {
+            let node = crate::client::name_of(paths)?;
+            let join = vox_text::shell::node_command(&["vox", "room", "join"], node.as_str());
+            println!(
+                "  To reopen it once the cause above is fixed, run `{join}` with this room's \
+                 address and passphrase (another member's `vox room link` prints the address)."
+            );
+        }
     }
     for name in &clashing {
         println!(
@@ -5037,6 +5045,9 @@ async fn collect_offer(
                     d.to_owned()
                 }
                 None => {
+                    paths
+                        .verify_profile()
+                        .map_err(|e| AppError::Usage(e.to_string()))?;
                     let d = vox_core::node::pulls::room_dir(paths, &channel_id);
                     vox_core::node::paths::create_private_dir(&d).map_err(|e| {
                         AppError::Usage(format!("cannot use {} for the file: {e}", d.display()))
@@ -5060,7 +5071,7 @@ async fn collect_offer(
 
     let (bound, mut events) = open_forward(client, paths, channel_id, offer).await?;
     let mut started = false;
-    let result = collect(&bound, &dest, offer)
+    let result = collect(&bound, &dest, offer, managed.then_some(paths))
         .await
         .map_err(|(e, got)| {
             started = got > 0;
@@ -5097,10 +5108,15 @@ async fn collect_offer(
         // announcement stays on the log, the bytes were live only while it was shared. A transfer
         // the sharer refused says that, not the socket's error ("Connection reset by peer"). One
         // that sent the wrong bytes says that, whatever the node said.
-        Err(e) if !e.to_string().contains("announced") => match events.as_mut() {
-            Some(ev) => Err(why_not_collected(ev, offer, started).await.unwrap_or(e)),
-            None => Err(e),
-        },
+        Err(e)
+            if !e.to_string().contains("announced")
+                && !e.to_string().contains("profile directory") =>
+        {
+            match events.as_mut() {
+                Some(ev) => Err(why_not_collected(ev, offer, started).await.unwrap_or(e)),
+                None => Err(e),
+            }
+        }
         other => other,
     }
 }
@@ -5176,6 +5192,9 @@ async fn collect_folder(
             d.to_owned()
         }
         None => {
+            paths
+                .verify_profile()
+                .map_err(|e| AppError::Usage(e.to_string()))?;
             let d = vox_core::node::pulls::room_dir(paths, &channel_id);
             vox_core::node::paths::create_private_dir(&d).map_err(|e| {
                 AppError::Usage(format!("cannot use {} for the folder: {e}", d.display()))
@@ -5194,6 +5213,11 @@ async fn collect_folder(
             safe_file_name(&offer.name),
             vox_core::node::pulls::bytes(offer.size)
         )));
+    }
+    if managed {
+        paths
+            .verify_profile()
+            .map_err(|e| AppError::Usage(e.to_string()))?;
     }
     std::fs::create_dir_all(&target).map_err(|e| {
         AppError::Usage(format!(
@@ -5235,6 +5259,9 @@ async fn collect_folder(
                 Ok(())
             };
             match begun {
+                Ok(()) if managed => {
+                    vox_core::node::folder::pull_profile(at, &target, list, &prior, paths).await
+                }
                 Ok(()) => vox_core::node::folder::pull(at, &target, list, &prior).await,
                 Err(e) => Err((e, vox_core::node::folder::Pulled::default())),
             }
@@ -5256,16 +5283,20 @@ async fn collect_folder(
                 "{e}; {} fetched before it stopped, and a get of it again keeps them",
                 done.fetched.len()
             ));
-            return Err(if e.to_string().contains("does not match") {
-                e
-            } else {
-                match events.as_mut() {
-                    Some(ev) => why_not_collected(ev, offer, !done.fetched.is_empty())
-                        .await
-                        .unwrap_or(e),
-                    None => e,
-                }
-            });
+            return Err(
+                if e.to_string().contains("does not match")
+                    || e.to_string().contains("profile directory")
+                {
+                    e
+                } else {
+                    match events.as_mut() {
+                        Some(ev) => why_not_collected(ev, offer, !done.fetched.is_empty())
+                            .await
+                            .unwrap_or(e),
+                        None => e,
+                    }
+                },
+            );
         }
     };
     for path in &done.kept {
@@ -5405,7 +5436,13 @@ async fn collect(
     bound: &str,
     dest: &Destination,
     offer: &Offer,
+    paths: Option<&Paths>,
 ) -> Result<std::path::PathBuf, (AppError, u64)> {
+    if let Some(paths) = paths {
+        paths
+            .verify_profile()
+            .map_err(|e| (AppError::Usage(e.to_string()), 0))?;
+    }
     let dir = dest.dir();
     // `create_new`, so the temporary file is never somebody else's either.
     let (part, file) = (0..1000)
@@ -5428,6 +5465,11 @@ async fn collect(
             )
         })?;
     let result = receive(bound, file, &dir, offer).await;
+    if let Some(paths) = paths {
+        paths
+            .verify_profile()
+            .map_err(|e| (AppError::Usage(e.to_string()), 0))?;
+    }
     let total = match result {
         Ok(total) => total,
         Err(e) => {

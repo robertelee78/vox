@@ -812,17 +812,13 @@ pub async fn node_create(
         })
 }
 
-/// Unlock a node, and remember it for every daemon start where this system keeps secrets
-/// (ADR-031 CW-2/CW-7). A Mac stores any supplied secret in the Keychain. Elsewhere a passphrase
-/// from a persistent file is remembered by that file; a passphrase typed, read from stdin or
-/// taken from `VOX_IDENTITY_PASSPHRASE` unlocks the node for this daemon's life and is stored
-/// nowhere, which is said. Unlocking is not remembering (ADR-038 FX-34): measured 2026-10-21 on
-/// the decider's Linux host (vox 0.4.9), every unlock without a file was refused, so after the
-/// update's daemon restart no node could be unlocked at all.
+/// Unlock a node and remember how to start it again. A Mac uses the login Keychain; Linux uses
+/// the kernel keyring until reboot, or a persistent passphrase file the person chose (RG-11).
+/// Unlocking never depends on successfully remembering the secret (ADR-038 FX-34).
 ///
 /// # Errors
-/// A missing node, an unusable passphrase file, or the daemon's refusal. A Keychain that cannot
-/// take the passphrase is said, and the node is Ready, not remembered: not an error.
+/// A missing node, an unusable passphrase file, or the daemon's refusal. A failed credential
+/// store is said; the node is Ready but not remembered, not a failed unlock.
 pub async fn node_unlock(
     args: &NodeArgs,
     name: &str,
@@ -836,8 +832,8 @@ pub async fn node_unlock(
             vox_text::shell::command(&["vox", "node", "create", "--", name.as_str()])
         )));
     }
-    // Off macOS a remembered secret must remain readable as a regular file at every restart.
-    // Check before opening it, so a pipe or device is never treated as a persistent file.
+    // A chosen file remains readable after reboot; a pipe is one-time input, never a path
+    // to remember. Typed and one-time Linux unlocks instead use the kernel keyring.
     let persistent_file = if cfg!(target_os = "macos") {
         None
     } else if let Some(file) = passphrase_file.as_ref().filter(|p| *p != Path::new("-")) {
@@ -863,13 +859,17 @@ pub async fn node_unlock(
     let passphrase = tokio::task::spawn_blocking(move || attach_passphrase(None, file))
         .await
         .map_err(|e| AppError::Usage(format!("asking for a passphrase: {e}")))??;
-    // How the node is remembered, if it is: `None` unlocks it for this daemon's life only.
+    // An explicit file also supplies recovery after reboot; otherwise remember in OS memory.
     let keep = if passphrase.is_empty() {
         Some(KeepSource::None)
     } else if cfg!(target_os = "macos") {
         Some(KeepSource::Keychain(String::new()))
+    } else if let Some(file) = persistent_file {
+        Some(KeepSource::File(file))
+    } else if cfg!(target_os = "linux") {
+        Some(KeepSource::Keychain(String::new()))
     } else {
-        persistent_file.map(KeepSource::File)
+        None
     };
     ensure_daemon(&account, args.listen, &args.anchor_specs()).await?;
     let mut d = daemon(&account).await?;
@@ -891,8 +891,8 @@ fn given_not_typed(file: Option<&Path>) -> bool {
 
 /// How node `name`, attached with `passphrase`, is remembered, so the daemon makes it Ready again
 /// whenever it starts with nobody typing (#666, ADR-028 K-10): a node with no passphrase needs
-/// nothing stored; a passphrase `typed` at the terminal is stored in the Keychain once the daemon
-/// has proved it. One from a file or `VOX_IDENTITY_PASSPHRASE` is not stored, which is said.
+/// nothing stored; a passphrase `typed` at the terminal is stored by the operating system once
+/// the daemon has proved it. One from a file or `VOX_IDENTITY_PASSPHRASE` is not stored here.
 fn remembered(name: &NodeName, passphrase: &str, typed: bool) -> Option<KeepSource> {
     if passphrase.is_empty() {
         Some(KeepSource::None)
@@ -902,8 +902,9 @@ fn remembered(name: &NodeName, passphrase: &str, typed: bool) -> Option<KeepSour
     } else {
         eprintln!(
             "vox: node {name}'s passphrase came from a file or VOX_IDENTITY_PASSPHRASE, so it is \
-             not stored in the Keychain; to have the daemon make it Ready at each start, unlock it \
-             again with `vox node unlock` and its name (with --passphrase-file on systems without a Keychain)"
+             not remembered by this command; to have the daemon make it Ready at each start, \
+             unlock it again with `vox node unlock` and its name; on Linux, choose \
+             --passphrase-file if it must also become Ready after reboot"
         );
         None
     }
@@ -938,7 +939,7 @@ async fn attach_request(
             if remembering_required {
                 if !info.keep {
                     return Err(AppError::Usage(format!(
-                        "node {name} is Ready but not remembered; correct the Keychain problem \
+                        "node {name} is Ready but not remembered; correct the credential storage problem \
                          reported above and run `vox node unlock {name}` again"
                     )));
                 }
@@ -948,11 +949,14 @@ async fn attach_request(
             }
             if info.keep {
                 match asked {
-                    Some(KeepSource::Keychain(_)) => println!(
-                        "vox: its passphrase is remembered in the Keychain, so the daemon \
-                         makes node {name} Ready again by itself whenever it starts; `vox node \
-                         lock {name}` locks and forgets it"
-                    ),
+                    Some(KeepSource::Keychain(_)) => {
+                        let place = if cfg!(target_os = "linux") { "kernel keyring until reboot" } else { "Keychain" };
+                        println!(
+                            "vox: its passphrase is remembered in the {place}, so the daemon \
+                             makes node {name} Ready again by itself whenever it starts; `vox node \
+                             lock {name}` locks and forgets it"
+                        );
+                    }
                     Some(KeepSource::None) => println!(
                         "vox: node {name} has no passphrase, so it becomes Ready whenever the daemon starts; no secret is stored"
                     ),
@@ -1031,7 +1035,9 @@ pub async fn node_rename(args: &NodeArgs, old: &str, new: &str) -> Result<(), Ap
             let passphrase = match read {
                 Ok(p) => p,
                 Err(e) => {
-                    eprintln!("vox: node {old}'s passphrase in the Keychain: {e}; type it here");
+                    eprintln!(
+                        "vox: node {old}'s saved passphrase is unavailable: {e}; type it here"
+                    );
                     tokio::task::spawn_blocking(|| attach_passphrase(None, None))
                         .await
                         .map_err(|e| AppError::Usage(format!("asking for a passphrase: {e}")))??
@@ -1408,15 +1414,15 @@ pub async fn node_lock(args: &NodeArgs, name: &str) -> Result<(), AppError> {
     }
     ensure_daemon(&account, args.listen, &args.anchor_specs()).await?;
     let mut d = daemon(&account).await?;
-    match d
+    let forget_error = match d
         .request(DaemonRequest::Unkeep { node: name.clone() })
         .await
     {
-        Ok(DaemonFrame::Ok) => {}
-        Ok(DaemonFrame::Refused(r)) => return Err(AppError::Usage(r.to_string())),
+        Ok(DaemonFrame::Ok) => None,
+        Ok(DaemonFrame::Refused(r)) => Some(r.to_string()),
         Ok(other) => return Err(unexpected_daemon(&other)),
         Err(e) => return Err(AppError::Usage(format!("the daemon did not answer: {e}"))),
-    }
+    };
     // One request per control connection. Forget first, so a stopped node cannot return.
     let mut d = daemon(&account).await?;
     match d
@@ -1435,6 +1441,9 @@ pub async fn node_lock(args: &NodeArgs, name: &str) -> Result<(), AppError> {
                 n.name == name && n.status == Some(vox_core::node::daemonipc::NodeStatus::Ready)
             }) {
                 println!("vox: node {name} is Ready after the lock request; run `vox node list` to see its current remembered state");
+                if let Some(error) = &forget_error {
+                    eprintln!("vox: {error}");
+                }
                 return Ok(());
             }
             if !nodes.iter().any(|n| {
@@ -1444,13 +1453,23 @@ pub async fn node_lock(args: &NodeArgs, name: &str) -> Result<(), AppError> {
             }) {
                 return Err(AppError::Usage(format!("node {name}'s state changed after the lock request; run `vox node list` to see its current status")));
             }
-            println!(
-                "vox: node {name} is Locked and forgotten; its rooms and messages stay here; \
-                 `vox node unlock {name}` makes it Ready again"
-            );
+            if let Some(error) = &forget_error {
+                println!("vox: node {name} is Locked; its rooms and messages stay here; `vox node unlock {name}` makes it Ready again");
+                eprintln!("vox: {error}");
+            } else {
+                println!(
+                    "vox: node {name} is Locked and forgotten; its rooms and messages stay here; \
+                     `vox node unlock {name}` makes it Ready again"
+                );
+            }
             Ok(())
         }
-        Ok(DaemonFrame::Refused(r)) => Err(AppError::Usage(r.to_string())),
+        Ok(DaemonFrame::Refused(r)) => {
+            if let Some(error) = &forget_error {
+                eprintln!("vox: {error}");
+            }
+            Err(AppError::Usage(r.to_string()))
+        }
         Ok(other) => Err(unexpected_daemon(&other)),
         Err(e) => Err(AppError::Usage(format!("the daemon did not answer: {e}"))),
     }

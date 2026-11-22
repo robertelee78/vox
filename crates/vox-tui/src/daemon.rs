@@ -166,6 +166,7 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
         daemon_stop_requested()?
     });
     let named = named_node(args)?;
+    let managed = args.login_item || crate::update::restart::is_managed_daemon(std::process::id());
     // The new daemon, rather than the command that launched it, owns completion.
     let restart = if let Some(old_pid) = args.replace_pid {
         let file = crate::daemon_client::restart_lock(&account)?;
@@ -190,7 +191,7 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
                     "vox daemon: stopped by {} while it waited for restart admission",
                     signal.name()
                 ));
-                return Ok(());
+                return signal_stop(signal, managed);
             }
         }
         let before = rt
@@ -261,7 +262,7 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
                         "vox daemon: stopped by {} while it waited",
                         signal.name()
                     ));
-                    return Ok(());
+                    return signal_stop(signal, managed);
                 }
                 if let Some(serving) = take(&rt)? {
                     eprintln!("vox daemon: the daemon that was running stopped; this one serves");
@@ -294,7 +295,7 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
                             "vox daemon: stopped by {} while it waited",
                             signal.name()
                         ));
-                        return Ok(());
+                        return signal_stop(signal, managed);
                     }
                     if let Some(serving) = take(&rt)? {
                         break serving;
@@ -308,7 +309,7 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
     println!("vox daemon: serving (pid {})", std::process::id());
     drop(restart);
     let router = serving.router.clone();
-    router.attach_kept();
+    let mut attaching = router.attach_kept();
 
     if let Some(addr) = args.metrics {
         let listener = rt
@@ -343,7 +344,7 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
                 });
                 rt.shutdown_background();
                 say(format_args!("vox daemon: stopped by {}", signal.name()));
-                return Ok(());
+                return signal_stop(signal, managed);
             }
         }
         None if !args.as_detached && !args.no_node && account.nodes_on_disk().is_empty() => {
@@ -371,6 +372,17 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
     }
 
     let signal = rt.block_on(async {
+        while !attaching.is_empty() {
+            tokio::select! {
+                signal = &mut stop => return Some(signal),
+                () = router.stop_asked() => {
+                    say(format_args!("vox daemon: stop requested by the product's control client"));
+                    return None;
+                },
+                _ = attaching.join_next() => {}
+            }
+        }
+        serving.presence.accept_management();
         let idle = async {
             if !args.as_detached {
                 return std::future::pending::<()>().await;
@@ -405,7 +417,11 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
             },
         }
     });
-    stop_daemon(rt, &router, &serving.presence, signal)
+    stop_daemon(rt, &router, &serving.presence, signal)?;
+    match signal {
+        Some(signal) => signal_stop(signal, managed),
+        None => Ok(()),
+    }
 }
 
 /// A start that no retry can change. As the login item (`--login-item`), it is written to
@@ -846,8 +862,21 @@ fn daemon_stop_requested() -> Result<impl Future<Output = crate::app::StopSignal
     })
 }
 
-/// Detach every node and end the daemon, with the exit rules `vox daemon` has always had: a stop
-/// that finished exits 0 saying which signal; one that gave up says so and fails (V210-93).
+fn signal_stop(signal: crate::app::StopSignal, managed: bool) -> Result<(), AppError> {
+    if !managed {
+        return Ok(());
+    }
+    Err(AppError::Refused {
+        code: 71,
+        message: format!(
+            "daemon stopped by {}; a service manager may start it again",
+            signal.name()
+        ),
+    })
+}
+
+/// Detach every node and end the daemon. A completed stop exits zero; the managed daemon's
+/// caller applies the nonzero signal status after this clean shutdown.
 pub(crate) fn stop_daemon(
     rt: tokio::runtime::Runtime,
     router: &Router,
