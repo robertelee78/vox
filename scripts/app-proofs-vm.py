@@ -72,7 +72,8 @@ def managed_guest_proof():
     atexit.register(cleanup_abandoned_fixture)
     plist = fixture / "job.plist"
     env = {"HOME": str(fixture), "VOX_DATA_DIR": str(fixture / "data"),
-           "VOX_CONFIG_DIR": str(fixture / "config"), "VOX_LISTEN": "127.0.0.1:0"}
+           "VOX_CONFIG_DIR": str(fixture / "config"), "VOX_LISTEN": "127.0.0.1:0",
+           "VOX_PROXY": "127.0.0.1:0"}
     if shipped_defaults:
         if default_root.exists():
             default_root.rename(previous_root)
@@ -88,6 +89,8 @@ def managed_guest_proof():
         env["VOX_TEST_STOP_HOLD_FILE"] = str(hold)
     if os.environ.get("VOX_PROOF_MANAGER_FIELDS_ABSENT"):
         env["VOX_TEST_MANAGER_FIELDS_ABSENT"] = "1"
+    if os.environ.get("VOX_MUTANT_ONESHOT_PENDING_IMMEDIATE"):
+        env["VOX_TEST_ONESHOT_PENDING_IMMEDIATE"] = "1"
     for path in ((default_root,) if shipped_defaults else (fixture / "data", fixture / "config")):
         path.mkdir(parents=True)
     job = plistlib.loads(source.read_bytes())
@@ -118,6 +121,10 @@ def managed_guest_proof():
     owned = False
     restarter = None
     read_client = None
+    one_shot_client = None
+    hook_client = None
+    stopping_hook = None
+    status_client = None
     bootout = None
     extra_pid = None
     caller_log = fixture / "restart-caller.log"
@@ -252,7 +259,8 @@ def managed_guest_proof():
                   f"elapsed={time.monotonic() - began:.3f}s:\n{words}", flush=True)
             if not hold.with_suffix(".entered").is_file():
                 raise RuntimeError("APPARATUS: hook did not enter the staged login-item check")
-            if (answer.returncode or "the login-item startup check did not finish; no daemon was started" not in words
+            if (answer.returncode or "the login-item startup check did not finish; no daemon was started" not in answer.stdout
+                    or "ask the operator to restart" in answer.stdout
                     or "waiting for the daemon restart" in words or "Vox is preparing node" in words
                     or greeting() is not None or launch("print", target).returncode == 0):
                 raise RuntimeError(f"PRODUCT: slow login-item check falsely promised a restart: {words}")
@@ -303,6 +311,23 @@ def managed_guest_proof():
                 restarter.kill()
                 restarter.wait()
                 print(f"[proof] killed restart caller exit={restarter.returncode}", flush=True)
+            if os.environ.get("VOX_PROOF_HOOK_STOP_DETECTION"):
+                stopped_hook_log = fixture / "stopping-hook.log"
+                with stopped_hook_log.open("w") as output:
+                    stopping_hook = subprocess.Popen(
+                        [str(helper), "agent", "hook", "--node", "default"],
+                        env=env, stdin=subprocess.PIPE, stdout=output,
+                        stderr=subprocess.STDOUT, text=True)
+                    stopping_hook.stdin.write(json.dumps({
+                        "hook_event_name": "UserPromptSubmit", "session_id": "rg9-stopping-login-item"}))
+                    stopping_hook.stdin.close()
+                until("stopping hook detection or exit",
+                      lambda: "waiting for the daemon restart" in stopped_hook_log.read_text()
+                      or stopping_hook.poll() is not None)
+                stopped_hook_words = stopped_hook_log.read_text()
+                print(f"[proof] managed stopping-refusal detection:\n{stopped_hook_words}", flush=True)
+                if "waiting for the daemon restart" not in stopped_hook_words:
+                    raise RuntimeError(f"PRODUCT: hook did not follow the stopping daemon: {stopped_hook_words}")
             if failure_listener is not None:
                 failure_switch.touch()
                 read_log = fixture / "failing-replacement-client.log"
@@ -335,6 +360,50 @@ def managed_guest_proof():
                 return text if pid is None and "state = spawn scheduled" in text else None
             pending = until("young daemon's scheduled spawn", scheduled)
             print(f"[proof] pending before ensure_daemon:\n{pending}", flush=True)
+            if not shipped_defaults:
+                hook_log = fixture / "pending-hook.log"
+                with hook_log.open("w") as output:
+                    hook_client = subprocess.Popen(
+                        [str(helper), "agent", "hook", "--node", "default"],
+                        env=env, stdin=subprocess.PIPE, stdout=output, stderr=subprocess.STDOUT,
+                        text=True)
+                    hook_client.stdin.write(json.dumps({"hook_event_name": "UserPromptSubmit",
+                                                        "session_id": "rg9-pending-login-item"}))
+                    hook_client.stdin.close()
+                until("pending hook detection or exit",
+                      lambda: "waiting for the daemon restart" in hook_log.read_text()
+                      or hook_client.poll() is not None)
+                hook_words = hook_log.read_text()
+                if state()[0:2] != (None, first_runs):
+                    raise RuntimeError("APPARATUS: replacement started before pending hook detection")
+                if "waiting for the daemon restart" not in hook_words:
+                    raise RuntimeError(f"PRODUCT: hook did not detect the pending manager: {hook_words}")
+                print(f"[proof] pending hook detection:\n{hook_words}", flush=True)
+                one_shot_log = fixture / "pending-one-shot.log"
+                with one_shot_log.open("w") as output:
+                    one_shot_client = subprocess.Popen(
+                        [str(helper), "room", "list", "--node", "default"],
+                        env=env, stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT)
+                status_log = fixture / "pending-status.log"
+                with status_log.open("w") as output:
+                    status_client = subprocess.Popen(
+                        [str(helper), "status", "--node", "default"],
+                        env=env, stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT)
+                until("one-shot manager wait or refusal",
+                      lambda: "waiting for the login item" in one_shot_log.read_text()
+                      or one_shot_client.poll() is not None)
+                one_shot_text = one_shot_log.read_text()
+                if one_shot_client.poll() is not None:
+                    raise RuntimeError(f"PRODUCT: one-shot did not wait for the pending daemon: {one_shot_text}; status: {status_log.read_text()}")
+                if state()[0:2] != (None, first_runs):
+                    raise RuntimeError("APPARATUS: replacement started before one-shot wait was observed")
+                until("status manager wait or refusal",
+                      lambda: "waiting for the login item" in status_log.read_text()
+                      or status_client.poll() is not None)
+                if status_client.poll() is not None:
+                    raise RuntimeError(f"PRODUCT: status did not wait for the pending daemon: {status_log.read_text()}")
+                if state()[0:2] != (None, first_runs):
+                    raise RuntimeError("APPARATUS: replacement started before status wait was observed")
             read_log = fixture / "pending-start-client.log"
             with read_log.open("w+") as output:
                 read_client = subprocess.Popen([str(helper), "daemon", "--detach"],
@@ -353,9 +422,39 @@ def managed_guest_proof():
                          f"{extra_pid},{manager_pid}"], capture_output=True, text=True)
                     print(f"[proof] competing processes:\n{processes.stdout}{processes.stderr}", flush=True)
                 text = read_log.read_text()
+                if hook_client is not None:
+                    hook_client.wait(timeout=120)
+                    hook_words = hook_log.read_text()
+                    print(f"[proof] pending hook exit={hook_client.returncode}:\n{hook_words}", flush=True)
+                    if hook_client.returncode:
+                        raise RuntimeError(f"PRODUCT: pending hook failed: {hook_words}")
+                if stopping_hook is not None:
+                    stopping_hook.wait(timeout=120)
+                    print(f"[proof] stopping hook exit={stopping_hook.returncode}:\n"
+                          f"{stopped_hook_log.read_text()}", flush=True)
+                    if stopping_hook.returncode:
+                        raise RuntimeError("PRODUCT: managed stopping hook failed")
+                if status_client is not None:
+                    status_client.wait(timeout=120)
+                    status_text = status_log.read_text()
+                    print(f"[proof] pending status exit={status_client.returncode}:\n{status_text}", flush=True)
+                    if (status_client.returncode
+                            or "waiting for the login item to start or replace the daemon" not in status_text
+                            or not any(line.startswith("node default") for line in status_text.splitlines())):
+                        raise RuntimeError(f"PRODUCT: pending status did not wait and report its node: {status_text}")
+                if one_shot_client is not None:
+                    one_shot_client.wait(timeout=120)
+                    one_shot_text = one_shot_log.read_text()
+                    print(f"[proof] pending one-shot exit={one_shot_client.returncode}:\n"
+                          f"{one_shot_text}", flush=True)
+                    if (one_shot_client.returncode
+                            or "waiting for the login item to start or replace the daemon" not in one_shot_text):
+                        raise RuntimeError(f"PRODUCT: pending one-shot did not wait and succeed: {one_shot_text}")
+                    if state()[0:2] != (manager_pid, runs) or greeting() != manager_pid:
+                        raise RuntimeError("PRODUCT: one-shot did not use the manager's one replacement")
                 print(f"[proof] pending-start client exit={read_client.returncode}; greeting={hello}; "
                       f"manager pid={manager_pid}; runs={runs}:\n{text}\n{manager}", flush=True)
-                if "waiting for the login item to replace the daemon" not in text:
+                if "waiting for the login item to start or replace the daemon" not in text:
                     raise RuntimeError(f"PRODUCT: pending manager wait did not say what it awaits: {text}")
                 if (read_client.returncode != 0 or hello != manager_pid
                         or manager_pid == first or runs != first_runs + 1):
@@ -465,6 +564,16 @@ def managed_guest_proof():
         if read_client is not None and read_client.poll() is None:
             read_client.kill()
             read_client.wait()
+        if one_shot_client is not None and one_shot_client.poll() is None:
+            one_shot_client.kill()
+            one_shot_client.wait()
+        if hook_client is not None and hook_client.poll() is None:
+            hook_client.kill()
+            hook_client.wait()
+        for child in (stopping_hook, status_client):
+            if child is not None and child.poll() is None:
+                child.kill()
+                child.wait()
         if bootout is not None and bootout.poll() is None:
             hold.unlink(missing_ok=True)
             bootout.communicate(timeout=120)
@@ -600,6 +709,8 @@ def recovery_guest(ssh, options, destination, out):
             "exec env VOX_PROOF_VM_GUEST=1 "
             + ("VOX_PROOF_FAIL_REPLACEMENT=1 " if os.environ.get("VOX_PROOF_FAIL_REPLACEMENT") else "")
             + ("VOX_PROOF_PENDING_START=1 " if os.environ.get("VOX_PROOF_PENDING_START") else "")
+            + ("VOX_PROOF_HOOK_STOP_DETECTION=1 " if os.environ.get("VOX_PROOF_HOOK_STOP_DETECTION") else "")
+            + ("VOX_MUTANT_ONESHOT_PENDING_IMMEDIATE=1 " if os.environ.get("VOX_MUTANT_ONESHOT_PENDING_IMMEDIATE") else "")
             + ("VOX_PROOF_SHIPPED_DEFAULTS=1 " if os.environ.get("VOX_PROOF_SHIPPED_DEFAULTS") else "")
             + ("VOX_PROOF_SLOW_HOOK_CHECK=1 " if os.environ.get("VOX_PROOF_SLOW_HOOK_CHECK") else "")
             + ("VOX_PROOF_ROOT_PRECEDENCE=1 " if os.environ.get("VOX_PROOF_ROOT_PRECEDENCE") else "")

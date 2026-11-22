@@ -236,14 +236,25 @@ Phase changes never reset it. A missing, disabled or inactive job ends the wait,
 run count passing the first replacement without a greeting. Missing or changed manager fields
 fall back to the old fixed ten seconds. End-of-wait advice describes the current state;
 a deliberately stopped job does not promise a future replacement.
-When no socket answers, startup-capable clients also check whether the matching account's
-login item has a spawn pending, rather than race it with a client daemon.
-Hooks do not take the managed command wait: their node clients retain the original
-greeting/refusal path, and a pending managed spawn gives the existing bounded `Starting`
-answer inside the hook's existing 500ms startup patience.
-The managed wait names the login item's replacement without quoting the unrelated ten-second
-greeting bound. If a hook's login-item check itself exceeds that patience, it says the check did
-not finish and no daemon was started, rather than promising a restart.
+When no socket answers, commands also check whether the matching account's login item has a
+spawn pending. They wait for it rather than advise starting a daemon that would race launchd.
+`vox status` uses this same admission before its daemon-only node inventory.
+A prompt hook recognises a restart from the unmanaged restart lock, a daemon's typed stopping
+refusal, or a matching pending login item. It spends one existing ten-second registration
+patience, measured from hook entry, on the replacement's greeting, registration, node and
+selected room preparation, and this turn's room news. At that bound it gives the existing
+next-turn deferral without advancing the news cursor. A cold start keeps its existing 500ms
+probe/start path and immediate preparation response. An unfinished login-item check starts
+nothing and tells the agent to retry next turn, not to restart a daemon that may not exist.
+An unrecognised manager layout keeps the existing cold-start fallback; it is not evidence
+of a restart. The managed command wait says the login item will start or replace the daemon.
+The restart/news act in `the_daemon_and_its_nodes_proof` posts from another member, checks
+same-turn delivery with a held and a killed restarter, then holds replacement attachment
+past the hook patience and checks truthful deferral followed by next-turn news.
+The native OMP preparation uses the same restart/node/room wait; a bounded deferral completes
+its existing envelope/decision exchange and consumes no room news. Saved decisions still finish
+without rereading daemon state. The existing guest pending act also checks `vox status`, and
+`VOX_PROOF_HOOK_STOP_DETECTION=1` checks hook detection while the managed daemon is still stopping.
 The guest `--restart-vm` route accepts `VOX_PROOF_SHIPPED_DEFAULTS=1` with
 `VOX_PROOF_PENDING_START=1`: the shipped job has only its helper path adapted, and uses the guest
 user's default roots. The act preserves and restores any prior guest root. `VOX_PROOF_SLOW_HOOK_CHECK=1`

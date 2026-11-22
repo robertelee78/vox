@@ -16,9 +16,27 @@ use crate::app::AppError;
 pub async fn status(paths: &Paths, json: bool) -> Result<(), AppError> {
     use vox_core::node::daemonipc::{DaemonClient, DaemonFrame, DaemonRequest, NodeStatus};
     let at = crate::client::one_shot(paths)?;
-    let mut daemon = DaemonClient::open(&paths.account().socket())
-        .await
-        .map_err(|e| crate::client::said(&at, e))?;
+    let account = paths.account();
+    #[cfg(target_os = "macos")]
+    let began = std::time::Instant::now();
+    let opened = DaemonClient::open(&account.socket()).await;
+    #[cfg(target_os = "macos")]
+    let opened = match opened {
+        Err(error)
+            if crate::client::wait_for_managed(
+                &account,
+                &account.socket(),
+                &error,
+                true,
+                began,
+            )
+            .await? =>
+        {
+            DaemonClient::open(&account.socket()).await
+        }
+        other => other,
+    };
+    let mut daemon = opened.map_err(|e| crate::client::said(&at, e))?;
     let nodes = match daemon.request(DaemonRequest::Nodes).await? {
         DaemonFrame::Nodes(nodes) => nodes,
         DaemonFrame::Refused(r) => return Err(AppError::Usage(r.to_string())),
