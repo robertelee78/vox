@@ -8439,7 +8439,7 @@ impl Node {
                             }
                         } else if owner.pending(peer)
                             || owner.key_catalog_announcement(peer).is_some() || owner.key_catalog(peer).is_some()
-                            || (self.trust.is_trusted(&peer) && owner.key_token(peer).is_some())
+                            || owner.key_token(peer).is_some()
                         {
                             self.discover_rooms.insert(room);
                             self.sched_rooms.insert(room);
@@ -14832,7 +14832,7 @@ impl Node {
                         self.sched_rooms.insert(room);
                     }
                 }
-                if self.trust.is_trusted(&peer) && self.ports.contains_key(&(room, peer)) {
+                if self.ports.contains_key(&(room, peer)) {
                     owner.mark_key_dirty(peer);
                 }
             }
@@ -16735,9 +16735,7 @@ impl Node {
                     eprintln!("vox: key catalog connection could not be initialized: {error}");
                 }
             }
-            if self.trust.is_trusted(peer) {
-                owner.mark_key_dirty(*peer);
-            }
+            owner.mark_key_dirty(*peer);
             if owner.pending(*peer) || owner.key_catalog_announcement(*peer).is_some() {
                 if let Some(port) = self.ports.get_mut(&(*channel_id, *peer)) {
                     port.key_catalog_owed = owner.key_catalog_announcement(*peer).is_some();

@@ -255,20 +255,28 @@ impl Node {
             }
             return;
         }
-        let super::Stage::RekeyGovernance {
-            rekey_after,
-            history_after,
-        } = std::mem::replace(&mut continuation.stage, super::Stage::Vacant)
-        else {
-            self.fail_owned_consent(
-                room,
-                Error::Profile("rekey governance prerequisite missing"),
-                continuation,
-                reply,
-            )
-            .await;
-            return;
-        };
+        let (rekey_after, history_after) =
+            match std::mem::replace(&mut continuation.stage, super::Stage::Vacant) {
+                super::Stage::LogRekeyGovernance(route) => {
+                    self.begin_owned_log_rekeys(room, continuation.target, route, Some(lifetime))
+                        .await;
+                    return;
+                }
+                super::Stage::RekeyGovernance {
+                    rekey_after,
+                    history_after,
+                } => (rekey_after, history_after),
+                _ => {
+                    self.fail_owned_consent(
+                        room,
+                        Error::Profile("rekey governance prerequisite missing"),
+                        continuation,
+                        reply,
+                    )
+                    .await;
+                    return;
+                }
+            };
         let selection = Selection {
             room,
             instance: Arc::clone(&continuation.instance),
