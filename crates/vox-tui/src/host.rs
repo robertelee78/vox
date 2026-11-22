@@ -1063,6 +1063,9 @@ impl Router {
 
     async fn deliver_manual_anchors(&self, state: &MachineAnchors) {
         // Keep the refresh lock until delivery finishes: no old set can overtake a mutation.
+        if let Err(error) = self.inner.defaults.computer.set_anchors(state.set.clone()) {
+            eprintln!("vox daemon: computer anchor reach could not be saved: {error}");
+        }
         for (_, node) in self.attached_handles() {
             let _ = node
                 .apply(NodeCommand::SetAnchors {
@@ -2990,6 +2993,66 @@ impl Router {
         ) && me != Some(info.peer)
             && !view.drive.contains(&info.peer)
         {
+            if let Action::RoomPause {
+                paused: Some(paused),
+                ..
+            } = &req.action
+            {
+                let action = if *paused { "pause" } else { "resume" };
+                let room = vox_core::node::link::b32_encode(&info.channel_id);
+                let target = me
+                    .map(|id| vox_core::node::link::b32_encode(&id))
+                    .unwrap_or_else(|| node.as_str().to_owned());
+                let command = |driver: &str| {
+                    vox_text::shell::command(&[
+                        "vox", "room", action, &room, &target, "--node", driver,
+                    ])
+                };
+                let status = match self.inner.defaults.computer.status() {
+                    Ok(status) => status,
+                    Err(error) => return refuse(format!(
+                        "{node} does not accept drive from this node; permitted drivers could not be read: {error}; on the computer hosting {node}: {}",
+                        command(node.as_str())
+                    )),
+                };
+                let source = vox_core::node::link::b32_encode(&info.peer);
+                let source_computer = status
+                    .nodes
+                    .iter()
+                    .find(|candidate| candidate.fingerprint == source)
+                    .map(|candidate| candidate.computer.as_str());
+                let channel = view
+                    .open_channels
+                    .iter()
+                    .find(|channel| channel.channel_id == info.channel_id);
+                let permitted = status.nodes.iter().find(|candidate| {
+                    source_computer == Some(candidate.computer.as_str())
+                        && vox_core::node::link::b32_decode(&candidate.fingerprint, "node")
+                            .is_ok_and(|id| {
+                                view.drive.contains(&id)
+                                    && channel.is_some_and(|channel| channel.members.contains(&id))
+                            })
+                });
+                let said = if let Some(driver) = permitted {
+                    format!(
+                        "{node} does not accept drive from this node; {} can {action} it: {}",
+                        driver.name,
+                        command(&driver.name)
+                    )
+                } else if source_computer.is_some() {
+                    format!("{node} does not accept drive from this node; no node of this computer can {action} it; on the computer hosting {node}: {}",
+                        command(node.as_str()))
+                } else {
+                    format!("{node} accepts drive only from nodes it trusts with drive; on the computer hosting {node}: {}",
+                        command(node.as_str()))
+                };
+                return Answer {
+                    ok: false,
+                    said,
+                    code: None,
+                    pause: None,
+                };
+            }
             return Answer {
                 ok: false,
                 said: vox_agentcomms::drive::no_drive("the session's node"),

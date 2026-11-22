@@ -37,6 +37,12 @@ pub(super) struct Continuation<L = Option<Arc<maintenance_save::Lifetime>>> {
 
 pub(super) type Retained = Continuation<Arc<maintenance_save::Lifetime>>;
 
+/// An owed Computer boundary parks the exact trust cursor, not another initial deletion.
+pub(super) struct TrustRetry {
+    pub(super) continuation: Continuation,
+    pub(super) reply: Option<oneshot::Sender<Outcome>>,
+}
+
 impl From<Retained> for Continuation {
     fn from(next: Retained) -> Self {
         Self {
@@ -236,7 +242,7 @@ impl Node {
                     tokio::spawn(async move {
                         instance.lock().await.mark_trust_failed(generation);
                     });
-                    self.governance_work.trust_waiting.insert(room);
+                    self.governance_work.trust_waiting.insert(room, None);
                     let retry = self
                         .now_ms()
                         .0
@@ -501,9 +507,41 @@ impl Node {
                 }
                 let action = {
                     let channel = continuation.instance.lock().await;
-                    channel
-                        .require_governance_ready(&continuation.lifetime.store, self.now_ms())
-                        .and_then(|_| state.action(&channel, &continuation.lifetime.store))
+                    match self.capture_room_offer_boundary(&channel, &continuation.lifetime.store) {
+                        Ok(true) => channel
+                            .require_governance_ready(&continuation.lifetime.store, self.now_ms())
+                            .and_then(|_| state.action(&channel, &continuation.lifetime.store))
+                            .map(Some),
+                        Ok(false) => Ok(None),
+                        Err(error) => Err(error),
+                    }
+                };
+                let action = match action {
+                    Ok(Some(action)) => Ok(action),
+                    Ok(None) => {
+                        let Retained {
+                            instance,
+                            attachment,
+                            lifetime,
+                            after,
+                        } = continuation;
+                        drop(lifetime);
+                        self.governance_work.trust_waiting.insert(
+                            room,
+                            Some(TrustRetry {
+                                continuation: Continuation {
+                                    instance,
+                                    attachment,
+                                    lifetime: None,
+                                    after,
+                                },
+                                reply,
+                            }),
+                        );
+                        self.retry_computer_room_removal(room);
+                        return;
+                    }
+                    Err(error) => Err(error),
                 };
                 let work = match action {
                     Ok(trust_save::ReconcileAction::Trust(work)) => {
@@ -953,7 +991,7 @@ impl Node {
                             .deadlines
                             .get(&room)
                             .copied()
-                            .filter(|_| self.governance_work.trust_waiting.contains(&room)),
+                            .filter(|_| self.governance_work.trust_waiting.contains_key(&room)),
                     )
                     .min();
                 self.governance_work.set_deadline(room, deadline);
@@ -1162,6 +1200,7 @@ impl Node {
             self.publish().await;
         }
         drop(continuation);
+        self.resume_computer_room_removals(room).await;
         if let Some(reply) = reply {
             let _ = reply.send(Outcome::Done);
         }

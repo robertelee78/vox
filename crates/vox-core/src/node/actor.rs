@@ -48,6 +48,7 @@ use crate::node::ports::{BackoffScope, OutboundService};
 
 mod bounded_sync;
 mod computer;
+mod computer_removal;
 pub use computer::PolicySupersession;
 mod consent_release;
 mod consent_save;
@@ -8477,7 +8478,7 @@ impl Node {
                             }
                         } else if owner.pending(peer)
                             || owner.key_catalog_announcement(peer).is_some() || owner.key_catalog(peer).is_some()
-                            || (self.trust.is_trusted(&peer) && owner.key_token(peer).is_some())
+                            || owner.key_token(peer).is_some()
                         {
                             self.discover_rooms.insert(room);
                             self.sched_rooms.insert(room);
@@ -14852,7 +14853,7 @@ impl Node {
                         self.sched_rooms.insert(room);
                     }
                 }
-                if self.trust.is_trusted(&peer) && self.ports.contains_key(&(room, peer)) {
+                if self.ports.contains_key(&(room, peer)) {
                     owner.mark_key_dirty(peer);
                 }
             }
@@ -16755,9 +16756,7 @@ impl Node {
                     eprintln!("vox: key catalog connection could not be initialized: {error}");
                 }
             }
-            if self.trust.is_trusted(peer) {
-                owner.mark_key_dirty(*peer);
-            }
+            owner.mark_key_dirty(*peer);
             if owner.pending(*peer) || owner.key_catalog_announcement(*peer).is_some() {
                 if let Some(port) = self.ports.get_mut(&(*channel_id, *peer)) {
                     port.key_catalog_owed = owner.key_catalog_announcement(*peer).is_some();
@@ -24770,11 +24769,30 @@ impl Node {
         self.decisions.set_aliases(&trusted);
         // Who is offered to the keyring (K-15 – K-18), over every open room.
         let names_here: Vec<Option<String>> = channels.iter().map(|c| c.name.clone()).collect();
+        let removed_offer_members = match (&self.computer, &self.profile) {
+            (Some(computer), Some(profile))
+                if open_channels
+                    .iter()
+                    .any(|room| !room.offer_bases.is_empty()) =>
+            {
+                computer.removed_offer_members(profile.fingerprint()).ok()
+            }
+            _ => None,
+        };
         let offers = crate::node::offers::offers(
             &open_channels,
             &names_here,
             &trusted,
             &self.dismissed_offers,
+            |room, basis| match (&self.computer, &self.profile) {
+                (Some(computer), Some(profile)) => computer.suppress_offer(
+                    profile.fingerprint(),
+                    room,
+                    basis,
+                    removed_offer_members.as_ref(),
+                ),
+                _ => false,
+            },
         );
         if known.iter().any(|room| !inventory.contains_key(room)) {
             anchor_inventory_error.get_or_insert_with(|| {
