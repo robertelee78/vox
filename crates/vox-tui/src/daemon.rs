@@ -168,9 +168,15 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
     let named = named_node(args)?;
     // The new daemon, rather than the command that launched it, owns completion.
     let restart = if let Some(old_pid) = args.replace_pid {
+        let managed = crate::update::restart::is_managed_daemon(old_pid);
         let file = crate::daemon_client::restart_lock(&account)?;
         loop {
-            match file.try_lock() {
+            let acquired = if managed {
+                file.try_lock_shared()
+            } else {
+                file.try_lock()
+            };
+            match acquired {
                 Ok(()) => break,
                 Err(std::fs::TryLockError::WouldBlock) => {}
                 Err(std::fs::TryLockError::Error(e)) => {
@@ -190,8 +196,13 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
                     "vox daemon: stopped by {} while it waited for restart admission",
                     signal.name()
                 ));
-                return Ok(());
+                return Err(signal_stop(signal));
             }
+        }
+        if managed {
+            return rt.block_on(crate::update::restart::finish_managed_restart(
+                &account, old_pid,
+            ));
         }
         let before = rt
             .block_on(DaemonClient::observe(&account.socket()))
@@ -215,19 +226,27 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
     } else {
         None
     };
+    let managed_start =
+        args.replace_pid.is_none() && crate::update::restart::is_managed_daemon(std::process::id());
     let take = |rt: &tokio::runtime::Runtime| {
-        let take = if args.replace_pid.is_some() {
-            take_account_unlocked
+        if args.replace_pid.is_some() {
+            take_account_unlocked(
+                &account,
+                rt,
+                args.profile.listen,
+                &args.profile.anchors,
+                args.proxy,
+            )
         } else {
-            take_account
-        };
-        take(
-            &account,
-            rt,
-            args.profile.listen,
-            &args.profile.anchors,
-            args.proxy,
-        )
+            take_account_admitted(
+                &account,
+                rt,
+                args.profile.listen,
+                &args.profile.anchors,
+                args.proxy,
+                managed_start,
+            )
+        }
     };
     let mut given = None;
     let (rt, serving) = match take(&rt)? {
@@ -261,7 +280,7 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
                         "vox daemon: stopped by {} while it waited",
                         signal.name()
                     ));
-                    return Ok(());
+                    return Err(signal_stop(signal));
                 }
                 if let Some(serving) = take(&rt)? {
                     eprintln!("vox daemon: the daemon that was running stopped; this one serves");
@@ -294,7 +313,7 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
                             "vox daemon: stopped by {} while it waited",
                             signal.name()
                         ));
-                        return Ok(());
+                        return Err(signal_stop(signal));
                     }
                     if let Some(serving) = take(&rt)? {
                         break serving;
@@ -343,7 +362,7 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
                 });
                 rt.shutdown_background();
                 say(format_args!("vox daemon: stopped by {}", signal.name()));
-                return Ok(());
+                return Err(signal_stop(signal));
             }
         }
         None if !args.as_detached && !args.no_node && account.nodes_on_disk().is_empty() => {
@@ -473,8 +492,33 @@ pub(crate) fn take_account(
     anchor_specs: &[String],
     proxy: std::net::SocketAddr,
 ) -> Result<Option<Serving>, AppError> {
+    take_account_admitted(
+        account,
+        rt,
+        listen,
+        anchor_specs,
+        proxy,
+        crate::update::restart::is_managed_daemon(std::process::id()),
+    )
+}
+
+fn take_account_admitted(
+    account: &Account,
+    rt: &tokio::runtime::Runtime,
+    listen: std::net::SocketAddr,
+    anchor_specs: &[String],
+    proxy: std::net::SocketAddr,
+    managed: bool,
+) -> Result<Option<Serving>, AppError> {
     let admission = crate::daemon_client::restart_lock(account)?;
-    match admission.try_lock_shared() {
+    // A managed completion worker holds shared admission: only the real manager may join it.
+    // Unmanaged replacements remain exclusive, so a waiting manager cannot steal their handoff.
+    let acquired = if managed {
+        admission.try_lock_shared()
+    } else {
+        admission.try_lock()
+    };
+    match acquired {
         Ok(()) => take_account_unlocked(account, rt, listen, anchor_specs, proxy),
         Err(std::fs::TryLockError::WouldBlock) => Ok(None),
         Err(std::fs::TryLockError::Error(e)) => {
@@ -846,8 +890,18 @@ fn daemon_stop_requested() -> Result<impl Future<Output = crate::app::StopSignal
     })
 }
 
-/// Detach every node and end the daemon, with the exit rules `vox daemon` has always had: a stop
-/// that finished exits 0 saying which signal; one that gave up says so and fails (V210-93).
+fn signal_stop(signal: crate::app::StopSignal) -> AppError {
+    AppError::Refused {
+        code: signal.exit_code(),
+        message: format!(
+            "daemon stopped by {}; a service manager may start it again",
+            signal.name()
+        ),
+    }
+}
+
+/// Detach every node and end the daemon. Product Stop exits zero; a signal exits with
+/// 128 + its signal number after clean shutdown, so an enrolled manager can recover it.
 pub(crate) fn stop_daemon(
     rt: tokio::runtime::Runtime,
     router: &Router,
@@ -889,8 +943,9 @@ pub(crate) fn stop_daemon(
             ),
         });
     }
-    if signal.is_some() {
+    if let Some(signal) = signal {
         say(format_args!("vox daemon: stopped by {why}"));
+        return Err(signal_stop(signal));
     } else {
         say(format_args!("vox daemon: stopped"));
     }

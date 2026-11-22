@@ -2363,3 +2363,181 @@ fn an_admin_cannot_name_another_admin() {
     );
     eprintln!("[proof] admin: no node honoured the admin bob's modified client named");
 }
+
+/// RG-14: ending is not a reason to refuse the person's local leave.
+#[test]
+#[ignore = "real daemons and an offline member; run in release"]
+fn an_ended_room_can_be_left_at_once() {
+    watchdog::arm();
+    let rt = runtime();
+    let tmp = support::diagnostic_tempdir();
+    let mut room = room_of(&rt, tmp.path(), &["alice", "bob"]);
+    room.workers[1].stop_daemon_cleanly();
+    let alice = &mut room.workers[0];
+    setup(alice, &["room", "end", &room.id]);
+    let started = std::time::Instant::now();
+    let left = alice.vox(None, &["room", "leave", &room.id]);
+    assert!(
+        left.ok,
+        "PRODUCT: an ended room could not be left: {left:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "PRODUCT: leaving an ended room waited instead of finishing locally"
+    );
+    assert!(
+        left.stdout.contains("had already ended")
+            && left.stdout.contains("this node's copy is deleted")
+            && !left.stdout.contains("withdrawal is queued"),
+        "PRODUCT: ended-room leave described a departure instead of local deletion: {left:?}"
+    );
+    erased(alice, &room.id, &room.cid, false);
+}
+
+/// RG-14: invalid stores are preserved; inaccessible good stores keep their identity and rooms.
+/// Positive crash recovery is covered by a_daemon_reopens_its_rooms_proof.rs.
+#[test]
+#[ignore = "real vox opens invalid stores and a permission-denied good store; run in release"]
+fn an_unreadable_store_is_left_exactly_as_it_is() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    watchdog::arm();
+    let tmp = support::diagnostic_tempdir();
+    let mut problems = Vec::new();
+    for (name, bytes) in [
+        ("garbage", vec![0xa5; 4096]),
+        ("truncated", b"redb".to_vec()),
+        ("empty", Vec::new()),
+    ] {
+        let worker = support::worker(tmp.path(), name);
+        let path = worker.paths.store_file();
+        std::fs::write(&path, &bytes).expect("APPARATUS: stage an invalid store header");
+        let siblings = || {
+            let mut names = std::fs::read_dir(path.parent().expect("APPARATUS: store parent"))
+                .expect("APPARATUS: profile directory")
+                .map(|entry| entry.expect("APPARATUS: profile entry").file_name())
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        };
+        let names = siblings();
+        let modified = std::fs::metadata(&path)
+            .expect("APPARATUS: store metadata")
+            .modified()
+            .expect("APPARATUS: store mtime");
+        let out = worker.vox(None, &["id"]);
+        if out.ok {
+            problems.push(format!("{name}: vox accepted an invalid store: {out:?}"));
+        }
+        if std::fs::read(&path).expect("APPARATUS: read refused store") != bytes {
+            problems.push(format!("{name}: vox changed the unreadable store's bytes"));
+        }
+        if std::fs::metadata(&path)
+            .expect("APPARATUS: store metadata")
+            .modified()
+            .expect("APPARATUS: store mtime")
+            != modified
+        {
+            problems.push(format!("{name}: vox changed the unreadable store's mtime"));
+        }
+        if siblings() != names {
+            problems.push(format!(
+                "{name}: vox made a copy beside the unreadable store"
+            ));
+        }
+        if !out.stderr.contains("store could not be read")
+            || !out
+                .stderr
+                .contains(path.to_str().expect("APPARATUS: store path"))
+            || !out.stderr.contains("restore it from a backup")
+            || !out.stderr.contains("move it aside to start a new node")
+        {
+            problems.push(format!(
+                "{name}: refusal did not say what failed, where, and what to do: {out:?}"
+            ));
+        }
+    }
+    let rt = runtime();
+    let mut room = room_of(&rt, tmp.path(), &["alice", "bob"]);
+    let alice = &mut room.workers[0];
+    let marker = "the good store still holds this room after permissions are restored";
+    setup(alice, &["room", "post", &room.id, marker]);
+    let before = setup(alice, &["room", "read", &room.id]);
+    assert!(
+        before.stdout.contains(marker),
+        "APPARATUS: the good store did not hold the staged room post: {before:?}"
+    );
+    alice.stop_daemon_cleanly();
+    let path = alice.paths.store_file();
+    let bytes = std::fs::read(&path).expect("APPARATUS: snapshot the good store");
+    struct RestoreMode {
+        path: std::path::PathBuf,
+        mode: u32,
+    }
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            if let Err(error) =
+                std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(self.mode))
+            {
+                eprintln!(
+                    "APPARATUS: could not restore permissions on {}: {error}",
+                    self.path.display()
+                );
+            }
+        }
+    }
+    let original_mode = std::fs::metadata(&path)
+        .expect("APPARATUS: good store metadata")
+        .permissions()
+        .mode();
+    let restore = RestoreMode {
+        path: path.clone(),
+        mode: original_mode,
+    };
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))
+        .expect("APPARATUS: deny access to the good scratch store");
+    assert!(
+        std::fs::File::open(&path)
+            .err()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied),
+        "APPARATUS: chmod did not deny read access to the good store"
+    );
+    let refused = alice.vox(None, &["id"]);
+    drop(restore);
+    assert_eq!(
+        std::fs::metadata(&path)
+            .expect("APPARATUS: restored store metadata")
+            .permissions()
+            .mode(),
+        original_mode,
+        "APPARATUS: the scratch store's original permissions were not restored"
+    );
+    if refused.ok
+        || !refused
+            .stderr
+            .contains("check the file's permissions and the disk, then try again")
+        || refused.stderr.contains("restore it from a backup")
+        || refused.stderr.contains("start a new node")
+        || !refused
+            .stderr
+            .contains(path.to_str().expect("APPARATUS: store path"))
+        || !refused.stderr.contains("Permission denied")
+    {
+        problems.push(format!(
+            "permission-denied good store did not get safe retry advice: {refused:?}"
+        ));
+    }
+    if std::fs::read(&path).expect("APPARATUS: read the permission-refused store") != bytes {
+        problems.push("vox changed the permission-denied good store's bytes".to_owned());
+    }
+    setup(alice, &["id"]);
+    alice.restart_daemon(&tmp.path().join("permissions-restored.daemon.err"));
+    support::until(
+        alice,
+        None,
+        "the held room post after restoring permissions",
+        &["room", "read", &room.id],
+        |out| out.ok && out.stdout.contains(marker),
+    );
+    assert!(problems.is_empty(), "PRODUCT: {}", problems.join("\n"));
+}

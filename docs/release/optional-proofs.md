@@ -17,6 +17,39 @@ They are kept "at the ready for troubleshooting". When a user reports one of the
   - A product failure fails as the product's verdict.
 - **CI compiles them on every run and never runs them.** The CI step is "Compile optional proofs (not run; troubleshooting kit)": `cargo test --release -p vox-tui --features optional-proofs --no-run`, with `-D warnings`. A change that breaks one is caught at once, not on the day it is needed.
 
+### Managed daemon recovery (ADR-052 RG-9)
+
+The optional Linux systemd journey in `the_daemon_and_its_nodes_proof.rs` supplies a minimal
+`Restart=on-failure` user unit with private profile roots, then removes it. Vox ships no
+systemd unit or manual enrollment instructions. It checks signal recovery and explicit
+product Stop independently of client auto-start.
+
+```sh
+cargo test --release -p vox-tui --features optional-proofs,test-knobs \
+  --test the_daemon_and_its_nodes_proof \
+  a_systemd_user_unit_recovers_foreign_signals_and_honors_product_stop \
+  -- --ignored --exact --nocapture
+```
+
+Run it only inside its disposable `vox-rg9-…` container with a real systemd user session and
+`VOX_PROOF_SYSTEMD_CONTAINER` naming that container. There is no `vox daemon stop` subcommand;
+the proof sends the existing public control Stop request.
+
+The macOS guest journey loads the bundle's shipped launch agent with scratch bindings and
+boots it out even on failure. This establishes keep-alive behavior, not signed SMAppService
+enrollment or approval; those belong to the release journey.
+
+For the recovery-only guest journey, first build the helper in a shared build hold, then run:
+
+```sh
+python3 scripts/app-proofs-vm.py --recovery-vm /absolute/prebuilt/vox \
+  apps/macos/Bundle/LaunchAgents/us.vox.daemon.plist /absolute/receipt-directory
+```
+
+This route requires the existing stopped `vox-app-proofs` guest, snapshots supplied artifacts,
+does not resize it, and leaves it stopped. It stages a private node, requires a launchd-owned
+replacement before any healing client, checks `vox status`, and sends public control Stop.
+
 ### macOS update recovery (ADR-014 M-29a)
 
 For a newer release, `vox update` downloads and verifies its updater before transferring the
@@ -39,10 +72,11 @@ A live process, permission refusal, or unknown query failure is still waited for
 not change the existing shutdown bound.
 
 Before filesystem commit, the updater preserves and round-trip-verifies the source as an
-authenticated rollback archive. It stops the captured app/daemon, exchanges intact bundles,
-and retires the displaced tree before allowing new-version startup. A precommit refusal restores
-the source from that verified archive, not from a possibly partially deleted tree. A postcommit
-handoff failure resumes unfinished work without an implicit downgrade.
+authenticated rollback archive. It quits the captured app, but keeps the old daemon serving
+through the intact bundle exchange. After publication, the replacement helper owns daemon
+handoff. A precommit refusal restores the source from that verified archive, not from a
+possibly partially deleted tree. A postcommit handoff failure resumes unfinished work without
+an implicit downgrade.
 
 A signed update/identifier-launch/rollback measurement must retain both release bundles'
 original signed helpers, verify the restored signature and unchanged signed plist, inspect exact
@@ -188,6 +222,163 @@ run** for the paging change, and blocks neither CI nor release. CI compiles it. 
 ```sh
 CARGO_BUILD_JOBS=2 cargo test --release -p vox-tui --features optional-proofs --test a_large_room_reads_whole_proof a_hundred_thousand_entry_session_opens_in_one_second_with_bounded_memory -- --ignored --exact --nocapture
 ```
+
+## Agent retry ownership (ADR-052 RG-4)
+
+The optional acts in `agent_hook_proof` drive the generated, shipped OMP extension with
+`support/omp_turn_host.mjs`, the existing recorded-reproduction host stand-in, not a model.
+Each process uses scratch data and config roots. Run one exact act in release with
+`--features test-knobs,optional-proofs -- --ignored --exact <name> --nocapture`:
+
+- `a_native_omp_conversation_survives_a_decided_turn_restart`: physically pauses the replacement
+  daemon during a held turn; later room news must appear once in the same conversation.
+- `a_native_omp_turn_without_a_decision_stays_uncertain`: preserves the undecided refusal.
+- `a_native_omp_conversation_finishes_a_decision_after_a_room_move`: holds a real saved
+  attention receipt across an operator room move; the next hook finishes it and new-room news
+  is shown once. The old Session must be reported ended before that hook.
+- `a_native_omp_conversation_finishes_a_decision_after_a_session_resume`: ends and resumes the conversation's
+  Session in its original room while a decided receipt is pending; the next hook finishes and
+  later news is shown once.
+- `nine_restarted_sessions_wait_for_registration`: nine real hooks contend on the kernel lock.
+- `a_sibling_room_post_is_accepted_after_policy_installation`: holds real sibling startup across policy
+  installation and the room-startup boundary. A sibling room operation is accepted after
+  policy installation, and the pending native Session opens after release without another hook.
+  Its verdict uses the product's response, not a count of status polls.
+- `a_linked_worktree_gets_its_repository_offer_and_names_map_authority`: checks both hook riders.
+
+`key_package_proof` also includes `a_governance_refresh_is_a_retryable_read_refusal` and
+`an_abandoned_key_request_is_selected_again`, run with `test-knobs`. The latter abandons one
+real selected log package before Open; the returning offline member must still read the
+sender's post while direct key sends remain held. No in-process node or live model is used.
+
+## Busy-room newcomer and paging (ADR-052 RG-1, #1315)
+
+`a_newcomer_reads_the_whole_history_proof` includes two variants of the same busy-room
+journey. They are optional while RG-2 through RG-4 remove the reproduced admission, trust
+and key-delivery failures; an optional red is not a release waiver. They use four scratch
+computer daemons (X hosts six earlier joiners and its personal sibling; Y hosts slow
+author `y1`; Z hosts fast author `z1`; W hosts a personal sibling and later `n-new`),
+one anchor process, and three OMP Session stand-ins, all on `y1` (no model). The paused
+variant checks the serving daemon's PID against its held daemon lock, observes its stopped process state,
+and pauses it for 1.5 seconds in every 3 seconds. The delayed variant isolates the slow
+member on IPv6 loopback, with its IPv4 anchor reached through the existing userspace
+forward; its only outgoing path delays each datagram 350 ms. It requires both the
+forward's probe and a product-reported RTT of at least 300 ms before the newcomer joins.
+
+The 3,000-row seed is split concurrently between `y1` and `z1`. X's personal node pairs
+its computer with Y, Z and W before the room is created on Y; no explicit all-pair trust
+is added. The three authors are `y1`, `z1`, and `n-old1` (the latter starts after its
+join). Three OMP Sessions on `y1` alternate 400-character user/reply steps at one per second.
+Every post is a separately started process, offered on a one-second schedule without
+waiting for the previous answer. Several posts can therefore be in flight against the slow
+member at once: this is a heavier load than the old rig, which waited for each answer,
+not merely a cadence difference. Offered times and acknowledged times are recorded
+separately; offered gaps must stay within 750–1250 ms. The slow author's acknowledgement
+lag is measured, not bounded. The slow condition is active before six earlier joins
+through fast `z1`, with ten seconds between the first five and thirty seconds after the sixth.
+W creates `n-new` only then; computer revisions and trust are sampled after two seconds,
+and it joins after eight seconds through a fresh fast-`z1` link. A refused join of any
+joiner is immediately recorded as RED PRODUCT, never a staging failure, and is not retried.
+The proof attempts every remaining joiner once where staging allows, including the newcomer,
+and records `refused k of 7 joins` with every refusal's words.
+After admission every admitted earlier member and the newcomer offers one post per second.
+Only acknowledged posts count toward the 100-post red in either direction and convergence.
+The shared room apparatus strips inherited `PI_` and `OMP` session variables as well as
+the other harness markers; each stand-in supplies only its own Session environment.
+
+A recorded through-slow-member run refused `n-old2` after 44.5 seconds: the member paused
+1.5 seconds in every 3 seconds did not complete its exchange (`peer sent no complete frame
+in time`). Receipt: `/opt/vox-evidence/v0431/rg-1/review-r1/faithful-paused.log:13101-13108`.
+That observation is not the five-second seat-question veto RG-2 changes. The journey
+routes all earlier joiners and the newcomer through fast `z1` to exercise that distinct rule.
+On today's product the journey has also shown posts refused with `computer trust changed
+while this command was being applied` after the newcomer's node is created on a paired
+computer: these are the words ADR-052 records for C-3, but which rule refused them here has
+not been traced (this journey removes nobody).
+
+Run one named variant, in release, without `test-knobs`:
+
+```sh
+cargo test --release -p vox-tui --features optional-proofs \
+  --test a_newcomer_reads_the_whole_history_proof -- --ignored --exact \
+  a_busy_room_newcomer_reads_every_member_with_a_paused_member --nocapture
+
+cargo test --release -p vox-tui --features optional-proofs \
+  --test a_newcomer_reads_the_whole_history_proof -- --ignored --exact \
+  a_busy_room_newcomer_reads_every_member_with_a_delayed_path --nocapture
+```
+
+Set `VOX_PROOF_SHIPPED_BINARY` to the absolute path of an untouched release helper to
+drive that asset instead of Cargo's helper. Every process still gets scratch
+`VOX_DATA_DIR` and `VOX_CONFIG_DIR`. `VOX_PROOF_RG1_EVIDENCE` selects the existing
+directory under which scratch profiles are created; `VOX_PROOF_KEEP_DIRS=1` retains them.
+Capture stdout and stderr: receipts include every command, status and doctor snapshot,
+first-event marks counted in acknowledged posts, and every paging cursor. These marks are
+independent observations, not an assumed sequence of prerequisites:
+
+- `contiguous_verified`: status reports the author's verified contiguous position past
+  the marker's acknowledged feed fence. It can be false while a sparse copy is retained,
+  and says nothing about decryption or showability.
+- `mutual_room_trust`: the author's doctor reports mutual room trust. This is sufficient
+  evidence of the room grant being applied, but is not a prerequisite for a shown post.
+- `no_key_owed`: the author's status reports no sender-key delivery owed. This can mean
+  the room is unsettled or a package was committed but not fetched. It does **not**
+  establish that the recipient holds the key.
+- `shown`: the exact post is present in the recipient's real paged read. Only this mark
+  establishes that the person can read it.
+
+The red prints all observed and unobserved marks rather than choosing a “first missing”
+step from an assumed order. Both-ways completion depends on `shown` only; a lagging doctor
+or delivery report cannot keep an otherwise complete room from finishing.
+
+The reader follows the **stderr** `older messages not shown` footer until it finds the
+requested row or reaches the room's start. Its own real-binary self-check plants the
+first row in a 5,000-row room:
+
+```sh
+cargo test --release -p vox-tui --features optional-proofs \
+  --test a_newcomer_reads_the_whole_history_proof -- --ignored --exact \
+  the_busy_room_reader_finds_the_first_of_five_thousand_rows --nocapture
+```
+
+The named reader mutant is the same command with `VOX_PROOF_RG1_NO_PAGING=1`: it removes
+older-page reads in the proof, not the product, and must turn the first-row assertion red.
+The busy-room journey's apparatus failures say APPARATUS. A refused join quotes the
+product as RED PRODUCT and names the joining member; the final verdict counts refused joins.
+After admission, 100 acknowledged post-join posts with none displayed is RED PRODUCT in
+either direction, with all marks reported. If a member has no acknowledged post, 100 answered
+offers (acknowledged plus refused since join) produce a red saying how many were refused
+and that none was acknowledged. The acknowledged post set is fixed by each offer's join phase, not a sliding
+newest-post window. GREEN additionally requires every member's post shown both ways and
+every acknowledged post on every member after the authors stop; errors from the final
+in-flight commands are checked after those commands finish. Pause-thread and serving-daemon
+liveness are checked before join verdicts, during the timeline and during convergence.
+After authors stop, ten answered `--history older` demands without a smaller missing-post
+set produce RED PRODUCT naming the member and a missing post. Sampler pages record even
+refused reads without deciding the verdict or stopping the sampler.
+No elapsed watchdog decides a product verdict.
+
+After all admission attempts, a refused newcomer ends the run with every recorded failure;
+an admitted newcomer continues into the timeline and convergence with only admitted members,
+while refused posts remain recorded and their authors keep offering posts.
+The final verdict is RED PRODUCT for any refused join, post or command, or failing tail observation,
+and GREEN only when none occurred and every acknowledged post is shown on every admitted member.
+If refreshing the fast member's link is refused, retain that refusal and use its already-successful
+link for the newcomer; do not retry the refused command or change the admitting member.
+
+For an **apparatus smoke only**, add `VOX_PROOF_RG1_NO_PAUSE=1` to the paused-variant
+command. It disables the serving-process pause so the
+post-admission code can run on the shipped helper. Its product red or green is never a
+verdict on an ADR requirement; record which post-admission branches it actually reaches.
+
+Coverage remains limited: no direction has ever become shown, so the `shown`/`shown_post`
+success paths, the all-directions-shown loop end, the stopped-authors loop (including its
+demand-count and refusal branches), and GREEN have never run. Neither have the
+refused-newcomer branch under this code, the refused-link fallback, the tail's error
+branches, a tail with a member refused at admission, or the all-posts-refused bound.
+The first candidate that gets past the 100-post red is these shown-dependent branches'
+first run; an APPARATUS fault or a hang there is a defect of this proof to fix, not the
+candidate's failure.
 
 ## The proofs
 

@@ -932,6 +932,19 @@ fn holders(dir: &Path) -> Vec<String> {
     }
 }
 
+#[cfg(target_os = "macos")]
+struct HeldUpdater(Option<std::process::Child>);
+
+#[cfg(target_os = "macos")]
+impl Drop for HeldUpdater {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.0 {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 /// ADR-034 UP-1 and UP-2: the real update journey, isolated from unrelated download cases.
 #[test]
 #[ignore = "real update, production Argon2id; run in release with test-knobs"]
@@ -1162,6 +1175,178 @@ fn daemon_restart_claim(
         ),
     ));
 
+    #[cfg(target_os = "macos")]
+    let out = if bundle {
+        use std::io::BufRead as _;
+        let original = libproc::proc_pid::pidinfo::<libproc::bsd_info::BSDInfo>(
+            i32::try_from(before_pid).expect("APPARATUS: daemon pid"),
+            0,
+        )
+        .expect("APPARATUS: capture original daemon kernel identity");
+        let original_start = (original.pbi_start_tvsec, original.pbi_start_tvusec);
+        let created = vox(
+            &link,
+            home,
+            &[
+                "room",
+                "create",
+                "--node",
+                "kept",
+                "--passphrase-file",
+                pass_arg,
+                "--name",
+                "update-held",
+            ],
+            &env,
+        );
+        assert!(
+            created.status.success(),
+            "APPARATUS: create held room: {}",
+            said(&created)
+        );
+        let rooms = vox(&link, home, &["room", "list", "--node", "kept"], &env);
+        let room = String::from_utf8_lossy(&rooms.stdout)
+            .split_whitespace()
+            .next()
+            .expect("APPARATUS: list held room")
+            .to_owned();
+        let post = vox(
+            &link,
+            home,
+            &[
+                "room",
+                "post",
+                &room,
+                "before publication",
+                "--node",
+                "kept",
+            ],
+            &env,
+        );
+        assert!(
+            post.status.success(),
+            "APPARATUS: post held room: {}",
+            said(&post)
+        );
+        let app_log = home.join("held-update.log");
+        let log = std::fs::File::create(&app_log).expect("APPARATUS: updater output");
+        let pipe = home.join("before-swap.fifo");
+        let made = Command::new("/usr/bin/mkfifo")
+            .arg(&pipe)
+            .status()
+            .expect("APPARATUS: create publication hold pipe");
+        assert!(
+            made.success(),
+            "APPARATUS: could not create publication hold pipe"
+        );
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = std::fs::File::open(pipe).and_then(|file| {
+                let mut line = String::new();
+                std::io::BufReader::new(file).read_line(&mut line)?;
+                Ok(line)
+            });
+            let _ = ready_tx.send(result);
+        });
+        let hold = home.join("before-swap.fifo");
+        let mut updater = HeldUpdater(Some(
+            vox_command(&link, home, &["update"], &env)
+                .env("VOX_TEST_HOLD_BEFORE_BUNDLE_SWAP", &hold)
+                .stdout(log.try_clone().expect("APPARATUS: clone updater output"))
+                .stderr(log)
+                .spawn()
+                .expect("APPARATUS: start held updater"),
+        ));
+        let ready = ready_rx.recv_timeout(std::time::Duration::from_secs(120));
+        if !matches!(&ready, Ok(Ok(line)) if line == "ready\n") {
+            let mut child = updater.0.take().expect("APPARATUS: held updater");
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("APPARATUS: updater did not reach pre-publication hold: {ready:?}");
+        }
+        let (kept, plain, state) = listed(&link);
+        let same_pid = std::fs::read_to_string(data.join(".daemon/lock"))
+            .is_ok_and(|pid| pid.trim() == before_pid.to_string());
+        let read = vox(
+            &link,
+            home,
+            &["room", "read", &room, "--node", "kept"],
+            &env,
+        );
+        claims.push(claim(
+            "bundle.old_daemon_serves_before_publication",
+            same_pid
+                && kept
+                && plain
+                && read.status.success()
+                && said(&read).contains("before publication")
+                && app_says(&home.join("Apps/Vox.app")) == VERSION,
+            format!(
+                "old pid={before_pid}, same={same_pid}; {state}; read: {}",
+                said(&read)
+            ),
+        ));
+        let mut child = updater.0.take().expect("APPARATUS: held updater");
+        child.kill().expect("APPARATUS: kill held updater");
+        child.wait().expect("APPARATUS: reap held updater");
+        let (kept, plain, state) = listed(&link);
+        let after_death = vox(
+            &link,
+            home,
+            &["room", "read", &room, "--node", "kept"],
+            &env,
+        );
+        claims.push(claim(
+            "bundle.old_daemon_serves_after_updater_death",
+            kept && plain
+                && after_death.status.success()
+                && said(&after_death).contains("before publication")
+                && std::fs::read_to_string(data.join(".daemon/lock"))
+                    .is_ok_and(|pid| pid.trim() == before_pid.to_string()),
+            format!("{state}; read: {}", said(&after_death)),
+        ));
+        let log_path = data.join(".daemon/log");
+        let log_before = std::fs::read_to_string(&log_path).unwrap_or_default();
+        let mut cut_env = env.to_vec();
+        cut_env.push(("VOX_TEST_ABORT_AFTER_SWAP", "1"));
+        let cut = vox(&link, home, &["update"], &cut_env);
+        assert!(
+            !cut.status.success() && app_says(&home.join("Apps/Vox.app")) == next,
+            "APPARATUS: did not reach post-exchange interruption: {}",
+            said(&cut)
+        );
+        let captured_alive = std::fs::read_to_string(data.join(".daemon/lock"))
+            .is_ok_and(|pid| pid.trim() == before_pid.to_string())
+            && libproc::proc_pid::pidinfo::<libproc::bsd_info::BSDInfo>(before_pid as i32, 0)
+                .is_ok_and(|info| {
+                    info.pbi_status != nix::libc::SZOMB
+                        && (info.pbi_start_tvsec, info.pbi_start_tvusec) == original_start
+                });
+        let recovered = vox(&link, home, &["update"], &env);
+        let final_pid = std::fs::read_to_string(data.join(".daemon/lock")).unwrap_or_default();
+        let log_after = std::fs::read_to_string(&log_path).unwrap_or_default();
+        let new_log = log_after.get(log_before.len()..);
+        let serving = new_log.map(|log| {
+            log.lines()
+                .filter(|line| line.contains("vox daemon: serving (pid "))
+                .collect::<Vec<_>>()
+        });
+        let recovery_text = said(&recovered);
+        claims.push(claim("bundle.post_exchange_recovery_handoffs_daemon",
+            captured_alive && recovered.status.success()
+                && reports(&link) == format!("vox {next}")
+                && final_pid.trim() != before_pid.to_string()
+                && recovery_text.contains(&format!("recovered an earlier transition; CLI and app Vox {next}"))
+                && serving.as_ref().is_some_and(|lines| {
+                    lines.len() == 1
+                        && lines[0].contains(&format!("vox daemon: serving (pid {})", final_pid.trim()))
+                }),
+            format!("old pid={before_pid}, alive after exchange={captured_alive}; final pid={final_pid:?}; product log={new_log:?}; interrupted: {}; recovered: {recovery_text}", said(&cut))));
+        recovered
+    } else {
+        vox(&link, home, &["update"], &env)
+    };
+    #[cfg(not(target_os = "macos"))]
     let out = vox(&link, home, &["update"], &env);
     let text = said(&out);
     let (kept_after, plain_after, after) = listed(&link);
@@ -2755,10 +2940,10 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
             let repaired = vox(&helper, home, &["update"], &offline);
             let text = said(&repaired);
             claims.push(claim(
-                "bundle.precommit_recovery_restores_the_original",
+                "bundle.exchange_recovery_retains_the_published_bundle",
                 repaired.status.success()
-                    && app_says(&active) == before_version
-                    && reports(&helper) == format!("vox {before_version}")
+                    && app_says(&active) == after_version
+                    && reports(&helper) == format!("vox {after_version}")
                     && signed(&active).is_ok()
                     && profile_intact(),
                 format!("offline recovery {}: {text}", repaired.status),
