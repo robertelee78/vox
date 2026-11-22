@@ -89,8 +89,9 @@ enum NativeWork {
         paths: crate::node::paths::Paths,
         name: String,
         retirement: Option<RetirementPermit>,
-        /// The room ended for everyone (not left): what this node remembers of its end.
+        /// What this node remembers of its leave or the room's end.
         ended: Option<Box<crate::node::ended_rooms::EndedRoom>>,
+        erase_continuity: bool,
     },
 }
 enum NativeSaved {
@@ -282,6 +283,7 @@ fn native(
             name,
             retirement,
             ended,
+            erase_continuity,
         } => {
             paths.remove_room_cursors(&crate::node::link::b32_encode(&room), &name);
             let mut committed_retirement = None;
@@ -305,12 +307,14 @@ fn native(
                     &room,
                     retirement.is_some(),
                 )?;
-                if let Some(record) = ended {
+                if erase_continuity {
                     crate::node::channel::erase_own_continuity(
                         &mut batch,
                         &room,
                         &signer.fingerprint(),
                     )?;
+                }
+                if let Some(record) = ended {
                     // Remembered with the deletion, so the room's name still answers (#1206);
                     // installed only once the batch is committed.
                     let now = record.noted_ms;
@@ -778,11 +782,10 @@ impl Node {
         // afterwards: who ended it and when, by its own clock; or that this identity left it,
         // at its departure's clock. A purge that precedes a rejoin remembers nothing.
         let me = channel.me();
+        let erase_continuity = channel.ended(self.now_ms().get()).is_some();
         let ended = match &purpose {
             Some(LeftPurgePurpose::Join { .. }) => None,
-            Some(LeftPurgePurpose::Leave { .. })
-                if channel.ended(self.now_ms().get()).is_none() =>
-            {
+            Some(LeftPurgePurpose::Leave { .. }) if !erase_continuity => {
                 let now = self.now_ms().get();
                 Some(Box::new(crate::node::ended_rooms::EndedRoom {
                     channel_id: room,
@@ -828,6 +831,7 @@ impl Node {
                 name,
                 retirement,
                 ended,
+                erase_continuity,
             },
             After::Purge {
                 transition,

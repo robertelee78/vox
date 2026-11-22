@@ -656,7 +656,7 @@ const ADDRESS_PATIENCE: Duration = Node::BOARD_PATIENCE;
 /// whenever it wants"). The person left when the departure was written; this bounds only how
 /// long the hidden room is held for a member to reach, across restarts, from the departure's
 /// own clock.
-const LEAVE_BOUND_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+const LEAVE_BOUND_MS: u64 = 2 * 24 * 60 * 60 * 1_000;
 /// The longest a leave's bound timer sleeps before reading the wall clock again: a sleep is
 /// monotonic and stands still while the machine sleeps, so the bound is kept by the clock, not
 /// by one long sleep.
