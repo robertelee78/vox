@@ -12,8 +12,8 @@ enum Task {
     Visit(TreeRange),
     Join { start: u64 },
 }
-/// Scalar, request-owned DFS; completed children live in the sealed serving cache, so a
-/// cancelled/restarted request keeps real progress without a new durable job or scheduler.
+/// Scalar, request-owned DFS; completed children live in the daemon's bounded serving cache.
+/// Cache eviction or cancellation loses no canonical source metadata.
 pub(crate) struct ProofRangeRestore {
     head: Digest32,
     binding: TreeBinding,
@@ -103,7 +103,7 @@ impl ChannelState {
 }
 
 impl ProofRangeRestore {
-    /// At most one newly reconstructed node commits per call. Cache/index/context reads and
+    /// At most one newly reconstructed node advances per call. Cache/index/context reads and
     /// reconstruction consume the existing WorkBudget; total old-data work can be O(interval).
     fn restore(
         room: &impl HistoryAdmissionRoom,
@@ -270,7 +270,7 @@ impl ProofRangeRestore {
                     }
                 }
                 Task::Join { start } => {
-                    // Children may have committed in an earlier slice. A newly observed
+                    // Children may have been reconstructed in an earlier slice. A newly observed
                     // fork/lifetime state cannot authorize another reconstructed parent.
                     if !reconstruction_allowed {
                         return Ok(ProofRangeStep::Missing);
@@ -293,12 +293,17 @@ impl ProofRangeRestore {
                 }
             };
             drop(read);
-            // No scalar progress is installed until both the descriptor and its generated
-            // context commit. These objects never populate the acceptance-range namespace.
+            // Install scalar progress only after the generated context commits. The descriptor
+            // is disposable serving material, never part of the acceptance-range namespace.
             room.history_write_tracked(store, committed, |index| {
-                index.keep_history_context(&context)?;
-                index.keep_history_proof_range(cursor.head, cursor.binding, start, descriptor)
+                index.keep_history_context(&context)
             })?;
+            entry_store::sparse::cache_history_proof_range(
+                cursor.head,
+                cursor.binding,
+                start,
+                descriptor,
+            )?;
             cursor.tasks.pop();
             cursor.values.truncate(cursor.values.len() - operands);
             if cursor.values.len() == MAX_TREE_DEPTH + 1 {

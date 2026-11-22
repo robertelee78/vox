@@ -488,7 +488,7 @@ pub(in crate::node::channel) fn observe_public(
 
 fn candidate(saved: &Stored, id: u64) -> Option<Source> {
     let row = saved.row.as_ref()?;
-    if !crate::node::sessions::is_record(&row.body) && !row.body.contains("session_name") {
+    if !super::locality::candidate(&row.body) {
         return None;
     }
     Some(Source {
@@ -564,6 +564,16 @@ pub(in crate::node::channel) fn put(
         }
     }
     if let Some(source) = candidate(saved, id) {
+        super::locality::source_saved(
+            &mut index,
+            source,
+            &saved
+                .row
+                .as_ref()
+                .ok_or(Error::MalformedAtRest("Session candidate row missing"))?
+                .body,
+            true,
+        )?;
         index.header.private_generation =
             index
                 .header
@@ -642,6 +652,16 @@ pub(in crate::node::channel) fn remove(
         }
     }
     if let Some(source) = candidate(saved, id) {
+        super::locality::source_saved(
+            &mut index,
+            source,
+            &saved
+                .row
+                .as_ref()
+                .ok_or(Error::MalformedAtRest("Session candidate row missing"))?
+                .body,
+            false,
+        )?;
         index.header.private_generation =
             index
                 .header
