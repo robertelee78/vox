@@ -192,9 +192,9 @@ impl Node {
         let wake = Arc::clone(&self.post_save_wake);
         let task = tokio::spawn(async move {
             let publication = match authority {
-                Some(authority) => match authority.acquire_publication().await {
-                    Some(publication) => Some(publication),
-                    None => {
+                Some(authority) => match authority.try_acquire_publication() {
+                    Ok(Some(publication)) => Some(publication),
+                    Ok(None) | Err(_) => {
                         let _ = reply.send(OwnedAdmission::NotCommitted {
                             error: Error::Profile("Drive authority changed; nothing was sent"),
                             bodies,
@@ -318,7 +318,7 @@ impl Node {
             let publication = if page {
                 None
             } else {
-                authority.acquire_publication().await
+                authority.try_acquire_publication().ok().flatten()
             };
             let mut channel = channel.lock_owned().await;
             let saved = tokio::task::spawn_blocking(move || {
@@ -355,10 +355,12 @@ impl Node {
                 Err("attention operation could not be confirmed; refresh before retrying".into())
             });
             let _ = reply.send(saved);
-            *output
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(false);
-            wake.notify_one();
+            if !page {
+                *output
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(false);
+                wake.notify_one();
+            }
         });
         if !page {
             self.pending_session_bookkeeping = Some(Bookkeeping {

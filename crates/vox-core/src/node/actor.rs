@@ -2157,9 +2157,6 @@ impl NetEvent {
             self,
             Self::Names(_)
                 | Self::Resolve { .. }
-                | Self::SessionActivity { .. }
-                | Self::SessionProjection { .. }
-                | Self::SessionFiles { .. }
                 | Self::RoomHistory { .. }
                 | Self::MemberDialer(_)
                 | Self::LocalTrustBlacklist(_)
@@ -8077,15 +8074,6 @@ impl Node {
                     // is published or scheduled for it.
                     if matches!(command, NodeCommand::Ping) {
                         let _ = reply.send(Outcome::Done);
-                        continue;
-                    }
-                    if self.pending_session_bookkeeping.is_some()
-                        && !matches!(&command, NodeCommand::PreparePost { .. }
-                            | NodeCommand::Attention {
-                                operation: crate::node::attention::Operation::Page(_), ..
-                            })
-                    {
-                        self.retain_store_command(command, reply);
                         continue;
                     }
                     if (self.store_save_pending() && Self::command_waits_for_save(&command))
