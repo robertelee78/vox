@@ -90,7 +90,7 @@ fn store_inventory(paths: &Paths, nodes: &[vox_core::node::daemonipc::NodeInfo])
                     Err(error) => (None, Some(error)),
                 };
                 serde_json::json!({
-                    "node": node.name.as_str(), "path": path,
+                    "node": node.name.as_str(), "path": path.display().to_string(),
                     "file_bytes": file_bytes, "file_error": file_error,
                     "free_bytes": free_bytes, "free_error": free_error,
                 })
