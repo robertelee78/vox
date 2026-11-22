@@ -683,9 +683,9 @@ fn read_all(dir: &std::path::Path, room: &str, texts: &[String], secs: u64) -> u
     }
 }
 
-/// From D reading all six to B reading all six: measured 3.426 s with the
-/// retained offline continuation, 33.729 s when it was dropped. Ten seconds
-/// leaves load margin while distinguishing delayed maintenance recovery.
+/// Kept log delivery completes without another failed reach after D reads all six.
+/// Measured elapsed times were 3.426 s when kept and 33.729 s when rescued by
+/// ordinary maintenance; elapsed time is printed, not a PRODUCT verdict.
 #[test]
 #[ignore = "five real daemons restarted in turn, production Argon2id; CI runs it in release"]
 fn a_key_through_the_log_releases_what_a_direct_one_does() {
@@ -790,6 +790,13 @@ fn a_key_through_the_log_releases_what_a_direct_one_does() {
     });
     let d_got = read_all(&k.d, &k.room, &sent, 120);
     let log_release_started = Instant::now();
+    let failed_reaches = || {
+        a.stderr()
+            .lines()
+            .filter(|line| line.contains("could not reach") && line.contains(&b_short))
+            .count()
+    };
+    let failures_when_d_read = failed_reaches();
     let d_early = readable(&k.d, &k.room, std::slice::from_ref(&before));
     // A's entries reach C in order: C reading a post made after the packages means C holds them.
     ok(&k.a, &["room", "post", &k.room, "v226-sentinel"], "");
@@ -803,6 +810,18 @@ fn a_key_through_the_log_releases_what_a_direct_one_does() {
         std::thread::sleep(Duration::from_millis(250));
     }
     wait_for_log_delivery(&k, &a, &c, "PRODUCT");
+    let failures_when_delivery_completed = failed_reaches();
+    eprintln!(
+        "[V030-01 kept delivery] A's failed reaches to B: when D read all six \
+         {failures_when_d_read}, when delivery completed {failures_when_delivery_completed}"
+    );
+    assert_eq!(
+        failures_when_delivery_completed,
+        failures_when_d_read,
+        "PRODUCT: A must keep B's log delivery across governance refresh, not rescue it after \
+         another failed reach\nA stderr:\n{}",
+        a.stderr()
+    );
     a.stop();
     d.stop();
 
@@ -810,9 +829,7 @@ fn a_key_through_the_log_releases_what_a_direct_one_does() {
     let b = Daemon::start("b", &k.b);
     let b_got = read_all(&k.b, &k.room, &sent, 120);
     let log_release_elapsed = log_release_started.elapsed();
-    eprintln!(
-        "[V030-01 latency] D read all six → B read {b_got}: {log_release_elapsed:?} (bound 10 s)"
-    );
+    eprintln!("[V030-01 elapsed] D read all six → B read {b_got}: {log_release_elapsed:?}");
     let b_early = readable(&k.b, &k.room, std::slice::from_ref(&before));
     let b_said = b.stderr();
     b.stop();
@@ -834,11 +851,6 @@ fn a_key_through_the_log_releases_what_a_direct_one_does() {
         b_got, d_got,
         "PRODUCT: a member reached only through the log must read what a directly reached one reads\n\
          B stderr:\n{b_said}"
-    );
-    assert!(
-        log_release_elapsed < Duration::from_secs(10),
-        "PRODUCT: after D reads all six, B must read all six through the log within 10 s; \
-         it took {log_release_elapsed:?} (D {d_got}, B {b_got})"
     );
     assert_eq!(
         (d_early, b_early),

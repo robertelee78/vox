@@ -277,9 +277,10 @@ M5 mutant removing the author-trust filter.
 The direct-versus-log act also requires the log path to retain its exact offline delivery
 while the consent's own governance fold refreshes. Measured from that refresh to B reading
 all six, this took 3.426 seconds with the continuation and 33.729 seconds after dropping it:
-ordinary maintenance eventually recovered the durable debt. The act measures the shipped
-CLI from D reading all six to B reading all six, with a ten-second bound; dropping the
-continuation makes that latency assertion red without weakening the six-post equality.
+ordinary maintenance eventually recovered the durable debt. The act prints elapsed time
+without a PRODUCT bound. It requires A to finish B's log delivery without another failed
+reach after D reads all six; dropping the continuation makes that structural assertion red
+without weakening the six-post equality.
 The offline-member act waits for the author's renewed consent after rotation and for
 the carrier's role-complete receipt before the author stops. It reads current consent
 from one idempotently repeated addressed post's reach report and the feed positions
