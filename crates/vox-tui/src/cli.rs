@@ -516,7 +516,7 @@ enum RoomCmd {
     /// Set message lifetime, or use --steps to set Session-step lifetime separately.
     ///
     /// A step is one thing an agent did in its Session: a message, a command it ran, or a file
-    /// it edited. Steps default to seven days or the message lifetime, whichever is shorter.
+    /// it edited. Steps default to two days or the message lifetime, whichever is shorter.
     /// Durations are `1h`, `7d`, `1w`, `1m` (a month), seconds, or `forever`.
     ///
     /// Admins set the room rule; other members can shorten the lifetime on their own node.
@@ -674,7 +674,7 @@ pub struct RetentionArgs {
     /// Set Session-step lifetime separately from messages: `7d`, `1h`, seconds, or `forever`.
     ///
     /// A step is one thing an agent did in its Session: a message, a command it ran, or a file
-    /// it edited. The default is seven days or the message lifetime, whichever is shorter.
+    /// it edited. The default is two days or the message lifetime, whichever is shorter.
     /// Admins set the room rule; other members can only shorten their own node's lifetime.
     #[arg(long, value_name = "DURATION", conflicts_with = "duration")]
     pub steps: Option<String>,
@@ -2455,6 +2455,8 @@ enum Cmd {
     /// their sync, peers and their paths, tunnels, datagram and app counters, and the sync
     /// counters per room and peer: sessions opened, admitted, refused, completed,
     /// partial and failed, and any backoff.
+    /// Includes every node's store-file size and available filesystem bytes, even when
+    /// that node is Locked or detached; unreadable figures say why they are unavailable.
     Status(StatusArgs),
     /// Every retained decision by this node, newest first; --json prints one event per line.
     Decisions(StatusArgs),

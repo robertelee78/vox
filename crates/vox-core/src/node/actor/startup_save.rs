@@ -125,7 +125,7 @@ fn prepare(profile: &Profile, decisions: &DecisionLog, now: u64) -> crate::error
         }
         _ => return Err(Error::Profile("unexpected blacklist import completion")),
     }
-    let accepted = metadata_save::load_accepted_joins(profile.store(), signer)?;
+    let accepted = metadata_save::finish_saved_accepted_joins(profile.store(), signer)?;
     let unfinished = profile
         .store()
         .get_meta(PENDING_JOIN_CLEANUP_META_KEY)?

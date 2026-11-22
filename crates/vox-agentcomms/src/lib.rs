@@ -41,8 +41,8 @@
 //!   (ADR-020 §5 as corrected by ADR-021 §4).
 //! - [`ops`] — operation ids: a retry is one operation, a conflict is explicit and
 //!   voids it (ADR-021 §6).
-//! - [`version`] — workers must run the same Vox version, and refuse to coordinate
-//!   when one does not (ADR-021 §5).
+//! - [`version`] — workers coordinate under the same claim-rules number, independent
+//!   of their Vox package versions (ADR-052 RG-10).
 //!
 //! ## What this crate is not
 //!
