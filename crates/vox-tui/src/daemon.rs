@@ -309,7 +309,7 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
     println!("vox daemon: serving (pid {})", std::process::id());
     drop(restart);
     let router = serving.router.clone();
-    router.attach_kept();
+    let mut attaching = router.attach_kept();
 
     if let Some(addr) = args.metrics {
         let listener = rt
@@ -372,6 +372,17 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
     }
 
     let signal = rt.block_on(async {
+        while !attaching.is_empty() {
+            tokio::select! {
+                signal = &mut stop => return Some(signal),
+                () = router.stop_asked() => {
+                    say(format_args!("vox daemon: stop requested by the product's control client"));
+                    return None;
+                },
+                _ = attaching.join_next() => {}
+            }
+        }
+        serving.presence.accept_management();
         let idle = async {
             if !args.as_detached {
                 return std::future::pending::<()>().await;
