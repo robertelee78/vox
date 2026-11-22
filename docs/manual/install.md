@@ -36,6 +36,11 @@ command and its retained previous unchanged and shows the loader's words and the
 Update and rollback also refuse a binary that does not run on this machine before replacing
 the working command.
 
+After a cut-short Linux install, run the installer again. A successful rerun removes the old
+fixed-name partial and partials whose installer process has ended, without touching a running
+installer's candidate. If a leftover cannot be removed, it names that file and asks you to remove
+it when the directory is writable.
+
 The installer also runs `vox shell-setup`, which adds a marked block to your zsh, bash or fish
 startup file for `PATH` and tab completion. Open a new terminal afterwards.
 

@@ -477,7 +477,7 @@ else
     fail "$INSTALL_DIR/vox exists but was not installed by this installer; remove it or set VOX_INSTALL_DIR"
   fi
   # Each invocation checks and publishes its own file on the destination filesystem.
-  candidate=$(mktemp "$INSTALL_DIR/.vox-candidate.XXXXXX")
+  candidate=$(mktemp "$INSTALL_DIR/.vox-candidate.$$.XXXXXX")
   cp "$tmp/$ASSET" "$candidate"
   chmod 0755 "$candidate"
   if ! run_check "$candidate" "$version"; then
@@ -486,7 +486,7 @@ else
     exit 1
   fi
   if [ -e "$INSTALL_DIR/vox" ]; then
-    previous_partial=$(mktemp "$INSTALL_DIR/.vox-previous.XXXXXX")
+    previous_partial=$(mktemp "$INSTALL_DIR/.vox-previous.$$.XXXXXX")
     cp -p "$INSTALL_DIR/vox" "$previous_partial"
     mv -f "$previous_partial" "$INSTALL_DIR/.vox-previous"
   fi
@@ -502,6 +502,21 @@ else
   fi
   installed=$run_output
   say "installed: $INSTALL_DIR/vox ($installed)"
+
+  # A killed installer cannot run its trap. Keep every live owner's partial.
+  for partial in "$INSTALL_DIR/.vox-candidate.partial" \
+    "$INSTALL_DIR"/.vox-candidate.*.* "$INSTALL_DIR"/.vox-previous.*.*; do
+    [ -f "$partial" ] || continue
+    if [ "$partial" != "$INSTALL_DIR/.vox-candidate.partial" ]; then
+      owner=${partial##*/.vox-}
+      owner=${owner#*.}
+      owner=${owner%%.*}
+      case "$owner" in ''|*[!0-9]*) continue ;; esac
+      [ "$owner" != "$$" ] || continue
+      if kill -0 "$owner" 2>/dev/null; then continue; fi
+    fi
+    rm -f "$partial" || say "warning: leftover installer partial $partial could not be removed; remove it when this directory is writable"
+  done
 
   # Persist only Vox's receive-buffer setting, and report the kernel's readback.
   sysctl_dir=/etc/sysctl.d

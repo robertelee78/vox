@@ -864,7 +864,7 @@ fn install_sh_installs_what_it_verified_and_refuses_what_it_could_not() {
         }
     }
 
-    // Linux retains its existing read-only partial cleanup behavior.
+    // A rerun removes both the old fixed partial and a dead per-invocation owner's partial.
     if cfg!(target_os = "linux") {
         use std::os::unix::fs::PermissionsExt as _;
         let tmp = tempfile::tempdir().staged();
@@ -872,7 +872,15 @@ fn install_sh_installs_what_it_verified_and_refuses_what_it_could_not() {
         let bin = home.join("bin");
         let (first, said_first) = run_installer(&server, home, "stable");
         if first {
-            for leftover in [".vox-candidate.partial", ".vox-previous"] {
+            let mut dead = Command::new("sh").args(["-c", "exit 0"]).spawn().staged();
+            let dead_pid = dead.id();
+            dead.wait().staged();
+            let dead_partial = format!(".vox-candidate.{dead_pid}.dead00");
+            for leftover in [
+                ".vox-candidate.partial",
+                dead_partial.as_str(),
+                ".vox-previous",
+            ] {
                 std::fs::write(bin.join(leftover), b"cut short").staged();
                 std::fs::set_permissions(
                     bin.join(leftover),
@@ -888,7 +896,7 @@ fn install_sh_installs_what_it_verified_and_refuses_what_it_could_not() {
                 .staged()
                 .filter_map(Result::ok)
                 .map(|e| e.file_name().to_string_lossy().into_owned())
-                .filter(|n| n.ends_with(".partial"))
+                .filter(|n| n.starts_with(".vox-candidate."))
                 .collect();
             claims.push(claim(
                 "install.reruns_after_a_cut_short_run",
@@ -1492,8 +1500,37 @@ fn linux_candidate_claims(claims: &mut Vec<Claim>) {
             matches!(&ready, Ok(Ok(line)) if line == "ready\n"),
             "APPARATUS: first installer did not reach its candidate check: {ready:?}"
         );
+        let held: Vec<PathBuf> = std::fs::read_dir(&bin)
+            .staged()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".vox-candidate.")
+            })
+            .map(|entry| entry.path())
+            .collect();
+        assert_eq!(
+            held.len(),
+            1,
+            "APPARATUS: expected one held installer candidate: {held:?}"
+        );
+        let mut dead = Command::new("sh").args(["-c", "exit 0"]).spawn().staged();
+        let dead_pid = dead.id();
+        dead.wait().staged();
+        let stale = bin.join(format!(".vox-candidate.{dead_pid}.dead00"));
+        let legacy = bin.join(".vox-candidate.partial");
+        std::fs::write(&stale, b"cut short").staged();
+        std::fs::write(&legacy, b"cut short").staged();
         release_tree_of(tree.path(), "stable", SERVED, &second, &|_| {});
         let second_run = run_installer(&server, home.path(), "stable");
+        claims.push(claim(
+            "install.rerun_cleans_dead_partials_but_keeps_a_live_install",
+            second_run.0 && held[0].exists() && !stale.exists() && !legacy.exists(),
+            format!("second={second_run:?}; live partial kept={}; dead partial retained={}; legacy partial retained={}",
+                held[0].exists(), stale.exists(), legacy.exists()),
+        ));
         use std::os::unix::fs::OpenOptionsExt as _;
         let mut release = std::fs::OpenOptions::new()
             .write(true)
