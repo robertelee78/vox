@@ -283,9 +283,9 @@ impl Node {
                     error,
                     Error::Profile("room publication is busy; retry this operation")
                 ) {
-                    let _ = self.event_tx.send(NodeEvent::JoinFailed {
-                        reason: format!(
-                            "room {} recovery could not complete its retained save: {error}",
+                    let _ = self.event_tx.send(NodeEvent::NodeNote {
+                        note: format!(
+                            "room {} recovery did not complete its retained save: {error}; check vox status and the daemon log before reopening this room",
                             crate::node::network::short_id(room)
                         ),
                     });
@@ -368,8 +368,8 @@ impl Node {
                     continuation.stage,
                     Stage::Settle | Stage::CatchUp | Stage::Presence | Stage::Shares
                 ) {
-                    let _ = self.event_tx.send(NodeEvent::JoinFailed { reason: format!(
-                        "joined room {} again, but could not start a new sender key in it: {error}", crate::node::network::short_id(room)) });
+                    let _ = self.event_tx.send(NodeEvent::NodeNote { note: format!(
+                        "room {} settlement did not start a new sender key: {error}; check vox status and the daemon log before reopening this room", crate::node::network::short_id(room)) });
                     self.finish_settlement_offer(room, &mut continuation);
                     if continuation.recover {
                         continuation.stage = Stage::Fence;

@@ -397,16 +397,17 @@ fn circuits_to(dir: &std::path::Path, peer: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// Whether the node in `dir` has completed a sync of `room` since it started, and lists `member`
-/// in it, by its own `vox status --json`: what a member needs before it writes a consent there.
-/// A node that has not synced a room since it joined writes nothing in it (V210-164), so a
-/// `vox trust add` then releases no key and dials nobody (#335).
+/// Whether the node completed a room exchange (served or fetched), and lists `member`.
+/// This is transport readiness, not receipt of new entries: the completed counter retains
+/// the old clock's staging meaning without waiting for another outbound fetch.
 fn synced_with(dir: &std::path::Path, room: &str, member: &str) -> bool {
     let (ok, out, _) = vox(dir, &["status", "--json"], None);
     ok && serde_json::from_str::<serde_json::Value>(out.trim()).is_ok_and(|v| {
         v["rooms"].as_array().into_iter().flatten().any(|r| {
             r["id"].as_str().is_some_and(|id| id.starts_with(room))
-                && !r["last_sync_ms"].is_null()
+                && v["sync"].as_array().into_iter().flatten().any(|lane| {
+                    lane["room"] == r["id"] && lane["completed"].as_u64().is_some_and(|n| n > 0)
+                })
                 && r["members"]
                     .as_array()
                     .into_iter()

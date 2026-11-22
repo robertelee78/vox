@@ -762,17 +762,17 @@ pub enum DialFailed {
 }
 
 impl DialFailed {
-    /// What the dial reports (ADR-011 38a), each naming no one but `expected`: a refusal says
-    /// "nothing at `<address>` answers as `<expected>`"; a `PROVE` that does not verify, "what
-    /// answered at `<address>` did not prove it is `<expected>`"; a silence, that `<address>` did
-    /// not answer within [`EXCHANGE_TIMEOUT`]. A silence is not an impostor: one said as "nothing
-    /// answers as" sent a person looking for one when the anchor was only slow (a dial across
-    /// its pause, the anchor-restart proof's red).
+    /// What the dial reports (ADR-011 38a), naming no one but `expected`. A uniform
+    /// refusal proves the daemon answered, not why that node is unavailable. A bad
+    /// `PROVE` and a silence remain separate outcomes.
     #[must_use]
     pub fn into_error(self, addr: SocketAddr, expected: &Digest32) -> Error {
         match self {
             Self::NotAnswered => {
-                Error::HandshakeAuth(format!("nothing at {addr} answers as {}", short(expected)))
+                Error::HandshakeAuth(format!(
+                    "the daemon answered at {addr}, but node {} is not available there (it may not be attached); ask its operator to check vox node list, or check whether the address is wrong or no longer belongs to that node",
+                    short(expected)
+                ))
             }
             Self::BadProve(_) => Error::HandshakeAuth(format!(
                 "what answered at {addr} did not prove it is {}",
