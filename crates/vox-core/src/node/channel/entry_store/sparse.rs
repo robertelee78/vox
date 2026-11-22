@@ -12,8 +12,9 @@ use crate::log::history::{
     MAX_CONTEXT_BYTES, MAX_FRAME_BYTES, MAX_HEADER_BYTES,
 };
 
-// One pool for every room, Store and read snapshot in the daemon. Descriptors are immutable
-// serving math, never acceptance authority. Neither hits nor replacements change FIFO order.
+// One pool shared across every node, room, Store and read snapshot in the daemon.
+// Descriptors are immutable serving math, never acceptance authority. Neither hits nor
+// replacements change FIFO order.
 const PROOF_CACHE_ENTRIES: usize = 8 * 1024;
 const PROOF_CACHE_BYTES: usize = 8 * 1024 * 1024;
 struct ProofCache {
@@ -2590,7 +2591,12 @@ impl Write<'_, '_> {
                 continue;
             }
             if key[33..] != [0; 31] {
-                return Err(invalid("proof-serving object key"));
+                eprintln!(
+                    "vox: room {} kept malformed proof-range cache key {:?}",
+                    crate::node::link::b32_encode(self.channel),
+                    key
+                );
+                continue;
             }
             let Value::Number(id) = value else {
                 return Err(invalid("proof-serving object locator"));

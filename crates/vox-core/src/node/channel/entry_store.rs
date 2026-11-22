@@ -30,6 +30,9 @@ const ALL_CACHE_BYTES: usize = 64 * 1024 * 1024;
 static CACHE_USED: AtomicUsize = AtomicUsize::new(0);
 const MAX_DEPTH: usize = 64;
 const DIRECTORY: u64 = 0;
+// One completion bit in the existing sealed per-room KeyMaterial namespace, not a
+// directory/schema change. Present with canonical CBOR uint(1) only after the whole scan.
+const SEG_PROOF_CACHE_CLEANED: u64 = 30;
 type Key = [u8; 64];
 
 mod dag_facts;
@@ -2600,6 +2603,23 @@ impl EntryIndex {
         sek: &Sek,
         channel: &Digest32,
     ) -> Result<()> {
+        if let Some(segment) = store.snapshot()?.get_segment_bounded(
+            channel,
+            SegmentKind::KeyMaterial,
+            SEG_PROOF_CACHE_CLEANED,
+            1,
+        )? {
+            let marker = open_segment(
+                sek,
+                SegmentKind::KeyMaterial,
+                SEG_PROOF_CACHE_CLEANED,
+                &segment,
+            )?;
+            if marker.as_slice() != [1] {
+                return Err(invalid("proof cache cleanup completion marker"));
+            }
+            return Ok(());
+        }
         let mut after = None;
         loop {
             let mut batch = store.batch()?;
@@ -2609,8 +2629,20 @@ impl EntryIndex {
                 return Ok(());
             }
             let (done, next, changed) = writer.cleanup_history_proof_ranges(after)?;
-            if changed {
-                writer.seal()?;
+            if done {
+                let marker =
+                    seal_segment(sek, SegmentKind::KeyMaterial, SEG_PROOF_CACHE_CLEANED, &[1])?;
+                writer.batch.put_segment(
+                    channel,
+                    SegmentKind::KeyMaterial,
+                    SEG_PROOF_CACHE_CLEANED,
+                    &marker,
+                )?;
+            }
+            if changed || done {
+                if changed {
+                    writer.seal()?;
+                }
                 batch.commit()?;
                 self.committed();
                 #[cfg(feature = "test-knobs")]

@@ -674,6 +674,11 @@ fn an_admin_removes_one_member_and_the_creator_readmits_it_forward_only() {
         back,
         "APPARATUS: full-history control rejoin did not reach its sender: {roster:?}"
     );
+    let restart_before_post = std::env::var_os("VOX_PROOF_FX62_RESTART_REJOIN").is_some();
+    if restart_before_post {
+        dave.restart_daemon(&tmp.path().join("dave-rejoined-restart.err"));
+        eprintln!("[proof] FX62 never-removed-full: restarted rejoined dave before its first post");
+    }
     // Own-history recovery is the #1163 prerequisite, not roster propagation; use the
     // same patience as its existing recovery consumers rather than WITHIN's leave window.
     let (writable, post) = poll(
@@ -682,7 +687,8 @@ fn an_admin_removes_one_member_and_the_creator_readmits_it_forward_only() {
         support::TIMEOUT,
         |o| o.ok,
     );
-    if !writable
+    if !restart_before_post
+        && !writable
         && post
             .stderr
             .contains("this node's record of its own history in this room is behind")

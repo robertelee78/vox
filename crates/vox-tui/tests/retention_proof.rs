@@ -966,6 +966,8 @@ mod proof_rows {
     use vox_core::node::profile::Profile;
     use vox_core::node::store::Store;
 
+    const PROOF_CACHE_CLEANED: u64 = 30;
+
     fn encode_binding(binding: TreeBinding, e: &mut Encoder) {
         e.array(4)
             .uint(2)
@@ -1169,7 +1171,12 @@ mod proof_rows {
                 "APPARATUS: exact cache key"
             );
         }
-        eprintln!("STOPPED-STORE {dir:?}: decoded object kinds {counts:?}");
+        let file_bytes = std::fs::metadata(profile.paths().store_file())
+            .unwrap()
+            .len();
+        eprintln!(
+            "STOPPED-STORE {dir:?}: file bytes {file_bytes}; decoded object kinds {counts:?}"
+        );
         counts
     }
     fn no_rows(dir: &Path, room: &Digest32) {
@@ -1259,6 +1266,11 @@ mod proof_rows {
     }
     fn seed_old_rows(dir: &Path, room: &Digest32) -> usize {
         let profile = profile(dir);
+        // This fixture represents a pre-conversion room, not a new cache writer.
+        profile
+            .store()
+            .delete_segment(room, SegmentKind::KeyMaterial, PROOF_CACHE_CLEANED)
+            .unwrap();
         let sek = sek(&profile, room);
         let mut directory = decoded(profile.store(), &sek, room, 0);
         let mut pages = Vec::new();
@@ -1588,6 +1600,27 @@ mod proof_rows {
                 "PRODUCT: cleanup deleted non-cache object kind {kind}: {before:?} -> {after:?}"
             );
         }
+        // Keep the product's completed-conversion marker, if it has one. Planting old rows
+        // after it makes a rescan observable: a completed room must leave these canaries alone.
+        let completed_marker = profile(&a)
+            .store()
+            .get_segment(&id, SegmentKind::KeyMaterial, PROOF_CACHE_CLEANED)
+            .unwrap();
+        let canaries = seed_old_rows(&a, &id);
+        if let Some(marker) = completed_marker {
+            profile(&a)
+                .store()
+                .put_segment(&id, SegmentKind::KeyMaterial, PROOF_CACHE_CLEANED, &marker)
+                .unwrap();
+        }
+        let ad = daemon_on(&a, "a-second-open", &format!("{IDENTITY}\n"), &alisten);
+        attached(&a, "a-second-open");
+        all_messages(&a, &room, 80);
+        drop(ad);
+        let retained = counts(&a, &id).get(&9).copied().unwrap_or(0);
+        assert_eq!(retained, canaries,
+            "PRODUCT: a completed room rescanned its old-proof object tree on second open: {retained}/{canaries} canaries remain");
+        eprintln!("SECOND OPEN: retained {retained} store canaries; no cleanup scan");
         let seeded = seed_old_rows(&a, &id);
         let hold = a.join("proof-cleanup.hold");
         std::fs::write(&hold, b"hold after one committed batch").unwrap();

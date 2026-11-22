@@ -764,7 +764,10 @@ values and container/rehash allocation. They are not written to the store. Canon
 ranges, source headers, contexts, witnesses and receipts remain durable. Opening a room removes
 only that room's old ProofRange objects and index references in bounded atomic batches;
 interruption leaves completed batches applied and the next open resumes by an idempotent scan.
-Locked/unopened rooms are not converted by a whole-store startup pass.
+Completion is recorded once as one sealed bit (CBOR uint 1) in the existing per-room
+KeyMaterial segment namespace, slot 30; subsequent opens read that bit and do not scan
+the object tree. No directory or store-format version changes. Locked/unopened rooms
+are not converted by a whole-store startup pass.
 
 Both optional journeys extend `retention_proof.rs` and use private scratch profiles/Keychains:
 
@@ -779,4 +782,6 @@ The first exchanges messages across changing signed heads, abandons verified fet
 both members and pages back through every acknowledged message while decoded stopped-store
 ProofRange counts stay zero. Its independent mutants restore admission writes or reconstruction
 writes. The second seeds the old serving-row shape in a real stopped room, opens it, interrupts
-after a committed cleanup batch and reopens it, preserving other object kinds and readable history.
+after a committed cleanup batch and reopens it, preserving other object kinds and readable
+history. A second open preserves planted stopped-store canaries, proving the completed room
+does not scan again; each row-count observation also records the store's file length.
