@@ -2642,8 +2642,9 @@ fn daemon_restart_claim(
                 "APPARATUS: update did not reach relocation"
             );
             if let Some(status) = updating.0.try_wait().unwrap() {
-                panic!(
-                    "PRODUCT: update exited before held compaction ({status}): {}{}",
+                assert!(
+                    status.success(),
+                    "PRODUCT: update failed before held compaction ({status}): {}{}",
                     std::fs::read_to_string(&stdout).unwrap_or_default(),
                     std::fs::read_to_string(&stderr).unwrap_or_default()
                 );
