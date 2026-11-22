@@ -1,5 +1,5 @@
-//! Session payloads live outside the public room log. Each sealed record commits its verified
-//! wire, rendered row and first-seen time together with the consumed drive chain.
+//! Session payloads live outside the public room log. New sealed rows retain the
+//! wire once and its one-record opener; old rendered-body rows remain readable.
 
 use std::time::{Duration, Instant};
 
@@ -594,6 +594,10 @@ pub(super) struct Stored {
     pub(super) record: Record,
     // An authorized legacy body can arrive before its drive key package is installed.
     pub(super) row: Option<SessionRow>,
+    // HMAC(CK_i, 0x01), the AEAD key for precisely this ciphertext, never CK_i.
+    // Sealed with the row under its room SEK and (PrivateSession, id) associated
+    // data. It leaves/erases with that row and never enters Record::wire.
+    opener: Option<crate::group::senderkey::MessageKey>,
     pub(super) first_seen: u64,
     // Own lifecycle records retain the public arrival boundary of their publication.
     // This stays local, is copied on grant refresh, and is never transmitted to peers.
@@ -649,18 +653,37 @@ pub(super) struct PrivateSessions {
 
 impl Stored {
     fn bytes(&self) -> Zeroizing<Vec<u8>> {
-        let mut e = Encoder::new();
-        e.array(7)
-            .uint(2)
-            .bytes(&self.record.wire())
-            .bytes(&self.row.as_ref().map_or_else(Vec::new, session_cache_bytes))
-            .uint(self.first_seen);
+        let mut e = Encoder::for_secrets();
+        e.array(if self.opener.is_some() { 8 } else { 7 })
+            .uint(if self.opener.is_some() { 3 } else { 2 })
+            .bytes(&self.record.wire());
+        if self.opener.is_some() {
+            let mut metadata = Encoder::new();
+            if let Some(row) = &self.row {
+                metadata
+                    .array(7)
+                    .uint(CACHE_VERSION)
+                    .bytes(&row.entry_hash)
+                    .bytes(&row.author)
+                    .uint(row.created_millis)
+                    .uint(crate::node::content::KIND_SESSION)
+                    .text(&row.session_id)
+                    .text("");
+            }
+            e.bytes(&metadata.finish());
+        } else {
+            e.bytes(&self.row.as_ref().map_or_else(Vec::new, session_cache_bytes));
+        }
+        e.uint(self.first_seen);
         if let Some(after) = self.attention_after {
             e.bytes(&after.after.instance)
                 .uint(after.after.arrival)
                 .bytes(&after.identity);
         } else {
             e.bytes(&[]).uint(0).bytes(&[]);
+        }
+        if let Some(key) = &self.opener {
+            e.bytes(key.bytes());
         }
         Zeroizing::new(e.finish())
     }
@@ -669,11 +692,11 @@ impl Stored {
         let mut d = Decoder::new(bytes);
         let fields = d.array()?;
         let version = d.uint()?;
-        if !matches!((fields, version), (4, 1) | (7, 2)) {
+        if !matches!((fields, version), (4, 1) | (7, 2) | (8, 3)) {
             return Err(Error::MalformedAtRest("private Session state version"));
         }
         let record = Record::read(d.bytes()?)?;
-        let row = match d.bytes()? {
+        let mut row = match d.bytes()? {
             [] => None,
             bytes => {
                 let CacheRow::Session(row) = parse_cache(bytes)? else {
@@ -683,7 +706,7 @@ impl Stored {
             }
         };
         let first_seen = d.uint()?;
-        let attention_after = if version == 2 {
+        let attention_after = if version >= 2 {
             let instance = d.bytes()?;
             let arrival = d.uint()?;
             let identity = d.bytes()?;
@@ -704,6 +727,42 @@ impl Stored {
         } else {
             None
         };
+        let opener = if version == 3 {
+            let key = crate::group::senderkey::MessageKey::from_bytes(
+                d.bytes()?
+                    .try_into()
+                    .map_err(|_| Error::MalformedAtRest("private Session opener length"))?,
+            );
+            let metadata = row
+                .as_mut()
+                .ok_or(Error::MalformedAtRest("private Session metadata missing"))?;
+            if !metadata.body.is_empty() {
+                return Err(Error::MalformedAtRest(
+                    "private Session metadata contains body",
+                ));
+            }
+            match reopen(&record, &key) {
+                Ok(content) => {
+                    if metadata.created_millis != content.created_millis
+                        || metadata.session_id != content.session_id
+                    {
+                        return Err(Error::MalformedAtRest("private Session metadata binding"));
+                    }
+                    metadata.body = content.body;
+                }
+                Err(_) => {
+                    // A damaged opener is visible in its place, not an empty page
+                    // or a fabricated successful activity. Other rows still read.
+                    metadata.body = serde_json::json!({
+                        "v": 1, "session": metadata.session_id, "kind": "unreadable",
+                        "text": "This Session step could not be opened from this node's store; read it on another authorized member."
+                    }).to_string();
+                }
+            }
+            Some(key)
+        } else {
+            None
+        };
         d.finish()?;
         if row.as_ref().is_some_and(|row| {
             row.entry_hash != record.hash() || row.author != record.message.header.author_id
@@ -713,10 +772,22 @@ impl Stored {
         Ok(Self {
             record,
             row,
+            opener,
             first_seen,
             attention_after,
         })
     }
+}
+
+fn reopen(
+    record: &Record,
+    key: &crate::group::senderkey::MessageKey,
+) -> Result<crate::node::content::SessionEntry> {
+    let plaintext = Zeroizing::new(record.message.reopen_private(key)?);
+    let Decoded::Session(content) = crate::node::content::decode(&plaintext)? else {
+        return Err(Error::MalformedAtRest("private Session content kind"));
+    };
+    Ok(content)
 }
 
 impl ChannelState {

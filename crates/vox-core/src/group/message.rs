@@ -226,6 +226,86 @@ impl GroupMessage {
     }
 }
 
+/// Ciphertext used only by the root-signed private Session envelope. The ordinary
+/// room codec never accepts an absent sender signature.
+pub(crate) struct PrivateMessage {
+    pub(crate) header: MessageHeader,
+    pub(crate) ciphertext: Vec<u8>,
+    sender_signature: Option<CompositeSignature>,
+}
+
+impl PrivateMessage {
+    pub(crate) fn from_group(message: GroupMessage) -> Self {
+        Self {
+            header: message.header,
+            ciphertext: message.ciphertext,
+            sender_signature: Some(message.signature),
+        }
+    }
+
+    pub(crate) fn is_compact(&self) -> bool {
+        self.sender_signature.is_none()
+    }
+
+    pub(crate) fn wire(&self) -> Vec<u8> {
+        let mut e = Encoder::new();
+        e.array(if self.is_compact() { 2 } else { 3 })
+            .bytes(&self.header.canonical_body())
+            .bytes(&self.ciphertext);
+        if let Some(signature) = &self.sender_signature {
+            e.bytes(&signature.to_bytes());
+            domain_prefixed(GROUP_MSG_SIGN_DOMAIN, &e.finish())
+        } else {
+            e.finish()
+        }
+    }
+
+    pub(crate) fn read_compact(bytes: &[u8]) -> Result<Self> {
+        let mut d = Decoder::new(bytes);
+        if d.array()? != 2 {
+            return Err(Error::MalformedBundle("private ciphertext arity"));
+        }
+        let header = MessageHeader::from_canonical_body(d.bytes()?)?;
+        let ciphertext = d.bytes()?.to_vec();
+        d.finish()?;
+        Ok(Self {
+            header,
+            ciphertext,
+            sender_signature: None,
+        })
+    }
+
+    pub(crate) fn seal(header: MessageHeader, key: &MessageKey, plaintext: &[u8]) -> Result<Self> {
+        let body = header.canonical_body();
+        let ad = MessageHeader::associated_data_from(&body);
+        Ok(Self {
+            header,
+            ciphertext: aead_seal(key, &body, &ad, plaintext)?,
+            sender_signature: None,
+        })
+    }
+
+    /// Receipt paths first verify the record's root signature and drive grant.
+    /// Legacy records additionally retain their original sender-key verification.
+    pub(crate) fn open(&self, key: &MessageKey, signing: &CompositePublicKey) -> Result<Vec<u8>> {
+        if let Some(signature) = &self.sender_signature {
+            signing.verify(
+                &GroupMessage::sign_input(&self.header, &self.ciphertext),
+                signature,
+            )?;
+        }
+        self.reopen_private(key)
+    }
+
+    /// Reopen an already accepted, sealed local row. Its opener is no authority
+    /// for accepting peer input or advancing any ratchet.
+    pub(crate) fn reopen_private(&self, key: &MessageKey) -> Result<Vec<u8>> {
+        let body = self.header.canonical_body();
+        let ad = MessageHeader::associated_data_from(&body);
+        aead_open(key, &body, &ad, &self.ciphertext)
+    }
+}
+
 /// AES-256-GCM seal under a single-use message key with a nonce derived from the
 /// key AND the canonical header bytes.
 fn aead_seal(mk: &MessageKey, header_body: &[u8], ad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {

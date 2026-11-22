@@ -1111,12 +1111,12 @@ impl PendingSession {
             };
         // Even an encrypt error may have consumed the candidate iteration. Never retry its basis.
         self.encrypted = true;
-        let message = self
+        let (message, opener) = self
             .drive
             .chain
             .as_mut()
             .ok_or(Error::Profile("drive key missing"))?
-            .encrypt(&Zeroizing::new(content.to_canonical_vec()))?;
+            .encrypt_private(&Zeroizing::new(content.to_canonical_vec()))?;
         let record = Record::new(signer, self.room, message)?;
         let hash = record.hash();
         let attention_after = attention_after.or_else(|| {
@@ -1135,6 +1135,7 @@ impl PendingSession {
         let saved = Stored {
             record,
             row: Some(row),
+            opener: Some(opener),
             first_seen: self.now,
             attention_after,
         };

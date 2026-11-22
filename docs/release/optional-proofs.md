@@ -695,3 +695,17 @@ Seventy shipped nodes share one scratch daemon, join a room, trust each other an
 messages read. The app client must expose all69 readers on every message and every trust
 relationship. The terminal must open the room and show every reader and peer's trust (#792).
 This expensive proof is optional and blocks neither CI nor release.
+
+### Private Session record storage (ADR-052 RG-13)
+
+`cargo test --release -p vox-tui --features test-knobs,optional-proofs --test retention_proof private_session_steps_store_one_body_and_reopen_after_rotation -- --exact --ignored --nocapture`
+
+Two scratch daemons append different-sized Session steps, read identical complete pages,
+restart, and rotate the drive generation. The author must still read the old steps;
+the member downgraded to read must not read the Session. Stopped-store measurements
+require one row per step, one stored byte per body byte, and one signature's fixed cost.
+This proof is optional; without the feature it prints OPTIONAL PROOF NOT RUN.
+
+The mixed-version measurement uses `VOX_TEST_PRIVATE_ASK_RECEIPT` in a `test-knobs`
+daemon to count actual private-page asks at the serving node. It prints only the
+requested cursor, never ciphertext, plaintext or an opener; a shipped build has no knob.

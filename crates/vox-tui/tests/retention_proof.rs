@@ -102,6 +102,8 @@ fn vox_with(
         .env("VOX_DATA_DIR", dir)
         .env("VOX_CONFIG_DIR", dir.join("cfg"))
         .env_remove("VOX_ROOM")
+        .env_remove("VOX_NODE")
+        .env_remove("VOX_SESSION")
         .stdin(if stdin.is_some() {
             Stdio::piped()
         } else {
@@ -157,6 +159,8 @@ fn daemon_on(dir: &Path, tag: &str, stdin_lines: &str, listen: &str) -> Daemon {
         .env("VOX_DATA_DIR", dir)
         .env("VOX_CONFIG_DIR", dir.join("cfg"))
         .env_remove("VOX_ROOM")
+        .env_remove("VOX_NODE")
+        .env_remove("VOX_SESSION")
         .stdin(Stdio::piped())
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err))
@@ -935,4 +939,783 @@ fn a_member_who_joins_after_messages_expired_catches_up() {
         "PRODUCT: carol shows {owed} expired messages as not received yet: she waits on bodies no \
          member can supply"
     );
+}
+
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(private_session_steps_store_one_body_and_reopen_after_rotation);
+
+#[cfg(feature = "optional-proofs")]
+#[path = "../../vox-core/tests/support/raw_sync.rs"]
+mod private_raw_sync;
+
+/// The store measurement is of rows actually written by the binary, not a codec
+/// benchmark. The same bodies must still be read through the CLI after restarting.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "real private Session authors, driver, restarts and store measurements"]
+fn private_session_steps_store_one_body_and_reopen_after_rotation() {
+    use redb::{ReadableDatabase, ReadableTable, TableDefinition};
+    use vox_core::node::ipc::{Frame, IpcClient, NodeSocket, Request};
+    use vox_core::node::paths::{NodeName, Paths};
+
+    watchdog::arm();
+    let tmp = tempfile::tempdir().expect("APPARATUS: scratch roots");
+    let (a, b) = pair(tmp.path());
+    let mut author = Some(daemon(&a, "author", &format!("{IDENTITY}\n")));
+    let mut driver = Some(daemon(&b, "driver", &format!("{IDENTITY}\n")));
+    attached(&a, "author");
+    attached(&b, "driver");
+    let (_, author_fp, _) = vox(&a, &["id"], None);
+    let (_, driver_fp, _) = vox(&b, &["id"], None);
+    let author_fp = author_fp.trim();
+    let driver_fp = driver_fp.trim();
+    let (ok, out, err) = vox(
+        &a,
+        &["trust", "add", driver_fp, "--name", "driver", "--drive"],
+        None,
+    );
+    assert!(ok, "PRODUCT (staging): drive grant: {out}{err}");
+    let room = room(&a, &b);
+    let author_at = listening(&a);
+    let driver_at = listening(&b);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("APPARATUS: runtime");
+    let paths = |dir: &Path| {
+        Paths::resolve("default", Some(dir), Some(&dir.join("cfg")))
+            .expect("APPARATUS: profile paths")
+    };
+    let request = |dir: &Path, request: Request| {
+        let began = Instant::now();
+        loop {
+            let mut client = rt
+                .block_on(IpcClient::open_at(&NodeSocket::one_shot(
+                    paths(dir).account().socket(),
+                    NodeName::parse("default").unwrap(),
+                )))
+                .expect("APPARATUS: connect binary socket");
+            let frame = rt
+                .block_on(client.request(&request))
+                .expect("APPARATUS: request binary");
+            if !matches!(&frame, Frame::Error { reason }
+                if reason.contains("refresh") || reason.contains("permissions are still")
+                    || reason.contains("preparing"))
+            {
+                break frame;
+            }
+            assert!(
+                began.elapsed() < Duration::from_secs(180),
+                "APPARATUS: Session publication did not settle: {frame:?}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    let Frame::Rooms { rooms } = request(&a, Request::Rooms { after: None }) else {
+        panic!("APPARATUS: room listing response");
+    };
+    let id = rooms.first().expect("APPARATUS: created room").0;
+    let session = "rg13-one-body";
+    let opening = serde_json::json!({"v":1,"type":"session","from":session,
+        "body":"","at":{"session_name":"One body"},"data":{"session":{"harness":"proof"}}})
+    .to_string();
+    assert!(
+        matches!(
+            request(
+                &a,
+                Request::Post {
+                    channel_id: id,
+                    text: opening,
+                    card: false
+                }
+            ),
+            Frame::Ok
+        ),
+        "PRODUCT (staging): Session opening was not saved"
+    );
+    let authored = std::cell::RefCell::new(Vec::new());
+    let append = |seq: usize, size: usize| {
+        let text = format!("ONE-BODY-{seq}-{}", "x".repeat(size));
+        let body =
+            serde_json::json!({"v":1,"session":session,"kind":"reply","seq":seq,"text":text})
+                .to_string();
+        let frame = request(
+            &a,
+            Request::AppendSession {
+                channel_id: id,
+                session_id: session.into(),
+                body: body.clone(),
+            },
+        );
+        assert!(
+            matches!(frame, Frame::Appended { .. }),
+            "PRODUCT: binary refused step {seq}: {frame:?}"
+        );
+        if let Frame::Appended { entry } = &frame {
+            authored.borrow_mut().push(*entry);
+        }
+        (body.len(), text)
+    };
+    let replies = |dir: &Path| {
+        let (ok, out, err) = vox(
+            dir,
+            &["room", "session", &room, session, "--raw", "--json"],
+            None,
+        );
+        if !ok {
+            return Err(format!("{out}{err}"));
+        }
+        Ok(out
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter_map(|row| {
+                row["body"]
+                    .as_str()
+                    .and_then(|body| serde_json::from_str::<serde_json::Value>(body).ok())
+            })
+            .filter(|body| body["kind"] == "reply")
+            .filter_map(|body| body["text"].as_str().map(str::to_owned))
+            .collect::<Vec<_>>())
+    };
+    let wait_replies = |dir: &Path, expected: &[String]| {
+        let began = Instant::now();
+        loop {
+            let shown = replies(dir);
+            if shown.as_ref().is_ok_and(|shown| shown == expected) {
+                break;
+            }
+            assert!(
+                began.elapsed() < Duration::from_secs(180),
+                "PRODUCT: binary did not show the complete Session page: {shown:?}"
+            );
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    };
+    let store_rows = |tag: &str| {
+        let copy = tmp.path().join(format!("{tag}.redb"));
+        std::fs::copy(paths(&a).store_file(), &copy).expect("APPARATUS: copy stopped store");
+        let db = redb::Database::open(&copy).expect("APPARATUS: open copied store");
+        let transaction = db.begin_read().expect("APPARATUS: store snapshot");
+        let table = transaction
+            .open_table(TableDefinition::<([u8; 32], u8, u64), &[u8]>::new(
+                "segments",
+            ))
+            .expect("APPARATUS: product segment table");
+        table
+            .iter()
+            .expect("APPARATUS: segment rows")
+            .map(|row| row.expect("APPARATUS: segment row"))
+            .filter_map(|(key, value)| {
+                let (room, kind, position) = key.value();
+                (room == id && kind == 10).then_some((position, value.value().len()))
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let (_, warm) = append(0, 64);
+    let mut expected = vec![warm];
+    wait_replies(&a, &expected);
+    wait_replies(&b, &expected);
+    drop(author.take());
+    let mut previous = store_rows("warm");
+    let mut costs = Vec::new();
+    for (seq, size) in [(1, 1024), (2, 2048), (3, 3072)] {
+        author = Some(daemon_on(
+            &a,
+            &format!("author-{seq}"),
+            &format!("{IDENTITY}\n{ROOMPASS}\n"),
+            &author_at,
+        ));
+        attached(&a, "restarted author");
+        wait_replies(&a, &expected);
+        let (body, text) = append(seq, size);
+        expected.push(text);
+        wait_replies(&a, &expected);
+        wait_replies(&b, &expected);
+        drop(author.take());
+        let current = store_rows(&format!("step-{seq}"));
+        let added = current
+            .iter()
+            .filter(|(id, _)| !previous.contains_key(id))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            added.len(),
+            1,
+            "PRODUCT: one append wrote {} private rows; before={previous:?}, after={current:?}",
+            added.len()
+        );
+        assert!(previous.iter().all(|(id,size)| current.get(id) == Some(size)),
+            "PRODUCT: appending rewrote an earlier private row: before={previous:?}, after={current:?}");
+        costs.push((body, *added[0].1));
+        previous = current;
+    }
+    eprintln!("PRODUCT STORE RECEIPT: (body bytes, sealed row bytes)={costs:?}");
+    // Check the slope first so the base's RED names the reproduced duplicate body.
+    for pair in costs.windows(2) {
+        assert_eq!(
+            pair[1].1 - pair[0].1,
+            pair[1].0 - pair[0].0,
+            "PRODUCT: stored step grew by {} bytes for {} body bytes: {costs:?}",
+            pair[1].1 - pair[0].1,
+            pair[1].0 - pair[0].0
+        );
+    }
+    for (body, stored) in costs {
+        assert!(
+            stored < body + 4500,
+            "PRODUCT: step still pays for two 3373-byte signatures: body={body}, stored={stored}"
+        );
+    }
+    author = Some(daemon_on(
+        &a,
+        "author-final",
+        &format!("{IDENTITY}\n{ROOMPASS}\n"),
+        &author_at,
+    ));
+    attached(&a, "author-final");
+    wait_replies(&a, &expected);
+    drop(driver.take());
+    driver = Some(daemon_on(
+        &b,
+        "driver-restart",
+        &format!("{IDENTITY}\n{ROOMPASS}\n"),
+        &driver_at,
+    ));
+    attached(&b, "driver-restart");
+    wait_replies(&b, &expected);
+    for dir in [&a, &b] {
+        let mut pages = Vec::new();
+        let mut before = None;
+        loop {
+            let frame = request(
+                dir,
+                Request::SessionPage {
+                    channel_id: id,
+                    which: vox_core::node::drive::SessionFilter::Session(session.into()),
+                    before,
+                    limit: 2,
+                },
+            );
+            let Frame::SessionPage { rows, older, .. } = frame else {
+                panic!("PRODUCT: binary refused an older Session page: {frame:?}");
+            };
+            assert!(
+                !rows.is_empty(),
+                "PRODUCT: binary returned an empty Session page with rows owed"
+            );
+            before = rows.first().map(|row| row.entry_hash);
+            pages.push(
+                rows.into_iter()
+                    .filter_map(|row| {
+                        let body: serde_json::Value = serde_json::from_str(&row.body).ok()?;
+                        (body["kind"] == "reply").then(|| body["text"].as_str().unwrap().to_owned())
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            if older == 0 {
+                break;
+            }
+        }
+        assert!(
+            pages.len() > 1,
+            "APPARATUS: older-page boundary was not reached"
+        );
+        let shown = pages.into_iter().rev().flatten().collect::<Vec<_>>();
+        assert_eq!(
+            shown, expected,
+            "PRODUCT: complete older pages differ after restart"
+        );
+    }
+
+    // An actual member's stopped profile supplies the apparatus identity and the
+    // exact next ciphertexts. Only the running recipient decides acceptance.
+    drop(driver.take());
+    let pending = (4..9).map(|seq| append(seq, 256).1).collect::<Vec<_>>();
+    drop(author.take());
+    {
+        use vox_core::atrest::idfactor::SignatureIdentityFactor;
+        use vox_core::atrest::store::{open_segment, SegmentKind};
+        use vox_core::cbor::{Decoder, Encoder};
+        use vox_core::group::message::MessageHeader;
+        use vox_core::node::profile::Profile;
+        use vox_core::transport::framing::{read_frame, write_frame};
+        use vox_core::transport::quic::VoxEndpoint;
+        use vox_core::transport::streams::{accept_typed, StreamKind};
+
+        let mut profile = Profile::open(paths(&a)).expect("APPARATUS: stopped author profile");
+        profile
+            .unlock(IDENTITY.as_bytes())
+            .expect("APPARATUS: unlock stopped author");
+        let signer = profile.signer_arc().expect("APPARATUS: author identity");
+        let sek = profile
+            .store()
+            .get_sek_wrap(&id)
+            .unwrap()
+            .unwrap()
+            .unwrap_sek(
+                &SignatureIdentityFactor::new(&*signer),
+                &id,
+                ROOMPASS.as_bytes(),
+            )
+            .expect("APPARATUS: author room key");
+        let mut wires = profile
+            .store()
+            .segments(&id, SegmentKind::PrivateSession)
+            .unwrap()
+            .into_iter()
+            .map(|(position, sealed)| {
+                let bytes = open_segment(&sek, SegmentKind::PrivateSession, position, &sealed)
+                    .expect("APPARATUS: accepted author row opens");
+                let mut d = Decoder::new(&bytes);
+                d.array().unwrap();
+                d.uint().unwrap();
+                (position, d.bytes().unwrap().to_vec())
+            })
+            .collect::<Vec<_>>();
+        wires.sort_by_key(|(position, _)| *position);
+        let wires = wires
+            .into_iter()
+            .rev()
+            .take(5)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .map(|(_, wire)| wire)
+            .collect::<Vec<_>>();
+        assert_eq!(wires.len(), 5, "APPARATUS: five withheld steps");
+        driver = Some(daemon_on(
+            &b,
+            "tamper-driver",
+            &format!("{IDENTITY}\n{ROOMPASS}\n"),
+            &driver_at,
+        ));
+        attached(&b, "tamper-driver");
+        let victim_at = listening(&b)
+            .parse()
+            .expect("APPARATUS: driver listen address");
+        let (_, fingerprint, _) = vox(&b, &["id"], None);
+        let victim = vox_core::node::link::b32_decode(fingerprint.trim(), "driver identity")
+            .expect("APPARATUS: driver fingerprint");
+        let attack_rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("APPARATUS: wire peer runtime");
+        let endpoint = attack_rt.block_on(async {
+            VoxEndpoint::bind(signer, "127.0.0.1:0".parse().unwrap())
+                .expect("APPARATUS: authenticated wire peer")
+        });
+        let conn = std::sync::Arc::new(
+            attack_rt
+                .block_on(endpoint.connect(victim_at, victim, now_ms()))
+                .expect("APPARATUS: connect author wire peer"),
+        );
+        let (asked, asks) = std::sync::mpsc::channel();
+        let (responses, mut response_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, Vec<u8>)>();
+        let serving = attack_rt.spawn(async move {
+            while let Ok((kind, send, mut recv)) = accept_typed(&conn).await {
+                if kind == StreamKind::Session {
+                    let bytes = read_frame(&mut recv, 4096).await.unwrap().unwrap();
+                    let mut d = Decoder::new(&bytes);
+                    assert_eq!(d.array().unwrap(), 6, "APPARATUS: Session ask");
+                    assert_eq!(d.uint().unwrap(), 2, "APPARATUS: Session ask version");
+                    d.bytes().unwrap();
+                    d.uint().unwrap();
+                    let incarnation = d.bytes().unwrap().to_vec();
+                    let after = d.uint().unwrap();
+                    // No archive fixture or invented cursor: every verdict is on
+                    // an ordinary live pull from this authenticated real member.
+                    assert_eq!(d.array().unwrap(), 1, "APPARATUS: live query");
+                    assert_eq!(d.uint().unwrap(), 0, "APPARATUS: live query kind");
+                    d.finish().unwrap();
+                    asked.send((incarnation, after)).unwrap();
+                    let Some((position, wire)) = response_rx.recv().await else {
+                        break;
+                    };
+                    let mut e = Encoder::new();
+                    e.array(6)
+                        .uint(2)
+                        .bytes(&[42; 32])
+                        .uint(position)
+                        .uint(0)
+                        .array(1)
+                        .array(2)
+                        .uint(position)
+                        .bytes(&wire)
+                        .array(0);
+                    let mut send = send;
+                    write_frame(&mut send, &e.finish()).await.unwrap();
+                    send.finish().unwrap();
+                } else {
+                    // The room's existing public sync continues independently.
+                    tokio::spawn(async move {
+                        let Ok((_room, _epoch)) =
+                            vox_core::node::syncstream::read_sync_request(&mut recv).await
+                        else {
+                            return;
+                        };
+                        let transport = vox_core::node::syncstream::accept_sync(
+                            tokio::runtime::Handle::current(),
+                            send,
+                            recv,
+                        );
+                        let _ = tokio::task::spawn_blocking(move || {
+                            private_raw_sync::session(
+                                transport,
+                                &private_raw_sync::Ask::Everything,
+                                None,
+                            )
+                        })
+                        .await;
+                    });
+                }
+            }
+        });
+        let mut position = 0;
+        let _ = asks
+            .recv_timeout(Duration::from_secs(90))
+            .expect("APPARATUS: recipient did not ask authenticated peer");
+        for (arm, (wire, text)) in ["root-signature", "header", "room", "author", "ciphertext"]
+            .into_iter()
+            .zip(wires.into_iter().zip(pending))
+        {
+            let mut d = Decoder::new(&wire);
+            assert_eq!(d.array().unwrap(), 4, "APPARATUS: private envelope");
+            let version = d.uint().unwrap();
+            assert_eq!(
+                version, 3,
+                "PRODUCT: new steps did not use one-signature envelope"
+            );
+            let mut room_bytes = d.bytes().unwrap().to_vec();
+            let message = d.bytes().unwrap();
+            let mut signature = d.bytes().unwrap().to_vec();
+            d.finish().unwrap();
+            let mut m = Decoder::new(message);
+            assert_eq!(
+                m.array().unwrap(),
+                2,
+                "PRODUCT: private envelope retained inner signature"
+            );
+            let mut header = MessageHeader::from_canonical_body(m.bytes().unwrap()).unwrap();
+            let mut ciphertext = m.bytes().unwrap().to_vec();
+            m.finish().unwrap();
+            match arm {
+                "header" => header.iteration += 1,
+                "room" => room_bytes[0] ^= 1,
+                "author" => header.author_id = victim,
+                "ciphertext" => ciphertext[0] ^= 1,
+                "root-signature" => signature[0] ^= 1,
+                _ => unreachable!(),
+            }
+            let mut m = Encoder::new();
+            m.array(2)
+                .bytes(&header.canonical_body())
+                .bytes(&ciphertext);
+            let mut e = Encoder::new();
+            e.array(4)
+                .uint(version)
+                .bytes(&room_bytes)
+                .bytes(&m.finish())
+                .bytes(&signature);
+            position += 1;
+            responses.send((position, e.finish())).unwrap();
+            let (incarnation, after) = asks
+                .recv_timeout(Duration::from_secs(90))
+                .expect("APPARATUS: recipient did not finish its tampered-page decision");
+            assert_eq!(
+                (incarnation, after),
+                (vec![42; 32], position),
+                "APPARATUS: recipient has not decided the supplied tampered row"
+            );
+            assert!(
+                !replies(&b).unwrap_or_default().contains(&text),
+                "PRODUCT: recipient showed the {arm}-tampered step: {:?}",
+                replies(&b)
+            );
+            position += 1;
+            responses.send((position, wire)).unwrap();
+            expected.push(text);
+            wait_replies(&b, &expected);
+            eprintln!(
+                "PRODUCT TAMPER RECEIPT: {arm} refused; original same-iteration step read whole"
+            );
+            let _ = asks
+                .recv_timeout(Duration::from_secs(90))
+                .expect("APPARATUS: recipient did not request next live page");
+        }
+        drop(responses);
+        serving.abort();
+        drop((endpoint, attack_rt, profile));
+    }
+    author = Some(daemon_on(
+        &a,
+        "after-tamper",
+        &format!("{IDENTITY}\n{ROOMPASS}\n"),
+        &author_at,
+    ));
+    attached(&a, "after-tamper");
+    wait_replies(&a, &expected);
+    let (ok, out, err) = vox(&a, &["trust", "read", driver_fp], None);
+    assert!(ok, "PRODUCT (staging): drive withdrawal: {out}{err}");
+    let (_, post_rotation) = append(9, 1024);
+    expected.push(post_rotation);
+    wait_replies(&a, &expected);
+    drop(author.take());
+    author = Some(daemon_on(
+        &a,
+        "past-generation",
+        &format!("{IDENTITY}\n{ROOMPASS}\n"),
+        &author_at,
+    ));
+    attached(&a, "past-generation");
+    wait_replies(&a, &expected);
+    drop(author.take());
+    {
+        use vox_core::atrest::idfactor::SignatureIdentityFactor;
+        use vox_core::atrest::store::{open_segment, seal_segment, SegmentKind};
+        use vox_core::cbor::{Decoder, Encoder};
+        use vox_core::node::profile::Profile;
+        let mut profile = Profile::open(paths(&a)).expect("APPARATUS: stopped corruption target");
+        profile.unlock(IDENTITY.as_bytes()).unwrap();
+        let signer = profile.signer_arc().unwrap();
+        let sek = profile
+            .store()
+            .get_sek_wrap(&id)
+            .unwrap()
+            .unwrap()
+            .unwrap_sek(
+                &SignatureIdentityFactor::new(&*signer),
+                &id,
+                ROOMPASS.as_bytes(),
+            )
+            .unwrap();
+        let (position, sealed) = profile
+            .store()
+            .segments(&id, SegmentKind::PrivateSession)
+            .unwrap()
+            .into_iter()
+            .find(|(position, sealed)| {
+                let bytes =
+                    open_segment(&sek, SegmentKind::PrivateSession, *position, sealed).unwrap();
+                let mut d = Decoder::new(&bytes);
+                d.array().unwrap();
+                d.uint().unwrap();
+                vox_core::hash::sha256(d.bytes().unwrap()) == authored.borrow()[1]
+            })
+            .expect("APPARATUS: step chosen for damaged opener");
+        let bytes = open_segment(&sek, SegmentKind::PrivateSession, position, &sealed).unwrap();
+        let mut d = Decoder::new(&bytes);
+        assert_eq!(
+            (d.array().unwrap(), d.uint().unwrap()),
+            (8, 3),
+            "PRODUCT: new stored row has no versioned opener"
+        );
+        let wire = d.bytes().unwrap();
+        let metadata = d.bytes().unwrap();
+        let seen = d.uint().unwrap();
+        let instance = d.bytes().unwrap();
+        let arrival = d.uint().unwrap();
+        let identity = d.bytes().unwrap();
+        let mut key = d.bytes().unwrap().to_vec();
+        d.finish().unwrap();
+        key[0] ^= 1;
+        let mut e = Encoder::new();
+        e.array(8)
+            .uint(3)
+            .bytes(wire)
+            .bytes(metadata)
+            .uint(seen)
+            .bytes(instance)
+            .uint(arrival)
+            .bytes(identity)
+            .bytes(&key);
+        let damaged =
+            seal_segment(&sek, SegmentKind::PrivateSession, position, &e.finish()).unwrap();
+        profile
+            .store()
+            .put_segment(&id, SegmentKind::PrivateSession, position, &damaged)
+            .unwrap();
+    }
+    author = Some(daemon_on(
+        &a,
+        "damaged-opener",
+        &format!("{IDENTITY}\n{ROOMPASS}\n"),
+        &author_at,
+    ));
+    attached(&a, "damaged-opener");
+    let began = Instant::now();
+    loop {
+        let shown = vox(&a, &["room", "session", &room, session, "--json"], None);
+        if shown.0 && shown.1.contains("could not be opened") && shown.1.contains("ONE-BODY-9-") {
+            break;
+        }
+        assert!(
+            began.elapsed() < Duration::from_secs(180),
+            "PRODUCT: unreadable step hid the rest of its page instead of saying why: {shown:?}"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    post(&a, &room, "AFTER-DRIVE-WITHDRAWAL");
+    until(
+        &b,
+        &room,
+        "PRODUCT: read-only member still receives chat",
+        90,
+        |texts| texts.iter().any(|s| s == "AFTER-DRIVE-WITHDRAWAL"),
+    );
+    let listing = vox(&b, &["room", "sessions", &room, "--json"], None);
+    assert!(
+        !listing
+            .1
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .any(|row| row["id"] == session && row["can_drive"] == true)
+            && replies(&b).is_err(),
+        "PRODUCT: read-only member still reads the withdrawn Session: {listing:?}; {:?}",
+        replies(&b)
+    );
+    let own_session = "rg13-driver-own";
+    let opening = serde_json::json!({"v":1,"type":"session","from":own_session,
+        "body":"","at":{"session_name":"Driver own"},"data":{"session":{"harness":"proof"}}})
+    .to_string();
+    assert!(
+        matches!(
+            request(
+                &b,
+                Request::Post {
+                    channel_id: id,
+                    text: opening,
+                    card: false
+                }
+            ),
+            Frame::Ok
+        ),
+        "PRODUCT (staging): driver's own Session did not open"
+    );
+    let own_body = serde_json::json!({"v":1,"session":own_session,"kind":"reply","seq":1,
+        "text":"DRIVER-OWN-SURVIVES-REMOVAL"})
+    .to_string();
+    assert!(
+        matches!(
+            request(
+                &b,
+                Request::AppendSession {
+                    channel_id: id,
+                    session_id: own_session.into(),
+                    body: own_body
+                }
+            ),
+            Frame::Appended { .. }
+        ),
+        "PRODUCT (staging): driver's own append failed"
+    );
+    let (ok, out, err) = vox(&b, &["trust", "remove", author_fp], None);
+    assert!(
+        ok,
+        "PRODUCT (staging): removing author trust failed: {out}{err}"
+    );
+    drop(driver.take());
+    driver = Some(daemon_on(
+        &b,
+        "removed-author",
+        &format!("{IDENTITY}\n{ROOMPASS}\n"),
+        &driver_at,
+    ));
+    attached(&b, "removed-author");
+    let began = Instant::now();
+    loop {
+        let shown = vox(&b, &["room", "session", &room, own_session, "--json"], None);
+        if shown.0 && shown.1.contains("DRIVER-OWN-SURVIVES-REMOVAL") {
+            break;
+        }
+        assert!(
+            began.elapsed() < Duration::from_secs(180),
+            "PRODUCT: deleting another author's receiver broke own Session pages: {shown:?}"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    assert!(
+        replies(&b).is_err(),
+        "PRODUCT: removed author's Session became readable"
+    );
+    let retained_authored = || {
+        use vox_core::atrest::idfactor::SignatureIdentityFactor;
+        use vox_core::atrest::store::{open_segment, SegmentKind};
+        use vox_core::cbor::Decoder;
+        use vox_core::node::profile::Profile;
+        let mut profile = Profile::open(paths(&b)).expect("APPARATUS: stopped driver profile");
+        profile
+            .unlock(IDENTITY.as_bytes())
+            .expect("APPARATUS: driver unlock");
+        let signer = profile.signer_arc().unwrap();
+        let sek = profile
+            .store()
+            .get_sek_wrap(&id)
+            .unwrap()
+            .unwrap()
+            .unwrap_sek(
+                &SignatureIdentityFactor::new(&*signer),
+                &id,
+                ROOMPASS.as_bytes(),
+            )
+            .unwrap();
+        profile
+            .store()
+            .segments(&id, SegmentKind::PrivateSession)
+            .unwrap()
+            .into_iter()
+            .filter(|(position, sealed)| {
+                let bytes =
+                    open_segment(&sek, SegmentKind::PrivateSession, *position, sealed).unwrap();
+                let mut d = Decoder::new(&bytes);
+                d.array().unwrap();
+                d.uint().unwrap();
+                authored
+                    .borrow()
+                    .contains(&vox_core::hash::sha256(d.bytes().unwrap()))
+            })
+            .count()
+    };
+    drop(driver.take());
+    assert!(
+        retained_authored() > 0,
+        "APPARATUS: removal did not leave retained rows to exercise their expiry"
+    );
+    let mut child = Command::new(VOX)
+        .args(["daemon", "--listen", &driver_at])
+        .env("VOX_DATA_DIR", &b)
+        .env("VOX_CONFIG_DIR", b.join("cfg"))
+        .env(
+            "VOX_TEST_CLOCK_STEP_MS",
+            (8 * 86_400_000u64 + 1).to_string(),
+        )
+        .env_remove("VOX_NODE")
+        .env_remove("VOX_ROOM")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(b.join("expiry.err")).unwrap())
+        .spawn()
+        .unwrap();
+    writeln!(child.stdin.take().unwrap(), "{IDENTITY}\n{ROOMPASS}").unwrap();
+    driver = Some(Daemon(child));
+    attached(&b, "expiry");
+    let began = Instant::now();
+    loop {
+        let shown = vox(&b, &["room", "session", &room, own_session, "--json"], None);
+        if shown.0 && !shown.1.contains("DRIVER-OWN-SURVIVES-REMOVAL") {
+            break;
+        }
+        assert!(
+            began.elapsed() < Duration::from_secs(180),
+            "PRODUCT: expired own activity did not disappear: {shown:?}"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    drop(driver.take());
+    assert_eq!(
+        retained_authored(),
+        0,
+        "PRODUCT: removed author's expired rows and their in-row openers remain on this node"
+    );
+    drop((author, driver));
 }
