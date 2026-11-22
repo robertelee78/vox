@@ -17,7 +17,6 @@ pub(crate) enum Work {
     Select {
         trust_digest: Digest32,
         replay: bool,
-        abandon_unopened: bool,
     },
     Open {
         pending: PendingPackage,
@@ -316,14 +315,10 @@ impl ChannelState {
             Work::Select {
                 trust_digest,
                 replay,
-                abandon_unopened,
             } => {
                 // Context is established before the durable selection cursor can advance.
                 let context = self.join_context()?;
                 let mut queue = self.key_packages.clone();
-                if abandon_unopened {
-                    queue.abandon_unopened();
-                }
                 if replay {
                     queue.retry_retained();
                 }
@@ -729,6 +724,25 @@ impl Prepared {
                             },
                             (pending.root, pending.now, pending.membership),
                         )?;
+                        // Abandon one real selection before Open, without acknowledging it.
+                        #[cfg(feature = "test-knobs")]
+                        let progress = {
+                            let mut progress = progress;
+                            if progress.package.is_some() {
+                                if let Some(arm) =
+                                    std::env::var_os("VOX_TEST_ABANDON_KEY_PACKAGE_ONCE")
+                                {
+                                    if std::fs::remove_file(&arm).is_ok() {
+                                        progress.package = None;
+                                        let _ = std::fs::write(
+                                            std::path::Path::new(&arm).with_extension("selected"),
+                                            b"selected package abandoned before Open",
+                                        );
+                                    }
+                                }
+                            }
+                            progress
+                        };
                         delta = Delta::Queue(queue);
                         Ok(Saved::Selected { progress, context })
                     }
