@@ -207,15 +207,6 @@ impl CompletedText {
     }
 }
 
-pub(crate) enum PolicyBlocker {
-    Physical(std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + Sync>>),
-    Sparse {
-        request: [u8; 16],
-        root: [u8; 16],
-        wake: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + Sync>>,
-    },
-}
-
 impl ChannelState {
     pub(crate) fn post_pending(&self) -> bool {
         self.pending_text.is_some()
@@ -236,42 +227,6 @@ impl ChannelState {
         self.authored_waiters
             .load(std::sync::atomic::Ordering::Acquire)
             > 0
-    }
-
-    /// Inspect a managed-policy prerequisite while holding the room mutex.
-    pub(crate) fn policy_publication_blocker(
-        &self,
-        store: &Store,
-    ) -> Result<Option<PolicyBlocker>> {
-        if self.poisoned {
-            return Err(self.save_failure());
-        }
-        if self.post_pending() {
-            let wake = self.history_publication_wake();
-            if self.post_pending() {
-                return Ok(Some(PolicyBlocker::Physical(wake)));
-            }
-        }
-        let read = self.entries.read(store, &self.sek, &self.channel_id)?;
-        if read.publication_busy() {
-            let wake = self.history_publication_wake();
-            if read.publication_busy() {
-                let request = read.sparse_publication_request().ok_or(Error::Profile(
-                    "history publication has no sparse request owner",
-                ))?;
-                let root = self
-                    .history_publication_flow_root(request)
-                    .ok_or(Error::Profile(
-                        "history publication has no live Flow binding",
-                    ))?;
-                return Ok(Some(PolicyBlocker::Sparse {
-                    request,
-                    root,
-                    wake,
-                }));
-            }
-        }
-        Ok(None)
     }
 
     /// Reserve only publication ownership; incoming repair has no local-author prerequisites.
@@ -527,12 +482,12 @@ impl ChannelState {
                 }
                 drop(self.local_append_eligible_for(store, false)?);
                 self.ensure_governance_append_eligible_by(store, &me, false, false)?;
+                let millis = seconds.saturating_mul(1_000);
                 let current = self
                     .checked_governance(store, now.get())?
                     .display(&self.genesis)?;
-                let millis = seconds.saturating_mul(1_000);
                 if if *steps {
-                    current.step_ttl_ms == millis
+                    current.step_policy_signed && current.step_ttl_ms == millis
                 } else {
                     current.policy.ttl_ms == millis
                 } {
@@ -788,10 +743,13 @@ impl PendingText {
         let (failure, error) = match work {
             Ok(Ok(())) => (None, None),
             Ok(Err(error)) => {
-                let failure = if governance::refreshing(&error)
+                let failure = if matches!(
+                    &error,
+                    Error::Profile("this room's trust withdrawal is incomplete")
+                ) || (governance::refreshing(&error)
                     && self.committed.is_empty()
                     && !self.encrypted_control_committed
-                    && !self.rotation_committed
+                    && !self.rotation_committed)
                 {
                     None
                 } else {
@@ -856,6 +814,21 @@ impl PendingText {
                     .as_ref()
                     .is_none_or(|typed| typed.kind == kind)
         })
+    }
+
+    pub(crate) fn require_trust_withdrawn(
+        &self,
+        store: &Store,
+        signer: &dyn RootSigner,
+    ) -> Result<()> {
+        let locks = crate::node::pending_lock::PendingLocks::load(store, signer)?;
+        if locks
+            .for_room(&self.room)
+            .any(|target| self.authors.contains_key(&target))
+        {
+            return Err(Error::Profile("this room's trust withdrawal is incomplete"));
+        }
+        Ok(())
     }
 
     /// Call only on the physical owner worker. A later failure retains earlier durable controls.
@@ -1037,6 +1010,11 @@ impl PendingText {
         extra: &[(u64, Option<SealedSegment>)],
         boundary: Option<&recovery::AppendBoundary>,
     ) -> Result<()> {
+        let releases_key = matches!(
+            signed_kind,
+            SignedEntryKind::Content | SignedEntryKind::KeyPackage
+        ) || (signed_kind == SignedEntryKind::Governance
+            && crate::wire::parse_frame(&payload)?.tag == crate::wire::StructTag::ConsentGrant);
         let keep_log = kind == EntryKind::Governance || signed_kind == SignedEntryKind::StepPolicy;
         let required = self.required(signed_kind)?;
         let context = self.context(store, signer, &required)?;
@@ -1189,6 +1167,9 @@ impl PendingText {
         // Acquisition and commit are outside every room/actor/key-byte guard. Batch stays on
         // this physical thread, preserving the existing durable received-debt settlement.
         let mut batch = store.batch()?;
+        if releases_key {
+            self.require_trust_withdrawn(store, signer)?;
+        }
         let accepted = self.sek.with(|sek| {
             if let Some(generation) = self.removal_fence {
                 governance::check_removal_generation_in(&batch, sek, &self.room, generation)?;

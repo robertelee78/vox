@@ -525,7 +525,10 @@ impl PendingSession {
             .as_ref()
             .err()
             .filter(|error| {
-                self.encrypted
+                !matches!(
+                    error,
+                    Error::Profile("this room's trust withdrawal is incomplete")
+                ) && (self.encrypted
                     || !(super::super::governance::refreshing(error)
                         || ChannelState::authorization_refreshing(error)
                         || matches!(
@@ -533,7 +536,7 @@ impl PendingSession {
                             Error::OwnHistoryBehind
                                 | Error::RoomNotSynced
                                 | Error::Profile("room publication is busy; retry this operation")
-                        ))
+                        )))
             })
             .map(ToString::to_string);
         let drive = self
@@ -603,6 +606,14 @@ impl PendingSession {
             .write
             .take()
             .ok_or(Error::Profile("Session save input missing"))?;
+        if !matches!(
+            &write,
+            SessionWrite::Delivered { .. } | SessionWrite::RemovalRotation
+        ) {
+            if let Some(controls) = &self.controls {
+                controls.require_trust_withdrawn(store, signer)?;
+            }
+        }
         if let SessionWrite::Package { package, .. } = write {
             let controls = self
                 .controls
@@ -1147,6 +1158,9 @@ impl PendingSession {
         let state = self.drive.to_state();
         let drive = seal_segment(sek, SegmentKind::KeyMaterial, SEG_DRIVE, &state)?;
         let mut batch = store.batch()?;
+        if let Some(controls) = &self.controls {
+            controls.require_trust_withdrawn(store, signer)?;
+        }
         governance::check_removal_generation_in(&batch, sek, &self.room, self.removal_generation)?;
         // Unchanged ruled durability; inbox receipt, record, index and advanced ratchet are atomic.
         batch.ruled();

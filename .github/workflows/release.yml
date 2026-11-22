@@ -74,32 +74,41 @@ jobs:
           echo "::error::CI on $SHA did not finish within this job's budget"
           exit 1
 
-  # Build once alongside exact-commit CI; only draft staging waits for both.
+  # The same Linux build serves tags and pre-tag candidates. It holds no credentials and rechecks
+  # a candidate's source itself, so it needs no preflight: a job that `needs` the preflight is
+  # counted as having a skipped ancestor on a tag run, and `publish` would then be skipped too.
   build-linux-x64:
-    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.candidate_only }}
     runs-on: ubuntu-latest
+    container: quay.io/pypa/manylinux_2_28_x86_64@sha256:d086f64cddcace250ef0f0073583c51b8298159303290a730c9f59bd91edfd2c
     timeout-minutes: 45
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Build release binary
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Recheck candidate source
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_only }}
+        env:
+          EXPECTED_SHA: ${{ inputs.candidate_sha }}
+        # The job runs in a container as another user than the checkout's owner, and git refuses
+        # such a repository ("dubious ownership") unless it is named safe.
         run: |
-          cargo build --release --bin vox
-          # The unstripped build is published beside the stripped one (ADR-038 FX-25).
-          cp target/release/vox target/release/vox-symbols
-          strip target/release/vox
-          ls -lh target/release/vox
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
 
-      - name: Package release assets
-        run: |
-          scripts/package-release.sh target/release/vox x86_64-unknown-linux-gnu
-          scripts/package-release.sh target/release/vox-symbols x86_64-unknown-linux-gnu symbols
+      - name: Build on the Linux floor and package release assets
+        run: scripts/linux-release-steps.sh dist
+      - name: Include the candidate installer
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_only }}
+        run: cp install.sh dist/
 
       - uses: actions/upload-artifact@v4
         with:
-          name: x86_64-unknown-linux-gnu
+          name: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_only && 'vox-candidate-normal-x86_64-unknown-linux-gnu' || 'x86_64-unknown-linux-gnu' }}
           path: dist/*
+          if-no-files-found: error
 
   # ADR-014 M-27: the one macOS job. It builds `vox` and Vox.app for aarch64-apple-darwin only
   # (the Intel macOS target is not built at all, M-26a), signs `vox`, puts that signed binary in

@@ -20,7 +20,7 @@ of its result, the replies, the end of each turn, approvals and questions with w
 and files sent either way. None of it appears in the room's conversation.
 
 A step is one thing an agent did in its Session: a message, a command it ran, or a file it
-edited. By default, steps stay for seven days or the room's message lifetime, whichever is
+edited. By default, steps stay for two days or the room's message lifetime, whichever is
 shorter. A shorter message lifetime on your node can shorten it further. Keeping ordinary room
 messages forever therefore does not keep Session steps forever.
 
