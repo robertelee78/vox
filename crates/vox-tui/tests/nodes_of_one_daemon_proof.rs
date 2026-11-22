@@ -35,6 +35,10 @@ mod hostile;
 #[path = "support/ports.rs"]
 mod ports;
 
+#[cfg(feature = "optional-proofs")]
+#[path = "support/pty_driver.rs"]
+mod pty_driver;
+
 #[path = "support/optional_proof.rs"]
 mod optional_proof;
 optional_proof::not_run!(
@@ -50,6 +54,7 @@ optional_proof::not_run!(
     computer_removal_keeps_rooms_without_offering_removed_nodes,
     computer_removal_reconciles_absence_before_a_fresh_join,
     computer_removal_checks_a_locked_nodes_rooms_when_it_opens,
+    a_fresh_admission_survives_a_still_pending_computer_eviction,
     computer_removal_offers_only_a_fresh_basis,
     computer_removal_names_a_room_without_a_local_admin,
     computer_management_uses_anchors_added_after_start,
@@ -5571,6 +5576,293 @@ fn computer_removal_checks_a_locked_nodes_rooms_when_it_opens() {
             .run(&["room", "roster", &room, "--node", "delta"], "")
             .1
     );
+}
+
+/// A fresh remote admission must not be evicted by an older removal when this room reopens.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "three computers, a closed delegated-admin room and real TUI; release with test-knobs,optional-proofs"]
+fn a_fresh_admission_survives_a_still_pending_computer_eviction() {
+    let journey = RoomTrustJourney::new(false);
+    let delta = journey.a.make_node("delta");
+    let gamma = journey.c.make_node("gamma");
+    let (ok, out, err) = journey
+        .a
+        .run(&["node", "unlock", "delta", "--passphrase-file", "-"], PASS);
+    assert!(ok, "APPARATUS: ready the local room admin: {out}{err}");
+    for (account, node, peer) in [
+        (&journey.a, "delta", gamma.as_str()),
+        (&journey.c, "gamma", delta.as_str()),
+        (&journey.b, "beta", gamma.as_str()),
+        (&journey.c, "gamma", journey.beta.as_str()),
+    ] {
+        let (ok, out, err) = account.run(
+            &["trust", "add", peer, "--name", &peer[..12], "--node", node],
+            "",
+        );
+        assert!(
+            ok,
+            "APPARATUS: trust room participant {peer} on {node}: {out}{err}"
+        );
+    }
+    let room = make_room(&journey.c, "gamma");
+    let link = removal_link(&journey.c, "gamma", &room);
+    removal_join(&journey.a, "delta", &link);
+    removal_join(&journey.b, "beta", &link);
+    let mut admin_answer = String::new();
+    let granted = wait_until(RETURN_WITHIN, || {
+        let (ok, out, err) = journey.c.run(
+            &["room", "admin", "add", &room, &delta, "--node", "gamma"],
+            "",
+        );
+        admin_answer = format!("{out}{err}");
+        if ok {
+            return true;
+        }
+        assert!(
+            admin_answer
+                .contains("this room's permissions are still being read from local storage")
+                || admin_answer.contains("a previous change to this room is still being applied"),
+            "APPARATUS: delegate local removal authority: {admin_answer}"
+        );
+        false
+    });
+    assert!(
+        granted,
+        "APPARATUS: local admin grant never became ready: {admin_answer}"
+    );
+    assert!(
+        wait_until(RETURN_WITHIN, || {
+            let (ok, admins, _) = journey
+                .a
+                .run(&["room", "admin", "list", &room, "--node", "delta"], "");
+            let (roster_ok, roster, _) = journey
+                .a
+                .run(&["room", "roster", &room, "--node", "delta"], "");
+            ok && admins.contains(&delta) && roster_ok && roster.contains(&journey.beta)
+        }),
+        "APPARATUS: delta never observed its admin grant and beta's old membership"
+    );
+    let tui = |open: bool| {
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pty/tui_close_room.py");
+        let out = pty_driver::run(
+            script,
+            &[
+                VOX,
+                journey.a.data.to_str().unwrap(),
+                journey.a.cfg.to_str().unwrap(),
+                PASS.trim_end(),
+                ROOM_PASS.trim_end(),
+                "pending-eviction",
+                "",
+                "delta",
+                if open { "open" } else { "close" },
+            ],
+        );
+        println!("[pending admission witness] TUI:\n{}", out.stdout);
+        assert!(
+            out.code == Some(0) && out.has_verdict("pending-eviction"),
+            "APPARATUS: TUI {} did not establish the room state: {}",
+            if open { "open" } else { "close" },
+            out.stdout
+        );
+    };
+    let status_at = |phase: &str| {
+        for (owner, account) in [("remover", &journey.a), ("removed", &journey.b)] {
+            let (ok, words, err) = account.run(&["computer", "status"], "");
+            assert!(
+                ok,
+                "APPARATUS: {phase} {owner} status unavailable: {words}{err}"
+            );
+            println!(
+                "[pending admission witness] {phase} {owner}:\n{words}{err}\nJSON: {}",
+                computer(account, &["status"])
+            );
+        }
+    };
+    tui(false);
+    let (ok, closed, closed_err) = journey.a.run(&["room", "list", "--node", "delta"], "");
+    assert!(
+        ok && closed.contains("[closed]"),
+        "APPARATUS: delta's room was not closed before removal: {closed}{closed_err}"
+    );
+    println!("[pending admission witness] closed before removal:\n{closed}{closed_err}");
+    let frontier = computer(&journey.a, &["status"])["frontier"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    computer(
+        &journey.a,
+        &["remove", &journey.beta_computer, "--confirm", &frontier],
+    );
+    assert!(
+        wait_until(RETURN_WITHIN, || grant_words(
+            &journey.a,
+            "delta",
+            &journey.beta
+        )
+        .is_none()),
+        "APPARATUS: closed-room admin did not apply the saved trust removal"
+    );
+    let full_room = full_room_id(&link, &room);
+    let room_value =
+        serde_json::to_value(vox_core::node::link::b32_decode(&full_room, "room").unwrap())
+            .unwrap();
+    let saved = computer(&journey.a, &["status"]);
+    let old_event = saved["removals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|removal| removal["computer"] == journey.beta_computer)
+        .and_then(|removal| removal["event"].as_str())
+        .unwrap()
+        .to_owned();
+    let pending_here = || {
+        let status = computer(&journey.a, &["status"]);
+        status["removals"].as_array().is_some_and(|rows| {
+            rows.iter().any(|row| {
+                row["event"] == old_event
+                    && row["pending"].as_array().is_some_and(|pending| {
+                        pending.iter().any(|held| held["room"] == room_value)
+                    })
+            })
+        })
+    };
+    assert!(
+        pending_here(),
+        "APPARATUS: the old eviction was not pending for the closed room: {saved}"
+    );
+    status_at("after-removal-room-closed");
+    assert!(
+        wait_until(RETURN_WITHIN, || computer(&journey.b, &["status"])["state"]
+            == "removed"),
+        "APPARATUS: beta's computer did not learn the removal before fresh admission"
+    );
+    let mut leave_answer = String::new();
+    let left = wait_until(RETURN_WITHIN, || {
+        let (ok, out, err) = journey
+            .b
+            .run(&["room", "leave", &room, "--node", "beta"], "");
+        leave_answer = format!("{out}{err}");
+        if ok {
+            return true;
+        }
+        assert!(
+            leave_answer.contains("computer trust changed while this command was being applied"),
+            "APPARATUS: beta cannot leave before fresh admission: {leave_answer}"
+        );
+        false
+    });
+    assert!(
+        left,
+        "APPARATUS: beta's leave never settled: {leave_answer}"
+    );
+    assert!(
+        wait_until(RETURN_WITHIN, || {
+            let (ok, roster, _) = journey
+                .c
+                .run(&["room", "roster", &room, "--node", "gamma"], "");
+            ok && !roster.contains(&journey.beta)
+        }),
+        "APPARATUS: creator did not observe beta's departure"
+    );
+    assert!(
+        pending_here(),
+        "APPARATUS: old eviction completed before the fresh admission"
+    );
+    status_at("after-remote-departure-still-pending");
+    removal_join(&journey.b, "beta", &link);
+    assert!(
+        wait_until(RETURN_WITHIN, || {
+            let (ok, roster, _) = journey
+                .c
+                .run(&["room", "roster", &room, "--node", "gamma"], "");
+            ok && roster.contains(&journey.beta)
+        }),
+        "APPARATUS: creator did not show beta's fresh admission"
+    );
+    assert!(
+        pending_here(),
+        "APPARATUS: old eviction was no longer pending at fresh admission"
+    );
+    status_at("fresh-admission-still-pending");
+    for (account, node, peer) in [
+        (&journey.a, "delta", journey.beta.as_str()),
+        (&journey.b, "beta", delta.as_str()),
+    ] {
+        let (ok, trust, trust_err) = account.run(
+            &["trust", "add", peer, "--name", &peer[..12], "--node", node],
+            "",
+        );
+        assert!(
+            ok,
+            "APPARATUS: deliberate new trust on {node} before reopening: {trust}{trust_err}"
+        );
+    }
+    assert!(
+        wait_until(RETURN_WITHIN, || grant_words(
+            &journey.a,
+            "delta",
+            &journey.beta
+        )
+        .is_some()),
+        "APPARATUS: deliberate new trust was not saved before reopening"
+    );
+    let (ok, ring, ring_err) = journey.a.run(&["trust", "list", "--node", "delta"], "");
+    assert!(
+        ok && ring.contains(&journey.beta),
+        "APPARATUS: new trust not readable: {ring}{ring_err}"
+    );
+    println!(
+        "[pending admission witness] fresh member trusted while room closed:\n{ring}{ring_err}"
+    );
+    assert!(
+        pending_here(),
+        "APPARATUS: old eviction was not pending immediately before reopen"
+    );
+    status_at("freshly-trusted-before-reopen");
+    tui(true);
+    removal_wait_room_open(&journey.a, "delta", &room);
+    status_at("room-reopened");
+    assert!(
+        wait_until(RETURN_WITHIN, || !pending_here()),
+        "APPARATUS: old eviction did not report a result after reopening: {}",
+        computer(&journey.a, &["status"])
+    );
+    let (ok, roster, roster_err) = journey
+        .a
+        .run(&["room", "roster", &room, "--node", "delta"], "");
+    assert!(
+        ok,
+        "APPARATUS: reopened roster unreadable: {roster}{roster_err}"
+    );
+    let message = "freshly-admitted-beta-after-old-pending-eviction";
+    let (posted, post, post_err) = journey
+        .b
+        .run(&["room", "post", &room, message, "--node", "beta"], "");
+    let mut readback = String::new();
+    let read = if posted && roster.contains(&journey.beta) {
+        wait_until(RETURN_WITHIN, || {
+            let (ok, out, err) = journey
+                .a
+                .run(&["room", "read", &room, "--node", "delta"], "");
+            readback = format!("{out}{err}");
+            ok && readback.contains(message)
+        })
+    } else {
+        let (_, out, err) = journey
+            .a
+            .run(&["room", "read", &room, "--node", "delta"], "");
+        readback = format!("{out}{err}");
+        false
+    };
+    status_at("old-eviction-result");
+    println!("[pending admission witness] node {} roster:\n{roster}{roster_err}\nposted={posted}:\n{post}{post_err}\nread:\n{readback}", journey.beta);
+    assert!(roster.contains(&journey.beta),
+        "PRODUCT: old pending eviction removed freshly admitted trusted node {}; roster:\n{roster}{roster_err}\nposted={posted}:\n{post}{post_err}\nread:\n{readback}",
+        journey.beta);
+    assert!(posted && read,
+        "APPARATUS: membership survived but its post/read did not settle: {post}{post_err}; {readback}");
 }
 
 /// #1020: manual trust is local to the person even while Computer policy is active, and removing

@@ -52,12 +52,21 @@ impl Node {
                     self.retry_computer_room_removal(room);
                     return;
                 }
-                match channel.is_member_removed(&store, &row.member) {
-                    Ok(true) => true,
-                    Ok(false) => !channel.is_member(&row.member),
-                    Err(_) => {
-                        self.retry_computer_room_removal(room);
-                        return;
+                // A later grant supersedes this removal's unfinished room choice.
+                let trusted_again = self.trust.is_trusted(&row.member);
+                #[cfg(feature = "test-knobs")]
+                let trusted_again = trusted_again
+                    && !crate::node::computer::fx28_mutant("ignore-retrusted-computer-removal");
+                if trusted_again {
+                    true
+                } else {
+                    match channel.is_member_removed(&store, &row.member) {
+                        Ok(true) => true,
+                        Ok(false) => !channel.is_member(&row.member),
+                        Err(_) => {
+                            self.retry_computer_room_removal(room);
+                            return;
+                        }
                     }
                 }
             };

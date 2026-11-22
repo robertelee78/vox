@@ -97,8 +97,9 @@ The pairing journey in `nodes_of_one_daemon_proof.rs` also covers saved room cho
 `computer_removal_keeps_rooms_without_offering_removed_nodes`,
 `computer_removal_reconciles_absence_before_a_fresh_join`,
 `computer_removal_checks_a_locked_nodes_rooms_when_it_opens`,
-`computer_removal_names_a_room_without_a_local_admin`, and
-`computer_removal_offers_only_a_fresh_basis`.
+`computer_removal_names_a_room_without_a_local_admin`,
+`computer_removal_offers_only_a_fresh_basis`,
+`a_fresh_admission_survives_a_still_pending_computer_eviction`.
 Run one name at a time with
 `cargo test --release -p vox-tui --features test-knobs,optional-proofs --test nodes_of_one_daemon_proof <name> -- --ignored --exact --nocapture`.
 The restart and absence acts use causal holds and require an exclusive proof slot.
@@ -107,6 +108,10 @@ computer removal event. An event with no local choice keeps room memberships. Ch
 completion and rooms checked on first unlock share the existing computer snapshot;
 unfinished work uses the room's existing one-second governance retry, not a separate
 removal worker or journal.
+A pending eviction finishes without evicting a node this computer presently trusts
+again, individually or through its current computer group. The finished row disappears
+from status. A fresh admission alone is not enough in a room closed at removal: the
+saved removal has no room-feed frontier with which to date that admission.
 Each accepted removal also keeps this computer's existing-node offer obligations and
 per-room basis cutoffs in that same snapshot. Until a room's cutoff is captured it
 offers none of that computer's nodes; afterwards only pre-removal bases are suppressed.
