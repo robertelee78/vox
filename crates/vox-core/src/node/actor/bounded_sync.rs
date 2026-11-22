@@ -219,6 +219,24 @@ type RetirementKey = crate::node::history_budget::RetirementKey;
 type RetirementLedger = crate::node::history_budget::RetirementLedger;
 type RetirementEntry = crate::node::history_budget::RetirementEntry;
 
+/// `VOX_MUTANT_TRANSPORT_STREAK`: an answered turn leaves the transport failure streak as it was.
+/// Says so once on stderr when it first keeps a streak.
+#[cfg(feature = "test-knobs")]
+fn transport_streak_mutant() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("VOX_MUTANT_TRANSPORT_STREAK").is_some());
+    static SAID: std::sync::Once = std::sync::Once::new();
+    if *ON {
+        SAID.call_once(|| {
+            eprintln!(
+                "vox: VOX_MUTANT_TRANSPORT_STREAK engaged: an answered turn kept the transport \
+                 failure streak"
+            );
+        });
+    }
+    *ON
+}
+
 fn retirement_key(flow: &Flow) -> RetirementKey {
     RetirementKey {
         actor: flow.actor_incarnation(),
@@ -3536,6 +3554,32 @@ impl Node {
                         // A worker can return Busy after the canonical refresh scanned parked
                         // owners. Recheck before retaining its now-obsolete capability.
                         flow.authorization_changed = true;
+                    }
+                }
+            }
+            // An exchange the peer answered on this still-current attempt ends the port's
+            // transport failure streak, as a clean session the peer opened does (`Dir::In` in
+            // `actor.rs`, which clears the transport backoff). Without it, two transport failures
+            // half a minute apart, with any number of answered exchanges between, pace every later
+            // single failure as a sustained one: 30 s or more with the whole port stopped while
+            // the peer serves. A turn that only read locally (a fresh flow's initialization), a
+            // stale or pre-empted one, proves nothing about the peer and leaves the streak, so a
+            // peer that fails every exchange still escalates. `until` and the status book's
+            // `backoff` are left as they are on purpose: a pause already running is not cut
+            // short, and status keeps naming the pacing in force until it expires.
+            if valid && flow.peer_answered() {
+                if let Some(backoff) = self
+                    .ports
+                    .get_mut(&(work.room, work.peer))
+                    .and_then(|port| port.transport_backoff.as_mut())
+                    .filter(|backoff| backoff.failures > 0)
+                {
+                    #[cfg(feature = "test-knobs")]
+                    let kept = transport_streak_mutant();
+                    #[cfg(not(feature = "test-knobs"))]
+                    let kept = false;
+                    if !kept {
+                        backoff.failures = 0;
                     }
                 }
             }

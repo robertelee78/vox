@@ -516,7 +516,7 @@ enum RoomCmd {
     /// Set message lifetime, or use --steps to set Session-step lifetime separately.
     ///
     /// A step is one thing an agent did in its Session: a message, a command it ran, or a file
-    /// it edited. Steps default to seven days or the message lifetime, whichever is shorter.
+    /// it edited. Steps default to two days or the message lifetime, whichever is shorter.
     /// Durations are `1h`, `7d`, `1w`, `1m` (a month), seconds, or `forever`.
     ///
     /// Admins set the room rule; other members can shorten the lifetime on their own node.
@@ -674,7 +674,7 @@ pub struct RetentionArgs {
     /// Set Session-step lifetime separately from messages: `7d`, `1h`, seconds, or `forever`.
     ///
     /// A step is one thing an agent did in its Session: a message, a command it ran, or a file
-    /// it edited. The default is seven days or the message lifetime, whichever is shorter.
+    /// it edited. The default is two days or the message lifetime, whichever is shorter.
     /// Admins set the room rule; other members can only shorten their own node's lifetime.
     #[arg(long, value_name = "DURATION", conflicts_with = "duration")]
     pub steps: Option<String>,
@@ -1804,13 +1804,13 @@ pub enum NodeCmd {
         #[command(flatten)]
         account: AccountArgs,
     },
-    /// Unlock a node and always remember it for daemon restarts, updates and reboots.
-    /// On a Mac its passphrase is stored in the Keychain; elsewhere a nonempty passphrase
-    /// requires a persistent --passphrase-file. A node with no passphrase needs no secret stored.
+    /// Unlock a node and remember it for daemon restarts and crashes.
+    /// A Mac stores its passphrase in the Keychain. Linux keeps it in the kernel keyring until
+    /// reboot; choose --passphrase-file for recovery after reboot. Vox never writes that file.
     Unlock {
         /// The node.
         name: String,
-        /// Read the identity passphrase from this file (first line; `-` reads stdin on a Mac).
+        /// Read the identity passphrase from this file (first line; `-` reads stdin).
         #[arg(long)]
         passphrase_file: Option<PathBuf>,
         #[command(flatten)]
@@ -1841,8 +1841,8 @@ pub enum NodeCmd {
         #[command(flatten)]
         account: AccountArgs,
     },
-    /// Forget a node's remembered passphrase: it is removed from the Keychain, and the daemon no
-    /// longer makes the node Ready by itself when it starts. A Ready node stays Ready.
+    /// Forget a node's saved restart source and its Keychain or kernel-keyring secret.
+    /// The daemon no longer makes it Ready at start; a Ready node stays Ready.
     #[command(hide = true)]
     ForgetPassphrase {
         /// The node.
@@ -2557,6 +2557,8 @@ enum Cmd {
     /// it before anything is renamed, keeps the binary it replaced as `.vox-previous`, and
     /// refreshes your shell completions. Only an install `install.sh` or a previous `vox
     /// update` made is replaced in place; a build from source is refused, not overwritten.
+    /// A download, or a retained previous, that does not run on this machine is refused and
+    /// the reason is shown; the installed vox is never replaced by it.
     ///
     /// On a Mac, Vox.app is replaced whole. A running vox daemon is then restarted onto the new
     /// version: a node whose passphrase the daemon keeps is Ready again, and any other node

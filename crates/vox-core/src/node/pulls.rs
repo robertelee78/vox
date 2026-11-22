@@ -291,6 +291,7 @@ fn entry_receipts(paths: &Paths, entry: &Digest32) -> PathBuf {
 /// Keep the existing receipt until its exact replacement directory entry is durable. If a
 /// previous attempt stopped after linking it, only that same file may complete the move.
 fn move_legacy_receipt(paths: &Paths, file: &Path, entry: &Digest32) -> Result<(), String> {
+    paths.verify_profile().map_err(|e| e.to_string())?;
     let group = entry_receipts(paths, entry);
     let to = group.join(file.file_name().ok_or("receipt has no name")?);
     crate::node::paths::create_private_dir(&group).map_err(|e| e.to_string())?;
@@ -331,6 +332,7 @@ fn pending_dir(paths: &Paths) -> PathBuf {
 /// # Errors
 /// It cannot be recorded.
 pub fn begin(paths: &Paths, pulled: &Pulled) -> Result<(), String> {
+    paths.verify_profile().map_err(|e| e.to_string())?;
     let dir = pending_dir(paths);
     crate::node::paths::create_private_dir(&dir)
         .and_then(|()| {
@@ -348,6 +350,7 @@ pub fn begin(paths: &Paths, pulled: &Pulled) -> Result<(), String> {
 /// It cannot be recorded.
 pub fn finish(paths: &Paths, pulled: &Pulled) -> Result<(), String> {
     record(paths, pulled)?;
+    paths.verify_profile().map_err(|e| e.to_string())?;
     let _ = std::fs::remove_file(
         pending_dir(paths).join(format!("{}.json", b32_encode(&pulled.entry))),
     );
@@ -395,6 +398,9 @@ fn receipt_index(paths: &Paths, entry: &Digest32) -> PathBuf {
 /// A derived exact-entry pointer. Failure to save it cannot turn a completed, durable pull
 /// into a failure: the authoritative receipt remains readable by the streaming fallback.
 fn index_record(paths: &Paths, file: &Path, entry: &Digest32) {
+    if paths.verify_profile().is_err() {
+        return;
+    }
     let Some(name) = file.file_name() else {
         return;
     };
@@ -459,6 +465,7 @@ pub fn recorded_entry(paths: &Paths, entry: &Digest32) -> Option<Pulled> {
 /// # Errors
 /// The record cannot be written.
 pub fn record(paths: &Paths, pulled: &Pulled) -> Result<(), String> {
+    paths.verify_profile().map_err(|e| e.to_string())?;
     let mut nonce = [0u8; 8];
     getrandom::fill(&mut nonce).map_err(|e| format!("no randomness for the record: {e}"))?;
     // The authoritative receipts themselves are addressed by entry. A not-yet-pulled offer
@@ -567,6 +574,7 @@ fn saved_state(paths: &Paths, entry: &Digest32) -> Result<Option<SavedState>, St
 }
 
 fn save_state(paths: &Paths, offer: &Offer, state: SavedKind) -> Result<(), String> {
+    paths.verify_profile().map_err(|e| e.to_string())?;
     let path = state_path(paths, &offer.entry);
     let dir = path.parent().ok_or("pull state has no directory")?;
     let bytes = serde_json::to_vec(&SavedState {
@@ -669,6 +677,9 @@ fn receipt_revision(paths: &Paths) -> Result<[Option<std::time::SystemTime>; 3],
 }
 
 fn forget_receipt(paths: &Paths, receipt: &Path, entry: &Digest32) {
+    if paths.verify_profile().is_err() {
+        return;
+    }
     if std::fs::remove_file(receipt).is_ok() {
         let index = receipt_index(paths, entry);
         if std::fs::read_to_string(&index)
@@ -805,6 +816,7 @@ pub async fn pull_driven(
     paths: &Paths,
     driven: &Driven,
 ) -> Result<PathBuf, String> {
+    paths.verify_profile().map_err(|e| e.to_string())?;
     let sha = driven.sha256.to_ascii_lowercase();
     if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err("the file's SHA-256 is not one".into());
@@ -829,12 +841,16 @@ pub async fn pull_driven(
             hex(&crate::hash::sha256(driven.tag.as_bytes())[..8])
         ));
         let copied = {
-            let (part, sha) = (part.clone(), sha.clone());
-            tokio::task::spawn_blocking(move || copy_checked(&served, &part, size, &sha))
-                .await
-                .map_err(|e| e.to_string())
-                .and_then(|r| r)
+            let (part, sha, paths) = (part.clone(), sha.clone(), paths.clone());
+            tokio::task::spawn_blocking(move || {
+                paths.verify_profile().map_err(|e| e.to_string())?;
+                copy_checked(&served, &part, size, &sha)
+            })
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|r| r)
         };
+        paths.verify_profile().map_err(|e| e.to_string())?;
         if let Err(e) = copied {
             let _ = std::fs::remove_file(&part);
             return Err(e);
@@ -869,10 +885,14 @@ pub async fn pull_driven(
     };
     let name = safe_file_name(&offer.name);
     let part = dir.join(format!(".{name}.{}.part", hex(&offer.entry[..8])));
-    let received = receive(bound, &part, &offer).await;
+    let received = match paths.verify_profile() {
+        Ok(()) => receive(bound, &part, &offer).await,
+        Err(e) => Err(e.to_string()),
+    };
     let _ = handle
         .apply(NodeCommand::StopForward { local: bound })
         .await;
+    paths.verify_profile().map_err(|e| e.to_string())?;
     if let Err(e) = received {
         let _ = std::fs::remove_file(&part);
         return Err(e);
@@ -1212,6 +1232,7 @@ impl Pulls {
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 continue;
             }
+            self.paths.verify_profile().map_err(|e| e.to_string())?;
             let dir = room_dir(&self.paths, &room);
             let _ = crate::node::paths::create_private_dir(&dir);
             if let Some(why) = short_of_space(&dir, offer.size) {
@@ -1230,6 +1251,7 @@ impl Pulls {
         running.remove(&entry);
         match done {
             Ok(()) => {
+                self.paths.verify_profile().map_err(|e| e.to_string())?;
                 let _ = std::fs::remove_file(state_path(&self.paths, &entry));
                 landed(&self.paths).ok_or_else(|| "it was pulled, but its record is gone".into())
             }
@@ -1470,6 +1492,10 @@ impl Pulls {
             }
             // **Not dialled while it would fill the disk**, and said once; looked at again on the
             // next scan rather than retried on a timer.
+            if let Err(e) = self.paths.verify_profile() {
+                self.say_state_error(e.to_string());
+                return;
+            }
             let dir = room_dir(&self.paths, &offer.room);
             let _ = crate::node::paths::create_private_dir(&dir);
             if let Some(why) = short_of_space(&dir, offer.size) {
@@ -1522,7 +1548,11 @@ impl Pulls {
                 running.remove(&offer.entry);
                 match done {
                     Ok(()) => {
-                        let _ = std::fs::remove_file(state_path(&pulls.paths, &offer.entry));
+                        if let Err(e) = pulls.paths.verify_profile() {
+                            pulls.say_state_error(e.to_string());
+                        } else {
+                            let _ = std::fs::remove_file(state_path(&pulls.paths, &offer.entry));
+                        }
                     }
                     Err(why) => {
                         let wait_ms = wait_ms
@@ -1547,6 +1577,7 @@ impl Pulls {
 
     /// Pull `offer`, verify it, and put it in place.
     async fn pull(&self, offer: &Offer) -> Result<(), String> {
+        self.paths.verify_profile().map_err(|e| e.to_string())?;
         let dir = room_dir(&self.paths, &offer.room);
         crate::node::paths::create_private_dir(&dir).map_err(|e| e.to_string())?;
         if let Some(count) = offer.files {
@@ -1566,8 +1597,12 @@ impl Pulls {
         };
         let name = safe_file_name(&offer.name);
         let part = self.part_of(offer);
-        let received = receive(bound, &part, offer).await;
+        let received = match self.paths.verify_profile() {
+            Ok(()) => receive(bound, &part, offer).await,
+            Err(e) => Err(e.to_string()),
+        };
         let _ = self.apply(NodeCommand::StopForward { local: bound }).await;
+        self.paths.verify_profile().map_err(|e| e.to_string())?;
         if let Err(e) = received {
             let _ = std::fs::remove_file(&part);
             return Err(e);
@@ -1592,6 +1627,7 @@ impl Pulls {
     /// what is not already there as listed. A pull cut short is not recorded, so it is tried again,
     /// and that try keeps every file the first one finished.
     async fn pull_folder(&self, offer: &Offer, base: &Path, count: u64) -> Result<(), String> {
+        self.paths.verify_profile().map_err(|e| e.to_string())?;
         let dir = folder_dir(&self.paths, base, &offer.room, &offer.author, &offer.name);
         crate::node::paths::create_private_dir(&dir).map_err(|e| e.to_string())?;
         let bound = match self
@@ -1622,7 +1658,10 @@ impl Pulls {
                     .map(|f| (f.path.clone(), f.sha256.clone()))
                     .collect();
                 match begin(&self.paths, &pull) {
-                    Ok(()) => crate::node::folder::pull(bound, &dir, &list, &prior).await,
+                    Ok(()) => {
+                        crate::node::folder::pull_profile(bound, &dir, &list, &prior, &self.paths)
+                            .await
+                    }
                     Err(e) => Err((e, crate::node::folder::Pulled::default())),
                 }
             }
@@ -1631,7 +1670,9 @@ impl Pulls {
         let _ = self.apply(NodeCommand::StopForward { local: bound }).await;
         let done = pulled.map_err(|(e, _)| {
             // A folder made for a pull that put nothing in it goes again.
-            let _ = std::fs::remove_dir(&dir);
+            if self.paths.verify_profile().is_ok() {
+                let _ = std::fs::remove_dir(&dir);
+            }
             e
         })?;
         pull.files = done.placed;
@@ -1642,6 +1683,10 @@ impl Pulls {
     /// retention is known again. Receipts and the folder-reference check are streamed, never
     /// collected into a second copy of all the node's retained history.
     fn expire(&self) {
+        if let Err(e) = self.paths.verify_profile() {
+            self.say_state_error(e.to_string());
+            return;
+        }
         let now = now_ms();
         let retention: Option<BTreeMap<Digest32, u64>> = {
             let view = self.view.borrow();
@@ -1668,6 +1713,10 @@ impl Pulls {
         };
         let files = self.paths.files_dir();
         for _ in 0..64 {
+            if let Err(e) = self.paths.verify_profile() {
+                self.say_state_error(e.to_string());
+                return;
+            }
             if let Some(mut folder) = cursor.folder.take() {
                 // Retention may have changed while this bounded scan was suspended.
                 if !due(&folder.pulled) {
@@ -1713,7 +1762,7 @@ impl Pulls {
                             }
                             Ok(_) => {}
                         }
-                        remove_folder_copy(&folder.pulled.path, &folder.pulled.files);
+                        remove_folder_copy(&self.paths, &folder.pulled.path, &folder.pulled.files);
                         forget_receipt(&self.paths, &folder.receipt, &folder.pulled.entry);
                     }
                 }
@@ -1788,7 +1837,7 @@ impl Pulls {
 /// Delete a pulled folder copy at `dir`: each file this pull placed, `(path, sha256)`, that is
 /// still as it placed it (one the person changed is theirs, and stays), then every folder that
 /// leaves empty, `dir` too.
-fn remove_folder_copy(dir: &Path, placed: &[(String, String)]) {
+fn remove_folder_copy(paths: &Paths, dir: &Path, placed: &[(String, String)]) {
     let mut parents = BTreeSet::new();
     for (path, sha) in placed {
         if !crate::node::folder::safe_path(path) {
@@ -1797,6 +1846,9 @@ fn remove_folder_copy(dir: &Path, placed: &[(String, String)]) {
         let file = dir.join(path);
         let unchanged = std::fs::symlink_metadata(&file).is_ok_and(|m| m.is_file())
             && crate::node::folder::digest(&file).is_ok_and(|(now, _)| now == *sha);
+        if paths.verify_profile().is_err() {
+            return;
+        }
         if unchanged && std::fs::remove_file(&file).is_ok() {
             let mut at = file.parent();
             while let Some(p) = at.filter(|p| p.starts_with(dir) && *p != dir) {
@@ -1807,7 +1859,13 @@ fn remove_folder_copy(dir: &Path, placed: &[(String, String)]) {
     }
     // Deepest first, so a folder is empty by the time it is tried.
     for p in parents.iter().rev() {
+        if paths.verify_profile().is_err() {
+            return;
+        }
         let _ = std::fs::remove_dir(p);
+    }
+    if paths.verify_profile().is_err() {
+        return;
     }
     let _ = std::fs::remove_dir(dir);
 }
