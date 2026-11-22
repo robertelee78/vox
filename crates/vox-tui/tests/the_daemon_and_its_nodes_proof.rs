@@ -58,6 +58,14 @@ mod watchdog;
 #[path = "support/test_knobs.rs"]
 mod test_knobs;
 
+#[cfg(target_os = "linux")]
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+#[path = "support/typed.rs"]
+mod typed;
+#[cfg(target_os = "linux")]
+optional_proof::not_run!(a_systemd_user_unit_recovers_foreign_signals_and_honors_product_stop);
+
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -804,6 +812,188 @@ fn a_conversation_refuses_a_rebuilt_node_under_the_same_name() {
         "PRODUCT: a rebuilt node must not adopt the old conversation; registered={registered}; {notices}");
 }
 
+/// A daemon must not write into a directory substituted for the profile it opened: not by
+/// leave, pause or a new hook, and not by a session's end, which must neither create the
+/// registration lock in the replacement nor remove the replacement's own registration.
+/// Mutants: remove the shared profile-directory check, the session grant check, or the
+/// registration lock's check.
+#[test]
+#[ignore = "real daemon and encrypted profile; run in release with test-knobs"]
+fn a_room_leave_refuses_a_replaced_profile_directory() {
+    fn tree(root: &Path) -> Vec<(PathBuf, u32, Vec<u8>)> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fn visit(root: &Path, path: &Path, entries: &mut Vec<(PathBuf, u32, Vec<u8>)>) {
+            let metadata = std::fs::symlink_metadata(path).expect("APPARATUS: inspect profile");
+            let relative = path.strip_prefix(root).unwrap().to_owned();
+            let mode = metadata.permissions().mode();
+            if metadata.is_dir() {
+                entries.push((relative, mode, Vec::new()));
+                for entry in std::fs::read_dir(path).expect("APPARATUS: read profile directory") {
+                    visit(
+                        root,
+                        &entry.expect("APPARATUS: profile entry").path(),
+                        entries,
+                    );
+                }
+            } else if metadata.is_symlink() {
+                use std::os::unix::ffi::OsStrExt as _;
+                let target = std::fs::read_link(path).expect("APPARATUS: read profile symlink");
+                entries.push((relative, mode, target.as_os_str().as_bytes().to_vec()));
+            } else {
+                assert!(
+                    metadata.is_file(),
+                    "APPARATUS: unexpected profile entry {path:?}"
+                );
+                entries.push((
+                    relative,
+                    mode,
+                    std::fs::read(path).expect("APPARATUS: read profile file"),
+                ));
+            }
+        }
+
+        let mut entries = Vec::new();
+        visit(root, root, &mut entries);
+        entries.sort();
+        entries
+    }
+
+    watchdog::arm();
+    let a = Account::new();
+    a.make_node("agent");
+    let daemon = Daemon::start(&a, &["--node", "agent"], &[]);
+    daemon.expect("node agent is Ready", Duration::from_secs(30), |line| {
+        line.contains("node agent is Ready")
+    });
+    let room = make_room(&a, "agent");
+    let profile = a.data.join("nodes/agent");
+    let old = a.data.join("nodes/original-agent");
+    std::fs::rename(&profile, &old).expect("APPARATUS: move the opened profile");
+    let copy = Command::new("/bin/cp")
+        .arg("-R")
+        .arg(&old)
+        .arg(&profile)
+        .status()
+        .expect("APPARATUS: copy replacement profile");
+    assert!(
+        copy.success(),
+        "APPARATUS: copy replacement profile: {copy}"
+    );
+    std::fs::write(
+        profile.join("replacement-sentinel"),
+        b"replacement belongs here\n",
+    )
+    .expect("APPARATUS: write replacement sentinel");
+    let before = tree(&profile);
+    let (ok, out, err) = a.run(&["room", "leave", "--node", "agent", &room], "");
+    let after_leave = tree(&profile);
+    let (pause_ok, pause_out, pause_err) = a.run(&["room", "pause", "--node", "agent", &room], "");
+    let after_pause = tree(&profile);
+    let said = format!("{out}{err}");
+    let pause_said = format!("{pause_out}{pause_err}");
+    assert!(
+        !ok
+            && said.contains("profile directory")
+            && said.contains("gone or replaced")
+            && said.contains("nothing was written"),
+        "PRODUCT: leave must refuse the replaced profile in plain words; success={ok}, said: {said}"
+    );
+    assert_eq!(
+        before, after_leave,
+        "PRODUCT: room leave changed the replacement profile despite its refusal: {said}"
+    );
+    assert!(
+        !pause_ok
+            && pause_said.contains("profile directory")
+            && pause_said.contains("gone or replaced")
+            && pause_said.contains("nothing was written"),
+        "PRODUCT: pause must refuse the replaced profile in plain words; success={pause_ok}, said: {pause_said}"
+    );
+    assert_eq!(
+        before, after_pause,
+        "PRODUCT: room pause changed the replacement profile despite its refusal: {pause_said}"
+    );
+    let (hook_ok, hook_out, hook_err) = a.run(
+        &[
+            "agent",
+            "hook",
+            "--node",
+            "agent",
+            "--room",
+            &room,
+            "--session",
+            "s-replaced",
+            "--format",
+            "text",
+        ],
+        "",
+    );
+    let hook_said = format!("{hook_out}{hook_err}");
+    println!("replaced-profile hook: success={hook_ok}: {hook_said}");
+    assert!(
+        !profile.join("sessions/s-replaced.json").exists()
+            && !profile.join("sessions.lock").exists(),
+        "PRODUCT: a refused hook wrote a session registration or lock into the replacement: {hook_said}"
+    );
+    assert!(
+        hook_said.contains("profile directory")
+            && hook_said.contains("gone or replaced")
+            && hook_said.contains("nothing was written"),
+        "PRODUCT: the hook must explain the replaced-profile refusal: {hook_said}"
+    );
+    assert_eq!(
+        before,
+        tree(&profile),
+        "PRODUCT: the hook changed the replacement profile: {hook_said}"
+    );
+
+    // A restored profile holds its own registration. The old daemon serving that session's
+    // SessionEnd must leave it, and must not create the registration lock beside it.
+    fn listing(entries: &[(PathBuf, u32, Vec<u8>)]) -> String {
+        use std::hash::{Hash as _, Hasher as _};
+        entries
+            .iter()
+            .map(|(path, mode, bytes)| {
+                let mut hash = std::collections::hash_map::DefaultHasher::new();
+                bytes.hash(&mut hash);
+                format!(
+                    "{} mode={mode:o} size={} hash={:016x}",
+                    path.display(),
+                    bytes.len(),
+                    hash.finish()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+    std::fs::create_dir_all(profile.join("sessions"))
+        .expect("APPARATUS: make the replacement's sessions directory");
+    std::fs::write(
+        profile.join("sessions/s-restored.json"),
+        br#"{"session":"s-restored"}"#,
+    )
+    .expect("APPARATUS: write the replacement's own registration");
+    let before_end = tree(&profile);
+    let (end_ok, end_out, end_err) = a.hook("agent", "s-restored", "SessionEnd");
+    let after_end = tree(&profile);
+    println!("replaced-profile SessionEnd: success={end_ok}: {end_out}{end_err}");
+    let daemon_said = daemon.said();
+    for line in daemon_said
+        .lines()
+        .filter(|line| line.contains("gone or replaced"))
+    {
+        println!("daemon: {line}");
+    }
+    assert!(
+        !profile.join("sessions.lock").exists() && before_end == after_end,
+        "PRODUCT: the daemon's SessionEnd changed the replacement profile.\nbefore:\n{}\nafter:\n{}",
+        listing(&before_end),
+        listing(&after_end)
+    );
+    daemon.stop();
+}
+
 #[cfg(feature = "test-knobs")]
 #[test]
 #[ignore = "real binaries with production Argon2id; run in release"]
@@ -1146,7 +1336,7 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
             err.contains("could not read remembered state") && err.contains("it was not changed")
         };
         assert!(
-            !ok && truthful && !out.contains("Ready and remembered"),
+            !ok && truthful && !out.contains("Ready (remembered)"),
             "PRODUCT: failed persistence must fail unlock and name its partial state: {out}{err}"
         );
         let (_, shown, err) = a.run(&["node", "list"], "");
@@ -1169,7 +1359,7 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
         "",
     );
     assert!(
-        ok && out.contains("Ready and remembered"),
+        ok && out.contains("Ready (remembered)"),
         "PRODUCT: unlock must make the node Ready and remembered: {out}{err}"
     );
     let room = make_room(&a, "default");
@@ -1195,7 +1385,7 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
         ],
         "",
     );
-    assert!(!ok && err.contains("identity passphrase") && !out.contains("Ready and remembered"),
+    assert!(!ok && err.contains("identity passphrase") && !out.contains("Ready (remembered)"),
         "PRODUCT: a Ready protected node must reject empty input instead of remembering no passphrase: {out}{err}");
     let (_, listed, err) = a.run(&["node", "list"], "");
     assert!(
@@ -1215,7 +1405,7 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
         "",
     );
     assert!(
-        ok && out.contains("Ready and remembered"),
+        ok && out.contains("Ready (remembered)"),
         "PRODUCT: correct passphrase retry must remember the Ready node: {out}{err}"
     );
     let wrong = pass.with_extension("wrong");
@@ -1231,7 +1421,7 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
         ],
         "",
     );
-    assert!(!ok && err.contains("identity passphrase") && !out.contains("Ready and remembered"),
+    assert!(!ok && err.contains("identity passphrase") && !out.contains("Ready (remembered)"),
         "PRODUCT: wrong input must not replace an already-Ready node's usable restart secret: {out}{err}");
     // The restart and room read below prove the rejected replacement left usable material.
     stop_pid(a.lock_pid().expect("APPARATUS: unlocked node's daemon"));
@@ -1289,7 +1479,7 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
     );
     assert!(
         ok && err.contains("`vox node attach` is now `vox node unlock`")
-            && out.contains("Ready and remembered"),
+            && out.contains("Ready (remembered)"),
         "PRODUCT: attach --keep must be the remembering unlock alias: {out}{err}"
     );
     let (ok, out, err) = a.run(&["room", "read", &room], "");
@@ -1420,7 +1610,7 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
         ] {
             let (ok, out, err) = a.run(&args, "");
             assert!(!ok && err.contains("could not read remembered state") && err.contains("it was not changed")
-                && !out.contains("Ready and remembered") && !out.contains("Locked and forgotten"),
+                && !out.contains("Ready (remembered)") && !out.contains("Locked and forgotten"),
                 "PRODUCT: unreadable remembered state must be refused without claiming a change: {out}{err}");
         }
         let (ok, shown, err) = a.run(&["node", "list"], "");
@@ -1469,7 +1659,7 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
         "",
     );
     assert!(
-        ok && out.contains("Ready and remembered"),
+        ok && out.contains("Ready (remembered)"),
         "PRODUCT: unlock after the repaired lock must succeed: {out}{err}"
     );
     let (ok, out, err) = a.run(&["node", "attach", "default", "--no-remember"], "");
@@ -1493,7 +1683,7 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
         assert!(
             !ok && err.contains("Ready, but remembering could not be confirmed")
                 && err.contains("keychain")
-                && !out.contains("Ready and remembered"),
+                && !out.contains("Ready (remembered)"),
             "PRODUCT: a failed remember must fail unlock and name its partial state: {out}{err}"
         );
         let (_, listed, err) = a.run(&["node", "list"], "");
@@ -1611,6 +1801,928 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
         "PRODUCT: signed out, node default's rooms and messages must stay: attached again by hand \
          ({ok}: {out}{err}) its room must still read \"before the restart\"\nlog:\n{log}"
     );
+}
+
+/// A kernel without keyrings never refuses typed unlock, lock or forgetting.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "Linux namespace, seccomp or emulator with an unavailable user keyring; run in release"]
+fn a_linux_unavailable_keyring_keeps_unlock_ready_without_a_disk_secret() {
+    typed::require_disposable_keyring();
+    watchdog::arm();
+    let probe_name = format!("vox-rg11-unavailable-probe-{}", std::process::id());
+    let probe = Command::new("keyctl")
+        .args(["add", "user", &probe_name, "scratch", "@u"])
+        .output()
+        .expect("APPARATUS: probe the unavailable user keyring");
+    if probe.status.success() {
+        let key = String::from_utf8_lossy(&probe.stdout).trim().to_owned();
+        let _ = Command::new("keyctl").args(["revoke", &key]).status();
+        let _ = Command::new("keyctl").args(["unlink", &key, "@u"]).status();
+    }
+    let refusal = String::from_utf8_lossy(&probe.stderr);
+    eprintln!("Unavailable kernel keyring prerequisite: {refusal}");
+    assert!(
+        !probe.status.success()
+            && ["Function not implemented", "Operation not supported",]
+                .iter()
+                .any(|reason| refusal.contains(reason)),
+        "APPARATUS: this preservation proof needs an unavailable user keyring: {refusal}"
+    );
+    let a = Account::new();
+    struct Cleanup<'a>(&'a Account);
+    impl Drop for Cleanup<'_> {
+        fn drop(&mut self) {
+            if let Some(pid) = self.0.lock_pid() {
+                let _ = Command::new("/bin/kill")
+                    .args(["-TERM", &pid.to_string()])
+                    .status();
+            }
+        }
+    }
+    let _cleanup = Cleanup(&a);
+    a.make_node("default");
+    std::fs::remove_file(a._tmp.path().join("identity.pass")).unwrap();
+    let mut unlock = a.cmd(&["node", "unlock", "default"]);
+    unlock.env_remove("VOX_IDENTITY_PASSPHRASE");
+    let (ok, text) = typed::typed(&unlock, PASS);
+    eprintln!(
+        "Typed unlock without a keyring: {}",
+        text.replace(PASS, "[redacted]")
+    );
+    assert!(
+        ok && text.contains("Ready") && text.contains("not remembered") && text.contains("kernel keyring"),
+        "PRODUCT: an unavailable keyring must leave typed unlock successful and Ready, saying it is not remembered: {}",
+        text.replace(PASS, "[redacted]")
+    );
+    let mut status = a.cmd(&["status", "--node", "default", "--json"]);
+    status.env_remove("VOX_IDENTITY_PASSPHRASE");
+    let out = status.output().unwrap();
+    assert!(
+        out.status.success()
+            && serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["status"]
+                == "Ready",
+        "PRODUCT: failed remembering must not lock this daemon's Ready node"
+    );
+    fn no_plaintext(path: &Path) -> bool {
+        std::fs::read_dir(path).unwrap().all(|entry| {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                no_plaintext(&path)
+            } else if path.is_file() {
+                !std::fs::read(path)
+                    .unwrap()
+                    .windows(PASS.len())
+                    .any(|w| w == PASS.as_bytes())
+            } else {
+                true
+            }
+        })
+    }
+    assert!(
+        no_plaintext(a._tmp.path()),
+        "PRODUCT: unavailable keyring must not fall back to a plaintext secret on disk"
+    );
+    stop_pid(a.lock_pid().unwrap());
+    let mut restart = a.cmd(&["daemon", "--detach"]);
+    restart.env_remove("VOX_IDENTITY_PASSPHRASE");
+    assert!(
+        restart.output().unwrap().status.success(),
+        "APPARATUS: scratch daemon restart"
+    );
+    let mut status = a.cmd(&["status", "--node", "default"]);
+    status.env_remove("VOX_IDENTITY_PASSPHRASE");
+    let out = status.output().unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    eprintln!("Restart without a keyring: {text}");
+    assert!(
+        out.status.success() && text.contains("Locked") && text.contains("vox node unlock"),
+        "PRODUCT: without a kernel key or chosen file, restart must say Locked and the unlock command: {text}"
+    );
+    for args in [
+        ["node", "lock", "default"],
+        ["node", "forget-passphrase", "default"],
+    ] {
+        let mut command = a.cmd(&args);
+        command.env_remove("VOX_IDENTITY_PASSPHRASE");
+        let out = command.output().unwrap();
+        assert!(
+            out.status.success(),
+            "PRODUCT: an unavailable keyring must not refuse {args:?}: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// RG-11: a daemon from another login session reads a uid-owned, not possessed, kernel key.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "Linux kernel keyring and real typed unlock; run in release"]
+fn a_linux_typed_unlock_survives_another_sessions_daemon() {
+    typed::require_disposable_keyring();
+    fn fresh_session(a: &Account, args: &[&str]) -> Command {
+        let base = a.cmd(args);
+        let mut command = Command::new("/usr/bin/keyctl");
+        command
+            .args([
+                "session",
+                "-",
+                "/bin/sh",
+                "-c",
+                "keyctl clear @s && exec \"$@\"",
+                "sh",
+            ])
+            .arg(VOX)
+            .args(args)
+            .env_clear();
+        for (key, value) in base.get_envs() {
+            if let Some(value) = value {
+                command.env(key, value);
+            }
+        }
+        command.env_remove("VOX_IDENTITY_PASSPHRASE");
+        command
+    }
+    fn ready(a: &Account) -> (bool, String) {
+        let out = fresh_session(a, &["status", "--node", "default", "--json"])
+            .output()
+            .expect("APPARATUS: status in a new session");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let ready = out.status.success()
+            && serde_json::from_slice::<serde_json::Value>(&out.stdout)
+                .ok()
+                .is_some_and(|value| value["status"] == "Ready");
+        (ready, text)
+    }
+    fn settled_ready(a: &Account) -> bool {
+        let started = Instant::now();
+        loop {
+            let (ready, text) = ready(a);
+            if ready {
+                return true;
+            }
+            if text
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .any(|value| value["status"] == "Locked")
+            {
+                return false;
+            }
+            assert!(started.elapsed() < Duration::from_secs(60),
+                "APPARATUS: daemon never reported terminal Ready or Locked; no product verdict: {text}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    watchdog::arm();
+    let a = Account::new();
+    struct Cleanup<'a>(&'a Account);
+    impl Drop for Cleanup<'_> {
+        fn drop(&mut self) {
+            if let Some(pid) = self.0.lock_pid() {
+                let _ = Command::new("/bin/kill")
+                    .args(["-TERM", &pid.to_string()])
+                    .status();
+            }
+            use sha2::{Digest as _, Sha256};
+            let account = self
+                .0
+                .data
+                .join("nodes/default")
+                .to_string_lossy()
+                .into_owned();
+            let name = format!("us.vox.node:{:x}", Sha256::digest(account.as_bytes()));
+            if let Ok(found) = Command::new("keyctl")
+                .args(["search", "@u", "user", &name])
+                .output()
+            {
+                if found.status.success() {
+                    let key = String::from_utf8_lossy(&found.stdout).trim().to_owned();
+                    let _ = Command::new("keyctl").args(["revoke", &key]).status();
+                    let _ = Command::new("keyctl").args(["unlink", &key, "@u"]).status();
+                }
+            }
+        }
+    }
+    let _cleanup = Cleanup(&a);
+    a.make_node("default");
+    // Account's general staging file is not selected or available to this typed unlock.
+    std::fs::remove_file(a._tmp.path().join("identity.pass")).unwrap();
+    let (ok, text) = typed::typed(&fresh_session(&a, &["node", "unlock", "default"]), PASS);
+    eprintln!("Typed unlock: {}", text.replace(PASS, "[redacted]"));
+    assert!(
+        ok && text.contains("Ready"),
+        "APPARATUS: typed Linux unlock did not become Ready: {text}"
+    );
+    let pid = a.lock_pid().expect("APPARATUS: typed unlock daemon");
+    stop_pid(pid);
+    let out = fresh_session(&a, &["daemon", "--detach"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "APPARATUS: new-session daemon start: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        settled_ready(&a),
+        "PRODUCT: typed unlock must survive a daemon in a new, empty session keyring: {}; {}",
+        ready(&a).1,
+        a.log()
+    );
+    eprintln!(
+        "PASS linux.typed_unlock_survives_new_session_daemon: {}",
+        ready(&a).1
+    );
+
+    // A crash has the same key lifetime as an orderly restart.
+    let pid = a.lock_pid().unwrap();
+    Command::new("/bin/kill")
+        .args(["-KILL", &pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(
+        wait_until(Duration::from_secs(15), || !alive(pid)),
+        "APPARATUS: crashed daemon is still running"
+    );
+    let out = fresh_session(&a, &["daemon", "--detach"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "APPARATUS: daemon after crash: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        settled_ready(&a),
+        "PRODUCT: typed unlock must survive a crashed daemon: {}; {}",
+        ready(&a).1,
+        a.log()
+    );
+    eprintln!("PASS linux.typed_unlock_survives_crash: {}", ready(&a).1);
+
+    stop_pid(a.lock_pid().unwrap());
+    // Remove only this scratch node's key, never another key of the container user. Losing
+    // this boot-scoped credential stages what reboot does without rebooting the shared VM.
+    use sha2::{Digest as _, Sha256};
+    let account = a.data.join("nodes/default").to_string_lossy().into_owned();
+    let name = format!("us.vox.node:{:x}", Sha256::digest(account.as_bytes()));
+    let found = Command::new("keyctl")
+        .args(["search", "@u", "user", &name])
+        .output()
+        .unwrap();
+    assert!(
+        found.status.success(),
+        "APPARATUS: this node's boot-scoped key was not found: {}",
+        String::from_utf8_lossy(&found.stderr)
+    );
+    let key = String::from_utf8_lossy(&found.stdout).trim().to_owned();
+    let removed = Command::new("keyctl")
+        .args(["unlink", &key, "@u"])
+        .output()
+        .unwrap();
+    assert!(
+        removed.status.success(),
+        "APPARATUS: could not clear this scratch boot credential"
+    );
+    let out = fresh_session(&a, &["daemon", "--detach"]).output().unwrap();
+    assert!(out.status.success(), "APPARATUS: daemon after key loss");
+    let out = fresh_session(&a, &["status", "--node", "default"])
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("Locked") && text.contains("vox node unlock") && text.contains("default"),
+        "PRODUCT: after reboot without a chosen file, status must say Locked and how to unlock: {text}");
+    eprintln!("PASS linux.lost_boot_key_says_locked_and_unlock_command: {text}");
+    let pass = a._tmp.path().join("chosen.pass");
+    std::fs::write(&pass, format!("{PASS}\n")).unwrap();
+    let out = fresh_session(
+        &a,
+        &[
+            "node",
+            "unlock",
+            "default",
+            "--passphrase-file",
+            pass.to_str().unwrap(),
+        ],
+    )
+    .output()
+    .unwrap();
+    assert!(
+        out.status.success(),
+        "APPARATUS: chosen-file unlock: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    stop_pid(a.lock_pid().unwrap());
+    let out = fresh_session(&a, &["daemon", "--detach"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "APPARATUS: daemon with chosen-file recovery"
+    );
+    assert!(
+        settled_ready(&a),
+        "PRODUCT: after losing the boot key, the chosen file must restore Ready: {}; {}",
+        ready(&a).1,
+        a.log()
+    );
+    eprintln!(
+        "PASS linux.chosen_file_restores_ready_after_boot_key_loss: {}",
+        ready(&a).1
+    );
+    let _ = a.run(&["node", "lock", "default"], "");
+    stop_pid(a.lock_pid().unwrap());
+}
+
+/// RG-9: real systemd in the authorized disposable container, not an in-process supervisor.
+#[cfg(all(target_os = "linux", feature = "optional-proofs"))]
+#[test]
+#[ignore = "optional: a systemd user session in the authorized vox-rg9 container"]
+fn a_systemd_user_unit_recovers_foreign_signals_and_honors_product_stop() {
+    use std::collections::BTreeMap;
+    use vox_core::node::daemonipc::{DaemonClient, DaemonFrame, DaemonRequest};
+    fn manager(args: &[&str]) -> std::process::Output {
+        Command::new("systemctl")
+            .arg("--user")
+            .args(args)
+            .output()
+            .expect("APPARATUS: run the scratch user's systemctl")
+    }
+    fn properties(unit: &str) -> BTreeMap<String, String> {
+        let output = manager(&[
+            "show",
+            unit,
+            "--property=MainPID,ActiveState,SubState,ExecMainStatus,Result,NRestarts,Job",
+        ]);
+        assert!(
+            output.status.success(),
+            "APPARATUS: inspect our user unit: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                line.split_once('=')
+                    .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            })
+            .collect()
+    }
+    fn pid(state: &BTreeMap<String, String>) -> Option<u32> {
+        state
+            .get("MainPID")?
+            .parse::<u32>()
+            .ok()
+            .filter(|pid| *pid > 1)
+    }
+    fn serving(a: &Account, unit: &str, old: Option<u32>, recovery: bool) -> u32 {
+        let began = Instant::now();
+        loop {
+            let state = properties(unit);
+            if let Some(current) = pid(&state).filter(|current| Some(*current) != old) {
+                if a.log().contains(&format!("serving (pid {current})")) {
+                    eprintln!("[proof] manager owns serving pid {current}: {state:?}");
+                    return current;
+                }
+            }
+            assert!(!(recovery && state.get("ActiveState").is_some_and(|s| s == "inactive")
+                && state.get("ExecMainStatus").is_some_and(|s| s == "0")),
+                "PRODUCT: a foreign TERM was reported as a successful stop, so Restart=on-failure left no daemon: {state:?}\n{}", a.log());
+            assert!(
+                began.elapsed() < Duration::from_secs(60),
+                "APPARATUS: user unit never reached a new serving generation: {state:?}\n{}",
+                a.log()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    fn stop(a: &Account, unit: &str) {
+        let account = vox_core::node::paths::Account::of(Some(&a.data), Some(&a.cfg)).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let reply = runtime.block_on(async {
+            let mut client = DaemonClient::open(&account.socket())
+                .await
+                .expect("APPARATUS: reach the unit's serving daemon");
+            client
+                .request(DaemonRequest::Stop)
+                .await
+                .expect("PRODUCT: explicit Stop was not acknowledged")
+        });
+        assert!(
+            matches!(reply, DaemonFrame::Ok),
+            "PRODUCT: explicit Stop was refused: {reply:?}"
+        );
+        let mut final_state = BTreeMap::new();
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                final_state = properties(unit);
+                final_state
+                    .get("ActiveState")
+                    .is_some_and(|s| s == "inactive")
+            }),
+            "APPARATUS: explicit Stop did not finish: {final_state:?}\n{}",
+            a.log()
+        );
+        assert!(pid(&final_state).is_none()
+            && final_state.get("ExecMainStatus").is_some_and(|s| s == "0")
+            && final_state.get("Result").is_some_and(|s| s == "success")
+            && final_state.get("Job").is_none_or(|s| s.is_empty() || s == "0"),
+            "PRODUCT: explicit Stop must leave the on-failure unit stopped with no queued restart: {final_state:?}\n{}", a.log());
+        eprintln!("[proof] explicit product Stop leaves the unit stopped: {final_state:?}");
+    }
+    struct Unit {
+        name: String,
+        path: PathBuf,
+        data: PathBuf,
+    }
+    impl Drop for Unit {
+        fn drop(&mut self) {
+            // All these processes were started for this proof's private profile, including its worker.
+            for pid in daemons_of(&self.data) {
+                let _ = Command::new("kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .status();
+            }
+            let _ = manager(&["stop", &self.name]);
+            let _ = std::fs::remove_file(&self.path);
+            let _ = manager(&["daemon-reload"]);
+        }
+    }
+    watchdog::arm();
+    assert!(
+        Path::new("/run/.containerenv").exists()
+            && std::env::var("VOX_PROOF_SYSTEMD_CONTAINER")
+                .is_ok_and(|name| name.starts_with("vox-rg9-")),
+        "APPARATUS: this proof runs only in its authorized disposable podman container"
+    );
+    let a = Account::new();
+    a.make_node("default");
+    let name = format!("vox-rg9-{}.service", std::process::id());
+    let runtime = PathBuf::from(
+        std::env::var_os("XDG_RUNTIME_DIR").expect("APPARATUS: container user runtime directory"),
+    );
+    let directory = runtime.join("systemd/user");
+    std::fs::create_dir_all(&directory).expect("APPARATUS: user unit directory");
+    let path = directory.join(&name);
+    assert!(
+        !path.exists(),
+        "APPARATUS: refusing an existing unit {}",
+        path.display()
+    );
+    // Vox ships no unit. This proof enrolls only its private on-failure unit.
+    std::fs::write(&path, format!(
+        "[Unit]\nDescription=Vox RG-9 proof\n[Service]\nExecStart={VOX} daemon --no-node --listen 127.0.0.1:0 --data-dir {} --config-dir {}\nEnvironment=VOX_DATA_DIR={} VOX_CONFIG_DIR={} VOX_PROXY=127.0.0.1:0 HOME={}\nRestart=on-failure\nRestartSec=1\n",
+        a.data.display(), a.cfg.display(), a.data.display(), a.cfg.display(), a._tmp.path().join("home").display()
+    )).expect("APPARATUS: write our scratch unit");
+    let unit = Unit {
+        name,
+        path,
+        data: a.data.clone(),
+    };
+    for args in [vec!["daemon-reload"], vec!["start", unit.name.as_str()]] {
+        let output = manager(&args);
+        assert!(
+            output.status.success(),
+            "APPARATUS: enroll our user unit: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let first = serving(&a, &unit.name, None, false);
+    let (ok, out, err) = a.run(&["node", "attach", "default"], "");
+    assert!(
+        ok,
+        "APPARATUS: attach the scratch node before TERM: {out}{err}"
+    );
+    let (ok, out, err) = a.run(&["status", "--json"], "");
+    assert!(ok, "APPARATUS: initial vox status failed: {out}{err}");
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &first.to_string()])
+            .status()
+            .unwrap()
+            .success(),
+        "APPARATUS: send TERM only to the unit daemon this proof started"
+    );
+    // No vox client has run: manager state plus the product's own serving line decide recovery.
+    let recovered = serving(&a, &unit.name, Some(first), true);
+    assert_ne!(
+        first, recovered,
+        "PRODUCT: foreign TERM left the same daemon generation"
+    );
+    let (ok, out, err) = a.run(&["node", "attach", "default"], "");
+    assert!(
+        ok,
+        "PRODUCT: attach after manager recovery failed: {out}{err}"
+    );
+    let (ok, out, err) = a.run(&["status", "--json"], "");
+    assert!(
+        ok,
+        "PRODUCT: vox status after manager recovery failed: {out}{err}"
+    );
+    let report: serde_json::Value = serde_json::from_str(&out)
+        .unwrap_or_else(|e| panic!("PRODUCT: vox status was not JSON: {e}: {out}"));
+    assert_eq!(
+        report["log_path"].as_str(),
+        a.data.join(".daemon/log").to_str(),
+        "PRODUCT: recovered vox status did not report this daemon's log: {out}"
+    );
+    assert!(
+        pid(&properties(&unit.name)) == Some(recovered) && a.lock_pid() == Some(recovered),
+        "PRODUCT: vox status did not use the manager's replacement: {out}{err}"
+    );
+    eprintln!("[proof] vox status after TERM: {out}");
+    stop(&a, &unit.name);
+}
+
+/// RG-9: an explicit product Stop is final; a foreign signal remains a clean but failed exit.
+#[test]
+#[ignore = "real daemon processes; run in release with test-knobs on macOS"]
+fn a_product_stop_exits_zero_and_foreign_signals_exit_for_the_manager() {
+    use vox_core::node::daemonipc::{DaemonClient, DaemonFrame, DaemonRequest};
+    struct Owned(Daemon);
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            if self.0.child.try_wait().ok().flatten().is_none() {
+                let _ = self.0.child.kill();
+                let _ = self.0.child.wait();
+            }
+        }
+    }
+    fn start(a: &Account, args: &[&str]) -> Owned {
+        let daemon = Owned(Daemon::start(a, args, &[]));
+        assert!(
+            wait_until(Duration::from_secs(30), || daemon
+                .0
+                .said()
+                .contains("control socket")),
+            "APPARATUS: the daemon did not start serving: {}",
+            daemon.0.said()
+        );
+        daemon
+    }
+    watchdog::arm();
+    let a = Account::new();
+    let account = vox_core::node::paths::Account::of(Some(&a.data), Some(&a.cfg))
+        .expect("APPARATUS: scratch account paths");
+    let mut daemon = start(&a, &["--login-item", "--no-node"]);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let stopped = runtime.block_on(async {
+        let mut client = DaemonClient::open(&account.socket())
+            .await
+            .expect("APPARATUS: connect to the serving daemon");
+        client
+            .request(DaemonRequest::Stop)
+            .await
+            .expect("PRODUCT: the explicit product stop was not acknowledged")
+    });
+    assert!(
+        matches!(stopped, DaemonFrame::Ok),
+        "PRODUCT: the product's explicit Stop was refused: {stopped:?}"
+    );
+    let status = daemon
+        .0
+        .child
+        .wait()
+        .expect("APPARATUS: reap explicitly stopped daemon");
+    eprintln!("[proof] explicit Stop: {status}\n{}", daemon.0.said());
+    assert!(
+        status.success()
+            && daemon
+                .0
+                .said()
+                .contains("stop requested by the product's control client"),
+        "PRODUCT: an explicit product Stop must exit zero after clean shutdown: {status}\n{}",
+        daemon.0.said()
+    );
+    drop(daemon);
+
+    for (signal, code) in [("TERM", 71), ("HUP", 71), ("INT", 71), ("QUIT", 71)] {
+        let mut daemon = start(&a, &["--login-item", "--no-node"]);
+        let pid = daemon.0.child.id();
+        let sent = Command::new("kill")
+            .args([&format!("-{signal}"), &pid.to_string()])
+            .status()
+            .expect("APPARATUS: signal the daemon this proof started");
+        assert!(
+            sent.success(),
+            "APPARATUS: could not send SIG{signal} to owned pid {pid}"
+        );
+        let status = daemon
+            .0
+            .child
+            .wait()
+            .expect("APPARATUS: reap signal-stopped daemon");
+        let said = daemon.0.said();
+        eprintln!("[proof] foreign SIG{signal} stopped pid {pid}: {status}\n{said}");
+        assert!(status.code() == Some(code) && said.contains(&format!("stopped by SIG{signal}"))
+            && !said.contains("did not finish stopping"),
+            "PRODUCT: SIG{signal} must finish clean shutdown then exit {code}, so a service manager can recover it; got {status}:\n{said}");
+    }
+
+    let mut daemon = start(&a, &["--no-node"]);
+    let pid = daemon.0.child.id();
+    let sent = Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .expect("APPARATUS: signal the hand-run daemon this proof started");
+    assert!(
+        sent.success(),
+        "APPARATUS: could not send SIGTERM to owned pid {pid}"
+    );
+    let status = daemon
+        .0
+        .child
+        .wait()
+        .expect("APPARATUS: reap hand-run daemon");
+    let said = daemon.0.said();
+    eprintln!("[proof] hand-run SIGTERM stopped pid {pid}: {status}\n{said}");
+    assert!(
+        status.success()
+            && said.contains("vox daemon: stopped by SIGTERM")
+            && !said.contains("a service manager may start it again")
+            && !said.contains("did not finish stopping"),
+        "PRODUCT: a hand-run daemon stopped by SIGTERM must exit zero with its old words and no service-manager claim; got {status}:\n{said}"
+    );
+}
+
+/// The room read is issued while no daemon can answer, not after a client has healed a gap.
+/// Unpaused reads may truthfully report saved history preparing; the fixture lets that finish
+/// before asserting news, while keeping its paused clients below their existing 10 s deadline.
+#[cfg(feature = "test-knobs")]
+#[test]
+#[ignore = "real daemon processes and production Argon2id; run in release"]
+fn a_room_read_during_restart_waits_for_one_replacement() {
+    restart_with_a_staged_stop(false);
+}
+
+/// No healing client runs until the replacement is observed serving after its caller dies.
+#[cfg(feature = "test-knobs")]
+#[test]
+#[ignore = "real daemon processes and production Argon2id; run in release"]
+fn a_restart_caller_killed_during_stop_leaves_a_daemon_serving() {
+    restart_with_a_staged_stop(true);
+}
+
+#[cfg(feature = "test-knobs")]
+fn restart_with_a_staged_stop(killed: bool) {
+    use vox_core::node::daemonipc::DaemonClient;
+    struct Actors {
+        children: Vec<Child>,
+        data: PathBuf,
+        hold: PathBuf,
+    }
+    impl Drop for Actors {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.hold);
+            for child in &mut self.children {
+                if child.try_wait().ok().flatten().is_none() {
+                    let _ = Command::new("kill")
+                        .args(["-CONT", &child.id().to_string()])
+                        .status();
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+            for pid in daemons_of(&self.data) {
+                let _ = Command::new("kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .status();
+            }
+        }
+    }
+    fn signal(pid: u32, what: &str) {
+        assert!(
+            Command::new("kill")
+                .args([what, &pid.to_string()])
+                .status()
+                .unwrap()
+                .success(),
+            "APPARATUS: {what} to owned pid {pid}"
+        );
+    }
+    fn output(a: &Account, name: &str, args: &[&str]) -> (Child, PathBuf) {
+        let path = a._tmp.path().join(name);
+        let file = std::fs::File::create(&path).unwrap();
+        let child = a
+            .cmd(args)
+            .stdout(file.try_clone().unwrap())
+            .stderr(file)
+            .spawn()
+            .unwrap();
+        (child, path)
+    }
+    watchdog::arm();
+    test_knobs::require(&["VOX_TEST_STOP_HOLD_NODE", "VOX_TEST_STOP_HOLD_FILE"]);
+    let a = Account::new();
+    a.make_node("default");
+    let hold = a._tmp.path().join("hold-stop");
+    std::fs::write(&hold, "").unwrap();
+    let pass = a._tmp.path().join("identity.pass");
+    let mut old = Daemon::start(
+        &a,
+        &[
+            "--node",
+            "default",
+            "--keep",
+            "--passphrase-file",
+            pass.to_str().unwrap(),
+        ],
+        &[
+            ("VOX_TEST_STOP_HOLD_NODE", "default"),
+            ("VOX_TEST_STOP_HOLD_FILE", hold.to_str().unwrap()),
+        ],
+    );
+    let mut actors = Actors {
+        children: Vec::new(),
+        data: a.data.clone(),
+        hold,
+    };
+    assert!(
+        wait_until(Duration::from_secs(60), || old
+            .said()
+            .contains("control socket")),
+        "APPARATUS: initial daemon never served: {}",
+        old.said()
+    );
+    let room = make_room(&a, "default");
+    let (ok, out, err) = a.run(
+        &["room", "post", &room, "news across the causal restart"],
+        "",
+    );
+    assert!(ok, "APPARATUS: post before restart: {out}{err}");
+    let from = a.log().len();
+    let (caller, caller_out) = output(&a, "restart.out", &["daemon", "--restart"]);
+    let caller_pid = caller.id();
+    actors.children.push(caller);
+    assert!(
+        wait_until(Duration::from_secs(30), || old
+            .said()
+            .contains("test holding stop of node default")),
+        "APPARATUS: old daemon never reached its held stop: {}\n{}",
+        old.said(),
+        std::fs::read_to_string(&caller_out).unwrap_or_default()
+    );
+    let replacement = daemons_of(&a.data)
+        .into_iter()
+        .find(|pid| *pid != old.child.id() && *pid != caller_pid);
+    eprintln!(
+        "[proof] held old pid {}, caller {caller_pid}, replacement already started {replacement:?}",
+        old.child.id()
+    );
+    if killed {
+        actors.children[0].kill().unwrap();
+        let status = actors.children[0].wait().unwrap();
+        eprintln!("[proof] killed restart caller {caller_pid}: {status}");
+    } else {
+        signal(caller_pid, "-STOP");
+        if let Some(pid) = replacement {
+            signal(pid, "-STOP");
+        }
+    }
+    std::fs::remove_file(&actors.hold).unwrap();
+    assert!(
+        wait_until(Duration::from_secs(30), || old
+            .child
+            .try_wait()
+            .unwrap()
+            .is_some()),
+        "APPARATUS: released old daemon never exited: {}",
+        old.said()
+    );
+    let account = vox_core::node::paths::Account::of(Some(&a.data), Some(&a.cfg)).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let observe = || {
+        runtime
+            .block_on(DaemonClient::observe(&account.socket()))
+            .ok()
+    };
+    if killed {
+        let mut greeting = None;
+        let served = wait_until(Duration::from_secs(45), || {
+            greeting = observe();
+            greeting.as_ref().is_some_and(|d| d.pid != old.child.id())
+        });
+        let living = daemons_of(&a.data);
+        eprintln!("[proof] before any healing client: greeting {greeting:?}, scratch daemon pids {living:?}\n{}", a.log());
+        assert!(
+            served,
+            "PRODUCT: killed restarter left no serving replacement after the old daemon exited; \
+             observed {greeting:?}, daemon pids {living:?}\n{}",
+            a.log()
+        );
+    } else {
+        assert!(
+            std::os::unix::net::UnixStream::connect(account.socket()).is_err(),
+            "APPARATUS: replacement was not held before it served"
+        );
+        let commands = [
+            ("read", vec!["room", "read", room.as_str()]),
+            ("status", vec!["status", "--json"]),
+            ("rooms", vec!["room", "list"]),
+            ("nodes", vec!["node", "list"]),
+        ];
+        let resume_by = Instant::now() + Duration::from_secs(8);
+        let mut calls = Vec::new();
+        for (name, args) in commands {
+            let (client, client_out) = output(&a, &format!("during-{name}.out"), &args);
+            actors.children.push(client);
+            calls.push((name, client_out));
+        }
+        for (index, (name, path)) in calls.iter().enumerate() {
+            // Status uses the greeting without a waiting callback. It was issued in this
+            // same unbound window; its actual answer is checked after the replacement serves.
+            if *name == "status" {
+                if actors.children[index + 1].try_wait().unwrap().is_none() {
+                    signal(actors.children[index + 1].id(), "-STOP");
+                }
+                continue;
+            }
+            assert!(
+                wait_until(Duration::from_secs(5), || {
+                    let said = std::fs::read_to_string(path).unwrap_or_default();
+                    said.contains("vox: waiting")
+                        || actors.children[index + 1].try_wait().unwrap().is_some()
+                }),
+                "APPARATUS: {name} neither waited nor answered in the staged gap"
+            );
+            if actors.children[index + 1].try_wait().unwrap().is_none() {
+                signal(actors.children[index + 1].id(), "-STOP");
+            }
+        }
+        if let Some(pid) = replacement {
+            signal(pid, "-CONT");
+        }
+        signal(caller_pid, "-CONT");
+        let mut ready = String::new();
+        assert!(
+            wait_until(resume_by.saturating_duration_since(Instant::now()), || {
+                let (ok, out, err) = a.run(&["room", "read", &room], "");
+                ready = format!("{out}{err}");
+                ok && ready.contains("news across the causal restart")
+            }),
+            "APPARATUS: replacement preparation missed the 8 s client-pause budget: {ready}"
+        );
+        for (index, (name, path)) in calls.iter().enumerate() {
+            assert!(Instant::now() < resume_by,
+                "APPARATUS: client pause exceeded 8 s, too close to the existing 10 s greeting deadline");
+            if actors.children[index + 1].try_wait().unwrap().is_none() {
+                signal(actors.children[index + 1].id(), "-CONT");
+            }
+            let status = actors.children[index + 1].wait().unwrap();
+            let said = std::fs::read_to_string(path).unwrap_or_default();
+            eprintln!("[proof] {name} issued in no-daemon gap: {status}: {said}");
+            assert!(status.success(),
+                "PRODUCT: {name} issued during restart did not receive its answer: {status}: {said}");
+            assert!(
+                name != &"read" || said.contains("news across the causal restart"),
+                "PRODUCT: room read issued during restart lost its news: {said}"
+            );
+            assert!(
+                *name == "status" || said.contains("vox: waiting"),
+                "PRODUCT: {name} did not wait during the held restart: {said}"
+            );
+        }
+        let restart_status = actors.children[0].wait().unwrap();
+        assert!(
+            restart_status.success(),
+            "PRODUCT: restart failed: {}",
+            std::fs::read_to_string(&caller_out).unwrap_or_default()
+        );
+    }
+    let mut result = (false, String::new(), String::new());
+    let ready = wait_until(Duration::from_secs(60), || {
+        result = a.run(&["room", "read", &room], "");
+        result.0 && result.1.contains("news across the causal restart")
+    });
+    let (ok, news, err) = result;
+    let log = a.log();
+    let generations = log
+        .get(from..)
+        .unwrap_or("")
+        .matches("vox daemon: serving (pid ")
+        .count();
+    eprintln!("[proof] caller killed={killed}; replacement generations={generations}; room read {ok}: {news}{err}\n{log}");
+    assert!(
+        ready && ok && news.contains("news across the causal restart"),
+        "PRODUCT: replacement did not serve the remembered room: {news}{err}"
+    );
+    assert_eq!(generations, 1,
+        "PRODUCT: restart must create exactly one replacement generation, got {generations}:\n{log}");
 }
 
 /// RG-9: a client arriving in a restart waits for its owner, even if the caller dies.
@@ -1746,15 +2858,22 @@ fn a_restart_owns_its_replacement_while_a_client_waits() {
             || !client_ok
             || !out.contains("already running")
             || !hook.0
-            || !err.contains("waiting for the daemon restart")
-            || !hook.2.contains("waiting for the daemon restart")
+            || !err.contains("daemon restart")
+            || !hook.2.contains("daemon restart")
         {
             stop_pid(replacement);
         }
         assert!(client_ok && out.contains("already running"),
             "PRODUCT: a client during restart started a competing daemon instead of waiting: {out}{err}; restart: {restart}");
         assert!(
-            err.contains("waiting for the daemon restart"),
+            !hook.1.contains("ask the operator to restart")
+                && !hook.2.contains("ask the operator to restart"),
+            "PRODUCT: a prompt during restart incorrectly blamed a broken daemon: {}{}",
+            hook.1,
+            hook.2
+        );
+        assert!(
+            err.contains("daemon restart"),
             "APPARATUS: the client did not arrive during the restart: {out}{err}"
         );
         assert!(
@@ -1765,7 +2884,7 @@ fn a_restart_owns_its_replacement_while_a_client_waits() {
             a.log()
         );
         assert!(
-            hook.2.contains("waiting for the daemon restart"),
+            hook.2.contains("daemon restart"),
             "APPARATUS: the hook did not arrive during the restart: {}{}",
             hook.1,
             hook.2

@@ -171,6 +171,7 @@ impl Event {
 #[derive(Clone)]
 pub struct DecisionLog {
     dir: PathBuf,
+    opened: Option<crate::node::paths::FileIdentity>,
     /// The sealing key while the identity is unlocked; `None` while it is locked.
     key: Arc<std::sync::Mutex<Option<Arc<Sek>>>>,
     /// Decisions taken while locked, `(day, event)`, written when the key returns.
@@ -210,6 +211,7 @@ impl DecisionLog {
     pub fn new(node_dir: &Path) -> Self {
         Self {
             dir: node_dir.join(DECISIONS_DIR),
+            opened: crate::node::paths::FileIdentity::of(node_dir).ok(),
             key: Arc::default(),
             pending: Arc::default(),
             pruned: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -270,6 +272,10 @@ impl DecisionLog {
     /// Left in place, the first unlock's local-trust import failed on them (`AtRestUnlockFailed`)
     /// and automatic local trust never applied, with nothing said of why.
     pub fn start_fresh(&self, now_ms: u64) {
+        if let Err(e) = self.verify_profile() {
+            eprintln!("vox: {e}");
+            return;
+        }
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
             return;
         };
@@ -318,6 +324,10 @@ impl DecisionLog {
     /// then remove it (#563: never left readable). A day whose events cannot all be written is
     /// left for the next unlock.
     fn seal_plaintext_days(&self, key: &Sek) {
+        if let Err(e) = self.verify_profile() {
+            eprintln!("vox: {e}");
+            return;
+        }
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
             return;
         };
@@ -338,6 +348,10 @@ impl DecisionLog {
                 .lines()
                 .filter(|l| Event::of(l).is_some())
                 .try_for_each(|l| self.append(key, day, l));
+            if let Err(e) = self.verify_profile() {
+                eprintln!("vox: {e}");
+                return;
+            }
             if sealed.is_ok() {
                 let _ = std::fs::remove_file(&path);
             }
@@ -477,7 +491,18 @@ impl DecisionLog {
         }
     }
 
+    fn verify_profile(&self) -> crate::error::Result<()> {
+        crate::node::paths::verify_profile_directory(
+            self.dir.parent().ok_or(crate::error::Error::Profile(
+                "decision directory has no parent",
+            ))?,
+            self.opened,
+        )
+    }
+
     fn append(&self, key: &Sek, day: i64, line: &str) -> std::io::Result<()> {
+        self.verify_profile()
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
         crate::node::paths::create_private_dir(&self.dir)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         let sealed = seal_segment(key, SEALED_KIND, day_id(day), line.as_bytes())
@@ -723,6 +748,10 @@ impl DecisionLog {
     /// Remove every day's file older than [`KEEP_DAYS`] before `today`. A file whose name is not a
     /// date this module writes is left alone.
     pub fn prune(&self, today: i64) {
+        if let Err(e) = self.verify_profile() {
+            eprintln!("vox: {e}");
+            return;
+        }
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
             return;
         };

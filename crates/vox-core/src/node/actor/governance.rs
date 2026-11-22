@@ -53,7 +53,8 @@ pub(super) struct Maintenance {
     /// removes only its room from this set.
     pub(super) settled: BTreeSet<Digest32>,
     pub(super) consent_after: BTreeMap<Digest32, Digest32>,
-    deadlines: BTreeMap<Digest32, u64>,
+    pub(super) trust_waiting: BTreeMap<Digest32, Option<governance_save::TrustRetry>>,
+    pub(super) deadlines: BTreeMap<Digest32, u64>,
     deadline_order: BTreeSet<(u64, Digest32)>,
     /// Admin changes already committed to the room log whose board roster still owes a
     /// successful projection.  A refresh or Computer-policy handoff is retryable, not a reason
@@ -109,6 +110,9 @@ impl Maintenance {
             self.deadline_order.remove(&(deadline, room));
             self.deadlines.remove(&room);
             self.settled.remove(&room);
+            if self.trust_waiting.get(&room).is_some_and(Option::is_none) {
+                self.trust_waiting.remove(&room);
+            }
             // A deadline can expire while a bounded sweep is already beyond this room.  The
             // current sweep cannot observe it, and its completion replaces `pending` with
             // `again`; carry a second sweep explicitly instead of waiting for unrelated work.
@@ -137,6 +141,9 @@ impl Maintenance {
     /// do not invalidate an already checked governance fold.
     pub(super) fn wake_room(&mut self, room: Digest32) {
         self.settled.remove(&room);
+        if self.trust_waiting.get(&room).is_some_and(Option::is_none) {
+            self.trust_waiting.remove(&room);
+        }
         // If the active ordered sweep has already visited this room, its completion replaces
         // `pending` with `again`. Carry the wake across that boundary instead of losing it.
         if self.after.is_some_and(|after| room <= after) {
@@ -293,6 +300,7 @@ impl Node {
             self.governance_work.pending = false;
             self.governance_work.after = None;
             self.governance_work.settled.clear();
+            self.governance_work.trust_waiting.clear();
             self.governance_work.deadlines.clear();
             self.governance_work.deadline_order.clear();
             self.governance_work.policy_interrupted.clear();
@@ -312,6 +320,9 @@ impl Node {
             self.governance_work
                 .settled
                 .retain(|room| self.channels.contains_key(room));
+            self.governance_work
+                .trust_waiting
+                .retain(|room, _| self.channels.contains_key(room));
             self.governance_work
                 .admin_rosters
                 .retain(|room| self.channels.contains_key(room));
@@ -334,10 +345,66 @@ impl Node {
             pending.owe_governance(&shared, self.delivery_epoch);
             return;
         }
-        let Ok(channel) = shared.try_lock() else {
+        if !self.governance_work.deadlines.contains_key(&room)
+            && self
+                .governance_work
+                .trust_waiting
+                .get(&room)
+                .is_some_and(Option::is_some)
+        {
+            let Some(Some(retry)) = self.governance_work.trust_waiting.remove(&room) else {
+                unreachable!();
+            };
+            self.begin_pending_maintenance(
+                room,
+                maintenance_save::Work::Projection(
+                    crate::node::channel::session_projection::ProjectionWork::Governance,
+                ),
+                maintenance_save::Continuation::Governance(retry.continuation),
+                retry.reply,
+            )
+            .await;
+            return;
+        }
+        let Ok(mut channel) = shared.try_lock() else {
             self.governance_work.again = true;
             return;
         };
+        let generation = self.trust_generation;
+        if channel.is_poisoned() {
+            return;
+        }
+        if !self.governance_work.trust_waiting.contains_key(&room)
+            && !channel.trust_reconciled(generation)
+            && self.profile.as_ref().is_some_and(|profile| {
+                channel
+                    .require_governance_ready(profile.store(), self.now_ms())
+                    .is_ok()
+            })
+        {
+            let trusted = self.trust.trusted();
+            channel.owe_private_support();
+            drop(channel);
+            let continuation = governance_save::Continuation::trust(
+                shared,
+                self.delivery_epoch,
+                trusted.clone(),
+                generation,
+            );
+            self.begin_pending_maintenance(
+                room,
+                maintenance_save::Work::Trust(trust_save::Work(
+                    crate::node::channel::pending_trust::TrustWrite::Delete {
+                        trusted,
+                        withdrawn: None,
+                    },
+                )),
+                maintenance_save::Continuation::Governance(continuation),
+                None,
+            )
+            .await;
+            return;
+        }
         drop(channel);
         let continuation = governance_save::Continuation::turn(shared, self.delivery_epoch);
         self.begin_pending_maintenance(

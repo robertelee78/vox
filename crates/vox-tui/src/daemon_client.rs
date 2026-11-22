@@ -113,6 +113,10 @@ pub async fn ensure_daemon_for_hook(
     )
     .await;
     match greeted {
+        Err(_) if restarting(account)? => {
+            eprintln!("vox: waiting for the daemon restart");
+            return Ok(HookDaemon::Starting);
+        }
         Err(_) => return Ok(HookDaemon::Unanswered),
         Ok(Ok(_)) => return Ok(HookDaemon::Ready),
         Ok(Err(e @ vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Silent { .. }))) => {

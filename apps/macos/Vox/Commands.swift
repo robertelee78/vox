@@ -510,7 +510,7 @@ private struct RetentionSheet: View {
             Text("A step is one thing an agent did in its Session: a message, a command it ran, or a file it edited.")
                 .secondaryText()
                 .accessibilityIdentifier("step-retention-meaning")
-            Text("By default, steps last for seven days or the message lifetime, whichever is shorter.")
+            Text("By default, steps last for two days or the message lifetime, whichever is shorter.")
                 .secondaryText()
             if let value = model.stepRetention {
                 Picker(model.stepRetentionAdmin ? "Room keeps steps" : "This node keeps steps", selection: $stepSeconds) {

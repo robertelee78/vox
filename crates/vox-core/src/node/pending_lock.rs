@@ -69,13 +69,10 @@ impl PendingLocks {
     }
 
     /// The members removed while `room` was closed.
-    #[must_use]
-    pub fn for_room(&self, room: &Digest32) -> Vec<Digest32> {
+    pub fn for_room<'a>(&'a self, room: &'a Digest32) -> impl Iterator<Item = Digest32> + 'a {
         self.entries
-            .iter()
-            .filter(|(r, _)| r == room)
-            .map(|(_, m)| *m)
-            .collect()
+            .range((*room, [0; 32])..=(*room, [u8::MAX; 32]))
+            .map(|(_, member)| *member)
     }
 
     /// Forget one completed room/member withdrawal without disturbing other debts.

@@ -955,9 +955,9 @@ impl Drop for OneTimeOwner {
     }
 }
 
-/// The exact selected OTP remains unavailable to other outbound jobs through native crypto
-/// and its original actor receipt. Dropping an unused selection is not a fabricated spend.
-#[derive(Debug)]
+/// The exact selected OTP remains unavailable through crypto, queued writes and cached retries.
+/// Clones share ownership; only dropping the last unused selection makes it eligible again.
+#[derive(Debug, Clone)]
 pub(crate) struct OneTimeReservation {
     owner: std::sync::Arc<OneTimeOwner>,
 }
@@ -976,6 +976,14 @@ impl OneTimeReservation {
     /// success. The original table retains that fact without touching another profile.
     pub(crate) fn mark_named(&self) {
         self.owner.state.mark_named();
+    }
+
+    /// Once a write or publication named this selection, no later failure can return it.
+    pub(crate) fn is_named(&self) -> bool {
+        self.owner
+            .state
+            .named
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 }
 

@@ -162,6 +162,7 @@ impl Profile {
         // guards are one step; whoever comes second finds the vault and is refused — at once,
         // as soon as the vault is there, even while its maker goes on holding the lock (a TUI
         // keeps it for as long as it runs). The lock is then kept with the profile.
+        paths.verify_profile()?;
         let vault_file = paths.vault_file();
         let lock = lock_dir(
             &paths.profile_dir,
@@ -267,6 +268,7 @@ impl Profile {
     /// [`Profile::open`], first taking the profile's lock ([`lock_profile`]) and keeping it for
     /// as long as the profile is open; `waiting` is called once if that takes over a second.
     pub fn open_noting(paths: Paths, waiting: LockWaitNotice<'_>) -> Result<Self> {
+        paths.verify_profile()?;
         if !paths.vault_file().is_file() {
             return Err(Error::Profile("no identity on this node"));
         }
@@ -314,6 +316,7 @@ impl Profile {
             return Err(Error::Profile("vault identity does not match the store"));
         }
         // Only now, with the passphrase proved, may the profile be written.
+        self.paths.verify_profile()?;
         note_fingerprint(&self.paths, &self.fingerprint, !passphrase.is_empty())?;
         self.store.make_writable()?;
         drop(backup);
