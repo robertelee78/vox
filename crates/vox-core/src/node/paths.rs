@@ -852,21 +852,43 @@ pub fn roots(
     data_override: Option<&Path>,
     config_override: Option<&Path>,
 ) -> Result<(PathBuf, PathBuf)> {
-    let data_root = match data_override {
-        Some(p) => p.to_path_buf(),
-        None => match std::env::var_os("VOX_DATA_DIR") {
-            Some(v) => PathBuf::from(v),
-            None => default_data_root()?,
-        },
+    roots_with(data_override, config_override, |name| {
+        std::env::var_os(name)
+    })
+}
+
+/// Resolve the same roots from another process's environment without creating directories.
+///
+/// # Errors
+/// If neither an override nor the supplied environment names the required directories.
+pub fn roots_with(
+    data_override: Option<&Path>,
+    config_override: Option<&Path>,
+    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<(PathBuf, PathBuf)> {
+    let root = |explicit: Option<&Path>, env, xdg, fallback| {
+        if let Some(path) = explicit {
+            Ok(path.to_path_buf())
+        } else if let Some(path) = lookup(env) {
+            Ok(PathBuf::from(path))
+        } else {
+            default_root_with(xdg, fallback, &lookup)
+        }
     };
-    let config_dir = match config_override {
-        Some(p) => p.to_path_buf(),
-        None => match std::env::var_os("VOX_CONFIG_DIR") {
-            Some(v) => PathBuf::from(v),
-            None => default_config_root()?,
-        },
-    };
-    Ok((data_root, config_dir))
+    Ok((
+        root(
+            data_override,
+            "VOX_DATA_DIR",
+            "XDG_DATA_HOME",
+            ".local/share/vox",
+        )?,
+        root(
+            config_override,
+            "VOX_CONFIG_DIR",
+            "XDG_CONFIG_HOME",
+            ".config/vox",
+        )?,
+    ))
 }
 
 /// The control socket `file` in `dir`, or its short fallback when that path does not fit a Unix
@@ -895,43 +917,37 @@ pub(crate) fn fallback_socket_for(dir: &Path) -> PathBuf {
     socket_fallback_root().join(name).join("vox.sock")
 }
 
-fn home_dir() -> Result<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty())
-        .ok_or_else(|| Error::Path {
-            op: "home directory",
-            detail: "HOME is not set".into(),
-        })
-}
-
 /// The data root used when neither `--data-dir` nor `VOX_DATA_DIR` names one: the one Vox.app
 /// serves.
 ///
 /// # Errors
 /// HOME not set.
 pub fn default_data_root() -> Result<PathBuf> {
-    if let Some(v) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
-        return Ok(PathBuf::from(v).join("vox"));
-    }
-    let home = home_dir()?;
-    Ok(if cfg!(target_os = "macos") {
-        home.join("Library").join("Application Support").join("vox")
-    } else {
-        home.join(".local").join("share").join("vox")
+    default_root_with("XDG_DATA_HOME", ".local/share/vox", &|name| {
+        std::env::var_os(name)
     })
 }
 
-fn default_config_root() -> Result<PathBuf> {
-    if let Some(v) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
-        return Ok(PathBuf::from(v).join("vox"));
+fn default_root_with(
+    xdg: &str,
+    linux_path: &str,
+    lookup: &impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<PathBuf> {
+    if let Some(path) = lookup(xdg).filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(path).join("vox"));
     }
-    let home = home_dir()?;
-    Ok(if cfg!(target_os = "macos") {
-        home.join("Library").join("Application Support").join("vox")
+    let home = lookup("HOME")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or_else(|| Error::Path {
+            op: "home directory",
+            detail: "HOME is not set".into(),
+        })?;
+    Ok(home.join(if cfg!(target_os = "macos") {
+        "Library/Application Support/vox"
     } else {
-        home.join(".config").join("vox")
-    })
+        linux_path
+    }))
 }
 
 /// Create `dir` (and parents) and set it to `0700` on Unix.

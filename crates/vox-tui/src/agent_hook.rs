@@ -157,7 +157,7 @@ async fn check_native_notice(
         return Err(AppError::Usage("Vox attention registration changed".into()));
     }
     let at = crate::client::one_shot(paths)?;
-    let client = crate::client::open(&at).await?;
+    let client = crate::client::open_for_hook(&at).await?;
     let owner = client
         .me()
         .ok_or_else(|| AppError::Usage("Vox node is locked".into()))?;
@@ -220,7 +220,7 @@ async fn check_omp_opening(paths: &Paths, input: &HookInput) -> Result<(), AppEr
     check_omp_registration(paths, saved).await?;
     if let Some(recipient) = &input.omp_recipient {
         let at = crate::client::one_shot(paths)?;
-        let mut client = crate::client::open(&at).await?;
+        let mut client = crate::client::open_for_hook(&at).await?;
         let owner = client
             .me()
             .ok_or_else(|| AppError::Usage("Vox node is locked".into()))?;
@@ -477,7 +477,7 @@ async fn omp_prepare(
     if let Some(room) = &saved.room {
         let room = b32_decode(room, "attention room")?;
         let at = crate::client::one_shot(paths)?;
-        let client = crate::client::open(&at).await?;
+        let client = crate::client::open_for_hook(&at).await?;
         let owner = client
             .me()
             .ok_or_else(|| AppError::Usage("Vox node is locked".into()))?;
@@ -2117,7 +2117,7 @@ pub async fn run(
                 return Err(AppError::Usage("Vox attention registration changed".into()));
             }
             let at = crate::client::one_shot(paths)?;
-            let client = crate::client::open(&at).await?;
+            let client = crate::client::open_for_hook(&at).await?;
             let owner = client
                 .me()
                 .ok_or_else(|| AppError::Usage("Vox node is locked".into()))?;
@@ -3205,7 +3205,7 @@ async fn drain(
     }
     // Over the account socket as this node, which the session's registration attached (ADR-026
     // C-1, N-6): never attaching anything itself.
-    let mut client = crate::client::open(&crate::client::one_shot(paths)?).await?;
+    let mut client = crate::client::open_for_hook(&crate::client::one_shot(paths)?).await?;
     let me = client.me();
     if me.is_none() {
         return Err(AppError::Usage(
