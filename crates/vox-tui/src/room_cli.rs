@@ -321,7 +321,10 @@ pub async fn list(paths: &Paths) -> Result<(), AppError> {
         if open_failure.is_some() {
             let node = crate::client::name_of(paths)?;
             let join = vox_text::shell::node_command(&["vox", "room", "join"], node.as_str());
-            println!("  To reopen it, run `{join}` with this room's address and passphrase.");
+            println!(
+                "  To reopen it once the cause above is fixed, run `{join}` with this room's \
+                 address and passphrase (another member's `vox room link` prints the address)."
+            );
         }
     }
     for name in &clashing {
