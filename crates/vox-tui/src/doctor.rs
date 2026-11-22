@@ -270,7 +270,7 @@ async fn room_or_only(client: &mut IpcClient, room: Option<&str>) -> Result<Dige
         .or_else(|| std::env::var("VOX_ROOM").ok())
         .filter(|r| !r.trim().is_empty());
     if let Some(r) = named {
-        return crate::room_cli::room_of(client, r.trim()).await;
+        return crate::room_cli::room_of_now(client, r.trim()).await;
     }
     let rooms = match client.rooms().await {
         Ok(Frame::Rooms { rooms }) => rooms,

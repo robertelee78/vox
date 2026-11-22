@@ -14,8 +14,11 @@ use vox_core::node::paths::Account;
 
 use crate::app::AppError;
 
-/// How long a client waits for a daemon it started to answer (S-2).
+/// How long a client waits for a daemon it started, or for a room first seen preparing.
 pub const START_WITHIN: Duration = Duration::from_secs(15);
+
+/// Cadence for a client checking whether the node has become available.
+pub(crate) const NODE_WAIT_POLL: Duration = Duration::from_millis(50);
 
 /// The whole time an agent hook gives a daemon probe and cold start before returning its bounded
 /// answer. The daemon continues under its reaper and the next turn uses the saved registration.
@@ -283,7 +286,7 @@ async fn wait_for_restart(account: &Account, within: Duration) -> Result<bool, A
         if began.elapsed() >= within {
             return Ok(false);
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(NODE_WAIT_POLL).await;
     }
 }
 
@@ -430,7 +433,7 @@ async fn start_daemon_bounded(
                 format_args!("{}\n{}", startup_text(&startup), tail(&log_path, 20))
             )));
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(NODE_WAIT_POLL).await;
     };
     outcome
 }
