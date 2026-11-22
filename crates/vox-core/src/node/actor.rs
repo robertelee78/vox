@@ -7892,9 +7892,24 @@ impl Node {
                         .computer_authority()
                         .is_some_and(|authority| matches!(authority.superseded(), Ok(true))))
             });
+            let room_change = self
+                .deferred_commands
+                .front()
+                .and_then(|deferred| self.command_waits_for_room_change(&deferred.command.0));
+            if let Some(fault) = room_change {
+                if let Some((_, reason)) = self
+                    .deferred_commands
+                    .front_mut()
+                    .and_then(|deferred| deferred.deadline.as_mut())
+                {
+                    *reason = fault;
+                }
+            }
+            let room_change_busy = room_change.is_some();
             let resume_command = !self.store_save_pending()
                 && !journal_busy
                 && !authority_busy
+                && !room_change_busy
                 && !self.deferred_commands.is_empty();
             let receive_command = resume_command
                 || self
@@ -7932,6 +7947,18 @@ impl Node {
                 }
             };
             tokio::pin!(governance_deadline);
+            let deferred_deadline = self
+                .deferred_commands
+                .iter()
+                .filter_map(|deferred| deferred.deadline.map(|(deadline, _)| deadline))
+                .min();
+            let deferred_deadline = async move {
+                match deferred_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::pin!(deferred_deadline);
             let view_due = self.view_owed;
             let deferred_commands = &mut self.deferred_commands;
             tokio::select! {
@@ -8020,6 +8047,18 @@ impl Node {
                     // the one-second actor tick, a command, or network traffic to invalidate it.
                     self.governance_work.wake_expired(self.now_ms().get());
                 }
+                () = &mut deferred_deadline => {
+                    let now = tokio::time::Instant::now();
+                    while let Some(index) = self.deferred_commands.iter().position(|deferred| {
+                        deferred.deadline.is_some_and(|(deadline, _)| deadline <= now)
+                    }) {
+                        if let Some(deferred) = self.deferred_commands.remove(index) {
+                            if let Some((_, fault)) = deferred.deadline {
+                                let _ = deferred.command.1.send(Outcome::Failed(fault));
+                            }
+                        }
+                    }
+                }
                 () = tokio::task::yield_now(), if maintenance_ready => {
                     for _ in 0..4 {
                         let turn = maintenance_next;
@@ -8050,18 +8089,21 @@ impl Node {
                 }
                 received = async {
                     if resume_command {
-                        return deferred_commands.pop_front().map(|deferred| ReadRequest {
-                            command: deferred.command.0, reply: Some(deferred.command.1),
-                        });
+                        return deferred_commands.pop_front().map(|deferred| (
+                            ReadRequest {
+                                command: deferred.command.0, reply: Some(deferred.command.1),
+                            },
+                            deferred.deadline,
+                        ));
                     }
                     tokio::select! {
-                        read = read_rx.recv() => read,
+                        read = read_rx.recv() => read.map(|read| (read, None)),
                         command = cmd_rx.recv(), if receive_command => {
-                            command.map(|(command, reply)| ReadRequest { command, reply: Some(reply) })
+                            command.map(|(command, reply)| (ReadRequest { command, reply: Some(reply) }, None))
                         }
                     }
                 } => {
-                    let Some(ReadRequest { command, reply }) = received else { break };
+                    let Some((ReadRequest { command, reply }, deadline)) = received else { break };
                     // A handler decides on a current view (status answers from it), and the reply
                     // follows a publication that holds the command's own writes.
                     if self.view_owed.is_some() {
@@ -8075,6 +8117,12 @@ impl Node {
                         continue;
                     }
                     let Some(reply) = reply else { continue };
+                    if let Some((until, fault)) = deadline {
+                        if tokio::time::Instant::now() >= until {
+                            let _ = reply.send(Outcome::Failed(fault));
+                            continue;
+                        }
+                    }
                     let shutdown = matches!(command, NodeCommand::Shutdown);
                     // Computer policy is applied by its causal `ComputerPolicy` event (and by
                     // startup before Ready), never by minting a fresh wall-clock deadline for an
@@ -8087,6 +8135,33 @@ impl Node {
                     // is published or scheduled for it.
                     if matches!(command, NodeCommand::Ping) {
                         let _ = reply.send(Outcome::Done);
+                        continue;
+                    }
+                    if let Some(fault) = self.command_waits_for_room_change(&command) {
+                        #[cfg(feature = "test-knobs")]
+                        if matches!(&command, NodeCommand::RenameRoom { channel_id, .. }
+                            if Self::room_command_mutant_armed("pending-room-refuse-immediately", channel_id)) {
+                            let _ = reply.send(Outcome::Failed(fault));
+                            continue;
+                        }
+                        if fault == Fault::GovernanceRefreshing {
+                            match &command {
+                                NodeCommand::SendText { channel_id, .. }
+                                | NodeCommand::SendTextAt { channel_id, .. }
+                                | NodeCommand::SendTextAdmitted { channel_id, .. }
+                                | NodeCommand::AppendSession { channel_id, .. } => {
+                                    self.governance_work.wake_room(*channel_id);
+                                }
+                                _ => {}
+                            }
+                        }
+                        self.retain_store_command(command, reply);
+                        if let Some(deferred) = self.deferred_commands.back_mut() {
+                            deferred.deadline = Some(deadline.unwrap_or_else(|| (
+                                tokio::time::Instant::now() + Self::BOARD_PATIENCE,
+                                fault,
+                            )));
+                        }
                         continue;
                     }
                     if (self.store_save_pending() && Self::command_waits_for_save(&command))
@@ -8102,6 +8177,9 @@ impl Node {
                             }))
                     {
                         self.retain_store_command(command, reply);
+                        if let Some(deferred) = self.deferred_commands.back_mut() {
+                            deferred.deadline = deadline;
+                        }
                         continue;
                     }
                     if matches!(

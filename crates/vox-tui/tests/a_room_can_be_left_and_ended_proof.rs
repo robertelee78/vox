@@ -61,6 +61,8 @@
 mod pty_driver;
 #[path = "support/room.rs"]
 mod support;
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
@@ -2540,4 +2542,192 @@ fn an_unreadable_store_is_left_exactly_as_it_is() {
         |out| out.ok && out.stdout.contains(marker),
     );
     assert!(problems.is_empty(), "PRODUCT: {}", problems.join("\n"));
+}
+
+/// Each command is submitted once, with no other person's command in flight.
+#[test]
+#[ignore = "real daemons with a held receiver commit; run in release with test-knobs"]
+fn a_room_command_waits_for_a_background_change() {
+    background_room_command(false);
+}
+
+#[test]
+#[ignore = "real daemons and the room command's thirty-second wait; run in release with test-knobs"]
+fn a_room_command_whose_background_change_stays_held_is_refused_without_a_change() {
+    background_room_command(true);
+}
+
+fn background_room_command(stays_held: bool) {
+    watchdog::arm();
+    test_knobs::require(&["VOX_TEST_HOLD_ROOM_WRITE"]);
+    let rt = runtime();
+    let tmp = support::diagnostic_tempdir();
+    let binary =
+        std::env::var("VOX_PROOF_ROOM_CHANGE_BINARY").unwrap_or_else(|_| support::VOX.to_owned());
+    let mut room = rt.block_on(support::room_as(tmp.path(), &["alice", "bob"], &binary));
+    for worker in &room.workers {
+        test_knobs::require_mutant_on_daemon(
+            worker.daemon_pid().expect("APPARATUS: owned daemon pid"),
+            &worker.name,
+        );
+    }
+    let hold = tmp.path().join("receiver-hold");
+    let mutant_arm = tmp.path().join("room-command-mutant");
+    let log = tmp.path().join("alice-held.daemon.err");
+    room.workers[0].restart_daemon_as(
+        &binary,
+        &[
+            (
+                "VOX_TEST_HOLD_ROOM_WRITE",
+                hold.to_str().expect("APPARATUS: hold path"),
+            ),
+            (
+                "VOX_TEST_ROOM_COMMAND_MUTANT_ARM",
+                mutant_arm.to_str().expect("APPARATUS: arm path"),
+            ),
+        ],
+        &log,
+    );
+    test_knobs::require_mutant_on_daemon(
+        room.workers[0]
+            .daemon_pid()
+            .expect("APPARATUS: restarted daemon pid"),
+        "restarted alice",
+    );
+    let alice = &room.workers[0];
+    support::until(
+        alice,
+        None,
+        "Alice's room reopens",
+        &["room", "read", &room.id],
+        |out| out.ok,
+    );
+    struct Release(std::path::PathBuf);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let id = &room.id;
+    let own = alice.b32();
+    let bob = room.workers[1].b32();
+    let commands = [
+        vec!["room", "rename", id, "after-background"],
+        vec!["room", "post", id, "accepted-after-background"],
+        vec!["room", "pause", id, &own],
+        vec!["room", "link", id],
+        vec!["room", "remove-member", id, &bob],
+    ];
+    for (index, args) in commands.iter().enumerate() {
+        if stays_held && index != 0 {
+            break;
+        }
+        let engaged = hold.with_extension("engaged");
+        let _ = std::fs::remove_file(&engaged);
+        let release = Release(hold.clone());
+        std::fs::write(&hold, room.cid).expect("APPARATUS: arm receiver hold");
+        setup(
+            &room.workers[1],
+            &["room", "post", id, &format!("receiver-overlap-{index}")],
+        );
+        let until = Instant::now() + Duration::from_secs(60);
+        while !engaged.exists() {
+            assert!(
+                Instant::now() < until,
+                "APPARATUS: receiver never held the room:\n{}",
+                std::fs::read_to_string(&log).unwrap_or_default()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        eprintln!(
+            "[proof] staged {}",
+            std::fs::read_to_string(&engaged).unwrap()
+        );
+        test_knobs::arm_room_mutant(&mutant_arm, &room.cid);
+        let started = Instant::now();
+        let (out, elapsed) = std::thread::scope(|scope| {
+            let (finished, done) = std::sync::mpsc::channel();
+            scope.spawn(move || {
+                // A deadline verdict is a user-visible latency claim, not a wedge heuristic.
+                // Keep the real change held until the command answers; release at the safety
+                // ceiling only so a missing product deadline cannot hang the proof.
+                let ceiling = if stays_held {
+                    Duration::from_secs(35)
+                } else {
+                    Duration::from_secs(3)
+                };
+                let _ = done.recv_timeout(ceiling);
+                drop(release);
+            });
+            let out = alice.vox(None, args);
+            let elapsed = started.elapsed();
+            let _ = finished.send(());
+            (out, elapsed)
+        });
+        eprintln!(
+            "[proof] once-only `vox {}` after {elapsed:?}: {out:?}",
+            args.join(" ")
+        );
+        eprintln!(
+            "[proof] receiver daemon:\n{}",
+            std::fs::read_to_string(&log).unwrap_or_default()
+        );
+        test_knobs::require_room_mutant_engaged(&mutant_arm);
+        if stays_held {
+            assert!(
+                !out.ok && out.stderr.contains("a previous change to this room is still being applied; this request made no change"),
+                "PRODUCT: the held room command did not truthfully refuse without a change: {out:?}"
+            );
+            assert!(elapsed < Duration::from_secs(35), "PRODUCT: room command exceeded its thirty-second wait plus reply allowance: {elapsed:?}; {out:?}");
+            assert!(elapsed >= Duration::from_secs(29), "PRODUCT: room command refused before its thirty-second wait ran out: {elapsed:?}; {out:?}");
+            let list = alice.vox(None, &["room", "list"]);
+            assert!(
+                list.ok
+                    && list.stdout.contains("mission")
+                    && !list.stdout.contains("after-background"),
+                "PRODUCT: refused rename changed the room: {list:?}"
+            );
+        } else {
+            assert!(
+                out.ok,
+                "PRODUCT: once-only `vox {}` during a background room change was refused: {out:?}",
+                args.join(" ")
+            );
+            match index {
+                0 => assert!(
+                    alice
+                        .vox(None, &["room", "list"])
+                        .stdout
+                        .contains("after-background"),
+                    "PRODUCT: accepted rename did not take effect"
+                ),
+                1 => {
+                    support::until(
+                        alice,
+                        None,
+                        "accepted post is read back",
+                        &["room", "read", id],
+                        |out| out.ok && out.stdout.contains("accepted-after-background"),
+                    );
+                }
+                2 => assert!(
+                    out.stdout.contains("Paused"),
+                    "PRODUCT: accepted pause did not report Paused: {out:?}"
+                ),
+                3 => assert!(
+                    out.stdout.contains("vox://"),
+                    "PRODUCT: accepted link returned no room address: {out:?}"
+                ),
+                _ => {
+                    support::until(
+                        alice,
+                        None,
+                        "removed member is absent",
+                        &["room", "roster", id],
+                        |out| out.ok && !out.stdout.contains(&bob),
+                    );
+                }
+            }
+        }
+    }
 }

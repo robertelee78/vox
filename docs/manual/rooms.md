@@ -111,6 +111,13 @@ A message that starts with a link carries a card: your node fetches the page onc
 and puts its title, description and a small image into the encrypted message. Readers' nodes never
 contact the site. Links to private addresses get no card. `--no-card` posts without one.
 
+A room-changing command waits up to thirty seconds for a background change already applying
+to that room. If that change still cannot finish, Vox says the previous change is still being
+applied and that this request made no change. Read-only commands remain available while it waits.
+Text and Session appends also wait for this room's received permissions to finish being read.
+Nothing is posted or sealed on the earlier permissions. If that wait runs out, Vox says the
+permissions are still being read; the append made no change.
+
 ## Follow a room, or read from where you stopped
 
 ```sh

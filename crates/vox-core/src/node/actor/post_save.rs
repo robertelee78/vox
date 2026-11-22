@@ -12,6 +12,7 @@ pub(super) struct DeferredCommand {
     pub(super) command: Command,
     // Reserve the original queue's released position; do not grow a second unbounded queue.
     pub(super) _permit: Option<mpsc::OwnedPermit<Command>>,
+    pub(super) deadline: Option<(tokio::time::Instant, Fault)>,
 }
 
 type SavedEnd = Option<std::result::Result<EndWithdrawal, Fault>>;
@@ -284,6 +285,84 @@ impl Node {
         }
     }
 
+    #[cfg(feature = "test-knobs")]
+    pub(super) fn room_command_mutant_armed(name: &str, room: &Digest32) -> bool {
+        if !crate::node::computer::fx28_mutant(name) {
+            return false;
+        }
+        let Some(path) = std::env::var_os("VOX_TEST_ROOM_COMMAND_MUTANT_ARM") else {
+            return false;
+        };
+        let path = std::path::PathBuf::from(path);
+        if !std::fs::read(&path).is_ok_and(|armed| armed.as_slice() == room) {
+            return false;
+        }
+        std::fs::write(path.with_extension("engaged"), name).is_ok()
+    }
+
+    /// Only the selected room waits; a trust edit still applies room by room.
+    pub(super) fn command_waits_for_room_change(&self, command: &NodeCommand) -> Option<Fault> {
+        let room = match command {
+            NodeCommand::SendText { channel_id, .. }
+            | NodeCommand::SendTextAt { channel_id, .. }
+            | NodeCommand::SendTextAdmitted { channel_id, .. }
+            | NodeCommand::AppendSession { channel_id, .. }
+            | NodeCommand::RenameRoom { channel_id, .. }
+            | NodeCommand::RemoveRoomMember { channel_id, .. }
+            | NodeCommand::ReadmitRoomMember { channel_id, .. }
+            | NodeCommand::SetRetention { channel_id, .. }
+            | NodeCommand::SetStepRetention { channel_id, .. }
+            | NodeCommand::ChooseIdleEnd { channel_id, .. }
+            | NodeCommand::EndRoom { channel_id }
+            | NodeCommand::SetAdmin { channel_id, .. }
+            | NodeCommand::ChangeRoomAnchors { channel_id, .. }
+            | NodeCommand::CloseChannel { channel_id }
+            | NodeCommand::LeaveRoom { channel_id }
+            | NodeCommand::Invite { channel_id }
+            | NodeCommand::RoomPause {
+                channel_id,
+                paused: Some(_),
+                ..
+            } => channel_id,
+            _ => return None,
+        };
+        let shared = self.channels.get(room)?;
+        let Ok(channel) = shared.try_lock() else {
+            return Some(Fault::RoomChangePending);
+        };
+        if channel.is_poisoned() {
+            return None;
+        }
+        if matches!(
+            command,
+            NodeCommand::SendText { .. }
+                | NodeCommand::SendTextAt { .. }
+                | NodeCommand::SendTextAdmitted { .. }
+                | NodeCommand::AppendSession { .. }
+        ) && self.profile.as_ref().is_some_and(|profile| {
+            channel
+                .require_governance_ready(profile.store(), self.now_ms())
+                .is_err_and(|error| ChannelState::governance_refreshing(&error))
+        }) {
+            #[cfg(feature = "test-knobs")]
+            if Self::room_command_mutant_armed("pending-governance-not-deferred", room) {
+                return None;
+            }
+            return Some(Fault::GovernanceRefreshing);
+        }
+        (self.pending_posts.contains_key(room)
+            || self.publish_waiters.contains_key(room)
+            || self.own_key_leave_pending.contains_key(room)
+            || self.own_key_ended_pending.contains_key(room)
+            || channel.post_pending()
+            || self.profile.as_ref().is_some_and(|profile| {
+                channel
+                    .history_publication_busy(profile.store())
+                    .unwrap_or(false)
+            }))
+        .then_some(Fault::RoomChangePending)
+    }
+
     pub(super) fn retain_store_command(
         &mut self,
         command: NodeCommand,
@@ -296,6 +375,7 @@ impl Node {
         self.deferred_commands.push_back(DeferredCommand {
             command: (command, reply),
             _permit: permit,
+            deadline: None,
         });
     }
 
