@@ -4503,16 +4503,21 @@ impl Router {
     }
 
     /// Attach every node the attach file keeps (L-4), each in the background: a client that asks
-    /// for one meanwhile waits for it, as for any attach.
-    pub fn attach_kept(&self) {
+    /// for one meanwhile waits for it. The returned tasks mark completion of startup attachment.
+    pub fn attach_kept(&self) -> tokio::task::JoinSet<()> {
         let kept = self.mark_kept_attaching();
+        let mut tasks = tokio::task::JoinSet::new();
         for (node, source) in kept {
             let router = self.clone();
-            self.inner.rt.spawn(async move {
-                router.attach_one_kept(&node, source).await;
-                lock(&router.inner.starting).remove(&node);
-            });
+            tasks.spawn_on(
+                async move {
+                    router.attach_one_kept(&node, source).await;
+                    lock(&router.inner.starting).remove(&node);
+                },
+                &self.inner.rt,
+            );
         }
+        tasks
     }
 
     /// List every node the attach file keeps as attaching (#666), and return them with their
