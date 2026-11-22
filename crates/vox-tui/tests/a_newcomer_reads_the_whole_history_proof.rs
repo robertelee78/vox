@@ -5097,6 +5097,38 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         said(&bob, "bob"),
         said(&alice, "alice")
     );
+    // Let Bob receive the sender keys he is already owed before taking him offline. Otherwise
+    // his independent fallback can append beside Carol's measured package and shift its position.
+    let bob_keys_deadline = Instant::now() + READY_WITHIN;
+    loop {
+        let (ok, out, err) = vox(&alice, &["status", "--json"], None);
+        assert!(
+            ok,
+            "PRODUCT: Alice could not report Bob's key delivery: {out}{err}"
+        );
+        let status: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|error| {
+            panic!("PRODUCT: malformed key-delivery status: {error}: {out}")
+        });
+        let pending = status["rooms"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|row| row["id"].as_str().is_some_and(|id| id.starts_with(&room)))
+            .and_then(|row| row["members"].as_array())
+            .into_iter()
+            .flatten()
+            .find(|row| row["id"].as_str() == Some(fps[1].as_str()))
+            .and_then(|row| row["key_delivery_pending"].as_bool());
+        if pending == Some(false) {
+            break;
+        }
+        assert!(
+            Instant::now() < bob_keys_deadline,
+            "PRODUCT: Bob did not receive Alice's owed sender keys within {READY_WITHIN:?}; \
+             last shipped status: {out}"
+        );
+        std::thread::yield_now();
+    }
     // Bob is now a real returning member, but is offline while two authors build suffixes.  That
     // makes his next Page settle newer positions before the older private-package header closes
     // Alice's gap, and gives the durable continuation scheduler two authors to rotate.
@@ -5171,10 +5203,10 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         ok,
         "PRODUCT: alice's `vox trust add` of carol failed: {err}"
     );
-    // Alice had no direct connection at the decision and Carol's process remains stopped. The
-    // shipped snapshot must now show either the exact asked-for attempt or its exact fallback
-    // result. Once the attempt disappears, absence of that result is structurally a PRODUCT red;
-    // only an attempt still owned by the network may run until the external apparatus deadman.
+    // A failed reach hands delivery to native publication. Its network owner can disappear
+    // before the key and consent are saved, so await the final result within the existing
+    // publication bound rather than treating that handoff as a lost key.
+    let mut publication_deadline = None;
     let (fallback_attempt, package_seq, consent_seq) = loop {
         let observation = offline_fallback_observation(&alice, &room, &fps[2]);
         assert!(
@@ -5188,14 +5220,22 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         {
             break (attempt, package_seq, consent_seq);
         }
-        assert!(
-            observation
-                .active
-                .iter()
-                .any(|attempt| *attempt > reach_before),
-            "PRODUCT: Carol's asked-for member reach completed but shipped status records no \
-             package/consent fallback result after serial {reach_before}"
-        );
+        if !observation
+            .active
+            .iter()
+            .any(|attempt| *attempt > reach_before)
+        {
+            let deadline =
+                publication_deadline.get_or_insert_with(|| Instant::now() + READY_WITHIN);
+            assert!(
+                Instant::now() < *deadline,
+                "PRODUCT: the key was never published after the reach failure within \
+                 {READY_WITHIN:?}; reach baseline={reach_before}, last network owners={:?}; \
+                 last shipped status: {}",
+                observation.active,
+                observation.status
+            );
+        }
         std::thread::yield_now();
     };
     assert_eq!(
@@ -8536,11 +8576,11 @@ struct OfflineFallbackObservation {
     serial: u64,
     active: Vec<u64>,
     fallback: Option<(u64, Option<u64>, Option<u64>)>,
+    status: String,
 }
 
 /// One shipped snapshot of the exact member-delivery reach and its store-and-forward result.
-/// The actor publishes both under `lanes`, so a removed failure callback becomes a PRODUCT red
-/// (the attempt vanished without a result) rather than an external-watchdog diagnosis.
+/// Network-owner disappearance is diagnostic only: native publication may still be completing.
 fn offline_fallback_observation(
     dir: &Path,
     room: &str,
@@ -8598,6 +8638,7 @@ fn offline_fallback_observation(
         serial,
         active,
         fallback,
+        status: out,
     }
 }
 
