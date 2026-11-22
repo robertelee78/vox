@@ -769,20 +769,7 @@ pub fn register(paths: &Paths, session: &str, codex: bool) {
 // A profile directory replaced since `paths` were resolved is refused before anything in it is
 // created or changed: every registration writer takes this lock first.
 fn registration_lock(paths: &Paths) -> Result<std::fs::File, String> {
-    let verified = paths.verify_profile();
-    #[cfg(feature = "test-knobs")]
-    let verified = if std::env::var("VOX_TEST_RG10_MUTANT").as_deref()
-        == Ok("registration-lock-trusts-path")
-    {
-        eprintln!(
-            "vox: test knob VOX_TEST_RG10_MUTANT=registration-lock-trusts-path: the registration \
-             lock does not check the profile directory"
-        );
-        Ok(())
-    } else {
-        verified
-    };
-    verified.map_err(|e| e.to_string())?;
+    paths.verify_profile().map_err(|e| e.to_string())?;
     let path = paths.session_dir().with_extension("lock");
     if let Some(parent) = path.parent() {
         vox_core::node::paths::create_private_dir(parent).map_err(|e| e.to_string())?;

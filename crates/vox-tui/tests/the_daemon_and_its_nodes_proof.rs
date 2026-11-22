@@ -807,9 +807,8 @@ fn a_conversation_refuses_a_rebuilt_node_under_the_same_name() {
 /// A daemon must not write into a directory substituted for the profile it opened: not by
 /// leave, pause or a new hook, and not by a session's end, which must neither create the
 /// registration lock in the replacement nor remove the replacement's own registration.
-/// Mutants: remove the shared profile-directory check, or the session grant check; or run with
-/// `VOX_MUTANT_RG10=registration-lock-trusts-path` (test-knobs), which skips the registration
-/// lock's check.
+/// Mutants: remove the shared profile-directory check, the session grant check, or the
+/// registration lock's check.
 #[test]
 #[ignore = "real daemon and encrypted profile; run in release with test-knobs"]
 fn a_room_leave_refuses_a_replaced_profile_directory() {
@@ -855,15 +854,7 @@ fn a_room_leave_refuses_a_replaced_profile_directory() {
     watchdog::arm();
     let a = Account::new();
     a.make_node("agent");
-    let mutant = std::env::var("VOX_MUTANT_RG10").unwrap_or_default();
-    if !mutant.is_empty() {
-        test_knobs::require(&["VOX_TEST_RG10_MUTANT"]);
-    }
-    let daemon = Daemon::start(
-        &a,
-        &["--node", "agent"],
-        &[("VOX_TEST_RG10_MUTANT", &mutant)],
-    );
+    let daemon = Daemon::start(&a, &["--node", "agent"], &[]);
     daemon.expect("node agent is Ready", Duration::from_secs(30), |line| {
         line.contains("node agent is Ready")
     });
@@ -982,15 +973,9 @@ fn a_room_leave_refuses_a_replaced_profile_directory() {
     let daemon_said = daemon.said();
     for line in daemon_said
         .lines()
-        .filter(|line| line.contains("VOX_TEST_RG10_MUTANT") || line.contains("gone or replaced"))
+        .filter(|line| line.contains("gone or replaced"))
     {
         println!("daemon: {line}");
-    }
-    if !mutant.is_empty() {
-        assert!(
-            daemon_said.contains(&format!("VOX_TEST_RG10_MUTANT={mutant}")),
-            "APPARATUS: mutant {mutant} did not engage in the daemon:\n{daemon_said}"
-        );
     }
     assert!(
         !profile.join("sessions.lock").exists() && before_end == after_end,
