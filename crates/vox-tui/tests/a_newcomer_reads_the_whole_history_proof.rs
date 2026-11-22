@@ -9104,16 +9104,26 @@ fn a_room_that_cannot_finish_preparing_says_why_and_costs_nothing() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    // Bob's admission folds and his three rows arrive: alice reads all six.
+    // A fresh peer row makes the post-restart round useful, even if all six earlier rows
+    // were already saved before the restart. A hint alone is not a completed useful sync.
+    let (ok, out, err) = vox(
+        &bob,
+        &["room", "post", &room, "a fresh row after preparation"],
+        None,
+    );
+    assert!(ok, "PRODUCT: bob's fresh post was refused: {out}{err}");
     let opened = Instant::now();
     loop {
         let (ok, out, err) = vox(&alice, &["room", "read", &room], None);
-        if ok && (1..=6).all(|i| out.contains(&format!("row {i}"))) {
+        if ok
+            && (1..=6).all(|i| out.contains(&format!("row {i}")))
+            && out.contains("a fresh row after preparation")
+        {
             break;
         }
         assert!(
             opened.elapsed() < Duration::from_secs(60),
-            "PRODUCT: the opened room does not read all six rows within 60 s: ok={ok}\n{out}{err}\nalice's daemon said: {}",
+            "PRODUCT: the opened room does not read all six saved rows and bob's fresh row within 60 s: ok={ok}\n{out}{err}\nalice's daemon said: {}",
             said(&alice, "alice")
         );
         std::thread::sleep(Duration::from_millis(500));
