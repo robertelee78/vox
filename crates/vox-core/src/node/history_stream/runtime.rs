@@ -357,16 +357,10 @@ pub(crate) struct Flow {
     /// A durable body chunk moved in this flow's last turn: the waiting slice is
     /// progress, not a busy wait, and its port must not grow a Busy backoff.
     pub(crate) body_progress: bool,
-    /// When this flow was built. A newer hint for its author supersedes it only once it has
-    /// had [`HINT_TURN`] of progress or stops progressing, so a burst of appends does not
-    /// restart it before it fetches a body.
+    /// When this flow was built: only `VOX_MUTANT_FETCH_DISCARD` reads it, to put back the cut
+    /// one second after it.
+    #[cfg(feature = "test-knobs")]
     pub(crate) since: std::time::Instant,
-    /// A receipt was committed or a body moved in some turn since this flow was built: the
-    /// progress the owner's turn (ADR-036) is kept for. Not the last turn's alone: between
-    /// wire exchanges a turn commits nothing (it builds the next query from the header it
-    /// just held), and judged on that turn a flow was superseded ~40 ms after it started,
-    /// at its first such turn after the poster's next append, never reaching a body.
-    pub(crate) turn_progress: bool,
     /// This turn's slice waits on the room's governance fold, which is not ready yet (ADR-037
     /// R2): a local wait, not a body slot held against a busy peer, so it never retires the slot,
     /// and the actor's fold hook is asked to drive the fold.
@@ -598,7 +592,7 @@ impl Flow {
             slots,
             owners: [None, None, None],
             body_progress: false,
-            turn_progress: false,
+            #[cfg(feature = "test-knobs")]
             since: std::time::Instant::now(),
             governance_wait: false,
             publication_wait: false,
@@ -802,7 +796,7 @@ impl Flow {
             slots,
             owners: [None, None, None],
             body_progress: false,
-            turn_progress: false,
+            #[cfg(feature = "test-knobs")]
             since: std::time::Instant::now(),
             governance_wait: false,
             publication_wait: false,
@@ -2400,12 +2394,13 @@ impl Flow {
                                 ));
                             }
                             // A head no newer than the window's top resumes it. A newer head
-                            // selects a new window at once, even over an unfinished one: fresh
-                            // messages wait for old bodies at most the owner's 1 s turn
-                            // (ADR-036 "the owner's turn"; the decider, #934 as amended
-                            // 2026-11-12), and the selector keeps the unfinished positions inside
-                            // the new window, walked newest first after the fresh ones, held
-                            // positions passing locally. Measured before this: a joiner read the
+                            // selects a new window when this operation runs, even over an
+                            // unfinished one, and the selector keeps the unfinished positions
+                            // inside the new window, walked newest first after the fresh ones,
+                            // held positions passing locally. A flow already fetching is not cut
+                            // for the newer head (ADR-052 RG-6): it finishes its position, then
+                            // ends at that boundary so the next flow selects the newer head.
+                            // Measured before the newer head selected at all: a joiner read the
                             // creator's next post only when his drain of her 150-post window
                             // ended, 51–59 s on.
                             if let Some(window) = state.live {
@@ -2718,6 +2713,25 @@ impl Flow {
                     }
                 }
                 self.live_unavailable = None;
+                // Position boundary (ADR-052 RG-6): this position is complete. When the same
+                // author's newer head waits in the inbox, end the walk here instead of taking
+                // the next position under the old head. The flow finishes, its hint is retired
+                // as superseded, and the next flow takes the newer head. That flow's selection
+                // keeps this window's start, so the fresh positions come first and the rest of
+                // this window follows. Nothing in flight is cancelled, and every head gets at
+                // least the one position just completed. Measured without this: a reader back
+                // 8,000 entries walked all 128 positions under its first head while the
+                // author's next entry, which the room needed before it could show any of them,
+                // waited. It showed nothing for about nine seconds.
+                if !retry
+                    && !boundary_reselect_off_mutant()
+                    && self.hint.is_some_and(|hint| {
+                        hint.author == author
+                            && inbox.newer_pending(self.room, self.hint_peer, author, hint.size)
+                    })
+                {
+                    return Ok(());
+                }
                 self.push(Task {
                     operation: if retry {
                         Operation::LiveRetry {
@@ -3899,10 +3913,8 @@ impl Flow {
     ) -> Result<StageStart> {
         let is_key = self.key_body_root.is_some() && purpose == Purpose::Control;
         // A slot held by a sibling flow of this node is a local wait with an exact release
-        // edge, for every slot: judged a Busy wait, a reader's flow toward the author lost its
-        // owner's turn (ADR-036) to the next head every time a flow toward another reader held
-        // the live slot for the same author, and refetched head and proof (measured: four
-        // readers, 90 such supersessions on the author's port in 60 s, ~100 rows each).
+        // edge, for every slot, not a Busy wait (measured when it was judged Busy: four readers,
+        // 90 restarts of a reader's flow on the author's port in 60 s, ~100 rows each).
         let wake = body_slot(purpose, is_key).map(|index| self.slots.released(index));
         if !self.slots.claim(purpose, request, is_key) {
             self.slot_wait = wake.map(|wake| {
@@ -4188,4 +4200,27 @@ async fn inspect(context: &Arc<Context>, job: &Job) -> Result<Option<demand::Sna
 }
 fn request_id() -> Result<RequestId> {
     crate::identity::rng::random_array::<16>()
+}
+
+/// `VOX_MUTANT_BOUNDARY_RESELECT_OFF`: a live walk keeps its first head to the end of the
+/// window, as with the cut simply removed, instead of ending at the next position boundary
+/// when the author's newer head waits. Says so once on stderr when the daemon first reads it.
+#[cfg(feature = "test-knobs")]
+fn boundary_reselect_off_mutant() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let on = std::env::var_os("VOX_MUTANT_BOUNDARY_RESELECT_OFF").is_some();
+        if on {
+            eprintln!(
+                "vox: VOX_MUTANT_BOUNDARY_RESELECT_OFF engaged: a live walk keeps its first \
+                 head to the window's end"
+            );
+        }
+        on
+    });
+    *ON
+}
+
+#[cfg(not(feature = "test-knobs"))]
+const fn boundary_reselect_off_mutant() -> bool {
+    false
 }
