@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 use vox_core::node::daemonipc::{
     DaemonClient, DaemonFrame, DaemonObservation, DaemonRequest, NodeState,
 };
+use vox_core::node::ipc::PROTOCOL_VERSION;
 use vox_core::node::paths::{Account, NodeName};
 
 /// How long the old daemon is given to stop: it detaches every node first, each within its own
@@ -521,23 +522,32 @@ async fn restart_checked(
         )
         .await?;
     } else {
-        if matches!(started, Started::ByClient | Started::ByHand) {
-            let pid = i32::try_from(before.pid)
-                .ok()
-                .and_then(rustix::process::Pid::from_raw)
-                .ok_or_else(|| AppError::Usage("the daemon gave an invalid process id".into()))?;
-            rustix::process::kill_process(pid, rustix::process::Signal::TERM)
-                .map_err(|e| AppError::Usage(format!("the daemon could not be stopped: {e}")))?;
-        } else {
-            request_stop(account, before.pid).await?;
-        }
-        if !gone_within(before.pid, STOP_WITHIN).await {
-            return Err(AppError::Usage(format!(
-                "the daemon (pid {}) did not stop within {} s; it still runs vox {}",
-                before.pid,
-                STOP_WITHIN.as_secs(),
-                before.version,
-            )));
+        #[cfg(target_os = "linux")]
+        let by_unit = matches!(started, Started::UserUnit(_));
+        #[cfg(not(target_os = "linux"))]
+        let by_unit = false;
+        if !by_unit {
+            if matches!(started, Started::ByClient | Started::ByHand) {
+                let pid = i32::try_from(before.pid)
+                    .ok()
+                    .and_then(rustix::process::Pid::from_raw)
+                    .ok_or_else(|| {
+                        AppError::Usage("the daemon gave an invalid process id".into())
+                    })?;
+                rustix::process::kill_process(pid, rustix::process::Signal::TERM).map_err(|e| {
+                    AppError::Usage(format!("the daemon could not be stopped: {e}"))
+                })?;
+            } else {
+                request_stop(account, before.pid).await?;
+            }
+            if !gone_within(before.pid, STOP_WITHIN).await {
+                return Err(AppError::Usage(format!(
+                    "the daemon (pid {}) did not stop within {} s; it still runs vox {}",
+                    before.pid,
+                    STOP_WITHIN.as_secs(),
+                    before.version,
+                )));
+            }
         }
         start_selected(account, helper, listen, &anchors, &started, now).await?;
     }
@@ -780,14 +790,37 @@ async fn gone_within(pid: u32, bound: Duration) -> bool {
     }
 }
 
-/// Actual manager ownership, rather than a daemon's command-line startup style.
+/// Only a systemd unit needs an ownership probe; macOS login items identify themselves.
 pub(crate) fn is_managed_daemon(pid: u32) -> bool {
-    !matches!(how_started(pid), Started::ByClient | Started::ByHand)
+    #[cfg(target_os = "linux")]
+    return user_unit(pid).is_some();
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        false
+    }
 }
 
 async fn request_stop(account: &Account, pid: u32) -> Result<(), crate::app::AppError> {
     use crate::app::AppError;
     tokio::time::timeout(STOP_WITHIN, async {
+        let greeting = DaemonClient::observe(&account.socket())
+            .await
+            .map_err(|e| AppError::Usage(format!("cannot confirm the daemon to stop: {e}")))?;
+        if greeting.pid != pid {
+            return Err(AppError::Usage(
+                "the daemon changed before the stop request; it was not stopped".into(),
+            ));
+        }
+        if greeting.protocol != PROTOCOL_VERSION {
+            // Released daemons on older protocols predate managed exit 71: TERM exits zero.
+            let process = i32::try_from(pid)
+                .ok()
+                .and_then(rustix::process::Pid::from_raw)
+                .ok_or_else(|| AppError::Usage("the daemon gave an invalid process id".into()))?;
+            return rustix::process::kill_process(process, rustix::process::Signal::TERM)
+                .map_err(|e| AppError::Usage(format!("the daemon could not be stopped: {e}")));
+        }
         let mut client = DaemonClient::open(&account.socket())
             .await
             .map_err(|e| AppError::Usage(format!("cannot request the daemon stop: {e}")))?;

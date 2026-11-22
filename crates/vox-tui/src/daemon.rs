@@ -856,7 +856,7 @@ fn signal_stop(signal: crate::app::StopSignal, managed: bool) -> Result<(), AppE
         return Ok(());
     }
     Err(AppError::Refused {
-        code: signal.exit_code(),
+        code: 71,
         message: format!(
             "daemon stopped by {}; a service manager may start it again",
             signal.name()

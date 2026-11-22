@@ -1886,7 +1886,7 @@ fn a_product_stop_exits_zero_and_foreign_signals_exit_for_the_manager() {
     );
     drop(daemon);
 
-    for (signal, code) in [("TERM", 143), ("HUP", 129), ("INT", 130), ("QUIT", 131)] {
+    for (signal, code) in [("TERM", 71), ("HUP", 71), ("INT", 71), ("QUIT", 71)] {
         let mut daemon = start(&a, &["--login-item", "--no-node"]);
         let pid = daemon.0.child.id();
         let sent = Command::new("kill")

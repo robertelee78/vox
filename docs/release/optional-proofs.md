@@ -21,8 +21,9 @@ They are kept "at the ready for troubleshooting". When a user reports one of the
 
 The optional Linux systemd journey in `the_daemon_and_its_nodes_proof.rs` supplies a minimal
 `Restart=on-failure` user unit with private profile roots, then removes it. Vox ships no
-systemd unit or manual enrollment instructions. It checks signal recovery and explicit
-product Stop independently of client auto-start.
+systemd unit or manual enrollment instructions. A managed daemon stopped by a signal exits 71
+after clean shutdown; explicit product Stop exits 0. The journey checks recovery independently
+of client auto-start.
 
 ```sh
 cargo test --release -p vox-tui --features optional-proofs,test-knobs \
