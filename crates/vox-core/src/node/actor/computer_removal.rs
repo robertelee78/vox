@@ -58,6 +58,24 @@ impl Node {
                 let trusted_again = trusted_again
                     && !crate::node::computer::fx28_mutant("ignore-retrusted-computer-removal");
                 if trusted_again {
+                    // Before this node applies the current policy, its keyring can still hold
+                    // the very grant this removal ends; only an applied keyring trusts again.
+                    let applied = self.computer_authority_current();
+                    #[cfg(feature = "test-knobs")]
+                    let applied = applied
+                        || crate::node::computer::fx28_mutant("stale-removal-window-unchecked");
+                    if !applied {
+                        // Apparatus: name the room whose row waits for the applied policy.
+                        #[cfg(feature = "test-knobs")]
+                        if let Ok(path) = std::env::var("VOX_TEST_HOLD_COMPUTER_EVICTION") {
+                            let _ = std::fs::write(
+                                std::path::Path::new(&path).with_extension("deferred"),
+                                crate::node::link::b32_encode(&room),
+                            );
+                        }
+                        self.retry_computer_room_removal(room);
+                        return;
+                    }
                     true
                 } else {
                     match channel.is_member_removed(&store, &row.member) {

@@ -55,6 +55,7 @@ optional_proof::not_run!(
     computer_removal_reconciles_absence_before_a_fresh_join,
     computer_removal_checks_a_locked_nodes_rooms_when_it_opens,
     a_fresh_admission_survives_a_still_pending_computer_eviction,
+    computer_removal_evicts_before_old_trust_can_be_called_new,
     computer_removal_offers_only_a_fresh_basis,
     computer_removal_names_a_room_without_a_local_admin,
     computer_management_uses_anchors_added_after_start,
@@ -4401,6 +4402,10 @@ impl Drop for RoomTrustJourney {
 #[cfg(feature = "optional-proofs")]
 impl RoomTrustJourney {
     fn new(pair_gamma: bool) -> Self {
+        Self::with_reconcile_send_hold(pair_gamma, None)
+    }
+
+    fn with_reconcile_send_hold(pair_gamma: bool, send_hold: Option<&str>) -> Self {
         let a = Account::new();
         let b = Account::new();
         let c = Account::new();
@@ -4409,22 +4414,23 @@ impl RoomTrustJourney {
         let gamma = c.make_node("gamma");
         let hold = a.data.join("rg3-withdrawal");
         let queued_key = a.data.join("rg3-queued-key");
-        let daemons = vec![
-            Daemon::start(
-                &a,
-                &[],
-                &[
-                    ("VOX_TEST_RG3_HOLD_WITHDRAWAL", hold.to_str().unwrap()),
-                    (
-                        "VOX_TEST_HOLD_COMPUTER_EVICTION",
-                        a.data.join("rg8-eviction").to_str().unwrap(),
-                    ),
-                    (
-                        "VOX_TEST_HOLD_PAIRWISE_KEY_FILE",
-                        queued_key.to_str().unwrap(),
-                    ),
-                ],
+        let eviction = a.data.join("rg8-eviction");
+        let mut daemon_env = vec![
+            ("VOX_TEST_RG3_HOLD_WITHDRAWAL", hold.to_str().unwrap()),
+            (
+                "VOX_TEST_HOLD_COMPUTER_EVICTION",
+                eviction.to_str().unwrap(),
             ),
+            (
+                "VOX_TEST_HOLD_PAIRWISE_KEY_FILE",
+                queued_key.to_str().unwrap(),
+            ),
+        ];
+        if let Some(spec) = send_hold {
+            daemon_env.push(("VOX_TEST_HOLD_COMPUTER_RECONCILE_SEND_FILE", spec));
+        }
+        let daemons = vec![
+            Daemon::start(&a, &[], &daemon_env),
             Daemon::start(&b, &[], &[]),
             Daemon::start(&c, &[], &[("VOX_TEST_PAIRWISE_OPENING_RECEIPTS", "1")]),
         ];
@@ -5578,6 +5584,258 @@ fn computer_removal_checks_a_locked_nodes_rooms_when_it_opens() {
     );
 }
 
+/// An open room must not confuse pre-removal trust with a deliberate later grant.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "three computers and a held policy send; release with test-knobs,optional-proofs"]
+fn computer_removal_evicts_before_old_trust_can_be_called_new() {
+    let controls = tempfile::Builder::new()
+        .prefix("p1")
+        .tempdir_in(if cfg!(target_os = "macos") {
+            "/private/tmp"
+        } else {
+            "/tmp"
+        })
+        .unwrap();
+    let arm = controls.path().join("arm");
+    let engaged = controls.path().join("engaged");
+    let release = controls.path().join("release");
+    let fault = controls.path().join("fault");
+    let spec = format!(
+        "{}\t{}\t{}\t{}",
+        arm.display(),
+        engaged.display(),
+        release.display(),
+        fault.display()
+    );
+    let mut journey = RoomTrustJourney::with_reconcile_send_hold(false, Some(&spec));
+    let delta = journey.a.make_node("delta");
+    let gamma = journey.c.make_node("gamma");
+    let (ok, out, err) = journey
+        .a
+        .run(&["node", "unlock", "delta", "--passphrase-file", "-"], PASS);
+    assert!(ok, "APPARATUS: ready local room administrator: {out}{err}");
+    for (account, node, peer) in [
+        (&journey.a, "delta", gamma.as_str()),
+        (&journey.c, "gamma", delta.as_str()),
+        (&journey.b, "beta", gamma.as_str()),
+        (&journey.c, "gamma", journey.beta.as_str()),
+    ] {
+        let (ok, out, err) = account.run(
+            &["trust", "add", peer, "--name", &peer[..12], "--node", node],
+            "",
+        );
+        assert!(
+            ok,
+            "APPARATUS: trust independent room participant: {out}{err}"
+        );
+    }
+    let room = make_room(&journey.c, "gamma");
+    let link = removal_link(&journey.c, "gamma", &room);
+    removal_join(&journey.a, "delta", &link);
+    removal_join(&journey.b, "beta", &link);
+    let grant_admin = |member: &str| {
+        let mut answer = String::new();
+        assert!(
+            wait_until(RETURN_WITHIN, || {
+                let (ok, out, err) = journey.c.run(
+                    &["room", "admin", "add", &room, member, "--node", "gamma"],
+                    "",
+                );
+                answer = format!("{out}{err}");
+                assert!(
+                    ok || answer.contains(
+                        "this room's permissions are still being read from local storage"
+                    ) || answer.contains("a previous change to this room is still being applied"),
+                    "APPARATUS: creator's admin change: {answer}"
+                );
+                ok
+            }),
+            "APPARATUS: creator's admin change never settled: {answer}"
+        );
+    };
+    grant_admin(&delta);
+    assert!(
+        wait_until(RETURN_WITHIN, || {
+            let (ok, admins, _) = journey
+                .a
+                .run(&["room", "admin", "list", &room, "--node", "delta"], "");
+            let (roster_ok, roster, _) = journey
+                .a
+                .run(&["room", "roster", &room, "--node", "delta"], "");
+            ok && admins.contains(&delta)
+                && roster_ok
+                && roster.contains(&journey.beta)
+                && grant_words(&journey.a, "delta", &journey.beta).is_some()
+                && computer(&journey.a, &["status"])["state"] == "confirmed"
+        }),
+        "APPARATUS: open room, old group trust and local admin did not settle"
+    );
+    // Keep the removed computer offline so its exchanged management facts cannot
+    // supersede the exact revision selected by the existing policy-send hold.
+    journey._daemons[1]
+        .child
+        .kill()
+        .expect("APPARATUS: stop beta's scratch daemon");
+    journey._daemons[1]
+        .child
+        .wait()
+        .expect("APPARATUS: reap beta's scratch daemon");
+    let before = computer(&journey.a, &["status"]);
+    // The removal's fold takes the next exchanged journal revision, which an earlier individual
+    // trust has already moved past the shown policy revision; exchanges name that journal.
+    let journal = before["applications"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|application| {
+            ["last_started_exchange", "last_answered_exchange"]
+                .into_iter()
+                .filter_map(move |exchange| application[exchange]["sent_revision"].as_u64())
+        })
+        .chain(before["revision"].as_u64())
+        .max()
+        .unwrap();
+    let revision = journal + 1;
+    let exact = format!("{delta}\t{revision}");
+    std::fs::write(&arm, &exact).unwrap();
+    let removed = computer(
+        &journey.a,
+        &[
+            "remove",
+            &journey.beta_computer,
+            "--confirm",
+            before["frontier"].as_str().unwrap(),
+        ],
+    );
+    println!("[old-trust apparatus] armed {exact}; before:\n{before}\nafter removal:\n{removed}");
+    assert_eq!(
+        removed["revision"].as_u64(),
+        Some(revision),
+        "APPARATUS: the removal saved a policy revision other than the armed one"
+    );
+    assert!(
+        wait_until(RETURN_WITHIN, || engaged.exists()),
+        "APPARATUS: exact policy send did not engage; arm={:?}; fault={:?}; status={}; daemon:\n{}",
+        std::fs::read_to_string(&arm),
+        std::fs::read_to_string(&fault),
+        computer(&journey.a, &["status"]),
+        journey._daemons[0].said()
+    );
+    let marker = read_daemon_marker(
+        &engaged,
+        journey.a.lock_pid().unwrap(),
+        "delta's current removal policy held before actor send",
+    );
+    assert_eq!(
+        marker.trim(),
+        exact,
+        "APPARATUS: wrong policy send was held"
+    );
+    assert!(
+        !fault.exists(),
+        "APPARATUS: policy-send hold fault: {}",
+        std::fs::read_to_string(&fault).unwrap_or_default()
+    );
+    println!("[old-trust witness] held policy send: {marker}");
+    // The remote creator's new admin grant drives a real governance turn on delta.
+    grant_admin(&journey.beta);
+    let mut admins = String::new();
+    assert!(wait_until(RETURN_WITHIN, || {
+        let (ok, out, err) = journey.a.run(
+            &["room", "admin", "list", &room, "--node", "delta"], "");
+        admins = format!("{out}{err}");
+        ok && admins.contains(&journey.beta)
+    }), "APPARATUS: delta did not observe the creator's governance turn while its policy send was held: {admins}");
+    println!("[old-trust witness] governance applied while policy send held:\n{admins}");
+    // The daemon's eviction apparatus names the room whose saved row the pass left waiting for
+    // the applied policy (`deferred`); a row the pass finished leaves `computer status`.
+    // (`observed` is shared with alpha's own row, so a later write can replace delta's room.)
+    let deferred = journey.a.data.join("rg8-eviction.deferred");
+    let full_room = full_room_id(&link, &room);
+    let room_value =
+        serde_json::to_value(vox_core::node::link::b32_decode(&full_room, "room").unwrap())
+            .unwrap();
+    let pending_here = |status: &serde_json::Value| {
+        status["removals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|removal| {
+                removal["pending"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row["room"] == room_value)
+            })
+    };
+    let deferred_here =
+        || std::fs::read_to_string(&deferred).is_ok_and(|named| named.trim() == full_room);
+    // Only the stale-removal-window mutants let delta's turn past the policy gate in this
+    // window; then the pass must decide delta's row before the policy is released.
+    if std::env::var("VOX_MUTANT_FX28").is_ok_and(|m| m.starts_with("stale-removal-window")) {
+        assert!(
+            wait_until(RETURN_WITHIN, || deferred_here()
+                || !pending_here(&computer(&journey.a, &["status"]))),
+            "APPARATUS: the mutant's governance turn never brought delta's row to the eviction pass while policy was held; daemon:\n{}",
+            journey._daemons[0].said()
+        );
+    }
+    println!(
+        "[old-trust witness] while policy held, delta's row in {full_room}: still shown pending={}, waiting for applied policy={}",
+        pending_here(&computer(&journey.a, &["status"])),
+        deferred_here()
+    );
+    // `vox trust list` fails closed while policy is unapplied, so it cannot show the actor's
+    // old keyring; the roster and pending row are what a person can read in this window.
+    let held = computer(&journey.a, &["status"]);
+    let (_, held_roster, held_err) = journey
+        .a
+        .run(&["room", "roster", &room, "--node", "delta"], "");
+    println!("[old-trust witness] roster while policy held:\n{held_roster}{held_err}\nstatus before releasing policy:\n{held}");
+    drop(
+        std::os::unix::net::UnixStream::connect(&release)
+            .expect("APPARATUS: release the held policy send"),
+    );
+    assert!(
+        wait_until(RETURN_WITHIN, || {
+            grant_words(&journey.a, "delta", &journey.beta).is_none()
+                && computer(&journey.a, &["status"])["state"] == "confirmed"
+        }),
+        "APPARATUS: released removal policy did not finish: {}",
+        computer(&journey.a, &["status"])
+    );
+    removal_wait_room_open(&journey.a, "delta", &room);
+    let mut roster = String::new();
+    let mut readable = false;
+    let evicted = wait_until(RETURN_WITHIN, || {
+        let (ok, out, err) = journey
+            .a
+            .run(&["room", "roster", &room, "--node", "delta"], "");
+        roster = format!("{out}{err}");
+        readable = ok;
+        ok && !roster.contains(&journey.beta)
+    });
+    assert!(
+        readable,
+        "APPARATUS: released room roster unreadable: {roster}"
+    );
+    let (ok, words, err) = journey.a.run(&["computer", "status"], "");
+    assert!(
+        ok,
+        "APPARATUS: final removal status unavailable: {words}{err}"
+    );
+    println!("[old-trust witness] final status:\n{words}{err}\nroster:\n{roster}");
+    assert!(evicted,
+        "PRODUCT: old pre-removal trust cancelled the saved eviction of {}; readable delta roster:\n{roster}\ncomputer status:\n{words}{err}",
+        journey.beta);
+    let status = computer(&journey.a, &["status"]);
+    assert!(
+        !pending_here(&status),
+        "PRODUCT: evicted member still shown pending: {status}"
+    );
+}
+
 /// A fresh remote admission must not be evicted by an older removal when this room reopens.
 #[cfg(feature = "optional-proofs")]
 #[test]
@@ -5862,7 +6120,7 @@ fn a_fresh_admission_survives_a_still_pending_computer_eviction() {
         "PRODUCT: old pending eviction removed freshly admitted trusted node {}; roster:\n{roster}{roster_err}\nposted={posted}:\n{post}{post_err}\nread:\n{readback}",
         journey.beta);
     assert!(posted && read,
-        "APPARATUS: membership survived but its post/read did not settle: {post}{post_err}; {readback}");
+        "PRODUCT: membership survived but its post/read did not settle: {post}{post_err}; {readback}");
 }
 
 /// #1020: manual trust is local to the person even while Computer policy is active, and removing

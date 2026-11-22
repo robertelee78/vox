@@ -195,6 +195,11 @@ impl<L> Continuation<L> {
             }
         )
     }
+    /// Test apparatus: a governance turn, whose end runs the computer-removal pass.
+    #[cfg(feature = "test-knobs")]
+    pub(super) fn is_turn(&self) -> bool {
+        matches!(self.after, After::Turn(_))
+    }
     pub(super) fn now(&self) -> Option<crate::time::Ms> {
         match &self.after {
             After::Sweep(sweep) => Some(match sweep.stage {

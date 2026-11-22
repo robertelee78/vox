@@ -99,7 +99,8 @@ The pairing journey in `nodes_of_one_daemon_proof.rs` also covers saved room cho
 `computer_removal_checks_a_locked_nodes_rooms_when_it_opens`,
 `computer_removal_names_a_room_without_a_local_admin`,
 `computer_removal_offers_only_a_fresh_basis`,
-`a_fresh_admission_survives_a_still_pending_computer_eviction`.
+`a_fresh_admission_survives_a_still_pending_computer_eviction`, and
+`computer_removal_evicts_before_old_trust_can_be_called_new`.
 Run one name at a time with
 `cargo test --release -p vox-tui --features test-knobs,optional-proofs --test nodes_of_one_daemon_proof <name> -- --ignored --exact --nocapture`.
 The restart and absence acts use causal holds and require an exclusive proof slot.
@@ -112,6 +113,12 @@ A pending eviction finishes without evicting a node this computer presently trus
 again, individually or through its current computer group. The finished row disappears
 from status. A fresh admission alone is not enough in a room closed at removal: the
 saved removal has no room-feed frontier with which to date that admission.
+"Trusts again" counts only once this node has applied the current computer policy; until
+then the row retries on that same deadline and stays pending in status.
+`computer_removal_evicts_before_old_trust_can_be_called_new` runs a governance turn while
+the removal's policy send is held. Its mutants, selected with `VOX_MUTANT_FX28`:
+`stale-removal-window` lets only that turn past the policy gate (expected green);
+`stale-removal-window-unchecked` also drops the applied-policy condition (expected red).
 Each accepted removal also keeps this computer's existing-node offer obligations and
 per-room basis cutoffs in that same snapshot. Until a room's cutoff is captured it
 offers none of that computer's nodes; afterwards only pre-removal bases are suppressed.
