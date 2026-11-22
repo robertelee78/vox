@@ -195,6 +195,9 @@ impl Work {
                     )?,
                     (false, Some(_)) => return Err(Error::Profile("room already stored")),
                 };
+                // A joined room keeps no longer than this node does, from before it is published.
+                channel.set_node_retention(retention.0);
+                channel.set_node_step_retention(retention.1);
                 let known = channel.author_fingerprints().into_iter().collect();
                 let pending = verify_unknown_records(&known, &set.bundles);
                 admit_verified_records(
