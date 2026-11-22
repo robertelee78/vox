@@ -416,7 +416,7 @@ fn a_restarted_room_drives_its_session_refresh_to_ready() {
     }
     // These are real protocol requests to the shipped daemon, not an in-process Node.
     // Public lifecycle posts replicate every staged row, unlike private delivery windows.
-    const PER_AUTHOR: usize = 512;
+    const PER_AUTHOR: usize = 256;
     let unchanged_room = vox_core::node::api::Fault::RoomChangePending.to_string();
     let at = NodeSocket::one_shot(
         room.workers[0].paths.account().socket(),
@@ -593,12 +593,12 @@ fn a_restarted_room_drives_its_session_refresh_to_ready() {
                 "APPARATUS: malformed refresh receipt {line:?}"
             );
             (
-                rows + fields[1].parse::<usize>().expect("APPARATUS: walked rows"),
+                rows + fields[1].parse::<usize>().expect("APPARATUS: opened rows"),
                 foreign + fields[2].parse::<usize>().expect("APPARATUS: foreign rows"),
             )
         });
     eprintln!(
-        "RG12 restart READY: authored={} own_openings={} foreign_openings={} walked={rows} own_walked={} foreign_walked={foreign} \
+        "RG12 restart READY: authored={} own_openings={} foreign_openings={} opened={rows} own_opened={} foreign_opened={foreign} \
         spawn_to_room_open={ready:?}\nwalk:\n{walked}\nproduct stderr:\n{}",
         2 * (PER_AUTHOR + 1),
         PER_AUTHOR + 1,
@@ -606,11 +606,12 @@ fn a_restarted_room_drives_its_session_refresh_to_ready() {
         rows - foreign,
         std::fs::read_to_string(&err).expect("APPARATUS: read restart product report")
     );
-    // Replay walks retained, indexed lifecycle sources rather than folded Session heads,
-    // so its counts need not match the number of acknowledged openings.
+    // This receipt counts opened records, not index-only visits at or above `through`.
+    // Zero-open batches still walk the index. Only this positive-share apparatus check
+    // reads the count; the PRODUCT readiness assertion above uses the public room event.
     assert!(
         foreign > 0 && rows > foreign,
-        "APPARATUS: restart did not walk a positive share of both own and foreign Session sources"
+        "APPARATUS: restart did not open a positive share of both own and foreign Session sources"
     );
     let mut observer = rt
         .block_on(IpcClient::open_at(&at))

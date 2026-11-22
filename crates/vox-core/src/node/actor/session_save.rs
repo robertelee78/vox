@@ -47,6 +47,7 @@ impl Drop for IngressWait {
 
 /// One original command owns the existing deferred-command credit until native completion.
 pub(super) struct Bookkeeping {
+    room: Digest32,
     result: Arc<std::sync::Mutex<Option<bool>>>,
     _task: tokio::task::JoinHandle<()>,
 }
@@ -99,6 +100,12 @@ pub(super) fn save_drive_admission(
 }
 
 impl Node {
+    pub(super) fn session_bookkeeping_blocks_room(&self, room: &Digest32) -> bool {
+        self.pending_session_bookkeeping
+            .as_ref()
+            .is_some_and(|pending| pending.room == *room)
+    }
+
     pub(super) fn complete_session_bookkeeping(&mut self) -> bool {
         let Some(pending) = &self.pending_session_bookkeeping else {
             return false;
@@ -261,6 +268,7 @@ impl Node {
             wake.notify_one();
         });
         self.pending_session_bookkeeping = Some(Bookkeeping {
+            room,
             result,
             _task: task,
         });
@@ -364,6 +372,7 @@ impl Node {
         });
         if !page {
             self.pending_session_bookkeeping = Some(Bookkeeping {
+                room,
                 result,
                 _task: task,
             });

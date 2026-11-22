@@ -775,12 +775,31 @@ fn status_and_posts_answer_while_ten_sessions_step() {
             .stderr(Stdio::piped())
             .spawn()
             .expect("APPARATUS: concurrent Session listing");
+        let mut admins = command()
+            .args(["room", "admin", "list", &room])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("APPARATUS: concurrent room admins listing");
+        let pause = scope.spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("APPARATUS: pause-status wire runtime")
+                .block_on(vox_core::node::room_pause::status(&at, cid, owner))
+        });
         // Give the already-started listing its turn before measuring status.
         std::thread::sleep(Duration::from_millis(100));
         let listing_held = listing
             .try_wait()
             .expect("APPARATUS: observe listing")
             .is_none();
+        let admins_held = admins
+            .try_wait()
+            .expect("APPARATUS: observe admins listing")
+            .is_none();
+        let pause_held = !pause.is_finished();
         let start = Instant::now();
         let mut status = command()
             .args(["status", "--json"])
@@ -817,20 +836,27 @@ fn status_and_posts_answer_while_ten_sessions_step() {
         let listed = listing
             .wait_with_output()
             .expect("APPARATUS: Session listing output");
+        let admins = admins
+            .wait_with_output()
+            .expect("APPARATUS: admins listing output");
+        let pause = pause
+            .join()
+            .expect("APPARATUS: pause-status driver panicked");
         let saved = attention
             .join()
             .expect("APPARATUS: attention driver panicked");
         eprintln!(
             "RG12 attention status within_1s={answered} observed={observed:?} \
             answered_before_release={before_release} listing_held={listing_held} \
-            status={output:?} listing={listed:?} attention={saved:?}"
+            admins_held={admins_held} pause_held={pause_held} \
+            status={output:?} listing={listed:?} admins={admins:?} pause={pause:?} attention={saved:?}"
         );
         assert!(
-            listing_held,
-            "APPARATUS: Session listing did not overlap held attention commit"
+            listing_held && admins_held && pause_held,
+            "APPARATUS: Session, admins or pause-status read did not overlap held attention commit"
         );
-        assert!(listed.status.success() && saved.is_ok(),
-            "PRODUCT: Session listing or attention failed after commit release: {listed:?} {saved:?}");
+        assert!(listed.status.success() && admins.status.success() && pause.is_ok() && saved.is_ok(),
+            "PRODUCT: a room read or attention failed after commit release: {listed:?} {admins:?} {pause:?} {saved:?}");
         answered && before_release && output.status.success()
     });
     assert!(

@@ -2157,6 +2157,9 @@ impl NetEvent {
             self,
             Self::Names(_)
                 | Self::Resolve { .. }
+                | Self::SessionActivity { .. }
+                | Self::SessionProjection { .. }
+                | Self::SessionFiles { .. }
                 | Self::RoomHistory { .. }
                 | Self::MemberDialer(_)
                 | Self::LocalTrustBlacklist(_)
@@ -7820,6 +7823,25 @@ impl Node {
         }
     }
 
+    fn event_waits_for_save(&self, event: &NetEvent, save_pending: bool) -> bool {
+        let room = match event {
+            NetEvent::SessionActivity { channel_id, .. }
+            | NetEvent::SessionProjection { channel_id, .. }
+            | NetEvent::SessionFiles { channel_id, .. }
+            | NetEvent::RoomHistory { channel_id, .. } => Some(channel_id),
+            _ => None,
+        };
+        if room.is_some_and(|room| self.session_bookkeeping_blocks_room(room)) {
+            return true;
+        }
+        self.seat_waits_for_install(event).unwrap_or_else(|| {
+            save_pending
+                && (event.waits_for_store()
+                    || matches!(event, NetEvent::LocalTrustBlacklist(_)
+                        if !self.trust.local_history_imported()))
+        })
+    }
+
     async fn run_loop(
         &mut self,
         cmd_rx: &mut mpsc::Receiver<(NodeCommand, oneshot::Sender<Outcome>)>,
@@ -7855,17 +7877,9 @@ impl Node {
         )> = std::collections::VecDeque::new();
         loop {
             let save_pending = self.store_save_pending();
-            let saved_ready = if !save_pending {
-                saved_events
-                    .iter()
-                    .position(|(event, _)| self.seat_waits_for_install(event) != Some(true))
-            } else {
-                // A seat can pass blocked Store events once its own roster is installed.
-                // Ordinary Store events keep FIFO order and their original admission credit.
-                saved_events
-                    .iter()
-                    .position(|(event, _)| self.seat_waits_for_install(event) == Some(false))
-            };
+            let saved_ready = saved_events
+                .iter()
+                .position(|(event, _)| !self.event_waits_for_save(event, save_pending));
             let receive_net = saved_events.iter().all(|(_, credit)| credit.is_some());
             let journal_busy = self.deferred_commands.front().is_some_and(|deferred| {
                 Self::command_needs_journal(&deferred.command.0)
@@ -8077,6 +8091,9 @@ impl Node {
                         continue;
                     }
                     if (self.store_save_pending() && Self::command_waits_for_save(&command))
+                        || matches!(&command, NodeCommand::RoomPause {
+                            channel_id, paused: None, ..
+                        } if self.session_bookkeeping_blocks_room(channel_id))
                         || ((self.policy_save_pending() || !self.own_key_leave_pending.is_empty()
                             || !self.own_key_ended_pending.is_empty()) && matches!(command,
                             NodeCommand::SendText { .. } | NodeCommand::SendTextAt { .. }
@@ -8335,11 +8352,7 @@ impl Node {
                     }
                     net_rx.recv().await.map(|event| (event, None, false))
                 }, if receive_net || saved_ready.is_some() => {
-                    let waits_for_store = self.seat_waits_for_install(&event).unwrap_or_else(|| {
-                        save_pending && (event.waits_for_store()
-                            || matches!(&event, NetEvent::LocalTrustBlacklist(_)
-                                if !self.trust.local_history_imported()))
-                    });
+                    let waits_for_store = self.event_waits_for_save(&event, save_pending);
                     if waits_for_store
                     {
                         let credit = if parked {
