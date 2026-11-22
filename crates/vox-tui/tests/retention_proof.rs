@@ -1843,7 +1843,7 @@ fn session_steps_expire_after_two_days_unless_the_admin_chose_otherwise() {
             .unwrap()
             .0;
         let room = vox_core::node::link::b32_encode(&cid);
-        let log_count = || {
+        let governance_revision = || {
             let (ok, out, err) = run(&["status", "--json"], None);
             assert!(ok, "APPARATUS: status around admin choice: {out}{err}");
             let status: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -1852,10 +1852,11 @@ fn session_steps_expire_after_two_days_unless_the_admin_chose_otherwise() {
                 .unwrap()
                 .iter()
                 .find(|r| r["id"] == room)
-                .and_then(|r| r["log_entries"].as_u64())
+                .and_then(|r| r["governance_revision"].as_u64())
                 .expect("APPARATUS: policy room not published")
         };
-        let before = (name == "equal").then(log_count);
+        // Background room controls share the log; only governance records this admin choice.
+        let before = (name == "equal").then(governance_revision);
         if let Some(seconds) = seconds {
             let seconds = seconds.to_string();
             let (ok, out, err) = run(&["room", "retention", &room, "--steps", &seconds], None);
@@ -1863,17 +1864,17 @@ fn session_steps_expire_after_two_days_unless_the_admin_chose_otherwise() {
             println!("SEEN: vox room retention {name} --steps {seconds}: {out}{err}");
         }
         if let Some(before) = before {
-            let after_first = log_count();
-            println!("SEEN: first default-equal choice: before={before}; after={after_first}");
+            let after_first = governance_revision();
+            println!("SEEN: first default-equal choice governance revision: before={before}; after={after_first}");
             if after_first != before + 1 {
-                policy_failures.push(format!("first explicit default-equal choice must record one signed log entry: before={before}; after={after_first}"));
+                policy_failures.push(format!("first explicit default-equal choice must advance governance revision once: before={before}; after={after_first}"));
             }
             let (ok, out, err) = run(&["room", "retention", &room, "--steps", "172800"], None);
             assert!(ok, "APPARATUS: repeat default-equal choice: {out}{err}");
-            let after_repeat = log_count();
-            println!("SEEN: repeated default-equal choice: before={after_first}; after={after_repeat}; {out}{err}");
+            let after_repeat = governance_revision();
+            println!("SEEN: repeated default-equal choice governance revision: before={after_first}; after={after_repeat}; {out}{err}");
             if after_repeat != after_first {
-                policy_failures.push(format!("repeating a signed default-equal choice must add no log entry: before={after_first}; after={after_repeat}"));
+                policy_failures.push(format!("repeating a signed default-equal choice must leave governance revision unchanged: before={after_first}; after={after_repeat}"));
             }
         }
         let lifecycle = serde_json::json!({"v":1,"type":"session","from":"ttl-session",
@@ -3042,20 +3043,30 @@ fn private_session_steps_store_one_body_and_reopen_after_rotation() {
         std::fs::copy(paths(&a).store_file(), &copy).expect("APPARATUS: copy stopped store");
         let db = redb::Database::open(&copy).expect("APPARATUS: open copied store");
         let transaction = db.begin_read().expect("APPARATUS: store snapshot");
-        let table = transaction
-            .open_table(TableDefinition::<([u8; 32], u8, u64), &[u8]>::new(
-                "segments",
-            ))
-            .expect("APPARATUS: product segment table");
-        table
-            .iter()
-            .expect("APPARATUS: segment rows")
-            .map(|row| row.expect("APPARATUS: segment row"))
-            .filter_map(|(key, value)| {
-                let (room, kind, position) = key.value();
-                (room == id && kind == 10).then_some((position, value.value().len()))
-            })
-            .collect::<std::collections::BTreeMap<_, _>>()
+        let mut rows = std::collections::BTreeMap::new();
+        for name in ["segments", "small_segments"] {
+            match transaction.open_table(TableDefinition::<([u8; 32], u8, u64), &[u8]>::new(name)) {
+                Ok(table) => {
+                    for row in table.iter().expect("APPARATUS: segment rows") {
+                        let (key, value) = row.expect("APPARATUS: segment row");
+                        let (room, kind, position) = key.value();
+                        if room == id && kind == 10 {
+                            rows.insert((name, position), value.value().len());
+                        }
+                    }
+                }
+                Err(redb::TableError::TableDoesNotExist(_)) => {}
+                Err(error) => panic!("APPARATUS: product segment table: {error}"),
+            }
+        }
+        let small = rows
+            .keys()
+            .filter(|(name, _)| *name == "small_segments")
+            .count();
+        eprintln!(
+            "PRODUCT STORE TABLE RECEIPT {tag}: small_segments kind-10 rows={small}; rows by (table, position)={rows:?}"
+        );
+        rows
     };
     let (_, warm) = append(0, 64);
     let mut expected = vec![warm];
@@ -3735,20 +3746,22 @@ fn a_session_change_rewrites_only_that_session() {
         std::fs::copy(paths.store_file(), &copy).expect("APPARATUS: durable store copy");
         let db = redb::Database::open(&copy).expect("APPARATUS: copied product store");
         let txn = db.begin_read().expect("APPARATUS: copied read transaction");
-        let table = txn
-            .open_table(TableDefinition::<([u8; 32], u8, u64), &[u8]>::new(
-                "segments",
-            ))
-            .expect("APPARATUS: product segments");
         let mut bytes = 0u64;
-        for row in table.iter().expect("APPARATUS: product rows") {
-            let (key, value) = row.expect("APPARATUS: product row");
-            let (room, kind, _) = key.value();
-            if &room == cid && kind == 14 {
-                bytes += value.value().len() as u64;
+        for name in ["segments", "small_segments"] {
+            match txn.open_table(TableDefinition::<([u8; 32], u8, u64), &[u8]>::new(name)) {
+                Ok(table) => {
+                    for row in table.iter().expect("APPARATUS: product rows") {
+                        let (key, value) = row.expect("APPARATUS: product row");
+                        let (room, kind, _) = key.value();
+                        if &room == cid && kind == 14 {
+                            bytes += value.value().len() as u64;
+                        }
+                    }
+                }
+                Err(redb::TableError::TableDoesNotExist(_)) => {}
+                Err(error) => panic!("APPARATUS: product segment table: {error}"),
             }
         }
-        drop(table);
         drop(txn);
         drop(db);
         let stored = vox_core::node::store::Store::open_read_only(&copy)
@@ -3790,7 +3803,15 @@ fn a_session_change_rewrites_only_that_session() {
     let mut measured = Vec::new();
     let mut index_costs = Vec::new();
     let mut preserved = Vec::new();
-    for n in [100usize, 1500] {
+    let mut sizes = vec![100usize, 1500];
+    if let Ok(count) = std::env::var("RG13_SESSION_LOCAL_LARGER_COUNT") {
+        sizes.push(
+            count
+                .parse()
+                .expect("APPARATUS: larger Session count must be an integer"),
+        );
+    }
+    for n in sizes {
         let name = format!("local-{n}");
         let (ok, out, err) = vox(
             root,
