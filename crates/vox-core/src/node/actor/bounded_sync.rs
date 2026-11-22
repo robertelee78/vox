@@ -219,6 +219,24 @@ type RetirementKey = crate::node::history_budget::RetirementKey;
 type RetirementLedger = crate::node::history_budget::RetirementLedger;
 type RetirementEntry = crate::node::history_budget::RetirementEntry;
 
+/// `VOX_MUTANT_TRANSPORT_STREAK`: an answered turn leaves the transport failure streak as it was.
+/// Says so once on stderr when it first keeps a streak.
+#[cfg(feature = "test-knobs")]
+fn transport_streak_mutant() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("VOX_MUTANT_TRANSPORT_STREAK").is_some());
+    static SAID: std::sync::Once = std::sync::Once::new();
+    if *ON {
+        SAID.call_once(|| {
+            eprintln!(
+                "vox: VOX_MUTANT_TRANSPORT_STREAK engaged: an answered turn kept the transport \
+                 failure streak"
+            );
+        });
+    }
+    *ON
+}
+
 fn retirement_key(flow: &Flow) -> RetirementKey {
     RetirementKey {
         actor: flow.actor_incarnation(),
@@ -3499,6 +3517,26 @@ impl Node {
                         false
                     }
                 });
+            // A turn that returned without failure ends the port's transport failure streak, as
+            // a successful session does. Otherwise two transport failures half a minute apart,
+            // with any number of answered turns between, pace every later single failure as a
+            // sustained one: 30 s or more with the whole port stopped while the peer serves.
+            if returned.failure.is_none() {
+                if let Some(backoff) = self
+                    .ports
+                    .get_mut(&(work.room, work.peer))
+                    .and_then(|port| port.transport_backoff.as_mut())
+                    .filter(|backoff| backoff.failures > 0)
+                {
+                    #[cfg(feature = "test-knobs")]
+                    let kept = transport_streak_mutant();
+                    #[cfg(not(feature = "test-knobs"))]
+                    let kept = false;
+                    if !kept {
+                        backoff.failures = 0;
+                    }
+                }
+            }
             // The physical Background position is free on every returned outcome, including
             // stale, failed and local-retry exits. Reconsider only the eligible opposite service;
             // this is a capacity wake, not Public request or generation credit.
