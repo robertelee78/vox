@@ -135,6 +135,7 @@ fn parse_input(raw: &str) -> HookInput {
 async fn check_native_notice(
     paths: &Paths,
     notice: &crate::wake::NativeNotice,
+    turn: Option<&RestartTurn>,
 ) -> Result<(), AppError> {
     let saved = crate::wake::pause_registration(paths, &notice.recipient.session)
         .map_err(AppError::Usage)?
@@ -157,7 +158,7 @@ async fn check_native_notice(
         return Err(AppError::Usage("Vox attention registration changed".into()));
     }
     let at = crate::client::one_shot(paths)?;
-    let client = crate::client::open_for_hook(&at).await?;
+    let client = open_for_turn(paths, turn).await?;
     let owner = client
         .me()
         .ok_or_else(|| AppError::Usage("Vox node is locked".into()))?;
@@ -213,14 +214,18 @@ async fn check_omp_registration(
     Ok(())
 }
 
-async fn check_omp_opening(paths: &Paths, input: &HookInput) -> Result<(), AppError> {
+async fn check_omp_opening(
+    paths: &Paths,
+    input: &HookInput,
+    turn: Option<&RestartTurn>,
+) -> Result<(), AppError> {
     let Some(saved) = &input.omp_registration else {
         return Ok(());
     };
     check_omp_registration(paths, saved).await?;
     if let Some(recipient) = &input.omp_recipient {
         let at = crate::client::one_shot(paths)?;
-        let mut client = crate::client::open_for_hook(&at).await?;
+        let mut client = open_for_turn(paths, turn).await?;
         let owner = client
             .me()
             .ok_or_else(|| AppError::Usage("Vox node is locked".into()))?;
@@ -436,6 +441,7 @@ async fn omp_prepare(
     room_arg: Option<&str>,
     format: Format,
     session: Option<&str>,
+    turn: &RestartTurn,
 ) -> Result<(), AppError> {
     let session = session
         .filter(|s| !s.trim().is_empty() && *s == s.trim())
@@ -459,6 +465,7 @@ async fn omp_prepare(
         input.omp_registration = Some(saved.clone());
         omp_uncertainty_begin(paths, &input, None, None, &[])?;
         emit_receipts(format, "", &input.event, "", "", &[]);
+        turn.published.set(true);
         std::io::Write::flush(&mut std::io::stdout())
             .map_err(|e| AppError::Usage(format!("OMP output is unconfirmed: {e}")))?;
         let commit = omp_decision()?;
@@ -477,7 +484,10 @@ async fn omp_prepare(
     if let Some(room) = &saved.room {
         let room = b32_decode(room, "attention room")?;
         let at = crate::client::one_shot(paths)?;
-        let client = crate::client::open_for_hook(&at).await?;
+        let mut client = open_for_turn(paths, Some(turn)).await?;
+        if turn.restarting.get() {
+            rooms_for_turn(&mut client, saved.room.as_deref(), Some(turn)).await?;
+        }
         let owner = client
             .me()
             .ok_or_else(|| AppError::Usage("Vox node is locked".into()))?;
@@ -583,14 +593,41 @@ async fn omp_prepare(
     }
     drain(
         paths,
-        room_arg,
-        saved.room.as_deref(),
+        (room_arg, saved.room.as_deref()),
         &input,
         "",
         format,
         note,
+        Some(turn),
     )
     .await
+}
+
+/// A deferred native turn still completes the existing envelope/decision exchange.
+async fn omp_restart_deferral(
+    paths: &Paths,
+    daemon: &Daemon,
+    format: Format,
+    session: Option<&str>,
+) -> Result<(), AppError> {
+    let session =
+        session.ok_or_else(|| AppError::Usage("OMP preparation requires a Session".into()))?;
+    let _lock = omp_uncertainty_lock(paths, session).await?;
+    let saved = crate::wake::pause_registration(paths, session)
+        .map_err(AppError::Usage)?
+        .ok_or_else(|| AppError::Usage("Vox OMP conversation is no longer registered".into()))?;
+    check_omp_registration(paths, &saved).await?;
+    let mut input = parse_input("");
+    input.session_id = session.to_owned();
+    input.omp_registration = Some(saved);
+    let words = Unregistered::Attaching(daemon.node.clone()).said(&input, &daemon.account);
+    omp_uncertainty_begin(paths, &input, None, None, &[])?;
+    emit_receipts(format, "", &input.event, &format!("{words}\n"), "", &[]);
+    std::io::Write::flush(&mut std::io::stdout())
+        .map_err(|e| AppError::Usage(format!("OMP output is unconfirmed: {e}")))?;
+    let commit = omp_decision()?;
+    omp_save_decision(paths, session, commit)?;
+    omp_finish_decision(paths, session).await
 }
 
 fn omp_decision() -> Result<bool, AppError> {
@@ -2056,10 +2093,28 @@ pub async fn run(
     session: Option<&str>,
     mode: HookMode,
 ) -> Result<(), AppError> {
+    let began = tokio::time::Instant::now();
+    let turn = RestartTurn {
+        deadline: began + REGISTER_WITHIN,
+        restarting: std::cell::Cell::new(false),
+        published: std::cell::Cell::new(false),
+    };
     let attention_register = matches!(mode, HookMode::AttentionRegister);
     let native_attention = matches!(mode, HookMode::NativeAttention);
     if matches!(mode, HookMode::OmpPrepare) {
-        return omp_prepare(paths, daemon, room_arg, format, session).await;
+        {
+            let work = omp_prepare(paths, daemon, room_arg, format, session, &turn);
+            tokio::pin!(work);
+            tokio::select! {
+                result = &mut work => return result,
+                () = tokio::time::sleep_until(turn.deadline) => {
+                    if !turn.restarting.get() || turn.published.get() {
+                        return work.await;
+                    }
+                }
+            }
+        }
+        return omp_restart_deferral(paths, daemon, format, session).await;
     }
     let mut raw = String::new();
     // A harness always provides stdin; a person testing by hand may not — and
@@ -2345,100 +2400,117 @@ pub async fn run(
         // register or reopen a conversation that ended while its notice was queued.
         return drain(
             paths,
-            room_arg,
-            Some(&b32_encode(&notice.recipient.room)),
+            (room_arg, Some(&b32_encode(&notice.recipient.room))),
             &input,
             &raw,
             format,
             None,
+            None,
         )
         .await;
     }
-    let drained = match daemon.register(&input, room_arg).await {
-        Ok(answer) => {
-            // The prompt goes to the Session first: it is what the turn the drain starts answers.
-            if let Some(ev) = &mirrored {
-                crate::session_mirror::hook(daemon, ev, &input.session_id).await;
-            }
-            let setup_note = crate::agent_onboarding::outcome(
-                &daemon.account,
-                harness_key(&input),
-                &input.session_id,
-            );
-            let note = setup_note.or_else(|| {
-                crate::room_map::note(
-                    answer.room.as_deref(),
-                    answer.new,
-                    answer.joining.as_deref(),
-                    &daemon.account.data_root,
-                    std::path::Path::new(&input.cwd),
-                    daemon.node.as_str(),
-                    Some(&input.session_id),
+    let work = async {
+        let drained = match daemon.register_turn(&input, room_arg, Some(&turn)).await {
+            Ok(answer) => {
+                // The prompt goes to the Session first: it is what the turn the drain starts answers.
+                if let Some(ev) = &mirrored {
+                    crate::session_mirror::hook(daemon, ev, &input.session_id).await;
+                }
+                let setup_note = crate::agent_onboarding::outcome(
+                    &daemon.account,
+                    harness_key(&input),
+                    &input.session_id,
+                );
+                let note = setup_note.or_else(|| {
+                    crate::room_map::note(
+                        answer.room.as_deref(),
+                        answer.new,
+                        answer.joining.as_deref(),
+                        &daemon.account.data_root,
+                        std::path::Path::new(&input.cwd),
+                        daemon.node.as_str(),
+                        Some(&input.session_id),
+                    )
+                });
+                drain(
+                    paths,
+                    (room_arg, answer.room.as_deref()),
+                    &input,
+                    &raw,
+                    format,
+                    note,
+                    Some(&turn),
                 )
-            });
-            drain(
-                paths,
-                room_arg,
-                answer.room.as_deref(),
-                &input,
-                &raw,
+                .await
+            }
+            Err(Unregistered::NotAttached(node)) => {
+                // **Said once per session, not every turn** (#666): the operator was told the
+                // command, and a macOS notification tells the person too; each later turn reads
+                // nothing until the node is attached, and says so only on stderr.
+                let words = Unregistered::NotAttached(node.clone()).said(&input, &daemon.account);
+                eprintln!("vox agent hook: {words}");
+                if crate::wake::first_detached_notice(paths, &input.session_id) {
+                    crate::notify::needs_passphrase_from_hook(paths, node.as_str(), &words);
+                    emit(format, &raw, &input.event, &format!("{words}\n"), "");
+                }
+                return Ok(());
+            }
+            Err(Unregistered::NoNode(node)) => {
+                // Said once per session too: nothing changes until the operator runs setup.
+                let words = Unregistered::NoNode(node.clone()).said(&input, &daemon.account);
+                eprintln!("vox agent hook: {words}");
+                if first_in_session(&daemon.account, node.as_str(), &input.session_id) {
+                    emit(format, &raw, &input.event, &format!("{words}\n"), "");
+                }
+                return Ok(());
+            }
+            Err(
+                u @ (Unregistered::NoDaemon(_)
+                | Unregistered::Attaching(_)
+                | Unregistered::DaemonUnanswered
+                | Unregistered::Temporary(_)
+                | Unregistered::Version(_)),
+            ) => {
+                let words = u.said(&input, &daemon.account);
+                eprintln!("vox agent hook: {words}");
+                emit(format, &raw, &input.event, &format!("{words}\n"), "");
+                return Ok(());
+            }
+            Err(Unregistered::Failed(e)) => Err(e),
+        };
+        if let Err(e) = drained {
+            // Report and carry on: a hook must never break the turn it rides on. **But say so to
+            // the agent too, in one line** (V210-163): on stderr alone, an agent whose node was down
+            // heard nothing and could not tell that from a quiet room.
+            eprintln!("vox agent hook: {e}");
+            emit(
                 format,
-                note,
-            )
-            .await
+                &raw,
+                &input.event,
+                &format!(
+                    "Vox could not read your rooms this turn: {}\n",
+                    one_line_reason(&e)
+                ),
+                "",
+            );
         }
-        Err(Unregistered::NotAttached(node)) => {
-            // **Said once per session, not every turn** (#666): the operator was told the
-            // command, and a macOS notification tells the person too; each later turn reads
-            // nothing until the node is attached, and says so only on stderr.
-            let words = Unregistered::NotAttached(node.clone()).said(&input, &daemon.account);
-            eprintln!("vox agent hook: {words}");
-            if crate::wake::first_detached_notice(paths, &input.session_id) {
-                crate::notify::needs_passphrase_from_hook(paths, node.as_str(), &words);
-                emit(format, &raw, &input.event, &format!("{words}\n"), "");
-            }
-            return Ok(());
-        }
-        Err(Unregistered::NoNode(node)) => {
-            // Said once per session too: nothing changes until the operator runs setup.
-            let words = Unregistered::NoNode(node.clone()).said(&input, &daemon.account);
-            eprintln!("vox agent hook: {words}");
-            if first_in_session(&daemon.account, node.as_str(), &input.session_id) {
-                emit(format, &raw, &input.event, &format!("{words}\n"), "");
-            }
-            return Ok(());
-        }
-        Err(
-            u @ (Unregistered::NoDaemon(_)
-            | Unregistered::Attaching(_)
-            | Unregistered::DaemonUnanswered
-            | Unregistered::Temporary(_)
-            | Unregistered::Version(_)),
-        ) => {
-            let words = u.said(&input, &daemon.account);
-            eprintln!("vox agent hook: {words}");
-            emit(format, &raw, &input.event, &format!("{words}\n"), "");
-            return Ok(());
-        }
-        Err(Unregistered::Failed(e)) => Err(e),
+        Ok(())
     };
-    if let Err(e) = drained {
-        // Report and carry on: a hook must never break the turn it rides on. **But say so to
-        // the agent too, in one line** (V210-163): on stderr alone, an agent whose node was down
-        // heard nothing and could not tell that from a quiet room.
-        eprintln!("vox agent hook: {e}");
-        emit(
-            format,
-            &raw,
-            &input.event,
-            &format!(
-                "Vox could not read your rooms this turn: {}\n",
-                one_line_reason(&e)
-            ),
-            "",
-        );
+    tokio::pin!(work);
+    tokio::select! {
+        result = &mut work => result,
+        () = tokio::time::sleep_until(turn.deadline) => {
+            if !turn.restarting.get() {
+                return work.await;
+            }
+            if !turn.published.get() {
+                let words = Unregistered::Attaching(daemon.node.clone()).said(&input, &daemon.account);
+                eprintln!("vox agent hook: {words}");
+                emit(format, &raw, &input.event, &format!("{words}\n"), "");
+            }
+            Ok(())
+        }
     }
-    Ok(())
 }
 
 /// Why a turn's session was not registered.
@@ -2572,7 +2644,112 @@ impl Unregistered {
 /// The longest a hook waits for the daemon to register its session (#408). ADR-020 states no hook
 /// latency, so this is about 10 s: more than the daemon's own bound on a detaching node
 /// ([`vox_core::node::daemonipc::DETACHING_PATIENCE`]), so that refusal arrives first and says why.
+/// A confirmed restart shares this patience across greeting, preparation and news.
 const REGISTER_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Only a confirmed restart spends the registration patience on this whole turn.
+struct RestartTurn {
+    deadline: tokio::time::Instant,
+    restarting: std::cell::Cell<bool>,
+    published: std::cell::Cell<bool>,
+}
+
+/// Reuse the same restart signals even when the daemon changes between hook operations.
+async fn restart_refusal(
+    account: &vox_core::node::paths::Account,
+    error: Option<&vox_core::error::Error>,
+    turn: Option<&RestartTurn>,
+) -> Result<bool, AppError> {
+    use vox_core::error::{Error, IpcHandshake};
+    let Some(turn) = turn else { return Ok(false) };
+    if error.is_some_and(|error| {
+        !matches!(
+            error,
+            Error::Ipc(IpcHandshake::Unreachable { .. } | IpcHandshake::DaemonStopping { .. })
+        )
+    }) {
+        return Ok(false);
+    }
+    let restarting = turn.restarting.get() || crate::daemon_client::restarting(account)?;
+    #[cfg(target_os = "macos")]
+    let restarting = restarting || tokio::time::timeout_at(
+        turn.deadline, crate::update::restart::pending_login_item(account),
+    ).await.map_err(|_| AppError::Usage(
+        "the login-item startup check did not finish; no daemon was started; retry on the next turn".into(),
+    ))??.is_some();
+    if restarting && !turn.restarting.replace(true) {
+        eprintln!("vox: waiting for the daemon restart");
+    }
+    Ok(restarting)
+}
+
+async fn open_for_turn(paths: &Paths, turn: Option<&RestartTurn>) -> Result<IpcClient, AppError> {
+    let at = crate::client::one_shot(paths)?;
+    let mut account = None;
+    loop {
+        if turn.is_some_and(|turn| turn.restarting.get()) {
+            use vox_core::node::daemonipc::{DaemonClient, DaemonFrame, DaemonRequest, NodeState};
+            let account = account.get_or_insert_with(|| paths.account());
+            let opened = DaemonClient::open(&account.socket()).await;
+            if let Err(error) = &opened {
+                if restart_refusal(account, Some(error), turn).await? {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    continue;
+                }
+            }
+            let mut daemon = opened.map_err(|e| crate::client::said(&at, e))?;
+            match daemon.request(DaemonRequest::Nodes).await? {
+                DaemonFrame::Nodes(nodes) => {
+                    if nodes.iter().any(|node| {
+                        node.name == at.using.node && node.state == NodeState::Attaching
+                    }) {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        continue;
+                    }
+                }
+                DaemonFrame::Refused(vox_core::node::daemonipc::Refusal::Stopping) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    continue;
+                }
+                other => return Err(crate::client::unexpected_daemon(&other)),
+            }
+        }
+        match IpcClient::open_at(&at).await {
+            Ok(client) if client.me().is_none() && turn.is_some_and(|t| t.restarting.get()) => {}
+            Ok(client) => return Ok(client),
+            Err(error) => {
+                let account = account.get_or_insert_with(|| paths.account());
+                if !restart_refusal(account, Some(&error), turn).await? {
+                    return Err(crate::client::said(&at, error));
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+async fn rooms_for_turn(
+    client: &mut IpcClient,
+    working_room: Option<&str>,
+    turn: Option<&RestartTurn>,
+) -> Result<Vec<vox_core::node::ipc::RoomRow>, AppError> {
+    loop {
+        let rooms = match client.rooms().await {
+            Ok(Frame::Rooms { rooms }) => rooms,
+            Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
+            Ok(other) => return Err(crate::client::unexpected(&other)),
+            Err(e) => return Err(AppError::Usage(e.to_string())),
+        };
+        if !turn.is_some_and(|turn| turn.restarting.get())
+            || !rooms.iter().any(|(id, _, _, _, preparing, ..)| {
+                *preparing && working_room.is_some_and(|room| b32_encode(id) == room)
+            })
+        {
+            return Ok(rooms);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
 
 /// The daemon a hook speaks to, and the node it acts as (ADR-020 6.10, ADR-026 L-2, L-3).
 pub struct Daemon {
@@ -2596,6 +2773,15 @@ impl Daemon {
         &self,
         input: &HookInput,
         room_arg: Option<&str>,
+    ) -> Result<Registered, Unregistered> {
+        self.register_turn(input, room_arg, None).await
+    }
+
+    async fn register_turn(
+        &self,
+        input: &HookInput,
+        room_arg: Option<&str>,
+        turn: Option<&RestartTurn>,
     ) -> Result<Registered, Unregistered> {
         use vox_core::node::daemonipc::{DaemonClient, DaemonFrame, DaemonRequest};
         let mut record = crate::wake::Session::from_env(&input.session_id, input.codex);
@@ -2647,10 +2833,41 @@ impl Daemon {
                     )) => Unregistered::Failed(e),
                     _ => Unregistered::NoDaemon(one_line_reason(&e)),
                 })?;
+        #[cfg(target_os = "macos")]
+        if matches!(daemon, crate::daemon_client::HookDaemon::StartupUnchecked) {
+            return Err(Unregistered::Temporary(
+                "Vox could not read your rooms because the login-item startup check did not finish; \
+                 no daemon was started. Try again next turn.".into(),
+            ));
+        }
+        let mut restarting = matches!(daemon, crate::daemon_client::HookDaemon::Restarting);
+        if restarting {
+            #[cfg(feature = "test-knobs")]
+            if std::env::var_os("VOX_TEST_HOOK_RESTART_IMMEDIATE").is_some() {
+                eprintln!("test-knobs: hook takes the immediate restart path");
+                return Err(Unregistered::Attaching(self.node.clone()));
+            }
+            if let Some(turn) = turn {
+                turn.restarting.set(true);
+            } else {
+                return Err(Unregistered::Attaching(self.node.clone()));
+            }
+        }
         if matches!(daemon, crate::daemon_client::HookDaemon::Unanswered) {
             return Err(Unregistered::DaemonUnanswered);
         }
-        if matches!(daemon, crate::daemon_client::HookDaemon::Starting) {
+        let save_locally = matches!(daemon, crate::daemon_client::HookDaemon::Starting);
+        #[cfg(feature = "test-knobs")]
+        let save_locally =
+            if restarting && std::env::var_os("VOX_TEST_HOOK_RESTART_BLOCKING_SAVE").is_some() {
+                eprintln!("test-knobs: restart hook takes the blocking local registration save");
+                true
+            } else {
+                save_locally
+            };
+        // The replacement owns SessionRegister. Do not take the synchronous local registration
+        // lock on its behalf: this hook's whole-turn timeout must remain cancellable.
+        if save_locally {
             // The cold daemon owns its child and continues starting. Keep this turn atomically so
             // its kept node can discover the harness and the next hook can finish opening the
             // Session. A tmux claim is authority presented to the daemon, never persisted before
@@ -2659,7 +2876,7 @@ impl Daemon {
                 .account
                 .node_paths(&self.node)
                 .map_err(|e| AppError::Usage(e.to_string()))?;
-            record.tmux_claim = None;
+            let claim = record.tmux_claim.take();
             let _fence = if record.harness == "omp" {
                 let fingerprint = paths
                     .shown_fingerprint()
@@ -2690,13 +2907,24 @@ impl Daemon {
                     "the session was not registered: {why}"
                 )))
             })?;
-            return Err(Unregistered::Attaching(self.node.clone()));
+            // The saved record carries no unproved authority; this live turn still presents it.
+            record.tmux_claim = claim;
+            if !restarting {
+                return Err(Unregistered::Attaching(self.node.clone()));
+            }
         }
         let record = serde_json::to_string(&record)
             .map_err(|e| AppError::Usage(format!("the session's record: {e}")))?;
-        let mut d = DaemonClient::open(&self.account.socket())
-            .await
-            .map_err(|e| {
+        loop {
+            let opened = DaemonClient::open(&self.account.socket()).await;
+            if let Err(error) = &opened {
+                if restart_refusal(&self.account, Some(error), turn).await? {
+                    restarting = true;
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    continue;
+                }
+            }
+            let mut d = opened.map_err(|e| {
                 let words = e.to_string().lines().next().unwrap_or_default().to_owned();
                 if matches!(
                     &e,
@@ -2710,54 +2938,63 @@ impl Daemon {
                     Unregistered::NoDaemon(words)
                 }
             })?;
-        // **Never without a bound** (#408): the hook runs inside a model's turn, and a wait with
-        // no end hangs the harness. The daemon refuses a node still detaching after
-        // DETACHING_PATIENCE; this bounds everything else the registration can wait on.
-        let asked = tokio::time::timeout(
-            REGISTER_WITHIN,
-            d.request(DaemonRequest::SessionRegister {
-                node: self.node.clone(),
-                session: input.session_id.clone(),
-                record,
-                join,
-            }),
-        )
-        .await
-        .map_err(|_| Unregistered::Temporary("Vox daemon registration timed out".into()))?
-        .map_err(|e| Unregistered::Temporary(e.to_string()))?;
-        match asked {
-            // Its node still attaching: the daemon holds the registration until it is, and
-            // this turn says so (#666).
-            DaemonFrame::SessionRegistered { info, .. }
-                if matches!(info.state, vox_core::node::daemonipc::NodeState::Attaching) =>
-            {
-                Err(Unregistered::Attaching(self.node.clone()))
-            }
-            DaemonFrame::SessionRegistered {
-                room, new, joining, ..
-            } => Ok(Registered { room, new, joining }),
-            DaemonFrame::Refused(vox_core::node::daemonipc::Refusal::StillDetaching { node }) => {
-                Err(Unregistered::Temporary(format!(
+            // **Never without a bound** (#408): the hook runs inside a model's turn, and a wait with
+            // no end hangs the harness. The daemon refuses a node still detaching after
+            // DETACHING_PATIENCE; this bounds everything else the registration can wait on.
+            let asked = tokio::time::timeout(
+                REGISTER_WITHIN,
+                d.request(DaemonRequest::SessionRegister {
+                    node: self.node.clone(),
+                    session: input.session_id.clone(),
+                    record: record.clone(),
+                    join: join.clone(),
+                }),
+            )
+            .await
+            .map_err(|_| Unregistered::Temporary("Vox daemon registration timed out".into()))?
+            .map_err(|e| Unregistered::Temporary(e.to_string()))?;
+            return match asked {
+                // Its node still attaching: the daemon holds the registration until it is, and
+                // this turn says so (#666).
+                DaemonFrame::SessionRegistered { info, .. }
+                    if matches!(info.state, vox_core::node::daemonipc::NodeState::Attaching) =>
+                {
+                    if restarting {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        continue;
+                    }
+                    Err(Unregistered::Attaching(self.node.clone()))
+                }
+                DaemonFrame::SessionRegistered {
+                    room, new, joining, ..
+                } => Ok(Registered { room, new, joining }),
+                DaemonFrame::Refused(vox_core::node::daemonipc::Refusal::StillDetaching {
+                    node,
+                }) => Err(Unregistered::Temporary(format!(
                     "node {node}'s work is still stopping"
-                )))
-            }
-            DaemonFrame::Refused(vox_core::node::daemonipc::Refusal::Stopping) => {
-                Err(Unregistered::Temporary("Vox daemon is stopping".into()))
-            }
-            DaemonFrame::Refused(vox_core::node::daemonipc::Refusal::RegistrationRetryable {
-                reason,
-                ..
-            }) => Err(Unregistered::Temporary(format!(
-                "Vox registration temporarily unavailable: {reason:?}"
-            ))),
-            DaemonFrame::Refused(vox_core::node::daemonipc::Refusal::NoSuchNode { node }) => {
-                Err(Unregistered::NoNode(node))
-            }
-            DaemonFrame::Refused(vox_core::node::daemonipc::Refusal::NotAttached { node }) => {
-                Err(Unregistered::NotAttached(node))
-            }
-            DaemonFrame::Refused(r) => Err(AppError::Usage(r.to_string()).into()),
-            other => Err(crate::client::unexpected_daemon(&other).into()),
+                ))),
+                DaemonFrame::Refused(vox_core::node::daemonipc::Refusal::Stopping) => {
+                    if restart_refusal(&self.account, None, turn).await? {
+                        restarting = true;
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        continue;
+                    }
+                    Err(Unregistered::Temporary("Vox daemon is stopping".into()))
+                }
+                DaemonFrame::Refused(
+                    vox_core::node::daemonipc::Refusal::RegistrationRetryable { reason, .. },
+                ) => Err(Unregistered::Temporary(format!(
+                    "Vox registration temporarily unavailable: {reason:?}"
+                ))),
+                DaemonFrame::Refused(vox_core::node::daemonipc::Refusal::NoSuchNode { node }) => {
+                    Err(Unregistered::NoNode(node))
+                }
+                DaemonFrame::Refused(vox_core::node::daemonipc::Refusal::NotAttached { node }) => {
+                    Err(Unregistered::NotAttached(node))
+                }
+                DaemonFrame::Refused(r) => Err(AppError::Usage(r.to_string()).into()),
+                other => Err(crate::client::unexpected_daemon(&other).into()),
+            };
         }
     }
 
@@ -3187,25 +3424,26 @@ fn offers_said(paths: &Paths, offered: &[(String, String)]) -> String {
 
 async fn drain(
     paths: &Paths,
-    room_arg: Option<&str>,
-    working_room: Option<&str>,
+    selection: (Option<&str>, Option<&str>),
     input: &HookInput,
     raw_input: &str,
     format: Format,
     note: Option<String>,
+    turn: Option<&RestartTurn>,
 ) -> Result<(), AppError> {
-    check_omp_opening(paths, input).await?;
+    let (room_arg, working_room) = selection;
+    check_omp_opening(paths, input, turn).await?;
     if let Some(notice) = &input.native_notice {
         if working_room != Some(b32_encode(&notice.recipient.room).as_str()) {
             return Err(AppError::Usage(
                 "Vox attention room changed before reading".into(),
             ));
         }
-        check_native_notice(paths, notice).await?;
+        check_native_notice(paths, notice, turn).await?;
     }
     // Over the account socket as this node, which the session's registration attached (ADR-026
     // C-1, N-6): never attaching anything itself.
-    let mut client = crate::client::open_for_hook(&crate::client::one_shot(paths)?).await?;
+    let mut client = open_for_turn(paths, turn).await?;
     let me = client.me();
     if me.is_none() {
         return Err(AppError::Usage(
@@ -3214,12 +3452,7 @@ async fn drain(
     }
     crate::ident::load_names(&mut client).await;
 
-    let rooms = match client.rooms().await {
-        Ok(Frame::Rooms { rooms }) => rooms,
-        Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
-        Ok(other) => return Err(crate::client::unexpected(&other)),
-        Err(e) => return Err(AppError::Usage(e.to_string())),
-    };
+    let rooms = rooms_for_turn(&mut client, working_room, turn).await?;
     // The daemon returns this session's saved room, not merely whether it has one. A shared
     // node may hold several repositories' rooms; none of those selects news for another session.
     // Even an explicit hook --room cannot move an existing session: `vox agent room` does that.
@@ -3327,9 +3560,12 @@ async fn drain(
             return Ok(());
         };
         if input.omp_registration.is_some() {
-            check_omp_opening(paths, input).await?;
+            check_omp_opening(paths, input, turn).await?;
             omp_uncertainty_begin(paths, input, me, selected_room, &[])?;
             emit_receipts(format, raw_input, &input.event, "", "", &[]);
+            if let Some(turn) = turn {
+                turn.published.set(true);
+            }
             std::io::Write::flush(&mut std::io::stdout())
                 .map_err(|e| AppError::Usage(format!("OMP output is unconfirmed: {e}")))?;
             drop(publication);
@@ -3600,7 +3836,7 @@ async fn drain(
         }
     };
     if let Some(notice) = &input.native_notice {
-        if let Err(error) = check_native_notice(paths, notice).await {
+        if let Err(error) = check_native_notice(paths, notice, turn).await {
             drop(publication);
             if let Some(owner) = me {
                 cancel_attention_receipts(paths, owner, &attention_receipts).await;
@@ -3608,7 +3844,7 @@ async fn drain(
             return Err(error);
         }
     }
-    if let Err(error) = check_omp_opening(paths, input).await {
+    if let Err(error) = check_omp_opening(paths, input, turn).await {
         drop(publication);
         if let Some(owner) = me {
             cancel_attention_receipts(paths, owner, &attention_receipts).await;
@@ -3634,6 +3870,9 @@ async fn drain(
         &context,
         &input_receipts,
     );
+    if let Some(turn) = turn {
+        turn.published.set(true);
+    }
     if let Err(error) = std::io::Write::flush(&mut std::io::stdout()) {
         // Publication may be partial. Keep its reservations uncertain, and never append
         // a second envelope through run()'s pre-publication error reporter.
