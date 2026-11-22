@@ -2612,78 +2612,6 @@ fn live_retained_room_rows(w: &Worker, cid: &[u8; 32]) -> Vec<(u8, u64, Vec<u8>)
     rows
 }
 
-#[cfg(feature = "test-knobs")]
-fn hidden_room_key(w: &Worker, room: &[u8; 32]) -> vox_core::atrest::sek::Sek {
-    let mut profile = vox_core::node::profile::Profile::open(w.paths.clone())
-        .expect("APPARATUS: open stopped scratch profile for row comparison");
-    profile
-        .unlock(support::ID_PASS.as_bytes())
-        .expect("APPARATUS: unlock scratch row-comparison profile");
-    profile
-        .store()
-        .get_sek_wrap(room)
-        .expect("APPARATUS: retained room wrap")
-        .expect("APPARATUS: hidden copy retains its wrap")
-        .unwrap_sek(
-            &vox_core::atrest::idfactor::SignatureIdentityFactor::new(
-                profile.signer().expect("APPARATUS: scratch signer"),
-            ),
-            room,
-            support::ROOM_PASS.as_bytes(),
-        )
-        .expect("APPARATUS: unwrap scratch row-comparison key")
-}
-
-#[cfg(feature = "test-knobs")]
-fn comparable_hidden_rows(
-    rows: Vec<(u8, u64, Vec<u8>)>,
-    sek: &vox_core::atrest::sek::Sek,
-) -> Vec<(u8, u64, Vec<u8>)> {
-    use vox_core::atrest::store::{open_segment, sealed_segment_from_slice, SegmentKind};
-    use vox_core::cbor::Value;
-    rows.into_iter()
-        .map(|(kind, id, bytes)| {
-            let derived = match kind {
-                11 => SegmentKind::EntryIndex,
-                14 => SegmentKind::SessionIndex,
-                15 => SegmentKind::GovernanceIndex,
-                _ => return (kind, id, bytes),
-            };
-            let plain = open_segment(
-                sek,
-                derived,
-                id,
-                &sealed_segment_from_slice(&bytes).expect("APPARATUS: sealed derived row"),
-            )
-            .expect("APPARATUS: authenticate derived row");
-            if kind == 11 && id == 0 {
-                let Value::Array(mut fields) =
-                    Value::from_canonical_slice(&plain).expect("APPARATUS: entry directory CBOR")
-                else {
-                    panic!("APPARATUS: entry directory is not an array");
-                };
-                assert!(
-                    fields.len() == 26 && fields[0] == Value::Uint(13),
-                    "APPARATUS: unrecognised entry directory schema"
-                );
-                // Reopening changes these derived counters, not content (Directory::bytes;
-                // render_facts::reopen_rendered). Stable kinds remain sealed-byte exact.
-                fields[5] = Value::Uint(0);
-                fields[12] = Value::Uint(0);
-                (
-                    kind,
-                    id,
-                    Value::Array(fields)
-                        .to_canonical_vec()
-                        .expect("APPARATUS: canonical entry directory"),
-                )
-            } else {
-                (kind, id, plain.to_vec())
-            }
-        })
-        .collect()
-}
-
 /// The deadline is independent of the trust-change row-integrity claim.
 #[cfg(feature = "test-knobs")]
 #[test]
@@ -2723,7 +2651,6 @@ fn left_copy_lifecycle(trust_only: bool) {
         !retained.is_empty(),
         "PRODUCT: the hidden copy was deleted at once instead of retained for two days"
     );
-    let comparison_key = trust_only.then(|| hidden_room_key(alice, &room.cid));
     alice.restart_daemon_as(
         support::VOX,
         &[("VOX_TEST_CLOCK_STEP_MS", "86400000")],
@@ -2745,9 +2672,33 @@ fn left_copy_lifecycle(trust_only: bool) {
                 })
         },
     );
-    let retained_before_trust = comparison_key
-        .as_ref()
-        .map(|key| comparable_hidden_rows(live_retained_room_rows(alice, &room.cid), key));
+    // The acknowledged post flushes startup's derived saves before the first file snapshot.
+    alice
+        .vox_in(
+            None,
+            &[
+                "room",
+                "create",
+                "--name",
+                "still-writable",
+                "--passphrase-file",
+                "-",
+            ],
+            Some(support::ROOM_PASS),
+        )
+        .expect_ok("create a live room before the trust change");
+    let list = setup(alice, &["room", "list"]);
+    let live = list
+        .stdout
+        .lines()
+        .find(|line| line.contains("still-writable"))
+        .and_then(|line| line.split_whitespace().next())
+        .expect("APPARATUS: healthy room id");
+    setup(
+        alice,
+        &["room", "post", live, "trust did not refuse this post"],
+    );
+    let retained_before_trust = trust_only.then(|| live_retained_room_rows(alice, &room.cid));
     if trust_only {
         setup(
             alice,
@@ -2783,37 +2734,11 @@ fn left_copy_lifecycle(trust_only: bool) {
             },
         );
     }
-    alice
-        .vox_in(
-            None,
-            &[
-                "room",
-                "create",
-                "--name",
-                "still-writable",
-                "--passphrase-file",
-                "-",
-            ],
-            Some(support::ROOM_PASS),
-        )
-        .expect_ok("create a live room after the trust change");
-    let list = setup(alice, &["room", "list"]);
-    let live = list
-        .stdout
-        .lines()
-        .find(|line| line.contains("still-writable"))
-        .and_then(|line| line.split_whitespace().next())
-        .expect("APPARATUS: healthy room id");
-    setup(
-        alice,
-        &["room", "post", live, "trust did not refuse this post"],
-    );
     if trust_only {
         assert_eq!(
-            comparable_hidden_rows(live_retained_room_rows(alice, &room.cid),
-                comparison_key.as_ref().expect("APPARATUS: comparison key")),
+            live_retained_room_rows(alice, &room.cid),
             retained_before_trust.expect("APPARATUS: trust snapshot"),
-            "PRODUCT: trust changed stable sealed rows or authenticated derived content of the hidden room"
+            "PRODUCT: trust rewrote the hidden room's stored rows"
         );
         unavailable(alice, &room.id);
         let healthy = setup(alice, &["room", "read", live]);
