@@ -374,6 +374,10 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
         while !attaching.is_empty() {
             tokio::select! {
                 signal = &mut stop => return Some(signal),
+                () = router.stop_asked() => {
+                    say(format_args!("vox daemon: stop requested by the product's control client"));
+                    return None;
+                },
                 _ = attaching.join_next() => {}
             }
         }
