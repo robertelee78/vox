@@ -275,7 +275,7 @@ fn render(v: &Value) -> Result<String, AppError> {
             "  {} {}  {}  epoch {}  last sync {}  rows {}  log entries {}  sender keys held {}, received {}; governance revision {}, render backfill {}",
             short(s(r, "id")),
             s(r, "name"),
-            if r["not_receiving"] == true { "not receiving" } else { "no advertised feed gap of 20 entries" },
+            if r["not_receiving"] == true { "not receiving" } else { "no stalled receipt alarm" },
             r.get("epoch").and_then(Value::as_u64).unwrap_or(0),
             ago(now, &r["last_sync_ms"]),
             r.get("entries").and_then(Value::as_u64).unwrap_or(0),

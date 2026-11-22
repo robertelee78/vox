@@ -12390,6 +12390,9 @@ impl Node {
                     self.role_connection_serials.remove(&peer);
                 }
                 self.connected.remove(&peer);
+                self.status
+                    .receipt_waits
+                    .retain(|(_, member), _| *member != peer);
                 self.discover_peers.remove(&peer);
                 let releases: Vec<_> = self
                     .parked_private_drives
@@ -13700,17 +13703,11 @@ impl Node {
                     shared.lock().await.note_held(&store, peer, seq);
                 }
                 self.refresh_network_view().await;
-                if report.fail.is_none() {
-                    let brought = report.out.applied > 0;
-                    self.status
-                        .last_round_brought
-                        .insert((channel_id, peer), brought);
-                    if brought {
-                        // Empty exchanges do not move the received-entry clock.
-                        let now = self.now_ms().get();
-                        self.status.room_synced.insert(channel_id, now);
-                        self.status.member_synced.insert(peer, now);
-                    }
+                if report.fail.is_none() && report.out.applied > 0 {
+                    // Empty exchanges do not move the received-entry clock.
+                    let now = self.now_ms().get();
+                    self.status.room_synced.insert(channel_id, now);
+                    self.status.member_synced.insert(peer, now);
                 }
                 let o = report.out;
                 if current && (report.fail.is_none() || o.applied > 0) {
@@ -22865,7 +22862,7 @@ impl Node {
 
     /// The status report (PRD-001 R35): read from the published view, the connection
     /// manager, the sync schedules, the app layer and the ledgers in [`StatusBook`],
-    /// changing none of them.
+    /// observing per-member receipt progress without scheduling work.
     ///
     /// [`StatusBook`]: crate::node::status::StatusBook
     fn status_report(
@@ -22949,7 +22946,7 @@ impl Node {
             .collect();
         report.leaving = view.leaving.clone();
         for room in &view.open_channels {
-            let members = room
+            let mut members: Vec<_> = room
                 .members
                 .iter()
                 .map(|m| {
@@ -22982,20 +22979,19 @@ impl Node {
                             .iter()
                             .find_map(|(member, seq)| (*member == *m).then_some(*seq)),
                         verified_through: coverage.and_then(|coverage| coverage.verified_through),
-                        live_window_through: coverage
-                            .map_or(0, |coverage| coverage.live_window_through),
-                        live_window_pending: coverage
-                            .map_or(0, |coverage| coverage.live_window_pending),
-                        last_round_brought: self
-                            .status
-                            .last_round_brought
-                            .get(&(room.channel_id, *m))
-                            .copied(),
+                        live_window: coverage.and_then(|coverage| coverage.live_window),
+                        receipt_wait_ms: None,
                         key_delivery_pending: room.key_delivery_pending.contains(m)
                             || self.key_delivery_active(room.channel_id, *m),
                     }
                 })
                 .collect();
+            self.status
+                .receipt_waits
+                .retain(|(r, member), _| *r != room.channel_id || room.members.contains(member));
+            for member in &mut members {
+                self.status.observe_receipt(room.channel_id, member, now);
+            }
             // From the room as last published, never its lock: a sync session holds that lock
             // while it runs, and a status read must not wait on it or come back blank (#58).
             let summary = view

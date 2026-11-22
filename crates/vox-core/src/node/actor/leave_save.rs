@@ -1132,6 +1132,7 @@ impl Node {
         }
         self.app.set_reachers(&self.reachers);
         crate::node::status::SyncBook::forget_room(&self.sync_book, room);
+        self.status.receipt_waits.retain(|(r, _), _| r != room);
         self.sched_rooms.remove(room);
         self.discover_rooms.remove(room);
         self.consent_keys.forget_room(room);

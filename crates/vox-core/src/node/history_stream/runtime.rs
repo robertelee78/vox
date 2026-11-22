@@ -2590,18 +2590,40 @@ impl Flow {
                     self.push(root)?;
                     return Ok(());
                 }
-                // Proof-only pause after visible progress, outside the room/store locks.
+                // Proof-only pacing/hold after visible progress, outside room/store locks.
                 #[cfg(feature = "test-knobs")]
                 if let Some(path) = std::env::var_os("VOX_TEST_HOLD_LIVE_WINDOW_FILE") {
                     let path = std::path::PathBuf::from(path);
                     let remaining = window.next.saturating_add(1).saturating_sub(window.from);
-                    let selection =
-                        format!("{} {remaining}\n", crate::node::link::b32_encode(&author));
-                    if std::fs::read_to_string(&path).ok().as_deref() == Some(selection.as_str()) {
-                        std::fs::write(path.with_extension("entered"), &selection)
-                            .map_err(|_| Error::Profile("proof live-window marker failed"))?;
-                        while path.exists() {
-                            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    if let Ok(spec) = std::fs::read_to_string(&path) {
+                        if let Some(mode) = spec
+                            .trim()
+                            .strip_prefix(&format!("{} ", crate::node::link::b32_encode(&author)))
+                        {
+                            let pause = mode
+                                .strip_prefix("pause-ms=")
+                                .and_then(|ms| ms.parse::<u64>().ok());
+                            if pause.is_some()
+                                || mode == "hold"
+                                || mode.parse::<u64>().ok() == Some(remaining)
+                            {
+                                std::fs::write(
+                                    path.with_extension("entered"),
+                                    format!("through={} remaining={remaining}\n", window.through),
+                                )
+                                .map_err(|_| Error::Profile("proof live-window marker failed"))?;
+                                if let Some(ms) = pause {
+                                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                                } else if path.exists() {
+                                    // Hold the author's own pull. Other providers can finish
+                                    // their other-author tasks, but cannot advance this window.
+                                    if self.peer == author {
+                                        self.push(task)?;
+                                        self.waiting = true;
+                                    }
+                                    return Ok(());
+                                }
+                            }
                         }
                     }
                 }
