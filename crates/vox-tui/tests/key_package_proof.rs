@@ -411,6 +411,82 @@ fn set_up(k: &mut Cast, before: &str) -> Daemon {
     c
 }
 
+/// Twelve observed ten-second reach bounds leave room for sealing and carrying.
+fn wait_for_log_delivery(k: &Cast, a: &Daemon, c: &Daemon, verdict: &str) {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        // Repeating this operation posts once. Its fresh reach report says whether A's
+        // room log currently grants B consent, rather than merely naming B in its ring.
+        let (probe_ok, probe) = vox(
+            &k.a,
+            &[
+                "room",
+                "post",
+                &k.room,
+                "r11-renewal-receipt",
+                "--to",
+                &k.fps[1],
+                "--session",
+                "r11-renewal",
+                "--op",
+                "r11-renewal",
+                "--json",
+            ],
+            "",
+        );
+        let (a_ok, a_status) = vox(&k.a, &["status", "--json"], "");
+        let (c_ok, c_status) = vox(&k.c, &["status", "--json"], "");
+        let ready = (|| {
+            let probe: serde_json::Value = probe
+                .lines()
+                .find_map(|line| serde_json::from_str(line).ok())?;
+            let a_status: serde_json::Value = serde_json::from_str(&a_status).ok()?;
+            let c_status: serde_json::Value = serde_json::from_str(&c_status).ok()?;
+            let room = |status: &serde_json::Value| {
+                status["rooms"]
+                    .as_array()?
+                    .iter()
+                    .find(|room| {
+                        room["id"]
+                            .as_str()
+                            .is_some_and(|id| id.starts_with(&k.room))
+                    })
+                    .cloned()
+            };
+            let a_room = room(&a_status)?;
+            let c_room = room(&c_status)?;
+            let b = a_room["members"]
+                .as_array()?
+                .iter()
+                .find(|member| member["id"].as_str() == Some(k.fps[1].as_str()))?;
+            let a_at_c = c_room["members"]
+                .as_array()?
+                .iter()
+                .find(|member| member["id"].as_str() == Some(k.fps[0].as_str()))?;
+            let renewed = probe["reach"].as_array()?.first()?["you_trust"].as_bool()?;
+            let through = a_room["own_feed_through"].as_u64()?;
+            Some(
+                renewed
+                    && b["key_delivery_pending"] == false
+                    && a_at_c["holds_through"].as_u64()? >= through,
+            )
+        })() == Some(true);
+        if probe_ok && a_ok && c_ok && ready {
+            eprintln!("[keys-by-log] B's grant and all owed keys carried before A stops:\npost: {probe}\nA status: {a_status}\nC status: {c_status}");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{verdict}: A did not complete delivery to B through the log within 120 s\n\
+             post (success={probe_ok}): {probe}\nA status (success={a_ok}): {a_status}\n\
+             C status (success={c_ok}): {c_status}\nA stderr:\n{}\nC stderr:\n{}",
+            a.stderr(),
+            c.stderr()
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
 #[test]
 #[ignore = "three real daemons restarted in turn, production Argon2id; CI runs it in release"]
 fn keys_reach_an_offline_member_through_an_always_on_member() {
@@ -450,8 +526,8 @@ fn keys_reach_an_offline_member_through_an_always_on_member() {
         ok(&k.a, &["room", "post", &k.room, &t], "");
         sent.push(t);
     }
-    // A goes down only once C — still trusted, still reading — has everything: A's entries
-    // reach C in order, so C reading the last one means C holds every one before it.
+    // C reading the sentinel proves it holds the posts, not the asynchronously renewed
+    // grant/package for offline B. Wait for that grant and C's role-complete receipt too.
     ok(&k.a, &["room", "post", &k.room, "r11-sentinel"], "");
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
@@ -468,6 +544,7 @@ fn keys_reach_an_offline_member_through_an_always_on_member() {
         );
         std::thread::sleep(Duration::from_millis(250));
     }
+    wait_for_log_delivery(&k, &a, &c, "APPARATUS");
     a.stop();
 
     // ---- B comes back; A is down. Only C is there ----
@@ -482,6 +559,10 @@ fn keys_reach_an_offline_member_through_an_always_on_member() {
         std::thread::sleep(Duration::from_millis(500));
     }
     let early = readable(&k.b, &k.room, std::slice::from_ref(&before));
+    let (b_read_ok, b_read) = vox(&k.b, &["room", "read", &k.room], "");
+    let (history_ok, history) = vox(&k.b, &["room", "read", &k.room, "--history", "status"], "");
+    eprintln!("[R11] B room read (success={b_read_ok}):\n{b_read}");
+    eprintln!("[R11] B history status (success={history_ok}):\n{history}");
     let b_said = b.stderr();
     b.stop();
     c.stop();
@@ -535,7 +616,8 @@ fn keys_reach_an_offline_member_through_an_always_on_member() {
         got,
         sent.len(),
         "PRODUCT: B must read every message A posted after granting it, with A down and only C, \
-         the always-on member, up (PRD-001 R11)\nB stderr:\n{b_said}"
+         the always-on member, up (PRD-001 R11)\nB room read (success={b_read_ok}):\n{b_read}\n\
+         B history status (success={history_ok}):\n{history}\nB stderr:\n{b_said}"
     );
     assert_eq!(
         early, 0,
@@ -601,6 +683,9 @@ fn read_all(dir: &std::path::Path, room: &str, texts: &[String], secs: u64) -> u
     }
 }
 
+/// Kept log delivery completes without another failed reach after D reads all six.
+/// Measured elapsed times were 3.426 s when kept and 33.729 s when rescued by
+/// ordinary maintenance; elapsed time is printed, not a PRODUCT verdict.
 #[test]
 #[ignore = "five real daemons restarted in turn, production Argon2id; CI runs it in release"]
 fn a_key_through_the_log_releases_what_a_direct_one_does() {
@@ -704,6 +789,14 @@ fn a_key_through_the_log_releases_what_a_direct_one_does() {
         l.contains("could not reach") && l.contains(&b_short)
     });
     let d_got = read_all(&k.d, &k.room, &sent, 120);
+    let log_release_started = Instant::now();
+    let failed_reaches = || {
+        a.stderr()
+            .lines()
+            .filter(|line| line.contains("could not reach") && line.contains(&b_short))
+            .count()
+    };
+    let failures_when_d_read = failed_reaches();
     let d_early = readable(&k.d, &k.room, std::slice::from_ref(&before));
     // A's entries reach C in order: C reading a post made after the packages means C holds them.
     ok(&k.a, &["room", "post", &k.room, "v226-sentinel"], "");
@@ -716,12 +809,27 @@ fn a_key_through_the_log_releases_what_a_direct_one_does() {
         );
         std::thread::sleep(Duration::from_millis(250));
     }
+    wait_for_log_delivery(&k, &a, &c, "PRODUCT");
+    let failures_when_delivery_completed = failed_reaches();
+    eprintln!(
+        "[V030-01 kept delivery] A's failed reaches to B: when D read all six \
+         {failures_when_d_read}, when delivery completed {failures_when_delivery_completed}"
+    );
+    assert_eq!(
+        failures_when_delivery_completed,
+        failures_when_d_read,
+        "PRODUCT: A must keep B's log delivery across governance refresh, not rescue it after \
+         another failed reach\nA stderr:\n{}",
+        a.stderr()
+    );
     a.stop();
     d.stop();
 
     // ---- B comes back with only C up ----
     let b = Daemon::start("b", &k.b);
     let b_got = read_all(&k.b, &k.room, &sent, 120);
+    let log_release_elapsed = log_release_started.elapsed();
+    eprintln!("[V030-01 elapsed] D read all six → B read {b_got}: {log_release_elapsed:?}");
     let b_early = readable(&k.b, &k.room, std::slice::from_ref(&before));
     let b_said = b.stderr();
     b.stop();

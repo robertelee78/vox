@@ -17,6 +17,22 @@ They are kept "at the ready for troubleshooting". When a user reports one of the
   - A product failure fails as the product's verdict.
 - **CI compiles them on every run and never runs them.** The CI step is "Compile optional proofs (not run; troubleshooting kit)": `cargo test --release -p vox-tui --features optional-proofs --no-run`, with `-D warnings`. A change that breaks one is caught at once, not on the day it is needed.
 
+### Reading during a daemon restart (ADR-052 RG-9)
+
+The daemon journey stages a real restart with its old node's stop held by a file. A room read,
+status, room list and node list issued in the socket gap wait for the single replacement.
+A separate act kills the unmanaged restarter during that held stop and observes a serving
+replacement before any client that could start a daemon. Both use private profile roots.
+
+```sh
+cargo test --release -p vox-tui --features test-knobs \
+  --test the_daemon_and_its_nodes_proof \
+  a_room_read_during_restart_waits_for_one_replacement -- --ignored --exact --nocapture
+cargo test --release -p vox-tui --features test-knobs \
+  --test the_daemon_and_its_nodes_proof \
+  a_restart_caller_killed_during_stop_leaves_a_daemon_serving -- --ignored --exact --nocapture
+```
+
 ### Room-by-room computer trust (ADR-052 RG-3)
 
 The trust journey in `nodes_of_one_daemon_proof.rs` uses scratch computers and
@@ -74,6 +90,29 @@ cargo test --release -p vox-tui --features test-knobs,optional-proofs \
   a_saved_manual_removal_finishes_while_another_room_posts -- --ignored --exact --nocapture
 ```
 
+### Computer removal (ADR-052 RG-8)
+
+The pairing journey in `nodes_of_one_daemon_proof.rs` also covers saved room choices:
+`computer_removal_resumes_its_saved_room_choices_after_restart`,
+`computer_removal_keeps_rooms_without_offering_removed_nodes`,
+`computer_removal_reconciles_absence_before_a_fresh_join`,
+`computer_removal_checks_a_locked_nodes_rooms_when_it_opens`,
+`computer_removal_names_a_room_without_a_local_admin`, and
+`computer_removal_offers_only_a_fresh_basis`.
+Run one name at a time with
+`cargo test --release -p vox-tui --features test-knobs,optional-proofs --test nodes_of_one_daemon_proof <name> -- --ignored --exact --nocapture`.
+The restart and absence acts use causal holds and require an exclusive proof slot.
+Removal choices are local state saved atomically with the unchanged three-field signed
+computer removal event. An event with no local choice keeps room memberships. Choices,
+completion and rooms checked on first unlock share the existing computer snapshot;
+unfinished work uses the room's existing one-second governance retry, not a separate
+removal worker or journal.
+Each accepted removal also keeps this computer's existing-node offer obligations and
+per-room basis cutoffs in that same snapshot. Until a room's cutoff is captured it
+offers none of that computer's nodes; afterwards only pre-removal bases are suppressed.
+A deliberate fresh join or consent is offered normally. Closed rooms capture before
+their first exchange on reopening; a node created after the removal inherits nothing.
+
 ### Linux kernel-keyring proofs
 
 The dedicated typed-unlock, restart and unavailable-keyring journeys must run as a disposable
@@ -122,6 +161,20 @@ python3 scripts/app-proofs-vm.py --recovery-vm /absolute/prebuilt/vox \
 This route requires the existing stopped `vox-app-proofs` guest, snapshots supplied artifacts,
 does not resize it, and leaves it stopped. It stages a private node, requires a launchd-owned
 replacement before any healing client, checks `vox status`, and sends public control Stop.
+
+The same prebuilt runner's `--restart-vm` route kills a real `vox daemon --restart` caller
+while its old node's stop is held by a file. It requires one launchd replacement before any
+healing client, the daemon's own clean SIGTERM-stop words, and a successful status on that PID:
+
+```sh
+python3 scripts/app-proofs-vm.py --restart-vm /absolute/prebuilt/vox \
+  apps/macos/Bundle/LaunchAgents/us.vox.daemon.plist /absolute/receipt-directory
+```
+
+Build with `test-knobs` for the hold. It uses the same scratch bindings and always boots out
+the owned job and stops the guest. A login-item restart is one `launchctl kickstart -k`;
+the shipped job gives its daemon 35 seconds to finish stopping. It restarts a loaded job, not
+an absent one. A failed request is reported with launchctl's error.
 
 ### macOS update recovery (ADR-014 M-29a)
 
@@ -322,6 +375,26 @@ Each process uses scratch data and config roots. Run one exact act in release wi
 `an_abandoned_key_request_is_selected_again`, run with `test-knobs`. The latter abandons one
 real selected log package before Open; the returning offline member must still read the
 sender's post while direct key sends remain held. No in-process node or live model is used.
+
+The same file's `keys_reach_an_offline_member_through_an_always_on_member` and
+`a_key_through_the_log_releases_what_a_direct_one_does` require the offline reader to read
+six posts across a sender-key rotation through a room member it has not trusted. Current,
+authenticated room membership permits carrying the opaque sealed package; only trust in
+the package's author permits installing its key. Restoring the carrier-trust gate in
+`actor/key_body_scan.rs` makes the offline-member assertion red. The existing "Nor by the
+log" arm of `no_consent_without_a_ring_entry_proof` covers an untrusted author, with its
+M5 mutant removing the author-trust filter.
+The direct-versus-log act also requires the log path to retain its exact offline delivery
+while the consent's own governance fold refreshes. Measured from that refresh to B reading
+all six, this took 3.426 seconds with the continuation and 33.729 seconds after dropping it:
+ordinary maintenance eventually recovered the durable debt. The act prints elapsed time
+without a PRODUCT bound. It requires A to finish B's log delivery without another failed
+reach after D reads all six; dropping the continuation makes that structural assertion red
+without weakening the six-post equality.
+The offline-member act waits for the author's renewed consent after rotation and for
+the carrier's role-complete receipt before the author stops. It reads current consent
+from one idempotently repeated addressed post's reach report and the feed positions
+from `vox status --json`; it does not mistake a second failed dial for that receipt.
 
 ## Busy-room newcomer and paging (ADR-052 RG-1, #1315)
 

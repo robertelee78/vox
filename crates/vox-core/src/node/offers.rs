@@ -169,13 +169,17 @@ pub fn offers(
     names_here: &[Option<String>],
     keyring: &[(Digest32, String)],
     dismissed: &DismissedOffers,
+    mut suppressed: impl FnMut(Digest32, &OfferBasis) -> bool,
 ) -> Vec<Offer> {
     let in_keyring = |fp: &Digest32| keyring.iter().any(|(k, _)| k == fp);
     // Per member: its rooms, its reasons, and who of the keyring trusts it.
     let mut by: BTreeMap<Digest32, Gathered> = BTreeMap::new();
     for room in rooms {
         for b in &room.offer_bases {
-            if in_keyring(&b.member) || dismissed.contains(&room.channel_id, b) {
+            if in_keyring(&b.member)
+                || dismissed.contains(&room.channel_id, b)
+                || suppressed(room.channel_id, b)
+            {
                 continue;
             }
             let (in_rooms, why, trusters) = by.entry(b.member).or_default();
