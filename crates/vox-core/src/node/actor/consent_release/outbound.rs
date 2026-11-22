@@ -75,11 +75,11 @@ impl Node {
                 }
                 let key_ref = crate::governance::membership::skdm_ref(&skdm);
                 let id = (room, continuation.target, skdm.body.chain_id);
-                if let Some(frame) = self
+                if let Some((frame, prekey)) = self
                     .deliveries
                     .get(&id)
                     .filter(|delivery| delivery.key == key_ref)
-                    .map(|delivery| delivery.frame.clone())
+                    .map(|delivery| (delivery.frame.clone(), delivery.prekey.clone()))
                 {
                     let opening = Some(crate::hash::sha256(&frame));
                     let job = PairwiseJob {
@@ -95,6 +95,7 @@ impl Node {
                             epoch: continuation.attachment,
                         },
                         credit,
+                        prekey,
                     };
                     continuation.stage = super::Stage::Online { queue, job };
                     return Ok(self
@@ -266,10 +267,7 @@ impl Node {
                     .await;
                     return;
                 };
-                continuation.prekey = prekey;
-                if let Some(prekey) = frame.one_time_prekey {
-                    self.refused_otps.note(continuation.target, prekey);
-                }
+                // Keep the selection reserved, but unnamed, until the physical write.
                 let bytes = frame.frame.into_boxed_slice();
                 self.deliveries.insert(
                     id,
@@ -279,6 +277,7 @@ impl Node {
                         key: key_ref,
                         reservation,
                         opening: frame.opening,
+                        prekey: prekey.clone(),
                     },
                 );
                 self.key_left(&room, continuation.target);
@@ -295,6 +294,7 @@ impl Node {
                         epoch: continuation.attachment,
                     },
                     credit,
+                    prekey,
                 };
                 continuation.stage = super::Stage::Online { queue, job };
                 self.dispatch_owned_consent_issue(room, skdm, continuation, None, reply)
@@ -535,26 +535,17 @@ impl Node {
                 epoch: continuation.attachment,
             },
             credit,
+            prekey: hello
+                .then(|| {
+                    self.initiated
+                        .get(&(room, continuation.target))
+                        .and_then(|opening| opening.reservation.as_deref())
+                        .cloned()
+                })
+                .flatten(),
         });
-        if hello {
-            self.note_owned_legacy_hello(room, continuation.target);
-        }
         self.after_owned_consent_enqueue(room, history_owed, continuation, lifetime, reply)
             .await;
-    }
-
-    pub(super) fn note_owned_legacy_hello(&mut self, room: Digest32, peer: Digest32) {
-        let prekey = self
-            .initiated
-            .get(&(room, peer))
-            .and_then(|opening| opening.initial.as_ref())
-            .and_then(|initial| initial.one_time_prekey_id);
-        if let Some(prekey) = prekey {
-            self.refused_otps.note(peer, prekey);
-        }
-        if let Some(opening) = self.initiated.get_mut(&(room, peer)) {
-            opening.reservation = None;
-        }
     }
 }
 

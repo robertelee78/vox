@@ -205,7 +205,7 @@ retention is housekeeping, not security.
 ## Set how long Session steps stay
 
 A step is one thing an agent did in its Session: a message, a command it ran, or a file it
-edited. Steps have their own lifetime: by default, seven days or the room's message lifetime,
+edited. Steps have their own lifetime: by default, two days or the room's message lifetime,
 whichever is shorter. A shorter message lifetime on your node can shorten it further.
 
 ```sh
@@ -216,6 +216,11 @@ The creator or an admin changes the room's step rule. Other members use the same
 choose a shorter lifetime on their own node, such as `--steps 1d`. Choosing the room's current
 step limit again removes that local choice. In Vox.app, open **Retention** and use the separate
 **Session steps** control; **Use room rule** removes your node's shorter choice.
+
+An admin's explicit choice is recorded even when it equals the current default. A seven-day
+choice made while seven days was the default left no record and now follows the two-day default.
+To keep steps longer, an admin sets it again, for example `vox room retention <room> --steps 7d`;
+steps already deleted cannot be restored. Repeating an identical recorded choice adds no new entry.
 
 Shortening the step lifetime deletes older steps immediately, including steps already recorded.
 It does not change the lifetime of ordinary room messages or shared files. `--steps forever`

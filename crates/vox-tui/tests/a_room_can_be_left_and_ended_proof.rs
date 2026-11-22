@@ -193,23 +193,38 @@ fn erased(w: &mut Worker, room: &str, cid: &[u8; 32], checkpoint: bool) {
             .open_read_only(&path)
             .unwrap_or_else(|e| panic!("APPARATUS: open {} read-only: {e}", path.display()));
         let read = db.begin_read().expect("APPARATUS: read stopped store");
-        let segments = read
-            .open_table(redb::TableDefinition::<([u8; 32], u8, u64), &[u8]>::new(
-                "segments",
-            ))
-            .expect("APPARATUS: open sealed segments");
-        let rows: Vec<_> = segments
-            .range((*cid, 0, 0)..=(*cid, u8::MAX, u64::MAX))
-            .expect("APPARATUS: range room rows")
-            .map(|row| row.expect("APPARATUS: read room row").0.value())
-            .collect();
-        // ADR-023 RL-8.1 / RL-8.4: retain only the separate non-secret checkpoint,
-        // never message bodies, room keys, passphrases or a second room log.
-        assert!(
-            rows.is_empty(),
-            "PRODUCT: {} kept deleted room rows: {rows:?}",
-            w.name
-        );
+        let mut binding = b"vox/own-continuity-scope/v1".to_vec();
+        binding.extend_from_slice(cid);
+        binding.extend_from_slice(&w.fp);
+        let scope = vox_core::hash::sha256(&binding);
+        let mut markers = Vec::new();
+        for name in ["segments", "small_segments"] {
+            let segments = match read.open_table(
+                redb::TableDefinition::<([u8; 32], u8, u64), &[u8]>::new(name),
+            ) {
+                Ok(table) => table,
+                Err(redb::TableError::TableDoesNotExist(_)) => continue,
+                Err(e) => panic!("APPARATUS: open {name}: {e}"),
+            };
+            let rows: Vec<_> = segments
+                .range((*cid, 0, 0)..=(*cid, u8::MAX, u64::MAX))
+                .unwrap_or_else(|e| panic!("APPARATUS: range room rows in {name}: {e}"))
+                .map(|row| row.expect("APPARATUS: read room row").0.value())
+                .collect();
+            // ADR-023 RL-8.1 / RL-8.4: retain only the separate non-secret checkpoint,
+            // never message bodies, room keys, passphrases or a second room log.
+            assert!(
+                rows.is_empty(),
+                "PRODUCT: {} kept deleted room rows in {name}: {rows:?}",
+                w.name
+            );
+            markers.extend(
+                segments
+                    .range((scope, 0, 0)..=(scope, u8::MAX, u64::MAX))
+                    .unwrap_or_else(|e| panic!("APPARATUS: range continuity rows in {name}: {e}"))
+                    .map(|row| row.expect("APPARATUS: read continuity row").0.value()),
+            );
+        }
         let wraps = read
             .open_table(redb::TableDefinition::<[u8; 32], &[u8]>::new("sek_wraps"))
             .expect("APPARATUS: open SEK wraps");
@@ -218,15 +233,7 @@ fn erased(w: &mut Worker, room: &str, cid: &[u8; 32], checkpoint: bool) {
             "PRODUCT: {} kept the deleted room's SEK wrap",
             w.name
         );
-        let mut binding = b"vox/own-continuity-scope/v1".to_vec();
-        binding.extend_from_slice(cid);
-        binding.extend_from_slice(&w.fp);
-        let scope = vox_core::hash::sha256(&binding);
-        let markers: Vec<_> = segments
-            .range((scope, 0, 0)..=(scope, u8::MAX, u64::MAX))
-            .expect("APPARATUS: range continuity rows")
-            .map(|row| row.expect("APPARATUS: read continuity row").0.value())
-            .collect();
+        // Count checkpoints across both tables, including duplicate copies.
         let expected = if checkpoint {
             vec![(scope, 4, 0)]
         } else {
@@ -1518,6 +1525,101 @@ fn an_admin_the_creator_named_ends_a_room_and_then_it_takes_no_new_message() {
     eprintln!("[proof] end: a join to the ended room was told it ended");
 }
 
+fn rejoin_ended_with_status(worker: &Worker, link: &str) -> Out {
+    use std::io::Write as _;
+
+    struct Running(Option<std::process::Child>);
+    impl Drop for Running {
+        fn drop(&mut self) {
+            if let Some(child) = self.0.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+    fn finish(running: &mut Running, deadline: Instant, what: &str) -> std::process::Output {
+        loop {
+            if running
+                .0
+                .as_mut()
+                .expect("APPARATUS: owned command")
+                .try_wait()
+                .expect("APPARATUS: poll command")
+                .is_some()
+            {
+                return running
+                    .0
+                    .take()
+                    .expect("APPARATUS: completed command")
+                    .wait_with_output()
+                    .expect("APPARATUS: collect command");
+            }
+            assert!(
+                Instant::now() < deadline,
+                "PRODUCT: {what} did not answer within its command response bound"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    let command = |args: &[&str]| {
+        let mut command = std::process::Command::new(&worker.exe);
+        command
+            .args(args)
+            .env("VOX_DATA_DIR", &worker.data)
+            .env("VOX_CONFIG_DIR", &worker.cfg)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        support::strip_harness_env(&mut command);
+        command
+    };
+    let join_deadline = Instant::now() + GONE;
+    let mut join = Running(Some(
+        command(&["room", "join", "--passphrase-file", "-", link])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("APPARATUS: start ended-room join"),
+    ));
+    join.0
+        .as_mut()
+        .expect("APPARATUS: owned join")
+        .stdin
+        .take()
+        .expect("APPARATUS: join passphrase input")
+        .write_all(support::ROOM_PASS.as_bytes())
+        .expect("APPARATUS: write join passphrase");
+    let mut status = Running(Some(
+        command(&["status", "--json"])
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .expect("APPARATUS: start status beside ended-room join"),
+    ));
+    // Explicit command-response bounds, not an elapsed-silence verdict about background sync.
+    // Owned children are killed and reaped on any panic.
+    let output = finish(
+        &mut status,
+        Instant::now() + WITHIN,
+        "vox status during ended-room join",
+    );
+    assert!(
+        output.status.success(),
+        "PRODUCT: status was refused during ended-room join: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    eprintln!(
+        "[proof] status answered during ended-room join: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let joined = finish(&mut join, join_deadline, "vox room join for an ended room");
+    Out {
+        ok: joined.status.success(),
+        code: joined.status.code(),
+        stdout: String::from_utf8_lossy(&joined.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&joined.stderr).into_owned(),
+        argv: format!("{} room join --passphrase-file - {link}", worker.exe),
+    }
+}
+
 fn end_while_away(delegated: bool) {
     watchdog::arm();
     let rt = runtime();
@@ -1608,11 +1710,7 @@ fn end_while_away(delegated: bool) {
     setup(&room.workers[ender], &["room", "end", &id]);
     let deadline = Instant::now() + GONE;
     loop {
-        let result = room.workers[2].vox_in(
-            None,
-            &["room", "join", "--passphrase-file", "-", &link],
-            Some(support::ROOM_PASS),
-        );
+        let result = rejoin_ended_with_status(&room.workers[2], &link);
         assert!(
             !result.ok,
             "PRODUCT: ended room admitted a join: {result:?}"

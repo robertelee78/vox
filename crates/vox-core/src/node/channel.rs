@@ -1125,8 +1125,7 @@ const SIGNATURE_SWEEP_PAGE: usize = 64;
 /// R-6): more than a screen holds, and a bound on what every snapshot of the node carries.
 pub const READ_BY_SHOWN: usize = 128;
 
-/// How far back from a room's newest row its unread are looked for ([`ChannelState::unread`]):
-/// a bound on what every view of the node walks, far more than a person reads at once.
+/// Maximum rows examined by an explicit unread-history query.
 pub const UNREAD_LOOKED: usize = 1_000;
 
 /// How many owed bodies (V030-10) one sync session asks a peer for at most. The rest are asked of
@@ -3104,6 +3103,12 @@ impl ChannelState {
         // The actor establishes current governance and this node's retention settings
         // before sweeping or refreshing. The constructor's placeholder policies must
         // never reset an already completed durable projection on an ordinary restart.
+        if let Err(error) = store.pack_small_room_rows(channel_id) {
+            eprintln!(
+                "vox: room {}: its small rows stay where they are for now; packing will be tried when the room next opens: {error}",
+                crate::node::link::b32_encode(channel_id)
+            );
+        }
         Ok(room)
     }
 
@@ -5706,7 +5711,7 @@ impl ChannelState {
         crate::node::retention::shortest(self.room_retention(), self.node_retention)
     }
 
-    /// Configured room policy for Session activity; defaults to seven days.
+    /// Configured room policy for Session activity; defaults to two days.
     pub fn room_step_retention(&self) -> u64 {
         self.governance_display.step_ttl_ms / 1_000
     }
@@ -8832,41 +8837,6 @@ impl ChannelState {
                 .filter(|m| self.held.get(*m).is_some_and(|head| *head >= seq))
                 .count();
             out.push((key.1, n as u64));
-        }
-        out.reverse();
-        Ok(out)
-    }
-
-    /// What this node's person has not read here (ADR-028 R-8 at launch): the rows after the newest
-    /// one this node recorded as read, oldest first — rendered, not owed, written by someone else,
-    /// and covered by neither a signed receipt nor a durable local read mark of this node's.
-    /// A room this node never recorded anything read
-    /// in counts from its first row. At most [`UNREAD_LOOKED`] rows from the newest are looked at.
-    pub fn unread(&self, store: &Store) -> Result<Vec<Digest32>> {
-        if self.poisoned {
-            return Err(self.save_failure());
-        }
-        let me = self.me();
-        let mut out = Vec::new();
-        let rendered = self
-            .entries
-            .render_view(store, &self.sek, &self.channel_id)?;
-        let mut cursor = None;
-        for _ in 0..UNREAD_LOOKED {
-            let Some((key, _)) = rendered.step(None, true, cursor, true)? else {
-                break;
-            };
-            cursor = Some(key);
-            if rendered.was_read(&key.1, &me)? {
-                break;
-            }
-            let (author, _) = rendered
-                .order()
-                .author_position(&key.1)?
-                .ok_or(Error::MalformedAtRest("rendered entry missing"))?;
-            if author != me {
-                out.push(key.1);
-            }
         }
         out.reverse();
         Ok(out)
