@@ -3798,6 +3798,7 @@ impl Node {
         if let Some(name) = callback.recovery {
             if outcome.is_done() {
                 self.store_recovery.remove(&room);
+                self.bounded_sync.recover_room_retirements(room);
                 self.store_recovered
                     .insert(room, format!("{name} recovered; it can save again"));
                 eprintln!(

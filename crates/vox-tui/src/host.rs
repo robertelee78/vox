@@ -1738,6 +1738,13 @@ impl Router {
                     .await?
             }
         };
+        g.handle
+            .paths()
+            .verify_profile()
+            .map_err(|error| Refusal::Failed {
+                node: u.node.clone(),
+                why: error.to_string(),
+            })?;
         let drive = (Arc::downgrade(&self.inner), u.node.clone());
         Ok(Lease {
             node: u.node,
@@ -1801,19 +1808,10 @@ impl Router {
             crate::omp_fence::FenceError::Invalid => invalid(),
         })
     }
-    fn registration_store_refusal(
-        node: &NodeName,
-        error: crate::wake::RegistrationStoreError,
-    ) -> Refusal {
-        match error {
-            crate::wake::RegistrationStoreError::Busy => Refusal::RegistrationRetryable {
-                node: node.clone(),
-                reason: vox_core::node::daemonipc::RegistrationRetryReason::LockBusy,
-            },
-            crate::wake::RegistrationStoreError::Failed(why) => Refusal::Failed {
-                node: node.clone(),
-                why: format!("session was not registered: {why}"),
-            },
+    fn registration_store_refusal(node: &NodeName, why: String) -> Refusal {
+        Refusal::Failed {
+            node: node.clone(),
+            why: format!("session was not registered: {why}"),
         }
     }
 
@@ -1872,8 +1870,7 @@ impl Router {
             let lifecycle = self.session_lifecycle(node, &session.session);
             let _lifecycle = lifecycle.lock().await;
             self.settle_session_head(node, &session.session).await;
-            // The reply says attachment is pending, but registration itself must already
-            // be saved. A busy registration lock is a refusal, not a queued success.
+            // Attachment may be pending, but the registration is saved before its reply.
             let paths = self
                 .inner
                 .account
@@ -3525,7 +3522,7 @@ impl Router {
                 .await;
             // Recorded so the copy goes when the room's retention says (ADR-028 F-5), which is
             // all a record's expiry reads; its id is the share's, the one the drive named.
-            let _ = vox_core::node::pulls::record(
+            vox_core::node::pulls::record(
                 paths,
                 &vox_core::node::pulls::Pulled {
                     room: driven.room,
@@ -3537,7 +3534,8 @@ impl Router {
                     folder: None,
                     files: Vec::new(),
                 },
-            );
+            )
+            .map_err(|error| format!("file receipt was not saved: {error}"))?;
             let line = match note.as_deref().map(str::trim) {
                 Some(n) if !n.is_empty() => format!("{alias} sent you a file: {shown} — {n}"),
                 _ => format!("{alias} sent you a file: {shown}"),

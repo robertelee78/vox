@@ -52,10 +52,10 @@ pub fn op_of(env: &Envelope) -> Option<&str> {
 /// depth).
 ///
 /// Included: `type`, sorted `to`, `urgent`, `re`, `thread`, `from`, and `data` with
-/// the `op` key removed. Excluded: `body`, which is human prose a retrying model may
-/// reword; `at`, which is volatile context; and `hops` and `v`, which are transport.
-/// A reworded retry is therefore still a retry, and a retry that changes what it
-/// *does* is a conflict.
+/// the `op` key removed. The package stamp is informational when claim rules are
+/// explicit; the v0.4.30 package-only stamp is equivalent to claim rules 1.
+/// Excluded: `body`, which is human prose a retrying model may reword; `at`, which
+/// is volatile context; and `hops` and `v`, which are transport.
 #[must_use]
 pub fn semantic(env: &Envelope) -> String {
     let mut to = env.to.clone();
@@ -63,6 +63,16 @@ pub fn semantic(env: &Envelope) -> String {
     let mut data = env.data.clone();
     if let serde_json::Value::Object(m) = &mut data {
         m.remove(OP_KEY);
+        if m.contains_key(crate::version::CLAIMS_KEY) {
+            m.remove(crate::version::VOX_KEY);
+        } else if m
+            .get(crate::version::VOX_KEY)
+            .and_then(serde_json::Value::as_str)
+            == Some("0.4.30")
+        {
+            m.remove(crate::version::VOX_KEY);
+            m.insert(crate::version::CLAIMS_KEY.into(), "1".into());
+        }
     }
     let mut v = serde_json::json!({
         "type": env.kind,

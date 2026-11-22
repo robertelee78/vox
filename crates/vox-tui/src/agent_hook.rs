@@ -257,9 +257,9 @@ fn omp_uncertainty_file(paths: &Paths, session: &str) -> std::path::PathBuf {
     under_cursors(paths, "omp", session, "omp-uncertain")
 }
 
-/// Serialize preparation for one exact node and native Session. A published, undecided
-/// envelope survives process death as a private durable marker, not a retryable timeout.
-pub(crate) fn omp_uncertainty_lock(
+/// Serialize preparation for one exact node and native Session. An undecided envelope
+/// remains uncertain; a saved decision retries only its outstanding receipt.
+pub(crate) async fn omp_uncertainty_lock(
     paths: &Paths,
     session: &str,
 ) -> Result<std::fs::File, AppError> {
@@ -296,10 +296,10 @@ pub(crate) fn omp_uncertainty_lock(
         std::fs::TryLockError::Error(error) => AppError::Usage(error.to_string()),
     })?;
     match std::fs::symlink_metadata(&path) {
-        Ok(_) => Err(AppError::Refused {
-            code: 78,
-            message: OMP_UNCERTAIN.into(),
-        }),
+        Ok(_) => {
+            omp_finish_decision(paths, session).await?;
+            Ok(lock)
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(lock),
         Err(error) => Err(AppError::Usage(error.to_string())),
     }
@@ -316,16 +316,7 @@ fn omp_uncertainty_begin(
         [u8; 16],
     )],
 ) -> Result<(), AppError> {
-    let entries: Vec<_> = receipts
-        .iter()
-        .map(|(recipient, sources, ticket)| {
-            serde_json::json!({
-                "room": b32_encode(&recipient.room), "instance": recipient.instance,
-                "session": recipient.session, "ticket": ticket,
-                "sources": sources.iter().map(b32_encode).collect::<Vec<_>>(),
-            })
-        })
-        .collect();
+    let entries = serde_json::to_value(receipts).map_err(|e| AppError::Usage(e.to_string()))?;
     let body = serde_json::json!({
         "session": input.session_id,
         "node": owner.map(|id| b32_encode(&id)),
@@ -338,6 +329,93 @@ fn omp_uncertainty_begin(
         body.to_string().as_bytes(),
     )
     .map_err(|e| AppError::Usage(format!("cannot record OMP delivery uncertainty: {e}")))
+}
+
+// Local cursor writes finish before the decision is saved. Neither step asks the daemon.
+// An undecided marker still means exactly what it did before: no delivery may be guessed.
+fn omp_save_decision(paths: &Paths, session: &str, commit: bool) -> Result<(), AppError> {
+    let file = omp_uncertainty_file(paths, session);
+    let mut saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&file)?)
+        .map_err(|e| AppError::Usage(e.to_string()))?;
+    saved["decision"] = commit.into();
+    vox_core::node::paths::write_private_file_unique(&file, saved.to_string().as_bytes())
+        .map_err(|e| AppError::Usage(format!("cannot save OMP decision: {e}")))
+}
+
+async fn omp_finish_decision(paths: &Paths, session: &str) -> Result<(), AppError> {
+    use vox_core::node::attention::{local, Operation, Recipient, Reply};
+    let mut saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(omp_uncertainty_file(paths, session))?)
+            .map_err(|e| AppError::Usage(e.to_string()))?;
+    let commit = saved["decision"]
+        .as_bool()
+        .ok_or_else(|| AppError::Refused {
+            code: 78,
+            message: OMP_UNCERTAIN.into(),
+        })?;
+    let receipts: Vec<(Recipient, Vec<Digest32>, [u8; 16])> =
+        serde_json::from_value(saved["receipts"].take())
+            .map_err(|e| AppError::Usage(e.to_string()))?;
+    if !receipts.is_empty() {
+        let retry = |reason: String| AppError::Refused {
+            code: 75,
+            message: format!("Vox is finishing the saved OMP decision; retry: {reason}"),
+        };
+        let owner = b32_decode(saved["node"].as_str().unwrap_or_default(), "OMP node")?;
+        let at = crate::client::one_shot(paths)?;
+        for (recipient, sources, ticket) in receipts {
+            let room = recipient.room;
+            // A moved conversation cannot settle its old room's receipt.
+            if crate::wake::pause_registration(paths, session)
+                .map_err(retry)?
+                .and_then(|registration| registration.room)
+                != Some(b32_encode(&room))
+            {
+                continue;
+            }
+            // Metadata refresh may replace the opening hash without replacing the Session.
+            // A genuinely new Session cannot accept the saved receipt; its identity differs.
+            let recipient = match local(
+                &at,
+                owner,
+                room,
+                None,
+                Operation::Resolve {
+                    session: session.to_owned(),
+                },
+            )
+            .await
+            .map_err(retry)?
+            {
+                Reply::Resolved {
+                    recipient: current, ..
+                } if current.identity == recipient.identity => current,
+                Reply::Resolved { .. } => continue,
+                _ => return Err(retry("unexpected current OMP recipient answer".into())),
+            };
+            let instance = recipient.instance;
+            let operation = if commit {
+                Operation::Received {
+                    recipient,
+                    sources,
+                    ticket,
+                }
+            } else {
+                Operation::CancelPrepared {
+                    recipient,
+                    sources,
+                    ticket,
+                }
+            };
+            let reply = local(&at, owner, room, Some(instance), operation)
+                .await
+                .map_err(retry)?;
+            if !matches!(reply, Reply::Done) {
+                return Err(AppError::Usage("unexpected OMP receipt answer".into()));
+            }
+        }
+    }
+    omp_uncertainty_resolved(paths, session)
 }
 
 fn omp_uncertainty_resolved(paths: &Paths, session: &str) -> Result<(), AppError> {
@@ -367,7 +445,7 @@ async fn omp_prepare(
             "OMP preparation requires its native route and opencode format".into(),
         ));
     }
-    let _uncertainty_lock = omp_uncertainty_lock(paths, session)?;
+    let _uncertainty_lock = omp_uncertainty_lock(paths, session).await?;
     let saved = crate::wake::pause_registration(paths, session)
         .map_err(AppError::Usage)?
         .ok_or_else(|| AppError::Refused {
@@ -383,10 +461,9 @@ async fn omp_prepare(
         emit_receipts(format, "", &input.event, "", "", &[]);
         std::io::Write::flush(&mut std::io::stdout())
             .map_err(|e| AppError::Usage(format!("OMP output is unconfirmed: {e}")))?;
-        if omp_decision()? {
-            check_omp_registration(paths, &saved).await?;
-        }
-        return omp_uncertainty_resolved(paths, session);
+        let commit = omp_decision()?;
+        omp_save_decision(paths, session, commit)?;
+        return omp_finish_decision(paths, session).await;
     }
     let notice = match std::env::var("VOX_OMP_NOTICE") {
         Ok(value) => Some(
@@ -2608,13 +2685,10 @@ impl Daemon {
             } else {
                 None
             };
-            crate::wake::store_checked(&paths, &record).map_err(|why| match why {
-                crate::wake::RegistrationStoreError::Busy => {
-                    Unregistered::Temporary("Vox registration is busy".into())
-                }
-                crate::wake::RegistrationStoreError::Failed(why) => Unregistered::Failed(
-                    AppError::Usage(format!("the session was not registered: {why}")),
-                ),
+            crate::wake::store_checked(&paths, &record).map_err(|why| {
+                Unregistered::Failed(AppError::Usage(format!(
+                    "the session was not registered: {why}"
+                )))
             })?;
             return Err(Unregistered::Attaching(self.node.clone()));
         }
@@ -3260,19 +3334,15 @@ async fn drain(
                 .map_err(|e| AppError::Usage(format!("OMP output is unconfirmed: {e}")))?;
             drop(publication);
             if !omp_decision()? {
-                omp_uncertainty_resolved(paths, &input.session_id)?;
+                omp_save_decision(paths, &input.session_id, false)?;
+                omp_finish_decision(paths, &input.session_id).await?;
                 return Ok(());
             }
-            let NewsPublication::Ready(_publication) =
-                news_publication(paths, selected_room, me).await?
-            else {
-                return Err(AppError::Usage("Vox OMP publication is held".into()));
-            };
-            check_omp_opening(paths, input).await?;
             for d in &drains {
                 d.commit(paths, &input.session_id, 0, true)?;
             }
-            omp_uncertainty_resolved(paths, &input.session_id)?;
+            omp_save_decision(paths, &input.session_id, true)?;
+            omp_finish_decision(paths, &input.session_id).await?;
             return Ok(());
         }
         // Nothing new: emit nothing at all rather than "no new messages". An
@@ -3578,26 +3648,11 @@ async fn drain(
     let publication = if input.omp_registration.is_some() {
         drop(publication);
         if !omp_decision()? {
-            if let Some(owner) = me {
-                if !cancel_attention_receipts(paths, owner, &attention_receipts).await {
-                    return Err(AppError::Usage(
-                        "Vox OMP reservation cancellation was not confirmed".into(),
-                    ));
-                }
-            }
-            omp_uncertainty_resolved(paths, &input.session_id)?;
+            omp_save_decision(paths, &input.session_id, false)?;
+            omp_finish_decision(paths, &input.session_id).await?;
             return Ok(());
         }
-        let NewsPublication::Ready(publication) =
-            news_publication(paths, selected_room, me).await?
-        else {
-            return Err(AppError::Usage("Vox OMP publication is held".into()));
-        };
-        check_omp_opening(paths, input).await?;
-        if let Some(notice) = &input.native_notice {
-            check_native_notice(paths, notice).await?;
-        }
-        publication
+        None
     } else {
         publication
     };
@@ -3628,7 +3683,10 @@ async fn drain(
         )?;
     }
     drop(publication);
-    if let Some(owner) = me {
+    if input.omp_registration.is_some() {
+        omp_save_decision(paths, &input.session_id, true)?;
+        omp_finish_decision(paths, &input.session_id).await?;
+    } else if let Some(owner) = me {
         match crate::client::one_shot(paths) {
             Ok(at) => {
                 for (recipient, sources, ticket) in attention_receipts {
@@ -3646,9 +3704,6 @@ async fn drain(
                     .await
                     {
                         eprintln!("vox agent hook: attributed context was emitted, but its receipt is unconfirmed: {reason}");
-                        if input.omp_registration.is_some() {
-                            return Err(AppError::Usage(reason));
-                        }
                     }
                 }
             }
@@ -3656,17 +3711,11 @@ async fn drain(
                 // The one output is already public. Reporting its receipt failure must
                 // not append another JSON envelope or repeat the context.
                 eprintln!("vox agent hook: attributed context was emitted, but its receipt is unconfirmed: {reason}");
-                if input.omp_registration.is_some() {
-                    return Err(AppError::Usage(reason.to_string()));
-                }
             }
         }
     }
     for (d, shown) in drains.iter().zip(shown_in) {
         mark_read(&mut client, d, shown).await;
-    }
-    if input.omp_registration.is_some() {
-        omp_uncertainty_resolved(paths, &input.session_id)?;
     }
     Ok(())
 }

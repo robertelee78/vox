@@ -119,3 +119,22 @@ are registered through the public hook before the operation acts. The separate
 `an_agent_session_is_checked_from_both_sides_proof::the_doctor_explains_incompatible_claim_rules`
 act expects advice about matching claim rules, not matching package versions; it
 does not depend on the full journey's Claude wiring or process-provenance staging.
+
+RG-10's profile-replacement proof is
+`the_daemon_and_its_nodes_proof::a_room_leave_refuses_a_replaced_profile_directory`.
+It leaves the daemon running, substitutes the node directory, and requires a plain
+refusal without changing the replacement. The directory checks cover an operator
+replacing a profile, not an attacker racing filesystem calls. The long-path Unix
+socket fallback is unchanged.
+
+The same file's
+`attaching_a_node_refuses_an_invalid_or_foreign_store_without_writing_it` checks
+that invalid and foreign stores are refused unchanged.
+`acknowledged_room_posts_survive_a_daemon_killed_during_a_post` uses the macOS
+syscall interposer to kill the daemon at a store flush, then reads acknowledged
+posts after restart and unlock.
+
+`work_version_proof::legacy_claim_retry_survives_package_stamp_change` retries a
+v0.4.30 claim through the CLI using its original operation ID. Package metadata
+does not change compatible operation content; different claim rules still do.
+This does not migrate operation projections written by earlier binaries.

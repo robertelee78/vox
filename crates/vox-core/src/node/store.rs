@@ -355,9 +355,12 @@ const fn kind_code(kind: SegmentKind) -> u8 {
 }
 
 fn storage<E: std::fmt::Display>(op: &'static str) -> impl FnOnce(E) -> Error {
-    move |e| Error::Storage {
-        op,
-        detail: e.to_string(),
+    move |e| {
+        let mut detail = e.to_string();
+        if detail.contains("No space left on device") {
+            detail.insert_str(0, "the disk is full; free disk space: ");
+        }
+        Error::Storage { op, detail }
     }
 }
 
@@ -387,8 +390,6 @@ struct Epochs {
     replacement: bool,
     replacement_generation: u64,
     replacement_completed: u64,
-    /// A pre-rename retention link whose removal failed; drain it before another rewrite.
-    redundant_retained: Option<PathBuf>,
     durable_changed: tokio::sync::watch::Sender<(u64, u64)>,
 }
 
@@ -402,7 +403,6 @@ impl Default for Epochs {
             replacement: false,
             replacement_generation: 0,
             replacement_completed: 0,
-            redundant_retained: None,
             durable_changed: tokio::sync::watch::channel((0, 0)).0,
         }
     }
@@ -517,6 +517,8 @@ enum Class {
 pub struct Store {
     db: RwLock<Backing>,
     path: PathBuf,
+    opened_directory: super::paths::FileIdentity,
+    opened_file: Mutex<super::paths::FileIdentity>,
     /// The store's one writer (ADR-038 FX-30): every write transaction is begun, committed and
     /// its received ownership moved while this is held, so the commit's visibility and its mark are one
     /// step to every other holder. redb admits one writer at a time anyway; this names it.
@@ -565,11 +567,30 @@ impl Backing {
 /// redb names the busy case precisely; do not lose that by flattening it into a generic
 /// storage failure. A profile that is merely *busy* is not a profile that is broken, and only
 /// the caller can say what to do about it.
-fn open_error(e: redb::DatabaseError) -> Error {
+fn open_error(path: &Path, e: redb::DatabaseError) -> Error {
     if matches!(e, redb::DatabaseError::DatabaseAlreadyOpen) {
         Error::ProfileBusy
     } else {
-        storage("open")(e)
+        let action = match &e {
+            redb::DatabaseError::Storage(redb::StorageError::Io(error))
+                if error.kind() == std::io::ErrorKind::StorageFull =>
+            {
+                "the disk is full; free disk space and try again"
+            }
+            redb::DatabaseError::Storage(redb::StorageError::Io(error))
+                if error.kind() != std::io::ErrorKind::InvalidData =>
+            {
+                "check the file's permissions and the disk, then try again"
+            }
+            _ => "restore it from a backup, or move it aside to start a new node",
+        };
+        Error::Storage {
+            op: "open",
+            detail: format!(
+                "the store could not be read at {}: {e}; {action}",
+                path.display()
+            ),
+        }
     }
 }
 
@@ -578,11 +599,15 @@ impl Store {
     /// initialize or verify the schema version. A file this build cannot read
     /// (garbage, or a newer schema) is a [`Error::Storage`], never a panic.
     pub fn open(path: &Path) -> Result<Self> {
-        let db = open_database(path).map_err(open_error)?;
+        let db = open_database(path).map_err(|error| open_error(path, error))?;
         super::paths::set_private_file_mode(path)?;
         let store = Self {
             db: RwLock::new(Backing::Writable(db)),
             path: path.to_owned(),
+            opened_directory: super::paths::FileIdentity::of(
+                path.parent().unwrap_or(Path::new(".")),
+            )?,
+            opened_file: Mutex::new(super::paths::FileIdentity::of(path)?),
             writer: Mutex::new(Epochs::default()),
             agreement_settlement: Arc::new(tokio::sync::Semaphore::new(1)),
             profile_owner: None,
@@ -595,18 +620,24 @@ impl Store {
     /// identity is still locked — see `Backing`. It becomes writable with
     /// [`Self::make_writable`].
     ///
-    /// A store that cannot be read as it is — tables missing, or a file redb must repair first —
-    /// is opened writable instead, as [`Self::open`] would: that is a store that needs writing
-    /// whoever opens it.
+    /// Only a library recovery request permits a writable open before unlock: redb repairs
+    /// its own committed state, without initializing Vox tables. Missing public facts are
+    /// refused; the profile compares them with the unlocked vault before Vox writes.
     pub fn open_read_only(path: &Path) -> Result<Self> {
-        let db = match open_read_only_database(path) {
-            Ok(db) => db,
-            Err(redb::DatabaseError::DatabaseAlreadyOpen) => return Err(Error::ProfileBusy),
-            Err(_) => return Self::open(path),
+        let backing = match open_read_only_database(path) {
+            Ok(db) => Backing::ReadOnly(db),
+            Err(redb::DatabaseError::RepairAborted) => {
+                Backing::Writable(open_database(path).map_err(|error| open_error(path, error))?)
+            }
+            Err(error) => return Err(open_error(path, error)),
         };
         let store = Self {
-            db: RwLock::new(Backing::ReadOnly(db)),
+            db: RwLock::new(backing),
             path: path.to_owned(),
+            opened_directory: super::paths::FileIdentity::of(
+                path.parent().unwrap_or(Path::new(".")),
+            )?,
+            opened_file: Mutex::new(super::paths::FileIdentity::of(path)?),
             writer: Mutex::new(Epochs::default()),
             agreement_settlement: Arc::new(tokio::sync::Semaphore::new(1)),
             profile_owner: None,
@@ -614,8 +645,10 @@ impl Store {
         if store.schema_is_current()? {
             Ok(store)
         } else {
-            drop(store);
-            Self::open(path)
+            Err(Error::Storage {
+                op: "read schema",
+                detail: format!("the store could not be read at {}: its schema or tables are missing; no Vox state was written; restore it from a backup, or move it aside to start a new node", path.display()),
+            })
         }
     }
 
@@ -653,8 +686,8 @@ impl Store {
     /// Re-save the room's sealed state durably, without replaying the failed operation.
     /// redb 4.3 latches native I/O failures and refuses every subsequent write. For that
     /// specific latch, reconstruct all readable live rows on a fresh inode instead.
-    /// Old read transactions keep their original MVCC owner; recovery also retains the
-    /// original file beside the replacement. Any unreadable row aborts reconstruction.
+    /// Old read transactions keep their original MVCC owner. Any unreadable row
+    /// aborts reconstruction without replacing the original store.
     pub fn resave_room_after_write_failure(&self, channel: &Digest32) -> Result<()> {
         // Keep one lock order for every writer, including `rewrite_fresh`: writer before db.
         // Taking the read snapshot first would let a rewrite hold `writer` while waiting for
@@ -673,7 +706,7 @@ impl Store {
             Err(redb::TransactionError::Storage(redb::StorageError::PreviousIo)) => {
                 drop(original);
                 drop(backing);
-                return self.rewrite_fresh_locked(&mut epochs, true);
+                return self.rewrite_fresh_locked(&mut epochs);
             }
             Err(error) => return Err(storage("retry write")(error)),
         };
@@ -717,6 +750,7 @@ impl Store {
     /// [`Error::ProfileBusy`] if another process took the profile in between, or a storage
     /// error — in which case the store stays readable as it was.
     pub fn make_writable(&self) -> Result<()> {
+        self.verify_location()?;
         let mut backing = self.db.write().unwrap_or_else(PoisonError::into_inner);
         if matches!(*backing, Backing::Writable(_)) {
             return Ok(());
@@ -734,7 +768,7 @@ impl Store {
                 if let Ok(db) = open_read_only_database(&self.path) {
                     *backing = Backing::ReadOnly(self.keep_profile(db));
                 }
-                Err(open_error(e))
+                Err(open_error(&self.path, e))
             }
         }
     }
@@ -760,23 +794,12 @@ impl Store {
         // Serialize the complete snapshot and replacement with every such transaction, or one
         // can commit to the old inode after the snapshot and disappear at the rename.
         let mut epochs = self.writer()?;
-        self.rewrite_fresh_locked(&mut epochs, false)
+        self.rewrite_fresh_locked(&mut epochs)
     }
 
     /// The caller owns the writer; never recursively acquire it during recovery.
-    fn rewrite_fresh_locked(&self, epochs: &mut Epochs, retain_original: bool) -> Result<()> {
-        if let Some(retained) = epochs.redundant_retained.as_ref() {
-            match std::fs::remove_file(retained) {
-                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-                    return Err(Error::Path {
-                        op: "remove redundant failed-store link",
-                        detail: format!("{}: {error}", retained.display()),
-                    });
-                }
-                _ => {}
-            }
-            epochs.redundant_retained = None;
-        }
+    fn rewrite_fresh_locked(&self, epochs: &mut Epochs) -> Result<()> {
+        self.verify_location()?;
         // The writer excludes every competing replacement. The owned read transaction
         // retains its database/cache/profile without holding the backing lock through I/O.
         let r = {
@@ -794,7 +817,8 @@ impl Store {
         let fresh_path = PathBuf::from(fresh_path);
         let _ = std::fs::remove_file(&fresh_path);
         let copied = (|| -> Result<Cached<Arc<Database>>> {
-            let fresh = open_database(&fresh_path).map_err(open_error)?;
+            let fresh =
+                open_database(&fresh_path).map_err(|error| open_error(&fresh_path, error))?;
             super::paths::set_private_file_mode(&fresh_path)?;
             let w = fresh.begin_write().map_err(storage("begin write"))?;
             {
@@ -829,6 +853,7 @@ impl Store {
         let fresh = match copied {
             Ok(fresh) => fresh,
             Err(error) => {
+                self.verify_location()?;
                 let _ = std::fs::remove_file(&fresh_path);
                 return Err(error);
             }
@@ -841,65 +866,20 @@ impl Store {
                     op: "replace store",
                     detail: "store replacement generation exhausted".into(),
                 })?;
-        let mut retained_path = None;
-        let install = (|| -> Result<()> {
-            if retain_original {
-                // Never discard the only forensic/restart copy after a native failure.
-                // Hard-link before replacing the directory entry; existing pins remain valid.
-                let mut suffix = replacement_generation;
-                loop {
-                    let mut retained = self.path.clone().into_os_string();
-                    retained.push(format!(".failed-{suffix}"));
-                    let retained = PathBuf::from(retained);
-                    match std::fs::hard_link(&self.path, &retained) {
-                        Ok(()) => {
-                            retained_path = Some(retained);
-                            break;
-                        }
-                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                            suffix = suffix.checked_add(1).ok_or(Error::Storage {
-                                op: "retain failed store",
-                                detail: "retained store generation exhausted".into(),
-                            })?;
-                        }
-                        Err(error) => {
-                            return Err(Error::Path {
-                                op: "retain failed store",
-                                detail: format!("{}: {error}", self.path.display()),
-                            });
-                        }
-                    }
-                }
-                super::paths::sync_dir(&self.path)?;
-            }
-            // Both handles remain open across rename, each on its own inode.
-            std::fs::rename(&fresh_path, &self.path).map_err(|error| Error::Path {
-                op: "replace store",
-                detail: format!("{}: {error}", self.path.display()),
-            })
-        })();
+        self.verify_location()?;
+        // Both handles remain open across rename, each on its own inode.
+        let install = std::fs::rename(&fresh_path, &self.path).map_err(|error| Error::Path {
+            op: "replace store",
+            detail: format!("{}: {error}", self.path.display()),
+        });
         if let Err(error) = install {
-            // The original path still names this inode. The extra link is redundant until
-            // rename succeeds, and must not accumulate across automatic recovery attempts.
-            if let Some(retained) = retained_path {
-                match std::fs::remove_file(&retained) {
-                    Err(cleanup) if cleanup.kind() != std::io::ErrorKind::NotFound => {
-                        let detail = format!(
-                            "{}: {cleanup}; replacement failed: {error}",
-                            retained.display()
-                        );
-                        epochs.redundant_retained = Some(retained);
-                        return Err(Error::Path {
-                            op: "remove redundant failed-store link",
-                            detail,
-                        });
-                    }
-                    _ => {}
-                }
-            }
             let _ = std::fs::remove_file(&fresh_path);
             return Err(error);
         }
+        *self
+            .opened_file
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = super::paths::FileIdentity::of(&self.path)?;
         // Rename has installed the new inode, but it is not durable until its directory is
         // synced. Record that exact debt before directory sync. A failed sync leaves the
         // new backing writable, but gates later writes and acknowledgements on this exact
@@ -920,12 +900,13 @@ impl Store {
         if !epochs.replacement {
             return Ok(false);
         }
+        self.verify_location()?;
         {
             let mut backing = self.db.write().unwrap_or_else(PoisonError::into_inner);
             if matches!(*backing, Backing::Closed) {
-                *backing = Backing::Writable(
-                    self.keep_profile(open_database(&self.path).map_err(open_error)?),
-                );
+                *backing = Backing::Writable(self.keep_profile(
+                    open_database(&self.path).map_err(|error| open_error(&self.path, error))?,
+                ));
                 super::paths::set_private_file_mode(&self.path)?;
             }
             if !matches!(*backing, Backing::Writable(_)) {
@@ -944,6 +925,27 @@ impl Store {
         Ok(true)
     }
 
+    fn verify_location(&self) -> Result<()> {
+        super::paths::verify_profile_directory(
+            self.path.parent().unwrap_or(Path::new(".")),
+            Some(self.opened_directory),
+        )?;
+        let opened = *self
+            .opened_file
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if super::paths::FileIdentity::of(&self.path).ok() != Some(opened) {
+            return Err(Error::Path {
+                op: "write the opened store",
+                detail: format!(
+                    "store {} is gone or replaced; nothing was written; stop the old daemon and attach the current node",
+                    self.path.display()
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// Begin a read transaction on whichever handle is open.
     fn begin_read(&self) -> Result<Cached<redb::ReadTransaction>> {
         self.db
@@ -956,6 +958,7 @@ impl Store {
     /// the store is read-only.
     fn writer(&self) -> Result<MutexGuard<'_, Epochs>> {
         let mut epochs = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        self.verify_location()?;
         self.finish_replacement(&mut epochs)?;
         Ok(epochs)
     }

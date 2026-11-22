@@ -280,6 +280,7 @@ impl Account {
             profile_dir: self.node_dir(name),
             data_root: self.data_root.clone(),
             expected_identity: None,
+            opened_directory: FileIdentity::of(&self.node_dir(name)).ok(),
         }
     }
 
@@ -291,6 +292,7 @@ impl Account {
         create_private_dir(&self.config_dir)?;
         Ok(Paths {
             config_dir: self.config_dir.clone(),
+            opened_directory: FileIdentity::of(&profile_dir).ok(),
             profile_dir,
             data_root: self.data_root.clone(),
             expected_identity: None,
@@ -417,9 +419,20 @@ pub struct Paths {
     /// An explicit fingerprint selector's identity, checked at `Using` before node requests.
     /// This is client-local context, never persisted or inferred from a display fingerprint.
     pub expected_identity: Option<crate::hash::Digest32>,
+    opened_directory: Option<FileIdentity>,
 }
 
 impl Paths {
+    /// Refuse writes when this node's directory was removed or replaced after resolution.
+    ///
+    /// This checks an operator replacing a profile, not an attacker racing filesystem calls.
+    ///
+    /// # Errors
+    /// The original profile directory is missing or a different filesystem object.
+    pub fn verify_profile(&self) -> Result<()> {
+        verify_profile_directory(&self.profile_dir, self.opened_directory)
+    }
+
     /// Resolve and create the directories for node `profile`, honoring the ADR-015
     /// precedence. `data_override` / `config_override` are the CLI-flag layer.
     ///
@@ -477,6 +490,7 @@ impl Paths {
     /// # Errors
     /// If the node's config directory or the copy cannot be written.
     pub fn own_config_path(&self, file: &str) -> Result<PathBuf> {
+        self.verify_profile()?;
         let own = self.node_config_dir().join(file);
         if std::fs::symlink_metadata(&own).is_ok() {
             return Ok(own);
@@ -694,6 +708,10 @@ impl Paths {
     /// (base32), a prefix of it of 8 characters or more, or its local `name`. Returns how many
     /// went.
     pub fn remove_room_cursors(&self, room_id: &str, name: &str) -> usize {
+        if let Err(error) = self.verify_profile() {
+            eprintln!("vox: {error}");
+            return 0;
+        }
         let names_it = |file: &str| -> bool {
             let Some((room, _session)) = file.split_once('-') else {
                 return false;
@@ -748,6 +766,51 @@ impl Paths {
     pub fn session_dir(&self) -> PathBuf {
         self.profile_dir.join(SESSION_DIR)
     }
+}
+
+/// The filesystem object a path named when it was opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl FileIdentity {
+    pub(crate) fn of(path: &Path) -> Result<Self> {
+        let metadata = std::fs::metadata(path).map_err(|e| Error::Path {
+            op: "read opened file identity",
+            detail: format!("{}: {e}", path.display()),
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            Ok(Self {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = metadata;
+            Ok(Self {})
+        }
+    }
+}
+
+pub(crate) fn verify_profile_directory(path: &Path, opened: Option<FileIdentity>) -> Result<()> {
+    if opened.is_some() && FileIdentity::of(path).ok() == opened {
+        return Ok(());
+    }
+    Err(Error::Path {
+        op: "write the opened profile directory",
+        detail: format!(
+            "profile directory {} is gone or replaced; nothing was written; stop the old daemon \
+             and attach the current node",
+            path.display()
+        ),
+    })
 }
 
 /// Keep a session or room id to characters that cannot escape the cursor

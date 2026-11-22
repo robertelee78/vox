@@ -5037,6 +5037,9 @@ async fn collect_offer(
                     d.to_owned()
                 }
                 None => {
+                    paths
+                        .verify_profile()
+                        .map_err(|e| AppError::Usage(e.to_string()))?;
                     let d = vox_core::node::pulls::room_dir(paths, &channel_id);
                     vox_core::node::paths::create_private_dir(&d).map_err(|e| {
                         AppError::Usage(format!("cannot use {} for the file: {e}", d.display()))
@@ -5060,7 +5063,7 @@ async fn collect_offer(
 
     let (bound, mut events) = open_forward(client, paths, channel_id, offer).await?;
     let mut started = false;
-    let result = collect(&bound, &dest, offer)
+    let result = collect(&bound, &dest, offer, managed.then_some(paths))
         .await
         .map_err(|(e, got)| {
             started = got > 0;
@@ -5097,10 +5100,15 @@ async fn collect_offer(
         // announcement stays on the log, the bytes were live only while it was shared. A transfer
         // the sharer refused says that, not the socket's error ("Connection reset by peer"). One
         // that sent the wrong bytes says that, whatever the node said.
-        Err(e) if !e.to_string().contains("announced") => match events.as_mut() {
-            Some(ev) => Err(why_not_collected(ev, offer, started).await.unwrap_or(e)),
-            None => Err(e),
-        },
+        Err(e)
+            if !e.to_string().contains("announced")
+                && !e.to_string().contains("profile directory") =>
+        {
+            match events.as_mut() {
+                Some(ev) => Err(why_not_collected(ev, offer, started).await.unwrap_or(e)),
+                None => Err(e),
+            }
+        }
         other => other,
     }
 }
@@ -5176,6 +5184,9 @@ async fn collect_folder(
             d.to_owned()
         }
         None => {
+            paths
+                .verify_profile()
+                .map_err(|e| AppError::Usage(e.to_string()))?;
             let d = vox_core::node::pulls::room_dir(paths, &channel_id);
             vox_core::node::paths::create_private_dir(&d).map_err(|e| {
                 AppError::Usage(format!("cannot use {} for the folder: {e}", d.display()))
@@ -5194,6 +5205,11 @@ async fn collect_folder(
             safe_file_name(&offer.name),
             vox_core::node::pulls::bytes(offer.size)
         )));
+    }
+    if managed {
+        paths
+            .verify_profile()
+            .map_err(|e| AppError::Usage(e.to_string()))?;
     }
     std::fs::create_dir_all(&target).map_err(|e| {
         AppError::Usage(format!(
@@ -5235,6 +5251,9 @@ async fn collect_folder(
                 Ok(())
             };
             match begun {
+                Ok(()) if managed => {
+                    vox_core::node::folder::pull_profile(at, &target, list, &prior, paths).await
+                }
                 Ok(()) => vox_core::node::folder::pull(at, &target, list, &prior).await,
                 Err(e) => Err((e, vox_core::node::folder::Pulled::default())),
             }
@@ -5256,16 +5275,20 @@ async fn collect_folder(
                 "{e}; {} fetched before it stopped, and a get of it again keeps them",
                 done.fetched.len()
             ));
-            return Err(if e.to_string().contains("does not match") {
-                e
-            } else {
-                match events.as_mut() {
-                    Some(ev) => why_not_collected(ev, offer, !done.fetched.is_empty())
-                        .await
-                        .unwrap_or(e),
-                    None => e,
-                }
-            });
+            return Err(
+                if e.to_string().contains("does not match")
+                    || e.to_string().contains("profile directory")
+                {
+                    e
+                } else {
+                    match events.as_mut() {
+                        Some(ev) => why_not_collected(ev, offer, !done.fetched.is_empty())
+                            .await
+                            .unwrap_or(e),
+                        None => e,
+                    }
+                },
+            );
         }
     };
     for path in &done.kept {
@@ -5405,7 +5428,13 @@ async fn collect(
     bound: &str,
     dest: &Destination,
     offer: &Offer,
+    paths: Option<&Paths>,
 ) -> Result<std::path::PathBuf, (AppError, u64)> {
+    if let Some(paths) = paths {
+        paths
+            .verify_profile()
+            .map_err(|e| (AppError::Usage(e.to_string()), 0))?;
+    }
     let dir = dest.dir();
     // `create_new`, so the temporary file is never somebody else's either.
     let (part, file) = (0..1000)
@@ -5428,6 +5457,11 @@ async fn collect(
             )
         })?;
     let result = receive(bound, file, &dir, offer).await;
+    if let Some(paths) = paths {
+        paths
+            .verify_profile()
+            .map_err(|e| (AppError::Usage(e.to_string()), 0))?;
+    }
     let total = match result {
         Ok(total) => total,
         Err(e) => {
@@ -7325,6 +7359,7 @@ pub fn print_identity(
 /// reached — the node holds the room hidden for that, named only by `vox status` as leaving —
 /// and stop listing this identity in the room's roster. Joining again later is an ordinary
 /// join.
+/// An already ended room is deleted locally; no new departure or withdrawal is queued.
 ///
 /// # Errors
 /// If the node cannot be reached, or the room is unknown or closed.
@@ -7337,11 +7372,11 @@ pub async fn leave(paths: &Paths, room: &str) -> Result<(), AppError> {
             Err(_) => return Err(error),
         },
     };
-    let name = rooms_of(&mut client)
+    let (name, ended) = rooms_of(&mut client)
         .await?
         .into_iter()
         .find(|(id, ..)| *id == channel_id)
-        .map(|(_, name, ..)| name)
+        .map(|(_, name, _, over, ..)| (name, !over.is_empty()))
         .unwrap_or_default();
     let which = if name.is_empty() {
         format!("room {}", b32_encode(&channel_id))
@@ -7350,11 +7385,15 @@ pub async fn leave(paths: &Paths, room: &str) -> Result<(), AppError> {
     };
     // What it is to do, said before it is done (ADR-028 E-5).
     let services = offered_in(&mut client, channel_id).await;
-    println!(
-        "vox: about to leave {which}, or cancel its retained pending admission: this node will \
-         delete the local room, tell its members as they are reached and queue its own member \
-         withdrawal"
-    );
+    if ended {
+        println!("vox: about to delete this node's copy of {which}, which has already ended");
+    } else {
+        println!(
+            "vox: about to leave {which}, or cancel its retained pending admission: this node will \
+             delete the local room, tell its members as they are reached and queue its own member \
+             withdrawal"
+        );
+    }
     if !services.is_empty() {
         println!(
             "     your services offered there go with it: {}",
@@ -7365,6 +7404,10 @@ pub async fn leave(paths: &Paths, room: &str) -> Result<(), AppError> {
         Ok(Frame::Ok) => {
             if pending_only {
                 println!("vox: cancelled the pending admission for {which}; its member withdrawal is queued");
+            } else if ended {
+                println!(
+                    "vox: left {which}; it had already ended, and this node's copy is deleted"
+                );
             } else {
                 println!(
                     "vox: left {which}; members are told as they are reached, and its member \
