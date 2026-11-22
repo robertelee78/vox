@@ -294,30 +294,6 @@ struct Premise {
 }
 
 final class FirstRunProof: XCTestCase {
-    func testManagedDaemonLaunchd() throws {
-        try managedLaunchdProof("journey")
-    }
-
-    func testManagedRestartLaunchd() throws {
-        try managedLaunchdProof("restart")
-    }
-
-    private func managedLaunchdProof(_ mode: String) throws {
-        let env = ProcessInfo.processInfo.environment
-        guard env["VOX_PROOF_MANAGED_GUEST"] == mode else {
-            throw XCTSkip("guest-only: select the managed launchd proof explicitly")
-        }
-        guard let root = env["VOX_PROOF_ROOT"], let app = env["VOX_PROOF_APP"],
-              let scratch = env["VOX_PROOF_SCRATCH"] else {
-            throw Apparatus("managed guest proof needs the built app and scratch paths")
-        }
-        let result = stager.run(["/usr/bin/python3", "\(root)/scripts/app-proofs-vm.py",
-                                 "--managed-guest-proof", app, scratch, mode],
-                                env: ["VOX_PROOF_VM_GUEST": "1"])
-        print(result.out)
-        XCTAssertEqual(result.status, 0, "managed guest proof failed: \(result.out)")
-    }
-
     private var daemon: Started?
     /// Dora's daemon, a peer whose clock is behind (step 3d): apparatus, stopped with the case.
     private var peer: Started?

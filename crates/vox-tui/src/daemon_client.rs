@@ -215,7 +215,7 @@ pub(crate) fn restart_lock(account: &Account) -> Result<std::fs::File, AppError>
 
 pub(crate) fn restarting(account: &Account) -> Result<bool, AppError> {
     let file = restart_lock(account)?;
-    match file.try_lock() {
+    match file.try_lock_shared() {
         Ok(()) => Ok(false),
         Err(std::fs::TryLockError::WouldBlock) => Ok(true),
         Err(std::fs::TryLockError::Error(e)) => Err(AppError::Usage(format!(
@@ -225,7 +225,7 @@ pub(crate) fn restarting(account: &Account) -> Result<bool, AppError> {
 }
 
 async fn wait_for_restart(account: &Account, within: Duration) -> Result<bool, AppError> {
-    eprintln!("vox: waiting for the daemon to start or restart");
+    eprintln!("vox: waiting for the daemon restart");
     let began = Instant::now();
     loop {
         match tokio::time::timeout(

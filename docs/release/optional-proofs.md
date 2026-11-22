@@ -72,11 +72,10 @@ A live process, permission refusal, or unknown query failure is still waited for
 not change the existing shutdown bound.
 
 Before filesystem commit, the updater preserves and round-trip-verifies the source as an
-authenticated rollback archive. It quits the captured app, but keeps the old daemon serving
-through the intact bundle exchange. After publication, the replacement helper owns daemon
-handoff. A precommit refusal restores the source from that verified archive, not from a
-possibly partially deleted tree. A postcommit handoff failure resumes unfinished work without
-an implicit downgrade.
+authenticated rollback archive. It stops the captured app/daemon, exchanges intact bundles,
+and retires the displaced tree before allowing new-version startup. A precommit refusal restores
+the source from that verified archive, not from a possibly partially deleted tree. A postcommit
+handoff failure resumes unfinished work without an implicit downgrade.
 
 A signed update/identifier-launch/rollback measurement must retain both release bundles'
 original signed helpers, verify the restored signature and unchanged signed plist, inspect exact

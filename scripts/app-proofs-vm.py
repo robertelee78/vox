@@ -22,38 +22,6 @@ import socket
 import struct
 import tempfile
 
-def stop_managed_workers(helper, fixture):
-    """Stop only replacement workers bound to this proof's private account."""
-    data = str(fixture / "data")
-    config = str(fixture / "config")
-    def workers():
-        output = run(["/bin/ps", "-axww", "-o", "pid=", "-o", "command="],
-                     capture_output=True, text=True).stdout
-        found = []
-        for line in output.splitlines():
-            fields = line.strip().split(None, 1)
-            if len(fields) != 2 or not fields[0].isdigit():
-                continue
-            command = fields[1]
-            if (command.startswith(str(helper) + " daemon ")
-                    and f" --data-dir {data} " in command
-                    and f" --config-dir {config} " in command
-                    and " --replace-pid " in command):
-                found.append(int(fields[0]))
-        return found
-    for pid in workers():
-        if pid not in workers():
-            continue
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-    deadline = time.monotonic() + 10
-    while workers():
-        if time.monotonic() >= deadline:
-            raise RuntimeError("APPARATUS: owned replacement worker did not exit")
-        time.sleep(.05)
-
 def managed_guest_proof():
     if os.environ.get("VOX_PROOF_VM_GUEST") != "1" or not run(
         ["/usr/sbin/sysctl", "-n", "hw.model"], capture_output=True, text=True
@@ -61,7 +29,7 @@ def managed_guest_proof():
         raise RuntimeError("managed daemon proof requires a virtual Mac guest")
     app, scratch = map(Path, sys.argv[2:4])
     mode = sys.argv[4]
-    if mode not in ("journey", "restart", "recovery"):
+    if mode != "recovery":
         raise RuntimeError("unknown managed guest proof mode")
     helper = app / "Contents/Helpers/vox"
     source = app / "Contents/Library/LaunchAgents/us.vox.daemon.plist"
@@ -84,7 +52,6 @@ def managed_guest_proof():
             if result.returncode and launch("print", target).returncode == 0:
                 print(f"APPARATUS: cannot boot out owned job: {result.stderr}", file=sys.stderr)
                 return
-        stop_managed_workers(helper, fixture)
         shutil.rmtree(fixture)
         marker.unlink(missing_ok=True)
     atexit.register(cleanup_abandoned_fixture)
@@ -102,9 +69,7 @@ def managed_guest_proof():
     job["EnvironmentVariables"] = env
     plist.write_bytes(plistlib.dumps(job))
     control = fixture / "data/.daemon/vox.sock"
-    log = fixture / "data/.daemon/log"
     owned = False
-    children = []
     def interrupted(_sig, _frame):
         raise KeyboardInterrupt
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
@@ -172,116 +137,64 @@ def managed_guest_proof():
             raise RuntimeError(f"bootstrap failed: {boot.stderr}")
         owned = True
         first, first_runs = until("initial managed daemon", ready)
-        if mode == "recovery":
-            print(f"[proof] initial launchd state:\n{state()[2]}", flush=True)
-            passfile = fixture / "passphrase"
-            passfile.write_text("\n")
-            for args in (["node", "create", "default", "--passphrase-file", str(passfile)],
-                         ["node", "attach", "default", "--passphrase-file", str(passfile)]):
-                staged = subprocess.run([str(helper), *args], env=env, stdin=subprocess.DEVNULL,
-                                        capture_output=True, text=True, timeout=120)
-                print(f"[proof] vox {' '.join(args)} exit={staged.returncode}\n"
-                      f"{staged.stdout}{staged.stderr}", flush=True)
-                if staged.returncode:
-                    raise RuntimeError(f"APPARATUS: could not stage node: {staged.stdout}{staged.stderr}")
-            if ready() != (first, first_runs):
-                raise RuntimeError("APPARATUS: staging did not retain the initial managed daemon")
-        if mode in ("journey", "recovery"):
-            os.kill(first, signal.SIGTERM)
-            def recovered():
-                pid, runs, text = state()
-                if not pid and re.search(r"last exit code = 0\b", text):
-                    raise RuntimeError(f"PRODUCT: foreign TERM exited successfully and launchd did not restart it: {text}")
-                return (pid, runs) if pid and pid != first and greeting() == pid else None
-            second, second_runs = until("launchd replacement after foreign TERM", recovered)
-            if mode == "recovery":
-                print(f"[proof] recovered launchd state:\n{state()[2]}", flush=True)
-            print(f"[proof] foreign TERM: launchd replaced {first} with {second} without a client")
-            if mode == "recovery":
-                status = subprocess.run([str(helper), "status", "--node", "default"], env=env,
-                                        capture_output=True, text=True, timeout=90)
-                print(f"[proof] vox status exit={status.returncode}\n{status.stdout}{status.stderr}", flush=True)
-                if status.returncode or not status.stdout.lower().startswith("node "):
-                    raise RuntimeError(f"PRODUCT: vox status failed after launchd recovery: {status.stdout}{status.stderr}")
-                current, runs, text = state()
-                if current != second or runs != second_runs or greeting() != second:
-                    raise RuntimeError(f"PRODUCT: status did not use the recovered daemon: {text}")
-            with socket.socket(socket.AF_UNIX) as s:
-                s.settimeout(10)
-                s.connect(str(control))
-                frame(s)
-                request = bytes.fromhex("8119100c")
-                s.sendall(struct.pack(">I", len(request)) + request)
-                if frame(s) != bytes.fromhex("81190fa6"):
-                    raise RuntimeError("PRODUCT: explicit Stop was not acknowledged")
-            if mode == "recovery":
-                print("[proof] public wire Stop acknowledged", flush=True)
-            def stopped():
-                pid, runs, text = state()
-                return (runs, text) if not pid and re.search(r"last exit code = 0\b", text) else None
-            stopped_runs, stopped_text = until("successful explicit Stop", stopped)
-            if stopped_runs != second_runs or state()[1] != stopped_runs:
-                raise RuntimeError(f"PRODUCT: launchd restarted explicit Stop: {stopped_text}")
-            if mode == "recovery":
-                for _ in range(30):
-                    time.sleep(.1)
-                    pid, runs, text = state()
-                    if pid or runs != stopped_runs:
-                        raise RuntimeError(f"PRODUCT: launchd restarted explicit Stop: {text}")
-            print(f"[proof] explicit Stop: launchd reports exit 0, no pid, {stopped_runs} runs")
-            if mode == "recovery":
-                print(f"[proof] stopped launchd state:\n{state()[2]}", flush=True)
-            if mode == "recovery":
-                return
-            kick = launch("kickstart", target)
-            if kick.returncode:
-                raise RuntimeError(f"cannot restart fixture after Stop: {kick.stderr}")
-            old, old_runs = until("restarted fixture", lambda: ready(second))
-        else:
-            old, old_runs = first, first_runs
-        before = log.stat().st_size if log.exists() else 0
-        caller = subprocess.Popen([str(helper), "daemon", "--restart"], env=env,
-                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        children.append(caller)
-        def requested():
-            if caller.poll() is not None:
-                raise RuntimeError("APPARATUS: restart caller exited before stop boundary")
-            return log.exists() and b"shutting down on SIGTERM" in log.read_bytes()[before:]
-        until("restart stop request", requested)
-        caller.kill()
-        caller.wait()
-        def gap():
-            pid, _, text = state()
-            if pid and pid != old:
-                raise RuntimeError(f"APPARATUS: manager replacement started before client window: {text}")
-            return not pid and greeting() is None
-        until("manager stop window", gap)
-        client = subprocess.Popen([str(helper), "daemon", "--detach"], env=env,
-                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        children.append(client)
-        client_out, _ = client.communicate(timeout=90)
-        if client.returncode or b"already running" not in client_out:
-            raise RuntimeError(f"PRODUCT: client in managed restart window did not find the manager's daemon: {client_out!r}")
-        replacement, runs = until("manager-owned replacement", lambda: ready(old))
-        current, final_runs, text = state()
-        serving = greeting()
-        if replacement != current or serving != current or runs != old_runs + 1 or final_runs != runs:
-            raise RuntimeError(f"PRODUCT: restart did not retain exactly one launchd replacement: {text}; serving {serving}; client {client_out!r}")
-        if b"waiting for the daemon to start or restart" not in client_out:
-            raise RuntimeError(f"APPARATUS: client did not observe the admission window: {client_out!r}")
-        print(f"[proof] killed restart caller; launchd replaced {old} with {replacement}, runs {old_runs}->{runs}; client: {client_out!r}")
+        print(f"[proof] initial launchd state:\n{state()[2]}", flush=True)
+        passfile = fixture / "passphrase"
+        passfile.write_text("\n")
+        for args in (["node", "create", "default", "--passphrase-file", str(passfile)],
+                     ["node", "attach", "default", "--passphrase-file", str(passfile)]):
+            staged = subprocess.run([str(helper), *args], env=env, stdin=subprocess.DEVNULL,
+                                    capture_output=True, text=True, timeout=120)
+            print(f"[proof] vox {' '.join(args)} exit={staged.returncode}\n"
+                  f"{staged.stdout}{staged.stderr}", flush=True)
+            if staged.returncode:
+                raise RuntimeError(f"APPARATUS: could not stage node: {staged.stdout}{staged.stderr}")
+        if ready() != (first, first_runs):
+            raise RuntimeError("APPARATUS: staging did not retain the initial managed daemon")
+        os.kill(first, signal.SIGTERM)
+        def recovered():
+            pid, runs, text = state()
+            if not pid and re.search(r"last exit code = 0\b", text):
+                raise RuntimeError(f"PRODUCT: foreign TERM exited successfully and launchd did not restart it: {text}")
+            return (pid, runs) if pid and pid != first and greeting() == pid else None
+        second, second_runs = until("launchd replacement after foreign TERM", recovered)
+        print(f"[proof] recovered launchd state:\n{state()[2]}", flush=True)
+        print(f"[proof] foreign TERM: launchd replaced {first} with {second} without a client")
+        status = subprocess.run([str(helper), "status", "--node", "default"], env=env,
+                                capture_output=True, text=True, timeout=90)
+        print(f"[proof] vox status exit={status.returncode}\n{status.stdout}{status.stderr}", flush=True)
+        if status.returncode or not status.stdout.lower().startswith("node "):
+            raise RuntimeError(f"PRODUCT: vox status failed after launchd recovery: {status.stdout}{status.stderr}")
+        current, runs, text = state()
+        if current != second or runs != second_runs or greeting() != second:
+            raise RuntimeError(f"PRODUCT: status did not use the recovered daemon: {text}")
+        with socket.socket(socket.AF_UNIX) as s:
+            s.settimeout(10)
+            s.connect(str(control))
+            frame(s)
+            request = bytes.fromhex("8119100c")
+            s.sendall(struct.pack(">I", len(request)) + request)
+            if frame(s) != bytes.fromhex("81190fa6"):
+                raise RuntimeError("PRODUCT: explicit Stop was not acknowledged")
+        print("[proof] public wire Stop acknowledged", flush=True)
+        def stopped():
+            pid, runs, text = state()
+            return (runs, text) if not pid and re.search(r"last exit code = 0\b", text) else None
+        stopped_runs, stopped_text = until("successful explicit Stop", stopped)
+        if stopped_runs != second_runs or state()[1] != stopped_runs:
+            raise RuntimeError(f"PRODUCT: launchd restarted explicit Stop: {stopped_text}")
+        for _ in range(30):
+            time.sleep(.1)
+            pid, runs, text = state()
+            if pid or runs != stopped_runs:
+                raise RuntimeError(f"PRODUCT: launchd restarted explicit Stop: {text}")
+        print(f"[proof] explicit Stop: launchd reports exit 0, no pid, {stopped_runs} runs")
+        print(f"[proof] stopped launchd state:\n{state()[2]}", flush=True)
     finally:
-        for child in children:
-            if child.poll() is None:
-                child.kill()
-                child.wait()
         if owned:
             result = launch("bootout", domain, str(plist))
             if result.returncode and launch("print", target).returncode == 0:
                 raise RuntimeError(f"APPARATUS: could not boot out owned job: {result.stderr}")
-            if mode == "recovery":
-                print("[proof] owned launchd job booted out", flush=True)
-        stop_managed_workers(helper, fixture)
+            print("[proof] owned launchd job booted out", flush=True)
         shutil.rmtree(fixture)
         marker.unlink(missing_ok=True)
 
@@ -302,10 +215,6 @@ def main():
         raise RuntimeError("recovery proof is authorized only for vox-app-proofs")
     if os.environ.get("VOX_PROOF_APP"):
         raise RuntimeError("VOX_PROOF_APP cannot select an installed app in guest mode; unset it to prove the guest build")
-    if sys.argv[1:] == ["ManagedBundleProof"] and not Path(
-        os.environ.get("VOX_PROOF_NEXT_BINARY", "")
-    ).is_file():
-        raise RuntimeError("ManagedBundleProof needs VOX_PROOF_NEXT_BINARY from the same snapshot")
     if not shutil.which(tart):
         raise RuntimeError("Tart is missing; see docs/release/app-proof-vm.md")
     if recovery:
@@ -476,18 +385,7 @@ expect {
     args = " ".join(shlex.quote(arg) for arg in sys.argv[1:])
     controls = " ".join(name + "=" + shlex.quote(os.environ[name]) for name in
                         ("VOX_PROOF_FROM", "VOX_PROOF_CONTINUE", "VOX_PROOF_SHA", "VOX_PROOF_STEP", "VOX_PROOF_MUTANT") if name in os.environ)
-    next_fixture = ""
-    if sys.argv[1:] == ["ManagedBundleProof"]:
-        fixture = os.environ.get("VOX_PROOF_NEXT_BINARY")
-        if not fixture or not Path(fixture).is_file():
-            raise RuntimeError("ManagedBundleProof needs VOX_PROOF_NEXT_BINARY from the same snapshot")
-        next_fixture = guest + "/next-vox-" + stamp
-        run(["scp", *options, fixture, destination + ":" + next_fixture])
-        controls += " VOX_PROOF_NEXT_BINARY=" + shlex.quote(next_fixture)
-    cleanup_fixture = ("NEXT_FIXTURE=" + shlex.quote(next_fixture) +
-                       "\ntrap 'rm -f -- \"$NEXT_FIXTURE\"' EXIT") if next_fixture else ""
     remote = f'''set -eu
-{cleanup_fixture}
 export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"
 cd {shlex.quote(guest)}
 if [ -d run.lock ]; then echo 'app-proofs: APPARATUS: another guest proof still owns the desktop' >&2; exit 2; fi
@@ -558,11 +456,6 @@ VOX_PROOF_VM_GUEST=1 VOX_PROOF_RESULTS={shlex.quote(guest + '/results/' + stamp)
             (state / "run.lock/cleanup-unconfirmed").touch()
         result = 130
     finally:
-        if next_fixture and subprocess.run(
-            [*ssh, "rm -f -- " + shlex.quote(next_fixture)]
-        ).returncode:
-            print("app-proofs: APPARATUS: guest next-version fixture cleanup failed", file=sys.stderr)
-            result = 2
         copied = subprocess.run(["scp", *options, "-r", destination + ":" + guest + "/results/" + stamp + "/.", str(out)])
         if copied.returncode:
             print("app-proofs: APPARATUS: guest results could not be copied", file=sys.stderr)
@@ -615,19 +508,7 @@ def cancel_host(_signum, _frame):
 
 if __name__ == "__main__":
     try:
-        if len(sys.argv) > 1 and sys.argv[1] == "--managed-cleanup":
-            if os.environ.get("VOX_PROOF_VM_GUEST") != "1" or not run(
-                ["/usr/sbin/sysctl", "-n", "hw.model"], capture_output=True, text=True
-            ).stdout.strip().startswith("VirtualMac"):
-                raise RuntimeError("managed cleanup requires a virtual Mac guest")
-            helper, fixture = map(Path, sys.argv[2:4])
-            plist = fixture / "job.plist"
-            if (fixture.parent != Path("/tmp") or not fixture.name.startswith("vox-mg-")
-                    or not plist.is_file()
-                    or plistlib.loads(plist.read_bytes()).get("Program") != str(helper)):
-                raise RuntimeError("invalid managed cleanup fixture")
-            stop_managed_workers(helper, fixture)
-        elif len(sys.argv) > 1 and sys.argv[1] == "--managed-guest-proof":
+        if len(sys.argv) > 1 and sys.argv[1] == "--managed-guest-proof":
             managed_guest_proof()
         elif len(sys.argv) > 1 and sys.argv[1] == "--guest-run":
             guest_run()

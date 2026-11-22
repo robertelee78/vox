@@ -21,7 +21,9 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use vox_core::node::daemonipc::{DaemonClient, DaemonObservation, NodeState};
+use vox_core::node::daemonipc::{
+    DaemonClient, DaemonFrame, DaemonObservation, DaemonRequest, NodeState,
+};
 use vox_core::node::paths::{Account, NodeName};
 
 /// How long the old daemon is given to stop: it detaches every node first, each within its own
@@ -34,7 +36,7 @@ const REATTACH_WITHIN: Duration = Duration::from_secs(30);
 const LOGIN_ITEM: &str = "us.vox.daemon";
 
 /// How the running daemon was started, and so how it is started again.
-#[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub(super) enum Started {
     /// By a client.
     ByClient,
@@ -89,6 +91,7 @@ impl DaemonIntent {
 }
 
 /// Identity of the exact daemon observed when its startup intent was captured.
+#[cfg(target_os = "macos")]
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(super) struct DaemonProcess {
     pid: u32,
@@ -224,6 +227,73 @@ pub(super) fn capture_daemon_state(
     })
 }
 
+/// Stop only the daemon whose startup intent and process identity were captured.
+#[cfg(target_os = "macos")]
+pub(super) fn stop_captured_daemon(
+    account: &Account,
+    intent: &DaemonIntent,
+    process: Option<&DaemonProcess>,
+    helper: &Path,
+) -> Result<(), crate::app::AppError> {
+    use crate::app::AppError;
+    if process.is_some_and(|process| !process.is_valid()) {
+        return Err(AppError::Usage(
+            "invalid captured daemon process identity".into(),
+        ));
+    }
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async {
+        let daemon = match DaemonClient::observe(&account.socket()).await {
+            Ok(daemon) => Some(daemon),
+            Err(vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Unreachable { .. })) => None,
+            Err(e) => return Err(AppError::Usage(format!("cannot observe daemon before stopping it: {e}"))),
+        };
+        match (intent, process, daemon) {
+            (DaemonIntent::Absent, None, None) => Ok(()),
+            (DaemonIntent::Running { .. }, Some(expected), None) => {
+                if gone_within(expected.pid, Duration::ZERO).await {
+                    Ok(())
+                } else {
+                    Err(AppError::Usage("captured daemon process is still present but its socket is unreachable".into()))
+                }
+            }
+            (DaemonIntent::Running { .. }, Some(expected), Some(current))
+                if current.pid == expected.pid
+                    && same_daemon_process(expected, &daemon_process(current.pid)?) =>
+            {
+                require_daemon_executable(current.pid, helper)?;
+                if let DaemonIntent::Running { started: Started::LoginItem(target), .. } = intent {
+                    if !matches!(how_started(current.pid), Started::LoginItem(actual) if actual == *target) {
+                        return Err(AppError::Usage(
+                            "the captured login-item daemon is no longer launchd's matching job".into(),
+                        ));
+                    }
+                }
+                if !same_daemon_process(expected, &daemon_process(current.pid)?) {
+                    return Err(AppError::Usage("daemon changed before it could be stopped".into()));
+                }
+                request_stop(account, expected.pid).await?;
+                if !gone_within(expected.pid, STOP_WITHIN).await {
+                    return Err(AppError::Usage(format!(
+                        "the captured daemon (pid {}) did not stop within {} s",
+                        expected.pid, STOP_WITHIN.as_secs()
+                    )));
+                }
+                match DaemonClient::observe(&account.socket()).await {
+                    Err(vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Unreachable { .. })) => Ok(()),
+                    Ok(_) => Err(AppError::Usage("a daemon appeared after the captured daemon stopped".into())),
+                    Err(e) => Err(AppError::Usage(format!("cannot confirm daemon stopped: {e}"))),
+                }
+            }
+            _ => Err(AppError::Usage(
+                "daemon identity changed or was not captured; refusing to stop it".into(),
+            )),
+        }
+    })
+}
+
 /// Restart the account's daemon, if one runs, onto `helper`, the vox now in place, and say what that did: the version it runs, and each node it no longer has attached.
 ///
 /// Returns the nodes it left detached.
@@ -236,7 +306,7 @@ pub(super) fn restart_daemon(
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    rt.block_on(restart_checked(&account, helper, now, false, None, None))
+    rt.block_on(restart_checked(&account, helper, now, false, None))
 }
 
 /// Restart a particular account and propagate failures to the app handoff.
@@ -246,22 +316,12 @@ pub(super) fn restart_daemon_checked(
     helper: &Path,
     now: &str,
     intent: Option<&DaemonIntent>,
-    captured: Option<&DaemonProcess>,
 ) -> Result<Vec<NodeName>, crate::app::AppError> {
-    if captured.is_some_and(|process| !process.is_valid())
-        || captured.is_some() != matches!(intent, Some(DaemonIntent::Running { .. }))
-    {
-        return Err(crate::app::AppError::Usage(
-            "missing or invalid captured daemon process identity".into(),
-        ));
-    }
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
     let required = matches!(intent, Some(DaemonIntent::Running { .. }));
-    let detached = rt.block_on(restart_checked(
-        account, helper, now, required, intent, captured,
-    ))?;
+    let detached = rt.block_on(restart_checked(account, helper, now, required, intent))?;
     say_detached(&detached);
     Ok(detached)
 }
@@ -278,7 +338,6 @@ pub(crate) fn restart_current(account: &Account) -> Result<(), crate::app::AppEr
         env!("CARGO_PKG_VERSION"),
         true,
         None,
-        None,
     ))?;
     say_detached(&detached);
     Ok(())
@@ -290,7 +349,6 @@ async fn restart_checked(
     now: &str,
     start_if_absent: bool,
     intent: Option<&DaemonIntent>,
-    captured: Option<&DaemonProcess>,
 ) -> Result<Vec<NodeName>, crate::app::AppError> {
     use crate::app::AppError;
     let default_listen = crate::client::DEFAULT_LISTEN.parse().map_err(|e| {
@@ -322,29 +380,6 @@ async fn restart_checked(
             kept.push(name);
         }
     }
-    #[cfg(not(target_os = "macos"))]
-    let _ = captured;
-    #[cfg(target_os = "macos")]
-    let captured_original = if let Some(expected) = captured {
-        match before.as_ref() {
-            Some(existing) if existing.pid == expected.pid => {
-                if !same_daemon_process(expected, &daemon_process(existing.pid)?) {
-                    return Err(AppError::Usage(
-                        "captured daemon process changed before handoff; it was not stopped".into(),
-                    ));
-                }
-                true
-            }
-            None if !gone_within(expected.pid, Duration::ZERO).await => {
-                return Err(AppError::Usage(
-                    "captured daemon process still runs but its socket is unreachable; it was not stopped".into(),
-                ));
-            }
-            _ => false,
-        }
-    } else {
-        false
-    };
     #[cfg(target_os = "macos")]
     if let (Some(intent), Some(existing)) = (intent, before.as_ref()) {
         let DaemonIntent::Running {
@@ -355,53 +390,43 @@ async fn restart_checked(
                 "a daemon appeared although the captured startup intent was absent".into(),
             ));
         };
-        if !captured_original || existing.version == now {
-            if existing.version != now {
-                return Err(AppError::Usage(format!(
-                    "an unexpected daemon runs vox {} rather than {now}; refusing to stop it",
-                    existing.version
-                )));
-            }
-            let process = daemon_process(existing.pid)?;
-            // The captured original was validated against its executable before publication.
-            // Its pathname may have been retired; PID plus start time still identifies it.
-            if !captured_original {
-                require_daemon_executable(existing.pid, helper)?;
-            }
-            if matches!(started, Started::LoginItem(_)) && how_started(existing.pid) != *started {
+        if existing.version != now {
+            return Err(AppError::Usage(format!(
+                "an unexpected daemon runs vox {} rather than {now}; refusing to stop it",
+                existing.version
+            )));
+        }
+        let process = daemon_process(existing.pid)?;
+        require_daemon_executable(existing.pid, helper)?;
+        if let Started::LoginItem(target) = started {
+            if !matches!(how_started(existing.pid), Started::LoginItem(actual) if actual == *target)
+            {
                 return Err(AppError::Usage(
-                    "the daemon is not the captured launchd login item".into(),
+                    "the replacement daemon is not the captured launchd login item".into(),
                 ));
             }
-            let after = wait_for_replacement(account, now, None, &kept).await?;
-            if after.pid != process.pid
-                || !same_daemon_process(&process, &daemon_process(after.pid)?)
-            {
-                return Err(AppError::Usage("the daemon changed during handoff".into()));
-            }
-            if !captured_original {
-                require_daemon_executable(after.pid, helper)?;
-            }
-            println!(
-                "the vox daemon runs vox {} (pid {}), and its remembered nodes are Ready",
-                after.version, after.pid
-            );
-            let missing = attached
-                .iter()
-                .filter(|name| {
-                    !after.attached.iter().any(|node| {
-                        node.name.as_str() == name.as_str() && node.state == NodeState::Attached
-                    })
-                })
-                .map(|name| NodeName::parse(name).map_err(|e| AppError::Usage(e.to_string())))
-                .collect::<Result<Vec<_>, _>>()?;
-            return Ok(missing);
         }
-        if how_started(existing.pid) != *started {
+        let after = wait_for_replacement(account, now, None, &kept).await?;
+        if after.pid != process.pid || !same_daemon_process(&process, &daemon_process(after.pid)?) {
             return Err(AppError::Usage(
-                "captured daemon startup authority changed; it was not stopped".into(),
+                "the replacement daemon changed during handoff".into(),
             ));
         }
+        require_daemon_executable(after.pid, helper)?;
+        println!(
+            "the vox daemon runs vox {} (pid {}), and its remembered nodes are Ready",
+            after.version, after.pid
+        );
+        let missing = attached
+            .iter()
+            .filter(|name| {
+                !after.attached.iter().any(|node| {
+                    node.name.as_str() == name.as_str() && node.state == NodeState::Attached
+                })
+            })
+            .map(|name| NodeName::parse(name).map_err(|e| AppError::Usage(e.to_string())))
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(missing);
     }
     let Some(before) = before else {
         let attached = if let Some(DaemonIntent::Running {
@@ -447,21 +472,13 @@ async fn restart_checked(
         .find(|w| w[0] == "--listen")
         .and_then(|w| w[1].parse().ok())
         .unwrap_or(default_listen);
-    let attached = if let Some(DaemonIntent::Running { attached, .. }) = intent {
-        attached
-            .iter()
-            .map(|name| NodeName::parse(name).map_err(|e| AppError::Usage(e.to_string())))
-            .collect::<Result<Vec<_>, _>>()?
-    } else {
-        before
-            .attached
-            .iter()
-            .map(|node| node.name.clone())
-            .collect::<Vec<_>>()
-    };
-    // The updater process still runs its original release after the binary is replaced. It
-    // can ask its matching daemon for the names of services/forwards about to end. A repair
-    // from a different release reads Hello only, as every other mismatched client must.
+    let attached = before
+        .attached
+        .iter()
+        .map(|n| n.name.clone())
+        .collect::<Vec<_>>();
+    // The updater still runs its original release after replacement. Conservatively ask
+    // only a matching release for held names; a repair across releases reads Hello only.
     let held = if before.version == env!("CARGO_PKG_VERSION") {
         match tokio::time::timeout(Duration::from_secs(10), held_names(account, &attached)).await {
             Ok(Ok(names)) => names,
@@ -482,20 +499,8 @@ async fn restart_checked(
         Vec::new()
     };
 
-    #[cfg(target_os = "macos")]
-    if let Some(expected) = captured.filter(|expected| expected.pid == before.pid) {
-        if !same_daemon_process(expected, &daemon_process(before.pid)?) {
-            return Err(AppError::Usage(
-                "captured daemon process changed before restart; it was not stopped".into(),
-            ));
-        }
-    }
-    // A normal termination signal follows the daemon's own bounded shutdown path. Its pid
-    // came from this user's authenticated control socket, never a stale lock-file pid.
-    #[cfg(target_os = "linux")]
-    let by_unit = matches!(started, Started::UserUnit(_));
-    #[cfg(not(target_os = "linux"))]
-    let by_unit = false;
+    // Product-managed stops exit zero so the manager does not restart the old helper.
+    // An unmanaged rollback still uses its ordinary termination signal.
     // This binary and newer releases understand --replace-pid. An older rollback target may
     // not. A development build paired with an unmodified release of the same version is not
     // supported by this comparison; release versions change when the feature ships.
@@ -504,7 +509,7 @@ async fn restart_checked(
             semver::Version::parse(env!("CARGO_PKG_VERSION")).map(|current| target >= current)
         })
         .unwrap_or(false);
-    if can_replace {
+    if matches!(started, Started::ByClient | Started::ByHand) && can_replace {
         crate::daemon_client::replace_daemon(
             helper,
             account,
@@ -516,31 +521,27 @@ async fn restart_checked(
         )
         .await?;
     } else {
-        if !by_unit {
+        if matches!(started, Started::ByClient | Started::ByHand) {
             let pid = i32::try_from(before.pid)
                 .ok()
                 .and_then(rustix::process::Pid::from_raw)
                 .ok_or_else(|| AppError::Usage("the daemon gave an invalid process id".into()))?;
             rustix::process::kill_process(pid, rustix::process::Signal::TERM)
                 .map_err(|e| AppError::Usage(format!("the daemon could not be stopped: {e}")))?;
-            if !gone_within(before.pid, STOP_WITHIN).await {
-                return Err(AppError::Usage(format!(
-                    "the daemon (pid {}) did not stop within {} s; it still runs vox {}",
-                    before.pid,
-                    STOP_WITHIN.as_secs(),
-                    before.version,
-                )));
-            }
+        } else {
+            request_stop(account, before.pid).await?;
+        }
+        if !gone_within(before.pid, STOP_WITHIN).await {
+            return Err(AppError::Usage(format!(
+                "the daemon (pid {}) did not stop within {} s; it still runs vox {}",
+                before.pid,
+                STOP_WITHIN.as_secs(),
+                before.version,
+            )));
         }
         start_selected(account, helper, listen, &anchors, &started, now).await?;
     }
     let after = wait_for_replacement(account, now, Some(before.pid), &kept).await?;
-    if !matches!(started, Started::ByClient | Started::ByHand) && how_started(after.pid) != started
-    {
-        return Err(AppError::Usage(
-            "the replacement daemon is not owned by the selected service manager".into(),
-        ));
-    }
     let ended = match (held.is_empty(), attached.is_empty()) {
         (false, _) => format!(
             "; held sessions {} ended, along with other connections on nodes {}",
@@ -575,66 +576,14 @@ async fn restart_checked(
     Ok(missing)
 }
 
-/// Actual manager ownership, not merely a daemon flag or a process inherited from a client.
-pub(crate) fn is_managed_daemon(pid: u32) -> bool {
-    !matches!(how_started(pid), Started::ByClient | Started::ByHand)
-}
-
-/// Called by the detached replacement while it holds shared restart admission.
-/// The manager starts the serving daemon; this process only owns completion.
-pub(crate) async fn finish_managed_restart(
+async fn start_selected(
     account: &Account,
-    old_pid: u32,
+    helper: &Path,
+    listen: std::net::SocketAddr,
+    anchors: &[String],
+    started: &Started,
+    expected_version: &str,
 ) -> Result<(), crate::app::AppError> {
-    use crate::app::AppError;
-    let before = DaemonClient::observe(&account.socket())
-        .await
-        .map_err(|e| {
-            AppError::Usage(format!(
-                "cannot authenticate the managed daemon to replace: {e}"
-            ))
-        })?;
-    if before.pid != old_pid {
-        return Err(AppError::Usage(
-            "the managed daemon changed; it was not stopped".into(),
-        ));
-    }
-    let started = how_started(old_pid);
-    if matches!(started, Started::ByClient | Started::ByHand) {
-        return Err(AppError::Usage(
-            "the daemon is no longer owned by its service manager".into(),
-        ));
-    }
-    let pid = i32::try_from(old_pid)
-        .ok()
-        .and_then(rustix::process::Pid::from_raw)
-        .ok_or_else(|| AppError::Usage("the daemon gave an invalid process id".into()))?;
-    eprintln!(
-        "vox daemon: worker pid {} owns the managed restart of pid {old_pid}",
-        std::process::id()
-    );
-    rustix::process::kill_process(pid, rustix::process::Signal::TERM)
-        .map_err(|e| AppError::Usage(format!("the managed daemon could not be stopped: {e}")))?;
-    if !gone_within(old_pid, STOP_WITHIN).await {
-        return Err(AppError::Usage(format!(
-            "managed daemon pid {old_pid} did not stop within {} s",
-            STOP_WITHIN.as_secs()
-        )));
-    }
-    // START is idempotent if KeepAlive/Restart already brought it back. Concurrent callers
-    // can ask for the same old PID without restarting the manager's new generation again.
-    ask_manager(&started, false)?;
-    let after =
-        wait_for_replacement(account, env!("CARGO_PKG_VERSION"), Some(old_pid), &[]).await?;
-    if how_started(after.pid) != started {
-        return Err(AppError::Usage(
-            "the replacement is not the selected manager's daemon".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn ask_manager(started: &Started, restart: bool) -> Result<(), crate::app::AppError> {
     use crate::app::AppError;
     match started {
         #[cfg(target_os = "macos")]
@@ -644,44 +593,27 @@ fn ask_manager(started: &Started, restart: bool) -> Result<(), crate::app::AppEr
                 .bounded_output()?;
             if !out.status.success() {
                 return Err(AppError::Usage(format!(
-                    "launchd did not {} the daemon: {}",
-                    if restart { "restart" } else { "start" },
+                    "launchd did not restart the daemon: {}",
                     String::from_utf8_lossy(&out.stderr).trim()
                 )));
             }
         }
         #[cfg(target_os = "linux")]
         Started::UserUnit(unit) => {
-            let action = if restart { "restart" } else { "start" };
             let out = Command::new("systemctl")
-                .args(["--user", action, unit])
+                .args(["--user", "restart", unit])
                 .bounded_output()?;
             if !out.status.success() {
                 return Err(AppError::Usage(format!(
-                    "systemd did not {action} the daemon: {}",
+                    "systemd did not restart the daemon: {}",
                     String::from_utf8_lossy(&out.stderr).trim()
                 )));
             }
         }
-        Started::ByClient | Started::ByHand => unreachable!("manager request requires a manager"),
-    }
-    Ok(())
-}
-
-async fn start_selected(
-    account: &Account,
-    helper: &Path,
-    listen: std::net::SocketAddr,
-    anchors: &[String],
-    started: &Started,
-    expected_version: &str,
-) -> Result<(), crate::app::AppError> {
-    match started {
         Started::ByClient | Started::ByHand => {
             crate::daemon_client::start_daemon(helper, account, listen, anchors, expected_version)
                 .await?;
         }
-        _ => ask_manager(started, true)?,
     }
     Ok(())
 }
@@ -846,6 +778,41 @@ async fn gone_within(pid: u32, bound: Duration) -> bool {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// Actual manager ownership, rather than a daemon's command-line startup style.
+pub(crate) fn is_managed_daemon(pid: u32) -> bool {
+    !matches!(how_started(pid), Started::ByClient | Started::ByHand)
+}
+
+async fn request_stop(account: &Account, pid: u32) -> Result<(), crate::app::AppError> {
+    use crate::app::AppError;
+    tokio::time::timeout(STOP_WITHIN, async {
+        let mut client = DaemonClient::open(&account.socket())
+            .await
+            .map_err(|e| AppError::Usage(format!("cannot request the daemon stop: {e}")))?;
+        if client.pid != pid {
+            return Err(AppError::Usage(
+                "the daemon changed before the stop request; it was not stopped".into(),
+            ));
+        }
+        match client.request(DaemonRequest::Stop).await {
+            Ok(DaemonFrame::Ok) => Ok(()),
+            Ok(reply) => Err(AppError::Usage(format!(
+                "the daemon refused the stop request: {reply:?}"
+            ))),
+            Err(e) => Err(AppError::Usage(format!(
+                "the daemon did not acknowledge the stop request: {e}"
+            ))),
+        }
+    })
+    .await
+    .map_err(|_| {
+        AppError::Usage(format!(
+            "the daemon did not acknowledge the stop request within {} s",
+            STOP_WITHIN.as_secs()
+        ))
+    })?
 }
 
 /// How the daemon `pid` was started: by launchd's login item or a systemd user unit when either

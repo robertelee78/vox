@@ -1131,101 +1131,82 @@ fn stop_transaction(
     running: &Option<StoppedApp>,
     transition: &mut Transition,
 ) -> Result<(), AppError> {
+    use std::os::unix::ffi::OsStringExt as _;
     let active = apps.join(BUNDLE);
+    let account = vox_core::node::paths::Account {
+        data_root: PathBuf::from(std::ffi::OsString::from_vec(
+            transition.daemon_data_root.clone(),
+        )),
+        config_dir: PathBuf::from(std::ffi::OsString::from_vec(
+            transition.daemon_config_dir.clone(),
+        )),
+    };
     stop_captured_app(&active, running)?;
+    super::restart::stop_captured_daemon(
+        &account,
+        &transition.daemon,
+        transition.daemon_process.as_ref(),
+        &active.join(HELPER),
+    )?;
     transition
         .archive
         .as_mut()
         .ok_or_else(|| usage("missing archive transaction authority"))?
         .phase = FilesystemPhase::Stopped;
-    write_transition(apps, transition)?;
-    #[cfg(feature = "test-knobs")]
-    if let Some(path) = std::env::var_os("VOX_TEST_HOLD_BEFORE_BUNDLE_SWAP") {
-        use std::io::Write as _;
-        let mut pipe = fs::OpenOptions::new().write(true).open(path)?;
-        pipe.write_all(b"ready\n")?;
-        loop {
-            std::thread::park();
-        }
-    }
-    Ok(())
+    write_transition(apps, transition)
 }
 
 /// Exchange the candidate, retire the displaced tree, then commit archive authority.
 fn publish(apps: &Path, transition: &mut Transition) -> Result<(), AppError> {
     let active = apps.join(BUNDLE);
     let staged = apps.join(PARTIAL);
-    let retiring = transition
-        .archive
-        .as_ref()
-        .is_some_and(|archive| archive.phase == FilesystemPhase::Retiring);
-    if transition.source.matches(&bundle_identity(&active)?) {
-        if !transition.target.matches(&bundle_identity(&staged)?) {
-            return Err(usage(
-                "bundle identities changed before exchange; all files retained",
-            ));
-        }
-        swap(&staged, &active)?;
-        sync_dir(apps)?;
-        #[cfg(feature = "test-knobs")]
-        if std::env::var_os(TEST_ABORT_AFTER_SWAP_ENV).is_some_and(|v| !v.is_empty()) {
-            std::process::abort();
-        }
-    }
-    sync_dir(apps)?;
-    if !transition.target.matches(&bundle_identity(&active)?) {
-        return Err(usage(
-            "published bundle identity changed; all files retained",
-        ));
-    }
-    let staged_exists = path_exists(&staged)?;
-    if (!retiring && !staged_exists)
-        || (staged_exists && !transition.source.matches(&bundle_identity(&staged)?))
+    if !transition.source.matches(&bundle_identity(&active)?)
+        || !transition.target.matches(&bundle_identity(&staged)?)
     {
         return Err(usage(
-            "displaced bundle identity changed; all files retained",
+            "bundle identities changed before exchange; all files retained",
         ));
     }
-    if !retiring {
-        transition
-            .archive
-            .as_mut()
-            .ok_or_else(|| usage("missing archive transaction authority"))?
-            .phase = FilesystemPhase::Exchanged;
-        write_transition(apps, transition)?;
-        transition
-            .archive
-            .as_mut()
-            .ok_or_else(|| usage("missing archive transaction authority"))?
-            .phase = FilesystemPhase::Retiring;
-        write_transition(apps, transition)?;
+    swap(&staged, &active)?;
+    sync_dir(apps)?;
+    #[cfg(feature = "test-knobs")]
+    if std::env::var_os(TEST_ABORT_AFTER_SWAP_ENV).is_some_and(|v| !v.is_empty()) {
+        std::process::abort();
     }
-    if staged_exists {
-        launch_services(false, &staged).map_err(usage)?;
-        if !transition.target.matches(&bundle_identity(&active)?)
-            || !transition.source.matches(&bundle_identity(&staged)?)
-        {
-            return Err(usage(
-                "bundle identities changed before retirement; all files retained",
-            ));
-        }
-        vox_sockdrops::remove_item(&staged).map_err(|e| {
-            usage(format!(
-                "cannot retire displaced bundle {}: {e}",
-                staged.display()
-            ))
-        })?;
-        sync_dir(apps)?;
+    transition
+        .archive
+        .as_mut()
+        .ok_or_else(|| usage("missing archive transaction authority"))?
+        .phase = FilesystemPhase::Exchanged;
+    write_transition(apps, transition)?;
+    if !transition.target.matches(&bundle_identity(&active)?)
+        || !transition.source.matches(&bundle_identity(&staged)?)
+    {
+        return Err(usage(
+            "bundle identities changed after exchange; all files retained",
+        ));
     }
-    if retiring {
-        restore_previous_authority(
-            apps,
-            transition
-                .archive
-                .as_ref()
-                .ok_or_else(|| usage("missing archive transaction authority"))?,
-        )?;
+    transition
+        .archive
+        .as_mut()
+        .ok_or_else(|| usage("missing archive transaction authority"))?
+        .phase = FilesystemPhase::Retiring;
+    write_transition(apps, transition)?;
+    launch_services(false, &staged).map_err(usage)?;
+    if !transition.target.matches(&bundle_identity(&active)?)
+        || !transition.source.matches(&bundle_identity(&staged)?)
+    {
+        return Err(usage(
+            "bundle identities changed before retirement; all files retained",
+        ));
     }
+    vox_sockdrops::remove_item(&staged).map_err(|e| {
+        usage(format!(
+            "cannot retire displaced bundle {}: {e}",
+            staged.display()
+        ))
+    })?;
+    sync_dir(apps)?;
     promote_archive(
         apps,
         transition
@@ -2364,18 +2345,6 @@ fn recover_transition(
     {
         authenticate_readoption(apps, &mut transition)?;
     }
-    if transition.archive.as_ref().is_some_and(|archive| {
-        !archive.legacy
-            && matches!(
-                archive.phase,
-                FilesystemPhase::Stopped | FilesystemPhase::Exchanged | FilesystemPhase::Retiring
-            )
-    }) && transition
-        .target
-        .matches(&bundle_identity(&apps.join(BUNDLE))?)
-    {
-        publish(apps, &mut transition)?;
-    }
     if let Some(archive) = transition.archive.as_ref() {
         if !matches!(
             archive.phase,
@@ -2483,7 +2452,6 @@ fn recover_transition(
                 &active.join(HELPER),
                 &now,
                 Some(transition.handoff_daemon()),
-                transition.daemon_process.as_ref(),
             ) {
                 Ok(_detached) => {
                     transition.daemon_complete = true;
@@ -4148,23 +4116,17 @@ fn restart_for_handoff(
     now: &str,
     stopped: &Option<StoppedApp>,
     intent: Option<&super::restart::DaemonIntent>,
-    captured: Option<&super::restart::DaemonProcess>,
 ) -> Result<(), AppError> {
     use vox_core::node::paths::Account;
     let restart = |account: &Account| {
-        let _detached = super::restart::restart_daemon_checked(
-            account,
-            &active.join(HELPER),
-            now,
-            intent,
-            captured,
-        )
-        .map_err(|e| {
-            usage(format!(
-                "{} is in place, but the daemon restart failed: {e}",
-                active.display()
-            ))
-        })?;
+        let _detached =
+            super::restart::restart_daemon_checked(account, &active.join(HELPER), now, intent)
+                .map_err(|e| {
+                    usage(format!(
+                        "{} is in place, but the daemon restart failed: {e}",
+                        active.display()
+                    ))
+                })?;
 
         Ok::<(), AppError>(())
     };
@@ -4247,13 +4209,7 @@ fn transition_handoff(
 ) -> Result<(), AppError> {
     let mut failures = Vec::new();
     if !transition.daemon_complete {
-        match restart_for_handoff(
-            active,
-            version,
-            stopped,
-            Some(transition.handoff_daemon()),
-            transition.daemon_process.as_ref(),
-        ) {
+        match restart_for_handoff(active, version, stopped, Some(transition.handoff_daemon())) {
             Ok(()) => {
                 transition.daemon_complete = true;
                 if let Err(e) = write_transition(apps, transition) {
@@ -4359,7 +4315,6 @@ fn restore_source_and_handoff(
             &active.join(HELPER),
             &version,
             Some(transition.handoff_daemon()),
-            transition.daemon_process.as_ref(),
         )?;
         transition.daemon_complete = true;
         write_transition(apps, transition)?;
@@ -4390,12 +4345,6 @@ fn transition_failed_journal(
     transition: &mut Transition,
     error: AppError,
 ) -> AppError {
-    if bundle_identity(&apps.join(BUNDLE))
-        .is_ok_and(|identity| transition.target.matches(&identity))
-        && !matches!(transition.kind, TransitionKind::Refresh)
-    {
-        return usage(format!("{error}; published bundle and recovery authority retained; run `vox update` for repair"));
-    }
     if transition.archive.as_ref().is_some_and(|archive| {
         matches!(
             archive.phase,

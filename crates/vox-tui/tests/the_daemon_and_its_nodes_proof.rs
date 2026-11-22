@@ -1835,8 +1835,8 @@ fn a_product_stop_exits_zero_and_foreign_signals_exit_for_the_manager() {
             }
         }
     }
-    fn start(a: &Account) -> Owned {
-        let daemon = Owned(Daemon::start(a, &["--no-node"], &[]));
+    fn start(a: &Account, args: &[&str]) -> Owned {
+        let daemon = Owned(Daemon::start(a, args, &[]));
         assert!(
             wait_until(Duration::from_secs(30), || daemon
                 .0
@@ -1851,7 +1851,7 @@ fn a_product_stop_exits_zero_and_foreign_signals_exit_for_the_manager() {
     let a = Account::new();
     let account = vox_core::node::paths::Account::of(Some(&a.data), Some(&a.cfg))
         .expect("APPARATUS: scratch account paths");
-    let mut daemon = start(&a);
+    let mut daemon = start(&a, &["--login-item", "--no-node"]);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1887,7 +1887,7 @@ fn a_product_stop_exits_zero_and_foreign_signals_exit_for_the_manager() {
     drop(daemon);
 
     for (signal, code) in [("TERM", 143), ("HUP", 129), ("INT", 130), ("QUIT", 131)] {
-        let mut daemon = start(&a);
+        let mut daemon = start(&a, &["--login-item", "--no-node"]);
         let pid = daemon.0.child.id();
         let sent = Command::new("kill")
             .args([&format!("-{signal}"), &pid.to_string()])
@@ -1908,6 +1908,31 @@ fn a_product_stop_exits_zero_and_foreign_signals_exit_for_the_manager() {
             && !said.contains("did not finish stopping"),
             "PRODUCT: SIG{signal} must finish clean shutdown then exit {code}, so a service manager can recover it; got {status}:\n{said}");
     }
+
+    let mut daemon = start(&a, &["--no-node"]);
+    let pid = daemon.0.child.id();
+    let sent = Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .expect("APPARATUS: signal the hand-run daemon this proof started");
+    assert!(
+        sent.success(),
+        "APPARATUS: could not send SIGTERM to owned pid {pid}"
+    );
+    let status = daemon
+        .0
+        .child
+        .wait()
+        .expect("APPARATUS: reap hand-run daemon");
+    let said = daemon.0.said();
+    eprintln!("[proof] hand-run SIGTERM stopped pid {pid}: {status}\n{said}");
+    assert!(
+        status.success()
+            && said.contains("vox daemon: stopped by SIGTERM")
+            && !said.contains("a service manager may start it again")
+            && !said.contains("did not finish stopping"),
+        "PRODUCT: a hand-run daemon stopped by SIGTERM must exit zero with its old words and no service-manager claim; got {status}:\n{said}"
+    );
 }
 
 /// RG-9: a client arriving in a restart waits for its owner, even if the caller dies.
@@ -2043,17 +2068,15 @@ fn a_restart_owns_its_replacement_while_a_client_waits() {
             || !client_ok
             || !out.contains("already running")
             || !hook.0
-            || !err.contains("waiting for the daemon to start or restart")
-            || !hook
-                .2
-                .contains("waiting for the daemon to start or restart")
+            || !err.contains("waiting for the daemon restart")
+            || !hook.2.contains("waiting for the daemon restart")
         {
             stop_pid(replacement);
         }
         assert!(client_ok && out.contains("already running"),
             "PRODUCT: a client during restart started a competing daemon instead of waiting: {out}{err}; restart: {restart}");
         assert!(
-            err.contains("waiting for the daemon to start or restart"),
+            err.contains("waiting for the daemon restart"),
             "APPARATUS: the client did not arrive during the restart: {out}{err}"
         );
         assert!(
@@ -2064,8 +2087,7 @@ fn a_restart_owns_its_replacement_while_a_client_waits() {
             a.log()
         );
         assert!(
-            hook.2
-                .contains("waiting for the daemon to start or restart"),
+            hook.2.contains("waiting for the daemon restart"),
             "APPARATUS: the hook did not arrive during the restart: {}{}",
             hook.1,
             hook.2

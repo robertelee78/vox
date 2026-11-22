@@ -6,10 +6,6 @@
 #   scripts/app-proofs.sh                     # every proof
 #   scripts/app-proofs.sh FirstRunProof       # one class (xcodebuild's -only-testing)
 #   scripts/app-proofs.sh LaunchProof         # scripts/app-launch-proof.py alone: no UI automation
-#   scripts/app-proofs.sh FirstRunProof/testManagedDaemonLaunchd # real guest launchd
-#   scripts/app-proofs.sh FirstRunProof/testManagedRestartLaunchd # restart act alone
-#   VOX_PROOF_NEXT_BINARY=/absolute/path/to/vox-next scripts/app-proofs.sh ManagedBundleProof
-#     # next-version fixture compiled from the same snapshot, with test-knobs; guest only
 #   scripts/app-proofs.sh --host FirstRunProof # explicitly use this Mac's desktop
 # Default: a headless macOS guest; setup in docs/release/app-proof-vm.md.
 #   VOX_PROOF_APP=<any other Vox.app>         # refused before anything runs (see below)
@@ -32,16 +28,6 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
-MANAGED_PROOF=FirstRunProof/testManagedDaemonLaunchd
-MANAGED_RESTART_PROOF=FirstRunProof/testManagedRestartLaunchd
-if [[ " $* " == *" ManagedBundleProof "* ]] && [ "${VOX_PROOF_VM_GUEST:-}" != 1 ] && [ "${1:-}" = --host ]; then
-    echo "app-proofs: APPARATUS: the managed bundle proof is guest-only" >&2
-    exit 2
-fi
-if [[ " $* " == *" $MANAGED_PROOF "* || " $* " == *" $MANAGED_RESTART_PROOF "* ]] && [ "${VOX_PROOF_VM_GUEST:-}" != 1 ] && [ "${1:-}" = --host ]; then
-    echo "app-proofs: APPARATUS: the managed daemon proof is guest-only" >&2
-    exit 2
-fi
 if [ "${VOX_PROOF_VM_GUEST:-}" = 1 ]; then
     case "$(sysctl -n hw.model)" in
         VirtualMac*) echo "app-proofs: using the guest desktop and clipboard" ;;
@@ -368,38 +354,6 @@ finish() {
         kill "$STAGER" 2>/dev/null || true
         wait "$STAGER" 2>/dev/null || true
     fi
-    if [ "${VOX_PROOF_VM_GUEST:-}" = 1 ] && [ -f "$SCRATCH/managed-guest-fixture" ]; then
-        local fixture owner job
-        fixture="$(cat "$SCRATCH/managed-guest-fixture")"
-        case "$fixture" in
-            /tmp/vox-mg-*)
-                owner="$(cat "$fixture/owner.pid" 2>/dev/null || true)"
-                if [ -n "$owner" ] && ps -p "$owner" -o command= 2>/dev/null | grep -Fq -- "--managed-guest-proof"; then
-                    kill "$owner" 2>/dev/null || true
-                    for _ in $(seq 1 100); do kill -0 "$owner" 2>/dev/null || break; sleep 0.1; done
-                    if ps -p "$owner" -o command= 2>/dev/null | grep -Fq -- "--managed-guest-proof"; then
-                        kill -KILL "$owner" 2>/dev/null || true
-                    fi
-                fi
-                job="$(launchctl print "gui/$(id -u)/us.vox.daemon" 2>/dev/null || true)"
-                if [[ "$job" == *"$APP/Contents/Helpers/vox"* ]]; then
-                    launchctl bootout "gui/$(id -u)" "$fixture/job.plist" || status=2
-                fi
-                if launchctl print "gui/$(id -u)/us.vox.daemon" 2>/dev/null | grep -Fq "$APP/Contents/Helpers/vox"; then
-                    echo "app-proofs: APPARATUS: owned launchd job remains loaded" >&2
-                    status=2
-                elif [ -f "$fixture/job.plist" ] && ! VOX_PROOF_VM_GUEST=1 \
-                    /usr/bin/python3 "$ROOT/scripts/app-proofs-vm.py" --managed-cleanup \
-                    "$APP/Contents/Helpers/vox" "$fixture"; then
-                    echo "app-proofs: APPARATUS: owned replacement worker cleanup failed" >&2
-                    status=2
-                else
-                    rm -rf "$fixture"
-                fi
-                ;;
-            *) echo "app-proofs: APPARATUS: invalid managed fixture path" >&2; status=2 ;;
-        esac
-    fi
     trap_unregister
     if [ -n "$WATCH_REAL" ]; then finish_real || status=2; fi
     collect_results || status=2
@@ -433,19 +387,6 @@ if ! : > "$REAL_TOUCH"; then
 fi
 watch_real > "$REAL_WATCH_LOG" 2>&1 &
 WATCH_REAL=$!
-if [ "$*" = ManagedBundleProof ]; then
-    [ "${VOX_PROOF_VM_GUEST:-}" = 1 ] || { echo "app-proofs: APPARATUS: guest required" >&2; exit 2; }
-    [ -f "${VOX_PROOF_NEXT_BINARY:-}" ] || { echo "app-proofs: APPARATUS: genuine next-version fixture required" >&2; exit 2; }
-    version="$(awk -F '"' '/^version = / {print $2; exit}' Cargo.toml)"
-    expected="vox 9${version:1}"
-    reported="$(HOME="$SCRATCH" VOX_DATA_DIR="$SCRATCH/data" VOX_CONFIG_DIR="$SCRATCH/config" "$VOX_PROOF_NEXT_BINARY" --version)"
-    [ "$reported" = "$expected" ] || { echo "app-proofs: APPARATUS: fixture says $reported, expected $expected" >&2; exit 2; }
-    status=0
-    cargo test --release -p vox-tui --features test-knobs,optional-proofs --test update_proof \
-        an_update_restarts_its_daemon_and_refuses_a_different_local_version \
-        -- --ignored --exact --nocapture 2>&1 | tee "$RESULTS/managed-bundle.log" || status=$?
-    exit "$status"
-fi
 if [ "$#" -eq 0 ] || [ "$*" = "LaunchProof" ]; then
     python3 scripts/app-launch-proof.py "$APP" || launch_status=$?
     if [ "$*" = "LaunchProof" ]; then
@@ -489,13 +430,6 @@ fi
 status=0
 NATIVE_NODE="${VOX_PROOF_NATIVE_NODE:-$(command -v node || true)}"
 [ -n "$NATIVE_NODE" ] || NATIVE_NODE=/Users/admin/vox-app-proofs/apparatus/node
-managed_mode=""
-if [ "${VOX_PROOF_VM_GUEST:-}" = 1 ]; then
-    case "$*" in
-        "$MANAGED_PROOF") managed_mode=journey ;;
-        "$MANAGED_RESTART_PROOF") managed_mode=restart ;;
-    esac
-fi
 TEST_RUNNER_VOX_PROOF_STEP="${VOX_PROOF_STEP:-}" \
 TEST_RUNNER_VOX_PROOF_APP="$APP" TEST_RUNNER_VOX_PROOF_SCRATCH="$SCRATCH" \
     TEST_RUNNER_VOX_PROOF_STAGER_PORT="$(cat "$SCRATCH/stager.port")" \
@@ -506,8 +440,6 @@ TEST_RUNNER_VOX_PROOF_APP="$APP" TEST_RUNNER_VOX_PROOF_SCRATCH="$SCRATCH" \
     TEST_RUNNER_VOX_PROOF_NATIVE_NODE="$NATIVE_NODE" \
     TEST_RUNNER_VOX_PROOF_OPENCODE_HOST="$ROOT/crates/vox-tui/tests/support/opencode_plugin_host.mjs" \
     TEST_RUNNER_VOX_PROOF_OMP_REPLAY="$ROOT/crates/vox-tui/tests/support/omp_bridge_replay.py" \
-    TEST_RUNNER_VOX_PROOF_MANAGED_GUEST="$managed_mode" \
-    TEST_RUNNER_VOX_PROOF_ROOT="$ROOT" \
     TEST_RUNNER_VOX_PROOF_CONTINUE="${VOX_PROOF_CONTINUE:-}" \
     xcodebuild -project apps/macos/Vox.xcodeproj -scheme Vox -configuration Release \
     -derivedDataPath "$DERIVED" -resultBundlePath "$RESULTS/AppProofs.xcresult" \
