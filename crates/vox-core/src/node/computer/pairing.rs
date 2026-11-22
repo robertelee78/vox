@@ -1807,30 +1807,28 @@ impl Management {
                 (g.computer.fingerprint().ok() == Some(target)).then_some(*id)).collect();
             grants.sort();
             if grants.is_empty() { return Err(Error::Profile("this computer is not an active group member")); }
-            let mut row_count = rooms.len() + s.removal_local.values().map(Vec::len).sum::<usize>();
-            for record in s.history.values() {
-                let event = record.event()?;
-                if event.author == self.computer.signer.fingerprint() {
-                    row_count += event.removal.map_or(0, |removal| removal.rooms.len());
-                }
-            }
+            let row_count = rooms.len() + s.removal_local.values().map(Vec::len).sum::<usize>()
+                + s.removal_choice.values().map(|choice| choice.rooms.len()).sum::<usize>();
             if row_count > MAX_RECORDS
                 || s.removal_local.len() + checked_nodes.len() > MAX_RECORDS {
                 return Err(Error::Profile(HISTORY_FULL));
             }
             let mut body = Encoder::new();
-            body.array(5).bytes(&target).array(grants.len());
+            body.array(3).bytes(&target).array(grants.len());
             for grant in grants { body.bytes(&grant); }
             body.bytes(&s.rosters.get(&target).map(Control::id).unwrap_or([0; 32]));
+            let event = Control::sign(s, "remove", body.finish(), self.computer.signer.as_ref())?;
             #[cfg(feature = "test-knobs")]
             let keep_rooms = keep_rooms || super::fx28_mutant("removal-choice-not-saved");
-            body.uint(u64::from(keep_rooms));
-            super::removal::put_rooms(&mut body, rooms);
-            let event = Control::sign(s, "remove", body.finish(), self.computer.signer.as_ref())?;
+            s.removal_choice.insert(event.id(), super::removal::RemovalChoice {
+                keep_rooms,
+                rooms: rooms.to_vec(),
+            });
             for node in checked_nodes {
                 s.removal_local.insert((event.id(), *node), Vec::new());
             }
             s.retain_roster(event)?;
+            s.refresh_removal_pending()?;
             Ok(())
         })?;
         self.status()

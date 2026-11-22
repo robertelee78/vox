@@ -6,6 +6,9 @@ impl Node {
         let Some(computer) = self.computer.clone() else {
             return;
         };
+        if !computer.has_pending_room_removals() {
+            return;
+        }
         let Some(profile) = &self.profile else {
             return;
         };
@@ -13,13 +16,17 @@ impl Node {
         let store = profile.store_handle();
         let rooms = match store.channels() {
             Ok(rooms) => rooms,
-            Err(_) => return,
+            Err(_) => {
+                self.retry_computer_room_removal(room);
+                return;
+            }
         };
         let captured = computer.clone();
         if !matches!(
             tokio::task::spawn_blocking(move || captured.capture_removal_rooms(me, &rooms)).await,
             Ok(Ok(()))
         ) {
+            self.retry_computer_room_removal(room);
             return;
         }
         let Some(instance) = self.channels.get(&room).cloned() else {
@@ -29,23 +36,29 @@ impl Node {
             Ok(rows) => rows,
             Err(error) => {
                 eprintln!("vox: computer room removals could not be read: {error}");
+                self.retry_computer_room_removal(room);
                 return;
             }
         };
         for (event, index, row) in rows {
             #[cfg(feature = "test-knobs")]
             if hold_removal_for_proof(&row.room, false) {
+                self.retry_computer_room_removal(room);
                 continue;
             }
             let done = {
                 let channel = instance.lock().await;
                 if !channel.trust_reconciled(self.trust_generation) {
+                    self.retry_computer_room_removal(room);
                     return;
                 }
                 match channel.is_member_removed(&store, &row.member) {
                     Ok(true) => true,
                     Ok(false) => !channel.is_member(&row.member),
-                    Err(_) => return,
+                    Err(_) => {
+                        self.retry_computer_room_removal(room);
+                        return;
+                    }
                 }
             };
             if done {
@@ -58,6 +71,7 @@ impl Node {
                 }
                 #[cfg(feature = "test-knobs")]
                 if hold_removal_for_proof(&row.room, true) {
+                    self.retry_computer_room_removal(room);
                     continue;
                 }
                 #[cfg(feature = "test-knobs")]
@@ -72,7 +86,10 @@ impl Node {
                 {
                     Ok(Ok(())) => {}
                     result => {
-                        eprintln!("vox: computer room removal completion was not saved: {result:?}")
+                        eprintln!(
+                            "vox: computer room removal completion was not saved: {result:?}"
+                        );
+                        self.retry_computer_room_removal(room);
                     }
                 }
                 continue;
@@ -86,22 +103,34 @@ impl Node {
                         | "the room creator cannot be removed")) => {
                         Some(channel.genesis().creator_pubkey().fingerprint())
                     }
-                    Err(_) => continue,
+                    Err(_) => {
+                        self.retry_computer_room_removal(room);
+                        continue;
+                    }
                 }
             };
             if let Some(creator) = authority {
                 if row.command_node != creator {
                     let computer = computer.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        computer.finish_room_removal(event, index, Some(creator))
-                    })
-                    .await;
+                    if !matches!(
+                        tokio::task::spawn_blocking(move || {
+                            computer.finish_room_removal(event, index, Some(creator))
+                        })
+                        .await,
+                        Ok(Ok(()))
+                    ) {
+                        self.retry_computer_room_removal(room);
+                    }
                 }
                 continue;
             }
             if self.pending_posts.contains_key(&room) {
+                self.retry_computer_room_removal(room);
                 continue;
             }
+            // The existing one-second governance deadline also covers a rejected send or
+            // reply. Success is reconciled from the committed roster, not a task's verdict.
+            self.retry_computer_room_removal(room);
             if let Some(sender) = self.command_sender.upgrade() {
                 let (reply, received) = oneshot::channel();
                 if sender
@@ -121,6 +150,18 @@ impl Node {
             }
             break;
         }
+    }
+    pub(super) fn retry_computer_room_removal(&mut self, room: Digest32) {
+        let retry = self
+            .now_ms()
+            .0
+            .saturating_add(ROOM_RETRY.as_millis() as u64);
+        let next = self
+            .governance_work
+            .deadlines
+            .get(&room)
+            .map_or(retry, |at| (*at).min(retry));
+        self.governance_work.set_deadline(room, Some(next));
     }
 }
 
@@ -161,30 +202,25 @@ impl Node {
             &[(room, channel.offer_bases(store)?)],
         )
     }
-    pub(super) async fn capture_open_computer_offer_boundaries(&mut self) {
+    pub(super) async fn capture_open_computer_offer_boundaries(
+        &mut self,
+    ) -> crate::error::Result<()> {
         let (Some(profile), Some(computer)) = (&self.profile, &self.computer) else {
-            return;
+            return Ok(());
         };
         let me = profile.fingerprint();
         let store = profile.store_handle();
-        let Ok(known) = store.channels() else {
-            return;
-        };
+        let known = store.channels()?;
         let mut captured = Vec::new();
         for (room, instance) in &self.channels {
-            if let Ok(channel) = instance.try_lock() {
-                if let Ok(bases) = channel.offer_bases(&store) {
-                    captured.push((*room, bases));
-                }
-            }
+            let channel = instance.lock().await;
+            captured.push((*room, channel.offer_bases(&store)?));
         }
-        if !matches!(
-            computer.capture_offer_boundaries(me, &known, &captured),
-            Ok(true)
-        ) {
-            for room in known {
-                self.governance_work.wake_room(room);
-            }
+        if !computer.capture_offer_boundaries(me, &known, &captured)? {
+            return Err(Error::Profile(
+                "computer offer boundaries wait for its current save; retry this operation",
+            ));
         }
+        Ok(())
     }
 }

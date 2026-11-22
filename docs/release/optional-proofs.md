@@ -86,9 +86,11 @@ The pairing journey in `nodes_of_one_daemon_proof.rs` also covers saved room cho
 Run one name at a time with
 `cargo test --release -p vox-tui --features test-knobs,optional-proofs --test nodes_of_one_daemon_proof <name> -- --ignored --exact --nocapture`.
 The restart and absence acts use causal holds and require an exclusive proof slot.
-Removal choices are signed inside the existing computer removal event; old three-field
-events keep room memberships. Local completion and rooms checked on first unlock share
-the existing atomic computer snapshot. No separate removal worker or journal is used.
+Removal choices are local state saved atomically with the unchanged three-field signed
+computer removal event. An event with no local choice keeps room memberships. Choices,
+completion and rooms checked on first unlock share the existing computer snapshot;
+unfinished work uses the room's existing one-second governance retry, not a separate
+removal worker or journal.
 Each accepted removal also keeps this computer's existing-node offer obligations and
 per-room basis cutoffs in that same snapshot. Until a room's cutoff is captured it
 offers none of that computer's nodes; afterwards only pre-removal bases are suppressed.

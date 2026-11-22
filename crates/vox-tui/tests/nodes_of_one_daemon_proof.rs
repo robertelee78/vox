@@ -4373,6 +4373,25 @@ struct RoomTrustJourney {
 }
 
 #[cfg(feature = "optional-proofs")]
+impl Drop for RoomTrustJourney {
+    fn drop(&mut self) {
+        if std::env::var_os("VOX_MUTANT_FX28").is_some() {
+            for daemon in &self._daemons {
+                let lines: std::collections::BTreeSet<_> = daemon
+                    .said()
+                    .lines()
+                    .filter(|line| line.contains("[vox mutant] engaged"))
+                    .map(str::to_owned)
+                    .collect();
+                for line in lines {
+                    eprintln!("[daemon {}] {line}", daemon.child.id());
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "optional-proofs")]
 impl RoomTrustJourney {
     fn new(pair_gamma: bool) -> Self {
         let a = Account::new();
@@ -5245,13 +5264,17 @@ fn computer_removal_resumes_its_saved_room_choices_after_restart() {
         .a
         .run(&["room", "roster", &journey.room, "--node", "alpha"], "");
     assert!(ok, "APPARATUS: restart eviction cannot be judged because its roster was refused: {members}{err}");
-    assert!(settled && !members.contains(&journey.beta),
-        "PRODUCT: saved computer removal left beta in its administered room after restart: {members}{err}; status={}",
-        computer(&journey.a, &["status"]));
-    let (ok, offers, err) = journey.a.run(&["trust", "offers", "--node", "alpha"], "");
+    let (offers_ok, offers, offers_err) =
+        journey.a.run(&["trust", "offers", "--node", "alpha"], "");
+    let evicted = settled && !members.contains(&journey.beta);
+    let hidden = offers_ok && !offers.contains(&journey.beta);
     assert!(
-        ok && !offers.contains(&journey.beta),
-        "PRODUCT: removed computer's node offered after restart: {offers}{err}"
+        evicted && hidden,
+        "PRODUCT: computer removal after restart: evicted={evicted}, old offers suppressed={hidden}; \
+         saved computer removal left beta in its administered room after restart when evicted=false: \
+         {members}{err}; removed computer's node offered after restart when suppressed=false: \
+         {offers}{offers_err}; status={}",
+        computer(&journey.a, &["status"])
     );
     read_daemon_marker(
         &eviction.with_extension("engaged"),
@@ -5436,16 +5459,15 @@ fn computer_removal_reconciles_absence_before_a_fresh_join() {
         .run(&["room", "leave", &journey.healthy, "--node", "beta"], "");
     assert!(ok, "APPARATUS: beta leaves before eviction: {out}{err}");
     assert!(
-        wait_until(RETURN_WITHIN, || !journey
-            .a
-            .run(&["room", "roster", &journey.healthy, "--node", "alpha"], "")
-            .1
-            .contains(&journey.beta)),
-        "APPARATUS: alpha did not observe beta's departure"
+        wait_until(RETURN_WITHIN, || {
+            let (ok, roster, _) = journey
+                .a
+                .run(&["room", "roster", &journey.healthy, "--node", "alpha"], "");
+            ok && !roster.contains(&journey.beta)
+        }),
+        "APPARATUS: alpha did not read beta's departure from an available roster"
     );
     std::fs::remove_file(&eviction).unwrap();
-    // The room's ordinary command advances its existing governance continuation.
-    journey.assert_healthy_posts("removal-observes-absence");
     let status = computer(&journey.a, &["status"]);
     assert!(
         status["removals"]
@@ -5458,6 +5480,8 @@ fn computer_removal_reconciles_absence_before_a_fresh_join() {
         journey.a.lock_pid().unwrap(),
         "the existing room continuation observed beta's absence",
     );
+    // This room's own withdrawal and absence observation precede the posting premise.
+    journey.assert_healthy_posts("removal-observes-absence");
     removal_join(&journey.b, "beta", &link);
     // Give the old removal twenty actual room turns, not a timed quiet window.
     for index in 0..20 {
@@ -10883,20 +10907,34 @@ fn computer_removal_offers_only_a_fresh_basis() {
         ok && !old.contains(&journey.beta),
         "PRODUCT: the kept room offered the removed computer's old basis again: {old}{err}"
     );
-    let (ok, out, err) = journey
-        .b
-        .run(&["room", "leave", &journey.healthy, "--node", "beta"], "");
+    let mut leave_answer = String::new();
+    let mut leave_fault = false;
+    let left = wait_until(RETURN_WITHIN, || {
+        let (ok, out, err) = journey
+            .b
+            .run(&["room", "leave", &journey.healthy, "--node", "beta"], "");
+        leave_answer = format!("{out}{err}");
+        if ok {
+            return true;
+        }
+        if !leave_answer.contains("computer trust changed while this command was being applied") {
+            leave_fault = true;
+            return true;
+        }
+        false
+    });
     assert!(
-        ok,
-        "APPARATUS: beta leaves before its fresh admission: {out}{err}"
+        left && !leave_fault,
+        "APPARATUS: beta leaves before its fresh admission: {leave_answer}"
     );
     assert!(
-        wait_until(RETURN_WITHIN, || !journey
-            .a
-            .run(&["room", "roster", &journey.healthy, "--node", "alpha"], "")
-            .1
-            .contains(&journey.beta)),
-        "APPARATUS: alpha never observed the departure"
+        wait_until(RETURN_WITHIN, || {
+            let (ok, roster, _) = journey
+                .a
+                .run(&["room", "roster", &journey.healthy, "--node", "alpha"], "");
+            ok && !roster.contains(&journey.beta)
+        }),
+        "APPARATUS: alpha never read the departure from an available roster"
     );
     removal_join(&journey.b, "beta", &link);
     let mut shown = String::new();

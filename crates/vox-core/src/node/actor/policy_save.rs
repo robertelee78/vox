@@ -625,7 +625,10 @@ impl Node {
         }
         // Room withdrawals keep their existing durable PendingLocks and run independently.
         drop(lifetime);
-        self.capture_open_computer_offer_boundaries().await;
+        if let Err(error) = self.capture_open_computer_offer_boundaries().await {
+            let _ = work.reply.send(Err(error));
+            return;
+        }
         self.computer_expired = expired;
         self.computer_revision
             .store(revision, std::sync::atomic::Ordering::Release);

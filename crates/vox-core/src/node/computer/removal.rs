@@ -1,4 +1,4 @@
-//! Room choices belong to the signed removal; local results share its atomic state snapshot.
+//! Room choices and local results share the signed removal's atomic state snapshot.
 use super::*;
 use crate::node::link::b32_encode as text_id;
 use serde::{Deserialize, Serialize};
@@ -81,28 +81,38 @@ impl RemovalRoom {
         sha256_concat(&[&self.room, &self.member, &self.local_node])
     }
 }
+
+#[derive(Clone)]
+pub(super) struct RemovalChoice {
+    pub(super) keep_rooms: bool,
+    pub(super) rooms: Vec<RemovalRoom>,
+}
+impl RemovalChoice {
+    pub(super) fn put(&self, e: &mut Encoder) {
+        e.array(2).uint(u64::from(self.keep_rooms));
+        put_rooms(e, &self.rooms);
+    }
+    pub(super) fn read(d: &mut Decoder<'_>) -> Result<Self> {
+        arity(d, 2)?;
+        let keep_rooms = match d.uint()? {
+            0 => false,
+            1 => true,
+            _ => return Err(bad()),
+        };
+        Ok(Self {
+            keep_rooms,
+            rooms: read_rooms(d)?,
+        })
+    }
+}
 impl Computer {
     /// Historical authenticated node identities of this exact computer, including retired nodes.
     pub fn nodes_of_computer(&self, target: Digest32) -> Result<BTreeSet<Digest32>> {
-        let s = lock(&self.state);
-        let accepted = s.accepted_history()?;
-        let mut nodes = BTreeSet::new();
-        for (id, record) in &s.history {
-            if !accepted.contains(id) {
-                continue;
-            }
-            let event = record.event()?;
-            if event.author == target {
-                for binding in event.bindings {
-                    nodes.insert(binding.verify(&event.author, &event.group)?);
-                }
-            }
-        }
-        Ok(nodes)
+        lock(&self.state).members_of_computer(target)
     }
 
-    fn all_removal_rows(s: &State, event: Digest32, removal: &Removal) -> Vec<RemovalRoom> {
-        let mut rows = removal.rooms.clone();
+    fn all_removal_rows(s: &State, event: Digest32, choice: &RemovalChoice) -> Vec<RemovalRoom> {
+        let mut rows = choice.rooms.clone();
         for ((held, _), extra) in &s.removal_local {
             if *held == event {
                 rows.extend(extra.iter().cloned());
@@ -146,22 +156,23 @@ impl Computer {
             let Some(removal) = event.removal else {
                 continue;
             };
+            let choice = s.removal_choice.get(id);
+            let keep_rooms = choice.is_none_or(|choice| choice.keep_rooms);
             let local_nodes = Self::local_nodes_at(s, &accepted, local, event.sequence)?;
             progress.push(RemovalProgress {
                 event: text_id(id),
                 computer: text_id(&removal.target),
-                keep_rooms: removal.keep_rooms,
-                pending: Self::all_removal_rows(s, *id, &removal)
+                keep_rooms,
+                pending: choice
+                    .map_or_else(Vec::new, |choice| Self::all_removal_rows(s, *id, choice))
                     .into_iter()
                     .filter(|row| {
-                        !removal.keep_rooms && s.removal_done.get(&(*id, row.id())) != Some(&None)
+                        !keep_rooms && s.removal_done.get(&(*id, row.id())) != Some(&None)
                     })
                     .collect(),
                 unchecked_nodes: local_nodes
                     .iter()
-                    .filter(|node| {
-                        !removal.keep_rooms && !s.removal_local.contains_key(&(*id, **node))
-                    })
+                    .filter(|node| !keep_rooms && !s.removal_local.contains_key(&(*id, **node)))
                     .map(text_id)
                     .collect(),
             });
@@ -186,6 +197,11 @@ impl Computer {
         let pending: Vec<_> = {
             let s = lock(&self.state);
             let mut pending = Vec::new();
+            if s.removal_choice.iter().all(|(event, choice)| {
+                choice.keep_rooms || s.removal_local.contains_key(&(*event, node))
+            }) {
+                return Ok(());
+            }
             let accepted = s.accepted_history()?;
             for id in &accepted {
                 let event = s.history[id].event()?;
@@ -196,7 +212,11 @@ impl Computer {
                     continue;
                 };
                 let local_nodes = Self::local_nodes_at(&s, &accepted, local, event.sequence)?;
-                if !removal.keep_rooms && local_nodes.contains(&node) {
+                if s.removal_choice
+                    .get(id)
+                    .is_some_and(|choice| !choice.keep_rooms)
+                    && local_nodes.contains(&node)
+                {
                     pending.push((*id, removal.target));
                 }
             }
@@ -224,13 +244,11 @@ impl Computer {
             captured.push((event, rows));
         }
         self.change(|s| {
-            let mut total: usize = s.removal_local.values().map(Vec::len).sum();
-            for record in s.history.values() {
-                let event = record.event()?;
-                if event.author == local {
-                    total += event.removal.map_or(0, |removal| removal.rooms.len());
-                }
-            }
+            let mut total: usize = s.removal_local.values().map(Vec::len).sum::<usize>()
+                + s.removal_choice
+                    .values()
+                    .map(|choice| choice.rooms.len())
+                    .sum::<usize>();
             for (event, rows) in captured {
                 if s.removal_local.contains_key(&(event, node)) {
                     continue;
@@ -241,6 +259,7 @@ impl Computer {
                 }
                 s.removal_local.insert((event, node), rows);
             }
+            s.refresh_removal_pending()?;
             Ok(())
         })
     }
@@ -258,13 +277,14 @@ impl Computer {
             if event.author != local {
                 continue;
             }
-            let Some(removal) = event.removal else {
+            let Some(choice) = s
+                .removal_choice
+                .get(&id)
+                .filter(|choice| !choice.keep_rooms)
+            else {
                 continue;
             };
-            if removal.keep_rooms {
-                continue;
-            }
-            for row in Self::all_removal_rows(&s, id, &removal) {
+            for row in Self::all_removal_rows(&s, id, choice) {
                 if row.local_node == local_node
                     && row.room == room
                     && s.removal_done.get(&(id, row.id())) != Some(&None)
@@ -285,37 +305,36 @@ impl Computer {
     ) -> Result<()> {
         self.change(|s| {
             let record = s.history.get(&event).ok_or_else(bad)?.event()?;
-            let removal = record.removal.ok_or_else(bad)?;
+            let choice = s.removal_choice.get(&event).ok_or_else(bad)?;
             if record.author != self.signer.fingerprint()
-                || removal.keep_rooms
-                || !Self::all_removal_rows(s, event, &removal)
+                || choice.keep_rooms
+                || !Self::all_removal_rows(s, event, choice)
                     .iter()
                     .any(|held| held.id() == row)
             {
                 return Err(bad());
             }
             s.removal_done.insert((event, row), authority);
+            s.refresh_removal_pending()?;
             Ok(())
         })
+    }
+    pub(crate) fn has_pending_room_removals(&self) -> bool {
+        lock(&self.state).removal_pending
     }
 }
 /// Local facts of one accepted signed removal; no room or transport work is scheduled here.
 #[derive(Clone)]
 pub(super) struct Suppression {
     local_nodes: BTreeSet<Digest32>,
-    members: BTreeSet<Digest32>,
     boundaries: BTreeMap<(Digest32, Digest32), BTreeMap<Digest32, u64>>,
     remembered: BTreeMap<Digest32, BTreeSet<Digest32>>,
 }
 impl Suppression {
     pub(super) fn put(&self, e: &mut Encoder) {
-        e.array(4).array(self.local_nodes.len());
+        e.array(3).array(self.local_nodes.len());
         for node in &self.local_nodes {
             e.bytes(node);
-        }
-        e.array(self.members.len());
-        for member in &self.members {
-            e.bytes(member);
         }
         e.array(self.boundaries.len());
         for ((node, room), cuts) in &self.boundaries {
@@ -333,16 +352,10 @@ impl Suppression {
         }
     }
     pub(super) fn read(d: &mut Decoder<'_>) -> Result<Self> {
-        arity(d, 4)?;
+        arity(d, 3)?;
         let mut local_nodes = BTreeSet::new();
         for _ in 0..count(d)? {
             if !local_nodes.insert(digest(d)?) {
-                return Err(bad());
-            }
-        }
-        let mut members = BTreeSet::new();
-        for _ in 0..count(d)? {
-            if !members.insert(digest(d)?) {
                 return Err(bad());
             }
         }
@@ -358,7 +371,7 @@ impl Suppression {
             for _ in 0..count(d)? {
                 arity(d, 2)?;
                 let member = digest(d)?;
-                if !members.contains(&member) || cuts.insert(member, d.uint()?).is_some() {
+                if cuts.insert(member, d.uint()?).is_some() {
                     return Err(bad());
                 }
             }
@@ -385,13 +398,53 @@ impl Suppression {
         }
         Ok(Self {
             local_nodes,
-            members,
             boundaries,
             remembered,
         })
     }
 }
 impl State {
+    fn members_of_computer(&self, target: Digest32) -> Result<BTreeSet<Digest32>> {
+        let mut nodes = BTreeSet::new();
+        for id in self.accepted_history()? {
+            let event = self.history[&id].event()?;
+            if event.author == target {
+                for binding in event.bindings {
+                    nodes.insert(binding.verify(&event.author, &event.group)?);
+                }
+            }
+        }
+        Ok(nodes)
+    }
+    fn removed_members(&self, event: &Digest32) -> Result<BTreeSet<Digest32>> {
+        let removal = self.history[event].event()?.removal.ok_or_else(bad)?;
+        self.members_of_computer(removal.target)
+    }
+    pub(super) fn refresh_removal_pending(&mut self) -> Result<()> {
+        self.removal_pending = false;
+        if self.removal_choice.values().all(|choice| choice.keep_rooms) {
+            return Ok(());
+        }
+        let local = self.description.fingerprint()?;
+        let accepted = self.accepted_history()?;
+        for (id, choice) in &self.removal_choice {
+            if choice.keep_rooms || !accepted.contains(id) {
+                continue;
+            }
+            let event = self.history[id].event()?;
+            if Computer::all_removal_rows(self, *id, choice)
+                .iter()
+                .any(|row| self.removal_done.get(&(*id, row.id())) != Some(&None))
+                || Computer::local_nodes_at(self, &accepted, local, event.sequence)?
+                    .iter()
+                    .any(|node| !self.removal_local.contains_key(&(*id, *node)))
+            {
+                self.removal_pending = true;
+                break;
+            }
+        }
+        Ok(())
+    }
     pub(super) fn capture_suppression(&mut self, accepted: &BTreeSet<Digest32>) -> Result<()> {
         let local = self.description.fingerprint()?;
         for id in accepted {
@@ -399,9 +452,9 @@ impl State {
                 continue;
             }
             let event = self.history[id].event()?;
-            let Some(removal) = event.removal else {
+            if event.removal.is_none() {
                 continue;
-            };
+            }
             let mut local_nodes = BTreeSet::new();
             if let Some(roster) = self.rosters.get(&local) {
                 let roster = roster.event()?;
@@ -409,20 +462,10 @@ impl State {
                     local_nodes.insert(binding.verify(&local, &roster.group)?);
                 }
             }
-            let mut members = BTreeSet::new();
-            for record in accepted {
-                let roster = self.history[record].event()?;
-                if roster.author == removal.target {
-                    for binding in roster.bindings {
-                        members.insert(binding.verify(&roster.author, &roster.group)?);
-                    }
-                }
-            }
             self.suppression.insert(
                 *id,
                 Suppression {
                     local_nodes,
-                    members,
                     boundaries: BTreeMap::new(),
                     remembered: BTreeMap::new(),
                 },
@@ -462,10 +505,16 @@ impl Computer {
         if !owed(&next) {
             return Ok(true);
         }
-        for work in next
+        let members: BTreeMap<_, _> = next
             .suppression
-            .values_mut()
-            .filter(|work| work.local_nodes.contains(&node))
+            .iter()
+            .filter(|(_, work)| work.local_nodes.contains(&node))
+            .map(|(event, _)| Ok((*event, next.removed_members(event)?)))
+            .collect::<Result<_>>()?;
+        for (event, work) in next
+            .suppression
+            .iter_mut()
+            .filter(|(_, work)| work.local_nodes.contains(&node))
         {
             work.remembered
                 .entry(node)
@@ -477,10 +526,11 @@ impl Computer {
                 if work.boundaries.contains_key(&(node, *room)) {
                     continue;
                 }
-                let mut cuts = BTreeMap::new();
+                let mut cuts: BTreeMap<_, _> =
+                    members[event].iter().map(|member| (*member, 0)).collect();
                 for basis in bases
                     .iter()
-                    .filter(|basis| work.members.contains(&basis.member))
+                    .filter(|basis| members[event].contains(&basis.member))
                 {
                     cuts.entry(basis.member)
                         .and_modify(|cut: &mut u64| *cut = (*cut).max(basis.seq))
@@ -503,13 +553,10 @@ impl Computer {
         if super::fx28_mutant("offer-removed-nodes") {
             return false;
         }
-        lock(&self.state).suppression.values().any(|work| {
-            if !work.local_nodes.contains(&node) || !work.members.contains(&basis.member) {
+        let s = lock(&self.state);
+        s.suppression.iter().any(|(event, work)| {
+            if !work.local_nodes.contains(&node) {
                 return false;
-            }
-            #[cfg(feature = "test-knobs")]
-            if super::fx28_mutant("suppress-every-basis-forever") {
-                return true;
             }
             if work
                 .remembered
@@ -518,9 +565,21 @@ impl Computer {
             {
                 return false;
             }
-            work.boundaries
-                .get(&(node, room))
-                .is_none_or(|cuts| cuts.get(&basis.member).is_some_and(|cut| basis.seq <= *cut))
+            match work.boundaries.get(&(node, room)) {
+                Some(cuts) => {
+                    let Some(cut) = cuts.get(&basis.member) else {
+                        return false;
+                    };
+                    #[cfg(feature = "test-knobs")]
+                    if super::fx28_mutant("suppress-every-basis-forever") {
+                        return true;
+                    }
+                    basis.seq <= *cut
+                }
+                None => s
+                    .removed_members(event)
+                    .map_or(true, |members| members.contains(&basis.member)),
+            }
         })
     }
     pub(crate) fn offer_boundaries_owed(&self, node: Digest32, rooms: &[Digest32]) -> bool {

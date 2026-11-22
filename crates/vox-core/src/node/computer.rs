@@ -53,7 +53,11 @@ pub const COMPUTER_QUIET_EXCHANGE_AFTER: Duration = Duration::from_secs(60);
 /// another claim's mutant.
 #[cfg(feature = "test-knobs")]
 pub(crate) fn fx28_mutant(named: &str) -> bool {
-    std::env::var("VOX_TEST_FX28_MUTANT").as_deref() == Ok(named)
+    let engaged = std::env::var("VOX_TEST_FX28_MUTANT").as_deref() == Ok(named);
+    if engaged {
+        eprintln!("[vox mutant] engaged {named}");
+    }
+    engaged
 }
 
 /// Test apparatus: park one exact Computer-state commit after its replacement snapshot is ready
@@ -855,10 +859,7 @@ impl Control {
                 });
             }
             "remove" => {
-                let fields = count(&mut body)?;
-                if fields != 3 && fields != 5 {
-                    return Err(bad());
-                }
+                arity(&mut body, 3)?;
                 let target = digest(&mut body)?;
                 let mut grants = Vec::new();
                 for _ in 0..count(&mut body)? {
@@ -868,24 +869,10 @@ impl Control {
                     return Err(bad());
                 }
                 let roster = digest(&mut body)?;
-                // Three-field removals predate room eviction and never authorize it.
-                let keep_rooms = fields == 3
-                    || match body.uint()? {
-                        0 => false,
-                        1 => true,
-                        _ => return Err(bad()),
-                    };
-                let rooms = if fields == 5 {
-                    removal::read_rooms(&mut body)?
-                } else {
-                    Vec::new()
-                };
                 removal = Some(Removal {
                     target,
                     grants,
                     roster,
-                    keep_rooms,
-                    rooms,
                 });
             }
             "reach" => {
@@ -983,8 +970,6 @@ struct Removal {
     target: Digest32,
     grants: Vec<Digest32>,
     roster: Digest32,
-    keep_rooms: bool,
-    rooms: Vec<RemovalRoom>,
 }
 
 /// Current authenticated contact facts, carried by the same author chain as membership.
@@ -1178,6 +1163,10 @@ pub(crate) struct State {
     removal_local: BTreeMap<(Digest32, Digest32), Vec<RemovalRoom>>,
     /// CJ-11 obligations and immutable per-room offer cuts, folded with the removal.
     suppression: BTreeMap<Digest32, removal::Suppression>,
+    /// The remover's reviewed choice, saved atomically with its signed three-field event.
+    removal_choice: BTreeMap<Digest32, removal::RemovalChoice>,
+    /// Recomputed on load and local removal-result changes; never serialized.
+    removal_pending: bool,
 }
 impl State {
     /// Advance the durable journal for a management fact which is exchanged but is not yet an
@@ -1797,7 +1786,7 @@ impl State {
 
     fn body(&self) -> Vec<u8> {
         let mut e = Encoder::for_secrets();
-        e.array(35)
+        e.array(36)
             .bytes(&self.description.encode())
             .uint(self.revision)
             .array(self.invitations.len());
@@ -1970,6 +1959,11 @@ impl State {
             e.array(2).bytes(event);
             suppression.put(&mut e);
         }
+        e.array(self.removal_choice.len());
+        for (event, choice) in &self.removal_choice {
+            e.array(2).bytes(event);
+            choice.put(&mut e);
+        }
         e.finish()
     }
     fn read(vault: Vec<u8>, body: &[u8]) -> Result<Self> {
@@ -1978,7 +1972,7 @@ impl State {
         // durable pre-keyring application record, inbound/outbound miss distinction, or local
         // node-application miss history.
         let fields = count(&mut d)?;
-        if !(25..=35).contains(&fields) {
+        if !(25..=36).contains(&fields) {
             return Err(bad());
         }
         let description = Description::decode(d.bytes()?)?;
@@ -2378,8 +2372,22 @@ impl State {
                 }
             }
         }
+        let mut removal_choice = BTreeMap::new();
+        if fields >= 36 {
+            for _ in 0..count(&mut d)? {
+                arity(&mut d, 2)?;
+                if removal_choice
+                    .insert(digest(&mut d)?, removal::RemovalChoice::read(&mut d)?)
+                    .is_some()
+                {
+                    return Err(bad());
+                }
+            }
+        }
         d.finish()?;
         let mut s = Self {
+            removal_choice,
+            removal_pending: false,
             suppression,
             removal_done,
             removal_local,
@@ -2445,6 +2453,7 @@ impl State {
             return Err(bad());
         }
         s.accepted_history()?;
+        s.refresh_removal_pending()?;
         Ok(s)
     }
 }
@@ -4184,6 +4193,8 @@ impl Computer {
         };
         Description::decode(&description.encode())?;
         let state = State {
+            removal_choice: BTreeMap::new(),
+            removal_pending: false,
             suppression: BTreeMap::new(),
             removal_done: BTreeMap::new(),
             removal_local: BTreeMap::new(),
