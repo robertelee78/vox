@@ -339,9 +339,16 @@ pub fn one_shot(paths: &Paths) -> Result<NodeSocket, AppError> {
 }
 
 /// What a verb says on stderr, once, when the daemon has not greeted it within a second.
+#[cfg(target_os = "macos")]
 pub const DAEMON_WAITING: &str = "vox: waiting: the vox daemon here has not answered yet — it may \
      be busy (moving or unlocking a node), finishing a daemon restart, or stopped (Ctrl-Z, which goes on once resumed); this \
-     waits up to 10 s";
+     waits up to 10 s for a greeting; a managed restart is followed while its service manager progresses";
+
+/// What a verb says on stderr, once, when the daemon has not greeted it within a second.
+#[cfg(not(target_os = "macos"))]
+pub const DAEMON_WAITING: &str = "vox: waiting: the vox daemon here has not answered yet — it may \
+     be busy (moving or unlocking a node), finishing a daemon restart, or stopped (Ctrl-Z, which goes on once resumed); this \
+     waits up to 10 s for a greeting";
 
 /// Say [`DAEMON_WAITING`]: a verb waiting on the daemon is never silent.
 pub fn say_daemon_waiting() {
@@ -354,6 +361,71 @@ pub fn say_daemon_waiting() {
 /// # Errors
 /// As above.
 pub async fn open(at: &NodeSocket) -> Result<IpcClient, AppError> {
+    #[cfg(target_os = "macos")]
+    {
+        use vox_core::error::IpcHandshake;
+        let first = IpcClient::open_at(at).await;
+        let Err(Error::Ipc(IpcHandshake::DaemonStopping { pid })) = &first else {
+            return first.map_err(|e| said(at, e));
+        };
+        let Some(manager) = crate::update::restart::managed_daemon(*pid) else {
+            return first.map_err(|e| said(at, e));
+        };
+        let previous = *pid;
+        let began = std::time::Instant::now();
+        let mut changed = began;
+        let mut progress = None;
+        let mut announced = false;
+        loop {
+            let current = match DaemonClient::observe(&at.path).await {
+                Ok(hello) if hello.pid != previous => {
+                    #[cfg(feature = "test-knobs")]
+                    if let Some(dir) = std::env::var_os("VOX_TEST_HOLD_AFTER_MANAGED_GREETING") {
+                        let dir = std::path::PathBuf::from(dir);
+                        let greeted = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_err(|e| {
+                                AppError::Usage(format!("APPARATUS: greeting clock: {e}"))
+                            })?;
+                        std::fs::write(dir.join("ready"), greeted.as_nanos().to_string()).map_err(
+                            |e| {
+                                AppError::Usage(format!(
+                                    "APPARATUS: greeting hold announcement: {e}"
+                                ))
+                            },
+                        )?;
+                        while !dir.join("release").exists() {
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        }
+                    }
+                    return IpcClient::open_at(at).await.map_err(|e| said(at, e));
+                }
+                Ok(hello) => Some(hello.pid),
+                Err(Error::Ipc(IpcHandshake::Unreachable { .. })) => None,
+                Err(e) => return Err(said(at, e)),
+            };
+            let Some(state) = manager.progress()? else {
+                return Err(manager.not_ready(previous, current));
+            };
+            if !state.pending {
+                return Err(manager.not_ready(previous, state.pid));
+            }
+            if progress.as_ref() != Some(&state.key) {
+                changed = std::time::Instant::now();
+                progress = Some(state.key);
+            } else if changed.elapsed() >= state.within {
+                return Err(manager.not_ready(previous, state.pid));
+            }
+            if !announced && began.elapsed() >= vox_core::node::profile::LOCK_PATIENCE {
+                if let Some(waiting) = at.waiting {
+                    waiting();
+                }
+                announced = true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
     IpcClient::open_at(at).await.map_err(|e| said(at, e))
 }
 

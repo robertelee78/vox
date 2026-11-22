@@ -97,16 +97,75 @@ version string is not a next-release binary. Their release fixture serves that e
 helper and tag-pinned app records. Native app launch/registration claims remain in the signed
 guest journey below; the controlled CLI bundle fixture does not establish them.
 
+The prebuilt `--bundle-vm` route runs the existing controlled update journey in the stopped
+`vox-app-proofs` guest. Supply the genuinely compiled next-version helper and the prebuilt
+`update_proof` executable from the same source state:
+
+```sh
+VOX_PROOF_NEXT_BINARY=/absolute/vox-next \
+VOX_PROOF_UPDATE_HARNESS=/absolute/update-proof \
+VOX_PROOF_BUNDLE_AFTER_SWAP=1 \
+python3 scripts/app-proofs-vm.py --bundle-vm /absolute/prebuilt/vox \
+  apps/macos/Bundle/LaunchAgents/us.vox.daemon.plist /absolute/receipt-directory
+```
+
+Build the helper and proof with `test-knobs,optional-proofs` before the guest execution.
+The journey holds before exchange, kills the updater's process group, reads the saved room,
+then interrupts the published update before the manager request and uses ordinary `vox update`
+to finish the existing journal. It also reads during the manager's held stop, including an
+explicit `vox daemon --restart` whose caller is killed. All processes, the launch agent and
+profile belong to scratch; the outer runner boots out the job and stops the guest on failure.
+Take `/tmp/vox-guest.lock` for each run, releasing it only after the guest is stopped.
+
+The CLI preserves a stopping refusal's daemon PID internally and checks the existing login-item
+ownership query. Only a confirmed login item's stopping refusal waits for a replacement; no
+client starts a daemon on this path. It follows launchd's phase, PID and run count: phase
+changes reset the no-progress wait, stopping uses the job's exit timeout, a scheduled spawn
+uses its minimum runtime, and a new process keeps the existing ten-second greeting wait.
+Missing or changed manager text falls back to the fixed ten-second wait, not a parsing error
+or an endless wait. End-of-wait advice describes the current state.
+The managed-client wait is built and proven for the macOS login item only. Linux keeps its
+existing immediate stopping refusal; there is no new systemd progress observer. Vox ships no
+user unit. The existing disposable Linux proof supplies `Restart=on-failure`, `RestartSec=1`.
+There is no wire-frame change: an older daemon gives its existing refusal, and an older client
+keeps its existing behavior.
+
+The same prebuilt managed route stages absent manager fields and removes the owned job while
+the client waits; the real client's exit1 must name the stopped daemon and missing replacement:
+
+```sh
+VOX_PROOF_REMOVE_MANAGER=1 VOX_PROOF_MANAGER_FIELDS_ABSENT=1 \
+python3 scripts/app-proofs-vm.py --restart-vm /absolute/prebuilt/vox \
+  apps/macos/Bundle/LaunchAgents/us.vox.daemon.plist /absolute/receipt-directory
+```
+
+Build with `test-knobs` for this field-absence staging, which changes no product wait rule.
+An unpaused read can reach the replacement while its room prepares saved history and exit1
+with `that room is preparing its saved history`. This act keeps the waiting read live through
+the manager's phases, then holds it only after the replacement's greeting and before Use.
+It waits on the public saved-room result and releases that same read. Preparation observations
+and greeting-to-readiness intervals are printed; no room-readiness product behavior is changed.
+
+Item 46's cached-flag clause has NO change in this release. A genuine native-app probe found
+the captured AppKit flag stale after quit, while the fresh lookup returned nil and the kernel
+process was a zombie. Current `still()` already guards this divergence through its nil check.
+A force-quit probe found the fresh flag still false/non-nil while the paused process stayed live.
+Neither requested unguarded divergence was produced; the owner's original trigger remains
+UNKNOWN. Whether RG-9 closes with this clause unbuilt is the owner's decision.
+
+
 On macOS, daemon restart recognizes a kernel zombie state or native process-lookup `ESRCH`
 as stopped even if the terminal or service-manager parent has not reaped the PID yet.
 A live process, permission refusal, or unknown query failure is still waited for; this does
 not change the existing shutdown bound.
 
 Before filesystem commit, the updater preserves and round-trip-verifies the source as an
-authenticated rollback archive. It stops the captured app/daemon, exchanges intact bundles,
-and retires the displaced tree before allowing new-version startup. A precommit refusal restores
-the source from that verified archive, not from a possibly partially deleted tree. A postcommit
-handoff failure resumes unfinished work without an implicit downgrade.
+authenticated rollback archive. It quits the captured app and exchanges intact bundles while
+the old daemon still serves. A login item is replaced by one manager-owned `kickstart -k` after
+retirement; without a login item the captured daemon is stopped after exchange. The displaced
+tree is retired before new-version startup. A precommit refusal restores the source from its
+verified archive, not a possibly partially deleted tree. A postcommit handoff failure resumes
+unfinished work without an implicit downgrade.
 
 A signed update/identifier-launch/rollback measurement must retain both release bundles'
 original signed helpers, verify the restored signature and unchanged signed plist, inspect exact

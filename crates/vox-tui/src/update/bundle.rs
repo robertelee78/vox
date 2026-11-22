@@ -1131,23 +1131,8 @@ fn stop_transaction(
     running: &Option<StoppedApp>,
     transition: &mut Transition,
 ) -> Result<(), AppError> {
-    use std::os::unix::ffi::OsStringExt as _;
     let active = apps.join(BUNDLE);
-    let account = vox_core::node::paths::Account {
-        data_root: PathBuf::from(std::ffi::OsString::from_vec(
-            transition.daemon_data_root.clone(),
-        )),
-        config_dir: PathBuf::from(std::ffi::OsString::from_vec(
-            transition.daemon_config_dir.clone(),
-        )),
-    };
     stop_captured_app(&active, running)?;
-    super::restart::stop_captured_daemon(
-        &account,
-        &transition.daemon,
-        transition.daemon_process.as_ref(),
-        &active.join(HELPER),
-    )?;
     transition
         .archive
         .as_mut()
@@ -1166,6 +1151,16 @@ fn publish(apps: &Path, transition: &mut Transition) -> Result<(), AppError> {
         return Err(usage(
             "bundle identities changed before exchange; all files retained",
         ));
+    }
+    #[cfg(feature = "test-knobs")]
+    if let Some(dir) = std::env::var_os("VOX_TEST_HOLD_BEFORE_BUNDLE_SWAP") {
+        let dir = PathBuf::from(dir);
+        fs::write(dir.join("ready"), b"ready\n")
+            .map_err(|e| usage(format!("cannot announce bundle swap hold: {e}")))?;
+        let release = dir.join("release");
+        while !release.exists() {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
     swap(&staged, &active)?;
     sync_dir(apps)?;
@@ -1186,6 +1181,21 @@ fn publish(apps: &Path, transition: &mut Transition) -> Result<(), AppError> {
             "bundle identities changed after exchange; all files retained",
         ));
     }
+    use std::os::unix::ffi::OsStringExt as _;
+    let account = vox_core::node::paths::Account {
+        data_root: PathBuf::from(std::ffi::OsString::from_vec(
+            transition.daemon_data_root.clone(),
+        )),
+        config_dir: PathBuf::from(std::ffi::OsString::from_vec(
+            transition.daemon_config_dir.clone(),
+        )),
+    };
+    super::restart::stop_captured_daemon(
+        &account,
+        &transition.daemon,
+        transition.daemon_process.as_ref(),
+        &staged.join(HELPER),
+    )?;
     transition
         .archive
         .as_mut()
@@ -2452,6 +2462,7 @@ fn recover_transition(
                 &active.join(HELPER),
                 &now,
                 Some(transition.handoff_daemon()),
+                transition.daemon_process.as_ref(),
             ) {
                 Ok(_detached) => {
                     transition.daemon_complete = true;
@@ -4116,17 +4127,23 @@ fn restart_for_handoff(
     now: &str,
     stopped: &Option<StoppedApp>,
     intent: Option<&super::restart::DaemonIntent>,
+    captured: Option<&super::restart::DaemonProcess>,
 ) -> Result<(), AppError> {
     use vox_core::node::paths::Account;
     let restart = |account: &Account| {
-        let _detached =
-            super::restart::restart_daemon_checked(account, &active.join(HELPER), now, intent)
-                .map_err(|e| {
-                    usage(format!(
-                        "{} is in place, but the daemon restart failed: {e}",
-                        active.display()
-                    ))
-                })?;
+        let _detached = super::restart::restart_daemon_checked(
+            account,
+            &active.join(HELPER),
+            now,
+            intent,
+            captured,
+        )
+        .map_err(|e| {
+            usage(format!(
+                "{} is in place, but the daemon restart failed: {e}",
+                active.display()
+            ))
+        })?;
 
         Ok::<(), AppError>(())
     };
@@ -4209,7 +4226,13 @@ fn transition_handoff(
 ) -> Result<(), AppError> {
     let mut failures = Vec::new();
     if !transition.daemon_complete {
-        match restart_for_handoff(active, version, stopped, Some(transition.handoff_daemon())) {
+        match restart_for_handoff(
+            active,
+            version,
+            stopped,
+            Some(transition.handoff_daemon()),
+            transition.daemon_process.as_ref(),
+        ) {
             Ok(()) => {
                 transition.daemon_complete = true;
                 if let Err(e) = write_transition(apps, transition) {
@@ -4315,6 +4338,7 @@ fn restore_source_and_handoff(
             &active.join(HELPER),
             &version,
             Some(transition.handoff_daemon()),
+            transition.daemon_process.as_ref(),
         )?;
         transition.daemon_complete = true;
         write_transition(apps, transition)?;

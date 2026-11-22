@@ -703,6 +703,12 @@ pub enum IpcHandshake {
         /// How long the ping was given.
         secs: u64,
     },
+    /// A daemon refused `Use` while stopping; its greeting identifies the process.
+    #[error("the daemon is stopping")]
+    DaemonStopping {
+        /// The process that refused the opening, not permission to signal it.
+        pid: u32,
+    },
     /// The daemon answered the connection's `Use` with a refusal (ADR-026 C-2): the node is not
     /// attached for a one-shot verb, there is no such node, a wrong passphrase. Its words say what
     /// to do.
