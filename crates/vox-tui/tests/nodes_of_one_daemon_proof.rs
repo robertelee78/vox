@@ -10434,3 +10434,391 @@ fn daemon_alive(pid: u32) -> bool {
         .unwrap_or_else(|e| panic!("APPARATUS: could not inspect daemon pid {pid}: {e}"));
     out.status.success() && !out.stdout.is_empty()
 }
+
+fn rg8_ready(account: &Account, node: &str, listen: &str) -> Daemon {
+    account.make_node(node);
+    let mut daemon = Daemon::start(account, &["--node", node, "--listen", listen], &[]);
+    daemon.expect_apparatus_event("its Ready node", |line| {
+        line.contains(&format!("node {node} is Ready"))
+    });
+    daemon
+}
+
+fn rg8_pair(a: &Account, b: &Account) {
+    let offer = computer(a, &["invite"]);
+    let preview = computer(
+        b,
+        &[
+            "pair",
+            offer["invite_link"]
+                .as_str()
+                .expect("APPARATUS: pairing link"),
+            "--preview",
+        ],
+    );
+    let operation = preview["pairing"]["operation_id"]
+        .as_str()
+        .expect("APPARATUS: authenticated operation");
+    computer(b, &["approve", operation]);
+    computer(a, &["approve", operation]);
+    assert!(
+        wait_until(RETURN_WITHIN, || {
+            computer(a, &["status"])["state"] == "confirmed"
+                && computer(b, &["status"])["state"] == "confirmed"
+        }),
+        "APPARATUS: initial direct pairing did not confirm: {}; {}",
+        computer(a, &["status"]),
+        computer(b, &["status"])
+    );
+}
+
+#[test]
+#[ignore = "real paired computers and a relay-only restart; run in release with test-knobs"]
+fn computer_management_uses_anchors_added_after_start() {
+    watchdog::arm();
+    let anchor_account = Account::new();
+    let anchor = relay::Anchor::start(&anchor_account.data);
+    let a = Account::new();
+    let b = Account::new();
+    let port = port_forward::free_v4_udp_port();
+    let direct = format!("127.0.0.1:{port}");
+    let relayed = format!("[::1]:{port}");
+    let _left = rg8_ready(&a, "alpha", "127.0.0.1:0");
+    let right = rg8_ready(&b, "beta", &direct);
+    for (account, spec, node) in [
+        (&a, anchor.v4_spec.as_str(), "alpha"),
+        (&b, anchor.v4_spec.as_str(), "beta"),
+    ] {
+        let (ok, out, err) = account.run(&["anchor", "add", spec], "");
+        assert!(ok, "APPARATUS: add anchor after daemon start: {out}{err}");
+        computer(account, &["personal", node]);
+    }
+    rg8_pair(&a, &b);
+    right.stop();
+    let mut right = Daemon::start(
+        &b,
+        &[
+            "--node",
+            "beta",
+            "--listen",
+            &relayed,
+            "--anchor",
+            &anchor.v6_spec,
+        ],
+        &[],
+    );
+    right.expect_apparatus_event("beta Ready on its IPv6-only socket", |line| {
+        line.contains("node beta is Ready")
+    });
+    let late = a.make_node("alpha-later");
+    let (ok, out, err) = a.run(
+        &["node", "unlock", "alpha-later", "--passphrase-file", "-"],
+        PASS,
+    );
+    assert!(ok, "APPARATUS: attach the newly created node: {out}{err}");
+    let mut last = String::new();
+    assert!(
+        wait_until(RETURN_WITHIN, || {
+            last = b.run(&["trust", "list", "--node", "beta"], "").1;
+            last.contains(&late)
+                && computer(&a, &["status"])["state"] == "confirmed"
+                && computer(&b, &["status"])["state"] == "confirmed"
+        }),
+        "PRODUCT [RG8 current anchors]: beta, reachable only through the anchor added after alpha's daemon started, did not learn alpha-later within {RETURN_WITHIN:?}: ring {last}; A {}; B {}; logs {}; {}",
+        computer(&a, &["status"]), computer(&b, &["status"]), a.log(), b.log()
+    );
+    println!("[proof] runtime-added machine anchor carried alpha-later to the relay-only computer; both confirmed");
+
+    // A direct route must work with no configured anchor on either computer.
+    let anchor_id = anchor
+        .v4_spec
+        .split('@')
+        .next()
+        .expect("APPARATUS: anchor id");
+    for account in [&a, &b] {
+        let (ok, out, err) = account.run(&["anchor", "remove", anchor_id], "");
+        assert!(ok, "APPARATUS: remove the machine anchor: {out}{err}");
+    }
+    right.stop();
+    let mut right = Daemon::start(&b, &["--node", "beta", "--listen", &direct], &[]);
+    right.expect_apparatus_event("beta Ready directly with no anchor", |line| {
+        line.contains("node beta is Ready")
+    });
+    let direct_late = a.make_node("alpha-direct");
+    let (ok, out, err) = a.run(
+        &["node", "unlock", "alpha-direct", "--passphrase-file", "-"],
+        PASS,
+    );
+    assert!(ok, "APPARATUS: attach direct control node: {out}{err}");
+    assert!(
+        wait_until(RETURN_WITHIN, || {
+            b.run(&["trust", "list", "--node", "beta"], "")
+                .1
+                .contains(&direct_late)
+                && computer(&a, &["status"])["state"] == "confirmed"
+                && computer(&b, &["status"])["state"] == "confirmed"
+        }),
+        "PRODUCT: direct computer management depended on a removed anchor"
+    );
+    println!("[proof] direct control learned alpha-direct with no configured anchor");
+}
+
+#[test]
+#[ignore = "real computer pairing with an address-free link; run in release"]
+fn a_pairing_link_without_a_route_is_refused_at_once() {
+    watchdog::arm();
+    let a = Account::new();
+    let b = Account::new();
+    let offered = computer(&a, &["invite"]);
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(
+            offered["invite_link"]
+                .as_str()
+                .unwrap()
+                .strip_prefix("vox-computer://")
+                .unwrap(),
+        )
+        .expect("APPARATUS: decode real invitation");
+    let mut d = vox_core::cbor::Decoder::new(&bytes);
+    assert_eq!(d.array().unwrap(), 8, "APPARATUS: invitation shape");
+    let version = d.uint().unwrap();
+    let target = d.bytes().unwrap().to_vec();
+    let invite = d.bytes().unwrap().to_vec();
+    let secret = d.bytes().unwrap().to_vec();
+    let expires = d.uint().unwrap();
+    for _ in 0..d.array().unwrap() {
+        d.text().unwrap();
+    }
+    d.bytes().unwrap();
+    let transport = d.bytes().unwrap().to_vec();
+    d.finish().unwrap();
+    let mut e = vox_core::cbor::Encoder::new();
+    e.array(8)
+        .uint(version)
+        .bytes(&target)
+        .bytes(&invite)
+        .bytes(&secret)
+        .uint(expires)
+        .array(0)
+        .bytes(&vox_core::nat::bootstrap::BootstrapSet::new().to_bytes())
+        .bytes(&transport);
+    let link = format!(
+        "vox-computer://{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(e.finish())
+    );
+    let started = Instant::now();
+    let mut command = b
+        .cmd(&["computer", "pair", &link, "--preview", "--json"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("APPARATUS: start address-free pairing");
+    while command
+        .try_wait()
+        .expect("APPARATUS: inspect address-free pairing")
+        .is_none()
+    {
+        if started.elapsed() >= Duration::from_secs(2) {
+            command.kill().expect("APPARATUS: stop owned slow pairing");
+            let out = command
+                .wait_with_output()
+                .expect("APPARATUS: collect slow pairing");
+            panic!(
+                "PRODUCT: pairing with no address or anchor did not refuse at once (2 s): {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let out = command
+        .wait_with_output()
+        .expect("APPARATUS: collect address-free pairing");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && err.contains("pairing link has no address") && err.contains("vox computer invite"),
+        "PRODUCT: address-free pairing did not say why it cannot reach the computer and how to get a usable invitation: {err}"
+    );
+    assert!(
+        computer(&b, &["status"])["pairing"].is_null(),
+        "PRODUCT: unreachable link created a pairing"
+    );
+}
+
+#[test]
+#[ignore = "real uncompleted signed computer proposals; run in release"]
+fn either_computer_closes_a_half_signed_pairing_at_once() {
+    watchdog::arm();
+    for inviter_closes in [false, true] {
+        let a = Account::new();
+        let b = Account::new();
+        let offer = computer(&a, &["invite"]);
+        let preview = computer(
+            &b,
+            &["pair", offer["invite_link"].as_str().unwrap(), "--preview"],
+        );
+        let operation = preview["pairing"]["operation_id"].as_str().unwrap();
+        let holder = if inviter_closes { &a } else { &b };
+        let approved = computer(holder, &["approve", operation]);
+        assert!(
+            approved["pairing"]["approved_here"] == true
+                && approved["pairing"]["approved_there"] == false,
+            "APPARATUS: did not stage exactly one signed approval: {approved}"
+        );
+        let started = Instant::now();
+        let (ok, out, err) = holder.run(&["computer", "cancel", operation, "--json"], "");
+        assert!(
+            ok && started.elapsed() < Duration::from_secs(2),
+            "PRODUCT: holder could not close its half-signed pairing at once, inviter={inviter_closes}: {out}{err}"
+        );
+        let closed = computer(holder, &["status"]);
+        assert!(
+            closed["pairing"].is_null(),
+            "PRODUCT: closed proposal still blocks this computer: {closed}"
+        );
+        let next = computer(holder, &["invite"]);
+        assert!(
+            next["invite_link"].is_string(),
+            "PRODUCT: closed proposal prevents a new invitation: {next}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "real computer status across pairing states; run in release"]
+fn computer_status_opens_with_where_it_stands_and_the_next_command() {
+    watchdog::arm();
+    let a = Account::new();
+    let b = Account::new();
+    let check = |account: &Account, state: &str, next: &str| {
+        let (ok, out, err) = account.run(&["computer", "status"], "");
+        let mut lines = out.lines();
+        assert!(
+            ok && lines.next().is_some_and(|line| line.starts_with(state))
+                && lines.next().is_some_and(|line| line.starts_with(next)),
+            "PRODUCT: computer status did not open with its position and next command: {out}{err}"
+        );
+    };
+    check(
+        &a,
+        "This computer is not in a group.",
+        "Next: vox computer invite",
+    );
+    let offer = computer(&a, &["invite"]);
+    check(
+        &a,
+        "This computer is waiting for pairing.",
+        "Next: vox computer cancel ",
+    );
+    let preview = computer(
+        &b,
+        &["pair", offer["invite_link"].as_str().unwrap(), "--preview"],
+    );
+    let operation = preview["pairing"]["operation_id"].as_str().unwrap();
+    check(
+        &b,
+        "This computer needs your pairing approval.",
+        "Next: vox computer approve ",
+    );
+    computer(&b, &["approve", operation]);
+    check(
+        &b,
+        "This computer approved pairing; the other approval has not arrived.",
+        "Next: vox computer cancel ",
+    );
+    computer(&a, &["approve", operation]);
+    assert!(
+        wait_until(RETURN_WITHIN, || computer(&a, &["status"])["state"]
+            == "confirmed"
+            && computer(&b, &["status"])["state"] == "confirmed"),
+        "APPARATUS: status group did not confirm"
+    );
+    check(
+        &a,
+        "This computer is in a group with ",
+        "Next: vox computer invite",
+    );
+}
+
+#[test]
+#[ignore = "real paired nodes and room pause refusals; run in release"]
+fn a_refused_room_pause_names_the_node_and_command_that_can_pause() {
+    watchdog::arm();
+    let a = Account::new();
+    let b = Account::new();
+    let _left = rg8_ready(&a, "alpha", "127.0.0.1:0");
+    let _right = rg8_ready(&b, "owner", "127.0.0.1:0");
+    let agent = a.make_node("agent");
+    let beta = b.make_node("beta");
+    for (account, node) in [(&a, "agent"), (&b, "beta")] {
+        let (ok, out, err) = account.run(&["node", "unlock", node, "--passphrase-file", "-"], PASS);
+        assert!(ok, "APPARATUS: attach pause node: {out}{err}");
+    }
+    computer(&a, &["personal", "alpha"]);
+    computer(&b, &["personal", "owner"]);
+    rg8_pair(&a, &b);
+    let alpha = computer(&a, &["status"])["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["name"] == "alpha")
+        .unwrap()["fingerprint"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let room = make_room(&a, "alpha");
+    let (ok, link, err) = a.run(&["room", "link", &room, "--node", "alpha"], "");
+    assert!(ok, "APPARATUS: pause room link: {link}{err}");
+    let link = link
+        .lines()
+        .find(|line| line.starts_with("vox://"))
+        .unwrap();
+    let full_room = &link["vox://".len()..][..52];
+    for (account, node) in [(&a, "agent"), (&b, "beta")] {
+        let (ok, out, err) = account.run(
+            &[
+                "room",
+                "join",
+                link,
+                "--node",
+                node,
+                "--passphrase-file",
+                "-",
+            ],
+            ROOM_PASS,
+        );
+        assert!(ok, "APPARATUS: pause member join: {out}{err}");
+    }
+    let command = format!("vox room pause {full_room} {beta} --node alpha");
+    let (ok, out, err) = a.run(&["room", "pause", full_room, &beta, "--node", "agent"], "");
+    let said = format!("{out}{err}");
+    assert!(
+        !ok && said.contains("alpha") && said.contains(&command),
+        "PRODUCT: refused pause from {agent} did not name permitted alpha ({alpha}) and its command {command:?}: {said}"
+    );
+    let (ok, out, err) = a.run(
+        &[
+            "room", "pause", full_room, &beta, "--node", "alpha", "--json",
+        ],
+        "",
+    );
+    assert!(
+        ok && out.contains("\"paused\":true"),
+        "PRODUCT: the refusal's command did not pause beta: {out}{err}"
+    );
+    computer(&b, &["personal", "beta"]);
+    assert!(
+        wait_until(RETURN_WITHIN, || computer(&a, &["status"])["state"]
+            == "confirmed"
+            && computer(&b, &["status"])["state"] == "confirmed"),
+        "APPARATUS: new personal role did not settle"
+    );
+    let (ok, out, err) = a.run(&["room", "pause", full_room, &beta, "--node", "agent"], "");
+    let said = format!("{out}{err}");
+    assert!(
+        !ok && said.contains("no node of this computer can pause")
+            && said.contains(&format!("vox room pause {full_room} {beta} --node beta")),
+        "PRODUCT: no-driver pause refusal did not name beta's own command on its computer: {said}"
+    );
+}

@@ -773,3 +773,20 @@ Seventy shipped nodes share one scratch daemon, join a room, trust each other an
 messages read. The app client must expose all69 readers on every message and every trust
 relationship. The terminal must open the room and show every reader and peer's trust (#792).
 This expensive proof is optional and blocks neither CI nor release.
+
+### RG-8 computer anchors and terminal guidance
+
+The existing `nodes_of_one_daemon_proof` hosts these on-demand real-binary acts:
+`computer_management_uses_anchors_added_after_start`,
+`a_pairing_link_without_a_route_is_refused_at_once`,
+`either_computer_closes_a_half_signed_pairing_at_once`,
+`computer_status_opens_with_where_it_stands_and_the_next_command`, and
+`a_refused_room_pause_names_the_node_and_command_that_can_pause`.
+Build once with `cargo test --release -p vox-tui --features test-knobs,optional-proofs --test nodes_of_one_daemon_proof --no-run`,
+then select one function with `-- --ignored --exact --nocapture`.
+Run the anchor restart and immediate-return acts quiet; status and pause guidance assert
+only shipped words and outcomes. Each uses isolated account data/config roots.
+Runtime-added anchors apply to computer management as well as nodes, without a restart.
+Closing a half-signed attempt is local: it retains the signed intent and does not claim
+to revoke trust the other computer may already have recorded.
+
