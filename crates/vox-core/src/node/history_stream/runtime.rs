@@ -284,8 +284,8 @@ pub(crate) struct Flow {
     pub(crate) published: bool,
     pub(crate) rendered: bool,
     pub(crate) governance: bool,
-    /// An exchange of this flow fetched something this node did not hold (an object it saved,
-    /// a body chunk, a hint it did not have): a completed flow that brought nothing is an
+    /// An exchange of this flow fetched an object it saved or a body chunk it did not hold.
+    /// An inventory hint alone is not receipt: a completed flow that brought nothing is an
     /// `empty` round in `vox status --json` (ADR-038 FX-29).
     pub(crate) brought: bool,
     /// Set at the durable/user-visible work edge and drained by the actor before it classifies
@@ -2602,6 +2602,43 @@ impl Flow {
                     self.push(root)?;
                     return Ok(());
                 }
+                // Proof-only pacing/hold after visible progress, outside room/store locks.
+                #[cfg(feature = "test-knobs")]
+                if let Some(path) = std::env::var_os("VOX_TEST_HOLD_LIVE_WINDOW_FILE") {
+                    let path = std::path::PathBuf::from(path);
+                    let remaining = window.next.saturating_add(1).saturating_sub(window.from);
+                    if let Ok(spec) = std::fs::read_to_string(&path) {
+                        if let Some(mode) = spec
+                            .trim()
+                            .strip_prefix(&format!("{} ", crate::node::link::b32_encode(&author)))
+                        {
+                            let pause = mode
+                                .strip_prefix("pause-ms=")
+                                .and_then(|ms| ms.parse::<u64>().ok());
+                            if pause.is_some()
+                                || mode == "hold"
+                                || mode.parse::<u64>().ok() == Some(remaining)
+                            {
+                                std::fs::write(
+                                    path.with_extension("entered"),
+                                    format!("through={} remaining={remaining}\n", window.through),
+                                )
+                                .map_err(|_| Error::Profile("proof live-window marker failed"))?;
+                                if let Some(ms) = pause {
+                                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                                } else if path.exists() {
+                                    // Hold the author's own pull. Other providers can finish
+                                    // their other-author tasks, but cannot advance this window.
+                                    if self.peer == author {
+                                        self.push(task)?;
+                                        self.waiting = true;
+                                    }
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    }
+                }
                 let instance = self.instance;
                 let generation = self.generation;
                 let node = self.node;
@@ -3055,7 +3092,10 @@ impl Flow {
                         self.offered = self.offered.saturating_add(offered.added as u64);
                         self.rearmed = self.rearmed.saturating_add(offered.rearmed as u64);
                         let added = offered.added != 0;
-                        self.brought |= added;
+                        #[cfg(feature = "test-knobs")]
+                        if added {
+                            eprintln!("vox: RG7_HINT_OFFERED announcement count={}", offered.added);
+                        }
                         if added {
                             self.work_committed
                                 .store(true, std::sync::atomic::Ordering::Release);
@@ -3168,7 +3208,10 @@ impl Flow {
                         self.offered = self.offered.saturating_add(offered.added as u64);
                         self.rearmed = self.rearmed.saturating_add(offered.rearmed as u64);
                         let added = offered.added != 0;
-                        self.brought |= added;
+                        #[cfg(feature = "test-knobs")]
+                        if added {
+                            eprintln!("vox: RG7_HINT_OFFERED ordinary count={}", offered.added);
+                        }
                         if added {
                             self.work_committed
                                 .store(true, std::sync::atomic::Ordering::Release);

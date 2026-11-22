@@ -1,8 +1,8 @@
 //! The daemon's own bounded, counted log (ADR-034 LG-1–LG-2).
 //!
 //! Capture both output streams so diagnostics from core and subprocesses also have a UTC
-//! timestamp. A repeated line updates its fixed-width count in place; it consumes no more
-//! disk. Rotation bounds the current file and its one predecessor to one MiB each.
+//! timestamp. A repeated line updates its last occurrence time and fixed-width count in place.
+//! Rotation bounds the current file and its one predecessor to twelve MiB each.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -14,14 +14,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const LIMIT: u64 = 1024 * 1024;
+const LIMIT: u64 = 12 * 1024 * 1024;
 const LINE_LIMIT: usize = 16 * 1024;
 
 struct Log {
     path: PathBuf,
     file: File,
     len: u64,
-    counts: HashMap<String, (u64, u64)>,
+    counts: HashMap<String, (u64, u64, u64)>,
 }
 
 impl Log {
@@ -34,36 +34,12 @@ impl Log {
             .mode(0o600)
             .open(path)?;
         let len = file.metadata()?.len();
-        let mut log = Self {
+        Ok(Self {
             path: path.into(),
             file,
             len,
             counts: HashMap::new(),
-        };
-        // Old versions wrote an unbounded file. Do not keep that oversized predecessor.
-        if len > LIMIT {
-            log.file.set_len(0)?;
-            log.len = 0;
-        }
-        let previous = path.with_extension("log.1");
-        if std::fs::metadata(&previous).is_ok_and(|m| m.len() > LIMIT) {
-            std::fs::remove_file(previous)?;
-        }
-        if log.len != 0 {
-            let mut held = Vec::new();
-            log.file.seek(SeekFrom::Start(0))?;
-            log.file.read_to_end(&mut held)?;
-            if held.split(|b| *b == b'\n').any(|line| {
-                !(line.is_empty() || line.len() > 24 && line[10] == b'T' && line[23] == b'Z')
-            }) {
-                log.file.set_len(0)?;
-                log.len = 0;
-                for line in held.split(|b| *b == b'\n') {
-                    log.line(line)?;
-                }
-            }
-        }
-        Ok(log)
+        })
     }
 
     fn line(&mut self, bytes: &[u8]) -> io::Result<()> {
@@ -78,8 +54,10 @@ impl Log {
         if line.is_empty() {
             return Ok(());
         }
-        if let Some((at, count)) = self.counts.get_mut(line) {
+        if let Some((start, at, count)) = self.counts.get_mut(line) {
             *count = count.saturating_add(1);
+            self.file.seek(SeekFrom::Start(*start))?;
+            write!(self.file, "{}", utc_now())?;
             self.file.seek(SeekFrom::Start(*at))?;
             write!(self.file, "{count:020}")?;
             return Ok(());
@@ -101,8 +79,10 @@ impl Log {
         }
         self.file.seek(SeekFrom::Start(self.len))?;
         self.file.write_all(record.as_bytes())?;
-        self.counts
-            .insert(line.to_owned(), (self.len + prefix.len() as u64, 1));
+        self.counts.insert(
+            line.to_owned(),
+            (self.len, self.len + prefix.len() as u64, 1),
+        );
         self.len += record.len() as u64;
         Ok(())
     }

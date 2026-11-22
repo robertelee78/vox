@@ -319,7 +319,7 @@ fn every_member_is_back_after_an_anchor_restart() {
                     *t >= restarted
                         && *t < back
                         && l.contains("dialling this anchor failed")
-                        && l.contains("answers as")
+                        && l.contains("daemon answered")
                 })
                 .map(|(_, l)| format!("{}: {l}", d.name))
                 .collect::<Vec<_>>()
@@ -337,7 +337,7 @@ fn every_member_is_back_after_an_anchor_restart() {
     // What the members saw: a member the anchor turned away says its dial failed. One exception,
     // the staging's own: a dial whose exchange began before SIGSTOP and was not answered by then
     // times out across the hold, within EXCHANGE_TIMEOUT of SIGCONT, and must say it timed out —
-    // never "answers as" or "did not prove", which read as a refusal or an impostor (ADR-011 38a).
+    // never "daemon answered" or "did not prove", which say a refusal or an impostor (ADR-011 38a).
     let exchange = vox_core::transport::identity::EXCHANGE_TIMEOUT;
     let mut across_hold = Vec::new();
     let turned_away: Vec<String> = daemons
@@ -351,7 +351,7 @@ fn every_member_is_back_after_an_anchor_restart() {
                 .filter(|(t, l)| {
                     let held = *t < back + exchange
                         && l.contains(&format!("did not answer within {} s", exchange.as_secs()))
-                        && !l.contains("answers as")
+                        && !l.contains("daemon answered")
                         && !l.contains("did not prove");
                     if held {
                         across_hold.push(format!("{}: {l}", d.name));

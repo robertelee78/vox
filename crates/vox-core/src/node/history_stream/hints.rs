@@ -41,6 +41,9 @@ struct Transient {
 struct LaneGeneration {
     epoch: u64,
     availability: Option<(u64, crate::node::channel::availability::Token)>,
+    /// Highest own-feed position advertised by this peer in this port incarnation.
+    /// A locator, not proof that any body arrived.
+    advertised_through: Option<u64>,
 }
 
 #[derive(Default)]
@@ -273,6 +276,15 @@ impl HintInbox {
             return Err(Error::Unreachable("history inventory retired"));
         }
         let mut outcome = Offer::default();
+        if let Some(through) = hints
+            .iter()
+            .filter(|hint| hint.author == peer)
+            .map(|hint| hint.size)
+            .max()
+        {
+            let lane = state.generations.entry((room, peer)).or_default();
+            lane.advertised_through = Some(lane.advertised_through.unwrap_or(0).max(through));
+        }
         for hint in hints {
             if state.pending.iter().any(|p| {
                 p.room == room
@@ -336,6 +348,14 @@ impl HintInbox {
             outcome.added += 1;
         }
         Ok(outcome)
+    }
+    pub(crate) fn advertised_through(&self, room: Digest32, peer: Digest32) -> Option<u64> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .generations
+            .get(&(room, peer))
+            .and_then(|lane| lane.advertised_through)
     }
     pub(crate) fn pending(&self, room: Digest32, peer: Digest32) -> bool {
         let state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
@@ -541,6 +561,7 @@ impl HintInbox {
         let generation = state.generations.entry((room, peer)).or_default();
         generation.epoch = generation.epoch.saturating_add(1);
         generation.availability = None;
+        generation.advertised_through = None;
         state.pending.retain(|p| p.room != room || p.peer != peer);
         state
             .transient
@@ -557,6 +578,7 @@ impl HintInbox {
             if *candidate == room {
                 generation.epoch = generation.epoch.saturating_add(1);
                 generation.availability = None;
+                generation.advertised_through = None;
             }
         }
         state.pending.retain(|p| p.room != room);
@@ -573,6 +595,7 @@ impl HintInbox {
         for generation in state.generations.values_mut() {
             generation.epoch = generation.epoch.saturating_add(1);
             generation.availability = None;
+            generation.advertised_through = None;
         }
         state.pending = Vec::new();
         state.transient.clear();
