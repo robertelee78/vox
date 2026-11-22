@@ -1470,6 +1470,37 @@ impl Store {
         Ok(())
     }
 
+    /// Startup only, before sharing the store: allocated pages include the metadata trees,
+    /// unlike the sum of row bodies. An overflowing comparison cannot exceed a u64 file.
+    pub(crate) fn compact_if_needed(&mut self, notice: impl FnOnce(u64, u64)) -> Result<bool> {
+        let stats = {
+            let backing = self.db.get_mut().unwrap_or_else(PoisonError::into_inner);
+            let Backing::Writable(db) = backing else {
+                return Ok(false);
+            };
+            let txn = db.inner.begin_write().map_err(storage("measure store"))?;
+            let stats = txn.stats().map_err(storage("measure store"))?;
+            txn.abort().map_err(storage("finish store measurement"))?;
+            stats
+        };
+        let file_bytes = std::fs::metadata(&self.path)
+            .map_err(storage("measure store file"))?
+            .len();
+        let used_bytes = stats
+            .allocated_pages()
+            .checked_mul(stats.page_size() as u64);
+        let Some((used_bytes, twice_used)) =
+            used_bytes.and_then(|used| used.checked_mul(2).map(|twice| (used, twice)))
+        else {
+            return Ok(false);
+        };
+        if file_bytes <= twice_used {
+            return Ok(false);
+        }
+        notice(file_bytes, used_bytes);
+        self.compact()
+    }
+
     /// Reclaim space after deletions. Returns whether anything was compacted.
     pub fn compact(&mut self) -> Result<bool> {
         match self.db.get_mut().unwrap_or_else(PoisonError::into_inner) {

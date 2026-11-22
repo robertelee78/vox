@@ -278,6 +278,18 @@ history remains available while the room recovers.
 **Confirm:** the room can save a new post again, and `vox room read` shows that post together
 with its previously saved messages.
 
+## Startup says it is reclaiming unused store space
+
+After verifying an identity, the daemon compacts its store in place when the file is more
+than twice its reachable allocated page bytes, including metadata. The foreground daemon
+and its log say `reclaiming unused store space in place` before starting. A large store can
+take a while: that node becomes Ready only after compaction finishes, then its rooms reopen.
+There is no second store file or replacement rename. A locked identity is not compacted.
+
+If compaction fails, startup reports the storage error and asks you to free disk space and
+unlock again. Do not delete the store: its previously acknowledged rows remain the source
+for the next startup.
+
 ## A restored node writes nothing until its own history is recovered
 
 **Symptom:** `this node's record of its own history in this room is behind what a member holds`.

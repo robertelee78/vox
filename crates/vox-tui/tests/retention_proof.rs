@@ -936,3 +936,275 @@ fn a_member_who_joins_after_messages_expired_catches_up() {
          member can supply"
     );
 }
+
+/// A restart reclaims deleted bodies without losing the messages or private steps we kept.
+/// The crash arm kills the real daemon after backend relocation but before that commit.
+#[cfg(feature = "test-knobs")]
+#[test]
+#[ignore = "real daemon, grown/expired store and crash during in-place compaction"]
+fn a_restart_compacts_expired_space_and_keeps_acknowledged_rows_after_a_crash() {
+    use vox_core::node::ipc::{Frame, IpcClient, NodeSocket, Request};
+    use vox_core::node::paths::{NodeName, Paths};
+    const DAY: i64 = 86_400_000;
+    let tmp = tempfile::tempdir().expect("APPARATUS: scratch account");
+    let root = tmp.path();
+    std::fs::create_dir(root.join("cfg")).unwrap();
+    let keychain = attach::keychain(root);
+    let launch = |tag: &str, step: i64, marker: Option<&Path>| {
+        let mut cmd = Command::new(VOX);
+        cmd.args(["daemon", "--listen", "127.0.0.1:0"])
+            .env("VOX_DATA_DIR", root)
+            .env("VOX_CONFIG_DIR", root.join("cfg"))
+            .env("VOX_TEST_KEYCHAIN", &keychain)
+            .env("VOX_TEST_CLOCK_STEP_MS", step.to_string())
+            .env("VOX_PROXY", "127.0.0.1:0")
+            .env_remove("VOX_ROOM")
+            .env_remove("VOX_NODE")
+            .env_remove("VOX_IDENTITY_PASSPHRASE")
+            .env_remove("VOX_TEST_COMPACT_RELOCATED")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(root.join(format!("daemon-{tag}.err"))).unwrap());
+        if let Some(marker) = marker {
+            cmd.env("VOX_TEST_COMPACT_RELOCATED", marker);
+        }
+        let mut child = cmd.spawn().expect("APPARATUS: spawn scratch daemon");
+        writeln!(child.stdin.take().unwrap(), "{IDENTITY}").unwrap();
+        Daemon(child)
+    };
+    let stop = |mut daemon: Daemon| {
+        Command::new("kill")
+            .args(["-TERM", &daemon.0.id().to_string()])
+            .status()
+            .expect("APPARATUS: signal own daemon");
+        daemon.0.wait().expect("APPARATUS: reap own daemon");
+    };
+    let paths = Paths::resolve("default", Some(root), Some(&root.join("cfg"))).unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let request = |request: Request| {
+        let started = Instant::now();
+        loop {
+            let mut client = rt
+                .block_on(IpcClient::open_at(&NodeSocket::one_shot(
+                    paths.account().socket(),
+                    NodeName::parse("default").unwrap(),
+                )))
+                .expect("APPARATUS: connect to scratch daemon");
+            let frame = rt
+                .block_on(client.request(&request))
+                .expect("APPARATUS: request");
+            if !matches!(&frame, Frame::Error { reason } if reason.contains("permissions are still being read")
+                || reason.contains("room governance is refreshing"))
+            {
+                break frame;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(180),
+                "PRODUCT (staging): room did not become writable: {frame:?}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    let (ok, out, err) = vox(root, &["id"], None);
+    assert!(ok, "PRODUCT (staging): identity: {out}{err}");
+    let initial = launch("grown", 0, None);
+    attached(root, "grown");
+    let (ok, out, err) = vox(
+        root,
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "compact",
+        ],
+        Some(&format!("{ROOMPASS}\n")),
+    );
+    assert!(ok, "PRODUCT (staging): create room: {out}{err}");
+    let Frame::Rooms { rooms } = request(Request::Rooms { after: None }) else {
+        panic!("APPARATUS: room listing frame");
+    };
+    let cid = rooms
+        .iter()
+        .find(|(_, name, ..)| name == "compact")
+        .unwrap()
+        .0;
+    let room = vox_core::node::link::b32_encode(&cid);
+    let read_room = || {
+        let started = Instant::now();
+        loop {
+            let (ok, shown, err) = vox(root, &["room", "read", &room, "--json"], None);
+            if ok {
+                break shown;
+            }
+            assert!(
+                (err.contains("preparing its saved history")
+                    || err.contains("refreshing saved history"))
+                    && started.elapsed() < Duration::from_secs(180),
+                "PRODUCT (staging): saved room did not become readable: {shown}{err}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    let (ok, out, err) = vox(root, &["room", "retention", &room, "1d"], None);
+    assert!(ok, "PRODUCT (staging): retention: {out}{err}");
+    for id in 0..128 {
+        let frame = request(Request::Post {
+            channel_id: cid,
+            text: format!("expire-{id:04}-{}", "x".repeat(60_000)),
+            card: false,
+        });
+        assert!(
+            matches!(frame, Frame::Ok),
+            "PRODUCT (staging): grow post {id}: {frame:?}"
+        );
+    }
+    stop(initial);
+    let expired = launch("expiry", 2 * DAY, None);
+    attached(root, "expiry");
+    let started = Instant::now();
+    loop {
+        let shown = read_room();
+        if !shown.contains("expire-") {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(180),
+            "PRODUCT (staging): old bodies did not expire: {shown}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    for id in 0..8 {
+        let frame = request(Request::Post {
+            channel_id: cid,
+            text: format!("retained-message-{id}"),
+            card: false,
+        });
+        assert!(
+            matches!(frame, Frame::Ok),
+            "PRODUCT (staging): retained post {id}: {frame:?}"
+        );
+    }
+    let opening = serde_json::json!({"v":1,"type":"session","from":"compact-session",
+        "body":"","at":{"session_name":"Compaction retained Session"},
+        "data":{"session":{"harness":"compaction proof"}}})
+    .to_string();
+    let frame = request(Request::Post {
+        channel_id: cid,
+        text: opening,
+        card: false,
+    });
+    assert!(
+        matches!(frame, Frame::Ok),
+        "PRODUCT (staging): open retained Session: {frame:?}"
+    );
+    let frame = request(Request::AppendSession {
+        channel_id: cid,
+        session_id: "compact-session".into(),
+        body: serde_json::json!({"v":1,"session":"compact-session","kind":"reply","seq":1,
+            "text":"retained-private-step"})
+        .to_string(),
+    });
+    assert!(
+        matches!(frame, Frame::Appended { .. }),
+        "PRODUCT (staging): retained private step: {frame:?}"
+    );
+    let retained = || {
+        let shown = read_room();
+        for id in 0..8 {
+            assert!(
+                shown.contains(&format!("retained-message-{id}")),
+                "PRODUCT: acknowledged retained message {id} missing: {shown}"
+            );
+        }
+        assert!(
+            !shown.contains("expire-"),
+            "PRODUCT: expired body returned: {shown}"
+        );
+        let started = Instant::now();
+        loop {
+            let _ = vox(root, &["room", "sessions", &room, "--json"], None);
+            let (ok, shown, err) = vox(
+                root,
+                &["room", "session", &room, "compact-session", "--json"],
+                None,
+            );
+            if ok && shown.contains("retained-private-step") {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(180),
+                "PRODUCT: acknowledged private Session step missing: {shown}{err}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    retained();
+    stop(expired);
+    let file = paths.store_file();
+    let before = std::fs::metadata(&file).unwrap().len();
+    let db = redb::Database::open(&file).expect("APPARATUS: inspect stopped store");
+    let txn = db.begin_write().unwrap();
+    let stats = txn.stats().unwrap();
+    let used = stats
+        .allocated_pages()
+        .checked_mul(stats.page_size() as u64)
+        .unwrap();
+    txn.abort().unwrap();
+    drop(db);
+    assert!(
+        before > used.checked_mul(2).unwrap(),
+        "APPARATUS: expiry did not reach compaction threshold: file {before}, reachable {used}"
+    );
+    let saved = root.join("acknowledged.redb");
+    std::fs::copy(&file, &saved).unwrap();
+    let restarted = launch("compacted", 2 * DAY, None);
+    attached(root, "compacted");
+    retained();
+    let after = std::fs::metadata(&file).unwrap().len();
+    assert!(after < before,
+        "PRODUCT: daemon restart left expired space allocated: before {before}, after {after}, reachable {used}");
+    let note = std::fs::read_to_string(root.join("daemon-compacted.err")).unwrap();
+    assert!(
+        note.contains("reclaiming unused store space in place")
+            && note.contains("Ready when compaction finishes"),
+        "PRODUCT: the startup wait did not explain compaction: {note}"
+    );
+    stop(restarted);
+    std::fs::remove_file(&file).unwrap();
+    std::fs::copy(saved, &file).unwrap();
+    let marker = root.join("relocated");
+    let mut crashing = launch("relocating", 2 * DAY, Some(&marker));
+    let started = Instant::now();
+    while !marker.exists() {
+        assert!(
+            crashing.0.try_wait().unwrap().is_none(),
+            "PRODUCT: daemon exited before compaction relocation: {}",
+            std::fs::read_to_string(root.join("daemon-relocating.err")).unwrap()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(180),
+            "PRODUCT: bloated store was not compacted on restart: {}",
+            std::fs::read_to_string(root.join("daemon-relocating.err")).unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    crashing
+        .0
+        .kill()
+        .expect("APPARATUS: kill own relocating daemon");
+    crashing.0.wait().unwrap();
+    drop(crashing);
+    let recovered = launch("recovered", 2 * DAY, None);
+    attached(root, "recovered");
+    retained();
+    assert!(
+        std::fs::metadata(&file).unwrap().len() < before,
+        "PRODUCT: restart after killed relocation did not reclaim the store"
+    );
+    stop(recovered);
+}

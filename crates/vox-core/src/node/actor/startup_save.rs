@@ -234,6 +234,24 @@ fn run(
                 Err(fault_noting(events, "unlock the identity", &error)),
             );
         }
+        if let Err(error) = profile.compact_store(|file, used| {
+            let note = format!(
+                "reclaiming unused store space in place ({file} bytes, {used} used); \
+                 this node becomes Ready when compaction finishes; a large store can take a while"
+            );
+            eprintln!("vox daemon: {note}");
+            let _ = events.send(NodeEvent::NodeNote { note });
+        }) {
+            profile.lock();
+            return (
+                Some(profile),
+                Err(fault_noting(
+                    events,
+                    "compact the store; free disk space and unlock again",
+                    &error,
+                )),
+            );
+        }
     }
     let loaded = prepare(&profile, decisions, now)
         .map_err(|error| fault_noting(events, "load the identity's saved state", &error));

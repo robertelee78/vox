@@ -421,14 +421,14 @@ impl Profile {
         std::sync::Arc::clone(&self.store)
     }
 
-    /// Compact the store, which needs exclusive access. Returns `Ok(false)` without
-    /// compacting if another handle is outstanding — a sync session holds one while
-    /// it runs (M14.7e) — so compaction is attempted, never forced.
-    pub fn compact_store(&mut self) -> Result<bool> {
-        match std::sync::Arc::get_mut(&mut self.store) {
-            Some(store) => store.compact(),
-            None => Ok(false),
-        }
+    /// Reclaim in place at writable startup only when file bytes exceed twice the reachable
+    /// allocated page bytes, including metadata. `notice` explains the wait before work begins.
+    /// No shared room worker may hold the store yet.
+    pub(crate) fn compact_store(&mut self, notice: impl FnOnce(u64, u64)) -> Result<bool> {
+        let store = Arc::get_mut(&mut self.store).ok_or(Error::Profile(
+            "startup compaction needs the store before it is shared",
+        ))?;
+        store.compact_if_needed(notice)
     }
 
     /// The profile's paths.
