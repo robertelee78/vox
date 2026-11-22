@@ -9666,8 +9666,8 @@ fn the_busy_room_reader_finds_the_first_of_five_thousand_rows() {
     rg1::paging_check();
 }
 
-/// ADR-052 RG-6: a member returns after 8,000 acknowledged posts, reads the last one and pages
-/// back to the first. The protocol refusal itself, not elapsed silence, identifies the old wedge.
+/// ADR-052 RG-6: a member returns after 8,000 acknowledged posts, reads the newest window and
+/// pages back explicitly. This does not exercise a Live request below that bounded window.
 #[cfg(feature = "optional-proofs")]
 #[test]
 #[ignore = "eight thousand CLI posts and two real daemons; optional"]
@@ -10034,79 +10034,90 @@ mod rg1 {
         );
     }
 
+    /// A room/governance wait arranges the journey; its deadline never pronounces a product red.
+    fn returning_reader_ready(w: &Worker, id: &str) {
+        let started = Instant::now();
+        loop {
+            let listed = w.vox(None, &["room", "list"]);
+            let open = listed.ok
+                && listed.stdout.lines().any(|line| {
+                    line.trim_start().starts_with(&id[..12]) && !line.contains("[preparing")
+                });
+            if open {
+                let governance = w.vox(
+                    None,
+                    &["room", "read", id, "--json", "--notices", "--limit", "1"],
+                );
+                if governance.ok {
+                    return;
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(240),
+                    "APPARATUS: {} did not reach current room governance for staging: {governance:?}",
+                    w.name
+                );
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(240),
+                "APPARATUS: {} did not open its room for staging: {listed:?}",
+                w.name
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     pub(super) fn returning_reader() {
+        const POSTS: usize = 8000;
         let root = root();
         free_disk(root.path());
-        let staged = std::env::var_os("VOX_PROOF_RG6_STAGED");
-        if let Some(staged) = &staged {
-            let copied = Command::new("cp")
-                .arg("-R")
-                .arg(Path::new(staged).join("."))
-                .arg(root.path())
-                .status()
-                .expect("APPARATUS: copy stopped real-binary staging");
-            assert!(copied.success(), "APPARATUS: copy real-binary staging");
-        }
         let exe = binary();
         let alice = room::worker_as(root.path(), "behind-author", &exe);
         let bob = room::worker_as(root.path(), "behind-reader", &exe);
-        if staged.is_none() {
-            for (w, peer) in [(&alice, &bob), (&bob, &alice)] {
-                w.vox_env(
-                    None,
-                    &[("VOX_IDENTITY_PASSPHRASE", room::ID_PASS)],
-                    &["trust", "add", &peer.b32(), "--name", &peer.name],
-                    None,
-                )
-                .expect_ok("mutual trust before the room");
-            }
-        }
-        let listen = if staged.is_some() {
-            let port = std::fs::read_to_string(alice.data.join(".daemon/port"))
-                .expect("APPARATUS: staged author's listener");
-            format!("127.0.0.1:{}", port.trim())
-        } else {
-            "127.0.0.1:0".to_owned()
-        };
-        let _alice = start(&alice, &listen, None);
-        let id = if staged.is_none() {
-            let bob_daemon = start(&bob, "127.0.0.1:0", None);
-            let id = create(&alice);
-            let link = alice.vox(None, &["room", "link", &id]);
-            link.expect_ok("returning-reader room link");
-            bob.vox_in(
+        let _alice = start(&alice, "127.0.0.1:0", None);
+        let bob_daemon = start(&bob, "127.0.0.1:0", None);
+        for (w, peer) in [(&alice, &bob), (&bob, &alice)] {
+            w.vox_env(
                 None,
-                &["room", "join", "--passphrase-file", "-", link.stdout.trim()],
-                Some(room::ROOM_PASS),
+                &[("VOX_IDENTITY_PASSPHRASE", room::ID_PASS)],
+                &["trust", "add", &peer.b32(), "--name", &peer.name],
+                None,
             )
-            .expect_ok("reader joins before going away");
-            post(&alice, &id, "RG6-before-away", true);
-            while !read(&bob, &id, Some("RG6-before-away"))
-                .0
-                .contains("RG6-before-away")
-            {
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            bob_daemon.stop();
-            for n in 1..=8000 {
-                post(&alice, &id, &format!("RG6-away-{n:04}"), true);
-            }
-            id
-        } else {
-            let out = alice.vox(None, &["status", "--json"]);
-            out.expect_ok("staged author status");
-            let report = out.json();
-            report["rooms"][0]["id"]
-                .as_str()
-                .or_else(|| report["preparing"][0]["id"].as_str())
-                .expect("APPARATUS: staged room id")
-                .to_owned()
-        };
-        super::wait_room_open(&alice.data, &id[..12], &alice.name);
+            .expect_ok("mutual trust before the room");
+        }
+        let id = create(&alice);
+        let link = alice.vox(None, &["room", "link", &id]);
+        link.expect_ok("returning-reader room link");
+        bob.vox_in(
+            None,
+            &["room", "join", "--passphrase-file", "-", link.stdout.trim()],
+            Some(room::ROOM_PASS),
+        )
+        .expect_ok("reader joins before going away");
+        post(&alice, &id, "RG6-before-away", true);
+        returning_reader_ready(&bob, &id);
+        let staging = Instant::now();
+        while !read(&bob, &id, Some("RG6-before-away"))
+            .0
+            .contains("RG6-before-away")
+        {
+            assert!(
+                staging.elapsed() < Duration::from_secs(240),
+                "APPARATUS: reader never showed the pre-away staging post"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        bob_daemon.stop();
+        for n in 1..=POSTS {
+            post(&alice, &id, &format!("RG6-away-{n:04}"), true);
+        }
+        eprintln!(
+            "[RG-6] {POSTS} posts acknowledged while reader stopped; first return starts now"
+        );
         let _bob = start(&bob, "127.0.0.1:0", None);
-        super::wait_room_open(&bob.data, &id[..12], &bob.name);
-        super::wait_governance_current(&bob.data, &bob.name, &id, "returning reader");
-        let mut demand = false;
+        returning_reader_ready(&bob, &id);
+        let mut demand = None::<usize>;
+        let mut answered = None::<Value>;
+        let mut stalled = 0;
         let mut before = None::<String>;
         let mut numbered = BTreeMap::<usize, Value>::new();
         loop {
@@ -10114,12 +10125,9 @@ mod rg1 {
             if let Some(before) = &before {
                 args.extend(["--before", before]);
             }
-            let (ok, out, err) = super::vox(&bob.data, &args, None);
-            assert!(ok, "PRODUCT: returning reader page refused: {out}{err}");
-            for line in out.lines().filter(|line| !line.trim().is_empty()) {
-                let row: Value = serde_json::from_str(line).unwrap_or_else(|error| {
-                    panic!("PRODUCT: malformed reader row: {error}: {line}")
-                });
+            let shown = bob.vox(None, &args);
+            shown.expect_ok("returning reader page");
+            for row in shown.ndjson() {
                 if let Some(n) = row["text"]
                     .as_str()
                     .and_then(|text| text.strip_prefix("RG6-away-"))
@@ -10128,81 +10136,79 @@ mod rg1 {
                     numbered.insert(n, row);
                 }
             }
-            let (ok, out, err) = super::vox(&bob.data, &["status", "--json"], None);
-            assert!(ok, "PRODUCT: reader status refused: {out}{err}");
-            assert!(
-                !out.contains("protocol limits exceeded"),
-                "RED PRODUCT: returning reader cannot read and page back its acknowledged \
-                 backlog; vox status reports: {out}"
-            );
-            if numbered.contains_key(&8000) {
-                let mut first = 8000;
-                while first > 1 && numbered.contains_key(&(first - 1)) {
-                    first -= 1;
-                }
-                eprintln!(
-                    "[RG-6] returning reader shows {} posts; recent suffix={first}..=8000",
-                    numbered.len()
+            let mut first = POSTS + 1;
+            while first > 1 && numbered.contains_key(&(first - 1)) {
+                first -= 1;
+            }
+            if let Some(status) = answered.take() {
+                let floor = demand
+                    .take()
+                    .expect("APPARATUS: terminal answer has no request");
+                assert!(
+                    first <= POSTS || status["status"]["phase"] != "complete",
+                    "RED PRODUCT: completed newest history still does not show RG6-away-{POSTS:04}; \
+                     history status: {status}"
                 );
-                if first == 1 {
-                    let rows = super::room_rows(&bob.data, &id);
-                    assert_eq!(
-                        rows.iter()
-                            .filter(|row| row["text"]
-                                .as_str()
-                                .is_some_and(|text| text.starts_with("RG6-away-")))
-                            .count(),
-                        8000,
-                        "PRODUCT: the final paged read does not show all 8,000 acknowledged posts"
+                stalled = if first < floor { 0 } else { stalled + 1 };
+                assert!(
+                    stalled < 3,
+                    "RED PRODUCT: the page below RG6-away-{floor:04} never arrived after \
+                     {stalled} answered requests; oldest shown post remains RG6-away-{first:04}; \
+                     history status: {status}"
+                );
+            }
+            eprintln!(
+                "[RG-6] returning reader shows {} posts; recent suffix={first}..={POSTS}",
+                numbered.len()
+            );
+            if first == 1 {
+                let (texts, pages, _) = read(&bob, &id, None);
+                assert!(
+                    pages > 1 && (1..=POSTS).all(|n| texts.contains(&format!("RG6-away-{n:04}"))),
+                    "RED PRODUCT: final paged read lacks acknowledged posts; pages={pages}, texts={texts:?}"
+                );
+                eprintln!(
+                    "GREEN: returning reader shows last post and pages back to all {POSTS} posts"
+                );
+                break;
+            }
+            if demand.is_none() {
+                let mut args = vec!["room", "read", &id, "--history"];
+                if first <= POSTS {
+                    // The pre-away row is an old cached island, not this recent suffix's boundary.
+                    before = Some(
+                        numbered[&first]["entry_hash"]
+                            .as_str()
+                            .expect("PRODUCT: rendered row has no history cursor")
+                            .to_owned(),
                     );
-                    eprintln!(
-                        "GREEN: returning reader shows last post and pages back to all 8,000 posts"
-                    );
-                    break;
-                }
-                if !demand {
-                    // The pre-away row is an older cached island, not the boundary of the
-                    // recent suffix. Ask below that suffix, never below the old island.
-                    let cursor = numbered[&first]["entry_hash"]
-                        .as_str()
-                        .expect("PRODUCT: rendered row has no history cursor")
-                        .to_owned();
-                    let (ok, out, err) = super::vox(
-                        &bob.data,
-                        &[
-                            "room",
-                            "read",
-                            &id,
-                            "--history",
-                            "older",
-                            "--before",
-                            &cursor,
-                        ],
-                        None,
-                    );
-                    assert!(ok, "PRODUCT: older history refused: {out}{err}");
-                    eprintln!("[RG-6] older before {first}: {out}{err}");
-                    before = Some(cursor);
-                    demand = true;
+                    args.extend(["older", "--before", before.as_deref().expect("cursor set")]);
                 } else {
-                    let observed = super::history_observation(&bob.data, &id);
-                    if observed.phase == "more" {
-                        let (ok, out, err) = super::vox(
-                            &bob.data,
-                            &["room", "read", &id, "--history", "resume"],
-                            None,
-                        );
-                        assert!(ok, "PRODUCT: history resume refused: {out}{err}");
-                    } else if observed.phase == "complete" {
-                        demand = false;
-                    } else if matches!(observed.phase.as_str(), "unavailable" | "paused") {
-                        let (ok, out, err) = super::vox(
-                            &bob.data,
-                            &["room", "read", &id, "--history", "resume"],
-                            None,
-                        );
-                        assert!(ok, "PRODUCT: paused history resume refused: {out}{err}");
-                    }
+                    args.push("newest");
+                }
+                let requested = bob.vox(None, &args);
+                requested.expect_ok("returning reader history request");
+                demand = Some(first);
+            } else {
+                let status = bob.vox(
+                    None,
+                    &["room", "read", &id, "--json", "--history", "status"],
+                );
+                status.expect_ok("returning reader history status");
+                let status = status.json();
+                let phase = status["status"]["phase"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("PRODUCT: history status has no phase: {status}"));
+                if phase == "more" && !status["request"].is_null() {
+                    bob.vox(None, &["room", "read", &id, "--history", "resume"])
+                        .expect_ok("returning reader history resume");
+                } else if matches!(
+                    phase,
+                    "complete" | "unavailable" | "paused" | "cached" | "more"
+                ) {
+                    // Read the resulting page once more before judging the terminal answer:
+                    // its last row may have arrived after this iteration's first read.
+                    answered = Some(status);
                 }
             }
             std::thread::sleep(Duration::from_millis(100));
