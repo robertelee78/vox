@@ -192,16 +192,18 @@ run_check() { # <path> [expected version]
     126|127) run_verdict="could not start" ;;
     0)
       if [ -n "${2:-}" ]; then
-        printf 'vox %s\n' "$2" >"$tmp/expected"
+        expected="vox $2"
       else
         case "$run_output" in
           "vox "?*)
             case "${run_output#vox }" in *[![:graph:]]*) return 1 ;; esac
-            printf '%s\n' "$run_output" >"$tmp/expected" ;;
+            expected=$run_output ;;
           *) return 1 ;;
         esac
       fi
-      if cmp -s "$tmp/expected" "$tmp/run-out"; then run_verdict=ran; return 0; fi ;;
+      # Compared here in the shell: a minimal RHEL-family system has no `cmp`, and with it
+      # missing a vox that ran was reported as one that did not (seen on AlmaLinux 8).
+      if [ "$run_output" = "$expected" ]; then run_verdict=ran; return 0; fi ;;
   esac
   return 1
 }
@@ -238,7 +240,10 @@ explain_not_running() {
       reason="this system is older than that."
     fi
     printf 'vox install: this build needs glibc %s %s. Vox supports %s; %s\n' "$need" "$system" "$LINUX_SYSTEMS" "$reason" >&2
-  elif [ "$run_verdict" = "could not start" ] && [ ! -e /lib64/ld-linux-x86-64.so.2 ]; then
+  elif [ "$run_verdict" != "did not answer" ] && [ ! -e /lib64/ld-linux-x86-64.so.2 ]; then
+    # Whatever the failed start looked like (a shell's 127, or an emulator's own words and
+    # status when an x86_64 container runs on another processor): without its loader this
+    # build cannot start, and that is the cause to name.
     printf 'vox install: the program loader this build needs, /lib64/ld-linux-x86-64.so.2, is not on this system. Vox supports %s.\n' "$LINUX_SYSTEMS" >&2
   elif [ "$run_verdict" = "did not answer" ]; then
     printf 'vox install: a vox that does not answer `--version` is not installed. Vox supports %s; if this system is one of those, this is a defect in Vox: please report it with the lines above.\n' "$LINUX_SYSTEMS" >&2

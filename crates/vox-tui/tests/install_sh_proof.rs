@@ -1606,6 +1606,12 @@ fn the_linux_release_installer_names_a_missing_loader() {
 #[cfg(feature = "optional-proofs")]
 fn linux_asset_claims(selected: &[usize]) {
     use std::process::Stdio;
+    // `podman` with the operator's connection list and nothing else of the real HOME.
+    fn podman() -> Command {
+        let mut cmd = Command::new("podman");
+        watchdog::temp_home::real_podman(&mut cmd);
+        cmd
+    }
     struct Container {
         name: String,
         image: String,
@@ -1615,12 +1621,10 @@ fn linux_asset_claims(selected: &[usize]) {
     impl Drop for Container {
         fn drop(&mut self) {
             if self.created {
-                let _ = Command::new("podman")
-                    .args(["rm", "-f", &self.name])
-                    .status();
+                let _ = podman().args(["rm", "-f", &self.name]).status();
             }
             if self.created && self.pulled {
-                let _ = Command::new("podman").args(["rmi", &self.image]).status();
+                let _ = podman().args(["rmi", &self.image]).status();
             }
         }
     }
@@ -1671,7 +1675,7 @@ fn linux_asset_claims(selected: &[usize]) {
         serve(tree.path()).unwrap_or_else(|why| panic!("APPARATUS: asset release server: {why}"));
     // Remote Podman runs in a Linux VM, not in this host's loopback namespace. Forward this
     // proof's one server port there; no real profile or home directory enters a container.
-    let connections = Command::new("podman")
+    let connections = podman()
         .args(["system", "connection", "list", "--format", "json"])
         .output()
         .staged();
@@ -1740,7 +1744,7 @@ fn linux_asset_claims(selected: &[usize]) {
             "apk add --no-cache curl shadow util-linux; useradd -m -u 1000 user", false),
     ] {
         if !selected.contains(&index) { continue; }
-        let pulled = !Command::new("podman").args(["image", "exists", image]).status().staged().success();
+        let pulled = !podman().args(["image", "exists", image]).status().staged().success();
         let mut container = Container { name: format!("vox-rg11-assets-{}-{index}", std::process::id()), image: image.to_owned(), pulled, created: false };
         let work = tempfile::tempdir().staged();
         let entry = work.path().join("entry.sh");
@@ -1776,19 +1780,19 @@ USER
 chmod 755 /user.sh
 su -s /bin/sh user -c /user.sh
 "#, base=server.base)).staged();
-        let created = Command::new("podman").args(["create", "--platform", "linux/amd64",
+        let created = podman().args(["create", "--platform", "linux/amd64",
             "--cpus", "4", "--memory", "8g", "--network", "host", "--name", &container.name,
             image, "/bin/sh", "/entry.sh"]).output().staged();
         assert!(created.status.success(), "APPARATUS: create {image}: {}", String::from_utf8_lossy(&created.stderr));
         container.created = true;
         for (source, destination) in [(&entry, "/entry.sh"), (&installer, "/install.sh")] {
-            let out = Command::new("podman").arg("cp").arg(source)
+            let out = podman().arg("cp").arg(source)
                 .arg(format!("{}:{destination}", container.name)).output().staged();
             assert!(out.status.success(), "APPARATUS: copy container input: {}", String::from_utf8_lossy(&out.stderr));
         }
         let before = server.requests();
         let started = std::time::Instant::now();
-        let out = Command::new("podman").args(["start", "-a", &container.name]).output().staged();
+        let out = podman().args(["start", "-a", &container.name]).output().staged();
         let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
         assert!(out.status.success() && text.contains("INSTALL_BEGIN"),
             "APPARATUS: {id} did not reach the installer: {text}");
