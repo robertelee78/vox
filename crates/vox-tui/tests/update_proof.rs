@@ -958,11 +958,31 @@ fn holders(dir: &Path) -> Vec<String> {
 fn an_update_restarts_its_daemon_and_uses_a_different_local_version() {
     watchdog::arm();
     if std::env::var_os("VOX_PROOF_BUNDLE_BEFORE_SWAP").is_none() {
+        #[cfg(target_os = "macos")]
+        if let Some(binary) = std::env::var_os("VOX_PROOF_CURRENT_BINARY") {
+            let bytes = std::fs::read(&binary).expect("APPARATUS: supplied current helper bytes");
+            let knob = b"VOX_TEST_RELEASE_BASE";
+            assert!(
+                bytes.windows(knob.len()).any(|window| window == knob),
+                "APPARATUS: supplied current helper must have test-knobs release transport"
+            );
+            eprintln!("test-knobs: supplied current helper reads VOX_TEST_RELEASE_BASE");
+        } else {
+            test_knobs::require(&["VOX_TEST_RELEASE_BASE"]);
+        }
+        #[cfg(not(target_os = "macos"))]
         test_knobs::require(&["VOX_TEST_RELEASE_BASE"]);
     }
     #[cfg(target_os = "macos")]
     if std::env::var_os("VOX_PROOF_BUNDLE_BEFORE_SWAP").is_some() {
-        bundle_before_swap_claim();
+        let precommit = std::env::var_os("VOX_PROOF_BUNDLE_PRECOMMIT").is_some();
+        let combined = std::env::var_os("VOX_PROOF_BUNDLE_PRECOMMIT_THEN_RESTART").is_some();
+        if precommit || combined {
+            bundle_before_swap_claim(true);
+        }
+        if !precommit || combined {
+            bundle_before_swap_claim(false);
+        }
         return;
     }
     let mut claims = Vec::new();
@@ -1035,7 +1055,7 @@ impl Drop for BundleJob {
 
 /// The public control greeting is observed without starting a replacement daemon.
 #[cfg(target_os = "macos")]
-fn bundle_before_swap_claim() {
+fn bundle_before_swap_claim(precommit: bool) {
     use std::os::unix::process::CommandExt as _;
     assert_eq!(
         std::env::var("VOX_PROOF_VM_GUEST").as_deref(),
@@ -1255,6 +1275,123 @@ pathlib.Path(target).write_bytes(plistlib.dumps(p))
         std::fs::read_to_string(&daemon_log).unwrap_or_default(),
         std::fs::read_to_string(account.log_file()).unwrap_or_else(|e| format!("unavailable: {e}"))
     );
+    if precommit {
+        use std::os::unix::process::ExitStatusExt as _;
+        let cut_env: Vec<_> = env
+            .iter()
+            .copied()
+            .chain([("VOX_TEST_ABORT_AFTER_SWAP", "1")])
+            .collect();
+        let cut = vox(&link, home, &["update"], &cut_env);
+        let active = home.join("Apps/Vox.app");
+        let journal =
+            std::fs::read_to_string(home.join("Apps/.Vox.app.publishing/transition.json"))
+                .unwrap_or_default();
+        let phase = serde_json::from_str::<serde_json::Value>(&journal)
+            .ok()
+            .and_then(|value| value["archive"]["phase"].as_str().map(str::to_owned));
+        assert!(
+            (cut.status.signal() == Some(6) || cut.status.code() == Some(134))
+                && app_says(&active) == next
+                && phase.as_deref() == Some("Stopped"),
+            "APPARATUS: updater did not abort after exchange: exit={:?}; active={}; journal={journal}; {}",
+            cut.status,
+            app_says(&active),
+            said(&cut)
+        );
+        let greeting = observe()
+            .map(|hello| (hello.pid, hello.version))
+            .map_err(|e| e.to_string());
+        let read = vox(
+            &link,
+            home,
+            &["room", "read", &room, "--node", "kept"],
+            &env,
+        );
+        let mut claims = Vec::new();
+        let mut receipts = BTreeMap::new();
+        let detail = format!(
+            "abort: {}; greeting={greeting:?}; read exit={:?}: {}; launchd:\n{}; daemon log:\n{}",
+            said(&cut),
+            read.status.code(),
+            said(&read),
+            job.state(),
+            std::fs::read_to_string(&daemon_log).unwrap_or_default()
+        );
+        claims.push(claim(
+            "bundle.old_daemon_serves_after_precommit_abort",
+            greeting
+                .as_ref()
+                .is_ok_and(|(pid, version)| *pid == old_pid && version == VERSION)
+                && read.status.success()
+                && said(&read).contains(message),
+            detail.clone(),
+        ));
+        receipts.insert(
+            "bundle.old_daemon_serves_after_precommit_abort".into(),
+            detail,
+        );
+
+        // An offline update repairs retained work without proceeding to another publication.
+        let offline = [
+            ("VOX_TEST_RELEASE_BASE", "http://127.0.0.1:0"),
+            ("VOX_NO_SHELL_SETUP", "1"),
+            ("VOX_PROXY", "127.0.0.1:0"),
+            ("VOX_LISTEN", "127.0.0.1:0"),
+        ];
+        let repaired = vox(&link, home, &["update"], &offline);
+        let text = said(&repaired);
+        let detail = format!(
+            "offline recovery exit={:?}: {text}; active={}; helper={}; launchd:\n{}",
+            repaired.status.code(),
+            app_says(&active),
+            reports(&link),
+            job.state()
+        );
+        let recovered = repaired.status.success()
+            && app_says(&active) == VERSION
+            && reports(&link) == format!("vox {VERSION}")
+            && text.contains("recovered an earlier transition")
+            && text.contains("daemon handoff recorded complete");
+        claims.push(claim(
+            "bundle.precommit_recovery_restores_the_original",
+            recovered,
+            detail.clone(),
+        ));
+        receipts.insert(
+            "bundle.precommit_recovery_restores_the_original".into(),
+            detail,
+        );
+        if recovered {
+            let updated = vox(&link, home, &["update"], &env);
+            let greeting = observe()
+                .map(|hello| (hello.pid, hello.version))
+                .map_err(|e| e.to_string());
+            let detail = format!(
+                "next update exit={:?}: {}; active={}; helper={}; greeting={greeting:?}; launchd:\n{}",
+                updated.status.code(),
+                said(&updated),
+                app_says(&active),
+                reports(&link),
+                job.state()
+            );
+            claims.push(claim(
+                "bundle.update_after_precommit_recovery_completes",
+                updated.status.success()
+                    && app_says(&active) == next
+                    && reports(&link) == format!("vox {next}")
+                    && greeting.as_ref().is_ok_and(|(_, version)| version == &next),
+                detail.clone(),
+            ));
+            receipts.insert(
+                "bundle.update_after_precommit_recovery_completes".into(),
+                detail,
+            );
+        }
+        drop(job);
+        dispose("bundle precommit recovery proof", &claims, &receipts, false);
+        return;
+    }
 
     let hold = home.join("publication-hold");
     std::fs::create_dir(&hold).expect("APPARATUS: publication hold directory");
@@ -2133,7 +2270,7 @@ fn daemon_restart_claim(
     let config = home.join("config");
     let pass = home.join("pass");
     write(&pass, "update proof passphrase\n");
-    let private_keychain = crate::unlock_staging::keychain(&data);
+    let private_keychain = crate::unlock_staging::keychain_with_binary(&data, &link);
     let env = [
         (
             "VOX_TEST_KEYCHAIN",
@@ -2151,35 +2288,38 @@ fn daemon_restart_claim(
         ),
         ("VOX_LISTEN", "127.0.0.1:0"),
     ];
-    // Start it by hand, the update path that used to deliberately leave the old daemon alive.
-    let daemon_log = home.join("hand-daemon.log");
-    let log = std::fs::File::create(&daemon_log).expect("APPARATUS: daemon log");
-    let mut daemon = Command::new(&link);
-    daemon
-        .env_clear()
-        .env("HOME", home)
-        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
-        .env("VOX_PROXY", "127.0.0.1:0")
-        .envs(env.iter().copied())
-        .args(["daemon", "--no-node", "--listen", "127.0.0.1:0"])
-        .stdin(std::process::Stdio::null())
-        .stdout(log.try_clone().expect("APPARATUS: clone log"))
-        .stderr(log);
-    let mut daemon = daemon.spawn().expect("APPARATUS: start hand daemon");
-    let before_pid = daemon.id();
-    std::thread::spawn(move || {
-        let _ = daemon.wait();
-    });
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    while std::fs::read_to_string(data.join(".daemon/lock"))
-        .ok()
-        .is_none_or(|p| p.trim() != before_pid.to_string())
-    {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "APPARATUS: hand daemon never held the scratch root"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(50));
+    let client_started = bundle && std::env::var_os("VOX_PROOF_BUNDLE_UNMANAGED").is_some();
+    if !client_started {
+        // Start it by hand, the update path that used to deliberately leave the old daemon alive.
+        let daemon_log = home.join("hand-daemon.log");
+        let log = std::fs::File::create(&daemon_log).expect("APPARATUS: daemon log");
+        let mut daemon = Command::new(&link);
+        daemon
+            .env_clear()
+            .env("HOME", home)
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .env("VOX_PROXY", "127.0.0.1:0")
+            .envs(env.iter().copied())
+            .args(["daemon", "--no-node", "--listen", "127.0.0.1:0"])
+            .stdin(std::process::Stdio::null())
+            .stdout(log.try_clone().expect("APPARATUS: clone log"))
+            .stderr(log);
+        let mut daemon = daemon.spawn().expect("APPARATUS: start hand daemon");
+        let before_pid = daemon.id();
+        std::thread::spawn(move || {
+            let _ = daemon.wait();
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while std::fs::read_to_string(data.join(".daemon/lock"))
+            .ok()
+            .is_none_or(|p| p.trim() != before_pid.to_string())
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "APPARATUS: hand daemon never held the scratch root"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
     let pass_arg = pass.to_str().expect("APPARATUS: a UTF-8 temp path");
     let mut staging = Vec::new();
@@ -2198,6 +2338,29 @@ fn daemon_restart_claim(
         let out = vox(&link, home, args, &env);
         if !out.status.success() {
             staging.push(format!("`vox {}` said {:?}", args.join(" "), said(&out)));
+        }
+    }
+    if client_started {
+        let pid = std::fs::read_to_string(data.join(".daemon/lock"))
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+            .filter(|pid| *pid != 0);
+        let command = pid.and_then(|pid| {
+            Command::new("/bin/ps")
+                .args(["-p", &pid.to_string(), "-o", "command="])
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+        });
+        println!("[proof] client-started daemon lock pid={pid:?}; command={command:?}");
+        if !command
+            .as_deref()
+            .is_some_and(|line| line.contains("--as-detached"))
+        {
+            staging.push(format!(
+                "client-started daemon did not hold the scratch lock as --as-detached: pid={pid:?}, command={command:?}"
+            ));
         }
     }
     let listed = |link: &Path| -> (bool, bool, String) {

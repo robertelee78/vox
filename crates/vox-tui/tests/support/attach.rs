@@ -69,13 +69,17 @@ pub fn persistent_args(data: &Path, args: &[&str], passphrase: &str) -> Vec<Stri
 /// A private macOS Keychain for existing CLI staging, never the person's login Keychain.
 /// Every command builder on the same scratch root uses it, including the daemon's first start.
 pub fn keychain(data: &Path) -> PathBuf {
+    keychain_with_binary(data, Path::new(env!("CARGO_BIN_EXE_vox")))
+}
+
+/// Use the actual helper when a prebuilt proof runs on another machine.
+pub fn keychain_with_binary(data: &Path, binary: &Path) -> PathBuf {
     let path = data.join("proof.keychain-db");
     if cfg!(target_os = "macos") {
         static CREATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = CREATE.lock().expect("APPARATUS: Keychain staging lock");
         if !path.is_file() {
-            let binary =
-                std::fs::read(env!("CARGO_BIN_EXE_vox")).expect("APPARATUS: read proof binary");
+            let binary = std::fs::read(binary).expect("APPARATUS: read proof binary");
             assert!(
                 binary
                     .windows(b"VOX_TEST_KEYCHAIN".len())

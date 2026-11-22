@@ -83,6 +83,29 @@ pub async fn ensure_daemon(
             account.log_file().display()
         )));
     }
+    #[cfg(target_os = "macos")]
+    {
+        let began = Instant::now();
+        let manager = tokio::time::timeout(
+            vox_core::node::ipc::ANSWER_WITHIN,
+            crate::update::restart::pending_login_item(account),
+        )
+        .await
+        .map_err(|_| AppError::Usage(
+            "the login item did not answer the daemon startup check within 10 s; no daemon was started. Check Keep Running in Vox.app and the daemon log, then retry.".into(),
+        ))??;
+        if let Some(manager) = manager {
+            manager
+                .wait(
+                    &socket,
+                    None,
+                    Some(crate::client::say_daemon_waiting),
+                    began,
+                )
+                .await?;
+            return Ok(Daemon::Running);
+        }
+    }
     start_daemon(
         &std::env::current_exe()?,
         account,
@@ -138,6 +161,21 @@ pub async fn ensure_daemon_for_hook(
             HookDaemon::Starting
         });
     }
+    #[cfg(target_os = "macos")]
+    {
+        let check = crate::update::restart::pending_login_item(account);
+        let manager =
+            tokio::time::timeout(HOOK_WITHIN.saturating_sub(began.elapsed()), check).await;
+        match manager {
+            Ok(Ok(None)) => {}
+            Ok(Ok(Some(_))) | Err(_) => {
+                eprintln!("vox: waiting for the daemon restart");
+                return Ok(HookDaemon::Starting);
+            }
+            Ok(Err(e)) => return Err(e),
+        }
+    }
+    let remaining = HOOK_WITHIN.saturating_sub(began.elapsed());
     start_daemon_bounded(
         &std::env::current_exe()?,
         account,

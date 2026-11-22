@@ -77,12 +77,26 @@ def managed_guest_proof():
     job["EnvironmentVariables"] = env
     if mode == "restart":
         job["StandardErrorPath"] = str(daemon_log)
+    failure_listener = None
+    failure_switch = fixture / "fail-replacement"
+    if os.environ.get("VOX_PROOF_FAIL_REPLACEMENT"):
+        failure_listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        failure_listener.bind(("127.0.0.1", 0))
+        address = f"127.0.0.1:{failure_listener.getsockname()[1]}"
+        wrapper = fixture / "managed-start"
+        wrapper.write_text("#!/bin/sh\nif [ -f " + shlex.quote(str(failure_switch))
+                           + " ]; then export VOX_LISTEN=" + shlex.quote(address)
+                           + "; fi\nexec \"$@\"\n")
+        wrapper.chmod(0o700)
+        job["Program"] = str(wrapper)
+        job["ProgramArguments"] = [str(wrapper), *job["ProgramArguments"]]
     plist.write_bytes(plistlib.dumps(job))
     control = fixture / "data/.daemon/vox.sock"
     owned = False
     restarter = None
     read_client = None
     bootout = None
+    extra_pid = None
     caller_log = fixture / "restart-caller.log"
     def interrupted(_sig, _frame):
         raise KeyboardInterrupt
@@ -190,6 +204,63 @@ def managed_guest_proof():
                 restarter.kill()
                 restarter.wait()
                 print(f"[proof] killed restart caller exit={restarter.returncode}", flush=True)
+            if failure_listener is not None:
+                failure_switch.touch()
+                read_log = fixture / "failing-replacement-client.log"
+                with read_log.open("w+") as output:
+                    read_client = subprocess.Popen([str(helper), "room", "list", "--node", "default"],
+                                                   env=env, stdin=subprocess.DEVNULL, stdout=output,
+                                                   stderr=subprocess.STDOUT)
+                    until("stopping client wait or refusal",
+                          lambda: "finishing a daemon restart" in read_log.read_text()
+                          or read_client.poll() is not None)
+                    hold.unlink(missing_ok=True)
+                    until("client end or repeated failed replacement runs",
+                          lambda: read_client.poll() is not None or state()[1] > first_runs + 2)
+                    current, runs, manager = state()
+                    text = read_log.read_text()
+                    failed = daemon_log.read_text()
+                    print(f"[proof] failing replacement client exit={read_client.poll()}, runs={runs}:\n"
+                          f"{text}\nmanager:\n{manager}\ndaemon:\n{failed}", flush=True)
+                    if "address already in use" not in failed.lower():
+                        raise RuntimeError("APPARATUS: replacement did not hit the staged occupied listen port")
+                    if (read_client.poll() is None or read_client.returncode == 0
+                            or "replacement daemon exited before it answered" not in text):
+                        raise RuntimeError("PRODUCT: client followed failed replacement runs instead of ending truthfully: "
+                                           + text + "\n" + manager)
+                return
+            if os.environ.get("VOX_PROOF_PENDING_START"):
+                hold.unlink(missing_ok=True)
+                def scheduled():
+                    pid, runs, text = state()
+                    return text if pid is None and "state = spawn scheduled" in text else None
+                pending = until("young daemon's scheduled spawn", scheduled)
+                print(f"[proof] pending before ensure_daemon:\n{pending}", flush=True)
+                read_log = fixture / "pending-start-client.log"
+                with read_log.open("w+") as output:
+                    read_client = subprocess.Popen([str(helper), "daemon", "--detach"],
+                                                   env=env, stdin=subprocess.DEVNULL, stdout=output,
+                                                   stderr=subprocess.STDOUT)
+                    until("ensure_daemon client ends", lambda: read_client.poll() is not None)
+                    hello = greeting()
+                    manager_pid, runs, manager = state()
+                    if hello is not None and hello != manager_pid:
+                        extra_pid = hello
+                    if extra_pid is not None:
+                        until("manager attempts its replacement", lambda: state()[1] > first_runs)
+                        manager_pid, runs, manager = state()
+                        processes = subprocess.run(
+                            ["/bin/ps", "-o", "pid,ppid,stat,command", "-p",
+                             f"{extra_pid},{manager_pid}"], capture_output=True, text=True)
+                        print(f"[proof] competing processes:\n{processes.stdout}{processes.stderr}", flush=True)
+                    text = read_log.read_text()
+                    print(f"[proof] pending-start client exit={read_client.returncode}; greeting={hello}; "
+                          f"manager pid={manager_pid}; runs={runs}:\n{text}\n{manager}", flush=True)
+                    if (read_client.returncode != 0 or hello != manager_pid
+                            or manager_pid == first or runs != first_runs + 1):
+                        raise RuntimeError("PRODUCT: ensure_daemon raced the manager's pending replacement: "
+                                           + text + "\n" + manager)
+                return
             if os.environ.get("VOX_PROOF_REMOVE_MANAGER"):
                 read_log = fixture / "stopping-client.log"
                 with read_log.open("w+") as output:
@@ -215,7 +286,7 @@ def managed_guest_proof():
                     result = read_client.wait(timeout=120)
                     text = read_log.read_text()
                     print(f"[proof] missing-manager client exit={result}:\n{text}", flush=True)
-                    if (result == 0 or "the daemon stopped; its login item has not started the replacement yet" not in text
+                    if (result == 0 or "the daemon was stopped; its login item is not starting a replacement" not in text
                             or "test omitting manager phase" not in text):
                         raise RuntimeError(f"PRODUCT: removed-manager wait did not give the current state and fallback: {text}")
                 return
@@ -296,11 +367,18 @@ def managed_guest_proof():
             hold.unlink(missing_ok=True)
             bootout.communicate(timeout=120)
         hold.unlink(missing_ok=True)
+        if extra_pid is not None:
+            try:
+                os.kill(extra_pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
         if owned:
             result = launch("bootout", domain, str(plist))
             if result.returncode and launch("print", target).returncode == 0:
                 raise RuntimeError(f"APPARATUS: could not boot out owned job: {result.stderr}")
             print("[proof] owned launchd job booted out", flush=True)
+        if failure_listener is not None:
+            failure_listener.close()
         if restarter is not None and caller_log.exists():
             print(f"[proof] restart caller output:\n{caller_log.read_text()}", flush=True)
         shutil.rmtree(fixture)
@@ -400,6 +478,9 @@ def recovery_guest(ssh, options, destination, out):
                 "echo $$ > " + shlex.quote(guest + "/proof.pid") + "; "
                 "exec env VOX_PROOF_VM_GUEST=1 "
                 + ("VOX_PROOF_BUNDLE_AFTER_SWAP=1 " if os.environ.get("VOX_PROOF_BUNDLE_AFTER_SWAP") else "")
+                + ("VOX_PROOF_BUNDLE_PRECOMMIT=1 " if os.environ.get("VOX_PROOF_BUNDLE_PRECOMMIT") else "")
+                + ("VOX_PROOF_BUNDLE_PRECOMMIT_THEN_RESTART=1 " if os.environ.get("VOX_PROOF_BUNDLE_PRECOMMIT_THEN_RESTART") else "")
+                + ("VOX_PROOF_BUNDLE_UNMANAGED=1 " if os.environ.get("VOX_PROOF_BUNDLE_UNMANAGED") else "")
                 + ("VOX_PROOF_MATURE_RESTART=1 " if os.environ.get("VOX_PROOF_MATURE_RESTART") else "")
                 + ("VOX_PROOF_MANAGER_FIELDS_ABSENT=1 " if os.environ.get("VOX_PROOF_MANAGER_FIELDS_ABSENT") else "")
                 + "/usr/bin/python3 " + shlex.quote(guest + "/proof.py")
@@ -414,6 +495,8 @@ def recovery_guest(ssh, options, destination, out):
             "chmod 700 " + shlex.quote(app + "/Contents/Helpers/vox") + "; "
             "echo $$ > " + shlex.quote(guest + "/proof.pid") + "; "
             "exec env VOX_PROOF_VM_GUEST=1 "
+            + ("VOX_PROOF_FAIL_REPLACEMENT=1 " if os.environ.get("VOX_PROOF_FAIL_REPLACEMENT") else "")
+            + ("VOX_PROOF_PENDING_START=1 " if os.environ.get("VOX_PROOF_PENDING_START") else "")
             + ("VOX_PROOF_REMOVE_MANAGER=1 " if os.environ.get("VOX_PROOF_REMOVE_MANAGER") else "")
             + ("VOX_PROOF_MANAGER_FIELDS_ABSENT=1 " if os.environ.get("VOX_PROOF_MANAGER_FIELDS_ABSENT") else "")
             + "/usr/bin/python3 " + shlex.quote(guest + "/proof.py")
@@ -661,6 +744,12 @@ def bundle_guest_proof():
                VOX_PROOF_LAUNCH_PLIST=str(guest / "Vox.app/Contents/Library/LaunchAgents/us.vox.daemon.plist"))
     if os.environ.get("VOX_PROOF_BUNDLE_AFTER_SWAP"):
         env["VOX_PROOF_BUNDLE_AFTER_SWAP"] = "1"
+    if os.environ.get("VOX_PROOF_BUNDLE_PRECOMMIT"):
+        env["VOX_PROOF_BUNDLE_PRECOMMIT"] = "1"
+    if os.environ.get("VOX_PROOF_BUNDLE_PRECOMMIT_THEN_RESTART"):
+        env["VOX_PROOF_BUNDLE_PRECOMMIT_THEN_RESTART"] = "1"
+    if os.environ.get("VOX_PROOF_BUNDLE_UNMANAGED"):
+        env.pop("VOX_PROOF_BUNDLE_BEFORE_SWAP", None)
     child = None
     try:
         child = subprocess.Popen([str(guest / "update-proof"),

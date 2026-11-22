@@ -1838,7 +1838,6 @@ fn normalize_pending_refresh(
     if let Some(original) = transition.deferred_daemon.take() {
         transition.daemon = original;
     }
-    transition.daemon_process = None;
     transition.kind = TransitionKind::Refresh;
     transition.version = version.to_owned();
     transition.source = identity.clone();

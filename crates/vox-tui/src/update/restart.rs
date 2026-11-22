@@ -404,15 +404,16 @@ async fn restart_checked(
             ));
         };
         let process = daemon_process(existing.pid)?;
+        let original = captured.is_some_and(|expected| same_daemon_process(expected, &process));
         let replacing = existing.version != now;
         if replacing {
-            if !captured.is_some_and(|expected| same_daemon_process(expected, &process)) {
+            if !original {
                 return Err(AppError::Usage(format!(
                     "an unexpected daemon runs vox {} rather than {now}; refusing to stop it",
                     existing.version
                 )));
             }
-        } else {
+        } else if !original {
             require_daemon_executable(existing.pid, helper)?;
         }
         if let Started::LoginItem(target) = started {
@@ -423,9 +424,16 @@ async fn restart_checked(
                 ));
             }
         }
+        // Restoring an archive can retire the captured helper without changing its version.
+        // Replace that process before discarding the journal that identifies it.
+        let retired = original
+            && !replacing
+            && crate::claude_injector::exe_of(existing.pid).as_ref()
+                != Some(&std::fs::canonicalize(helper)?);
+        let replacing = replacing || retired;
         if replacing {
             let DaemonIntent::Running {
-                started: Started::LoginItem(_),
+                started,
                 listen,
                 anchors,
                 ..
@@ -435,6 +443,21 @@ async fn restart_checked(
                     "the captured old daemon has no login item to replace it".into(),
                 ));
             };
+            if !matches!(started, Started::LoginItem(_)) {
+                if !retired {
+                    return Err(AppError::Usage(
+                        "the captured old daemon has no login item to replace it".into(),
+                    ));
+                }
+                request_stop(account, existing.pid).await?;
+                if !gone_within(existing.pid, STOP_WITHIN).await {
+                    return Err(AppError::Usage(format!(
+                        "the captured daemon (pid {}) did not stop within {} s",
+                        existing.pid,
+                        STOP_WITHIN.as_secs()
+                    )));
+                }
+            }
             start_selected(account, helper, *listen, anchors, started, now).await?;
         }
         let after =
@@ -447,7 +470,9 @@ async fn restart_checked(
                 "the replacement daemon changed during handoff".into(),
             ));
         }
-        require_daemon_executable(after.pid, helper)?;
+        if !(original && after.pid == process.pid) {
+            require_daemon_executable(after.pid, helper)?;
+        }
         println!(
             "the vox daemon runs vox {} (pid {}), and its remembered nodes are Ready",
             after.version, after.pid
@@ -886,7 +911,7 @@ pub(crate) struct DaemonManager(Started);
 
 #[cfg(target_os = "macos")]
 pub(crate) struct ManagerProgress {
-    pub(crate) key: (&'static str, Option<u32>, u64),
+    pub(crate) runs: Option<u64>,
     pub(crate) within: Duration,
     pub(crate) pid: Option<u32>,
     pub(crate) pending: bool,
@@ -894,13 +919,14 @@ pub(crate) struct ManagerProgress {
 
 #[cfg(target_os = "macos")]
 impl DaemonManager {
-    pub(crate) fn progress(&self) -> Result<Option<ManagerProgress>, crate::app::AppError> {
+    pub(crate) async fn progress(&self) -> Result<Option<ManagerProgress>, crate::app::AppError> {
         use vox_core::node::ipc::ANSWER_WITHIN;
-        #[cfg(target_os = "macos")]
         if let Started::LoginItem(target) = &self.0 {
-            let out = Command::new("/bin/launchctl")
+            let out = tokio::process::Command::new("/bin/launchctl")
                 .args(["print", target])
-                .bounded_output()?;
+                .kill_on_drop(true)
+                .output()
+                .await?;
             if !out.status.success() {
                 return Ok(None);
             }
@@ -937,23 +963,27 @@ impl DaemonManager {
             let pid_text = value("pid = ");
             let pid = pid_text.and_then(|s| s.parse().ok());
             let runs = value("runs = ").and_then(|s| s.parse::<u64>().ok());
-            let seconds = match phase {
-                Some("SIGTERMed") => value("exit timeout = ").and_then(|s| s.parse::<u64>().ok()),
-                Some("spawn scheduled") => {
-                    value("minimum runtime = ").and_then(|s| s.parse::<u64>().ok())
-                }
-                _ => Some(ANSWER_WITHIN.as_secs()),
-            }
-            .filter(|seconds| *seconds > 0);
+            let seconds = value("exit timeout = ")
+                .and_then(|s| s.parse::<u64>().ok())
+                .filter(|seconds| *seconds > 0)
+                .zip(
+                    value("minimum runtime = ")
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .filter(|seconds| *seconds > 0),
+                )
+                .and_then(|(stop, spawn)| stop.checked_add(spawn))
+                .and_then(|seconds| seconds.checked_add(ANSWER_WITHIN.as_secs()));
             let mut known = phase.is_some()
                 && runs.is_some()
                 && seconds.is_some()
                 && (pid_text.is_none() || pid.is_some())
                 && (!matches!(phase, Some("running" | "SIGTERMed")) || pid.is_some());
             if let Some((domain, label)) = target.rsplit_once('/') {
-                let disabled = Command::new("/bin/launchctl")
+                let disabled = tokio::process::Command::new("/bin/launchctl")
                     .args(["print-disabled", domain])
-                    .bounded_output()?;
+                    .kill_on_drop(true)
+                    .output()
+                    .await?;
                 let disabled_text = String::from_utf8_lossy(&disabled.stdout);
                 known &=
                     disabled.status.success() && disabled_text.contains("disabled services = {");
@@ -969,37 +999,115 @@ impl DaemonManager {
                 known = false;
             }
             return Ok(Some(ManagerProgress {
-                key: if known {
-                    (phase.unwrap_or(""), pid, runs.unwrap_or(0))
-                } else {
-                    ("", None, 0)
-                },
+                runs: known.then_some(runs).flatten(),
                 within: if known {
                     Duration::from_secs(seconds.unwrap_or(0)).max(ANSWER_WITHIN)
                 } else {
                     ANSWER_WITHIN
                 },
                 pid,
-                pending: !known
-                    || pid.is_some()
-                    || matches!(
-                        phase,
-                        Some("spawn scheduled" | "spawning" | "spawn requested")
-                    ),
+                pending: phase != Some("not running")
+                    && (!known
+                        || pid.is_some()
+                        || matches!(
+                            phase,
+                            Some("spawn scheduled" | "spawning" | "spawn requested")
+                        )),
             }));
         }
         Ok(None)
     }
 
-    pub(crate) fn not_ready(&self, previous: u32, current: Option<u32>) -> crate::app::AppError {
-        let (manager, advice) = match &self.0 {
-            Started::LoginItem(_) => ("login item", "Check Keep Running in Vox.app and the daemon log, or run `vox daemon` to start one."),
-            _ => ("service manager", "Check its state and the daemon log."),
-        };
+    /// Observe one manager-owned replacement, never starting a daemon or extending the cap.
+    pub(crate) async fn wait(
+        &self,
+        socket: &Path,
+        previous: Option<u32>,
+        waiting: Option<fn()>,
+        began: Instant,
+    ) -> Result<(), crate::app::AppError> {
+        use crate::app::AppError;
+        use vox_core::error::{Error, IpcHandshake};
+        use vox_core::node::ipc::ANSWER_WITHIN;
+        let mut within = ANSWER_WITHIN;
+        let mut first_replacement = None;
+        let mut observed = false;
+        let mut announced = false;
+        let mut current = previous;
+        loop {
+            let remaining = within.saturating_sub(began.elapsed());
+            if remaining.is_zero() {
+                return Err(Self::not_ready(previous, current));
+            }
+            match tokio::time::timeout(remaining, DaemonClient::observe(socket)).await {
+                Ok(Ok(hello)) if Some(hello.pid) != previous => return Ok(()),
+                Ok(Ok(hello)) => current = Some(hello.pid),
+                Ok(Err(Error::Ipc(IpcHandshake::Unreachable { .. }))) => current = None,
+                Ok(Err(error)) => return Err(AppError::Core(error)),
+                Err(_) => return Err(Self::not_ready(previous, current)),
+            }
+            let state =
+                tokio::time::timeout(within.saturating_sub(began.elapsed()), self.progress())
+                    .await
+                    .map_err(|_| Self::not_ready(previous, current))??;
+            let Some(state) = state else {
+                return Err(Self::stopped());
+            };
+            current = state.pid;
+            if !state.pending {
+                return Err(Self::stopped());
+            }
+            if !observed {
+                within = state.within;
+                first_replacement = state.runs.and_then(|runs| {
+                    if state.pid.is_some() && state.pid != previous {
+                        Some(runs)
+                    } else {
+                        runs.checked_add(1)
+                    }
+                });
+                observed = true;
+            } else {
+                within = within.min(state.within);
+            }
+            if state
+                .runs
+                .zip(first_replacement)
+                .is_some_and(|(runs, first)| runs > first)
+            {
+                return Err(AppError::Usage(
+                    "the login item's replacement daemon exited before it answered; see the daemon log, then run `vox daemon` or reopen Vox.app to retry".into(),
+                ));
+            }
+            if began.elapsed() >= within {
+                return Err(Self::not_ready(previous, current));
+            }
+            if !announced && began.elapsed() >= vox_core::node::profile::LOCK_PATIENCE {
+                if let Some(waiting) = waiting {
+                    waiting();
+                }
+                announced = true;
+            }
+            tokio::time::sleep(
+                Duration::from_millis(50).min(within.saturating_sub(began.elapsed())),
+            )
+            .await;
+        }
+    }
+
+    fn stopped() -> crate::app::AppError {
+        crate::app::AppError::Usage(
+            "the daemon was stopped; its login item is not starting a replacement. Open Vox.app with Keep Running enabled, or run `vox daemon` to start it again.".into(),
+        )
+    }
+
+    fn not_ready(previous: Option<u32>, current: Option<u32>) -> crate::app::AppError {
+        let advice =
+            "Check Keep Running in Vox.app and the daemon log, or run `vox daemon` to start one.";
         crate::app::AppError::Usage(match current {
-            Some(pid) if pid == previous => format!("the daemon is still stopping; its {manager} has not started the replacement yet. {advice}"),
-            Some(pid) => format!("the {manager} started daemon pid {pid}, but it has not greeted this client. {advice}"),
-            None => format!("the daemon stopped; its {manager} has not started the replacement yet. {advice}"),
+            Some(pid) if Some(pid) == previous => format!("the daemon is still stopping; its login item has not provided a replacement. {advice}"),
+            Some(pid) => format!("the login item started daemon pid {pid}, but it has not greeted this client. {advice}"),
+            None => format!("no daemon has answered; its login item has not provided a replacement. {advice}"),
         })
     }
 }
@@ -1012,6 +1120,123 @@ pub(crate) fn managed_daemon(pid: u32) -> Option<DaemonManager> {
         None
     } else {
         Some(DaemonManager(started))
+    }
+}
+
+/// Find a loaded login item due to start this account's daemon.
+#[cfg(target_os = "macos")]
+pub(crate) async fn pending_login_item(
+    account: &Account,
+) -> Result<Option<DaemonManager>, crate::app::AppError> {
+    let target = format!("gui/{}/{LOGIN_ITEM}", rustix::process::getuid().as_raw());
+    let out = tokio::process::Command::new("/bin/launchctl")
+        .args(["print", &target])
+        .kill_on_drop(true)
+        .output()
+        .await?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    let Ok(text) = std::str::from_utf8(&out.stdout) else {
+        return Ok(None);
+    };
+
+    // launchctl prints inherited, default and job environment separately, in precedence order.
+    // Do not infer ownership from the label: another profile can load the same job.
+    let mut data = None;
+    let mut config = None;
+    let mut job_home = None;
+    let mut xdg_data = None;
+    let mut xdg_config = None;
+    let mut argument_data = None;
+    let mut argument_config = None;
+    let mut value_for = "";
+    let mut section = "";
+    let mut environments = 0;
+    let mut saw_arguments = false;
+    for line in text.lines().map(str::trim) {
+        if section.is_empty() {
+            match line {
+                "inherited environment = {" | "default environment = {" | "environment = {" => {
+                    section = "environment";
+                    environments += 1;
+                }
+                "arguments = {" => {
+                    section = "arguments";
+                    saw_arguments = true;
+                }
+                _ => {}
+            }
+        } else if line == "}" {
+            section = "";
+        } else if section == "environment" {
+            if let Some((name, value)) = line.split_once(" => ") {
+                match name {
+                    "VOX_DATA_DIR" => data = Some(value),
+                    "VOX_CONFIG_DIR" => config = Some(value),
+                    "HOME" => job_home = Some(value),
+                    "XDG_DATA_HOME" => xdg_data = Some(value),
+                    "XDG_CONFIG_HOME" => xdg_config = Some(value),
+                    _ => {}
+                }
+            }
+        } else if value_for == "--data-dir" {
+            argument_data = Some(line);
+            value_for = "";
+        } else if value_for == "--config-dir" {
+            argument_config = Some(line);
+            value_for = "";
+        } else if matches!(line, "--data-dir" | "--config-dir") {
+            value_for = line;
+        } else if let Some(value) = line.strip_prefix("--data-dir=") {
+            argument_data = Some(value);
+        } else if let Some(value) = line.strip_prefix("--config-dir=") {
+            argument_config = Some(value);
+        }
+    }
+    if !section.is_empty() || !value_for.is_empty() || environments != 3 || !saw_arguments {
+        return Ok(None);
+    }
+    let data = argument_data.or(data);
+    let config = argument_config.or(config);
+    let home = if data.is_none() || config.is_none() {
+        job_home.map(std::path::PathBuf::from).or_else(|| {
+            nix::unistd::User::from_uid(nix::unistd::Uid::current())
+                .ok()
+                .flatten()
+                .map(|user| user.dir)
+        })
+    } else {
+        None
+    };
+    let default = |xdg: Option<&str>| {
+        xdg.filter(|value| !value.is_empty())
+            .map(|value| std::path::PathBuf::from(value).join("vox"))
+            .or_else(|| {
+                home.as_ref()
+                    .map(|p| p.join("Library/Application Support/vox"))
+            })
+    };
+    let data = data
+        .map(std::path::PathBuf::from)
+        .or_else(|| default(xdg_data));
+    let config = config
+        .map(std::path::PathBuf::from)
+        .or_else(|| default(xdg_config));
+    if !data
+        .as_ref()
+        .is_some_and(|p| p.is_absolute() && *p == account.data_root)
+        || !config
+            .as_ref()
+            .is_some_and(|p| p.is_absolute() && *p == account.config_dir)
+    {
+        return Ok(None);
+    }
+    let manager = DaemonManager(Started::LoginItem(target));
+    if manager.progress().await?.is_some_and(|state| state.pending) {
+        Ok(Some(manager))
+    } else {
+        Ok(None)
     }
 }
 

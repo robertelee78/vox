@@ -212,13 +212,23 @@ explicit `vox daemon --restart` whose caller is killed. All processes, the launc
 profile belong to scratch; the outer runner boots out the job and stops the guest on failure.
 Take `/tmp/vox-guest.lock` for each run, releasing it only after the guest is stopped.
 
-The CLI preserves a stopping refusal's daemon PID internally and checks the existing login-item
-ownership query. Only a confirmed login item's stopping refusal waits for a replacement; no
-client starts a daemon on this path. It follows launchd's phase, PID and run count: phase
-changes reset the no-progress wait, stopping uses the job's exit timeout, a scheduled spawn
-uses its minimum runtime, and a new process keeps the existing ten-second greeting wait.
-Missing or changed manager text falls back to the fixed ten-second wait, not a parsing error
-or an endless wait. End-of-wait advice describes the current state.
+`VOX_PROOF_BUNDLE_PRECOMMIT=1` selects the existing abort-after-exchange condition and checks
+that the old daemon keeps serving and ordinary offline recovery restores the original release.
+`VOX_PROOF_BUNDLE_UNMANAGED=1` instead runs the existing controlled-bundle update with its
+client-started daemon and no login item.
+
+The CLI preserves a stopping refusal's daemon PID internally and confirms login-item ownership.
+It observes one replacement without starting a daemon. The whole wait has one cap: launchd's
+printed exit timeout plus minimum runtime plus the existing ten-second greeting patience.
+Phase changes never reset it. A missing, disabled or inactive job ends the wait, as does the
+run count passing the first replacement without a greeting. Missing or changed manager fields
+fall back to the old fixed ten seconds. End-of-wait advice describes the current state;
+a deliberately stopped job does not promise a future replacement.
+When no socket answers, startup-capable clients also check whether the matching account's
+login item has a spawn pending, rather than race it with a client daemon.
+Hooks do not take the managed command wait: their node clients retain the original
+greeting/refusal path, and a pending managed spawn gives the existing bounded `Starting`
+answer inside the hook's existing 500ms startup patience.
 The managed-client wait is built and proven for the macOS login item only. Linux keeps its
 existing immediate stopping refusal; there is no new systemd progress observer. Vox ships no
 user unit. The existing disposable Linux proof supplies `Restart=on-failure`, `RestartSec=1`.
@@ -233,6 +243,12 @@ VOX_PROOF_REMOVE_MANAGER=1 VOX_PROOF_MANAGER_FIELDS_ABSENT=1 \
 python3 scripts/app-proofs-vm.py --restart-vm /absolute/prebuilt/vox \
   apps/macos/Bundle/LaunchAgents/us.vox.daemon.plist /absolute/receipt-directory
 ```
+
+On that same `--restart-vm` route, `VOX_PROOF_FAIL_REPLACEMENT=1` occupies a private listen port
+and makes subsequent managed launches use it; the real daemon exits before greeting, and
+the waiting client must end with the failed-replacement words rather than follow a respawn loop.
+`VOX_PROOF_PENDING_START=1` issues `vox daemon --detach` during a young job's scheduled spawn;
+it must use the one login-item generation, never create a competing daemon.
 
 Build with `test-knobs` for this field-absence staging, which changes no product wait rule.
 An unpaused read can reach the replacement while its room prepares saved history and exit1

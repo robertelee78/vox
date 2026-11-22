@@ -355,6 +355,14 @@ pub fn say_daemon_waiting() {
     eprintln!("{DAEMON_WAITING}");
 }
 
+/// A hook keeps its existing greeting/refusal patience; managed command waiting is separate.
+///
+/// # Errors
+/// As [`open`], without waiting through a service manager's replacement phases.
+pub async fn open_for_hook(at: &NodeSocket) -> Result<IpcClient, AppError> {
+    IpcClient::open_at(at).await.map_err(|e| said(at, e))
+}
+
 /// A connection to `at` as its node, with each way it can fail said for a person: no daemon, a
 /// refusal (the node not attached, no such node), a socket that is not this user's.
 ///
@@ -368,62 +376,28 @@ pub async fn open(at: &NodeSocket) -> Result<IpcClient, AppError> {
         let Err(Error::Ipc(IpcHandshake::DaemonStopping { pid })) = &first else {
             return first.map_err(|e| said(at, e));
         };
+        let began = std::time::Instant::now();
         let Some(manager) = crate::update::restart::managed_daemon(*pid) else {
             return first.map_err(|e| said(at, e));
         };
         let previous = *pid;
-        let began = std::time::Instant::now();
-        let mut changed = began;
-        let mut progress = None;
-        let mut announced = false;
-        loop {
-            let current = match DaemonClient::observe(&at.path).await {
-                Ok(hello) if hello.pid != previous => {
-                    #[cfg(feature = "test-knobs")]
-                    if let Some(dir) = std::env::var_os("VOX_TEST_HOLD_AFTER_MANAGED_GREETING") {
-                        let dir = std::path::PathBuf::from(dir);
-                        let greeted = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map_err(|e| {
-                                AppError::Usage(format!("APPARATUS: greeting clock: {e}"))
-                            })?;
-                        std::fs::write(dir.join("ready"), greeted.as_nanos().to_string()).map_err(
-                            |e| {
-                                AppError::Usage(format!(
-                                    "APPARATUS: greeting hold announcement: {e}"
-                                ))
-                            },
-                        )?;
-                        while !dir.join("release").exists() {
-                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                        }
-                    }
-                    return IpcClient::open_at(at).await.map_err(|e| said(at, e));
-                }
-                Ok(hello) => Some(hello.pid),
-                Err(Error::Ipc(IpcHandshake::Unreachable { .. })) => None,
-                Err(e) => return Err(said(at, e)),
-            };
-            let Some(state) = manager.progress()? else {
-                return Err(manager.not_ready(previous, current));
-            };
-            if !state.pending {
-                return Err(manager.not_ready(previous, state.pid));
+        manager
+            .wait(&at.path, Some(previous), at.waiting, began)
+            .await?;
+        #[cfg(feature = "test-knobs")]
+        if let Some(dir) = std::env::var_os("VOX_TEST_HOLD_AFTER_MANAGED_GREETING") {
+            let dir = std::path::PathBuf::from(dir);
+            let greeted = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| AppError::Usage(format!("APPARATUS: greeting clock: {e}")))?;
+            std::fs::write(dir.join("ready"), greeted.as_nanos().to_string()).map_err(|e| {
+                AppError::Usage(format!("APPARATUS: greeting hold announcement: {e}"))
+            })?;
+            while !dir.join("release").exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-            if progress.as_ref() != Some(&state.key) {
-                changed = std::time::Instant::now();
-                progress = Some(state.key);
-            } else if changed.elapsed() >= state.within {
-                return Err(manager.not_ready(previous, state.pid));
-            }
-            if !announced && began.elapsed() >= vox_core::node::profile::LOCK_PATIENCE {
-                if let Some(waiting) = at.waiting {
-                    waiting();
-                }
-                announced = true;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
+        return IpcClient::open_at(at).await.map_err(|e| said(at, e));
     }
     #[cfg(not(target_os = "macos"))]
     IpcClient::open_at(at).await.map_err(|e| said(at, e))
