@@ -4384,6 +4384,12 @@ impl Node {
         store: Arc<Store>,
         conn: Arc<VoxConnection>,
     ) -> bool {
+        // A proof provider can serve inventories and refuse entries without racing the
+        // reader's fetched hint with its own unsolicited announcement.
+        #[cfg(feature = "test-knobs")]
+        if std::env::var_os("VOX_TEST_RESPOND_ONLY").is_some() {
+            return false;
+        }
         let (room, peer, service) = port;
         if self.own_key_leave_pending.contains_key(&room)
             || self.own_key_ended_pending.contains_key(&room)

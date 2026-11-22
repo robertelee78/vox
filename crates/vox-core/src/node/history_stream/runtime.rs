@@ -284,8 +284,8 @@ pub(crate) struct Flow {
     pub(crate) published: bool,
     pub(crate) rendered: bool,
     pub(crate) governance: bool,
-    /// An exchange of this flow fetched something this node did not hold (an object it saved,
-    /// a body chunk, a hint it did not have): a completed flow that brought nothing is an
+    /// An exchange of this flow fetched an object it saved or a body chunk it did not hold.
+    /// An inventory hint alone is not receipt: a completed flow that brought nothing is an
     /// `empty` round in `vox status --json` (ADR-038 FX-29).
     pub(crate) brought: bool,
     /// Set at the durable/user-visible work edge and drained by the actor before it classifies
@@ -3092,7 +3092,10 @@ impl Flow {
                         self.offered = self.offered.saturating_add(offered.added as u64);
                         self.rearmed = self.rearmed.saturating_add(offered.rearmed as u64);
                         let added = offered.added != 0;
-                        self.brought |= added;
+                        #[cfg(feature = "test-knobs")]
+                        if added {
+                            eprintln!("vox: RG7_HINT_OFFERED announcement count={}", offered.added);
+                        }
                         if added {
                             self.work_committed
                                 .store(true, std::sync::atomic::Ordering::Release);
@@ -3205,7 +3208,10 @@ impl Flow {
                         self.offered = self.offered.saturating_add(offered.added as u64);
                         self.rearmed = self.rearmed.saturating_add(offered.rearmed as u64);
                         let added = offered.added != 0;
-                        self.brought |= added;
+                        #[cfg(feature = "test-knobs")]
+                        if added {
+                            eprintln!("vox: RG7_HINT_OFFERED ordinary count={}", offered.added);
+                        }
                         if added {
                             self.work_committed
                                 .store(true, std::sync::atomic::Ordering::Release);

@@ -1064,8 +1064,9 @@ fn a_reselected_window_does_not_restart_a_stalled_receipt_observation() {
 
 /// RG-7: a fresh receipt clock cannot advance during exchanges that serve no new entries.
 /// Fully receive both initial feeds, stop both daemons through their control protocol, enable
-/// head refusal, and restart the reader while its sole room peer is still stopped. Thus no
-/// previously admitted flow or commit can land after the clock observation starts.
+/// head refusal, and restart the reader while its sole room peer is still stopped. The provider
+/// only responds, so new hints arrive in fetched inventories, never unsolicited announcements.
+/// Thus no previously admitted flow or commit can land after the clock observation starts.
 /// Attach explicitly: this tests receipts, not automatic saved-room recovery (ledger entry 40).
 #[cfg(feature = "test-knobs")]
 #[test]
@@ -1073,7 +1074,7 @@ fn a_reselected_window_does_not_restart_a_stalled_receipt_observation() {
 fn status_names_a_connected_member_whose_posts_are_not_received() {
     use vox_core::node::daemonipc::{DaemonClient, DaemonFrame, DaemonRequest};
     watchdog::arm();
-    test_knobs::require(&["VOX_TEST_UNAVAILABLE_HEAD_FILE"]);
+    test_knobs::require(&["VOX_TEST_UNAVAILABLE_HEAD_FILE", "VOX_TEST_RESPOND_ONLY"]);
     let sink = UdpSocket::bind("127.0.0.1:0").expect("APPARATUS: service port");
     let mut w = World::new(
         sink.local_addr()
@@ -1236,7 +1237,10 @@ fn status_names_a_connected_member_whose_posts_are_not_received() {
         "clock-refusing-author",
         &w.host_dir,
         &w.host_anchor,
-        &[("VOX_TEST_UNAVAILABLE_HEAD_FILE", &world::utf8(&marker))],
+        &[
+            ("VOX_TEST_UNAVAILABLE_HEAD_FILE", &world::utf8(&marker)),
+            ("VOX_TEST_RESPOND_ONLY", "1"),
+        ],
     );
     author.expect_line("refusing author control socket", |line| {
         line.starts_with("vox daemon: control socket ")
@@ -1279,6 +1283,16 @@ fn status_names_a_connected_member_whose_posts_are_not_received() {
         "APPARATUS: refusal did not withhold the new posts: {read}"
     );
     receipt_mutant_witness(&after, Some(&mut reader));
+    reader.expect_line("new hint offered without receiving its entries", |line| {
+        line.contains("RG7_HINT_OFFERED ")
+    });
+    if let Some(line) = reader
+        .transcript()
+        .lines()
+        .find(|line| line.contains("RG7_HINT_OFFERED "))
+    {
+        eprintln!("[proof] daemon hint witness: {line}");
+    }
     eprintln!(
         "[proof] fresh clock after three refused fetched rounds: before={} after={}\n{after}",
         before["rooms"][0]["last_sync_ms"], after["rooms"][0]["last_sync_ms"]
@@ -1286,6 +1300,11 @@ fn status_names_a_connected_member_whose_posts_are_not_received() {
     assert_eq!(after["rooms"][0]["last_sync_ms"], before["rooms"][0]["last_sync_ms"],
         "PRODUCT: fresh receipt clock advanced although its only provider refused all unseen heads and every earlier flow was retired: {after}");
     let text = status_text(&w.guest_dir, "withheld reader");
+    assert!(
+        text.contains("live entries have not been held for over 60s")
+            && !text.contains("no live-window receipt progress observed"),
+        "PRODUCT: status overstates what its receipt samples prove: {text}"
+    );
     for member in after["rooms"][0]["members"].as_array().unwrap() {
         let id = member["id"].as_str().unwrap();
         if member["me"] == true {

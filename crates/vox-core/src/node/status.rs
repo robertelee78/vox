@@ -475,7 +475,7 @@ impl StatusReport {
                 out.push(Unhealthy {
                     key: format!("room-not-receiving:{}", b32_encode(&room.id)),
                     message: format!(
-                        "room {} ({}): not receiving from connected member {}; member advertised through entry {} (at least {} live entries not held); no live-window receipt progress observed for over {}s; check that member's vox status and daemon log",
+                        "room {} ({}): not receiving from connected member {}; member advertised through entry {} and at least {} live entries have not been held for over {}s; check that member's vox status and daemon log",
                         short(&room.id), room.name, short(&member.id),
                         member.advertised_through.unwrap_or(0),
                         member.missing_live_entries(),
