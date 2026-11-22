@@ -41,9 +41,12 @@
 //! room: carol posts until bob renders one (bob is receiving the room), alice posts until carol
 //! renders one and then a final line carol renders (alice's posts go out). After 10 s more, bob's
 //! `vox room read` and his agent drain (`vox agent hook`) show **0** of alice's posts in either
-//! room, each read showing carol's control line or `CANNOT MEASURE`. Then, with alice's daemon
-//! **stopped**, bob trusts her, and still renders 0 of hers: his node holds no key of alice's,
-//! since a key taken and merely hidden would render the moment his ring names her. Before that,
+//! room, each read showing carol's control line or `CANNOT MEASURE`. A pairwise key from an
+//! untrusted author is refused (M3), not saved for a later trust. With alice offline when bob
+//! trusts her, none of her pre-rotation posts opens. A sealed key-package in the room's log is
+//! instead held until trust and taken then (M5): post-rotation posts may open at trust only
+//! with alice's own evidence that she could not reach bob and sent the key through the log.
+//! Before that,
 //! alice's key changes: she removes carol from her ring and trusts her again, which rotates her
 //! sender key, so every post so far sits under a **retired** generation, and she posts once more
 //! under the new one (carol renders it, or `CANNOT MEASURE`). Bob and dave are away across the
@@ -523,11 +526,14 @@ fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
         );
         let n = count(&seen, "A118-");
         // What an agent of bob's is woken with: the drain hook, as a harness runs it.
+        // A harness conversation stays in one room; each room has its own session.
         let (ok, drained, e) = bob.vox(
             &[
                 "agent", "hook", "--node", "default", "--room", room, "--format", "text",
             ],
-            Some("{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"untrusted\"}"),
+            Some(&format!(
+                r#"{{"hook_event_name":"UserPromptSubmit","session_id":"untrusted-{name}"}}"#
+            )),
         );
         assert!(
             ok && drained.contains(&control),
@@ -552,6 +558,10 @@ fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
     // generation and no refusal of theirs in flight to say so (with either online, his refusal of
     // the new key owes it again within moments, and the prune keeps it for both). It must keep it
     // for them, as history.
+    let alice_log = tmp.path().join("alice.daemon.err");
+    let before_rotation = std::fs::read_to_string(&alice_log)
+        .expect("APPARATUS: read alice's daemon output before rotation")
+        .len();
     drop(bob.daemon.take());
     drop(dave.daemon.take());
     // **Alice's key changes before bob trusts her.** She removes carol from her ring, which
@@ -652,12 +662,25 @@ fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
         );
     }
 
-    // Bob holds no key of alice's: with her daemon stopped, so nothing can be delivered, bob
-    // trusts her, and still none of her posts opens. A key taken earlier and merely not shown
-    // would render the moment his ring names her.
+    // Pairwise keys were refused before storage. A log package is retained until trust.
+    // A log re-key can also carry history (consent_release.rs:1312–1330): if an unmutated
+    // run ever opens pre-rotation posts with log evidence, scope the count by the history
+    // alice put in that package, rather than assuming generation alone proves its path.
     let tmp_path = tmp.path().to_owned();
     let mut alice = alice;
     alice.daemon = None;
+    let after_rotation = std::fs::read_to_string(&alice_log)
+        .expect("APPARATUS: read alice's daemon output after rotation");
+    let after_rotation = after_rotation
+        .get(before_rotation..)
+        .expect("APPARATUS: alice's daemon output was truncated across rotation");
+    let bob_short: String = bob.fp.chars().take(26).collect();
+    let reach_refusal = format!("could not reach {bob_short}");
+    let log_evidence: Vec<&str> = after_rotation
+        .lines()
+        .filter(|line| line.contains(&reach_refusal))
+        .collect();
+    eprintln!("[proof] alice's post-rotation log-key evidence for bob: {log_evidence:?}");
     bob.trust(&alice);
     std::thread::sleep(Duration::from_secs(10));
     for (name, room, _) in &alice_posted {
@@ -666,11 +689,25 @@ fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
             ok && seen.contains(&format!("CAROL-TO-BOB-IN-{name}")),
             "PRODUCT (staging): bob's read of room {name} after trusting alice did not succeed: {e}"
         );
-        let n = count(&seen, "A118-");
+        let n = count(&seen, &format!("A118-IN-{name} "))
+            + count(&seen, &format!("A118-FINAL-IN-{name}"));
         assert_eq!(
             n, 0,
-            "PRODUCT: bob renders {n} of alice's posts in room {name} with her offline, the moment he \
-             trusted her: his node held her key while it did not trust her"
+            "PRODUCT: bob renders {n} of alice's posts made before her rotation, with her offline, \
+             the moment he trusted her: his node took a pairwise key while it did not trust her"
+        );
+        let after = count(&seen, &format!("A118-WHILE-CAROL-REMOVED-IN-{name}"))
+            + count(&seen, &format!("A118-AFTER-ROTATION-IN-{name}"));
+        assert!(
+            after == 0 || !log_evidence.is_empty(),
+            "PRODUCT: bob renders {after} of alice's post-rotation posts in room {name}, with her \
+             offline, the moment he trusted her, but alice never reported that she could not \
+             reach bob after rotation: no log-key delivery accounts for them"
+        );
+        eprintln!(
+            "[proof] room {name}: bob opens {n} pre-rotation and {after} post-rotation posts at \
+             trust with alice offline; log delivery reported: {}",
+            !log_evidence.is_empty()
         );
     }
 
@@ -770,7 +807,9 @@ fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
             &[
                 "agent", "hook", "--node", "default", "--room", room, "--format", "text",
             ],
-            Some("{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"by-log\"}"),
+            Some(&format!(
+                r#"{{"hook_event_name":"UserPromptSubmit","session_id":"by-log-{name}"}}"#
+            )),
         );
         let n = count(&seen, "DAVE-BY-LOG-") + count(&drained, "DAVE-BY-LOG-");
         eprintln!(
