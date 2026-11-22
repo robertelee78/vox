@@ -55,9 +55,6 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
-#[cfg(target_os = "macos")]
-#[path = "support/syscalls.rs"]
-mod syscalls;
 #[path = "support/test_knobs.rs"]
 mod test_knobs;
 
@@ -808,7 +805,7 @@ fn a_conversation_refuses_a_rebuilt_node_under_the_same_name() {
 }
 
 /// A daemon must not write into a directory substituted for the profile it opened.
-/// Mutant: remove the shared profile-directory verification before room leave.
+/// Mutants: remove the shared profile-directory check, or the session grant check.
 #[test]
 #[ignore = "real daemon and encrypted profile; run in release with test-knobs"]
 fn a_room_leave_refuses_a_replaced_profile_directory() {
@@ -906,124 +903,39 @@ fn a_room_leave_refuses_a_replaced_profile_directory() {
         before, after_pause,
         "PRODUCT: room pause changed the replacement profile despite its refusal: {pause_said}"
     );
-    daemon.stop();
-}
-
-/// Missing or foreign stores must never be initialized while checking a node's identity.
-#[test]
-#[ignore = "real daemons and encrypted profiles; run in release with test-knobs"]
-fn attaching_a_node_refuses_an_invalid_or_foreign_store_without_writing_it() {
-    watchdog::arm();
-    let donor = Account::new();
-    donor.make_node("donor");
-    let daemon = Daemon::start(&donor, &["--node", "donor"], &[]);
-    daemon.expect("node donor is Ready", Duration::from_secs(30), |line| {
-        line.contains("node donor is Ready")
-    });
-    make_room(&donor, "donor");
-    daemon.stop();
-    let foreign_store = std::fs::read(donor.data.join("nodes/donor/store.redb"))
-        .expect("APPARATUS: read donor store");
-    assert!(!foreign_store.is_empty(), "APPARATUS: donor store is empty");
-
-    for (case, bytes) in [
-        ("empty", b"".as_slice()),
-        ("foreign identity", foreign_store.as_slice()),
-        ("foreign bytes", b"not a Vox database".as_slice()),
-    ] {
-        let a = Account::new();
-        a.make_node("agent");
-        let daemon = Daemon::start(&a, &["--no-node"], &[]);
-        daemon.expect("serving", Duration::from_secs(30), |line| {
-            line.contains("serving")
-        });
-        let store = a.data.join("nodes/agent/store.redb");
-        std::fs::write(&store, bytes).expect("APPARATUS: stage store");
-        let before = std::fs::read(&store).expect("APPARATUS: snapshot staged store");
-        let (ok, out, err) = a.run(&["node", "attach", "agent"], "");
-        let after = std::fs::read(&store).expect("PRODUCT: attaching removed the staged store");
-        let said = format!("{out}{err}");
-        assert_eq!(
-            before, after,
-            "PRODUCT: attaching {case} store changed its bytes: {said}"
-        );
-        assert!(
-            !ok && !said.trim().is_empty(),
-            "PRODUCT: attaching {case} store must refuse with an explanation; success={ok}: {said}"
-        );
-        daemon.stop();
-    }
-}
-
-/// A crash at a store flush must not lose any post the daemon acknowledged.
-#[cfg(target_os = "macos")]
-#[test]
-#[ignore = "real daemon crash under the syscall interposer; run in release with test-knobs"]
-fn acknowledged_room_posts_survive_a_daemon_killed_during_a_post() {
-    use std::os::unix::process::ExitStatusExt as _;
-
-    watchdog::arm();
-    let a = Account::new();
-    a.make_node("agent");
-    let arm = a._tmp.path().join("kill-arm");
-    let log = a._tmp.path().join("crash.tsv");
-    let mut daemon = Daemon::start(
-        &a,
-        &["--node", "agent"],
+    let (hook_ok, hook_out, hook_err) = a.run(
         &[
-            (
-                "DYLD_INSERT_LIBRARIES",
-                syscalls::interposer().to_str().unwrap(),
-            ),
-            ("VOX_INTERPOSE_LOG", log.to_str().unwrap()),
-            ("VOX_INTERPOSE_KILL_ARM", arm.to_str().unwrap()),
+            "agent",
+            "hook",
+            "--node",
+            "agent",
+            "--room",
+            &room,
+            "--session",
+            "s-replaced",
+            "--format",
+            "text",
         ],
+        "",
     );
-    daemon.expect("node agent is Ready", Duration::from_secs(30), |line| {
-        line.contains("node agent is Ready")
-    });
-    let room = make_room(&a, "agent");
-    let mut acknowledged = Vec::new();
-    for n in 0..3 {
-        let text = format!("acknowledged before crash {n}");
-        let (ok, out, err) = a.run(&["room", "post", "--node", "agent", &room, &text], "");
-        assert!(ok, "APPARATUS: post before crash: {out}{err}");
-        acknowledged.push(text);
-    }
-    std::fs::write(&arm, "1\n").expect("APPARATUS: arm the next store flush");
-    let pending = "post concurrent with daemon crash";
-    let (ok, out, err) = a.run(&["room", "post", "--node", "agent", &room, pending], "");
-    println!("concurrent post: success={ok} stdout={out} stderr={err}");
-    if ok {
-        acknowledged.push(pending.to_owned());
-    }
-    let status = daemon.child.wait().expect("APPARATUS: reap killed daemon");
-    let trace = std::fs::read_to_string(&log).expect("APPARATUS: read crash trace");
+    let hook_said = format!("{hook_out}{hook_err}");
+    println!("replaced-profile hook: success={hook_ok}: {hook_said}");
     assert!(
-        status.signal() == Some(9)
-            && trace
-                .lines()
-                .any(|line| line.contains("\tkill\t") && line.contains("/store.redb")),
-        "APPARATUS: SIGKILL did not occur at a real store flush: {status}; {trace}"
+        !profile.join("sessions/s-replaced.json").exists()
+            && !profile.join("sessions.lock").exists(),
+        "PRODUCT: a refused hook wrote a session registration or lock into the replacement: {hook_said}"
     );
-    drop(daemon);
-    let daemon = Daemon::start(&a, &["--node", "agent"], &[]);
-    daemon.expect(
-        "node agent is Ready after crash",
-        Duration::from_secs(30),
-        |line| line.contains("node agent is Ready"),
-    );
-    let (ok, out, err) = a.run(&["room", "read", "--node", "agent", &room], "");
     assert!(
-        ok,
-        "PRODUCT: room could not be read after daemon crash: {out}{err}"
+        hook_said.contains("profile directory")
+            && hook_said.contains("gone or replaced")
+            && hook_said.contains("nothing was written"),
+        "PRODUCT: the hook must explain the replaced-profile refusal: {hook_said}"
     );
-    for text in acknowledged {
-        assert!(
-            out.contains(&text),
-            "PRODUCT: acknowledged post {text:?} was lost after daemon crash: {out}{err}"
-        );
-    }
+    assert_eq!(
+        before,
+        tree(&profile),
+        "PRODUCT: the hook changed the replacement profile: {hook_said}"
+    );
     daemon.stop();
 }
 

@@ -935,10 +935,17 @@ impl Store {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         if super::paths::FileIdentity::of(&self.path).ok() != Some(opened) {
+            let node = self
+                .path
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                .unwrap_or("<node>");
+            let unlock = vox_text::shell::command(&["vox", "node", "unlock", "--", node]);
             return Err(Error::Path {
                 op: "write the opened store",
                 detail: format!(
-                    "store {} is gone or replaced; nothing was written; stop the old daemon and attach the current node",
+                    "store {} is gone or replaced; nothing was written; run `vox daemon --restart`, then `{unlock}`",
                     self.path.display()
                 ),
             });

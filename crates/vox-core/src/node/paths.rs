@@ -803,11 +803,16 @@ pub(crate) fn verify_profile_directory(path: &Path, opened: Option<FileIdentity>
     if opened.is_some() && FileIdentity::of(path).ok() == opened {
         return Ok(());
     }
+    let node = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("<node>");
+    let unlock = vox_text::shell::command(&["vox", "node", "unlock", "--", node]);
     Err(Error::Path {
         op: "write the opened profile directory",
         detail: format!(
-            "profile directory {} is gone or replaced; nothing was written; stop the old daemon \
-             and attach the current node",
+            "profile directory {} is gone or replaced; nothing was written; run `vox daemon --restart`, \
+             then `{unlock}`",
             path.display()
         ),
     })
