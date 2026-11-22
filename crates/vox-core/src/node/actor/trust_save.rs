@@ -429,6 +429,7 @@ pub(super) enum ReconcileAction {
     Withdraw {
         target: Digest32,
     },
+    /// Only the withdrawal hold of the proofs returns this: the shipped build never waits here.
     #[cfg(feature = "test-knobs")]
     Progress,
     Complete,

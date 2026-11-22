@@ -9935,6 +9935,11 @@ impl Node {
                 return Ok(None);
             };
             channel.require_governance_ready(profile.store(), self.now_ms())?;
+            // Left copies are deliberately absent from open_channels. Their
+            // checked publication must finish without waiting for a visible row.
+            if is_leaving(&channel) {
+                return Ok(Some(true));
+            }
             let view = self.view_tx.borrow();
             let Some(detail) = view
                 .open_channels
