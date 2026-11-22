@@ -26,7 +26,7 @@ const BYTES: usize = 64 * 1024 * 1024;
 /// One displayed page, including JSON string escaping and metadata.
 const PAGE_BYTES: usize = 96 * 1024;
 const PAGE_ROWS: usize = 64;
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+const VERSION: &str = version::CLAIM_RULES;
 // Two transient folds across the daemon. Admission refuses rather than accumulating waiters.
 static READERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 const CHANGED: &str = "the room's work board changed while reading";

@@ -793,7 +793,7 @@ cargo test --release -p vox-tui --features test-knobs --test install_sh_proof \
   install_sh_installs_what_it_verified_and_refuses_what_it_could_not -- --exact --nocapture
 VOX_PROOF_NEXT_BINARY=/absolute/path/to/9.x/vox cargo test --release -p vox-tui \
   --features test-knobs --test update_proof \
-  an_update_restarts_its_daemon_and_refuses_a_different_local_version -- --ignored --exact --nocapture
+  an_update_restarts_its_daemon_and_uses_a_different_local_version -- --ignored --exact --nocapture
 ```
 
 Build the fixture from a copy of the same tree with the workspace version's first

@@ -213,14 +213,14 @@ def startup():
     print("VERDICT GREEN: installed policy no longer gates the sibling's room operation; the original Session opens without another hook", flush=True)
 
 class Host:
-    def __init__(self, cwd, room_id=None, stop_after_decision=False):
+    def __init__(self, cwd, room_id=None, stop_after_decision=False, binary=None):
         self.session = "rg4-native-" + os.urandom(8).hex()
         self.lines = []
         self.cv = threading.Condition()
         self.hold = ROOT / "turn-hold"
         ext = ROOT / "extension.mjs"
         ext.write_text(run(["agent", "plugin", "omp", "--node", "agent"]).stdout)
-        env = dict(ENV, VOX_BIN=VOX, RCA_HOLD_FILE=str(self.hold))
+        env = dict(ENV, VOX_BIN=binary or VOX, RCA_HOLD_FILE=str(self.hold))
         if stop_after_decision:
             env["RCA_STOP_AFTER_ASIDE_DECISION"] = "1"
         if room_id:
@@ -247,6 +247,95 @@ class Host:
         self.send("turn " + text)
         self.await_line("turn-end: prompt", mark)
         return mark
+
+def identity_refusal():
+    r = room()
+    create("person")
+    link = run(["room", "link", r, "--node", "agent"]).stdout.strip()
+    run(["room", "join", link, "--node", "person", "--passphrase-file", "-"], "room passphrase\n")
+    person = run(["id", "--node", "person"]).stdout.strip()
+    original = run(["id", "--node", "agent"]).stdout.strip()
+    def room_policy_idle(node):
+        status = run(["status", "--json", "--node", node], check=False)
+        if status.returncode != 0:
+            return False
+        view = json.loads(status.stdout)
+        return view.get("governance_pending") is False and not view.get("preparing")
+    wait(lambda: room_policy_idle("agent") and room_policy_idle("person"),
+         "both nodes finish the join's policy work before trust changes")
+    run(["trust", "add", person, "--node", "agent", "--name", "person"], "\n")
+    run(["trust", "add", original, "--node", "person", "--name", "agent"], "\n")
+    # Keep a real prepare's exit pending after its real child has saved the decision.
+    # This wrapper preserves its output and exit status; it changes only EOF timing.
+    gate = ROOT / "prepare-exit"
+    wrapper = ROOT / "vox-gated"
+    wrapper.write_text("""#!/bin/bash
+printf '%s\\n' "$*" >> "$RG10_GATE.commands"
+if [[ " $* " == *" --omp-prepare "* && -e "$RG10_GATE.arm" ]]; then
+  "$RG10_REAL" "$@"
+  code=$?
+  printf '%s\\n' "$code" > "$RG10_GATE.closed"
+  while [[ ! -e "$RG10_GATE.release" ]]; do sleep 0.02; done
+  exit "$code"
+fi
+exec "$RG10_REAL" "$@"
+""")
+    wrapper.chmod(0o700)
+    ENV.update(RG10_GATE=str(gate), RG10_REAL=VOX)
+    host = Host(WORK, r, binary=str(wrapper))
+    host.turn("hello")
+    gate.with_suffix(".arm").write_text("hold")
+    host.hold.with_suffix(".arm").write_text("hold")
+    run(["room", "post", r, "--node", "person", "--type", "ask", "--to", original,
+         "--session", "rg10-person", "rg10-decided-before-rebuild"])
+    host.await_line("hold-begin")
+    old = pid()
+    os.kill(old, signal.SIGTERM)
+    wait(lambda: children[0].poll() is not None, "owned old daemon exited before decision")
+    children[0].wait()
+    host.hold.with_suffix(".arm").unlink(missing_ok=True)
+    host.hold.write_text("release")
+    host.await_line("turn-end: aside")
+    wait(lambda: gate.with_suffix(".closed").exists(), "decided prepare reached held EOF")
+    assert int(gate.with_suffix(".closed").read_text()) != 0, \
+        "APPARATUS: stopped daemon did not leave a failed acknowledgement"
+    saved = []
+    for file in DATA.glob("**/omp-uncertain/*"):
+        try:
+            value = json.loads(file.read_text())
+        except (OSError, ValueError):
+            continue
+        if value.get("session") == host.session and value.get("decision") is True:
+            saved.append(value)
+    assert saved, "APPARATUS: real prepare did not save the native decision"
+    # No process owns the old profile now. Rebuild that node, not a live directory.
+    (DATA / "nodes/agent").rename(DATA / "nodes/original-agent")
+    create("agent")
+    rebuilt = run(["id", "--node", "agent"]).stdout.strip()
+    assert rebuilt != original, "APPARATUS: rebuilt node kept the original identity"
+    host.await_line("This conversation is refused")
+    commands_before = gate.with_suffix(".commands").read_text().splitlines()
+    gate.with_suffix(".release").write_text("release")
+    def preparation_exited():
+        rows = subprocess.run(["ps", "-axo", "ppid=,command="], capture_output=True, text=True).stdout
+        return not any(line.split(None, 1)[0] == str(host.p.pid) and "--omp-prepare" in line
+                       for line in rows.splitlines() if line.split())
+    wait(preparation_exited, "held prepare exited after permanent refusal")
+    host.turn("after permanent refusal")
+    host.turn("refused again")
+    host.send("quit")
+    host.p.wait()
+    notices = [line for line in host.lines if "NOTIFY:" in line]
+    assert sum("This conversation is refused" in line for line in notices) == 1, \
+        "PRODUCT: rebuilt identity refusal must be said exactly once"
+    assert not any("reacquir" in line.lower() for line in notices), \
+        "PRODUCT: permanent refusal must not promise reacquiring registration"
+    commands_after = gate.with_suffix(".commands").read_text().splitlines()
+    assert not any("agent hook" in line for line in commands_after[len(commands_before):]), \
+        "PRODUCT: permanent refusal retried a hook against the rebuilt identity"
+    assert not (DATA / "nodes/agent/sessions" / f"{host.session}.json").exists(), \
+        "PRODUCT: refused conversation registered against its rebuilt identity"
+    print("VERDICT GREEN: decided turn's late exit preserves one permanent refusal and never reacquires", flush=True)
 
 def extension(moved=False, resumed=False):
     r = room()
@@ -428,6 +517,8 @@ try:
         riders()
     elif CASE == "undecided":
         undecided()
+    elif CASE == "identity":
+        identity_refusal()
     else:
         raise AssertionError("APPARATUS: unknown journey " + CASE)
 finally:

@@ -1085,9 +1085,6 @@ pub async fn node_rename(args: &NodeArgs, old: &str, new: &str) -> Result<(), Ap
                 Ok(other) => Err(crate::client::unexpected_daemon(&other)),
                 Err(e) => Err(AppError::Usage(e.to_string())),
             },
-            Err(e @ vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Version { .. })) => {
-                Err(AppError::Usage(e.to_string()))
-            }
             Err(_) => forget_kept(&account, &old),
         };
         if let Err(e) = forgotten {
@@ -1373,9 +1370,6 @@ pub async fn attach_with(
 pub async fn attached(account: &Account, name: &NodeName) -> Result<bool, AppError> {
     let mut d = match DaemonClient::open(&account.socket()).await {
         Ok(d) => d,
-        Err(e @ vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Version { .. })) => {
-            return Err(AppError::Usage(e.to_string()));
-        }
         Err(_) => return Ok(false),
     };
     let nodes = match d.request(DaemonRequest::Nodes).await {
@@ -1518,9 +1512,6 @@ pub async fn node_list(args: &NodeArgs) -> Result<(), AppError> {
             Ok(other) => return Err(unexpected_daemon(&other)),
             Err(e) => return Err(AppError::Usage(e.to_string())),
         },
-        Err(e @ vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Version { .. })) => {
-            return Err(AppError::Usage(e.to_string()));
-        }
         Err(e) => return Err(AppError::Usage(e.to_string())),
     };
     let mut names: Vec<NodeName> = running.iter().map(|n| n.name.clone()).collect();
@@ -1557,12 +1548,6 @@ pub(crate) const START_DAEMON: &str = if cfg!(target_os = "macos") {
 /// The daemon, or why there is none.
 async fn daemon(account: &Account) -> Result<DaemonClient, AppError> {
     DaemonClient::open(&account.socket()).await.map_err(|e| {
-        if matches!(
-            &e,
-            vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Version { .. })
-        ) {
-            return AppError::Usage(e.to_string());
-        }
         AppError::Usage(format!(
             "no vox daemon answers at {} ({e}); to start one, {START_DAEMON}",
             account.socket().display()
