@@ -501,7 +501,11 @@ fn publish_group(
     let mut after = None;
     while let Some((key, unit_id)) = index.nested_next(events, after)? {
         let unit = Unit::read(&index.descriptor(unit_id)?)?;
-        let id = index.waiting_find(unit.sources, &key)?.ok_or_else(bad)?;
+        // A source pruned since the replay is no longer eligible, like an unreadable one below.
+        let Some(id) = index.waiting_find(unit.sources, &key)? else {
+            after = Some(key);
+            continue;
+        };
         let source = unit.source(&key, id)?;
         let read = if unit_id == target {
             working
