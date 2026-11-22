@@ -1699,7 +1699,14 @@ fn sparse_live_window_reads_healthy(scene: WindowScene) {
     }
     watchdog::arm();
     let sink = UdpSocket::bind("127.0.0.1:0").expect("APPARATUS: service socket");
-    let w = World::new(sink.local_addr().expect("APPARATUS: address").port(), true);
+    let mut w = World::new(sink.local_addr().expect("APPARATUS: address").port(), true);
+    if stalled {
+        w.tmp.disable_cleanup(true);
+        eprintln!(
+            "[proof] stalled reader scratch retained on failure: {}",
+            w.tmp.path().display()
+        );
+    }
     let reader = if offline {
         w.guest_dir.clone()
     } else {
@@ -1832,7 +1839,7 @@ fn sparse_live_window_reads_healthy(scene: WindowScene) {
             &env,
         );
         process.expect_line("reader daemon ready", |line| {
-            if offline || stalled {
+            if offline {
                 line.contains("holding room") && line.contains(&w.room)
             } else {
                 line.starts_with("vox daemon: control socket")
@@ -1844,7 +1851,20 @@ fn sparse_live_window_reads_healthy(scene: WindowScene) {
         let (ok, _, out, err) = w.join(&reader);
         assert!(ok, "APPARATUS: newcomer did not join: {out}{err}");
     }
+    // The stalled act measures receipts, not automatic saved-room recovery (ledger entry 40).
     local_attach::Root::at(&reader, world::IDENTITY).attach("default");
+    if stalled {
+        eprintln!(
+            "[proof] stalled reader after explicit attach: {}",
+            status_json(&reader, "explicitly attached stalled reader")
+        );
+        restarted
+            .as_mut()
+            .unwrap()
+            .expect_line("reader room opened after explicit attach", |line| {
+                line.contains("holding room") && line.contains(&w.room)
+            });
+    }
     let mut catchup_start = None;
     let mut first_shown = 0;
     if staged {
@@ -1913,6 +1933,7 @@ fn sparse_live_window_reads_healthy(scene: WindowScene) {
                     && last_received >= started + (posts - 1) * 60_000
                 {
                     eprintln!("[proof] held author, {posts} other-member posts received, room last sync {last_received} > {started}:\n{text}\n{snapshot}");
+                    w.tmp.disable_cleanup(false);
                     return;
                 }
                 let elapsed = snapshot["now_ms"].as_u64().unwrap().saturating_sub(started);
