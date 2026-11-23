@@ -24,6 +24,17 @@ struct Pruned {
     legacy_kind: Option<bool>,
 }
 
+/// `test-knobs` mutant: a lengthening is projected without keeping what the shorter lifetime
+/// had made due. Never selectable in a build without the feature.
+fn lengthening_unfenced() -> bool {
+    #[cfg(feature = "test-knobs")]
+    if std::env::var_os("VOX_TEST_RETENTION_FLOOR_MUTANT").is_some() {
+        eprintln!("test-knobs: retention floor mutant engaged: a lengthening un-dues what was due");
+        return true;
+    }
+    false
+}
+
 enum Work {
     Cleanup {
         remove: Vec<(Digest32, u64, Option<Digest32>)>,
@@ -238,6 +249,17 @@ impl ChannelState {
                     false
                 };
                 if state.policy != Some(policy) {
+                    // A longer lifetime must not bring back what the shorter one had already
+                    // made due, whether or not its removal ran: that stays due. It is saved with
+                    // the new policy, before any read answers under it, and survives a restart.
+                    if let Some(old) = state.policy {
+                        for ((floor, was), new) in state.floor.iter_mut().zip(old).zip(policy) {
+                            if was != 0 && (new == 0 || new > was) && !lengthening_unfenced() {
+                                *floor =
+                                    (*floor).max(now_ms.saturating_sub(was.saturating_mul(1_000)));
+                            }
+                        }
+                    }
                     state.policy = Some(policy);
                     state.pending = true;
                     state.cursor = None;
@@ -289,8 +311,13 @@ impl ChannelState {
                 }
             }
             Step::Prune => {
-                let (selected, _) =
-                    read.retention_due(now_ms, retention.0, retention.1, entry_store::DUE_ENTRIES)?;
+                let (selected, _) = read.retention_due(
+                    now_ms,
+                    retention.0,
+                    retention.1,
+                    self.projection_state.floor,
+                    entry_store::DUE_ENTRIES,
+                )?;
                 let mut due = Vec::new();
                 let mut bytes = 0usize;
                 for (hash, tracked) in selected {

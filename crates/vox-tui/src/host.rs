@@ -42,7 +42,7 @@ use vox_core::node::actor::{ActorEnd, Bind, Node, NodeConfig, NodeHandle};
 use vox_core::node::api::{Fault, NodeCommand, Outcome, Secret};
 use vox_core::node::daemonipc::{
     AnchorInfo, AnchorSource, DaemonEvent, DaemonFrame, DaemonRequest, DaemonStatus, DetachCause,
-    KeepSource, NodeInfo, NodeState, NodeStatus, Refusal, UseNode,
+    KeepSource, NodeInfo, NodeState, NodeStatus, Refusal, StartupWork, UseNode,
 };
 use vox_core::node::ipc::{Dispatch, Lease};
 use vox_core::node::paths::{Account, NodeName, Paths};
@@ -233,7 +233,10 @@ type DetachOutcome = Option<Result<(), Refusal>>;
 /// One node's place in its life (L-1). A node with no slot is detached.
 enum Slot {
     /// Being attached; the outcome arrives here.
-    Attaching(watch::Receiver<Option<Result<(), Refusal>>>),
+    Attaching(
+        watch::Receiver<Option<Result<(), Refusal>>>,
+        Arc<Mutex<Option<StartupWork>>>,
+    ),
     /// Running.
     Attached(Box<Attached>),
     /// Being detached; the outcome arrives after its remembered-state cleanup finishes.
@@ -1409,13 +1412,17 @@ impl Router {
             })
     }
 
-    /// The attached nodes, as the hello says them.
+    /// Attached nodes and nodes reporting startup work, as the hello says them.
     #[must_use]
     pub fn attached(&self) -> Vec<NodeInfo> {
         let slots = lock(&self.inner.slots);
         slots
             .iter()
-            .filter(|(_, s)| matches!(s, Slot::Attached(_)))
+            .filter(|(_, slot)| match slot {
+                Slot::Attached(_) => true,
+                Slot::Attaching(_, work) => lock(work).is_some(),
+                Slot::Detaching(_) => false,
+            })
             .map(|(n, s)| info_of(n, Some(s)))
             .collect()
     }
@@ -4504,7 +4511,7 @@ impl Router {
                             None => DStep::NotAttached,
                         }
                     }
-                    Some(Slot::Attaching(rx)) => DStep::WaitAttach(rx.clone()),
+                    Some(Slot::Attaching(rx, _)) => DStep::WaitAttach(rx.clone()),
                     Some(Slot::Detaching(rx)) => DStep::WaitDetach(rx.clone()),
                     None if matches!(cause, DetachCause::Requested) => {
                         // A previous cleanup may have failed after the actor stopped. Reserve
@@ -4745,7 +4752,7 @@ impl Router {
                         };
                         Step::Have(Box::new(self.grant(node, a, w)?))
                     }
-                    Some(Slot::Attaching(rx)) => Step::WaitAttach(rx.clone()),
+                    Some(Slot::Attaching(rx, _)) => Step::WaitAttach(rx.clone()),
                     Some(Slot::Detaching(rx)) => Step::WaitDetach(rx.clone()),
                     None => {
                         // A protected node needs the person's Unlock. A passphrase-free
@@ -4757,7 +4764,10 @@ impl Router {
                             Step::NotAttached
                         } else {
                             let (tx, rx) = watch::channel(None);
-                            slots.insert(node.clone(), Slot::Attaching(rx));
+                            slots.insert(
+                                node.clone(),
+                                Slot::Attaching(rx, Arc::new(Mutex::new(None))),
+                            );
                             Step::Mine(tx)
                         }
                     }
@@ -5125,6 +5135,10 @@ impl Router {
         };
         let serve_only = lock(&self.inner.serve_only).get(node).cloned();
         let (room_removed, removals) = tokio::sync::mpsc::channel(1);
+        let startup_work = match lock(&self.inner.slots).get(node) {
+            Some(Slot::Attaching(_, reason)) => Some(Arc::clone(reason)),
+            _ => None,
+        };
         let (handle, actor) = loop {
             let mut cfg = NodeConfig::new()
                 .anchors(set.clone())
@@ -5132,6 +5146,9 @@ impl Router {
             cfg.history_budget = Arc::clone(&self.inner.history_budget);
             cfg.computer = Some(Arc::clone(&self.inner.defaults.computer.computer));
             cfg.session_room_removed = Some(room_removed.clone());
+            if let Some(reason) = startup_work.as_ref().map(Arc::clone) {
+                cfg.on_startup_work = Some(Arc::new(move |note| *lock(&reason) = note));
+            }
             if let Some(bind) = &bind {
                 cfg = cfg.bind(bind.clone());
             }
@@ -5692,6 +5709,7 @@ fn info_of_attached(name: &NodeName, a: &Attached) -> NodeInfo {
         fingerprint: a.fingerprint,
         implicit: a.implicit,
         keep: a.keep.is_some(),
+        startup: None,
     }
 }
 
@@ -5701,7 +5719,7 @@ fn info_of(name: &NodeName, slot: Option<&Slot>) -> NodeInfo {
         other => NodeInfo {
             name: name.clone(),
             state: match other {
-                Some(Slot::Attaching(_)) => NodeState::Attaching,
+                Some(Slot::Attaching(..)) => NodeState::Attaching,
                 Some(Slot::Detaching(_)) => NodeState::Detaching,
                 _ => NodeState::Detached,
             },
@@ -5709,6 +5727,10 @@ fn info_of(name: &NodeName, slot: Option<&Slot>) -> NodeInfo {
             status: None,
             implicit: false,
             keep: false,
+            startup: match other {
+                Some(Slot::Attaching(_, reason)) => lock(reason).clone(),
+                _ => None,
+            },
         },
     }
 }

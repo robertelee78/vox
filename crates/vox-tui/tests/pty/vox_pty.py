@@ -1,6 +1,6 @@
 """vox_pty.py — what every pty driver of the shipped `vox tui` shares, bounded (V210-54, #240).
 
-`tui_member_names.py` hung for 40 minutes on the macOS CI runner (run 36397085576) and took the
+A pty driver of `vox tui` once hung for 40 minutes on the macOS CI runner (run 36397085576) and took the
 whole job past its limit, with no word of where. So nothing here waits without a bound, and a
 driver that is still running past its budget says which stage it was at and where in the driver
 it stood, then cleans up and exits red:

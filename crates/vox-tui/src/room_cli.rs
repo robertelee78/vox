@@ -2043,6 +2043,55 @@ pub struct Tagged {
     pub from: Option<String>,
 }
 
+/// One `RoomPage`, waiting while the room refreshes its saved history (just after a retention
+/// change, one projection turn). A "not yet" is asked again by whoever was told it (ADR-052
+/// RG-4): at the client's cadence, saying once what it waits for, and giving the refusal
+/// unchanged at the client's start patience, as a command does for a preparing room.
+async fn room_page_waiting(
+    client: &mut IpcClient,
+    channel_id: Digest32,
+    before: Option<Digest32>,
+    limit: u64,
+) -> Result<Frame, AppError> {
+    let mut waiting_since: Option<std::time::Instant> = None;
+    loop {
+        let frame = client
+            .request(&Request::RoomPage {
+                channel_id,
+                before,
+                limit,
+            })
+            .await?;
+        let refreshing = matches!(&frame, Frame::Error { reason }
+            if reason.contains(vox_core::node::api::HISTORY_REFRESHING));
+        if !refreshing
+            || refresh_wait_off()
+            || waiting_since
+                .is_some_and(|began| began.elapsed() >= crate::daemon_client::START_WITHIN)
+        {
+            return Ok(frame);
+        }
+        if waiting_since.is_none() {
+            waiting_since = Some(std::time::Instant::now());
+            eprintln!(
+                "vox: waiting for room {} to finish refreshing its saved history",
+                id(&channel_id)
+            );
+        }
+        tokio::time::sleep(crate::daemon_client::NODE_WAIT_POLL).await;
+    }
+}
+
+/// `test-knobs` mutant: a read refused while its room refreshes is not waited for.
+fn refresh_wait_off() -> bool {
+    #[cfg(feature = "test-knobs")]
+    if std::env::var_os("VOX_TEST_REFRESH_WAIT_MUTANT").is_some() {
+        eprintln!("test-knobs: refresh wait mutant engaged: the refused read is not waited for");
+        return true;
+    }
+    false
+}
+
 /// The rows a read shows: those after `since`, at most `limit` (0 for all), or with `tagged`'s
 /// tags the room's messages carrying them all, from the node's index (#636). `None` when the
 /// cursor is not in the room.
@@ -2056,14 +2105,7 @@ async fn rows_of(
 ) -> Result<Option<Vec<vox_core::node::api::MessageRow>>, AppError> {
     if tagged.tags.is_empty() {
         if since.is_none() {
-            return match client
-                .request(&vox_core::node::ipc::Request::RoomPage {
-                    channel_id,
-                    before,
-                    limit: limit as u64,
-                })
-                .await?
-            {
+            return match room_page_waiting(client, channel_id, before, limit as u64).await? {
                 vox_core::node::ipc::Frame::RoomPage {
                     rows,
                     older,

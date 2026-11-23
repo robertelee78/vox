@@ -9797,7 +9797,19 @@ async fn open_as_attached(
         return Err(named(&at.path, e).await);
     }
     drop(opening);
-    let Some(answer) = read_frame(&mut stream).await? else {
+    let answer = {
+        let pending = read_frame(&mut stream);
+        tokio::pin!(pending);
+        if at.waiting.is_some() {
+            tokio::select! {
+                out = &mut pending => out?,
+                () = say_startup_work(at) => pending.await?,
+            }
+        } else {
+            pending.await?
+        }
+    };
+    let Some(answer) = answer else {
         return Err(hung_up(&at.path).await);
     };
     match DaemonFrame::from_bytes(&answer)? {
@@ -9821,6 +9833,29 @@ async fn open_as_attached(
             reason: r.to_string(),
         })),
         _ => Err(Error::Ipc(IpcHandshake::NotHello)),
+    }
+}
+
+// A pending Use already waits for its actual Ready answer. Observe the existing node record
+// alongside that wait, without extending a hook/app caller's enclosing timeout.
+async fn say_startup_work(at: &NodeSocket) {
+    use crate::node::daemonipc::{DaemonClient, DaemonFrame, DaemonRequest};
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let Ok(mut daemon) = DaemonClient::open(&at.path).await else {
+            continue;
+        };
+        let Ok(DaemonFrame::Nodes(nodes)) = daemon.request(DaemonRequest::Nodes).await else {
+            continue;
+        };
+        if let Some(work) = nodes
+            .iter()
+            .find(|node| node.name == at.using.node)
+            .and_then(|node| node.startup.as_ref())
+        {
+            eprintln!("vox: {}", work.reason);
+            return;
+        }
     }
 }
 

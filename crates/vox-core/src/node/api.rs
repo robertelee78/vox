@@ -105,6 +105,11 @@ pub struct MessageRow {
 /// V030-10).
 pub const NOT_RECEIVED_YET: &str = "(not received yet)";
 
+/// A saved-history read refused while the room's projection is not current, for example just
+/// after a retention change. The one copy of these words: the daemon answers with them, and
+/// `vox room read` recognises them to wait for that projection turn.
+pub const HISTORY_REFRESHING: &str = "the room is refreshing saved history; retry";
+
 /// Rows the view carries, oldest first, in shared chunks (V210-120): a room's timeline, and the
 /// positions of its structured posts.
 ///

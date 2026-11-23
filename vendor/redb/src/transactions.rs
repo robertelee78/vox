@@ -2415,6 +2415,14 @@ impl WriteTransaction {
         }
 
         table_tree.relocate_tables(&relocation_map)?;
+        #[cfg(feature = "vox-test-knobs")]
+        if progress && let Some(marker) = std::env::var_os("VOX_TEST_COMPACT_RELOCATED") {
+            std::fs::write(&marker, "table pages relocated before commit")
+                .map_err(crate::StorageError::from)?;
+            while std::path::Path::new(&marker).exists() {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
         system_table_tree.relocate_tables(&relocation_map)?;
 
         Ok(progress)
@@ -2791,6 +2799,11 @@ impl ReadTransaction {
             tree: TableTree::new(root_page, PageHint::Clean, guard, resolver)
                 .map_err(TransactionError::Storage)?,
         })
+    }
+
+    /// Vox decides whether to compact from allocator state without reading the store.
+    pub fn allocated_bytes(&self) -> Result<u64> {
+        Ok(self.mem.count_allocated_pages()? * self.mem.get_page_size() as u64)
     }
 
     /// Open the given table

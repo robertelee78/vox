@@ -137,10 +137,17 @@ what arrived after it, including late messages from members who were offline. `-
 gives what was done to the room, such as a rename or a retention change.
 
 A newly created room builds its first saved-history projection before it is shown as readable.
-Later projection work or an expiry backlog larger than one sweep can still answer
-`the room is refreshing saved history; retry`; that answer does not mean the node is downloading
-the room's whole history. Within one sweep, reads exclude expired messages and report exact
+Later projection work, such as right after a retention change, or an expiry backlog larger than
+one sweep can make the node answer `the room is refreshing saved history; retry`; that answer does
+not mean the node is downloading the room's whole history. `vox room read` waits for that work
+instead: it prints `vox: waiting for room <id> to finish refreshing its saved history` once, then
+the messages when the work is done, and gives the node's answer only if it has not finished within
+15 seconds. The terminal app, the Mac app, an agent's hook and `vox room read --since` or `--tag`
+still get the answer at once. Within one sweep, reads exclude expired messages and report exact
 pages and totals without waiting for physical deletion.
+A message that expired stays gone: a longer retention set afterwards, by the room or by your
+node's own setting, does not bring it back, even if its deletion had not run yet or the node
+restarted in between.
 
 A row that reads `(not received yet)` is a message whose text your node is still waiting for. See
 [a message says not received yet](troubleshooting.md#a-message-says-not-received-yet).

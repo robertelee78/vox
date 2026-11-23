@@ -98,26 +98,14 @@ fn vox_with(
     stdin: Option<&str>,
     identity: Option<&str>,
 ) -> (bool, String, String) {
-    let mut cmd = Command::new(VOX);
-    match identity {
-        Some(p) => cmd.env("VOX_IDENTITY_PASSPHRASE", p),
-        None => cmd.env_remove("VOX_IDENTITY_PASSPHRASE"),
-    };
-    cmd.args(args)
-        .env("VOX_DATA_DIR", dir)
-        .env("VOX_CONFIG_DIR", dir.join("cfg"))
-        .env("VOX_TEST_KEYCHAIN", attach::keychain(dir))
-        .env("VOX_PROXY", "127.0.0.1:0")
-        .env_remove("VOX_ROOM")
-        .env_remove("VOX_NODE")
-        .env_remove("VOX_SESSION")
-        .stdin(if stdin.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    let mut cmd = vox_command(dir, args, identity);
+    cmd.stdin(if stdin.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
     // A keyring change's passphrase is typed at a terminal, as a person types it (ADR-028 K-13).
     if typed::is_keyring_change(args) {
         let (ok, shown) = typed::keyring(&cmd);
@@ -139,6 +127,29 @@ fn vox_with(
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
     )
+}
+
+/// A `vox args` command on `dir`'s profile, before its stdio is chosen. The read wait's mutant
+/// reaches it as the knob the command reads.
+fn vox_command(dir: &Path, args: &[&str], identity: Option<&str>) -> Command {
+    let mut cmd = Command::new(VOX);
+    match identity {
+        Some(p) => cmd.env("VOX_IDENTITY_PASSPHRASE", p),
+        None => cmd.env_remove("VOX_IDENTITY_PASSPHRASE"),
+    };
+    cmd.args(args)
+        .env("VOX_DATA_DIR", dir)
+        .env("VOX_CONFIG_DIR", dir.join("cfg"))
+        .env("VOX_TEST_KEYCHAIN", attach::keychain(dir))
+        .env("VOX_PROXY", "127.0.0.1:0")
+        .envs(
+            std::env::var_os("VOX_MUTANT_REFRESH_WAIT")
+                .map(|on| ("VOX_TEST_REFRESH_WAIT_MUTANT", on)),
+        )
+        .env_remove("VOX_ROOM")
+        .env_remove("VOX_NODE")
+        .env_remove("VOX_SESSION");
+    cmd
 }
 
 fn daemon(dir: &Path, tag: &str, stdin_lines: &str) -> Daemon {
@@ -172,6 +183,10 @@ fn daemon_on(dir: &Path, tag: &str, stdin_lines: &str, listen: &str) -> Daemon {
             std::env::var("VOX_MUTANT_EXPIRY").unwrap_or_default(),
         )
         .env("VOX_TEST_HOLD_EXPIRY_PRUNE_FILE", dir.join("hold-expiry"))
+        .envs(
+            std::env::var_os("VOX_MUTANT_RETENTION_FLOOR")
+                .map(|on| ("VOX_TEST_RETENTION_FLOOR_MUTANT", on)),
+        )
         .env_remove("VOX_ROOM")
         .env_remove("VOX_NODE")
         .env_remove("VOX_SESSION")
@@ -1330,32 +1345,525 @@ fn a_room_stays_readable_while_messages_keep_expiring() {
         listed,
         "APPARATUS: restarted daemon never listed the backlog room"
     );
-    let (ok, out, err) = vox(dir, &["room", "read", "expiry", "--json"], None);
-    println!("[proof] stopped-daemon backlog first read: ok={ok} stdout={out:?} stderr={err:?}");
-    assert!(
-        !ok && err.contains("the room is refreshing saved history; retry"),
-        "PRODUCT: a backlog beyond one sweep must retain today's refusal: {out}{err}"
-    );
-    let mut caught_up = false;
+    // Hold the cleanup, so the backlog stays larger than one sweep while the act looks. The
+    // earlier arm's engagement mark is cleared first, so only this hold can set it.
+    let _ = std::fs::remove_file(dir.join("hold-expiry.engaged"));
+    std::fs::write(dir.join("hold-expiry"), b"hold the backlog's cleanup").unwrap();
+    let mut held = false;
     for _ in 0..512 {
-        let (ok, out, err) = vox(dir, &["room", "read", "expiry", "--json"], None);
+        if dir.join("hold-expiry.engaged").exists() {
+            held = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(held, "APPARATUS: the backlog's cleanup was never held");
+    // The daemon itself still refuses a backlog beyond one sweep (its own answer, asked over
+    // its socket).
+    let mut client = rt
+        .block_on(IpcClient::open_at(&socket))
+        .expect("APPARATUS: reopened expiry IPC");
+    let first = rt
+        .block_on(client.request(&Request::RoomPage {
+            channel_id: cid,
+            before: None,
+            limit: 0,
+        }))
+        .expect("APPARATUS: reopened expiry reply");
+    println!("[proof] stopped-daemon backlog first answer: {first:?}");
+    assert!(
+        matches!(&first, Frame::Error { reason }
+            if reason.contains(vox_core::node::api::HISTORY_REFRESHING)),
+        "PRODUCT: a backlog beyond one sweep must retain today's refusal: {first:?}"
+    );
+    // A person's `vox room read` waits for that cleanup, saying so, instead of being told to
+    // retry; it has not answered while the cleanup is held, and answers once it has run.
+    let mut cmd = vox_command(dir, &["room", "read", "expiry", "--json"], Some(IDENTITY));
+    let mut reader = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("APPARATUS: spawn vox room read");
+    let mut said = String::new();
+    std::io::BufRead::read_line(
+        &mut std::io::BufReader::new(reader.stderr.as_mut().expect("APPARATUS: its stderr")),
+        &mut said,
+    )
+    .expect("APPARATUS: read its stderr");
+    std::thread::sleep(Duration::from_millis(300));
+    let waiting = reader
+        .try_wait()
+        .expect("APPARATUS: the read's status")
+        .is_none();
+    std::fs::remove_file(dir.join("hold-expiry")).unwrap();
+    let answer = reader
+        .wait_with_output()
+        .expect("APPARATUS: wait for vox room read");
+    let rest = String::from_utf8_lossy(&answer.stderr);
+    println!(
+        "[proof] `vox room read` with the cleanup held: said {said:?}; still waiting 300 ms \
+         later: {waiting}; after release ok={} stderr={rest:?}",
+        answer.status.success()
+    );
+    assert!(
+        said.contains("waiting for room") && waiting,
+        "PRODUCT: `vox room read` across a held backlog must wait and say so, not refuse at \
+         once: {said}{rest}"
+    );
+    assert!(
+        answer.status.success() && answer.stdout.is_empty(),
+        "PRODUCT: once the cleanup ran, the waiting read must answer with no expired text: \
+         ok={} {}{rest}",
+        answer.status.success(),
+        String::from_utf8_lossy(&answer.stdout)
+    );
+}
+
+/// The held-prune arm above in a room where only the oldest rows are due, the common case.
+/// 40 old rows (a thread root, four of its replies and 35 posts; one native sweep takes 64) fall
+/// due while 145 newer rows (140 posts and five more replies in the same thread, more than one
+/// 128-row render leaf) stay. With that prune held, the counts, `older`, every page and the
+/// thread's summary must be exact for the 145 alone. Its own act, so that each expiry mutant
+/// reaches these assertions instead of stopping on the earlier arms of the act above.
+///
+/// The 90 seconds are the node's own (`cfg/retention`), so the node can then keep longer while
+/// it is down: stopped with its removal still held, it reopens keeping everything, and must still
+/// show only the 145. A longer lifetime never brings back what a read already left out.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "real binary, a 90-second message lifetime and a test-knobs native prune hold; release"]
+fn a_partly_expired_room_counts_pages_and_threads_only_what_remains() {
+    watchdog::arm();
+    use vox_core::node::ipc::{Frame, IpcClient, NodeSocket, Request};
+    use vox_core::node::paths::{NodeName, Paths};
+    // The old rows must all be due and the newer ones not yet at the reads: the newer posts start
+    // GAP after the last old one, and every row lives LIFETIME_S.
+    const LIFETIME_S: u64 = 90;
+    const GAP: Duration = Duration::from_secs(20);
+    const OLD_POSTS: usize = 35;
+    const NEW_POSTS: usize = 140;
+    const LIMIT: u64 = 50;
+    let scratch = tempfile::tempdir().expect("APPARATUS: partial expiry profile");
+    let dir = scratch.path();
+    std::fs::create_dir_all(dir.join("cfg")).expect("APPARATUS: partial expiry config");
+    std::fs::write(
+        dir.join("cfg").join("retention"),
+        format!("default {LIFETIME_S}\n"),
+    )
+    .expect("APPARATUS: the node's retention file");
+    let (ok, _, err) = vox(dir, &["id"], None);
+    assert!(ok, "PRODUCT (staging): identity refused: {err}");
+    let daemon_partial = daemon(dir, "partial", &format!("{IDENTITY}\n"));
+    attached(dir, "partial");
+    let (ok, _, err) = vox(
+        dir,
+        &[
+            "room",
+            "create",
+            "--name",
+            "partial",
+            "--passphrase-file",
+            "-",
+        ],
+        Some(&format!("{ROOMPASS}\n")),
+    );
+    assert!(ok, "PRODUCT (staging): create refused: {err}");
+    let mut settled = false;
+    for _ in 0..512 {
+        let (ok, out, err) = vox(dir, &["room", "read", "partial", "--json"], None);
         if ok {
-            assert!(
-                out.is_empty(),
-                "PRODUCT: backlog read showed expired text: {out}"
-            );
-            caught_up = true;
+            assert!(out.is_empty(), "APPARATUS: partial expiry room not empty");
+            settled = true;
             break;
         }
         assert!(
             err.contains("the room is refreshing saved history; retry"),
-            "PRODUCT: backlog changed its refusal: {err}"
+            "PRODUCT (staging): partial expiry policy did not settle: {err}"
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+    assert!(settled, "APPARATUS: partial expiry policy never settled");
+    let paths = Paths::resolve("default", Some(dir), Some(&dir.join("cfg"))).unwrap();
+    let socket = NodeSocket::one_shot(
+        paths.account().socket(),
+        NodeName::parse("default").unwrap(),
+    );
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut client = rt
+        .block_on(IpcClient::open_at(&socket))
+        .expect("APPARATUS: partial expiry IPC");
+    let mut request = |request: Request| {
+        rt.block_on(client.request(&request))
+            .expect("APPARATUS: partial expiry reply")
+    };
+    let Frame::Rooms { rooms } = request(Request::Rooms { after: None }) else {
+        panic!("APPARATUS: partial expiry room listing")
+    };
+    let cid = rooms
+        .iter()
+        .find(|(_, label, ..)| label == "partial")
+        .unwrap()
+        .0;
+    // Nothing is due before the old rows' lifetime ends, so the first prune with anything due
+    // is the one this holds.
+    std::fs::write(dir.join("hold-expiry"), b"hold the first native prune").unwrap();
+    post(dir, "partial", "partial-root");
+    let Frame::RoomPage { rows, .. } = request(Request::RoomPage {
+        channel_id: cid,
+        before: None,
+        limit: 1,
+    }) else {
+        panic!("PRODUCT (staging): the thread root's page refused")
+    };
+    let root = rows
+        .iter()
+        .find(|row| row.text == "partial-root")
+        .expect("PRODUCT (staging): posted root absent")
+        .entry_hash;
+    let thread = vox_core::node::link::b32_encode(&root);
+    let reply = |text: &str| {
+        serde_json::json!({"v":1,"type":"say","hops":8,"body":text,"thread":thread}).to_string()
+    };
+    let mut old = vec!["partial-root".to_owned()];
+    for n in 0..OLD_POSTS {
+        old.push(format!("partial-old-{n}"));
+        post(dir, "partial", &old[old.len() - 1]);
+        if n % 8 == 7 {
+            old.push(format!("partial-old-reply-{n}"));
+            post(dir, "partial", &reply(&old[old.len() - 1]));
+        }
+    }
+    std::thread::sleep(GAP);
+    let (mut newer, mut new_replies) = (Vec::new(), Vec::new());
+    for n in 0..NEW_POSTS {
+        newer.push(format!("partial-new-{n}"));
+        post(dir, "partial", &newer[newer.len() - 1]);
+        if n % 28 == 27 {
+            newer.push(format!("partial-new-reply-{n}"));
+            new_replies.push(newer[newer.len() - 1].clone());
+            post(dir, "partial", &reply(&newer[newer.len() - 1]));
+        }
+    }
+    println!(
+        "[proof] staged {} old rows ({} replies) then {} newer rows ({} replies)",
+        old.len(),
+        old.len() - 1 - OLD_POSTS,
+        newer.len(),
+        new_replies.len()
+    );
+    // A row by what was posted: a reply's envelope body, otherwise its text.
+    fn named(text: &str) -> String {
+        serde_json::from_str::<serde_json::Value>(text)
+            .ok()
+            .and_then(|envelope| envelope["body"].as_str().map(str::to_owned))
+            .unwrap_or_else(|| text.to_owned())
+    }
+    let shown = |rows: &[vox_core::node::api::MessageRow]| {
+        rows.iter().map(|row| named(&row.text)).collect::<Vec<_>>()
+    };
+    // Every row as the room holds it before anything is due: its hash, time and author.
+    let mut pages_held = Vec::new();
+    let mut before = None;
+    for _ in 0..16 {
+        let Frame::RoomPage { rows, older, .. } = request(Request::RoomPage {
+            channel_id: cid,
+            before,
+            limit: 128,
+        }) else {
+            panic!("PRODUCT (staging): the staged room's page refused")
+        };
+        before = rows.first().map(|row| row.entry_hash);
+        pages_held.push(rows);
+        if older == 0 {
+            break;
+        }
+    }
+    let held: Vec<_> = pages_held.into_iter().rev().flatten().collect();
+    let staged: Vec<String> = old.iter().chain(&newer).cloned().collect();
+    assert_eq!(
+        shown(&held),
+        staged,
+        "PRODUCT (staging): the room does not hold the staged rows in posting order"
+    );
+    let created = |names: &[String]| {
+        held.iter()
+            .filter(|row| names.contains(&named(&row.text)))
+            .map(|row| row.created_millis)
+            .collect::<Vec<_>>()
+    };
+    let lifetime_ms = LIFETIME_S * 1_000;
+    let old_first_due = created(&old).into_iter().min().unwrap() + lifetime_ms;
+    let old_last_due = created(&old).into_iter().max().unwrap() + lifetime_ms;
+    let new_first_due = created(&newer).into_iter().min().unwrap() + lifetime_ms;
     assert!(
-        caught_up,
-        "PRODUCT: stopped-daemon expiry backlog never became readable"
+        now_ms() < old_first_due && old_last_due < new_first_due,
+        "APPARATUS: staging overran its plan: now {} ms, first old due {old_first_due}, last old \
+         due {old_last_due}, first newer due {new_first_due}",
+        now_ms()
+    );
+    while !(dir.join("hold-expiry.engaged").exists() && now_ms() >= old_last_due)
+        && now_ms() < new_first_due
+    {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        dir.join("hold-expiry.engaged").exists(),
+        "APPARATUS: the native prune hold never engaged before the newer rows were due"
+    );
+    let at = now_ms();
+    let counted = request(Request::Count {
+        channel_id: cid,
+        since: None,
+    });
+    let first = request(Request::RoomPage {
+        channel_id: cid,
+        before: None,
+        limit: LIMIT,
+    });
+    // Every page back to the start, each `older` against what is left below it.
+    let mut pages = Vec::new();
+    let mut before = None;
+    for _ in 0..16 {
+        let page = request(Request::RoomPage {
+            channel_id: cid,
+            before,
+            limit: LIMIT,
+        });
+        let next = match &page {
+            Frame::RoomPage { rows, older, .. } if *older != 0 && !rows.is_empty() => {
+                rows.first().map(|row| row.entry_hash)
+            }
+            _ => None,
+        };
+        pages.push(page);
+        if next.is_none() {
+            break;
+        }
+        before = next;
+    }
+    let summary = request(Request::ThreadSummary {
+        channel_id: cid,
+        root,
+        after_author: None,
+    });
+    let replies = request(Request::ThreadPage {
+        channel_id: cid,
+        root,
+        before: None,
+        after: None,
+    });
+    let (ok, cli, err) = vox(
+        dir,
+        &[
+            "room",
+            "read",
+            "partial",
+            "--json",
+            "--limit",
+            &LIMIT.to_string(),
+        ],
+        None,
+    );
+    let done = now_ms();
+    assert!(
+        at >= old_last_due && done < new_first_due,
+        "APPARATUS: the reads ran from {at} to {done} ms, outside the window in which all {} old \
+         rows were due ({old_last_due}) and no newer one was ({new_first_due})",
+        old.len()
+    );
+    println!(
+        "[proof] reads at {at}..{done} ms: last old row due {old_last_due}, first newer due \
+         {new_first_due}; {} old rows due, prune held",
+        old.len()
+    );
+    if std::env::var_os("VOX_MUTANT_EXPIRY").is_some() {
+        let log = std::fs::read_to_string(dir.join("daemon-partial.err")).unwrap();
+        for line in log
+            .lines()
+            .filter(|line| line.contains("test-knobs: expiry"))
+        {
+            println!("[daemon] {line}");
+        }
+        assert!(
+            log.contains("test-knobs: expiry"),
+            "APPARATUS: expiry mutant never engaged"
+        );
+    }
+    let newest = held.last().map(|row| row.entry_hash);
+    println!("[proof] Count with {} old rows due: {counted:?}", old.len());
+    assert!(
+        matches!(counted, Frame::Count { n, last } if n == newer.len() as u64 && last == newest),
+        "PRODUCT: with {} old rows due, Count must be the {} newer rows ending at the newest: \
+         {counted:?}",
+        old.len(),
+        newer.len()
+    );
+    let expect_older = newer.len() as u64 - LIMIT;
+    let Frame::RoomPage { rows, older, .. } = &first else {
+        panic!("PRODUCT: the newest page was refused while old rows were due: {first:?}")
+    };
+    println!(
+        "[proof] newest page of {LIMIT}: {} rows, older {older}, first {:?}, last {:?}",
+        rows.len(),
+        rows.first().map(|row| named(&row.text)),
+        rows.last().map(|row| named(&row.text))
+    );
+    assert!(
+        *older == expect_older && shown(rows) == newer[newer.len() - LIMIT as usize..],
+        "PRODUCT: the newest page must be the newest {LIMIT} of the {} newer rows with older \
+         {expect_older}; it has older {older} and {:?}",
+        newer.len(),
+        shown(rows)
+    );
+    let mut walked = Vec::new();
+    let mut olders = Vec::new();
+    for page in pages.iter().rev() {
+        let Frame::RoomPage { rows, older, .. } = page else {
+            panic!("PRODUCT: a page back through the room was refused: {page:?}")
+        };
+        walked.extend(shown(rows));
+        olders.push((*older, rows.len()));
+    }
+    olders.reverse();
+    println!("[proof] pages back (older, rows): {olders:?}");
+    assert!(
+        walked == newer
+            && olders
+                .iter()
+                .scan(newer.len() as u64, |left, (older, rows)| {
+                    *left = left.saturating_sub(*rows as u64);
+                    Some(*older == *left)
+                })
+                .all(|exact| exact),
+        "PRODUCT: paging back must give exactly the {} newer rows, each page's older what is \
+         left below it; (older, rows) {olders:?}, rows {walked:?}",
+        newer.len()
+    );
+    let author = held[0].author;
+    let last_reply = created(&new_replies).into_iter().max().unwrap();
+    println!("[proof] thread summary with 4 old replies due: {summary:?}");
+    assert!(
+        matches!(&summary, Frame::ThreadSummary { reply_count, last_reply_millis, authors, next_author: None }
+            if *reply_count == new_replies.len() as u64 && *last_reply_millis == last_reply && *authors == [author]),
+        "PRODUCT: the thread summary must count only the {} newer replies (last at {last_reply}): \
+         {summary:?}",
+        new_replies.len()
+    );
+    assert!(
+        matches!(&replies, Frame::ThreadPage { rows, .. } if shown(rows) == new_replies),
+        "PRODUCT: the thread page must hold only the newer replies {new_replies:?}: {replies:?}"
+    );
+    let cli_texts: Vec<String> = cli
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|row| row["text"].as_str().map(named))
+        .collect();
+    assert!(
+        ok && cli_texts == newer[newer.len() - LIMIT as usize..],
+        "PRODUCT: `vox room read --limit {LIMIT}` must show the newest {LIMIT} newer rows only: \
+         ok={ok} {cli_texts:?} {err}"
+    );
+
+    // Stop the node with that removal still held, let it keep longer than its 90 seconds (its
+    // file no longer limits the room, which keeps everything), and start it again: what the
+    // reads above left out was due under the 90 seconds, and must stay gone.
+    drop(client);
+    drop(daemon_partial);
+    std::fs::remove_file(dir.join("cfg").join("retention"))
+        .expect("APPARATUS: remove the node's retention file");
+    std::fs::remove_file(dir.join("hold-expiry")).unwrap();
+    let _reopened = daemon(dir, "partial-restart", &format!("{IDENTITY}\n{ROOMPASS}\n"));
+    attached(dir, "partial-restart");
+    let mut reopened_at = None;
+    let mut last = String::new();
+    for _ in 0..1024 {
+        let (ok, _, err) = vox(
+            dir,
+            &["room", "read", "partial", "--json", "--limit", "1"],
+            None,
+        );
+        if ok {
+            reopened_at = Some(now_ms());
+            break;
+        }
+        last = err;
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let reopened_at = reopened_at.unwrap_or_else(|| {
+        panic!("PRODUCT (staging): the reopened room never answered a read: {last}")
+    });
+    assert!(
+        reopened_at < new_first_due,
+        "APPARATUS: the node answered again at {reopened_at} ms, after the first newer row's \
+         90 s ({new_first_due}); the restart arm proved nothing"
+    );
+    let mut client = rt
+        .block_on(IpcClient::open_at(&socket))
+        .expect("APPARATUS: reopened partial expiry IPC");
+    let counted = rt
+        .block_on(client.request(&Request::Count {
+            channel_id: cid,
+            since: None,
+        }))
+        .expect("APPARATUS: reopened partial expiry reply");
+    let mut pages_after = Vec::new();
+    let mut before = None;
+    for _ in 0..16 {
+        let page = rt
+            .block_on(client.request(&Request::RoomPage {
+                channel_id: cid,
+                before,
+                limit: 128,
+            }))
+            .expect("APPARATUS: reopened partial expiry reply");
+        let (rows, older) = match page {
+            Frame::RoomPage { rows, older, .. } => (rows, older),
+            other => panic!("PRODUCT: the reopened room's page was refused: {other:?}"),
+        };
+        before = rows.first().map(|row| row.entry_hash);
+        pages_after.push(rows);
+        if older == 0 {
+            break;
+        }
+    }
+    let after_restart: Vec<String> = pages_after
+        .iter()
+        .rev()
+        .flat_map(|rows| shown(rows))
+        .collect();
+    let back = after_restart
+        .iter()
+        .filter(|name| old.contains(name))
+        .count();
+    if std::env::var_os("VOX_MUTANT_RETENTION_FLOOR").is_some() {
+        let log = std::fs::read_to_string(dir.join("daemon-partial-restart.err")).unwrap();
+        for line in log
+            .lines()
+            .filter(|line| line.contains("test-knobs: retention floor"))
+        {
+            println!("[daemon] {line}");
+        }
+        assert!(
+            log.contains("test-knobs: retention floor"),
+            "APPARATUS: retention floor mutant never engaged"
+        );
+    }
+    println!(
+        "[proof] reopened keeping everything at {reopened_at} ms: {counted:?}; {} rows, {back} \
+         of the {} old ones",
+        after_restart.len(),
+        old.len()
+    );
+    assert!(
+        matches!(counted, Frame::Count { n, .. } if n == newer.len() as u64)
+            && after_restart == newer,
+        "PRODUCT: stopped while {} old rows were left out but not yet removed, the node reopened \
+         keeping everything and shows {back} of them again; Count {counted:?}, rows {after_restart:?}",
+        old.len()
     );
 }
 
@@ -1481,6 +1989,7 @@ optional_proof::not_run!(
     an_existing_session_index_keeps_its_listing_when_upgraded,
     private_session_steps_store_one_body_and_reopen_after_rotation,
     a_room_stays_readable_while_messages_keep_expiring,
+    a_partly_expired_room_counts_pages_and_threads_only_what_remains,
     a_hook_continuation_read_skips_expired_messages,
 );
 
@@ -5203,4 +5712,820 @@ fn an_existing_session_index_keeps_its_listing_when_upgraded() {
     let bound = reference.saturating_mul(3).saturating_add(256 * 1024);
     eprintln!("RG13 UPGRADE rename OS-write bytes={bytes} fresh100={reference} bound={bound}");
     assert!(bytes<=bound,"PRODUCT: rename after upgrading the base index rewrote unrelated Sessions: {bytes} OS-write bytes; bound={bound}");
+}
+
+/// A restart reclaims deleted bodies without losing the messages or private steps we kept.
+/// The crash arm kills the real daemon after backend relocation but before that commit.
+#[cfg(feature = "test-knobs")]
+#[test]
+#[ignore = "real daemon, grown/expired store and crash during in-place compaction"]
+fn a_restart_compacts_expired_space_and_keeps_acknowledged_rows_after_a_crash() {
+    compaction_journey(false, false, false);
+}
+
+#[cfg(feature = "test-knobs")]
+#[test]
+#[ignore = "real daemon and grown/expired store with compaction failure"]
+fn a_failed_startup_compaction_still_opens_the_node_and_its_rooms() {
+    compaction_journey(true, false, false);
+}
+
+#[cfg(feature = "test-knobs")]
+#[test]
+#[ignore = "real daemon and large expired store held during startup compaction"]
+fn a_large_store_reports_and_finishes_startup_compaction() {
+    compaction_journey(false, true, false);
+}
+
+#[cfg(feature = "test-knobs")]
+#[test]
+#[ignore = "real scratch daemon restart during a held large-store compaction"]
+fn a_restart_reports_held_storage_work_without_calling_it_a_failure() {
+    compaction_journey(false, true, true);
+}
+
+#[cfg(feature = "test-knobs")]
+struct CompactionRelease {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(feature = "test-knobs")]
+impl CompactionRelease {
+    fn start(marker: &Path) -> Self {
+        let marker = marker.to_owned();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done = stop.clone();
+        let worker = std::thread::spawn(move || {
+            while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = std::fs::remove_file(&marker);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        Self {
+            stop,
+            worker: Some(worker),
+        }
+    }
+}
+
+#[cfg(feature = "test-knobs")]
+impl Drop for CompactionRelease {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(worker) = self.worker.take() {
+            worker.join().expect("APPARATUS: join compaction releaser");
+        }
+    }
+}
+
+#[cfg(feature = "test-knobs")]
+struct ScratchRestartCleanup {
+    marker: PathBuf,
+    socket: PathBuf,
+}
+
+#[cfg(feature = "test-knobs")]
+impl Drop for ScratchRestartCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.marker);
+        if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            rt.block_on(async {
+                let _ = tokio::time::timeout(Duration::from_secs(5), async {
+                    if let Ok(mut daemon) =
+                        vox_core::node::daemonipc::DaemonClient::open(&self.socket).await
+                    {
+                        let _ = daemon
+                            .request(vox_core::node::daemonipc::DaemonRequest::Stop)
+                            .await;
+                    }
+                })
+                .await;
+            });
+        }
+    }
+}
+
+#[cfg(feature = "test-knobs")]
+fn compaction_journey(failure: bool, large: bool, restart: bool) {
+    watchdog::arm();
+    use redb::ReadableDatabase;
+    use vox_core::node::ipc::{Frame, IpcClient, NodeSocket, Request};
+    use vox_core::node::paths::{NodeName, Paths};
+    const DAY: i64 = 86_400_000;
+    let measure = large && !restart && std::env::var_os("VOX_MUTANT_RG13_MEASURE").is_some();
+    let tmp = tempfile::tempdir().expect("APPARATUS: scratch account");
+    let root = tmp.path();
+    std::fs::create_dir(root.join("cfg")).unwrap();
+    let keychain = attach::keychain(root);
+    let launch = |tag: &str, step: i64, marker: Option<&Path>| {
+        let mut cmd = Command::new(VOX);
+        cmd.args(["daemon", "--listen", "127.0.0.1:0"])
+            .env("VOX_DATA_DIR", root)
+            .env("VOX_CONFIG_DIR", root.join("cfg"))
+            .env("VOX_TEST_KEYCHAIN", &keychain)
+            .env("VOX_TEST_CLOCK_STEP_MS", step.to_string())
+            .env("VOX_PROXY", "127.0.0.1:0")
+            .env_remove("VOX_ROOM")
+            .env_remove("VOX_NODE")
+            .env_remove("VOX_IDENTITY_PASSPHRASE")
+            .env_remove("VOX_TEST_COMPACT_RELOCATED")
+            .env_remove("VOX_TEST_COMPACT_FAIL")
+            .env_remove("VOX_TEST_COMPACT_FAILURE_LOCKS")
+            .env_remove("VOX_TEST_SKIP_STARTUP_COMPACTION")
+            .env_remove("VOX_TEST_COMPACT_IGNORE_CAP")
+            .env_remove("VOX_TEST_RG13_NO_STARTUP_REASON")
+            .env_remove("VOX_TEST_RG13_NO_COMMAND_WAIT")
+            .env_remove("VOX_TEST_RG13_UPDATE_STORAGE_FAILURE")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(root.join(format!("daemon-{tag}.err"))).unwrap());
+        if let Some(marker) = marker {
+            cmd.env("VOX_TEST_COMPACT_RELOCATED", marker);
+        }
+        if std::env::var_os("VOX_MUTANT_SKIP_STARTUP_COMPACTION").is_some() {
+            cmd.env("VOX_TEST_SKIP_STARTUP_COMPACTION", "1");
+        }
+        for (selector, knob) in [
+            (
+                "VOX_MUTANT_RG13_NO_STARTUP_REASON",
+                "VOX_TEST_RG13_NO_STARTUP_REASON",
+            ),
+            (
+                "VOX_MUTANT_RG13_NO_COMMAND_WAIT",
+                "VOX_TEST_RG13_NO_COMMAND_WAIT",
+            ),
+            (
+                "VOX_MUTANT_RG13_UPDATE_STORAGE_FAILURE",
+                "VOX_TEST_RG13_UPDATE_STORAGE_FAILURE",
+            ),
+        ] {
+            if std::env::var_os(selector).is_some() {
+                cmd.env(knob, "1");
+            }
+        }
+        if tag == "failed" {
+            cmd.env("VOX_TEST_COMPACT_FAIL", "1");
+            if std::env::var_os("VOX_MUTANT_COMPACTION_FAILURE_LOCKS").is_some() {
+                cmd.env("VOX_TEST_COMPACT_FAILURE_LOCKS", "1");
+            }
+        }
+        let mut child = cmd.spawn().expect("APPARATUS: spawn scratch daemon");
+        writeln!(child.stdin.take().unwrap(), "{IDENTITY}").unwrap();
+        Daemon(child)
+    };
+    let stop = |mut daemon: Daemon| {
+        Command::new("kill")
+            .args(["-TERM", &daemon.0.id().to_string()])
+            .status()
+            .expect("APPARATUS: signal own daemon");
+        daemon.0.wait().expect("APPARATUS: reap own daemon");
+    };
+    let paths = Paths::resolve("default", Some(root), Some(&root.join("cfg"))).unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let request = |request: Request| {
+        let started = Instant::now();
+        loop {
+            let mut client = rt
+                .block_on(IpcClient::open_at(&NodeSocket::one_shot(
+                    paths.account().socket(),
+                    NodeName::parse("default").unwrap(),
+                )))
+                .expect("APPARATUS: connect to scratch daemon");
+            let frame = rt
+                .block_on(client.request(&request))
+                .expect("APPARATUS: request");
+            if !matches!(&frame, Frame::Error { reason } if reason.contains("permissions are still being read")
+                || reason.contains("room governance is refreshing")
+                || reason.contains("preparing its saved history")
+                || reason.contains("refreshing saved history"))
+            {
+                break frame;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(180),
+                "PRODUCT (staging): room did not become writable: {frame:?}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    let (ok, out, err) = vox(root, &["id"], None);
+    assert!(ok, "PRODUCT (staging): identity: {out}{err}");
+    let initial = launch("grown", 0, None);
+    attached(root, "grown");
+    if restart {
+        // Remember the identity while its store is small: an already Ready attachment does
+        // not save credentials, and unlocking the bloated store here would compact it early.
+        let (ok, out, err) = vox(root, &["node", "lock", "default"], None);
+        assert!(
+            ok,
+            "APPARATUS: lock scratch node before remembering: {out}{err}"
+        );
+        let (ok, out, err) = vox(root, &["node", "unlock", "default"], None);
+        assert!(ok, "APPARATUS: remember scratch node: {out}{err}");
+        use vox_core::node::daemonipc::{DaemonClient, DaemonFrame, DaemonRequest};
+        let nodes = rt.block_on(async {
+            let mut daemon = DaemonClient::open(&paths.account().socket()).await.unwrap();
+            daemon.request(DaemonRequest::Nodes).await.unwrap()
+        });
+        assert!(
+            matches!(&nodes, DaemonFrame::Nodes(nodes)
+                if nodes.iter().any(|node| node.name.as_str() == "default" && node.keep)),
+            "APPARATUS: restart fixture has no remembered node: {nodes:?}"
+        );
+    }
+    let (ok, out, err) = vox(
+        root,
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "compact",
+        ],
+        Some(&format!("{ROOMPASS}\n")),
+    );
+    assert!(ok, "PRODUCT (staging): create room: {out}{err}");
+    let Frame::Rooms { rooms } = request(Request::Rooms { after: None }) else {
+        panic!("APPARATUS: room listing frame");
+    };
+    let cid = rooms
+        .iter()
+        .find(|(_, name, ..)| name == "compact")
+        .unwrap()
+        .0;
+    let room = vox_core::node::link::b32_encode(&cid);
+    let read_room = || loop {
+        let (ok, shown, err) = vox(root, &["room", "read", &room, "--json"], None);
+        if ok {
+            break shown;
+        }
+        assert!(
+            err.contains("preparing its saved history") || err.contains("refreshing saved history"),
+            "PRODUCT (staging): saved room did not become readable: {shown}{err}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    if !failure && !large {
+        stop(initial);
+        let small_file = paths.store_file();
+        let before = std::fs::metadata(&small_file).unwrap().len();
+        assert!(
+            before < 64 * 1024 * 1024,
+            "APPARATUS: small-store fixture reached 64 MiB: {before}"
+        );
+        let small = launch("small", 0, None);
+        attached(root, "small");
+        let after = std::fs::metadata(&small_file).unwrap().len();
+        let log = std::fs::read_to_string(root.join("daemon-small.err")).unwrap();
+        assert_eq!(
+            before, after,
+            "PRODUCT: startup resized a small store: {log}"
+        );
+        assert!(
+            !log.contains("giving back disk space"),
+            "PRODUCT: small store startup announced compaction: {log}"
+        );
+        eprintln!("PRODUCT: small store unchanged at {before} bytes; no compaction wait line");
+        stop(small);
+    } else {
+        stop(initial);
+    }
+    let initial = launch("grow", 0, None);
+    attached(root, "grow");
+    let _ = read_room();
+    if !large {
+        let (ok, out, err) = vox(root, &["room", "retention", &room, "1d"], None);
+        assert!(ok, "PRODUCT (staging): retention: {out}{err}");
+    }
+    let mut id = 0;
+    loop {
+        let posts = if large { 12_000 } else { 1024 };
+        if id >= posts {
+            break;
+        }
+        let frame = request(Request::Post {
+            channel_id: cid,
+            text: format!("expire-{id:04}-{}", "x".repeat(60_000)),
+            card: false,
+        });
+        assert!(
+            matches!(frame, Frame::Ok),
+            "PRODUCT (staging): grow post {id}: {frame:?}"
+        );
+        id += 1;
+    }
+    eprintln!(
+        "APPARATUS: grew store through {id} acknowledged 60000-byte posts; file {} bytes",
+        std::fs::metadata(paths.store_file()).unwrap().len()
+    );
+    let expired = if large {
+        // Expire in the running daemon so startup cannot first shrink a just-grown file.
+        let (ok, out, err) = vox(root, &["room", "retention", &room, "1s"], None);
+        assert!(ok, "PRODUCT (staging): large-store expiry: {out}{err}");
+        initial
+    } else {
+        stop(initial);
+        let expired = launch("expiry", 2 * DAY, None);
+        attached(root, "expiry");
+        expired
+    };
+    loop {
+        let shown = read_room();
+        if !shown.contains("expire-") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if large {
+        let (ok, out, err) = vox(root, &["room", "retention", &room, "forever"], None);
+        assert!(ok, "PRODUCT (staging): retain measurement rows: {out}{err}");
+    }
+    for id in 0..8 {
+        let frame = request(Request::Post {
+            channel_id: cid,
+            text: format!("retained-message-{id}"),
+            card: false,
+        });
+        assert!(
+            matches!(frame, Frame::Ok),
+            "PRODUCT (staging): retained post {id}: {frame:?}"
+        );
+    }
+    let opening = serde_json::json!({"v":1,"type":"session","from":"compact-session",
+        "body":"","at":{"session_name":"Compaction retained Session"},
+        "data":{"session":{"harness":"compaction proof"}}})
+    .to_string();
+    let frame = request(Request::Post {
+        channel_id: cid,
+        text: opening,
+        card: false,
+    });
+    assert!(
+        matches!(frame, Frame::Ok),
+        "PRODUCT (staging): open retained Session: {frame:?}"
+    );
+    let frame = request(Request::AppendSession {
+        channel_id: cid,
+        session_id: "compact-session".into(),
+        body: serde_json::json!({"v":1,"session":"compact-session","kind":"reply","seq":1,
+            "text":"retained-private-step"})
+        .to_string(),
+    });
+    assert!(
+        matches!(frame, Frame::Appended { .. }),
+        "PRODUCT (staging): retained private step: {frame:?}"
+    );
+    let retained = || {
+        let shown = small_row_all_messages(root, &room);
+        for id in 0..8 {
+            assert!(
+                shown.contains(&format!("retained-message-{id}")),
+                "PRODUCT: acknowledged retained message {id} missing: {shown}"
+            );
+        }
+        assert!(
+            !shown.contains("expire-"),
+            "PRODUCT: expired body returned: {shown}"
+        );
+        let started = Instant::now();
+        loop {
+            let _ = vox(root, &["room", "sessions", &room, "--json"], None);
+            let (ok, shown, err) = vox(
+                root,
+                &["room", "session", &room, "compact-session", "--json"],
+                None,
+            );
+            if ok && shown.contains("retained-private-step") {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(180),
+                "PRODUCT: acknowledged private Session step missing: {shown}{err}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    retained();
+    if restart {
+        let marker = root.join("restart-relocated");
+        let _cleanup = ScratchRestartCleanup {
+            marker: marker.clone(),
+            socket: paths.account().socket(),
+        };
+        let stdout = root.join("restart.out");
+        let stderr = root.join("restart.err");
+        let mut cmd = Command::new(VOX);
+        cmd.args(["daemon", "--restart"])
+            .env("VOX_DATA_DIR", root)
+            .env("VOX_CONFIG_DIR", root.join("cfg"))
+            .env("VOX_TEST_KEYCHAIN", &keychain)
+            .env("VOX_TEST_COMPACT_RELOCATED", &marker)
+            .env("VOX_PROXY", "127.0.0.1:0")
+            .env_remove("VOX_NODE")
+            .env_remove("VOX_ROOM")
+            .stdin(Stdio::null())
+            .stdout(std::fs::File::create(&stdout).unwrap())
+            .stderr(std::fs::File::create(&stderr).unwrap());
+        if std::env::var_os("VOX_MUTANT_RG13_UPDATE_STORAGE_FAILURE").is_some() {
+            cmd.env("VOX_TEST_RG13_UPDATE_STORAGE_FAILURE", "1");
+        }
+        let mut restarting = Daemon(cmd.spawn().expect("APPARATUS: scratch restart"));
+        while !marker.exists() {
+            if let Some(exit) = restarting.0.try_wait().unwrap() {
+                assert!(
+                    exit.success(),
+                    "PRODUCT: restart failed before held compaction: {}{}",
+                    std::fs::read_to_string(&stdout).unwrap(),
+                    std::fs::read_to_string(&stderr).unwrap()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // This stages the requested >30-second hold; silence is not a verdict.
+        std::thread::sleep(Duration::from_secs(31));
+        let exit = restarting.0.wait().expect("APPARATUS: wait for restart");
+        let out = std::fs::read_to_string(&stdout).unwrap();
+        let err = std::fs::read_to_string(&stderr).unwrap();
+        if std::env::var_os("VOX_MUTANT_RG13_UPDATE_STORAGE_FAILURE").is_some() {
+            let log = std::fs::read_to_string(paths.account().log_file()).unwrap_or_default();
+            assert!(
+                log.contains("mutant rg13_update_storage_failure engaged"),
+                "APPARATUS: restart mutant not engaged in daemon: {log}"
+            );
+            eprintln!("{log}");
+        }
+        let release = CompactionRelease::start(&marker);
+        attached(root, "replacement");
+        drop(release);
+        retained();
+        use vox_core::node::daemonipc::{DaemonClient, DaemonRequest};
+        rt.block_on(async {
+            let mut daemon = DaemonClient::open(&paths.account().socket())
+                .await
+                .expect("APPARATUS: connect scratch replacement for cleanup");
+            daemon
+                .request(DaemonRequest::Stop)
+                .await
+                .expect("APPARATUS: stop scratch replacement");
+        });
+        drop(expired);
+        assert!(
+            exit.success()
+                && out.contains("giving back disk space")
+                && !out.contains("remembered nodes are Ready"),
+            "PRODUCT: restart misreported held storage: {exit}: {out}{err}"
+        );
+        return;
+    }
+    stop(expired);
+    let file = paths.store_file();
+    let db = redb::Database::open(&file).expect("APPARATUS: inspect stopped store");
+    let txn = db.begin_read().unwrap();
+    let used = txn.allocated_bytes().unwrap();
+    drop(txn);
+    drop(db);
+    let before = std::fs::metadata(&file).unwrap().len();
+    assert!(
+        before > used.checked_mul(2).unwrap(),
+        "APPARATUS: expiry did not reach compaction threshold: file {before}, reachable {used}"
+    );
+    assert!(
+        before - 2 * used >= 64 * 1024 * 1024,
+        "APPARATUS: file minus twice held is below 64 MiB: file {before}, used {used}"
+    );
+    if large {
+        assert!(
+            used > 256 * 1024 * 1024,
+            "APPARATUS: large fixture holds only {used} bytes"
+        );
+        let marker = root.join("large-relocated");
+        let mut held = launch("large-held", 0, Some(&marker));
+        while !marker.exists() {
+            assert!(
+                held.0.try_wait().unwrap().is_none(),
+                "PRODUCT: daemon exited before relocation: {}",
+                std::fs::read_to_string(root.join("daemon-large-held.err")).unwrap()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let log = std::fs::read_to_string(root.join("daemon-large-held.err")).unwrap();
+        for (selector, receipt) in [
+            (
+                "VOX_MUTANT_RG13_NO_STARTUP_REASON",
+                "mutant rg13_no_startup_reason engaged",
+            ),
+            (
+                "VOX_MUTANT_RG13_NO_COMMAND_WAIT",
+                "mutant rg13_no_command_wait engaged",
+            ),
+            (
+                "VOX_MUTANT_RG13_UPDATE_STORAGE_FAILURE",
+                "mutant rg13_update_storage_failure engaged",
+            ),
+        ] {
+            if std::env::var_os(selector).is_some() {
+                assert!(
+                    log.contains(receipt),
+                    "APPARATUS: mutant not engaged: {log}"
+                );
+                eprintln!("{log}");
+            }
+        }
+        let (ok, human, err) = vox(root, &["status"], None);
+        eprintln!("RECEIPT vox status success={ok}: stdout={human:?} stderr={err:?}");
+        assert!(
+            ok && human.contains("giving back disk space"),
+            "PRODUCT: status omitted startup reason: {human}{err}"
+        );
+        let (ok, json, err) = vox(root, &["status", "--json"], None);
+        eprintln!("RECEIPT vox status --json success={ok}: stdout={json:?} stderr={err:?}");
+        assert!(ok, "PRODUCT: status --json failed: {json}{err}");
+        let value: serde_json::Value =
+            serde_json::from_str(&json).expect("PRODUCT: status --json is not JSON");
+        let reason = value["startup"].as_str().unwrap_or("");
+        let public_file = value["startup_file_bytes"]
+            .as_u64()
+            .expect("PRODUCT: status omitted numeric startup_file_bytes");
+        let public_held = value["startup_held_bytes"]
+            .as_u64()
+            .expect("PRODUCT: status omitted numeric startup_held_bytes");
+        let actual_file = std::fs::metadata(&file).unwrap().len();
+        assert_eq!(
+            before, actual_file,
+            "APPARATUS: file changed while staging compaction"
+        );
+        assert_eq!(
+            public_file, actual_file,
+            "PRODUCT: startup file byte count differs from store file"
+        );
+        assert!(
+            public_held > 256 * 1024 * 1024,
+            "APPARATUS: public held count did not exceed 256 MiB: {public_held}"
+        );
+        assert!(
+            public_file
+                .checked_sub(public_held.saturating_mul(2))
+                .is_some_and(|reclaim| reclaim >= 64 * 1024 * 1024),
+            "APPARATUS: public counts did not reach floor: file {public_file}, held {public_held}"
+        );
+        assert!(
+            reason.contains("giving back disk space")
+                && reason.contains("default")
+                && reason.contains(&public_file.to_string())
+                && reason.contains(&public_held.to_string())
+                && human.contains(reason),
+            "PRODUCT: status did not report node, file and used bytes consistently: {human}; {json}"
+        );
+        eprintln!("MEASUREMENT staging file={public_file} held={public_held}");
+        if measure {
+            held.0.kill().expect("APPARATUS: kill relocating daemon");
+            held.0.wait().expect("APPARATUS: reap relocating daemon");
+            drop(held);
+            let interrupted = std::fs::metadata(&file).unwrap().len();
+            let started = Instant::now();
+            let mut recovered = launch("measurement-recovered", 0, None);
+            let mut first_reason = None;
+            let elapsed = loop {
+                assert!(
+                    recovered.0.try_wait().unwrap().is_none(),
+                    "PRODUCT: recovery daemon exited: {}",
+                    std::fs::read_to_string(root.join("daemon-measurement-recovered.err")).unwrap()
+                );
+                let (ok, shown, err) = vox(root, &["status", "--json"], None);
+                if ok {
+                    let sample: serde_json::Value = serde_json::from_str(&shown)
+                        .expect("PRODUCT: recovery status was not JSON");
+                    if first_reason.is_none() {
+                        match sample.get("startup") {
+                            Some(serde_json::Value::String(reason))
+                                if reason.contains("giving back disk space") =>
+                            {
+                                let elapsed = started.elapsed();
+                                eprintln!(
+                                    "MEASUREMENT first-startup-reason={:.6}s status={shown}",
+                                    elapsed.as_secs_f64()
+                                );
+                                first_reason = Some(elapsed);
+                            }
+                            Some(serde_json::Value::String(_) | serde_json::Value::Null) | None => {
+                            }
+                            _ => panic!("PRODUCT: invalid startup status: {shown}"),
+                        }
+                    }
+                    match sample["status"].as_str() {
+                        Some("Ready") => break started.elapsed(),
+                        Some(_) => {}
+                        None if sample["status"].is_null() => {}
+                        None => panic!("PRODUCT: invalid recovery status: {shown}"),
+                    }
+                } else {
+                    eprintln!("APPARATUS: recovery status not yet available: {shown}{err}");
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            };
+            match first_reason {
+                Some(first) => eprintln!(
+                    "MEASUREMENT launch-to-first-reason={:.6}s first-reason-to-Ready={:.6}s launch-to-Ready={:.6}s",
+                    first.as_secs_f64(),
+                    (elapsed - first).as_secs_f64(),
+                    elapsed.as_secs_f64()
+                ),
+                None => eprintln!(
+                    "MEASUREMENT first-startup-reason NOT OBSERVED; launch-to-Ready={:.6}s",
+                    elapsed.as_secs_f64()
+                ),
+            }
+            retained();
+            let after = std::fs::metadata(&file).unwrap().len();
+            eprintln!(
+                "MEASUREMENT interrupted-to-Ready={:.6}s file-before={public_file} held-before={public_held} inspector-held={used} file-interrupted={interrupted} file-after={after}",
+                elapsed.as_secs_f64()
+            );
+            stop(recovered);
+            return;
+        }
+        let stdout = root.join("waiting-room-list.out");
+        let stderr = root.join("waiting-room-list.err");
+        let mut cmd = Command::new(VOX);
+        cmd.args(["room", "list"])
+            .env("VOX_DATA_DIR", root)
+            .env("VOX_CONFIG_DIR", root.join("cfg"))
+            .env("VOX_TEST_KEYCHAIN", &keychain)
+            .env_remove("VOX_NODE")
+            .env_remove("VOX_ROOM")
+            .stdin(Stdio::null())
+            .stdout(std::fs::File::create(&stdout).unwrap())
+            .stderr(std::fs::File::create(&stderr).unwrap());
+        if std::env::var_os("VOX_MUTANT_RG13_NO_COMMAND_WAIT").is_some() {
+            cmd.env("VOX_TEST_RG13_NO_COMMAND_WAIT", "1");
+        }
+        let mut command = Daemon(cmd.spawn().expect("APPARATUS: start waiting room list"));
+        loop {
+            let notice = std::fs::read_to_string(&stderr).unwrap();
+            if notice.contains("giving back disk space") {
+                break;
+            }
+            if let Some(exit) = command.0.try_wait().unwrap() {
+                panic!(
+                    "PRODUCT: room list exited {exit} without startup notice: {}{notice}",
+                    std::fs::read_to_string(&stdout).unwrap()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        eprintln!(
+            "RECEIPT held vox room list stderr={:?}",
+            std::fs::read_to_string(&stderr).unwrap()
+        );
+        assert!(
+            command.0.try_wait().unwrap().is_none(),
+            "PRODUCT: room list returned while storage was held: {}{}",
+            std::fs::read_to_string(&stdout).unwrap(),
+            std::fs::read_to_string(&stderr).unwrap()
+        );
+        let (hook_ok, hook) = small_row_command(
+            root,
+            &[
+                "agent", "hook", "--node", "default", "--room", &room, "--format", "text",
+            ],
+            Some(r#"{"hook_event_name":"UserPromptSubmit","session_id":"compact-held-hook"}"#),
+        );
+        assert!(
+            hook_ok
+                && (hook.contains("Vox is preparing node default")
+                    || hook.contains("Vox daemon registration timed out")),
+            "PRODUCT: held-storage hook did not finish with its bounded startup note: {hook}"
+        );
+        assert!(
+            command.0.try_wait().unwrap().is_none(),
+            "PRODUCT: room list returned while compaction was still held: {}{}",
+            std::fs::read_to_string(&stdout).unwrap(),
+            std::fs::read_to_string(&stderr).unwrap()
+        );
+        let release = CompactionRelease::start(&marker);
+        let exit = command.0.wait().expect("APPARATUS: wait for room list");
+        drop(release);
+        let out = std::fs::read_to_string(&stdout).unwrap();
+        let err = std::fs::read_to_string(&stderr).unwrap();
+        eprintln!("RECEIPT completed vox room list stdout={out:?} stderr={err:?}");
+        assert!(
+            exit.success() && out.contains(&room[..12]),
+            "PRODUCT: waiting room list failed: {exit}: {out}{err}"
+        );
+        assert_eq!(
+            err.matches("giving back disk space").count(),
+            1,
+            "PRODUCT: waiting room list did not print exactly one notice: {err}"
+        );
+        retained();
+        let after = std::fs::metadata(&file).unwrap().len();
+        assert!(public_file.saturating_sub(after) >= 64 * 1024 * 1024,
+            "PRODUCT: large store reclaimed less than 64 MiB: before {public_file}, after {after}, held {public_held}");
+        eprintln!(
+            "PRODUCT: large store shrank from {public_file} to {after} bytes; held {public_held}"
+        );
+        stop(held);
+        let after_close = std::fs::metadata(&file).unwrap().len();
+        let again = launch("large-again", 0, None);
+        attached(root, "large-again");
+        let (ok, status, err) = vox(root, &["status"], None);
+        assert!(
+            ok && !status.contains("giving back disk space"),
+            "PRODUCT: unchanged store reported another compaction: {status}{err}"
+        );
+        let again_log = std::fs::read_to_string(root.join("daemon-large-again.err")).unwrap();
+        assert!(
+            !again_log.contains("giving back disk space"),
+            "PRODUCT: immediate restart compacted again: {again_log}"
+        );
+        let again_size = std::fs::metadata(&file).unwrap().len();
+        assert_eq!(after_close, again_size,
+            "PRODUCT: unchanged store resized on immediate restart: before {after_close}, after {again_size}");
+        retained();
+        stop(again);
+        return;
+    }
+    if failure {
+        let failed = launch("failed", 2 * DAY, None);
+        // Unlock's own reply reports the terminal startup outcome, not elapsed silence.
+        let (ok, out, err) = vox(root, &["node", "unlock", "default"], None);
+        let log = std::fs::read_to_string(root.join("daemon-failed.err")).unwrap();
+        if std::env::var_os("VOX_MUTANT_COMPACTION_FAILURE_LOCKS").is_some() {
+            assert!(
+                log.contains("mutant compaction_failure_locks engaged"),
+                "APPARATUS: mutant not seen in daemon: {log}"
+            );
+            eprintln!("{log}");
+        }
+        assert!(
+            ok && out.contains("Ready"),
+            "PRODUCT: failed compaction kept node from Ready: {out}{err}; daemon: {log}"
+        );
+        retained();
+        assert!(
+            log.contains("node default: store compaction skipped:")
+                && log.contains("compaction fault staged by proof")
+                && log.contains("continuing startup"),
+            "PRODUCT: compaction failure did not name node and true reason: {log}"
+        );
+        eprintln!("PRODUCT: compaction failed, node Ready, room and retained private step readable; {log}");
+        stop(failed);
+        return;
+    }
+    let saved = root.join("acknowledged.redb");
+    std::fs::copy(&file, &saved).unwrap();
+    let restarted = launch("compacted", 2 * DAY, None);
+    attached(root, "compacted");
+    retained();
+    let log = std::fs::read_to_string(root.join("daemon-compacted.err")).unwrap();
+    if std::env::var_os("VOX_MUTANT_SKIP_STARTUP_COMPACTION").is_some() {
+        assert!(
+            log.contains("mutant skip_startup_compaction engaged"),
+            "APPARATUS: skip mutant not seen in daemon: {log}"
+        );
+        eprintln!("{log}");
+    }
+    let after = std::fs::metadata(&file).unwrap().len();
+    assert!(after <= before - 4096,
+        "PRODUCT: daemon restart left expired space allocated: before {before}, after {after}, reachable {used}");
+    let note = std::fs::read_to_string(root.join("daemon-compacted.err")).unwrap();
+    assert!(
+        note.contains("giving back disk space") && note.contains("Ready when compaction finishes"),
+        "PRODUCT: the startup wait did not explain compaction: {note}"
+    );
+    stop(restarted);
+    std::fs::remove_file(&file).unwrap();
+    std::fs::copy(saved, &file).unwrap();
+    let marker = root.join("relocated");
+    let mut crashing = launch("relocating", 2 * DAY, Some(&marker));
+    while !marker.exists() {
+        assert!(
+            crashing.0.try_wait().unwrap().is_none(),
+            "PRODUCT: daemon exited before compaction relocation: {}",
+            std::fs::read_to_string(root.join("daemon-relocating.err")).unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    crashing
+        .0
+        .kill()
+        .expect("APPARATUS: kill own relocating daemon");
+    crashing.0.wait().unwrap();
+    drop(crashing);
+    let recovered = launch("recovered", 2 * DAY, None);
+    attached(root, "recovered");
+    retained();
+    assert!(
+        std::fs::metadata(&file).unwrap().len() < before,
+        "PRODUCT: restart after killed relocation did not reclaim the store"
+    );
+    stop(recovered);
 }

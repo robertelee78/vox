@@ -59,9 +59,8 @@
 //! gives it (F).
 //!
 //! **Why a file of its own:** no existing proof starts `vox serve` without an anchor or with its
-//! anchor down — the old refusal made that impossible — and the join journeys
-//! (`a_room_not_on_the_board_is_named_proof`) stage a board without the room only where no other
-//! route can hold it, which is the failure this fix keeps.
+//! anchor down — the old refusal made that impossible — and the join journeys stage a board
+//! without the room only where no other route can hold it, which is the failure this fix keeps.
 
 #![cfg(unix)]
 
