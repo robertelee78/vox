@@ -44,6 +44,7 @@ optional_proof::not_run!(
     the_linux_release_asset_installs_only_where_it_runs,
     the_linux_release_installer_refuses_below_its_floor,
     the_linux_release_installer_names_a_missing_loader,
+    a_shipped_release_installs_and_serves_a_fresh_node,
 );
 
 use std::collections::BTreeMap;
@@ -2150,4 +2151,16 @@ fn report(claims: &[Claim], receipts: &BTreeMap<String, String>, allowed: &[Stri
             .collect::<Vec<_>>()
             .join("\n")
     );
+}
+
+#[cfg(feature = "optional-proofs")]
+#[path = "support/release_journey.rs"]
+mod release_journey;
+
+/// The dist's own installer and bytes, in the authorized VM/container, never a cargo payload.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "release assets in a disposable guest; scripts/release/"]
+fn a_shipped_release_installs_and_serves_a_fresh_node() {
+    release_journey::run("install");
 }

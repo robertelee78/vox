@@ -51,6 +51,8 @@ mod dead_candidate;
 optional_proof::not_run!(
     an_older_release_updates_itself_and_refuses_a_bad_download,
     an_update_and_rollback_leave_one_launchable_vox,
+    a_published_install_updates_through_github_with_its_agent_turn,
+    a_candidate_source_pair_updates_with_its_agent_turn,
 );
 
 use std::collections::BTreeMap;
@@ -4269,4 +4271,24 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
         &receipts,
         false,
     );
+}
+
+#[cfg(feature = "optional-proofs")]
+#[path = "support/release_journey.rs"]
+mod release_journey;
+
+/// The published previous updater, its real GitHub endpoint, and one native agent conversation.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "published release update in a disposable guest; scripts/release/"]
+fn a_published_install_updates_through_github_with_its_agent_turn() {
+    release_journey::run("update");
+}
+
+/// Before-tag updater/restart/agent-turn observation, explicitly on the nonshipping pair.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "candidate-source test-knobs pair in a disposable guest; scripts/release/"]
+fn a_candidate_source_pair_updates_with_its_agent_turn() {
+    release_journey::run("controlled-update");
 }
