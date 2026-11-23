@@ -4210,7 +4210,15 @@ impl Node {
                         let _ = pending.reply.send(Outcome::Failed(Fault::ChannelNotOpen));
                         continue;
                     };
-                    let channel = instance.lock().await;
+                    // The actor does not wait for a room's lock: a session holding it is asked
+                    // again on the next tick.
+                    let Ok(channel) = instance.try_lock() else {
+                        self.pending_metadata
+                            .get_or_insert_with(Pending::default)
+                            .join_replies
+                            .insert(room, JoinPending::Ready(pending));
+                        continue;
+                    };
                     if channel.has_left(&channel.me()) {
                         let _ = pending.reply.send(Outcome::Failed(Fault::ChannelNotOpen));
                         continue;

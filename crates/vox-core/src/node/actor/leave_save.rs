@@ -1116,7 +1116,23 @@ impl Node {
         }
         self.cancel_room_preparation(room, Fault::UnknownChannel);
         self.reopen_failures.remove(room);
-        // The room is gone: no departure of it is waited for any more.
+        // The room is gone: no departure of it is waited for any more. A join that was waiting
+        // on that departure is answered below, not dropped: dropped, its client said the node
+        // was shutting down.
+        let rejoins: Vec<super::RetiringJoin> = self
+            .leave_waiters
+            .iter_mut()
+            .filter(|waiter| waiter.room == *room)
+            .filter_map(|waiter| waiter.rejoin.take())
+            .collect();
+        #[cfg(feature = "test-knobs")]
+        let rejoins = if !rejoins.is_empty()
+            && crate::node::computer::fx28_mutant("rejoin-waiter-dropped-on-purge")
+        {
+            Vec::new()
+        } else {
+            rejoins
+        };
         self.leave_waiters.retain(|waiter| waiter.room != *room);
         self.key_package_rooms.remove(room);
         self.key_package_governance_wait.remove(room);
@@ -1167,7 +1183,13 @@ impl Node {
         if let Err(error) = result {
             self.refresh_network_view().await;
             self.publish().await;
-            return Outcome::Failed(fault_of(&error));
+            // The copy may still be in the store: an ordinary join now would reopen it. The
+            // waiting join is told what failed instead.
+            let fault = fault_of(&error);
+            for join in rejoins {
+                let _ = join.reply.send(Outcome::Failed(fault));
+            }
+            return Outcome::Failed(fault);
         }
         self.deliveries.retain(|(r, _, _), _| r != room);
         self.delivery_reserved.retain(|(r, _, _), _| r != room);
@@ -1178,6 +1200,10 @@ impl Node {
         let _ = self
             .event_tx
             .send(NodeEvent::RoomRemoved { channel_id: *room });
+        // The left copy is gone, so a join that waited on its departure is an ordinary join now.
+        for join in rejoins {
+            Box::pin(self.begin_join_channel(join.link, join.passphrase, join.reply)).await;
+        }
         Outcome::Done
     }
 }

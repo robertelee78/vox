@@ -62,7 +62,8 @@ mod optional_proof;
 optional_proof::not_run!(
     a_node_that_left_rejoins_and_posts_at_once,
     an_unheard_departure_keeps_the_left_copy_until_a_member_returns,
-    a_waiting_rejoin_does_not_hold_independently_deferred_other_room_commands
+    a_waiting_rejoin_does_not_hold_independently_deferred_other_room_commands,
+    a_waiting_rejoin_is_answered_when_its_left_copy_is_deleted
 );
 
 #[path = "support/pty_driver.rs"]
@@ -1745,6 +1746,24 @@ fn end_while_away(delegated: bool, through_end: bool) {
     }
     let ender = if delegated { 1 } else { 0 };
     setup(&room.workers[ender], &["room", "end", &id]);
+    // The creator endorses only an End she holds. Wait until she holds Bob's (her room list says
+    // it ended, or her armed withdrawal save met its fault) before anything reads the boards for
+    // it; if Bob closed the room before she had it, the staging failed, not the product.
+    #[cfg(feature = "test-knobs")]
+    if delegated {
+        let engaged = tmp.path().join("fail-creator-withdrawal.engaged");
+        let (held, seen) = poll(&room.workers[0], &["room", "list"], GONE, |o| {
+            engaged.is_file()
+                || (o.ok
+                    && o.stdout
+                        .lines()
+                        .any(|l| l.starts_with(&id[..12]) && l.contains("ended")))
+        });
+        assert!(
+            held,
+            "APPARATUS: alice never held bob's End, so the creator could not endorse it: {seen:?}"
+        );
+    }
     if through_end {
         for w in &room.workers[..2] {
             let (gone, o) = poll(w, &["room", "list"], GONE, |o| {
@@ -3392,6 +3411,172 @@ fn a_waiting_rejoin_does_not_hold_independently_deferred_other_room_commands() {
         assert!(
             trust.ok && trust_before,
             "PRODUCT: trust did not answer before A after B release: {trust:?}; A={a_result:?}"
+        );
+    });
+}
+
+/// A rejoin waiting on its unheard departure is answered when its left copy is deleted another
+/// way: here by `vox room leave` of the copy, once the room's idle end has passed by the node's
+/// own clock. The join is then an ordinary join and says what it found; it never tells a person
+/// that a node that is running is shutting down.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "two real daemons, an offline member and a stepped product clock; optional"]
+fn a_waiting_rejoin_is_answered_when_its_left_copy_is_deleted() {
+    watchdog::arm();
+    let rt = runtime();
+    let tmp = support::diagnostic_tempdir();
+    let mut room = room_of(&rt, tmp.path(), &["alice", "bob"]);
+    let pass = "fading room passphrase";
+    room.workers[0]
+        .vox_in(
+            None,
+            &[
+                "room",
+                "create",
+                "--passphrase-file",
+                "-",
+                "--name",
+                "fading",
+                "--idle-end",
+                "90",
+            ],
+            Some(pass),
+        )
+        .expect_ok("APPARATUS: Alice creates a room with a 90-second idle end");
+    let link = room.workers[0]
+        .vox(None, &["room", "link", "fading"])
+        .expect_ok("APPARATUS: the idle room's link")
+        .stdout
+        .trim()
+        .to_owned();
+    let id = link
+        .strip_prefix("vox://")
+        .and_then(|rest| rest.split('?').next())
+        .map(|id| {
+            vox_core::node::link::b32_encode(
+                &vox_core::node::link::b32_decode(id, "room").expect("APPARATUS: room id"),
+            )
+        })
+        .expect("APPARATUS: room id in the link");
+    room.workers[1]
+        .vox_in(
+            None,
+            &["room", "join", "--passphrase-file", "-", &link],
+            Some(pass),
+        )
+        .expect_ok("APPARATUS: Bob joins the idle room");
+    let seed = "RG6 before Bob leaves the idle room";
+    room.workers[0]
+        .vox(None, &["room", "post", &id, seed])
+        .expect_ok("APPARATUS: Alice posts in the idle room");
+    let posted = Instant::now();
+    let (read, seen) = poll(&room.workers[1], &["room", "read", &id], WITHIN, |out| {
+        out.ok && out.stdout.contains(seed)
+    });
+    assert!(read, "APPARATUS: Bob did not read Alice's post: {seen:?}");
+    // Alice offline: nobody can take Bob's departure, so his join waits on it. Stopped inside
+    // the idle end, the creator never ends the room herself.
+    room.stop(0);
+    assert!(
+        posted.elapsed() < Duration::from_secs(90),
+        "APPARATUS: Alice ran past the room's idle end before she was stopped"
+    );
+    room.workers[1]
+        .vox(None, &["room", "leave", &id])
+        .expect_ok("APPARATUS: Bob leaves while Alice is offline");
+    // Three minutes on by Bob's clock (inside the boards' five-minute clock window): his left copy
+    // is past its idle end. The hold path is never written; set, the daemon says when a rejoin
+    // is waiting on its departure.
+    let hold = tmp.path().join("never-held");
+    let log = tmp.path().join("bob-past-idle-end.err");
+    room.workers[1].restart_daemon_as(
+        support::VOX,
+        &[
+            ("VOX_TEST_CLOCK_STEP_MS", "180000"),
+            (
+                "VOX_TEST_HOLD_ROOM_WRITE",
+                hold.to_str().expect("APPARATUS: hold path"),
+            ),
+        ],
+        &log,
+    );
+    let bob = &room.workers[1];
+    let leaving = |out: &Out| {
+        out.ok
+            && serde_json::from_str::<serde_json::Value>(&out.stdout).is_ok_and(|status| {
+                status["preparing"].as_array().is_some_and(Vec::is_empty)
+                    && status["leaving"]
+                        .as_array()
+                        .is_some_and(|rooms| rooms.iter().any(|held| held["id"] == id.as_str()))
+            })
+    };
+    support::until(
+        bob,
+        None,
+        "Bob's restart reopened his hidden left copy",
+        &["status", "--json"],
+        leaving,
+    );
+    let offset = std::fs::metadata(&log)
+        .expect("APPARATUS: stat Bob's daemon log")
+        .len() as usize;
+    std::thread::scope(|scope| {
+        let join = scope.spawn(|| {
+            bob.vox_in(
+                None,
+                &["room", "join", "--passphrase-file", "-", &link],
+                Some(pass),
+            )
+        });
+        let marker = format!("vox: rejoin waiting for departure room={id}");
+        let start = Instant::now();
+        loop {
+            let text = std::fs::read_to_string(&log).unwrap_or_default();
+            if text
+                .get(offset..)
+                .is_some_and(|tail| tail.contains(&marker))
+            {
+                eprintln!("[staging] {marker}");
+                break;
+            }
+            assert!(
+                !join.is_finished() && start.elapsed() < WITHIN,
+                "APPARATUS: Bob's join did not wait on its departure: {marker}\n{text}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let left = bob.vox(None, &["room", "leave", &id]);
+        eprintln!("[staging] leave of the ended left copy: {left:?}");
+        assert!(
+            left.ok,
+            "APPARATUS: the ended left copy was not deleted by `vox room leave`: {left:?}"
+        );
+        let gone = bob.vox(None, &["status", "--json"]);
+        assert!(
+            gone.ok && !leaving(&gone),
+            "APPARATUS: Bob's left copy is still held after its leave: {gone:?}"
+        );
+        let joined = join.join().expect("APPARATUS: join thread");
+        eprintln!("[proof] the waiting join answered: {joined:?}");
+        if let Ok(mutant) = std::env::var("VOX_MUTANT_FX28") {
+            let text = std::fs::read_to_string(&log).expect("APPARATUS: read Bob's daemon log");
+            let engaged = format!("[vox mutant] engaged {mutant}");
+            assert!(
+                text.get(offset..)
+                    .is_some_and(|tail| tail.contains(&engaged)),
+                "APPARATUS: mutant did not engage during the waiting join: {engaged}\n{text}"
+            );
+            eprintln!("{engaged}");
+        }
+        assert!(
+            !joined.stderr.contains("shutting down") && !joined.stdout.contains("shutting down"),
+            "PRODUCT: the waiting join was told a running node is shutting down: {joined:?}"
+        );
+        let running = bob.vox(None, &["status", "--json"]);
+        assert!(
+            running.ok,
+            "PRODUCT: Bob's node did not answer after the join: {running:?}"
         );
     });
 }

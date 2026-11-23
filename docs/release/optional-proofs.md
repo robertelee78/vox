@@ -34,6 +34,11 @@ act needs an exclusive proof slot.
 `creator_end_wound_down_while_away_clears_the_verified_checkpoint` keeps the node that
 left stopped until the creator has ended the room and both members have closed it, then
 requires its rejoin to be told the room has ended and its checkpoint to be cleared.
+`a_waiting_rejoin_is_answered_when_its_left_copy_is_deleted` leaves a room while its only
+other member is offline, steps the leaver's product clock past the room's idle end, starts a
+rejoin that waits on the unheard departure, deletes the ended left copy with `vox room leave`,
+and requires the waiting join to be answered as an ordinary join, never "shutting down". It
+needs `test-knobs` and is run with the same command, substituting its exact name.
 
 ### Reading during a daemon restart (ADR-052 RG-9)
 
