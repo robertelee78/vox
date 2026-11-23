@@ -1481,6 +1481,9 @@ pub struct ChannelState {
     gen: Arc<std::sync::atomic::AtomicU64>,
     /// Revocable committed history publication, independent of the mutable room lane.
     history_read: Option<Arc<history::ReadResource>>,
+    /// Each author's in-memory jump over positions its live walk already passed
+    /// ([`entry_store::sparse::LiveResume`]); empty after a restart.
+    pub(crate) live_resume: BTreeMap<Digest32, entry_store::sparse::LiveResume>,
 }
 
 impl Drop for ChannelState {
@@ -2356,6 +2359,7 @@ impl ChannelState {
             settled: true,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             history_read: None,
+            live_resume: BTreeMap::new(),
         };
         // The room's name is stated on its log as its first entry after the genesis, so every
         // member that joins reads it there (ADR-028 R-1).
@@ -2998,6 +3002,7 @@ impl ChannelState {
             settled,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             history_read: None,
+            live_resume: BTreeMap::new(),
         };
         room.entries
             .reopen_rendered(store, &room.sek, &room.channel_id)?;
@@ -3499,6 +3504,7 @@ impl ChannelState {
             settled: false,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             history_read: None,
+            live_resume: BTreeMap::new(),
         })
     }
 
@@ -8775,8 +8781,9 @@ impl ChannelState {
         self.held.get(member).copied()
     }
 
-    /// Read the existing sparse live-window basis alongside the contiguous prefix.
-    /// Explicit archive pages do not select a live window, so old gaps stay out of demand.
+    /// Read the existing sparse live-window basis alongside the contiguous prefix. Positions
+    /// still to walk are those between the window's start and its cursor, less a run the walk
+    /// will jump because it already passed it.
     pub(crate) fn feed_coverage(
         &self,
         store: &Store,
@@ -8800,6 +8807,10 @@ impl ChannelState {
                         0
                     } else {
                         window.next - window.from + 1
+                            - self
+                                .live_resume
+                                .get(member)
+                                .map_or(0, |resume| resume.passes(window))
                     },
                 )
             });
