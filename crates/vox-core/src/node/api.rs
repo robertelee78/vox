@@ -1961,7 +1961,7 @@ impl Fault {
                 "this room was joined and has not yet synced with another member, so nothing can be written to it\n       try again once a member is reachable"
             }
             Fault::OwnHistoryBehind => {
-                "this node's record of its own history in this room is behind what a member holds, as after restoring an older backup; it writes nothing here until that is resolved\n       `vox status --node <name>` names the room; a profile restored from a backup must not write where a newer copy of it already has"
+                "this node's record of its own history in this room is behind what a member holds, as after joining again or restoring an older backup; it writes nothing here until that is resolved\n       `vox status --node <name>` says `own history recovery is pending` while this node waits to recover that history from a member that holds it: keep one online, and try again once that line is gone; it says `conflicting signed own history; writes remain frozen` when that history conflicts"
             }
             Fault::LeaveUndone => {
                 "something was written in the room from this node after the leave, so it is in the room again\n       run `vox room leave` again to leave"

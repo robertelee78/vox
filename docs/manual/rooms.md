@@ -24,6 +24,9 @@ preparation budget; if the room is still preparing, the command reports the curr
 can be tried again.
 `vox room leave`, `vox share`, `vox ping`, Drive and agent-room commands share this wait:
 up to 15 seconds before the same preparing refusal as before.
+A preparing room has no name on the node until it opens, so a command that names a room right
+after a restart waits in the same 15 seconds for that name; if it is still not known, it says how
+many rooms are still preparing rather than that nothing matches.
 Some preparation depends on history or other members and may take longer. `vox room list`,
 `vox status` and `vox doctor --room` report the current state without waiting for the room to open.
 The daemon's console says `holding room … open` when a preparing room becomes readable.
