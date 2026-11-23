@@ -263,6 +263,12 @@ gateway
 lapses and deletes each one when it stops. `vox status --json` carries the same, and the last
 network change under `network_changed`.
 
+A room's or member's `last sync` is when a sync last saved room history this node did not hold
+before: an entry, a header or body, a signed head, a proof or a room context. It does not say that
+a message arrived. A room reads `not receiving` when a connected member has stayed at least 20 live
+entries behind for over 60 seconds with no progress seen between status samples; the line under
+`UNHEALTHY` names the member and how many of its live entries are missing now.
+
 Status remains available when another node's saved anchor inventory cannot be read. Its JSON
 `anchors` is the complete machine inventory; `node_anchors` retains a Ready node's own dial
 scope. If the machine inventory is unavailable, `anchors` is `null` and
