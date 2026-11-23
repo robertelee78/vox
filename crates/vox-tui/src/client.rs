@@ -1514,7 +1514,7 @@ pub async fn node_lock(args: &NodeArgs, name: &str) -> Result<(), AppError> {
             eprintln!("vox: {error}");
             return Err(AppError::Usage(format!("node {name} was not locked: its remembered state could not be forgotten, so the node is left as it was; correct the storage problem and run `vox node lock {name}` again")));
         };
-        stops_it = node.status == Some(vox_core::node::daemonipc::NodeStatus::Ready);
+        stops_it = node.state != NodeState::Detached;
     }
     let mut d = daemon(&account).await?;
     match d
@@ -1580,9 +1580,15 @@ pub async fn node_lock(args: &NodeArgs, name: &str) -> Result<(), AppError> {
 pub async fn node_signout(args: &NodeArgs, name: &str) -> Result<(), AppError> {
     let name = NodeName::parse(name)?;
     let account = args.account()?;
-    node_lock(args, name.as_str()).await?;
     let chosen = account.config_dir.join("app").join("node");
-    if std::fs::read_to_string(&chosen).is_ok_and(|s| s.trim() == name.as_str()) {
+    let app_chose_it = || std::fs::read_to_string(&chosen).is_ok_and(|s| s.trim() == name.as_str());
+    if let Err(e) = node_lock(args, name.as_str()).await {
+        if app_chose_it() {
+            eprintln!("vox: the app's choice of node {name} is kept; correct the error below and run `vox node signout {name}` again");
+        }
+        return Err(e);
+    }
+    if app_chose_it() {
         std::fs::remove_file(&chosen).map_err(|e| AppError::Usage(format!(
             "node {name}'s credentials are forgotten, but the app's choice at {} could not be removed: {e}", chosen.display()
         )))?;

@@ -17,6 +17,29 @@ They are kept "at the ready for troubleshooting". When a user reports one of the
   - A product failure fails as the product's verdict.
 - **CI compiles them on every run and never runs them.** The CI step is "Compile optional proofs (not run; troubleshooting kit)": `cargo test --release -p vox-tui --features optional-proofs --no-run`, with `-D warnings`. A change that breaks one is caught at once, not on the day it is needed.
 
+### First post after leaving and rejoining (ADR-052 RG-6)
+
+`a_room_can_be_left_and_ended_proof::a_node_that_left_rejoins_and_posts_at_once`
+leaves, rejoins once, posts immediately, and requires the other member to read that post.
+Run with `--features test-knobs,optional-proofs --test a_room_can_be_left_and_ended_proof a_node_that_left_rejoins_and_posts_at_once -- --ignored --exact --nocapture`.
+
+`an_unheard_departure_keeps_the_left_copy_until_a_member_returns` takes the only
+other member offline, checks the bounded refusal and retained-copy words, then brings
+the member back and requires a once-only rejoin and immediate post to be read.
+`a_waiting_rejoin_does_not_hold_independently_deferred_other_room_commands` holds
+only the other room's local receiver and requires its independently deferred post,
+read and trust command to answer before the waiting rejoin. Run either with the same
+command, substituting its exact name; both need `test-knobs`, and the held-receiver
+act needs an exclusive proof slot.
+`creator_end_wound_down_while_away_clears_the_verified_checkpoint` keeps the node that
+left stopped until the creator has ended the room and both members have closed it, then
+requires its rejoin to be told the room has ended and its checkpoint to be cleared.
+`a_waiting_rejoin_is_answered_when_its_left_copy_is_deleted` leaves a room while its only
+other member is offline, steps the leaver's product clock past the room's idle end, starts a
+rejoin that waits on the unheard departure, deletes the ended left copy with `vox room leave`,
+and requires the waiting join to be answered as an ordinary join, never "shutting down". It
+needs `test-knobs` and is run with the same command, substituting its exact name.
+
 ### Reading during a daemon restart (ADR-052 RG-9)
 
 The daemon journey stages a real restart with its old node's stop held by a file. A room read,
@@ -477,6 +500,9 @@ Each process uses scratch data and config roots. Run one exact act in release wi
   policy installation, and the pending native Session opens after release without another hook.
   Its verdict uses the product's response, not a count of status polls.
 - `a_linked_worktree_gets_its_repository_offer_and_names_map_authority`: checks both hook riders.
+- `a_native_omp_decided_turn_does_not_retry_a_permanently_refused_identity`: a decided turn's
+  late exit meets the node rebuilt under a new identity; the refusal is said once, never promises
+  reacquiring registration, and no later hook runs against the rebuilt identity.
 
 `key_package_proof` also includes `a_governance_refresh_is_a_retryable_read_refusal` and
 `an_abandoned_key_request_is_selected_again`, run with `test-knobs`. The latter abandons one
@@ -912,6 +938,8 @@ unknown. Ordinary text append and sender-key admission have their own use-bounda
 | `perf_r40_chat_latency_proof::r40_a_message_between_two_online_nodes_arrives_in_under_a_second_direct` | Chat messages are slow to arrive between two online people on a direct path (PRD-001 R40, under 1 s). | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test perf_r40_chat_latency_proof -- --ignored --exact r40_a_message_between_two_online_nodes_arrives_in_under_a_second_direct` | a real machine | 8 s / 9 s |
 | `perf_r40_relayed_chat_proof::r40_a_message_between_two_online_nodes_arrives_in_under_a_second_relayed` | The same, when the only path is a relay (R40, under 1 s). | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test perf_r40_relayed_chat_proof -- --ignored --exact r40_a_message_between_two_online_nodes_arrives_in_under_a_second_relayed` | a real machine with IPv4 and IPv6 loopback (the split is checked first) | 22 s / 23 s, with the deleted control running alongside |
 | `perf_r41_tunnel_throughput_proof::r41_a_tunnel_does_not_throttle_the_link_it_runs_over` | A tunnel (`vox forward`, SOCKS) is much slower than the link it runs over (R41). Or, under ADR-024's tapered congestion control: slow on a lossy link (under 2× a Cubic flow on the same loss), slower than a Cubic flow sharing a congested link (under 0.5×), stalled when the link turns lossy, under its lossy-link speed after a pause, or not back at full speed after the loss ends. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test perf_r41_tunnel_throughput_proof -- --ignored --exact r41_a_tunnel_does_not_throttle_the_link_it_runs_over` | a real machine; ~2 GB through a userspace link emulator. A link or arm whose emulator cannot hold its rate (a calibration window under 95%, or packets released late) is `CANNOT MEASURE` for that link or arm only, naming the window or the lateness, and the rest still measure; it is not a product verdict. `VOX_PERF_ONLY=<text>[|<text>…]` runs only the links and arms whose names contain one of them. It sets `VOX_TEST_ADVERTISE`, so it needs `test-knobs` too, as every command here has it. | 725 s (one run at load 35–44, M24.2 c3.1 `0b7d4d0d`) |
+| `perf_r41_tunnel_throughput_proof::r41a_a_stalled_receiver_behind_a_short_buffer_keeps_its_speed` | A tunnel slows far below raw TCP when the receiving host has a short socket buffer and its daemon stalls (R41a): the receiver's overflow reports never reach the sender, or the sender keeps the cuts they cover. On R41's WAN link the host receives through a 416 KiB buffer and its daemon is stopped 20 ms in every 100 ms. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test perf_r41_tunnel_throughput_proof -- --ignored --exact r41a_a_stalled_receiver_behind_a_short_buffer_keeps_its_speed` | Linux (on macOS it is CANNOT MEASURE: the kernel counts no socket drops); ~800 MB through the userspace link emulator | not timed here |
+| `a_newcomer_reads_the_whole_history_proof::a_daemon_answers_the_hook_while_syncing` | The agent hook says the daemon did not answer promptly while a newcomer fetches older history (ADR-038 FX-17), `vox status` counts a room's rows differently from what a paged read shows (FX-16), or the serving lane runs rounds `vox status` names no reason for (FX-15). Each of 200 hook runs must finish within 2 s. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test a_newcomer_reads_the_whole_history_proof -- --ignored --exact a_daemon_answers_the_hook_while_syncing` | two scratch daemons, a 257-post backlog | not timed here |
 | `a_first_direct_connection_is_prompt_proof::a_first_direct_connection_completes_in_under_two_seconds` | The first connection to a host on the same network takes more than 2 s (R42). | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test a_first_direct_connection_is_prompt_proof -- --ignored --exact a_first_direct_connection_completes_in_under_two_seconds` | a real machine | 22 s / 25 s |
 | `a_first_punched_connection_is_prompt_proof::a_first_hole_punched_connection_completes_in_under_two_seconds` | The first connection through two NATs takes more than 2 s (R42). | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test a_first_punched_connection_is_prompt_proof -- --ignored --exact a_first_hole_punched_connection_completes_in_under_two_seconds` | a real machine | 45 s / 52 s |
 | `a_first_relayed_connection_is_under_two_seconds_proof::a_first_relayed_connection_completes_in_under_two_seconds` | The first relayed connection takes more than 2 s (R42). | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test a_first_relayed_connection_is_under_two_seconds_proof -- --ignored --exact a_first_relayed_connection_completes_in_under_two_seconds` | a real machine | 21 s / 21 s |
@@ -1003,6 +1031,7 @@ decides the PRODUCT verdict. This is an on-demand diagnostic, not CI or a releas
 
 | Proof | Helps troubleshoot | Run | Needs | Time |
 |---|---|---|---|---|
+| `failure_reasons_proof::a_full_keyring_names_its_cause` | `vox trust add` past the 1,024 identities a keyring holds is not refused with the keyring-full cause and how to make room (case (9) at the real cap). | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test failure_reasons_proof -- --ignored --exact a_full_keyring_names_its_cause` | 1,100 production-Argon2id `trust add`s, eight at a time against one daemon | minutes in release; most of an hour in debug (#295) |
 | `notify_proof::a_room_that_cannot_sync_notifies_once_and_once_when_it_syncs_again` | A disconnected room with no new sync entries for ten minutes is never said, is said more than once, or is never said to have recovered (PRD-001 R37). Alice's only other member and anchor stop; one desktop notice names the stale room, then one recovery follows Bob reconnecting, posting, and Alice reading the new post. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test notify_proof -- --ignored --exact a_room_that_cannot_sync_notifies_once_and_once_when_it_syncs_again` | nothing beyond `vox` | over ten minutes (`STALE_SYNC_MS`) |
 | `vox_status_shows_the_node_proof::a_stalled_author_is_not_hidden_by_other_members_new_entries` | A held author's live-window deficit loses its `not receiving` verdict when another member's posts arrive. The proof-only hold leaves the author's persisted window unchanged while allowing other providers' other-author tasks to finish; this is not a proof of shipped slow-peer scheduling isolation. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test vox_status_shows_the_node_proof a_stalled_author_is_not_hidden_by_other_members_new_entries -- --ignored --exact --nocapture` | three scratch members, minute-spaced other-member posts | 60–130 s of observation, plus setup |
 | `vox_status_shows_the_node_proof::status_names_a_connected_member_whose_posts_are_not_received` | A hint-only inventory falsely refreshes last sync, or a connected author's withheld posts never produce the room's `not receiving` verdict. Both initial feeds are fully received and both daemons cleanly stopped; the provider restarts refusing heads and only responding, so the fresh reader fetches new hints without any new entry. Status must keep its receipt clock unchanged and describe live entries not held, not claim nothing arrived between samples. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test vox_status_shows_the_node_proof status_names_a_connected_member_whose_posts_are_not_received -- --ignored --exact --nocapture` | two scratch members, head refusal and respond-only test knobs | over 60 s of observation, plus setup |
@@ -1033,7 +1062,7 @@ decides the PRODUCT verdict. This is an on-demand diagnostic, not CI or a releas
 
 The `a_room_takes_every_joiner_proof` row came with #299 (V210-104), which made the proof optional with a stand-in from the start. The last four rows came from #262 (V210-71) and #287 (V210-93). Both first made these proofs opt-in, #262 through `[[test]]` entries with `required-features` and #287 through `#[cfg(feature = "heavy-proofs")]`. Neither was compiled without the feature, so nothing showed the proof existed. Each now has a stand-in, like the rest.
 
-**Part of a blocking proof:** `failure_reasons_proof`'s case (9), the keyring-full refusal, runs in every release build. In a **debug** build it runs only with `--features optional-proofs`, because its 1,100 production-Argon2id `trust add`s take most of an hour there (#295). Without the feature, the debug run prints `OPTIONAL PROOF NOT RUN` for that case.
+**Part of a blocking proof:** `failure_reasons_proof`'s case (9), the keyring-full refusal, is blocking at a small keyring cap set by the test-only `VOX_TEST_KEYRING_CAP`. Its arm at the real 1,024-identity cap is the optional `a_full_keyring_names_its_cause` above.
 
 ### Spike (samples a race under deliberate CPU load)
 
@@ -1235,3 +1264,82 @@ writes. The second seeds the old serving-row shape in a real stopped room, opens
 after a committed cleanup batch and reopens it, preserving other object kinds and readable
 history. A second open preserves planted stopped-store canaries, proving the completed room
 does not scan again; each row-count observation also records the store's file length.
+
+### Reading while messages expire (#1373)
+
+Two optional acts in `retention_proof.rs`, each in private scratch profiles:
+
+```sh
+cargo test --release -p vox-tui --features optional-proofs,test-knobs --test retention_proof \
+  a_room_stays_readable_while_messages_keep_expiring -- --ignored --exact --nocapture
+cargo test --release -p vox-tui --features optional-proofs,test-knobs --test retention_proof \
+  a_hook_continuation_read_skips_expired_messages -- --ignored --exact --nocapture
+```
+
+The first sets a one-second message lifetime and keeps posting: reads must answer, without
+already-expired messages and with exact pages, counts and thread summaries, while messages
+expire; a backlog larger than one cleanup sweep must still answer `the room is refreshing saved
+history; retry` until it is readable. The second holds the native prune with a test knob and
+requires the hook's continuation read to skip the expired rows instead of refusing.
+
+## RG-15 release assets in disposable guests
+
+`scripts/release/guest-state.sh` runs one state in the existing `vox-app-proofs` Tart guest,
+using the shared guest lock and one build-slot hold per build or proof, then stops the guest.
+`scripts/release/linux.py` runs one journey in its own `vox-rg15-*` container and removes it.
+Neither runs the product on the host or changes its real profile. The dist's own `install.sh`,
+records and signed bytes are the inputs; every product command uses a private home/data/config.
+
+For a guest prerequisite check without building or running a journey, use
+`guest-state.sh <new-evidence-state> readiness readiness <dist>`. It takes the free guest lock
+without waiting, records the SSH and journey Node paths/versions and `Promise.withResolvers`,
+records free disk, then stops the guest and releases the lock. A missing Node22 runtime or less
+than10GiB free is APPARATUS, not a product verdict. Node runtime preparation belongs only in
+the apparatus's own directory, never a system-wide guest installation.
+
+The existing proof files have three optional entry points:
+
+- `install_sh_proof::a_shipped_release_installs_and_serves_a_fresh_node`: install the given
+  `VOX_PROOF_DIST`, check its version, create a Ready node and post/read a room.
+- `update_proof::a_published_install_updates_through_github_with_its_agent_turn`: install a
+  published previous dist, run its real GitHub updater, and require
+  `VOX_PROOF_EXPECTED_VERSION`, Ready node and surviving room. The old loaded extension's
+  messages are quoted as EXPECTED OLD BEHAVIOUR. Continued later-news delivery passes; otherwise
+  the advice must contain at least one of the accepted phrases `Vox update mismatch` or
+  `start a new native OMP conversation` (other `NOTIFY:` lines alone do not pass).
+  A new conversation after update must show later news exactly once, with no
+  `Vox update mismatch` or uncertainty. This is the published-previous path.
+- `update_proof::a_candidate_source_pair_updates_with_its_agent_turn`: before-tag observation
+  with `VOX_PROOF_DIST` and `VOX_PROOF_CANDIDATE_DIST` naming genuine **nonshipping**
+  test-knobs builds. The same held conversation must show later news exactly once, report one
+  reconnecting line and no mismatch. This proves the candidate's updater/restart/agent turn,
+  not the published previous updater or real endpoint. macOS retains Apple verification.
+
+The two update observations are deliberately distinct. Before publication, normal assets have
+no release-base override. After publication the previous normal asset must update through
+`releases/latest`; never substitute a local copy or add a knob to make that observation green.
+`VOX_PROOF_JOURNEY_WORK` names a new scratch directory. The launcher uses
+`VOX_PROOF_JOURNEY_SCRIPT` only to locate the apparatus after copying it into a guest.
+For explicitly authorized refusal diagnosis only, `VOX_PROOF_INSPECT_REFUSED_UPDATE=1`
+records the installed version, status and saved post after a refused update, closes the native
+conversation, and records one further update and explicit daemon restart. The original refusal
+remains RED even if recovery succeeds; ordinary release journeys never enable this option.
+
+The busy-room journey already accepts `VOX_PROOF_SHIPPED_BINARY`; the guest runner points it at
+the binary the actual installer put in the scratch home. Build its release harness in a shared
+hold, then execute it alone. QEMU cannot judge its real-time posting/pause cadence, kernel-keyring
+retention, or other time-bound claims; such rows are APPARATUS/not judged under emulation, never
+a shipping GREEN. A non-timing install or updater verdict can still be measured there.
+
+macOS cleanup queries LaunchServices before unregistering an owned app path; a path that is
+already absent needs no removal. The exact PlugInKit `no plugin at <owned path>` response
+likewise means already absent. Other registration/cleanup failures are APPARATUS and prevent
+a successful journey state; the guest wrapper still stops its owned VM before releasing the lock.
+
+Every normal journey reads the installed, resolved binary and refuses a
+`VOX_TEST_RELEASE_BASE` marker as APPARATUS (wrong asset supplied). Controlled-update instead
+requires that marker in both nonshipping binaries. GREEN names the installed SHA-256 (both
+before/after digests for updates) and is printed only after owned cleanup succeeds. A cleanup
+failure after passing assertions says the assertions had held, exits nonzero and prints no GREEN.
+A wait that makes no progress names the unmet claim and is APPARATUS/not judged; an unexplained
+red is not cleared by a later green rerun.

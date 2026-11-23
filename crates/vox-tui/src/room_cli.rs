@@ -151,7 +151,7 @@ async fn room_of_readiness(
     prefix: &str,
     wait_for_preparing: bool,
 ) -> Result<Digest32, AppError> {
-    let rooms = rooms_of(client).await?;
+    let mut rooms = rooms_of(client).await?;
     if rooms.is_empty() {
         if let Some(ended) = ended_room_said(client, prefix).await {
             return Err(ended);
@@ -159,6 +159,33 @@ async fn room_of_readiness(
         return Err(AppError::Usage(
             "this node holds no rooms yet — join or create one first".into(),
         ));
+    }
+    // A room preparing after a restart has no name here until it opens (its name is sealed in
+    // it), so a name that matches nothing yet may be one of them: wait for it inside the same
+    // patience as a preparing room, and never answer that nothing matches while one is unnamed.
+    let unnamed_preparing = |rooms: &[vox_core::node::ipc::RoomRow]| {
+        rooms
+            .iter()
+            .filter(|(_, name, open, _, preparing, ..)| name.is_empty() && !open && *preparing)
+            .count()
+    };
+    let matches = |rooms: &[vox_core::node::ipc::RoomRow]| {
+        let ids: Vec<Digest32> = rooms.iter().map(|(id, ..)| *id).collect();
+        resolve_prefix(prefix, &ids).is_ok()
+            || rooms
+                .iter()
+                .any(|(_, name, ..)| !name.is_empty() && name.eq_ignore_ascii_case(prefix.trim()))
+    };
+    if wait_for_preparing && unnamed_preparing(&rooms) > 0 && !matches(&rooms) {
+        eprintln!("vox: waiting for this node's rooms to finish preparing, to find {prefix:?}");
+        let began = std::time::Instant::now();
+        while unnamed_preparing(&rooms) > 0
+            && !matches(&rooms)
+            && began.elapsed() < crate::daemon_client::START_WITHIN
+        {
+            tokio::time::sleep(crate::daemon_client::NODE_WAIT_POLL).await;
+            rooms = rooms_of(client).await?;
+        }
     }
     let ids: Vec<Digest32> = rooms.iter().map(|(id, ..)| *id).collect();
     let named: Vec<Digest32> = rooms
@@ -170,7 +197,18 @@ async fn room_of_readiness(
         [] => match resolve_prefix(prefix, &ids) {
             Ok(id) => id,
             // Not a typo: a room this node deleted because it ended says so (V030-08, #1206).
-            Err(error) => return Err(ended_room_said(client, prefix).await.unwrap_or(error)),
+            Err(error) => {
+                let preparing = unnamed_preparing(&rooms);
+                let error = if preparing == 0 {
+                    error
+                } else {
+                    AppError::Usage(format!(
+                        "no room named so far matches {:?}, and {preparing} of this node's rooms are still preparing: a room is named once it is open; try again when `vox room list` names them",
+                        prefix.trim()
+                    ))
+                };
+                return Err(ended_room_said(client, prefix).await.unwrap_or(error));
+            }
         },
         [one] => *one,
         // Two rooms of one name (ADR-028 R-3): neither is meant more than the other.

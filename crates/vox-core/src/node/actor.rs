@@ -189,6 +189,8 @@ struct LeaveWaiter {
     /// A member has the departure, and only the purge is owed (`finish_leave_if_heard`).
     heard: bool,
     committed: Option<leave_save::CommittedDeparture>,
+    /// A rejoin cannot erase the only copy of this exact signed departure.
+    rejoin: Option<RetiringJoin>,
 }
 
 /// One authenticated own body whose effect can now finish from its staged Page. A donor
@@ -868,6 +870,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::JoinNamePreflight { .. } => "reserving a joining room name",
         NetEvent::BoardGrew { .. } => "passing on a record that landed on our board",
         NetEvent::LeaveWaitOver { .. } => "answering a leave nobody took",
+        NetEvent::RejoinRoomEnded { .. } => "joining a left room its creator ended",
         NetEvent::BoardWithdrew => "showing a board a withdraw took records off",
         NetEvent::ChannelSealed { .. } => "finishing a room whose key was sealed",
         NetEvent::ChannelUnsealed { .. } => "holding a room whose key was unwrapped",
@@ -2120,6 +2123,12 @@ enum NetEvent {
         channel_id: Digest32,
         /// Which wait this ends.
         serial: u64,
+    },
+    /// A board holds the creator's End of a room a rejoin is waiting on, verified against this
+    /// node's checkpoint (`Joiner::room_end_verified`): the departure protects nothing now.
+    RejoinRoomEnded {
+        /// The room.
+        channel_id: Digest32,
     },
     /// A peer connected and opened a stream the actor must handle.
     Stream {
@@ -3905,6 +3914,17 @@ impl Joiner {
         genesis: Option<&crate::governance::genesis::Genesis>,
         withdrawals: &[crate::nat::withdraw::BoardWithdraw],
     ) -> crate::error::Result<bool> {
+        self.verified_end(genesis, withdrawals, true).await
+    }
+
+    /// Whether `withdrawals` hold the room's End signed by its creator, checked against this
+    /// node's checkpoint (`confirm_creator_end`); `erase` clears that checkpoint when they do.
+    async fn verified_end(
+        &self,
+        genesis: Option<&crate::governance::genesis::Genesis>,
+        withdrawals: &[crate::nat::withdraw::BoardWithdraw],
+        erase: bool,
+    ) -> crate::error::Result<bool> {
         let room = self.parsed.channel_id;
         let store = Arc::clone(&self.store);
         let signer = Arc::clone(&self.signer);
@@ -3954,10 +3974,32 @@ impl Joiner {
                 genesis.as_ref(),
                 &withdrawals,
                 now,
+                erase,
             )
         })
         .await
         .unwrap_or(Err(Error::AtRestLocked))
+    }
+
+    /// Whether the first board reached holds this room's End signed by its creator, verified
+    /// against this node's checkpoint. The checkpoint is left for the join that follows, whose
+    /// own board read clears it as an ordinary join does. A delegated or unverifiable End is not
+    /// one.
+    async fn room_end_verified(&self) -> bool {
+        let Ok(Some(board)) = self.reach_a_board().await else {
+            return false;
+        };
+        match self
+            .net
+            .fetch_channel(&board, &self.parsed.channel_id, 0)
+            .await
+        {
+            Ok(set) if !set.room_withdraws.is_empty() => self
+                .verified_end(set.genesis.as_ref(), &set.room_withdraws, false)
+                .await
+                .unwrap_or(false),
+            _ => false,
+        }
     }
     /// A board holding the room, when the boards in `tried` — starting with the one
     /// `reach_a_board` chose — had nothing for it, could not be read, or took no pre-join record:
@@ -6449,6 +6491,7 @@ enum LeftPurgePurpose {
         link: String,
         passphrase: Secret,
         reply: oneshot::Sender<Outcome>,
+        deadline: tokio::time::Instant,
     },
     Leave {
         replies: Vec<oneshot::Sender<Outcome>>,
@@ -6475,6 +6518,15 @@ impl LeftPurgePurpose {
             }
         }
     }
+}
+
+/// The original join owns only its reply and arguments while its exact cleanup is acknowledged.
+/// No Store reader or command-queue permit survives the purge.
+struct RetiringJoin {
+    link: String,
+    passphrase: Secret,
+    reply: oneshot::Sender<Outcome>,
+    deadline: tokio::time::Instant,
 }
 
 #[derive(Clone, Copy)]
@@ -7156,7 +7208,8 @@ pub struct Node {
     consent_keys: crate::node::pending_consent::PendingConsents,
     /// Fair scheduling cursor only; accepted Session work is in the encrypted Store.
     session_room_removed: Option<mpsc::Sender<crate::node::session_ingress::Retirement>>,
-    session_rooms_retiring: BTreeSet<crate::node::session_ingress::Retirement>,
+    session_rooms_retiring:
+        BTreeMap<crate::node::session_ingress::Retirement, Option<RetiringJoin>>,
     session_ingress_cursor: usize,
     session_ingress_scan: usize,
     drive_receipt_cursor: u64,
@@ -7623,7 +7676,7 @@ impl Node {
             retention_warned: std::collections::BTreeSet::new(),
             consent_keys: crate::node::pending_consent::PendingConsents::default(),
             session_room_removed,
-            session_rooms_retiring: BTreeSet::new(),
+            session_rooms_retiring: BTreeMap::new(),
             session_ingress_cursor: 0,
             session_ingress_scan: 0,
             drive_receipt_cursor: 0,
@@ -8528,6 +8581,8 @@ impl Node {
                 _ = ticker.tick() => {
                     self.complete_identity_startup().await;
                     self.complete_pending_posts().await;
+                    self.expire_retiring_joins();
+                    self.advance_metadata_join_replies().await;
                     if self.store_save_pending() {
                         // Only Store-dependent maintenance waits. Connection liveness,
                         // ordinary transport policy and independent presentation pulls keep
@@ -8820,10 +8875,20 @@ impl Node {
                     .and_then(|profile| {
                         crate::node::session_ingress::complete_retirement(profile, retirement)
                     });
-                if result.is_ok() {
-                    self.session_rooms_retiring.remove(&retirement);
-                }
+                let joining = if result.is_ok() {
+                    self.session_rooms_retiring.remove(&retirement).flatten()
+                } else {
+                    None
+                };
                 let _ = reply.send(result);
+                if let Some(join) = joining {
+                    if tokio::time::Instant::now() >= join.deadline {
+                        let _ = join.reply.send(Outcome::Failed(Fault::SessionCleanupBusy));
+                    } else {
+                        self.begin_join_channel(join.link, join.passphrase, join.reply)
+                            .await;
+                    }
+                }
                 Outcome::Done
             }
             // Original reply belongs to the retained save owner in the command loop.
@@ -12859,6 +12924,9 @@ impl Node {
             NetEvent::LeaveWaitOver { channel_id, serial } => {
                 self.finish_leave_unheard(channel_id, serial).await;
             }
+            NetEvent::RejoinRoomEnded { channel_id } => {
+                self.rejoin_room_ended(channel_id).await;
+            }
             NetEvent::AnchorNoteDue { channel_id, serial } => {
                 self.say_anchors_that_never_took(channel_id, serial);
             }
@@ -15783,8 +15851,7 @@ impl Node {
             let _ = reply.send(Outcome::Failed(Fault::RoomChangePending));
             return;
         }
-        // A room this identity left and still holds for its departure's delivery is joined
-        // again all the same (the decider, 2026-11-11): what it holds goes first, below.
+        // A retained left copy may still be the only copy of its signed departure.
         let resume_accepted = self.join_name_reservations.contains_key(&parsed.channel_id)
             && self.join_cleanup.contains_key(&parsed.channel_id);
         let (Some(net), Some(ring)) = (
@@ -15807,6 +15874,41 @@ impl Node {
                 ch.has_left(&ch.me())
             };
             if left {
+                self.resume_leave(&parsed.channel_id).await;
+                #[cfg(feature = "test-knobs")]
+                let purge_unheard =
+                    crate::node::computer::fx28_mutant("rejoin-purge-unheard-departure");
+                #[cfg(not(feature = "test-knobs"))]
+                let purge_unheard = false;
+                if !purge_unheard {
+                    if let Some(waiter) = self
+                        .leave_waiters
+                        .iter_mut()
+                        .find(|waiter| waiter.room == parsed.channel_id && !waiter.heard)
+                    {
+                        if waiter.rejoin.is_some() {
+                            let _ = reply.send(Outcome::Failed(Fault::RoomChangePending));
+                        } else {
+                            let probe_passphrase = passphrase.clone();
+                            waiter.rejoin = Some(RetiringJoin {
+                                link,
+                                passphrase,
+                                reply,
+                                deadline: tokio::time::Instant::now() + Self::BOARD_PATIENCE,
+                            });
+                            self.sched_rooms.insert(parsed.channel_id);
+                            self.spawn_end_probe(&parsed, net, ring, probe_passphrase);
+                            #[cfg(feature = "test-knobs")]
+                            if std::env::var_os("VOX_TEST_HOLD_ROOM_WRITE").is_some() {
+                                eprintln!(
+                                    "vox: rejoin waiting for departure room={}",
+                                    crate::node::link::b32_encode(&parsed.channel_id)
+                                );
+                            }
+                        }
+                        return;
+                    }
+                }
                 self.begin_own_key_left_purge(
                     parsed.channel_id,
                     shared,
@@ -15814,6 +15916,7 @@ impl Node {
                         link,
                         passphrase,
                         reply,
+                        deadline: tokio::time::Instant::now() + Self::BOARD_PATIENCE,
                     },
                 )
                 .await;
@@ -15821,7 +15924,33 @@ impl Node {
             }
         }
         // A prior deletion's owner must finish clearing its saved bindings before the same
-        // room can be rejoined; otherwise that cleanup could erase the new binding.
+        // room can be rejoined; otherwise that cleanup could erase the new binding. A join that
+        // meets this node's own cleanup still being acknowledged continues from that
+        // acknowledgement (`RetireSessionRoom`), within the join's patience.
+        if let Some(waiting) = self
+            .session_rooms_retiring
+            .iter_mut()
+            .find(|(retirement, _)| retirement.room == parsed.channel_id)
+            .map(|(_, join)| join)
+        {
+            #[cfg(feature = "test-knobs")]
+            let refuse = crate::node::computer::fx28_mutant("rejoin-before-session-retirement");
+            #[cfg(not(feature = "test-knobs"))]
+            let refuse = false;
+            if !refuse {
+                if waiting.is_some() {
+                    let _ = reply.send(Outcome::Failed(Fault::RoomChangePending));
+                } else {
+                    *waiting = Some(RetiringJoin {
+                        link,
+                        passphrase,
+                        reply,
+                        deadline: tokio::time::Instant::now() + Self::BOARD_PATIENCE,
+                    });
+                }
+                return;
+            }
+        }
         if let Some(profile) = self.profile.as_ref() {
             match crate::node::session_ingress::retirements(profile) {
                 Ok(rooms) if rooms.iter().any(|item| item.room == parsed.channel_id) => {
@@ -15866,40 +15995,7 @@ impl Node {
         // The pre-join record is stamped in milliseconds.
         let now = now_ms.get();
         let me = net.local_id();
-        // The boards to try, in the order `reach_a_board` tried them: the link's anchors, this
-        // machine's hand-added anchors. A live connection assigned to another room is
-        // not a route for this room.
-        //
-        // **One route per board, with every address known for it.** The link and this node can
-        // name the same anchor by different addresses — the host that minted the link reached it on
-        // IPv4, this node reaches it on IPv6 — and keeping only the first entry for an identity
-        // dropped this node's own addresses for it: an IPv6-only member was left dialling the
-        // link's IPv4 address for its own anchor, and reached it only by a fallback after that
-        // dial ran out. This node's own addresses go first — they are what it resolved for itself
-        // — then the link's, and the dial races them (`connect_direct` is Happy Eyeballs).
-        let mut routes: Vec<(Digest32, crate::nat::multiaddr::EndpointList)> = Vec::new();
-        let mut seen: std::collections::BTreeSet<Digest32> = [me].into_iter().collect();
-        for a in parsed.anchors.iter() {
-            if seen.insert(a.id) {
-                routes.push((a.id, a.endpoints.clone()));
-            }
-        }
-        for a in self.anchors.nodes() {
-            if seen.insert(a.id) {
-                routes.push((a.id, a.endpoints.clone()));
-            } else if let Some((_, known)) = routes.iter_mut().find(|(id, _)| *id == a.id) {
-                let mut all: Vec<crate::nat::multiaddr::Multiaddr> = a.endpoints.addrs().to_vec();
-                for m in known.addrs() {
-                    if !all.contains(m) {
-                        all.push(*m);
-                    }
-                }
-                all.truncate(crate::nat::multiaddr::MAX_ENDPOINTS);
-                if let Ok(merged) = crate::nat::multiaddr::EndpointList::new(all) {
-                    *known = merged;
-                }
-            }
-        }
+        let routes = self.join_routes(&parsed, me);
         if routes.is_empty() {
             // Nothing was tried, so say so rather than leave the person to read "did not answer"
             // about a board nobody dialled (V210-107).
@@ -19880,6 +19976,20 @@ impl Node {
     /// node is *locking* ([`NodeView::locking`]). The returned receiver fires once it has settled.
     async fn lock_all(&mut self) -> oneshot::Receiver<()> {
         self.session_ingress_waits.clear();
+        for join in self
+            .session_rooms_retiring
+            .values_mut()
+            .filter_map(Option::take)
+        {
+            let _ = join.reply.send(Outcome::Failed(Fault::Locked));
+        }
+        for join in self
+            .leave_waiters
+            .iter_mut()
+            .filter_map(|waiter| waiter.rejoin.take())
+        {
+            let _ = join.reply.send(Outcome::Failed(Fault::Locked));
+        }
         // The worker retains its original secret guard through physical completion.
         self.pending_session_bookkeeping = None;
         self.session_ingress_scan = 0;
@@ -21661,6 +21771,7 @@ impl Node {
             deadline_ms,
             heard: false,
             committed,
+            rejoin: None,
         });
         self.arm_leave_bound(channel_id, serial, deadline_ms);
         self.refresh_reachers().await;
@@ -21730,8 +21841,15 @@ impl Node {
                 _ => heard.push(waiter.serial),
             }
         }
-        self.leave_waiters
-            .retain(|w| !(w.room == channel_id && stale.contains(&w.serial)));
+        self.leave_waiters.retain_mut(|waiter| {
+            let current = !(waiter.room == channel_id && stale.contains(&waiter.serial));
+            if !current {
+                if let Some(join) = waiter.rejoin.take() {
+                    let _ = join.reply.send(Outcome::Failed(Fault::ChannelNotOpen));
+                }
+            }
+            current
+        });
         if heard.is_empty() {
             return;
         }
@@ -21772,8 +21890,15 @@ impl Node {
         };
         if !current {
             // A replacement room attachment or epoch: `resume_leave` arms its own wait.
-            self.leave_waiters
-                .retain(|w| !(w.room == channel_id && w.serial == serial));
+            self.leave_waiters.retain_mut(|waiter| {
+                let keep = !(waiter.room == channel_id && waiter.serial == serial);
+                if !keep {
+                    if let Some(join) = waiter.rejoin.take() {
+                        let _ = join.reply.send(Outcome::Failed(Fault::ChannelNotOpen));
+                    }
+                }
+                keep
+            });
             return;
         }
         let now = self.now_ms().get();
@@ -21799,15 +21924,25 @@ impl Node {
             }
         }
         if let Some(instance) = self.channels.get(&channel_id).cloned() {
-            self.begin_own_key_left_purge(
-                channel_id,
-                instance,
-                LeftPurgePurpose::Leave {
+            let join = self
+                .leave_waiters
+                .iter_mut()
+                .find(|waiter| waiter.room == channel_id && waiter.heard)
+                .and_then(|waiter| waiter.rejoin.take());
+            let purpose = match join {
+                Some(join) => LeftPurgePurpose::Join {
+                    link: join.link,
+                    passphrase: join.passphrase,
+                    reply: join.reply,
+                    deadline: join.deadline,
+                },
+                None => LeftPurgePurpose::Leave {
                     replies: Vec::new(),
                     lifetimes: Vec::new(),
                 },
-            )
-            .await;
+            };
+            self.begin_own_key_left_purge(channel_id, instance, purpose)
+                .await;
         }
     }
 
@@ -23195,7 +23330,7 @@ impl Node {
             || self.failed_post_reads.contains_key(&channel_id)
             || self
                 .session_rooms_retiring
-                .iter()
+                .keys()
                 .any(|item| item.room == channel_id)
         {
             return refuse();
@@ -24157,6 +24292,164 @@ impl Node {
         }
     }
 
+    /// The boards a join of `parsed` tries, in the order `reach_a_board` tries them: the link's
+    /// anchors, this machine's hand-added anchors. A live connection assigned to another room is
+    /// not a route for this room.
+    ///
+    /// **One route per board, with every address known for it.** The link and this node can
+    /// name the same anchor by different addresses — the host that minted the link reached it on
+    /// IPv4, this node reaches it on IPv6 — and keeping only the first entry for an identity
+    /// dropped this node's own addresses for it: an IPv6-only member was left dialling the
+    /// link's IPv4 address for its own anchor, and reached it only by a fallback after that
+    /// dial ran out. This node's own addresses go first — they are what it resolved for itself
+    /// — then the link's, and the dial races them (`connect_direct` is Happy Eyeballs).
+    fn join_routes(
+        &self,
+        parsed: &crate::node::link::InviteLink,
+        me: Digest32,
+    ) -> Vec<(Digest32, crate::nat::multiaddr::EndpointList)> {
+        let mut routes: Vec<(Digest32, crate::nat::multiaddr::EndpointList)> = Vec::new();
+        let mut seen: std::collections::BTreeSet<Digest32> = [me].into_iter().collect();
+        for a in parsed.anchors.iter() {
+            if seen.insert(a.id) {
+                routes.push((a.id, a.endpoints.clone()));
+            }
+        }
+        for a in self.anchors.nodes() {
+            if seen.insert(a.id) {
+                routes.push((a.id, a.endpoints.clone()));
+            } else if let Some((_, known)) = routes.iter_mut().find(|(id, _)| *id == a.id) {
+                let mut all: Vec<crate::nat::multiaddr::Multiaddr> = a.endpoints.addrs().to_vec();
+                for m in known.addrs() {
+                    if !all.contains(m) {
+                        all.push(*m);
+                    }
+                }
+                all.truncate(crate::nat::multiaddr::MAX_ENDPOINTS);
+                if let Ok(merged) = crate::nat::multiaddr::EndpointList::new(all) {
+                    *known = merged;
+                }
+            }
+        }
+        routes
+    }
+
+    /// One board read beside a rejoin's departure wait, so the wait adds nothing to it: only the
+    /// room creator's End, verified against this node's checkpoint, ends the wait early
+    /// (`rejoin_room_ended`). Anything else, a delegated End among it, leaves the join waiting.
+    fn spawn_end_probe(
+        &mut self,
+        parsed: &crate::node::link::InviteLink,
+        net: Arc<NodeNet>,
+        ring: Arc<tokio::sync::Mutex<PrekeyRing>>,
+        passphrase: Secret,
+    ) {
+        let Some(profile) = self.profile.as_ref() else {
+            return;
+        };
+        let Ok(signer) = profile.signer_arc() else {
+            return;
+        };
+        let store = profile.store_handle();
+        let me = net.local_id();
+        let routes = self.join_routes(parsed, me);
+        if routes.is_empty() {
+            return;
+        }
+        let job = Joiner {
+            net,
+            tx: self.net_tx.clone(),
+            me,
+            attachment: self.delivery_epoch,
+            parsed: parsed.clone(),
+            routes,
+            signer,
+            store,
+            resume_accepted: false,
+            ring,
+            // The read publishes no pre-join record.
+            seq: 0,
+            now: self.now_ms().get(),
+            pow_params: self.pow_params,
+            argon2: self.argon2,
+            passphrase,
+            secret_work: Arc::clone(&self.secret_work),
+            events: self.event_tx.clone(),
+        };
+        let tx = self.net_tx.clone();
+        let channel_id = parsed.channel_id;
+        self.spawn_join_housekeeping(async move {
+            if job.room_end_verified().await {
+                let _ = tx.send(NetEvent::RejoinRoomEnded { channel_id }).await;
+            }
+        });
+    }
+
+    /// The room a rejoin waits on was ended by its creator: no member will take the departure
+    /// now, and it protects nothing, so the join goes the ordinary way — the left copy is purged
+    /// and the join's board read answers that the room has ended.
+    async fn rejoin_room_ended(&mut self, channel_id: Digest32) {
+        if !self
+            .leave_waiters
+            .iter()
+            .any(|waiter| waiter.room == channel_id && !waiter.heard && waiter.rejoin.is_some())
+        {
+            return;
+        }
+        #[cfg(feature = "test-knobs")]
+        if crate::node::computer::fx28_mutant("rejoin-waits-through-verified-end") {
+            return;
+        }
+        let Some(join) = self
+            .leave_waiters
+            .iter_mut()
+            .find(|waiter| waiter.room == channel_id && !waiter.heard)
+            .and_then(|waiter| waiter.rejoin.take())
+        else {
+            return;
+        };
+        let Some(instance) = self.channels.get(&channel_id).cloned() else {
+            let _ = join.reply.send(Outcome::Failed(Fault::ChannelNotOpen));
+            return;
+        };
+        self.begin_own_key_left_purge(
+            channel_id,
+            instance,
+            LeftPurgePurpose::Join {
+                link: join.link,
+                passphrase: join.passphrase,
+                reply: join.reply,
+                deadline: join.deadline,
+            },
+        )
+        .await;
+    }
+
+    fn expire_retiring_joins(&mut self) {
+        let now = tokio::time::Instant::now();
+        for waiter in &mut self.leave_waiters {
+            if waiter
+                .rejoin
+                .as_ref()
+                .is_some_and(|join| now >= join.deadline || join.reply.is_closed())
+            {
+                if let Some(join) = waiter.rejoin.take() {
+                    let _ = join.reply.send(Outcome::Failed(Fault::DepartureNotHeard));
+                }
+            }
+        }
+        for pending in self.session_rooms_retiring.values_mut() {
+            if pending
+                .as_ref()
+                .is_some_and(|join| now >= join.deadline || join.reply.is_closed())
+            {
+                if let Some(join) = pending.take() {
+                    let _ = join.reply.send(Outcome::Failed(Fault::SessionCleanupBusy));
+                }
+            }
+        }
+    }
+
     /// Re-send durable room-deletion cleanups after unlock, without accepting old-room work.
     fn resume_session_retirements(&mut self) {
         let Some(profile) = self
@@ -24178,12 +24471,12 @@ impl Node {
             }
         };
         for room in rooms {
-            if self.session_rooms_retiring.contains(&room) {
+            if self.session_rooms_retiring.contains_key(&room) {
                 continue;
             }
             match owner.clone().try_reserve_owned() {
                 Ok(permit) => {
-                    self.session_rooms_retiring.insert(room);
+                    self.session_rooms_retiring.insert(room, None);
                     permit.send(room);
                 }
                 Err(mpsc::error::TrySendError::Full(_)) => break,

@@ -1605,6 +1605,8 @@ pub enum Fault {
     SessionCleanupBusy,
     /// The hosted daemon's reliable Session cleanup handler has gone away.
     SessionCleanupUnavailable,
+    /// Rejoining must keep the last copy of a signed departure until a member acknowledges it.
+    DepartureNotHeard,
     /// Making an identity, its file (`vault.cbor`) could not be written. Not [`Fault::Storage`],
     /// which named the store when the store was fine (V210-77).
     IdentityFileUnwritable,
@@ -1875,10 +1877,13 @@ impl Fault {
                 "an admin change is already being applied on this node\n       wait for its answer before making another admin change"
             }
             Fault::SessionCleanupBusy => {
-                "an earlier room's Session cleanup is still pending; no deletion started for this request\n       try again after that cleanup finishes"
+                "an earlier room's Session cleanup is still pending\n       try again after that cleanup finishes"
             }
             Fault::SessionCleanupUnavailable => {
                 "the daemon's Session cleanup handler is unavailable; no deletion started for this request\n       restart the daemon before trying again"
+            }
+            Fault::DepartureNotHeard => {
+                "no member of this room has acknowledged this node's signed departure; the left copy was kept and this join made no change\n       try joining again when a member of the room is reachable"
             }
             Fault::RetentionFileUnwritable => {
                 "your retention for this room could not be saved: the node's retention file (`retention`, in its configuration directory) could not be written\n       check free disk space, and that the configuration directory is writable; then run it again"
@@ -1961,7 +1966,7 @@ impl Fault {
                 "this room was joined and has not yet synced with another member, so nothing can be written to it\n       try again once a member is reachable"
             }
             Fault::OwnHistoryBehind => {
-                "this node's record of its own history in this room is behind what a member holds, as after restoring an older backup; it writes nothing here until that is resolved\n       `vox status --node <name>` names the room; a profile restored from a backup must not write where a newer copy of it already has"
+                "this node's record of its own history in this room is behind what a member holds, as after joining again or restoring an older backup; it writes nothing here until that is resolved\n       `vox status --node <name>` says `own history recovery is pending` while this node waits to recover that history from a member that holds it: keep one online, and try again once that line is gone; it says `conflicting signed own history; writes remain frozen` when that history conflicts"
             }
             Fault::LeaveUndone => {
                 "something was written in the room from this node after the leave, so it is in the room again\n       run `vox room leave` again to leave"
@@ -2123,6 +2128,7 @@ fault_names!(
     AdminChangePending,
     SessionCleanupBusy,
     SessionCleanupUnavailable,
+    DepartureNotHeard,
     IdentityFileUnwritable,
     RetentionFileUnwritable,
     SealedUnreadable,

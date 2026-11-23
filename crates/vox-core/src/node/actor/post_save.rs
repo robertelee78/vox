@@ -289,6 +289,25 @@ impl Node {
         command: NodeCommand,
         reply: oneshot::Sender<Outcome>,
     ) {
+        #[cfg(feature = "test-knobs")]
+        if let Some((channel_id, text)) =
+            std::env::var_os("VOX_TEST_HOLD_ROOM_WRITE").and(match &command {
+                NodeCommand::SendText { channel_id, text }
+                | NodeCommand::SendTextAt {
+                    channel_id, text, ..
+                }
+                | NodeCommand::SendTextAdmitted {
+                    channel_id, text, ..
+                } => Some((channel_id, text)),
+                _ => None,
+            })
+        {
+            eprintln!(
+                "vox: rejoin cross-room deferred room={} own_post={} text={text:?}",
+                crate::node::link::b32_encode(channel_id),
+                self.pending_posts.contains_key(channel_id),
+            );
+        }
         let permit = self
             .command_sender
             .upgrade()
