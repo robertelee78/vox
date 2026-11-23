@@ -68,6 +68,9 @@ pub const STALE_SYNC_MS: u64 = 10 * 60 * 1_000;
 /// A connected member's live deficit must show no walk progress for this many milliseconds.
 pub const NOT_RECEIVING_AFTER: u64 = 60_000;
 
+/// How many live entries a connected member must be missing before [`NOT_RECEIVING_AFTER`] runs.
+const NOT_RECEIVING_BEHIND: u64 = 20;
+
 /// The stale threshold in the unit a person reads: minutes, or seconds under a minute.
 fn stale_words(ms: u64) -> String {
     if ms >= 60_000 {
@@ -86,9 +89,11 @@ pub const ANCHOR_UNREACHABLE_MS: u64 = 60_000;
 /// milliseconds.
 #[derive(Debug, Default)]
 pub struct StatusBook {
-    /// Room → when a sync last brought new entries to this node there.
+    /// Room → when a sync last saved room history this node did not hold before there: an entry,
+    /// a header or body, a signed head, a proof or a room context. Not that a message arrived.
     pub room_synced: BTreeMap<Digest32, u64>,
-    /// Peer → when a sync with it last brought new entries, in any room.
+    /// Peer → when a sync with it last saved room history this node did not hold before, in any
+    /// room (the same rule as `room_synced`).
     pub member_synced: BTreeMap<Digest32, u64>,
     /// Latest receipt position and the start of its >=20-entry no-progress observation.
     pub(crate) receipt_waits: BTreeMap<(Digest32, Digest32), ReceiptWait>,
@@ -159,7 +164,8 @@ pub struct MemberStatus {
     pub advertised_through: Option<u64>,
     /// When this node last saw it connected (now, if it is), unix milliseconds.
     pub last_seen: Option<u64>,
-    /// When a sync with it last brought new entries, unix milliseconds.
+    /// When a sync with it last saved room history this node did not hold before (an entry, a
+    /// header or body, a signed head, a proof or a room context), unix milliseconds.
     pub last_sync: Option<u64>,
     /// What is said of it about this identity's key in this room, after its name, if anything
     /// (ADR-030 D-5, W-4): that the key waits, and why, or that it runs an older Vox.
@@ -201,7 +207,7 @@ impl MemberStatus {
     }
 
     fn behind(&self) -> bool {
-        !self.me && self.connected && self.missing_live_entries() >= 20
+        !self.me && self.connected && self.missing_live_entries() >= NOT_RECEIVING_BEHIND
     }
 }
 
@@ -225,7 +231,8 @@ pub struct RoomStatus {
     pub name: String,
     /// Its epoch.
     pub epoch: u64,
-    /// When a sync last brought new entries to this node here, unix milliseconds.
+    /// When a sync last saved room history this node did not hold before here (an entry, a
+    /// header or body, a signed head, a proof or a room context), unix milliseconds.
     pub last_sync: Option<u64>,
     /// The retention this node applies here, seconds (`0` forever): the shorter of the room's
     /// and the node's own (ADR-023 decision 2).
@@ -475,11 +482,12 @@ impl StatusReport {
                 out.push(Unhealthy {
                     key: format!("room-not-receiving:{}", b32_encode(&room.id)),
                     message: format!(
-                        "room {} ({}): not receiving from connected member {}; member advertised through entry {} and at least {} live entries have not been held for over {}s; check that member's vox status and daemon log",
+                        "room {} ({}): not receiving from connected member {}; member advertised through entry {}, and this node has been at least {} live entries behind it for over {}s ({} missing now); check that member's vox status and daemon log",
                         short(&room.id), room.name, short(&member.id),
                         member.advertised_through.unwrap_or(0),
-                        member.missing_live_entries(),
+                        NOT_RECEIVING_BEHIND,
                         NOT_RECEIVING_AFTER / 1_000,
+                        member.missing_live_entries(),
                     ),
                 });
             }
@@ -870,7 +878,7 @@ impl StatusReport {
         );
         gauge(
             "vox_room_last_sync_seconds",
-            "When a sync last brought new entries to this node in the room (0: never).",
+            "When a sync last saved room history this node did not hold before in the room (0: never).",
             self.rooms
                 .iter()
                 .map(|r| {
