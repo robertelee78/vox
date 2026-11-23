@@ -17,6 +17,9 @@ import time
 
 class VerdictError(AssertionError):
     """An attributed failure, printed at the journey or cleanup boundary."""
+    def __init__(self, detail, reported=False):
+        super().__init__(detail)
+        self.reported = reported
 
 
 def require(ok, side, detail):
@@ -395,7 +398,7 @@ def main():
             assertions_held = True
     except BaseException as error:
         report_failure(error)
-        raise VerdictError(str(error)) from error
+        raise VerdictError(str(error), reported=True) from error
     finally:
         try:
             try:
@@ -411,14 +414,16 @@ def main():
             print("CLEANUP CONFIRMED: journey-owned resources", flush=True)
         except BaseException as error:
             report_failure(error, "journey assertions had held; cleanup failed" if assertions_held else "cleanup failed")
-            raise VerdictError(str(error)) from error
+            raise VerdictError(str(error), reported=True) from error
     print(result, flush=True)
 
 
 if __name__ == "__main__":
     try:
         main()
-    except VerdictError:
+    except VerdictError as error:
+        if not error.reported:
+            report_failure(error)
         raise SystemExit(1)
     except SystemExit as error:
         if error.code:
