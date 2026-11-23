@@ -15,16 +15,53 @@ import threading
 import time
 
 
+class VerdictError(AssertionError):
+    """An attributed failure, printed at the journey or cleanup boundary."""
+
+
 def require(ok, side, detail):
     if not ok:
-        print(f"VERDICT RED: {side}: {detail}", flush=True)
-        raise AssertionError(f"{side}: {detail}")
+        raise VerdictError(f"{side}: {detail}")
+
+
+def report_failure(error, context=""):
+    detail = str(error) if isinstance(error, VerdictError) else f"APPARATUS: {type(error).__name__}: {error}"
+    print(f"VERDICT RED: {detail}" + (f"; {context}" if context else ""), flush=True)
+
+
+def installed_digest(binary, nonshipping):
+    data = binary.resolve(strict=True).read_bytes()
+    marker = b"VOX_TEST_RELEASE_BASE"
+    require((marker in data) == nonshipping, "APPARATUS",
+            "controlled pair lacks VOX_TEST_RELEASE_BASE test-knobs marker" if nonshipping else
+            "wrong asset supplied: installed binary contains VOX_TEST_RELEASE_BASE test-knobs marker; not a shipping asset")
+    return hashlib.sha256(data).hexdigest()
+
+
+def ready_status(output):
+    try:
+        status = json.loads(output)["status"]
+    except (ValueError, KeyError, TypeError):
+        require(False, "PRODUCT", f"unparsable status --json output: {output!r}")
+    require(isinstance(status, str), "PRODUCT", f"unparsable status --json output: {output!r}")
+    return status
+
+
+def room_from_list(output):
+    words = output.split()
+    require(bool(words) and len(words[0]) == 12 and all(c in "abcdefghijklmnopqrstuvwxyz234567" for c in words[0]),
+            "PRODUCT", f"empty or unparsable room list output: {output!r}")
+    return words[0]
 
 
 def run(argv, env=None, text=None, check=True):
     print("$", " ".join(map(str, argv)), flush=True)
-    p = subprocess.run(list(map(str, argv)), env=env, input=text, text=True,
-                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
+    try:
+        p = subprocess.run(list(map(str, argv)), env=env, input=text, text=True,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
+    except subprocess.TimeoutExpired:
+        require(False, "APPARATUS",
+                f"command did not complete within 300 s; not judged: {' '.join(map(str, argv))}")
     print(p.stdout + p.stderr, end="", flush=True)
     if check:
         require(p.returncode == 0, "PRODUCT", f"exit {p.returncode}: {p.stdout}{p.stderr}")
@@ -101,14 +138,14 @@ class Installed:
 
     def ready(self):
         p = self.vox("status", "--node", "agent", "--json")
-        require(json.loads(p.stdout)["status"] == "Ready", "PRODUCT", "installed node is not Ready")
+        require(ready_status(p.stdout) == "Ready", "PRODUCT", f"installed node is not Ready: {p.stdout!r}")
 
     def stage(self):
         self.vox("node", "create", "agent", "--passphrase-file", self.passfile)
         self.ready()
         self.vox("room", "create", "--node", "agent", "--name", "release-journey",
                  "--passphrase-file", "-", text="release room passphrase\n")
-        self.room = self.vox("room", "list", "--node", "agent").stdout.split()[0]
+        self.room = room_from_list(self.vox("room", "list", "--node", "agent").stdout)
         self.vox("room", "post", self.room, "release-journey-before-update", "--node", "agent")
         shown = self.vox("room", "read", self.room, "--node", "agent").stdout
         require("release-journey-before-update" in shown, "PRODUCT", "fresh installed node cannot read its post")
@@ -168,12 +205,20 @@ class Installed:
                     print(output, end="", flush=True)
                     require(removed.returncode == 0 or output.strip() == f"remove: no plugin at {extension}",
                             "APPARATUS", f"owned extension cleanup exit {removed.returncode}: {output}")
+            keychain = self.env.get("VOX_TEST_KEYCHAIN")
+            if keychain:
+                removed = subprocess.run(["/usr/bin/security", "delete-keychain", keychain],
+                                         capture_output=True, text=True)
+                require(removed.returncode == 0, "APPARATUS",
+                        f"owned private Keychain cleanup exit {removed.returncode}: {removed.stdout}{removed.stderr}")
+                print(f"CLEANUP CONFIRMED: removed owned private Keychain {keychain}", flush=True)
 
 
 def wait(pred, what):
     end = time.monotonic() + 120
     while not pred():
-        require(time.monotonic() < end, "APPARATUS", f"staging did not finish: {what}")
+        require(time.monotonic() < end, "APPARATUS",
+                f"claim not met: {what}; no product progress within 120 s; not judged")
         time.sleep(0.1)
 
 
@@ -225,17 +270,23 @@ class Turn:
 
     def finish(self):
         marker = "rg15-after-update-" + os.urandom(6).hex()
+        mismatch = next((line.strip() for line in self.lines if "Vox update mismatch" in line), None)
+        require(mismatch is None, "PRODUCT", f"native conversation reported mismatch: {mismatch!r}")
         self.installed.vox("room", "post", self.installed.room, "--node", "person", marker)
         wait(lambda: any(("STAGED:" in line and marker in line)
-                         or "delivery in this conversation is uncertain" in line for line in self.lines),
+                         or "delivery in this conversation is uncertain" in line
+                         or "Vox update mismatch" in line for line in self.lines),
              "later room news staged or native conversation refused")
+        mismatch = next((line.strip() for line in self.lines if "Vox update mismatch" in line), None)
+        require(mismatch is None, "PRODUCT", f"native conversation reported mismatch: {mismatch!r}")
         self.turn("read after update")
+        mismatch = next((line.strip() for line in self.lines if "Vox update mismatch" in line), None)
+        require(mismatch is None, "PRODUCT", f"native conversation reported mismatch: {mismatch!r}")
         require(sum("STAGED:" in line and marker in line for line in self.lines) == 1
                 and any("INJECTED" in line and marker in line for line in self.lines),
                 "PRODUCT", "native conversation did not show later news exactly once")
         require(not any("delivery in this conversation is uncertain" in line for line in self.lines),
                 "PRODUCT", "update made the native conversation uncertain")
-
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
@@ -251,12 +302,14 @@ def main():
     release = Release(args.dist, args.work / "server")
     installed = None
     candidate = None
+    assertions_held = False
     try:
         installed = Installed(release, args.work)
+        before_digest = installed_digest(installed.bin, args.journey == "controlled-update")
         if args.journey == "prepare-busy":
             (args.work / "installed-binary.txt").write_text(str(installed.bin) + "\n")
-            print(f"PREPARED installed binary: {installed.bin}; vox {release.version}", flush=True)
-            return
+            assertions_held = True
+            result = f"PREPARED installed binary: {installed.bin.resolve()}; vox {release.version}; sha256={before_digest}"
         if args.journey == "controlled-update":
             require(args.candidate_dist is not None, "APPARATUS", "--candidate-dist is required")
             candidate = Release(args.candidate_dist, args.work / "candidate-server")
@@ -272,7 +325,8 @@ def main():
                 run(["/usr/bin/security", "create-keychain", "-p", "", keychain])
                 installed.env["VOX_TEST_KEYCHAIN"] = str(keychain)
             print("NONSHIPPING: candidate-source test-knobs pair; not the published v0.4.30 updater or real endpoint", flush=True)
-        installed.stage()
+        if args.journey != "prepare-busy":
+            installed.stage()
         if args.journey in ("update", "controlled-update"):
             require(bool(args.expected_version), "APPARATUS", "--expected-version is required")
             installed.person()
@@ -308,8 +362,6 @@ def main():
                 turn.finish()
                 require(sum("reconnecting" in line for line in turn.lines) == 1,
                         "PRODUCT", "candidate pair did not report reconnecting exactly once")
-                require(not any("Vox update mismatch" in line for line in turn.lines),
-                        "PRODUCT", "candidate pair reported a package-version mismatch")
             else:
                 marker = "rg15-old-conversation-after-update-" + os.urandom(6).hex()
                 installed.vox("room", "post", installed.room, "--node", "person", marker)
@@ -333,23 +385,45 @@ def main():
                 turn = Turn(installed, args.work, args.support)
                 turn.turn("new conversation after published update")
                 turn.finish()
+            after_digest = installed_digest(installed.bin, bool(candidate))
         transport = ("candidate-source nonshipping pair; same native agent turn"
                      if candidate else "published-previous path; real GitHub updater; observed old conversation behaviour; new native agent turn")
-        print(f"VERDICT GREEN: {args.journey}; installed vox {release.version}"
-              + (f" -> {args.expected_version}; {transport}" if args.journey.endswith("update") else "; Ready node creates, posts and reads a room"), flush=True)
+        if args.journey != "prepare-busy":
+            result = (f"VERDICT GREEN: {args.journey}; installed vox {release.version}; sha256={before_digest}"
+                      + (f" -> {args.expected_version}; sha256={after_digest}; {transport}"
+                         if args.journey.endswith("update") else "; Ready node creates, posts and reads a room"))
+            assertions_held = True
+    except BaseException as error:
+        report_failure(error)
+        raise VerdictError(str(error)) from error
     finally:
-        if installed:
-            installed.cleanup()
-        release.close()
-        if candidate:
-            candidate.close()
+        try:
+            try:
+                if installed:
+                    installed.cleanup()
+            finally:
+                try:
+                    release.close()
+                finally:
+                    if candidate:
+                        candidate.close()
+            (args.work / "cleanup-confirmed").write_text("journey-owned cleanup succeeded\n")
+            print("CLEANUP CONFIRMED: journey-owned resources", flush=True)
+        except BaseException as error:
+            report_failure(error, "journey assertions had held; cleanup failed" if assertions_held else "cleanup failed")
+            raise VerdictError(str(error)) from error
+    print(result, flush=True)
 
 
 if __name__ == "__main__":
     try:
         main()
-    except AssertionError:
+    except VerdictError:
         raise SystemExit(1)
-    except (OSError, ValueError, KeyError, subprocess.TimeoutExpired) as error:
-        print(f"VERDICT RED APPARATUS: {error}", flush=True)
+    except SystemExit as error:
+        if error.code:
+            report_failure(error)
+        raise
+    except BaseException as error:
+        report_failure(error)
         raise SystemExit(1)

@@ -28,7 +28,6 @@ def main():
     p.add_argument("--expected-version")
     p.add_argument("--candidate-name")
     p.add_argument("--candidate-dist", type=Path)
-    p.add_argument("--clean-old-builds", action="store_true")
     p.add_argument("--readiness-only", action="store_true")
     args = p.parse_args()
     lock = Path("/tmp/vox-guest.lock/owner")
@@ -93,11 +92,6 @@ def main():
             call(["tar", "-rf", source, "-C", APPARATUS.parent.parent, "scripts/release"])
             call(["scp", *options, source, f"admin@{ip}:{remote}/source.tar"])
             call([*ssh, f"tar -xf {remote}/source.tar -C {remote}/source; export PATH=\"$HOME/.cargo/bin:/opt/homebrew/bin:$PATH\"; command -v cargo; command -v node; df -Pk {remote}"])
-            if args.clean_old_builds:
-                clean = f"python3 {remote}/source/scripts/release/guest-clean.py >{remote}/receipts/old-build-cleanup.log 2>&1; rc=$?; cat {remote}/receipts/old-build-cleanup.log; exit $rc"
-                outcome = subprocess.run([*ssh, clean])
-                call(["scp", *options, f"admin@{ip}:{remote}/receipts/old-build-cleanup.log", state / "old-build-cleanup.log"])
-                outcome.check_returncode()
         if args.dist:
             call([*ssh, f"mkdir -p {remote}/assets/{shlex.quote(args.name)}"])
             call(["scp", *options, "-r", str(args.dist.resolve()) + "/.", f"admin@{ip}:{remote}/assets/{args.name}/"])
@@ -135,6 +129,25 @@ def main():
                    f"\"$harness\" {function} --ignored --exact --nocapture")
     result = subprocess.run([*ssh, command])
     call(["scp", *options, "-r", f"admin@{ip}:{remote}/receipts/.", state / "guest-receipts"])
+    if args.action == "run":
+        # Only this invocation's scratch home, and only after its complete host copy.
+        cleanup = (
+            "import pathlib,shutil,subprocess; "
+            f"home=pathlib.Path({(work + '/home')!r}); "
+            "print('OWNED_SCRATCH_HOME='+str(home)); "
+            "subprocess.run(['du','-sk',str(home)],check=True) if home.exists() else None; "
+            "safe=home.is_dir() and (home.parent/'cleanup-confirmed').is_file() and not (home/'data/.daemon/lock').exists(); "
+            "shutil.rmtree(home) if safe else None; "
+            "print('CLEANUP CONFIRMED: copied owned scratch home removed' if safe else "
+            "'RETAINED: daemon ownership/lifetime not proved; no shared receipt sweep'); "
+            "print('FREE_BYTES='+str(shutil.disk_usage(home.parent).free))"
+        )
+        cleaned = subprocess.run([*ssh, "python3 -c " + shlex.quote(cleanup)], capture_output=True, text=True)
+        (state / "guest-scratch-cleanup.log").write_text(cleaned.stdout + cleaned.stderr)
+        print(cleaned.stdout + cleaned.stderr, end="", flush=True)
+        if cleaned.returncode:
+            print("VERDICT RED: APPARATUS: owned scratch receipt cleanup failed", flush=True)
+            raise SystemExit(2)
     raise SystemExit(result.returncode)
 
 

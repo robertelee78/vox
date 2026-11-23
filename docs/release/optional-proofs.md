@@ -1257,9 +1257,11 @@ The existing proof files have three optional entry points:
 - `update_proof::a_published_install_updates_through_github_with_its_agent_turn`: install a
   published previous dist, run its real GitHub updater, and require
   `VOX_PROOF_EXPECTED_VERSION`, Ready node and surviving room. The old loaded extension's
-  messages are quoted as EXPECTED OLD BEHAVIOUR, not required wording; it must show later
-  news or advice rather than silence. A new conversation after update must show later news
-  exactly once. This is the published-previous path.
+  messages are quoted as EXPECTED OLD BEHAVIOUR. Continued later-news delivery passes; otherwise
+  the advice must contain at least one of the accepted phrases `Vox update mismatch` or
+  `start a new native OMP conversation` (other `NOTIFY:` lines alone do not pass).
+  A new conversation after update must show later news exactly once, with no
+  `Vox update mismatch` or uncertainty. This is the published-previous path.
 - `update_proof::a_candidate_source_pair_updates_with_its_agent_turn`: before-tag observation
   with `VOX_PROOF_DIST` and `VOX_PROOF_CANDIDATE_DIST` naming genuine **nonshipping**
   test-knobs builds. The same held conversation must show later news exactly once, report one
@@ -1286,3 +1288,11 @@ macOS cleanup queries LaunchServices before unregistering an owned app path; a p
 already absent needs no removal. The exact PlugInKit `no plugin at <owned path>` response
 likewise means already absent. Other registration/cleanup failures are APPARATUS and prevent
 a successful journey state; the guest wrapper still stops its owned VM before releasing the lock.
+
+Every normal journey reads the installed, resolved binary and refuses a
+`VOX_TEST_RELEASE_BASE` marker as APPARATUS (wrong asset supplied). Controlled-update instead
+requires that marker in both nonshipping binaries. GREEN names the installed SHA-256 (both
+before/after digests for updates) and is printed only after owned cleanup succeeds. A cleanup
+failure after passing assertions says the assertions had held, exits nonzero and prints no GREEN.
+A wait that makes no progress names the unmet claim and is APPARATUS/not judged; an unexplained
+red is not cleared by a later green rerun.

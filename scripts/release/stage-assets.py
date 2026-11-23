@@ -10,7 +10,7 @@ p = argparse.ArgumentParser(description=__doc__)
 p.add_argument("artifact", type=Path)
 p.add_argument("output", type=Path)
 p.add_argument("--installer", type=Path, required=True,
-               help="installer from the candidate's exact source SHA (not a different checkout)")
+               help="install.sh from the candidate normal Linux dist; pin against tagged/published install.sh")
 args = p.parse_args()
 source = json.loads((args.artifact / "source.json").read_text())
 version = source["version"]
@@ -32,7 +32,7 @@ for directory, asset, prefix, kind, package in (
 shutil.copy2(args.artifact / "source.json", args.output / "source.json")
 shutil.copy2(args.installer, args.output / "install.sh")
 receipt = {"artifact": str(args.artifact.resolve()), "installer": str(args.installer.resolve()),
-           "installer_sha256": hashlib.sha256(args.installer.read_bytes()).hexdigest(),
+           "installer_sha256": hashlib.sha256((args.output / "install.sh").read_bytes()).hexdigest(),
            "source": source,
            "note": "Exact workflow signed bytes; schema1 stable records generated as HARNESS apparatus from their size/digest, not published records. Original Apple/source receipts retained; ancillary signer logs remain in the input artifact."}
 (args.output / "staging.json").write_text(json.dumps(receipt, indent=2) + "\n")
