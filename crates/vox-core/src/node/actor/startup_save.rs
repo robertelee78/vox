@@ -229,10 +229,13 @@ fn run(
     };
     if let Some(passphrase) = unlock {
         if let Err(error) = profile.unlock(&passphrase) {
-            return (
-                Some(profile),
-                Err(fault_noting(events, "unlock the identity", &error)),
-            );
+            // The vault did not open under it: the passphrase is wrong. `SealedUnreadable` is for
+            // what the identity sealed, opened only after this has proved the passphrase.
+            let fault = match error {
+                Error::AtRestUnlockFailed => Fault::WrongPassphrase,
+                error => fault_noting(events, "unlock the identity", &error),
+            };
+            return (Some(profile), Err(fault));
         }
     }
     let loaded = prepare(&profile, decisions, now)
