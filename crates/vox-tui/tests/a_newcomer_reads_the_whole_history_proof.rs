@@ -10708,7 +10708,7 @@ mod rg1 {
         post(&holder, &id, "WK-H-after-the-newcomer", true);
         let wanted = "WK-H-after-the-newcomer";
         let started = Instant::now();
-        let mut wedged = 0;
+        let mut wedge_samples = Vec::new();
         loop {
             let page = reader.vox(None, &["room", "read", &id, "--json", "--limit", "200"]);
             let shown: BTreeSet<String> = if page.ok {
@@ -10747,9 +10747,8 @@ mod rg1 {
                 );
                 return;
             }
-            // The wedge, from the newcomer's own status: the holder's advertised feed is not
-            // verified, no flow toward any reachable peer wants or runs anything, and the only
-            // peer it still needs is the author, which is stopped for the rest of the act.
+            // Require completed rounds toward the holder while its verified position stays
+            // flat, as well as three consecutive observations of the structural wedge.
             let ports = report["lanes"]["ports"]
                 .as_array()
                 .cloned()
@@ -10777,17 +10776,43 @@ mod rg1 {
                 });
             let needs_author =
                 port(&author.b32())["needs"] == true && port(&author.b32())["connected"] != true;
-            wedged = if unverified && idle && needs_author {
-                wedged + 1
+            let sample = report["sync"].as_array().and_then(|rows| {
+                rows.iter()
+                    .find(|sync| {
+                        sync["room"].as_str() == Some(&id)
+                            && sync["peer"].as_str() == Some(&holder.b32())
+                    })
+                    .and_then(|sync| {
+                        Some((
+                            row["verified_through"].as_u64()?,
+                            sync["fetched_completed"].as_u64()?,
+                        ))
+                    })
+            });
+            if unverified && idle && needs_author {
+                if let Some(sample) = sample {
+                    wedge_samples.push(sample);
+                    if wedge_samples.len() > 3 {
+                        wedge_samples.remove(0);
+                    }
+                } else {
+                    wedge_samples.clear();
+                }
             } else {
-                0
-            };
-            if wedged == 3 {
+                wedge_samples.clear();
+            }
+            if wedge_samples.len() == 3
+                && wedge_samples
+                    .iter()
+                    .all(|sample| sample.0 == wedge_samples[0].0)
+                && wedge_samples[2].1 > wedge_samples[0].1
+            {
                 panic!(
                     "RED PRODUCT: the newcomer does not show {wanted:?} (shows {shown:?}) and, in \
                      three status answers in a row, wants nothing from the holder it reaches \
-                     while it needs only the stopped author. Holder row: {row}; port toward the \
-                     holder: {}; port toward the author: {}",
+                     while it needs only the stopped author, despite completed holder rounds \
+                     advancing with verified position flat: {wedge_samples:?}. Holder row: {row}; \
+                     port toward the holder: {}; port toward the author: {}",
                     port(&holder.b32()),
                     port(&author.b32())
                 );
