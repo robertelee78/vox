@@ -47,3 +47,5 @@ if [[ $journey == busy ]]; then
 else
   VOX_SLOT_PRIORITY=3 "$slot" rg15 -- "${args[@]}"
 fi
+# Successful states must stop and release the guest before returning.
+exit 0

@@ -148,9 +148,26 @@ class Installed:
         if platform.system() == "Darwin":
             register = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
             for app in (self.home / "Applications").glob("*.app"):
-                subprocess.run([register, "-u", str(app)], check=True)
+                inventory = subprocess.run([register, "-dump"], capture_output=True, text=True)
+                require(inventory.returncode == 0, "APPARATUS",
+                        f"LaunchServices inventory exit {inventory.returncode}: {inventory.stderr}")
+                registered = any(line.rstrip().rstrip("/").endswith(str(app))
+                                 for line in inventory.stdout.splitlines())
+                if registered:
+                    removed = subprocess.run([register, "-u", str(app)], capture_output=True, text=True)
+                    print(removed.stdout + removed.stderr, end="", flush=True)
+                    require(removed.returncode == 0, "APPARATUS",
+                            f"owned app unregister exit {removed.returncode}: {removed.stdout}{removed.stderr}")
+                    print(f"CLEANUP CONFIRMED: removed LaunchServices registration at {app}", flush=True)
+                else:
+                    print(f"CLEANUP CONFIRMED: no LaunchServices registration at {app}", flush=True)
                 for extension in app.glob("Contents/PlugIns/*.appex"):
-                    subprocess.run(["/usr/bin/pluginkit", "-r", str(extension)], check=True)
+                    removed = subprocess.run(["/usr/bin/pluginkit", "-r", str(extension)],
+                                             capture_output=True, text=True)
+                    output = removed.stdout + removed.stderr
+                    print(output, end="", flush=True)
+                    require(removed.returncode == 0 or output.strip() == f"remove: no plugin at {extension}",
+                            "APPARATUS", f"owned extension cleanup exit {removed.returncode}: {output}")
 
 
 def wait(pred, what):
@@ -215,7 +232,7 @@ class Turn:
         self.turn("read after update")
         require(sum("STAGED:" in line and marker in line for line in self.lines) == 1
                 and any("INJECTED" in line and marker in line for line in self.lines),
-                "PRODUCT", "same native conversation did not show later news exactly once")
+                "PRODUCT", "native conversation did not show later news exactly once")
         require(not any("delivery in this conversation is uncertain" in line for line in self.lines),
                 "PRODUCT", "update made the native conversation uncertain")
 
@@ -263,6 +280,7 @@ def main():
             turn.turn("before update")
             turn.hold_across_update()
             print("UPDATE_ORIGIN=" + (candidate.base if candidate else "https://github.com/robertelee78/vox/releases/latest"), flush=True)
+            old_notifications_from = len(turn.lines)
             update = installed.vox("update", check=False)
             if update.returncode and os.environ.get("VOX_PROOF_INSPECT_REFUSED_UPDATE") == "1":
                 print(f"VERDICT RED: PRODUCT: original update exit {update.returncode}: {update.stdout}{update.stderr}", flush=True)
@@ -286,10 +304,39 @@ def main():
             installed.ready()
             old = installed.vox("room", "read", installed.room, "--node", "agent").stdout
             require("release-journey-before-update" in old, "PRODUCT", "update lost the saved room post")
-            turn.finish()
-        transport = "candidate-source nonshipping pair" if candidate else "real GitHub updater"
+            if candidate:
+                turn.finish()
+                require(sum("reconnecting" in line for line in turn.lines) == 1,
+                        "PRODUCT", "candidate pair did not report reconnecting exactly once")
+                require(not any("Vox update mismatch" in line for line in turn.lines),
+                        "PRODUCT", "candidate pair reported a package-version mismatch")
+            else:
+                marker = "rg15-old-conversation-after-update-" + os.urandom(6).hex()
+                installed.vox("room", "post", installed.room, "--node", "person", marker)
+                wait(lambda: marker in installed.vox("room", "read", installed.room, "--node", "agent").stdout,
+                     "later post reaches the updated node before observing the old conversation")
+                turn.turn("old conversation after published update")
+                observations = turn.lines[old_notifications_from:]
+                advice = [line.strip() for line in observations
+                          if "Vox update mismatch" in line or "start a new native OMP conversation" in line]
+                shown = any("INJECTED" in line and marker in line for line in observations)
+                print("EXPECTED OLD BEHAVIOUR: an update cannot replace the extension already loaded into "
+                      "an open conversation; record its advice or continued delivery, not a required message wording", flush=True)
+                for line in observations:
+                    if "NOTIFY:" in line or ("INJECTED" in line and marker in line):
+                        print("EXPECTED OLD BEHAVIOUR: " + line.strip(), flush=True)
+                require(shown or bool(advice), "PRODUCT",
+                        "old published conversation showed neither later news nor new-conversation advice")
+                turn.proc.stdin.write("quit\n")
+                turn.proc.stdin.flush()
+                turn.proc.wait(timeout=10)
+                turn = Turn(installed, args.work, args.support)
+                turn.turn("new conversation after published update")
+                turn.finish()
+        transport = ("candidate-source nonshipping pair; same native agent turn"
+                     if candidate else "published-previous path; real GitHub updater; observed old conversation behaviour; new native agent turn")
         print(f"VERDICT GREEN: {args.journey}; installed vox {release.version}"
-              + (f" -> {args.expected_version}; {transport} and native agent turn" if args.journey.endswith("update") else "; Ready node creates, posts and reads a room"), flush=True)
+              + (f" -> {args.expected_version}; {transport}" if args.journey.endswith("update") else "; Ready node creates, posts and reads a room"), flush=True)
     finally:
         if installed:
             installed.cleanup()

@@ -1215,11 +1215,15 @@ The existing proof files have three optional entry points:
   `VOX_PROOF_DIST`, check its version, create a Ready node and post/read a room.
 - `update_proof::a_published_install_updates_through_github_with_its_agent_turn`: install a
   published previous dist, run its real GitHub updater, and require
-  `VOX_PROOF_EXPECTED_VERSION`, a surviving room and the same native agent conversation.
+  `VOX_PROOF_EXPECTED_VERSION`, Ready node and surviving room. The old loaded extension's
+  messages are quoted as EXPECTED OLD BEHAVIOUR, not required wording; it must show later
+  news or advice rather than silence. A new conversation after update must show later news
+  exactly once. This is the published-previous path.
 - `update_proof::a_candidate_source_pair_updates_with_its_agent_turn`: before-tag observation
   with `VOX_PROOF_DIST` and `VOX_PROOF_CANDIDATE_DIST` naming genuine **nonshipping**
-  test-knobs builds. This proves the candidate source's updater/restart/agent turn; it does not
-  prove the published previous updater or the real endpoint. macOS retains Apple verification.
+  test-knobs builds. The same held conversation must show later news exactly once, report one
+  reconnecting line and no mismatch. This proves the candidate's updater/restart/agent turn,
+  not the published previous updater or real endpoint. macOS retains Apple verification.
 
 The two update observations are deliberately distinct. Before publication, normal assets have
 no release-base override. After publication the previous normal asset must update through
@@ -1236,3 +1240,8 @@ the binary the actual installer put in the scratch home. Build its release harne
 hold, then execute it alone. QEMU cannot judge its real-time posting/pause cadence, kernel-keyring
 retention, or other time-bound claims; such rows are APPARATUS/not judged under emulation, never
 a shipping GREEN. A non-timing install or updater verdict can still be measured there.
+
+macOS cleanup queries LaunchServices before unregistering an owned app path; a path that is
+already absent needs no removal. The exact PlugInKit `no plugin at <owned path>` response
+likewise means already absent. Other registration/cleanup failures are APPARATUS and prevent
+a successful journey state; the guest wrapper still stops its owned VM before releasing the lock.
