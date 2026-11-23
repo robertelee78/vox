@@ -2027,8 +2027,50 @@ impl Write<'_, '_> {
         }
         self.directory.restart = Some(RestartState::empty(*self.channel, epoch));
         self.directory.packages_ready = true;
+        // A room created or joined by this build has no older serving rows to reclaim; its
+        // ProofRange rows are receipt-owned witnesses, so the old-row sweep never runs on it.
+        if new_room_unmarked_mutant() {
+            return Ok(());
+        }
+        let marker = seal_segment(
+            self.sek,
+            SegmentKind::KeyMaterial,
+            SEG_PROOF_CACHE_CLEANED,
+            &[1],
+        )?;
+        self.batch.put_segment(
+            self.channel,
+            SegmentKind::KeyMaterial,
+            SEG_PROOF_CACHE_CLEANED,
+            &marker,
+        )?;
         Ok(())
     }
+}
+
+/// `VOX_MUTANT_NEW_ROOM_UNMARKED`: a room created or joined by this build starts without the
+/// old-row sweep's completion mark, as before this repair. Says so once when first read.
+#[cfg(feature = "test-knobs")]
+fn new_room_unmarked_mutant() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let on = std::env::var_os("VOX_MUTANT_NEW_ROOM_UNMARKED").is_some();
+        if on {
+            eprintln!(
+                "vox: VOX_MUTANT_NEW_ROOM_UNMARKED engaged: a new room starts without the \
+                 old-row sweep's mark"
+            );
+        }
+        on
+    });
+    *ON
+}
+
+#[cfg(not(feature = "test-knobs"))]
+const fn new_room_unmarked_mutant() -> bool {
+    false
+}
+
+impl Write<'_, '_> {
     pub(crate) fn note_presence(
         &mut self,
         author: Digest32,
@@ -2638,8 +2680,11 @@ impl EntryIndex {
         Ok(false)
     }
 
-    /// An opening room may first owe several publication-recovery quanta. Reclaim its old
-    /// serving cache only once those roots are idle, including the deferred startup path.
+    /// Reclaim, once per room, the ProofRange rows of builds that kept every fetched or
+    /// rebuilt proof. The mark then stops every later scan; rooms created or joined by this
+    /// build carry the mark from their first transaction, so receipt-owned pieces survive.
+    /// Runs only once the opening room's publication roots are idle, including the deferred
+    /// startup path.
     fn cleanup_old_history_proof_ranges(
         &self,
         store: &Store,

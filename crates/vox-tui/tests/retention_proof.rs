@@ -2001,7 +2001,10 @@ mod proof_rows {
     use vox_core::atrest::store::{open_segment, seal_segment, SegmentKind};
     use vox_core::cbor::{Decoder, Encoder, Value};
     use vox_core::hash::{sha256, Digest32};
-    use vox_core::log::history::{Descriptor, SignedHead, TreeBinding};
+    use vox_core::log::entry::Entry;
+    use vox_core::log::history::{
+        consistency_ranges, inclusion_ranges, Descriptor, SignedHead, TreeBinding,
+    };
     use vox_core::node::paths::Paths;
     use vox_core::node::profile::Profile;
     use vox_core::node::store::Store;
@@ -2160,9 +2163,26 @@ mod proof_rows {
             }
         }
     }
+    fn piece_key(head: &Digest32, binding: TreeBinding, start: u64, leaves: u64) -> Digest32 {
+        let mut e = Encoder::new();
+        e.array(5).bytes(b"vox/proof-serving-range/v1").bytes(head);
+        encode_binding(binding, &mut e);
+        e.uint(start).uint(leaves);
+        sha256(&e.finish())
+    }
     // Inspect a stopped COPY, decoding the object-index kind and its entire old value, not a
     // ciphertext-length histogram. Every other typed object remains separately counted.
-    fn counts(dir: &Path, room: &Digest32) -> std::collections::BTreeMap<u8, usize> {
+    // Returns the kind counts, the ProofRange keys, and the keys of every piece a held
+    // inclusion receipt (its siblings) or prefix receipt (its consistency nodes) needs.
+    #[allow(clippy::type_complexity)] // One stopped-store reading, three views of it.
+    fn inspect(
+        dir: &Path,
+        room: &Digest32,
+    ) -> (
+        std::collections::BTreeMap<u8, usize>,
+        std::collections::BTreeSet<Digest32>,
+        std::collections::BTreeSet<Digest32>,
+    ) {
         let copy = tempfile::tempdir().unwrap();
         copy_tree(dir, copy.path());
         let profile = profile(copy.path());
@@ -2178,13 +2198,16 @@ mod proof_rows {
             &mut objects,
         );
         let mut counts = std::collections::BTreeMap::new();
+        let mut rows = std::collections::BTreeSet::new();
+        let mut owned = std::collections::BTreeSet::new();
+        let mut sealed = 0;
         for row in objects {
             let row = array(&row);
             let key = bytes(&row[0]);
             assert_eq!(key.len(), 64, "APPARATUS: object key width");
             let kind = key[32];
             *counts.entry(kind).or_default() += 1;
-            if kind != 9 {
+            if !matches!(kind, 6 | 7 | 9) {
                 continue;
             }
             let at = array(&row[1]);
@@ -2193,38 +2216,70 @@ mod proof_rows {
             let value = decoded(profile.store(), &sek, room, number(&at[1]));
             let wire = value.to_canonical_vec().unwrap();
             let mut d = Decoder::new(&wire);
-            assert_eq!(d.array().unwrap(), 5, "APPARATUS: ProofRange shape");
-            assert_eq!(d.uint().unwrap(), 1, "APPARATUS: ProofRange version");
+            assert_eq!(d.array().unwrap(), 5, "APPARATUS: kind {kind} shape");
+            assert_eq!(d.uint().unwrap(), 1, "APPARATUS: kind {kind} version");
             let head: Digest32 = d.bytes().unwrap().try_into().unwrap();
             let binding = decode_binding(&mut d).unwrap();
-            assert_eq!(binding.room, *room, "APPARATUS: ProofRange room");
+            assert_eq!(binding.room, *room, "APPARATUS: kind {kind} room");
+            if kind != 9 {
+                let first = Descriptor::decode(&mut d).unwrap();
+                let pieces = if kind == 6 {
+                    let header = Entry::from_wire(d.bytes().unwrap()).unwrap();
+                    inclusion_ranges(header.skeleton.seq, first.leaves).unwrap()
+                } else {
+                    let root = Descriptor::decode(&mut d).unwrap();
+                    consistency_ranges(first.leaves, root.leaves).unwrap()
+                };
+                d.finish().unwrap();
+                owned.extend(
+                    pieces
+                        .into_iter()
+                        .map(|piece| piece_key(&head, binding, piece.start, piece.leaves)),
+                );
+                continue;
+            }
             let start = d.uint().unwrap();
             let descriptor = Descriptor::decode(&mut d).unwrap();
             d.finish().unwrap();
-            let mut e = Encoder::new();
-            e.array(5).bytes(b"vox/proof-serving-range/v1").bytes(&head);
-            encode_binding(binding, &mut e);
-            e.uint(start).uint(descriptor.leaves);
             assert_eq!(
                 &key[..32],
-                sha256(&e.finish()),
+                piece_key(&head, binding, start, descriptor.leaves),
                 "APPARATUS: exact cache key"
             );
+            rows.insert(key[..32].try_into().unwrap());
+            sealed += profile
+                .store()
+                .get_segment(room, SegmentKind::EntryIndex, number(&at[1]))
+                .unwrap()
+                .map_or(0, |segment| segment.nonce.len() + segment.ciphertext.len());
         }
         let file_bytes = std::fs::metadata(profile.paths().store_file())
             .unwrap()
             .len();
         eprintln!(
-            "STOPPED-STORE {dir:?}: file bytes {file_bytes}; decoded object kinds {counts:?}"
+            "STOPPED-STORE {dir:?}: file bytes {file_bytes}; decoded object kinds {counts:?}; \
+             ProofRange rows {} of {} receipt-owned pieces, their sealed records {sealed} bytes",
+            rows.len(),
+            owned.len()
         );
-        counts
+        (counts, rows, owned)
     }
-    fn no_rows(dir: &Path, room: &Digest32) {
-        let count = counts(dir, room).get(&9).copied().unwrap_or(0);
+    fn counts(dir: &Path, room: &Digest32) -> std::collections::BTreeMap<u8, usize> {
+        inspect(dir, room).0
+    }
+    // ADR-052 RG-6 with RG-13: every ProofRange row is a piece a held receipt needs to be
+    // served again. Nothing fetched, rebuilt or served for one request stays in the store.
+    fn receipt_rows(dir: &Path, room: &Digest32) -> usize {
+        let (_, rows, owned) = inspect(dir, room);
+        let unowned = rows.difference(&owned).count();
         assert_eq!(
-            count, 0,
-            "PRODUCT: fetching left {count} decoded ProofRange rows in the real room store"
+            unowned,
+            0,
+            "PRODUCT: {unowned} of {} decoded ProofRange rows in the real room store are no \
+             held receipt's piece",
+            rows.len()
         );
+        rows.len()
     }
     // Test-side old-store/eviction apparatus. It rewrites only the named derived tree, keeping
     // every other directory field and every signed entry, header, witness and receipt intact.
@@ -2570,8 +2625,8 @@ mod proof_rows {
         let blisten = listening(&b);
         drop(ad);
         drop(bd);
-        no_rows(&a, &id);
-        no_rows(&b, &id);
+        receipt_rows(&a, &id);
+        receipt_rows(&b, &id);
         let ad = daemon_on(&a, "a-post", &format!("{IDENTITY}\n"), &alisten);
         attached(&a, "a-post");
         for i in 100..140 {
@@ -2603,7 +2658,7 @@ mod proof_rows {
             eprintln!("ABANDONED verified fetch: receiver shows {held}/140 message bodies");
             drop(bd);
             std::fs::remove_file(hold).unwrap();
-            no_rows(&b, &id);
+            receipt_rows(&b, &id);
         }
         let bd = daemon_on(&b, "b-restart", &format!("{IDENTITY}\n"), &blisten);
         attached(&b, "b-restart");
@@ -2612,8 +2667,62 @@ mod proof_rows {
         all_messages(&b, &room, 140);
         drop(ad);
         drop(bd);
-        no_rows(&a, &id);
-        no_rows(&b, &id);
+        let held = (receipt_rows(&a, &id), receipt_rows(&b, &id));
+        // The same exchange again and again: both restart, the receiver asks its author for
+        // the newest history once more and both page everything back. Rows stay as they were.
+        for again in 0..2 {
+            let ad = daemon_on(
+                &a,
+                &format!("a-again-{again}"),
+                &format!("{IDENTITY}\n"),
+                &alisten,
+            );
+            let bd = daemon_on(
+                &b,
+                &format!("b-again-{again}"),
+                &format!("{IDENTITY}\n"),
+                &blisten,
+            );
+            attached(&a, &format!("a-again-{again}"));
+            attached(&b, &format!("b-again-{again}"));
+            let (ok, _, err) = vox(&b, &["room", "read", &room, "--history", "newest"], None);
+            assert!(ok, "PRODUCT: repeated history request: {err}");
+            let phase = std::cell::RefCell::new(String::new());
+            assert!(
+                within(120, || {
+                    let (_, said, _) = vox(
+                        &b,
+                        &["room", "read", &room, "--json", "--history", "status"],
+                        None,
+                    );
+                    let ended = serde_json::from_str::<serde_json::Value>(&said)
+                        .ok()
+                        .and_then(|v| v["status"]["phase"].as_str().map(str::to_owned))
+                        // `more` is the answer of a bounded scan that ended cached.
+                        .is_some_and(|phase| {
+                            ["complete", "unavailable", "paused", "cached", "more"]
+                                .contains(&&*phase)
+                        });
+                    *phase.borrow_mut() = said;
+                    ended
+                }),
+                "APPARATUS: the repeated history request never answered: {}",
+                phase.borrow()
+            );
+            all_messages(&b, &room, 140);
+            all_messages(&a, &room, 140);
+            drop(ad);
+            drop(bd);
+            let again_rows = (receipt_rows(&a, &id), receipt_rows(&b, &id));
+            assert_eq!(
+                again_rows, held,
+                "PRODUCT: restarting and repeating the exchange moved the ProofRange rows \
+                 (author, receiver) from {held:?} to {again_rows:?}"
+            );
+            eprintln!(
+                "REPEATED exchange {again}: ProofRange rows (author, receiver) {again_rows:?}"
+            );
+        }
     }
     pub(super) fn cleanup() {
         let (_tmp, a, b, ad, bd, room, id) = fresh();
@@ -2632,7 +2741,7 @@ mod proof_rows {
         attached(&a, "a-clean");
         all_messages(&a, &room, 80);
         drop(ad);
-        no_rows(&a, &id);
+        receipt_rows(&a, &id);
         let after = counts(&a, &id);
         for (kind, count) in before.iter().filter(|(kind, _)| **kind != 9 && **kind != 4) {
             assert!(
@@ -2688,7 +2797,7 @@ mod proof_rows {
         all_messages(&b, &room, 80);
         drop(ad);
         drop(bd);
-        no_rows(&a, &id);
+        receipt_rows(&a, &id);
     }
 }
 

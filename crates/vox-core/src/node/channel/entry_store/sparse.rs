@@ -268,7 +268,8 @@ pub(crate) enum ObjectKind {
     InclusionReceipt = 6,
     PrefixReceipt = 7,
     PendingHeader = 8,
-    // Exact-head proof-serving cache only; never used by acceptance or authored appends.
+    // Exact-head serving pieces a held inclusion/prefix receipt needs to be served again
+    // (written with that receipt); never used by acceptance or authored appends.
     ProofRange = 9,
     // A context actually supplied by a proof of this returning author's public head.
     RecoveryContext = 10,
@@ -2563,6 +2564,42 @@ impl Write<'_, '_> {
         self.directory.active.sparse.ranges =
             self.change_value(root, key, Some(Value::Number(id)))?;
         Ok(())
+    }
+    /// One fully verified wire piece of a durable inclusion/prefix receipt, written in that
+    /// receipt's transaction so the receipt can be served again after a restart. An existing
+    /// key writes nothing. This does not change prefix acceptance.
+    pub(crate) fn keep_history_proof_range(
+        &mut self,
+        head: Digest32,
+        binding: TreeBinding,
+        start: u64,
+        descriptor: Descriptor,
+    ) -> Result<()> {
+        self.require_sparse_idle()?;
+        if binding.room != *self.channel {
+            return Err(invalid("proof-serving range room"));
+        }
+        descriptor.validate()?;
+        let key = proof_range_key(&head, binding, start, descriptor.leaves)?;
+        if let Some(id) = Source::Batch(self.batch).number(
+            self.sek,
+            self.channel,
+            self.directory.active.sparse.objects,
+            &object_key(ObjectKind::ProofRange, &key),
+        )? {
+            let bytes =
+                Source::Batch(self.batch).sparse_record(self.sek, self.channel, id, STATE_BYTES)?;
+            if decode_proof_range(&bytes, &head, binding, start, descriptor.leaves)? != descriptor {
+                return Err(invalid("conflicting proof-serving range"));
+            }
+            return Ok(());
+        }
+        let mut e = Encoder::new();
+        e.array(5).uint(1).bytes(&head);
+        binding.encode(&mut e);
+        e.uint(start);
+        descriptor.encode(&mut e);
+        self.save_history_object(ObjectKind::ProofRange, key, &e.finish())
     }
     /// Scan at most sixteen object locators, deleting only the obsolete serving-cache kind.
     /// The object and its index reference retire in the same room transaction.
