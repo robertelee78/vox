@@ -11483,38 +11483,58 @@ except Exception as e: print(json.dumps({"kind":"apparatus","error":repr(e)}),fl
     }
 
     fn pair(inviter: &Worker, invitee: &Worker) {
-        let invite = inviter.vox(None, &["computer", "invite", "--json"]);
-        invite.expect_ok("computer invite");
-        let invitation = invite.json();
-        let link = invitation["invite_link"]
-            .as_str()
-            .expect("APPARATUS: computer invitation");
-        let paired = invitee.vox_in(None, &["computer", "pair", link, "--json"], Some("yes\n"));
-        paired.expect_ok("computer pair");
-        let paired = paired.json();
-        let op = paired["pairing"]["operation_id"]
-            .as_str()
-            .expect("APPARATUS: pairing operation");
-        inviter
-            .vox(None, &["computer", "approve", op, "--json"])
-            .expect_ok("computer approval");
-        let started = Instant::now();
-        loop {
-            let a = inviter.vox(None, &["computer", "status", "--json"]).json();
-            let b = invitee.vox(None, &["computer", "status", "--json"]).json();
-            eprintln!(
-                "[RG-1 pairing] {}={} {}={}",
-                inviter.name, a, invitee.name, b
-            );
-            if a["state"] == "confirmed" && b["state"] == "confirmed" {
-                break;
+        // Initial review plus two fresh reviews; persistent policy churn is a staging stop.
+        const ATTEMPTS: usize = 3;
+        let mut refusals = Vec::new();
+        for attempt in 1..=ATTEMPTS {
+            let invite = inviter.vox(None, &["computer", "invite", "--json"]);
+            invite.expect_ok("computer invite");
+            let invitation = invite.json();
+            let link = invitation["invite_link"]
+                .as_str()
+                .expect("APPARATUS: computer invitation");
+            let paired = invitee.vox_in(None, &["computer", "pair", link, "--json"], Some("yes\n"));
+            if !paired.ok
+                && paired.stderr.trim()
+                    == "vox computer: computer peer refused the request: node: this computer's policy changed while pairing; review again"
+            {
+                eprintln!(
+                    "[RG-1 pairing] attempt {attempt}/{ATTEMPTS}: fresh invitation required: {paired:?}"
+                );
+                refusals.push(paired);
+                continue;
             }
-            assert!(
-                started.elapsed() < Duration::from_secs(120),
-                "APPARATUS: pairing not confirmed"
-            );
-            std::thread::sleep(Duration::from_secs(1));
+            paired.expect_ok("computer pair");
+            let paired = paired.json();
+            let op = paired["pairing"]["operation_id"]
+                .as_str()
+                .expect("APPARATUS: pairing operation");
+            inviter
+                .vox(None, &["computer", "approve", op, "--json"])
+                .expect_ok("computer approval");
+            let started = Instant::now();
+            loop {
+                let a = inviter.vox(None, &["computer", "status", "--json"]).json();
+                let b = invitee.vox(None, &["computer", "status", "--json"]).json();
+                eprintln!(
+                    "[RG-1 pairing] {}={} {}={}",
+                    inviter.name, a, invitee.name, b
+                );
+                if a["state"] == "confirmed" && b["state"] == "confirmed" {
+                    return;
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(120),
+                    "APPARATUS: pairing not confirmed: {}={a} {}={b}",
+                    inviter.name,
+                    invitee.name
+                );
+                std::thread::sleep(Duration::from_secs(1));
+            }
         }
+        panic!(
+            "APPARATUS: staging: all {ATTEMPTS} fresh computer pair attempts refused after policy changed while pairing: {refusals:?}"
+        );
     }
 
     pub(super) fn journey(delayed: bool) {
