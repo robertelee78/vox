@@ -1359,6 +1359,356 @@ fn a_room_stays_readable_while_messages_keep_expiring() {
     );
 }
 
+/// The held-prune arm above in a room where only the oldest rows are due, the common case.
+/// 40 old rows (a thread root, four of its replies and 35 posts; one native sweep takes 64) fall
+/// due while 145 newer rows (140 posts and five more replies in the same thread, more than one
+/// 128-row render leaf) stay. With that prune held, the counts, `older`, every page and the
+/// thread's summary must be exact for the 145 alone. Its own act, so that each expiry mutant
+/// reaches these assertions instead of stopping on the earlier arms of the act above.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "real binary, a 90-second message lifetime and a test-knobs native prune hold; release"]
+fn a_partly_expired_room_counts_pages_and_threads_only_what_remains() {
+    watchdog::arm();
+    use vox_core::node::ipc::{Frame, IpcClient, NodeSocket, Request};
+    use vox_core::node::paths::{NodeName, Paths};
+    // The old rows must all be due and the newer ones not yet at the reads: the newer posts start
+    // GAP after the last old one, and every row lives LIFETIME_S.
+    const LIFETIME_S: u64 = 90;
+    const GAP: Duration = Duration::from_secs(20);
+    const OLD_POSTS: usize = 35;
+    const NEW_POSTS: usize = 140;
+    const LIMIT: u64 = 50;
+    let scratch = tempfile::tempdir().expect("APPARATUS: partial expiry profile");
+    let dir = scratch.path();
+    std::fs::create_dir_all(dir.join("cfg")).expect("APPARATUS: partial expiry config");
+    let (ok, _, err) = vox(dir, &["id"], None);
+    assert!(ok, "PRODUCT (staging): identity refused: {err}");
+    let _daemon = daemon(dir, "partial", &format!("{IDENTITY}\n"));
+    attached(dir, "partial");
+    let (ok, _, err) = vox(
+        dir,
+        &[
+            "room",
+            "create",
+            "--name",
+            "partial",
+            "--passphrase-file",
+            "-",
+        ],
+        Some(&format!("{ROOMPASS}\n")),
+    );
+    assert!(ok, "PRODUCT (staging): create refused: {err}");
+    let (ok, _, err) = vox(
+        dir,
+        &["room", "retention", "partial", &LIFETIME_S.to_string()],
+        None,
+    );
+    assert!(
+        ok,
+        "PRODUCT (staging): {LIFETIME_S}-second lifetime refused: {err}"
+    );
+    let mut settled = false;
+    for _ in 0..512 {
+        let (ok, out, err) = vox(dir, &["room", "read", "partial", "--json"], None);
+        if ok {
+            assert!(out.is_empty(), "APPARATUS: partial expiry room not empty");
+            settled = true;
+            break;
+        }
+        assert!(
+            err.contains("the room is refreshing saved history; retry"),
+            "PRODUCT (staging): partial expiry policy did not settle: {err}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(settled, "APPARATUS: partial expiry policy never settled");
+    let paths = Paths::resolve("default", Some(dir), Some(&dir.join("cfg"))).unwrap();
+    let socket = NodeSocket::one_shot(
+        paths.account().socket(),
+        NodeName::parse("default").unwrap(),
+    );
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut client = rt
+        .block_on(IpcClient::open_at(&socket))
+        .expect("APPARATUS: partial expiry IPC");
+    let mut request = |request: Request| {
+        rt.block_on(client.request(&request))
+            .expect("APPARATUS: partial expiry reply")
+    };
+    let Frame::Rooms { rooms } = request(Request::Rooms { after: None }) else {
+        panic!("APPARATUS: partial expiry room listing")
+    };
+    let cid = rooms
+        .iter()
+        .find(|(_, label, ..)| label == "partial")
+        .unwrap()
+        .0;
+    // Nothing is due before the old rows' lifetime ends, so the first prune with anything due
+    // is the one this holds.
+    std::fs::write(dir.join("hold-expiry"), b"hold the first native prune").unwrap();
+    post(dir, "partial", "partial-root");
+    let Frame::RoomPage { rows, .. } = request(Request::RoomPage {
+        channel_id: cid,
+        before: None,
+        limit: 1,
+    }) else {
+        panic!("PRODUCT (staging): the thread root's page refused")
+    };
+    let root = rows
+        .iter()
+        .find(|row| row.text == "partial-root")
+        .expect("PRODUCT (staging): posted root absent")
+        .entry_hash;
+    let thread = vox_core::node::link::b32_encode(&root);
+    let reply = |text: &str| {
+        serde_json::json!({"v":1,"type":"say","hops":8,"body":text,"thread":thread}).to_string()
+    };
+    let mut old = vec!["partial-root".to_owned()];
+    for n in 0..OLD_POSTS {
+        old.push(format!("partial-old-{n}"));
+        post(dir, "partial", &old[old.len() - 1]);
+        if n % 8 == 7 {
+            old.push(format!("partial-old-reply-{n}"));
+            post(dir, "partial", &reply(&old[old.len() - 1]));
+        }
+    }
+    std::thread::sleep(GAP);
+    let (mut newer, mut new_replies) = (Vec::new(), Vec::new());
+    for n in 0..NEW_POSTS {
+        newer.push(format!("partial-new-{n}"));
+        post(dir, "partial", &newer[newer.len() - 1]);
+        if n % 28 == 27 {
+            newer.push(format!("partial-new-reply-{n}"));
+            new_replies.push(newer[newer.len() - 1].clone());
+            post(dir, "partial", &reply(&newer[newer.len() - 1]));
+        }
+    }
+    println!(
+        "[proof] staged {} old rows ({} replies) then {} newer rows ({} replies)",
+        old.len(),
+        old.len() - 1 - OLD_POSTS,
+        newer.len(),
+        new_replies.len()
+    );
+    // A row by what was posted: a reply's envelope body, otherwise its text.
+    fn named(text: &str) -> String {
+        serde_json::from_str::<serde_json::Value>(text)
+            .ok()
+            .and_then(|envelope| envelope["body"].as_str().map(str::to_owned))
+            .unwrap_or_else(|| text.to_owned())
+    }
+    let shown = |rows: &[vox_core::node::api::MessageRow]| {
+        rows.iter().map(|row| named(&row.text)).collect::<Vec<_>>()
+    };
+    // Every row as the room holds it before anything is due: its hash, time and author.
+    let mut pages_held = Vec::new();
+    let mut before = None;
+    for _ in 0..16 {
+        let Frame::RoomPage { rows, older, .. } = request(Request::RoomPage {
+            channel_id: cid,
+            before,
+            limit: 128,
+        }) else {
+            panic!("PRODUCT (staging): the staged room's page refused")
+        };
+        before = rows.first().map(|row| row.entry_hash);
+        pages_held.push(rows);
+        if older == 0 {
+            break;
+        }
+    }
+    let held: Vec<_> = pages_held.into_iter().rev().flatten().collect();
+    let staged: Vec<String> = old.iter().chain(&newer).cloned().collect();
+    assert_eq!(
+        shown(&held),
+        staged,
+        "PRODUCT (staging): the room does not hold the staged rows in posting order"
+    );
+    let created = |names: &[String]| {
+        held.iter()
+            .filter(|row| names.contains(&named(&row.text)))
+            .map(|row| row.created_millis)
+            .collect::<Vec<_>>()
+    };
+    let lifetime_ms = LIFETIME_S * 1_000;
+    let old_first_due = created(&old).into_iter().min().unwrap() + lifetime_ms;
+    let old_last_due = created(&old).into_iter().max().unwrap() + lifetime_ms;
+    let new_first_due = created(&newer).into_iter().min().unwrap() + lifetime_ms;
+    assert!(
+        now_ms() < old_first_due && old_last_due < new_first_due,
+        "APPARATUS: staging overran its plan: now {} ms, first old due {old_first_due}, last old \
+         due {old_last_due}, first newer due {new_first_due}",
+        now_ms()
+    );
+    while !(dir.join("hold-expiry.engaged").exists() && now_ms() >= old_last_due)
+        && now_ms() < new_first_due
+    {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        dir.join("hold-expiry.engaged").exists(),
+        "APPARATUS: the native prune hold never engaged before the newer rows were due"
+    );
+    let at = now_ms();
+    let counted = request(Request::Count {
+        channel_id: cid,
+        since: None,
+    });
+    let first = request(Request::RoomPage {
+        channel_id: cid,
+        before: None,
+        limit: LIMIT,
+    });
+    // Every page back to the start, each `older` against what is left below it.
+    let mut pages = Vec::new();
+    let mut before = None;
+    for _ in 0..16 {
+        let page = request(Request::RoomPage {
+            channel_id: cid,
+            before,
+            limit: LIMIT,
+        });
+        let next = match &page {
+            Frame::RoomPage { rows, older, .. } if *older != 0 && !rows.is_empty() => {
+                rows.first().map(|row| row.entry_hash)
+            }
+            _ => None,
+        };
+        pages.push(page);
+        if next.is_none() {
+            break;
+        }
+        before = next;
+    }
+    let summary = request(Request::ThreadSummary {
+        channel_id: cid,
+        root,
+        after_author: None,
+    });
+    let replies = request(Request::ThreadPage {
+        channel_id: cid,
+        root,
+        before: None,
+        after: None,
+    });
+    let (ok, cli, err) = vox(
+        dir,
+        &[
+            "room",
+            "read",
+            "partial",
+            "--json",
+            "--limit",
+            &LIMIT.to_string(),
+        ],
+        None,
+    );
+    let done = now_ms();
+    assert!(
+        at >= old_last_due && done < new_first_due,
+        "APPARATUS: the reads ran from {at} to {done} ms, outside the window in which all {} old \
+         rows were due ({old_last_due}) and no newer one was ({new_first_due})",
+        old.len()
+    );
+    println!(
+        "[proof] reads at {at}..{done} ms: last old row due {old_last_due}, first newer due \
+         {new_first_due}; {} old rows due, prune held",
+        old.len()
+    );
+    if std::env::var_os("VOX_MUTANT_EXPIRY").is_some() {
+        let log = std::fs::read_to_string(dir.join("daemon-partial.err")).unwrap();
+        for line in log
+            .lines()
+            .filter(|line| line.contains("test-knobs: expiry"))
+        {
+            println!("[daemon] {line}");
+        }
+        assert!(
+            log.contains("test-knobs: expiry"),
+            "APPARATUS: expiry mutant never engaged"
+        );
+    }
+    let newest = held.last().map(|row| row.entry_hash);
+    println!("[proof] Count with {} old rows due: {counted:?}", old.len());
+    assert!(
+        matches!(counted, Frame::Count { n, last } if n == newer.len() as u64 && last == newest),
+        "PRODUCT: with {} old rows due, Count must be the {} newer rows ending at the newest: \
+         {counted:?}",
+        old.len(),
+        newer.len()
+    );
+    let expect_older = newer.len() as u64 - LIMIT;
+    let Frame::RoomPage { rows, older, .. } = &first else {
+        panic!("PRODUCT: the newest page was refused while old rows were due: {first:?}")
+    };
+    println!(
+        "[proof] newest page of {LIMIT}: {} rows, older {older}, first {:?}, last {:?}",
+        rows.len(),
+        rows.first().map(|row| named(&row.text)),
+        rows.last().map(|row| named(&row.text))
+    );
+    assert!(
+        *older == expect_older && shown(rows) == newer[newer.len() - LIMIT as usize..],
+        "PRODUCT: the newest page must be the newest {LIMIT} of the {} newer rows with older \
+         {expect_older}; it has older {older} and {:?}",
+        newer.len(),
+        shown(rows)
+    );
+    let mut walked = Vec::new();
+    let mut olders = Vec::new();
+    for page in pages.iter().rev() {
+        let Frame::RoomPage { rows, older, .. } = page else {
+            panic!("PRODUCT: a page back through the room was refused: {page:?}")
+        };
+        walked.extend(shown(rows));
+        olders.push((*older, rows.len()));
+    }
+    olders.reverse();
+    println!("[proof] pages back (older, rows): {olders:?}");
+    assert!(
+        walked == newer
+            && olders
+                .iter()
+                .scan(newer.len() as u64, |left, (older, rows)| {
+                    *left = left.saturating_sub(*rows as u64);
+                    Some(*older == *left)
+                })
+                .all(|exact| exact),
+        "PRODUCT: paging back must give exactly the {} newer rows, each page's older what is \
+         left below it; (older, rows) {olders:?}, rows {walked:?}",
+        newer.len()
+    );
+    let author = held[0].author;
+    let last_reply = created(&new_replies).into_iter().max().unwrap();
+    println!("[proof] thread summary with 4 old replies due: {summary:?}");
+    assert!(
+        matches!(&summary, Frame::ThreadSummary { reply_count, last_reply_millis, authors, next_author: None }
+            if *reply_count == new_replies.len() as u64 && *last_reply_millis == last_reply && *authors == [author]),
+        "PRODUCT: the thread summary must count only the {} newer replies (last at {last_reply}): \
+         {summary:?}",
+        new_replies.len()
+    );
+    assert!(
+        matches!(&replies, Frame::ThreadPage { rows, .. } if shown(rows) == new_replies),
+        "PRODUCT: the thread page must hold only the newer replies {new_replies:?}: {replies:?}"
+    );
+    let cli_texts: Vec<String> = cli
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|row| row["text"].as_str().map(named))
+        .collect();
+    assert!(
+        ok && cli_texts == newer[newer.len() - LIMIT as usize..],
+        "PRODUCT: `vox room read --limit {LIMIT}` must show the newest {LIMIT} newer rows only: \
+         ok={ok} {cli_texts:?} {err}"
+    );
+    std::fs::remove_file(dir.join("hold-expiry")).unwrap();
+}
+
 /// The hook's continuation API must skip one native sweep of already-expired bodies.
 #[cfg(feature = "optional-proofs")]
 #[test]
@@ -1481,6 +1831,7 @@ optional_proof::not_run!(
     an_existing_session_index_keeps_its_listing_when_upgraded,
     private_session_steps_store_one_body_and_reopen_after_rotation,
     a_room_stays_readable_while_messages_keep_expiring,
+    a_partly_expired_room_counts_pages_and_threads_only_what_remains,
     a_hook_continuation_read_skips_expired_messages,
 );
 
