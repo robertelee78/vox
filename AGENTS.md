@@ -27,6 +27,16 @@ decider's own. Each rule names the ADR section that holds the full record.
   product did) or an APPARATUS fault (staging not achieved, precondition unmet, watchdog, emulator
   late, harness error). An unattributed red is a proof defect, and the verifier rejects it.
   (ADR-018, 2026-10-01 section; §8b)
+  - "When we don't know 'product is broken' vs 'test is broken' -- that test doesn't belong in
+    the repo at all" (the decider, 2026-11-22). A test whose red cannot say which is deleted, not
+    repaired. What the product does for a person is then settled by using it, as a spike that is
+    run and reported.
+  - "We built some solid QA tests meant for use ad hoc as needed, never as a release gate. Can run
+    anything that helps us gain confidence we actually fixed the problems intended to be fixed
+    with the .31 release" (the decider, 2026-11-22). A test that is a usable ad hoc tool stays,
+    including one whose red names an input it was not given; a test whose red cannot be read does
+    not. A red seen once under load, or without the input a test names, is not evidence against
+    the test: run it once more, quiet, before deciding.
 - **Only valid proofs block; everything else is optional or deleted.** "Valid proofs block; rest
   optional." (ADR-018, 2026-10-01 section)
   - "spike tests are valid": run them and report the result; never commit them to the gate.

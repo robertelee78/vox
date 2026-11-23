@@ -19,8 +19,15 @@
 //! **Asserted,** with hard-coded numbers, after each arm keeps reading 45–60 s past the moment
 //! its required posts arrived (a late history release must be caught): in arm A bob reads
 //! exactly posts 1,101–1,110; in arm B exactly 1,101–2,050, all 950 of them; in neither any of
-//! posts 1–1,100. Precondition, or `PRODUCT (staging)`: alice's own paged reads show every post she
-//! made in both rooms.
+//! posts 1–1,100. Bob reads as a newcomer does (ADR-037 R1): he pages back through what he holds
+//! and asks for the page below his oldest row with `vox room read --history older --before`, until
+//! a demand adds nothing. Precondition, or `PRODUCT (staging)`: alice's own paged reads show every
+//! post she made in both rooms.
+//!
+//! **Limit of arm B.** Its privacy half is tested only if bob's node received the rows below
+//! post 1,101; this act does not show that it did. `vox room read` lists only rows bob can open,
+//! and the act sees a demand's acknowledgement, not how it ended. Arm A's privacy half is real:
+//! bob's window there holds rows sealed before the decision and he reads none.
 //!
 //! **The clock-step attack cannot be staged here** (it needs clock control, and sudo is
 //! forbidden): the design makes it inexpressible, since no clock reading enters the order.
@@ -63,10 +70,9 @@ use std::time::{Duration, Instant};
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const IDENTITY: &str = "an identity passphrase";
 const ROOMPASS: &str = "the room passphrase";
-/// How long bob has, in each arm, to read what he is entitled to.
-const BOUND: Duration = Duration::from_secs(300);
-/// Rows per page when walking a room, as an agent reading a long room pages it.
-const PAGE: usize = 500;
+/// How long a demand for older history may go without adding a row before bob's reading is
+/// judged settled (the newcomer proof's bound for one page, `PAGE_WITHIN`).
+const SETTLED: Duration = Duration::from_secs(60);
 
 /// A `vox daemon`, killed by its own PID when dropped.
 struct Daemon(Child);
@@ -159,22 +165,23 @@ fn attached(dir: &Path, tag: &str) -> String {
     );
 }
 
-/// Every `post <i>` this profile's `vox room read --json` shows for `room`, walked a page at a
-/// time with `--limit` and `--since`. Returns the distinct post numbers, how many rows carried
-/// one (a duplicate would make this larger than the set), and the pages read.
-fn read_posts(dir: &Path, room: &str) -> (BTreeSet<usize>, usize, usize) {
+/// Every `post <i>` this profile's `vox room read --json` shows for `room`, walked back a page at
+/// a time as the product says to (paging since `28d77d3a2`): while a page says `older messages not
+/// shown`, the next page is `--before` that page's first row, the entry the product names. Returns
+/// the distinct post numbers, how many rows carried one (a duplicate would make this larger than
+/// the set), how many rows of any kind the profile holds, and the oldest of them: what the page
+/// below is asked for with (`--history older --before`).
+fn read_posts(dir: &Path, room: &str) -> (BTreeSet<usize>, usize, usize, Option<String>) {
     let mut seen = BTreeSet::new();
-    let (mut rows_with_post, mut pages) = (0usize, 0usize);
-    let mut since: Option<String> = None;
+    let (mut rows_with_post, mut rows) = (0usize, 0usize);
+    let mut before: Option<String> = None;
     loop {
-        let limit = PAGE.to_string();
-        let mut args = vec!["room", "read", room, "--json", "--limit", &limit];
-        if let Some(c) = since.as_deref() {
-            args.extend(["--since", c]);
+        let mut args = vec!["room", "read", room, "--json"];
+        if let Some(c) = before.as_deref() {
+            args.extend(["--before", c]);
         }
         let (ok, out, err) = vox(dir, &args, None);
         assert!(ok, "PRODUCT (staging): vox room read --json refused: {err}");
-        pages += 1;
         let page: Vec<serde_json::Value> = out
             .lines()
             .filter(|l| !l.trim().is_empty())
@@ -182,6 +189,7 @@ fn read_posts(dir: &Path, room: &str) -> (BTreeSet<usize>, usize, usize) {
                 serde_json::from_str(l).unwrap_or_else(|e| panic!("PRODUCT: bad row ({e}): {l}"))
             })
             .collect();
+        rows += page.len();
         for row in &page {
             if let Some(n) = row["text"]
                 .as_str()
@@ -192,16 +200,23 @@ fn read_posts(dir: &Path, room: &str) -> (BTreeSet<usize>, usize, usize) {
                 seen.insert(n);
             }
         }
-        match page.last() {
-            Some(last) if page.len() == PAGE => {
-                since = Some(
-                    last["entry_hash"]
+        match page.first() {
+            Some(first) if err.contains("older messages not shown") => {
+                before = Some(
+                    first["entry_hash"]
                         .as_str()
                         .expect("PRODUCT: every row carries its entry hash")
                         .to_owned(),
                 );
             }
-            _ => return (seen, rows_with_post, pages),
+            _ => {
+                let oldest = page
+                    .first()
+                    .and_then(|r| r["entry_hash"].as_str())
+                    .map(str::to_owned)
+                    .or(before);
+                return (seen, rows_with_post, rows, oldest);
+            }
         }
     }
 }
@@ -243,19 +258,28 @@ fn join(bob: &Path, alice: &Path, room: &str) {
     assert!(ok, "PRODUCT (staging): vox room join: {err}");
 }
 
-/// Read bob's view of `room` until every post in `need` is there (or [`BOUND`] passes), then
-/// keep reading for `hold`, to catch a late release. Returns everything ever seen.
+/// Read bob's view of `room` as a newcomer reads a room's history: page back through what he
+/// holds, then ask for the page below his oldest row with `vox room read --json --history older
+/// --before <that row>` (ADR-037 R1: a join holds the newest rows of an author, the rest is fetched
+/// on demand), and again after each page that arrives. Stops when the demands have added no row
+/// for [`SETTLED`] and, once every post in `need` is there, not before `hold` has passed (a late
+/// release must be caught). Returns everything ever seen.
 fn watch(bob: &Path, room: &str, tag: &str, need: &[usize], hold: Duration) -> BTreeSet<usize> {
     let t0 = Instant::now();
     let mut all = BTreeSet::new();
     let mut got_at: Option<Instant> = None;
     let mut last = usize::MAX;
+    let (mut held, mut grew) = (0usize, Instant::now());
+    let mut said = String::new();
     loop {
-        let (seen, _, _) = read_posts(bob, room);
+        let (seen, _, rows, oldest) = read_posts(bob, room);
         all.extend(seen);
+        if rows > held {
+            (held, grew) = (rows, Instant::now());
+        }
         if all.len() != last {
             println!(
-                "[proof] {tag} +{:?}: bob reads {} posts (min {:?}, max {:?})",
+                "[proof] {tag} +{:?}: bob reads {} posts (min {:?}, max {:?}), holds {held} rows",
                 t0.elapsed(),
                 all.len(),
                 all.first(),
@@ -266,8 +290,44 @@ fn watch(bob: &Path, room: &str, tag: &str, need: &[usize], hold: Duration) -> B
         if got_at.is_none() && need.iter().all(|n| all.contains(n)) {
             got_at = Some(Instant::now());
         }
-        if got_at.is_some_and(|g| g.elapsed() > hold) || t0.elapsed() > BOUND {
+        if grew.elapsed() > SETTLED && got_at.is_none_or(|g| g.elapsed() > hold) {
+            println!(
+                "[proof] {tag}: settled at +{:?}, {held} rows held, the last demand said: {said}",
+                t0.elapsed()
+            );
             return all;
+        }
+        if let Some(oldest) = oldest {
+            let (ok, _, err) = vox(
+                bob,
+                &[
+                    "room",
+                    "read",
+                    room,
+                    "--json",
+                    "--history",
+                    "older",
+                    "--before",
+                    &oldest,
+                ],
+                None,
+            );
+            assert!(
+                ok,
+                "PRODUCT (staging): bob's `vox room read --history older` refused: {err}"
+            );
+            let now = err
+                .lines()
+                .find(|l| l.contains("history"))
+                .unwrap_or("")
+                .to_owned();
+            if now != said {
+                println!(
+                    "[proof] {tag} +{:?}: demand below {oldest}: {now}",
+                    t0.elapsed()
+                );
+                said = now;
+            }
         }
         std::thread::sleep(Duration::from_secs(2));
     }
@@ -343,7 +403,7 @@ fn posts_sealed_before_trust_stay_unreadable_and_everything_after_is_read() {
     post_range(&alice, &room_b, 1_101, 2_050);
 
     for (room, total) in [(&room_a, 1_110usize), (&room_b, 2_050)] {
-        let (mine, rows, _) = read_posts(&alice, room);
+        let (mine, rows, _, _) = read_posts(&alice, room);
         assert!(
             mine.len() == total && rows == total,
             "PRODUCT (staging): alice herself reads {} distinct posts in {rows} rows of {room}, not \

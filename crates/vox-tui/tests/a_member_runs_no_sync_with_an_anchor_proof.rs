@@ -177,20 +177,20 @@ impl Root {
         v["sync"].as_array().cloned().unwrap_or_default()
     }
 
-    /// Wait until `vox node list` shows this root's node attached.
+    /// Wait until `vox node list` shows this root's node `Ready` (the word since `7f1cfa048`).
     fn attached(&self, side: &str) {
         let deadline = Instant::now() + Duration::from_secs(90);
         loop {
             let out = self.ok(side, &["node", "list"]);
             if out
                 .lines()
-                .any(|l| l.split_whitespace().take(2).eq([self.node, "attached"]))
+                .any(|l| l.split_whitespace().take(2).eq([self.node, "Ready"]))
             {
                 return;
             }
             assert!(
                 Instant::now() < deadline,
-                "{side} node {} never showed attached:\n{out}",
+                "{side} node {} never showed Ready:\n{out}",
                 self.node
             );
             std::thread::sleep(Duration::from_millis(200));
