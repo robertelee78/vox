@@ -441,8 +441,9 @@ impl HintInbox {
             ..Offer::default()
         })
     }
-    /// Whether an immutable in-flight owner has a strictly newer queued successor. Equal-size
-    /// distinct heads remain fork evidence and never supersede each other by scalar ordering.
+    /// Whether an in-flight owner has a strictly newer queued successor. A live walk asks at
+    /// each position boundary (ADR-052 RG-6); equal-size distinct heads remain fork evidence
+    /// and never supersede each other by scalar ordering.
     pub(crate) fn newer_pending(
         &self,
         room: Digest32,
