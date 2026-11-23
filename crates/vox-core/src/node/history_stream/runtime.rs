@@ -2597,7 +2597,7 @@ impl Flow {
                     self.push(root)?;
                     return Ok(());
                 }
-                // Proof-only pacing/hold after visible progress, outside room/store locks.
+                // Proof-only pacing/hold/fail after visible progress, outside room/store locks.
                 #[cfg(feature = "test-knobs")]
                 if let Some(path) = std::env::var_os("VOX_TEST_HOLD_LIVE_WINDOW_FILE") {
                     let path = std::path::PathBuf::from(path);
@@ -2612,6 +2612,7 @@ impl Flow {
                                 .and_then(|ms| ms.parse::<u64>().ok());
                             if pause.is_some()
                                 || mode == "hold"
+                                || mode == "fail"
                                 || mode.parse::<u64>().ok() == Some(remaining)
                             {
                                 std::fs::write(
@@ -2621,6 +2622,16 @@ impl Flow {
                                 .map_err(|_| Error::Profile("proof live-window marker failed"))?;
                                 if let Some(ms) = pause {
                                     tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                                } else if mode == "fail" {
+                                    // Fail the author's own pull before this position, as when
+                                    // the peer answers that the selected body is unavailable:
+                                    // the flow ends mid-walk and the next one re-selects.
+                                    if self.peer == author {
+                                        return Err(Error::Unreachable(
+                                            "selected current body is unavailable or cancelled",
+                                        ));
+                                    }
+                                    return Ok(());
                                 } else if path.exists() {
                                     // Hold the author's own pull. Other providers can finish
                                     // their other-author tasks, but cannot advance this window.

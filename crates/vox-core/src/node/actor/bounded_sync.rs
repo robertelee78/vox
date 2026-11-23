@@ -234,7 +234,9 @@ fn transport_streak_mutant() -> bool {
 }
 
 /// `VOX_MUTANT_FETCH_DISCARD`: a fetch whose author posted again is cut one second after its
-/// flow was built, as before ADR-052 RG-6. Says so once on stderr when the daemon first reads it.
+/// flow was built, as before ADR-052 RG-6. It puts back that timer cut only: not main's other two
+/// supersede paths (the turn-return supersede and the byte-wait supersede), nor the signalling of
+/// work a cut turn had already published. Says so once on stderr when the daemon first reads it.
 #[cfg(feature = "test-knobs")]
 fn fetch_discard_mutant() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {

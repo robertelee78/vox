@@ -637,9 +637,11 @@ cargo test --release -p vox-tui --features optional-proofs,test-knobs \
   a_newcomer_who_keeps_posting_is_trusted_back_on_a_slow_path --nocapture
 ```
 
-Run it alone: its posting cadence is checked. `VOX_MUTANT_FETCH_DISCARD=1` puts back the rule
+Run it alone: its posting cadence is checked. `VOX_MUTANT_FETCH_DISCARD=1` puts back the timer cut
 ADR-052 RG-6 removed (a fetch whose author posted again is cut one second after its flow was
-built); the proof forwards it to both daemons and requires alice's daemon to say it engaged.
+built), and only that: not main's other two supersede paths (the turn-return supersede and the
+byte-wait supersede), nor the signalling of work a cut turn had already published. The proof
+forwards it to both daemons and requires alice's daemon to say it engaged.
 
 What replaced that cut: a live walk finishes the position it is fetching and, when the author's
 newer head is waiting, ends at that position boundary so the next round walks the newer head's
