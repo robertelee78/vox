@@ -441,6 +441,7 @@ impl ReadResource {
             .map_err(|failure| match failure {
                 Failure::Storage(error) => error,
                 Failure::Request(why) => Error::Profile(why),
+                Failure::Expired => Error::Profile(REMOVING_EXPIRED),
             })?;
             sek.key_bytes()?;
             Ok(answer)

@@ -1319,7 +1319,7 @@ pub async fn serve(
         }
     }
     // Taken before the room is made, so who reaches it from the first moment is said.
-    let events = crate::client::events(&held.at).await?;
+    let events = crate::client::events(&held.at, &paths.account()).await?;
     waiting.on("the room to be created");
     // **No anchor, no refusal** (V210-96, C1): a host on a LAN or on this machine is found
     // directly by a guest there, and an anchor bridges only hosts that cannot otherwise find each
@@ -1420,7 +1420,7 @@ pub async fn serve(
     println!();
     println!("who can reach it: a member of this room you have trusted (`vox trust add`)");
     println!("  a joiner with the address and the passphrase reaches NOTHING until then");
-    let mut aux = crate::client::open(&held.at).await?;
+    let mut aux = crate::client::open(&held.at, &paths.account()).await?;
     let mut said = audience(&mut aux, channel_id, held.me.as_ref()).await;
     print!("{said}");
     println!("Ctrl-C to stop");
@@ -1607,7 +1607,7 @@ pub async fn connect(
 ) -> Result<(), AppError> {
     let mut held = crate::client::hold(paths, args, pass, true, Some(waiting)).await?;
     // Taken before the join, so its first step is not raised before anyone listens.
-    let mut steps = crate::client::events(&held.at).await?;
+    let mut steps = crate::client::events(&held.at, &paths.account()).await?;
     waiting.on("the node to take the join");
     let request = Request::Join {
         link: url.to_owned(),
@@ -1754,7 +1754,7 @@ pub async fn up(
     // **What the node says about its reaches is said here** (PRD-001 R23, R36): the proxy's
     // refusals and cut tunnels are this node's events, beside a path that stays relayed, a peer
     // that cannot be reached, or a refusal's reason.
-    let mut events = crate::client::events(&held.at).await.ok();
+    let mut events = crate::client::events(&held.at, &paths.account()).await.ok();
     let closed = crate::client::hold_until_closed(&mut held.client);
     tokio::pin!(closed);
     loop {
@@ -1957,7 +1957,7 @@ pub async fn forward_named(
         Err(_) => local.to_owned(),
     };
     let local_addr: Option<SocketAddr> = local.parse().ok();
-    let events = crate::client::events(&held.at).await?;
+    let events = crate::client::events(&held.at, &paths.account()).await?;
     waiting.on("the forward to bind");
     let first_attempt = Instant::now();
     let bound = match held

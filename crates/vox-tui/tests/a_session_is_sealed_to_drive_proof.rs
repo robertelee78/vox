@@ -25,11 +25,16 @@
 //!    session has no terminal in this proof (its hook runs with no tmux of anyone's), so the told
 //!    line is proved in the tmux proof's own scratch server (a_claude_session_is_mirrored…, arm 11).
 //! 2. **Losing drive changes the key** (SC-2b). Alice downgrades bob to read (`vox trust read`).
-//!    Bob's node opens none of the entries alice's Session writes afterwards, while it still holds
-//!    the ones it read before and still reads alice's messages to the room; and its
-//!    `vox room sessions --json` no longer lists alice's Session (ADR-031 SA-1/SA-2, #739).
-//!    Its metadata and session-address target disappear, including after restart; node-only
-//!    messages still work. The owner keeps its own Session, and regrant restores discovery.
+//!    Bob's node opens none of the entries alice's Session writes afterwards and still reads
+//!    alice's messages to the room. He is shown at most the Session's row he held, with
+//!    `can_drive: false` (ADR-029 CL-3, SC-3): a node lists `can_drive` for the authors whose
+//!    current drive key it holds, so this is his own node saying the key it has is no longer
+//!    alice's. His `vox room session` is refused with `this node cannot read that Session`
+//!    (manual: "When Drive is taken back … CLI private queries refuse"); none of its steps shows
+//!    in his timeline. On the wire, neither alice nor a relay serves him anything of it,
+//!    including after his restart (a holder that resets his ask refuses it and serves nothing).
+//!    Its session-address target is refused, node-only messages still work, and the owner keeps
+//!    its own Session.
 //!
 //! 5. **A burst of key-packages names a fresh one-time prekey each** (ADR-030 P-3). With a
 //!    Session of alice's in two rooms, alice gives carol drive (`vox trust drive`): carol is owed
@@ -60,9 +65,18 @@
 //! - **Release the drive key on read** (claim 1): `drive_holders` in
 //!   `crates/vox-core/src/node/actor.rs` returns every trusted node. Carol's node opens alice's
 //!   Session entries: red PRODUCT.
-//! - **Return retained Sessions without current drive** (#739): remove only the final
-//!   `can_drive` filter in `sessions::fold`. Bob's revoked Session reappears in the shipped
-//!   listing: red PRODUCT on the absence assertion, not on staging.
+//! - **Return retained Sessions as drivable without current drive** (claim 2): the listing's
+//!   per-row `can_drive` in `session_projection/query.rs` is always true. Bob's listing after the
+//!   downgrade fails (`the room's Sessions changed; refresh the listing`): red PRODUCT in claim 2.
+//!   The flag `vox room sessions --json` prints (`sessions` in `room_cli.rs`) always true: bob's
+//!   row after the downgrade says `can_drive` true: red PRODUCT on the row check.
+//! - **Answer a Session read without current drive** (claim 2): `readable` in
+//!   `session_projection/query.rs` admits every author not refreshing. Bob's `vox room session` is
+//!   not refused with `this node cannot read that Session`: red PRODUCT.
+//! - **Serve the owner's records to a member that lost drive** (claim 2): the holder check in
+//!   `pending_upgrade/serve.rs` and the continuity range in `permitted_to`
+//!   (`private_session/pending_upgrade.rs`) both cut. Alice serves bob his pre-downgrade ciphertext
+//!   on his raw request: red PRODUCT.
 //! - **A Session's file served to any trusted member** (claim 3): `Witness::allowed` in
 //!   `crates/vox-core/src/node/shares.rs` lets anyone in. Carol is served the file: red PRODUCT.
 //! - **A driven file taken without checking drive** (claim 4): the DR-2 check in `drive` in
@@ -72,9 +86,10 @@
 //! - **A package's one-time prekey not noted** (claim 5): the `refused_otps.note` after the seal
 //!   in `post_key_package` in `crates/vox-core/src/node/actor.rs` removed. Both packages name one
 //!   prekey, and carol's node uses one: red PRODUCT.
-//! - **No rotation on losing drive** (claim 2): `rotate_drive_if_lost` in
-//!   `crates/vox-core/src/node/channel.rs` returns the lost members without changing the key. Bob's
-//!   node opens the entries written after his downgrade: red PRODUCT.
+//! - **No rotation on losing drive** (claim 2): `rotated` in `run_inner` of
+//!   `crates/vox-core/src/node/channel/pending_session.rs` is never true. Bob's node still holds
+//!   alice's current key: after the downgrade it lists her Session with `can_drive` true and
+//!   opens his earlier steps: red PRODUCT on the row check.
 //! - **Write an opening/end as ordinary room text** (#740): the read-only/revoked member's
 //!   `vox room read --json` exposes that lifecycle record: red PRODUCT.
 //! - **No lifecycle refresh on a new drive grant** (claim 6): Dave reads fresh chat but the
@@ -476,6 +491,16 @@ fn channel_id(rt: &tokio::runtime::Runtime, m: &Member, short: &str) -> [u8; 32]
 /// Whether `m`'s `vox room sessions --json` lists alice's Session as one it can drive; `None` if
 /// it does not list it.
 fn can_drive(m: &Member, room: &str) -> Option<bool> {
+    session_row(m, room).map(|v| {
+        v["can_drive"]
+            .as_bool()
+            .unwrap_or_else(|| panic!("PRODUCT: Session listing omitted drive: {v}"))
+    })
+}
+
+/// The row `m`'s `vox room sessions --json` prints for alice's Session; `None` if it does not
+/// list it.
+fn session_row(m: &Member, room: &str) -> Option<serde_json::Value> {
     let (ok, out, err) = m.vox(&["room", "sessions", room, "--json"], None);
     assert!(ok, "PRODUCT: Session listing failed: {out}{err}");
     out.lines()
@@ -485,11 +510,6 @@ fn can_drive(m: &Member, room: &str) -> Option<bool> {
                 .unwrap_or_else(|e| panic!("PRODUCT: malformed Session listing: {line}; {e}"))
         })
         .find(|v| v["id"] == SESSION)
-        .map(|v| {
-            v["can_drive"]
-                .as_bool()
-                .unwrap_or_else(|| panic!("PRODUCT: Session listing omitted drive: {v}"))
-        })
 }
 
 /// A person can address a visible Session, but read-only and revoked members address its node.
@@ -512,9 +532,13 @@ fn session_target(member: &Member, owner: &Member, room: &str, allowed: bool) {
             "PRODUCT: current driver could not address the Session: {out}{err}"
         );
     } else {
+        // A Session it does not list is unknown to it; one it lists without drive is one it
+        // cannot read. Either way it is refused, and its node is addressable.
+        let said = format!("{out}{err}");
         assert!(
-            !ok && format!("{out}{err}").contains("no Session in this room is named"),
-            "PRODUCT: member without current drive must be refused the retained Session target: {out}{err}"
+            !ok && (said.contains("no Session in this room is named")
+                || said.contains("this node cannot read that Session")),
+            "PRODUCT: member without current drive must be refused the retained Session target: {said}"
         );
         let (ok, out, err) = member.vox(
             &["room", "post", room, "--to", &owner.fp, "node-target-proof"],
@@ -525,6 +549,45 @@ fn session_target(member: &Member, owner: &Member, room: &str, allowed: bool) {
             "PRODUCT: read-only member could not address the node: {out}{err}"
         );
     }
+}
+
+/// What a member that has lost drive is shown of alice's Session: at most the row it listed while
+/// it had drive, `can_drive` false (ADR-029 CL-3, SC-3), and its private queries refuse (manual,
+/// Sessions: "When Drive is taken back … CLI private queries refuse"); what it read before stays
+/// only where it copied it. `also` names fields that may have changed since, as whether the
+/// Session is open or ended, which every member may see (SC-3).
+fn shown_only_its_row(
+    member: &Member,
+    room: &str,
+    held: &serde_json::Value,
+    when: &str,
+    also: &[&str],
+) {
+    let without_drive = |row: &serde_json::Value| {
+        let mut row = row.clone();
+        let fields = row
+            .as_object_mut()
+            .expect("PRODUCT: a Session listing row is not an object");
+        for field in std::iter::once(&"can_drive").chain(also) {
+            fields.remove(*field);
+        }
+        row
+    };
+    if let Some(row) = session_row(member, room) {
+        assert!(
+            row["can_drive"] == false && without_drive(&row) == without_drive(held),
+            "PRODUCT: {when}, {}'s `vox room sessions --json` may show alice's Session only as \
+             the row it held, with can_drive false: held {held}, shown {row}",
+            member.name
+        );
+    }
+    let (ok, out, err) = member.vox(&["room", "session", room, SESSION, "--json"], None);
+    assert!(
+        !ok && err.contains("this node cannot read that Session"),
+        "PRODUCT: {when}, {}'s `vox room session` must be refused with `this node cannot read \
+         that Session`: it printed {out}{err}",
+        member.name
+    );
 }
 
 /// How many one-time prekeys `m`'s node has used, as its `vox status --json` says (`prekeys`
@@ -622,7 +685,7 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
         .build()
         .expect("APPARATUS: a runtime");
     let (_anchor, spec) = anchor(tmp.path());
-    let mut alice = member(tmp.path(), "alice", &spec);
+    let alice = member(tmp.path(), "alice", &spec);
     let mut bob = member(tmp.path(), "bob", &spec);
     let mut carol = member(tmp.path(), "carol", &spec);
 
@@ -918,6 +981,10 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
     );
 
     // ---- claim 2: alice downgrades bob to read; her Session's later entries are not his ----
+    // His row as he lists it while he has drive: after the downgrade he may be shown only this,
+    // with `can_drive` false (ADR-029 CL-3, SC-3).
+    let bob_row_before = session_row(&bob, &room)
+        .expect("PRODUCT: bob, whom alice trusts with drive, no longer lists her Session");
     let (ok, o, e) = alice.vox(
         &[
             "trust",
@@ -947,7 +1014,7 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
     // Ten seconds more for anything still on its way.
     std::thread::sleep(Duration::from_secs(10));
     let bob_now = opened(&bob, &room);
-    let bob_lists_after = can_drive(&bob, &room);
+    let bob_timeline = bob.vox(&["room", "read", &room], None).1;
     eprintln!(
         "[proof] claim 2: bob synced past the later entries: {bob_synced}; opened {bob_now:?}"
     );
@@ -961,15 +1028,15 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
         "PRODUCT: after alice downgraded bob to read, he must open none of the Session entries \
          written afterwards: he opened {bob_now:?}"
     );
-    assert_eq!(
-        bob_lists_after, None,
-        "PRODUCT: after the downgrade and the entries sealed since, bob's `vox room sessions \
-         --json` must omit alice's retained Session"
-    );
+    shown_only_its_row(&bob, &room, &bob_row_before, "after the downgrade", &[]);
     assert!(
-        before.iter().all(|b| bob_now.contains(b)),
-        "PRODUCT: bob keeps the Session entries he read before the downgrade: he has {bob_now:?}"
+        before
+            .iter()
+            .chain(after.iter())
+            .all(|step| !bob_timeline.contains(step.as_str())),
+        "PRODUCT: Session activity must not show in bob's room timeline (SC-4): {bob_timeline}"
     );
+    assert_no_lifecycle(&bob, &room, SESSION);
 
     session_target(&bob, &alice, &room, false);
     assert_eq!(
@@ -1109,17 +1176,7 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
     );
     // Carol demonstrably holds the new ciphertext now. Bob cannot get it from her or its owner.
     private_wire_refused(&mut bob, &[&alice, &carol], id, &spec);
-    assert_eq!(
-        opened(&bob, &room),
-        before,
-        "PRODUCT: Bob's restart after drive loss changed the steps he had already read"
-    );
-
-    assert_eq!(
-        can_drive(&bob, &room),
-        None,
-        "PRODUCT: restart after drive loss must not restore retained Session discovery"
-    );
+    shown_only_its_row(&bob, &room, &bob_row_before, "after his restart", &[]);
     session_target(&bob, &alice, &room, false);
 
     // A fourth member joins the already-running Session with drive. Its room admission and
@@ -1172,6 +1229,10 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
         "PRODUCT: late member must read only its post-admission step; got {:?}",
         opened(&dave, &room)
     );
+    let dave_row_before = session_row(&dave, &room)
+        .expect("PRODUCT: dave, whom alice trusts with drive, does not list her Session");
+    let dave_opening_before = listed_opening(&rt, &dave, id)
+        .expect("PRODUCT: dave, whom alice trusts with drive, has no opening of her Session");
     let (ok, o, e) = alice.vox(
         &[
             "trust",
@@ -1197,15 +1258,12 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
         posts_until_read(&alice, &dave, &room, "AFTER-LATE-MEMBER-REVOKE"),
         "APPARATUS: revoked late member never read its ordinary control post"
     );
-    assert_eq!(
-        opened(&dave, &room),
-        [joined],
-        "PRODUCT: revoking late member's drive erased old history or released a new step"
-    );
-    assert_eq!(
-        can_drive(&dave, &room),
-        None,
-        "PRODUCT: revoked late member still discovers the retained Session"
+    shown_only_its_row(
+        &dave,
+        &room,
+        &dave_row_before,
+        "after his drive was revoked",
+        &[],
     );
 
     let (ok, o, e) = alice.vox(
@@ -1229,7 +1287,16 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
     );
     session_target(&dave, &alice, &room, true);
     // The relay has the missed step. The regranted member asks both it and the owner before
-    // any new step is written: neither may backfill even encrypted earlier records.
+    // any new step is written: neither may backfill even encrypted earlier records. A regrant
+    // begins a new readable interval with its own opening record; the probe's allowed set is
+    // the member's own listing, so it asks once that listing names the new opening (an owner
+    // serving that opening earlier would be judged against the old one). The holders may still
+    // reset his ask then, even with the new opening listed: refused, nothing served.
+    assert!(
+        until(Duration::from_secs(60), || listed_opening(&rt, &dave, id)
+            .is_some_and(|opening| opening != dave_opening_before)),
+        "APPARATUS (staging): dave's node never listed the opening of his regranted interval"
+    );
     private_wire_refused(&mut dave, &[&alice, &carol], id, &spec);
     let regranted = "AFTER-LATE-MEMBER-REGRANT";
     append(103, regranted);
@@ -1254,10 +1321,12 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
             member.name
         );
     }
-    assert_eq!(
-        opened(&bob, &room),
-        before,
-        "PRODUCT: another member's join and regrant changed Bob's already-read history"
+    shown_only_its_row(
+        &bob,
+        &room,
+        &bob_row_before,
+        "after another member's join and regrant",
+        &[],
     );
     // End through the real harness hook. Dave and Carol still have drive; Bob no longer does.
     let (ok, out, err) = alice.vox_with(
@@ -1277,10 +1346,12 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
         "APPARATUS: revoked reader did not read the end's ordinary control message"
     );
     assert_no_lifecycle(&bob, &room, SESSION);
-    assert_eq!(
-        session_state(&bob, &room, SESSION),
-        None,
-        "PRODUCT: revoked reader rediscovered retained lifecycle metadata after the Session ended"
+    shown_only_its_row(
+        &bob,
+        &room,
+        &bob_row_before,
+        "after the Session ended",
+        &["open", "ended_millis"],
     );
     // A new grant after the end receives retained lifecycle state, never the missed steps.
     let (ok, out, err) = alice.vox(
@@ -1316,27 +1387,6 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
         Some(false),
         "PRODUCT: driver lost the sealed end after reopening its own data root"
     );
-    // The existing legacy-classification arm stages Bob as a read-only receiver. Restore that
-    // precondition after the additional ended-Session grant case above.
-    let (ok, out, err) = alice.vox(
-        &[
-            "trust",
-            "read",
-            &bob.fp,
-            "--identity-passphrase-file",
-            alice.pass(),
-        ],
-        None,
-    );
-    assert!(
-        ok,
-        "APPARATUS: could not restore the legacy arm's read-only receiver: {out}{err}"
-    );
-    assert!(
-        until(Duration::from_secs(60), || can_drive(&bob, &room).is_none()),
-        "APPARATUS: legacy arm's read-only permission boundary was not staged"
-    );
-    legacy_placeholder_journey(&mut alice, &mut bob, id, &room, &spec);
 }
 
 fn session_state(member: &Member, room: &str, session: &str) -> Option<bool> {
@@ -1462,7 +1512,7 @@ fn private_wire_refused(member: &mut Member, holders: &[&Member], room: [u8; 32]
         VoxEndpoint::bind(signer, "127.0.0.1:0".parse().unwrap())
             .expect("APPARATUS: private wire peer binds")
     });
-    for (name, addr, fingerprint) in targets {
+    'holders: for (name, addr, fingerprint) in targets {
         let connection = rt
             .block_on(endpoint.connect(addr, fingerprint, raw_sync::now()))
             .expect("APPARATUS: private wire peer connects to holder");
@@ -1470,10 +1520,17 @@ fn private_wire_refused(member: &mut Member, holders: &[&Member], room: [u8; 32]
         let mut after = 0;
         let mut finished = false;
         for _ in 0..32 {
-            let bytes = rt.block_on(async {
+            // A holder that resets or stops the ask refuses it on purpose
+            // (`transport::streams::refuse`) and serves nothing on it: no record outside the
+            // member's grant. The pages it answered before the refusal were judged as they came.
+            let refused = |e: vox_core::error::Error, what: &str| match e {
+                vox_core::error::Error::PeerRefused(code) => code,
+                e => panic!("{what}: {e:?}"),
+            };
+            let page = rt.block_on(async {
                 let (mut send, mut recv) = open_typed(&connection, StreamKind::Session)
                     .await
-                    .expect("APPARATUS: private wire peer opens stream");
+                    .map_err(|e| refused(e, "APPARATUS: private wire peer opens stream"))?;
                 // The private Session ask, version 2: the room, its epoch, the donor cursor and
                 // the query, here the live tail (`sessionstream::read_ask`).
                 let mut e = Encoder::new();
@@ -1487,14 +1544,29 @@ fn private_wire_refused(member: &mut Member, holders: &[&Member], room: [u8; 32]
                     .uint(0);
                 write_frame(&mut send, &e.finish())
                     .await
-                    .expect("APPARATUS: private wire peer asks");
+                    .map_err(|e| refused(e, "APPARATUS: private wire peer asks"))?;
                 send.finish()
                     .expect("APPARATUS: private wire peer finishes request");
-                read_frame(&mut recv, 4 * 1024 * 1024)
-                    .await
-                    .expect("PRODUCT: member's private Session page exchange failed")
-                    .expect("PRODUCT: member received no private Session response")
+                Ok::<_, vox_core::wire::WireError>(
+                    read_frame(&mut recv, 4 * 1024 * 1024)
+                        .await
+                        .map_err(|e| {
+                            refused(e, "PRODUCT: member's private Session page exchange failed")
+                        })?
+                        .expect("PRODUCT: member received no private Session response"),
+                )
             });
+            let bytes = match page {
+                Ok(bytes) => bytes,
+                Err(code) => {
+                    eprintln!(
+                        "[proof] {name} refused {}'s private Session ask ({code:?}): it served \
+                         nothing outside the member's current grant",
+                        member.name
+                    );
+                    continue 'holders;
+                }
+            };
             // The answer, version 2: cursor, more, the records each with its position, and the
             // locator hints (`sessionstream::answer`).
             let mut d = Decoder::new(&bytes);
@@ -1579,358 +1651,28 @@ fn private_wire_refused(member: &mut Member, holders: &[&Member], room: [u8; 32]
     );
 }
 
-/// Raw signed input is apparatus; every verdict below is a real receiver CLI result.
-/// The donor stays stopped, so the synthetic append cannot fork its running feed.
-fn legacy_placeholder_journey(
-    alice: &mut Member,
-    bob: &mut Member,
-    room_id: [u8; 32],
-    room: &str,
-    anchor: &str,
-) {
-    use vox_core::atrest::idfactor::SignatureIdentityFactor;
-    use vox_core::atrest::store::{open_segment, SegmentKind};
-    use vox_core::group::SenderChain;
-    use vox_core::log::entry::{Entry, EntrySkeleton, ZERO_HASH};
-    use vox_core::log::feed::lipmaa;
-    use vox_core::log::sync::FeedFrontier;
-    use vox_core::node::content::{Content, LegacySessionIndex, SessionEntry};
-    use vox_core::node::link::{b32_decode, b32_encode};
-    use vox_core::node::paths::Paths;
-    use vox_core::node::profile::Profile;
-    use vox_core::suite::algo;
-    use vox_core::transport::quic::VoxEndpoint;
-
-    assert!(
-        posts_until_read(alice, bob, room, "LEGACY-PROOF-BEFORE-DONOR-STOP"),
-        "APPARATUS: receiver did not catch up with the donor before raw input staging"
-    );
-    let (_, status, _) = bob.vox(&["status", "--json"], None);
-    let victim_at = ports::loopback_listen(&status)
-        .expect("APPARATUS: Bob's scratch daemon has no loopback address");
-    let victim_id = b32_decode(&bob.fp, "proof victim").expect("APPARATUS: Bob's fingerprint");
-    drop(alice._daemon.take());
-    let paths = Paths::resolve("default", Some(&alice.data), Some(&alice.data.join("cfg")))
-        .expect("APPARATUS: donor scratch paths");
-    let mut profile = Profile::open(paths).expect("APPARATUS: stopped donor profile opens");
-    profile
-        .unlock(ID_PASS.as_bytes())
-        .expect("APPARATUS: donor unlocks");
-    let signer = profile.signer_arc().expect("APPARATUS: donor signer");
-    let author = profile.fingerprint();
-    let wrap = profile
-        .store()
-        .get_sek_wrap(&room_id)
-        .expect("APPARATUS: donor SEK wrap lookup")
-        .expect("APPARATUS: donor holds the room");
-    let sek = wrap
-        .unwrap_sek(
-            &SignatureIdentityFactor::new(&*signer),
-            &room_id,
-            ROOM_PASS.as_bytes(),
-        )
-        .expect("APPARATUS: donor room unwraps");
-    let sender_segment = profile
-        .store()
-        .segments(&room_id, SegmentKind::KeyMaterial)
-        .expect("APPARATUS: donor key pages")
-        .into_iter()
-        .find(|(id, _)| *id == 1)
-        .expect("APPARATUS: donor sender page")
-        .1;
-    let sender_bytes = open_segment(&sek, SegmentKind::KeyMaterial, 1, &sender_segment)
-        .expect("APPARATUS: sender page opens");
-    let mut sender =
-        SenderChain::from_state(&sender_bytes).expect("APPARATUS: sender state decodes");
-    let mut feed = std::collections::BTreeMap::new();
-    for (id, page) in profile
-        .store()
-        .segments(&room_id, SegmentKind::LogDb)
-        .expect("APPARATUS: donor log pages")
-    {
-        let bytes = open_segment(&sek, SegmentKind::LogDb, id, &page)
-            .expect("APPARATUS: donor log page opens");
-        let entry = Entry::from_wire(&bytes).expect("APPARATUS: donor log wire");
-        if entry.skeleton.author_id == author {
-            feed.insert(entry.skeleton.seq, entry);
+/// The opening record of alice's Session as `m`'s node lists it (`SessionsPage`), if it lists it.
+fn listed_opening(
+    rt: &tokio::runtime::Runtime,
+    m: &Member,
+    room: [u8; 32],
+) -> Option<vox_core::hash::Digest32> {
+    let mut socket = m.socket(rt);
+    let mut after = None;
+    loop {
+        match rt.block_on(socket.sessions_page(room, after)) {
+            Ok(Frame::SessionsPage { sessions, more, .. }) => {
+                if let Some(row) = sessions.iter().find(|s| s.id == SESSION) {
+                    return Some(row.opening);
+                }
+                if !more {
+                    return None;
+                }
+                after = sessions.last().map(|s| s.opening);
+            }
+            other => panic!("PRODUCT: {}'s Session listing page: {other:?}", m.name),
         }
     }
-    let epoch = sender.epoch();
-    let mut append = |payload: Vec<u8>| {
-        let seq = feed.last_key_value().map_or(1, |(n, _)| n + 1);
-        let hash_at = |n| feed.get(&n).map_or(ZERO_HASH, Entry::entry_hash);
-        let skeleton = EntrySkeleton {
-            v2: None,
-            author_id: author,
-            seq,
-            prev_hash: hash_at(seq - 1),
-            lipmaa_backlink: if seq == 1 {
-                ZERO_HASH
-            } else {
-                hash_at(lipmaa(seq))
-            },
-            channel_id: room_id,
-            epoch,
-            algo_ids: [algo::COMPOSITE_ED25519_ML_DSA_65, algo::AES_256_GCM],
-            payload_hash: vox_core::hash::sha256(&payload),
-            payload_len: payload.len() as u64,
-            end_of_feed: false,
-            claimed_ms: raw_sync::now(),
-            seen: Vec::new(),
-        };
-        let entry = Entry::build_signed(&*signer, skeleton, payload)
-            .expect("APPARATUS: donor append signs");
-        feed.insert(seq, entry.clone());
-        entry
-    };
-    let now = raw_sync::now();
-    let mut private = SenderChain::new(
-        &vox_core::node::drive::drive_channel(&room_id),
-        epoch,
-        &author,
-        0,
-        now,
-    )
-    .expect("APPARATUS: legacy drive chain");
-    let session = SessionEntry::new(now, SESSION, "LEGACY-WITHHELD-STEP")
-        .expect("APPARATUS: legacy Session envelope");
-    let legacy = append(
-        private
-            .encrypt(&session.to_canonical_vec())
-            .expect("APPARATUS: seal legacy Session")
-            .to_wire(),
-    );
-    let ordinary =
-        Content::text(now, "LEGACY-PROOF-RECOVERED-CHAT").expect("APPARATUS: ordinary envelope");
-    let ordinary = append(
-        sender
-            .encrypt(&ordinary.to_canonical_vec())
-            .expect("APPARATUS: seal ordinary chat")
-            .to_wire(),
-    );
-    let index = LegacySessionIndex::new(now, room_id, author, vec![legacy.entry_hash()])
-        .expect("APPARATUS: checked exact-hash index");
-    let declaration = append(
-        sender
-            .encrypt(&index.to_canonical_vec())
-            .expect("APPARATUS: seal index with ordinary sender key")
-            .to_wire(),
-    );
-    let positive =
-        Content::text(now, "LEGACY-PROOF-AFTER-INDEX").expect("APPARATUS: later chat envelope");
-    let positive = append(
-        sender
-            .encrypt(&positive.to_canonical_vec())
-            .expect("APPARATUS: seal later chat")
-            .to_wire(),
-    );
-    let skeleton = |entry: &Entry| {
-        Entry::build_signed_skeleton_only(&*signer, entry.skeleton.clone())
-            .expect("APPARATUS: signed missing-body skeleton")
-    };
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("APPARATUS: raw peer runtime");
-    let ep = rt.block_on(async {
-        VoxEndpoint::bind(signer.clone(), "127.0.0.1:0".parse().unwrap())
-            .expect("APPARATUS: bind donor endpoint")
-    });
-    let conn = rt
-        .block_on(ep.connect(victim_at, victim_id, raw_sync::now()))
-        .expect("APPARATUS: donor connects to real receiver");
-    let exchange = |entry: &Entry| {
-        rt.block_on(raw_sync::ask_offering(
-            &conn,
-            room_id,
-            epoch,
-            raw_sync::Ask::Ranges(Vec::new()),
-            vec![(
-                FeedFrontier {
-                    author_id: author,
-                    max_seq: entry.skeleton.seq,
-                    head_hash: entry.entry_hash(),
-                },
-                entry.to_wire(),
-            )],
-        ))
-    };
-    let offer = |entry: &Entry| {
-        let y = exchange(entry);
-        assert!(
-            y.hello && y.served == 1,
-            "APPARATUS: receiver did not request staged seq {} hash {}: {y:?}",
-            entry.skeleton.seq,
-            b32_encode(&entry.entry_hash())
-        );
-        // The responder FINs its send half while it is still draining our input. That FIN
-        // proves nothing about acceptance of the entry we just sent. Wait for its next public
-        // frontier to acknowledge this staged position before asserting on the receiver CLI.
-        assert!(
-            until(Duration::from_secs(10), || {
-                let receipt = rt.block_on(raw_sync::ask(
-                    &conn,
-                    room_id,
-                    epoch,
-                    raw_sync::Ask::Ranges(Vec::new()),
-                    None,
-                ));
-                receipt.hello
-                    && receipt
-                        .have
-                        .iter()
-                        .any(|(a, seq)| *a == author && *seq >= entry.skeleton.seq)
-            }),
-            "APPARATUS: receiver never acknowledged staged seq {} hash {} in its frontier",
-            entry.skeleton.seq,
-            b32_encode(&entry.entry_hash())
-        );
-    };
-    let owed = |member: &Member, hash: [u8; 32]| {
-        let (ok, out, err) = member.vox(&["room", "read", room, "--json"], None);
-        assert!(ok, "PRODUCT: receiver room read failed: {out}{err}");
-        out.lines()
-            .map(|line| {
-                serde_json::from_str::<serde_json::Value>(line).unwrap_or_else(|error| {
-                    panic!("PRODUCT: room read returned invalid JSON row {line:?}: {error}")
-                })
-            })
-            .any(|row| row["entry_hash"] == b32_encode(&hash) && row["owed"] == true)
-    };
-    offer(&skeleton(&legacy));
-    offer(&skeleton(&ordinary));
-    assert!(
-        owed(bob, legacy.entry_hash()) && owed(bob, ordinary.entry_hash()),
-        "APPARATUS: the receiver never showed both staged missing bodies before the index"
-    );
-    // FX-14: a row printed as not received yet still participates in prefix uniqueness. The
-    // selected body remains unavailable, so the existing reply rule refuses it for that exact
-    // reason. Mutant: skip `row.owed` while resolving reply prefixes; the command instead says no
-    // printed entry matched this prefix.
-    let owed_hashes = [legacy.entry_hash(), ordinary.entry_hash()];
-    let (ok, shown, err) = bob.vox(&["room", "read", room, "--json"], None);
-    assert!(
-        ok,
-        "PRODUCT: receiver could not read its staged missing-body rows: {shown}{err}"
-    );
-    let shown_hashes: Vec<String> = shown
-        .lines()
-        .map(|line| {
-            let row: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|error| {
-                panic!("PRODUCT: room read returned invalid JSON row {line:?}: {error}")
-            });
-            row["entry_hash"]
-                .as_str()
-                .unwrap_or_else(|| {
-                    panic!("PRODUCT: room read row named no string entry_hash: {row}")
-                })
-                .to_owned()
-        })
-        .collect();
-    let (owed_full, owed_prefix) = owed_hashes
-        .iter()
-        .filter_map(|hash| {
-            let full = b32_encode(hash);
-            let prefix = full.get(..8)?.to_owned();
-            (shown_hashes
-                .iter()
-                .filter(|entry| entry.starts_with(&prefix))
-                .count()
-                == 1)
-                .then_some((full, prefix))
-        })
-        .next()
-        .expect(
-            "APPARATUS: neither printed missing-body entry had a unique eight-character prefix",
-        );
-    let (reply_ok, reply_out, reply_err) = bob.vox(
-        &[
-            "room",
-            "post",
-            room,
-            "--json",
-            "--re",
-            &owed_prefix,
-            "OWED-PREFIX-REPLY",
-        ],
-        None,
-    );
-    assert!(
-        !reply_ok && reply_err.contains("cannot read that message"),
-        "PRODUCT: printed owed prefix {owed_prefix} must resolve to {owed_full} before the unavailable-body refusal: {reply_out}{reply_err}"
-    );
-    let (ok, after_reply, err) = bob.vox(&["room", "read", room, "--json"], None);
-    assert!(
-        ok && !after_reply.contains("OWED-PREFIX-REPLY"),
-        "PRODUCT: refusing the owed parent still posted the reply: {after_reply}{err}"
-    );
-    offer(&declaration);
-    assert!(
-        !owed(bob, legacy.entry_hash()),
-        "PRODUCT: an authenticated legacy Session hash still appears as missing chat"
-    );
-    assert!(
-        owed(bob, ordinary.entry_hash()),
-        "PRODUCT: classifying a Session also hid an ordinary missing chat body"
-    );
-    // The earlier skeleton truthfully told Bob this peer lacked its body. The production
-    // receiver suppresses another request to that peer temporarily, even when its feed head
-    // stays put. Keep offering the now-available body until Bob actually requests it; neither
-    // bypass the omission hint nor interpret a staging watchdog as a product verdict.
-    assert!(
-        until(Duration::from_secs(45), || {
-            let y = exchange(&ordinary);
-            assert!(
-                y.hello && y.ended.is_none(),
-                "APPARATUS: ordinary-body refill exchange failed: {y:?}"
-            );
-            y.served == 1
-        }),
-        "APPARATUS: receiver did not request the available ordinary body before staging watchdog"
-    );
-    offer(&positive);
-    assert!(bob.reads(room, "LEGACY-PROOF-RECOVERED-CHAT") && bob.reads(room, "LEGACY-PROOF-AFTER-INDEX"),
-        "PRODUCT: ordinary missing chat did not recover across the index's consumed sender iteration");
-    assert!(
-        !owed(bob, ordinary.entry_hash()) && !owed(bob, legacy.entry_hash()),
-        "PRODUCT: recovered chat or classified Session still appears as missing chat"
-    );
-    assert_eq!(
-        can_drive(bob, room),
-        None,
-        "PRODUCT: subtype classification restored Bob's revoked Session discovery"
-    );
-    drop(conn);
-    drop(ep);
-    drop(bob._daemon.take());
-    let child = vox_cmd(&bob.data)
-        .args(["daemon", "--listen", "127.0.0.1:0", "--anchor", anchor])
-        .arg("--passphrase-file")
-        .arg(&bob.pass)
-        .env("VOX_DATA_DIR", &bob.data)
-        .env("VOX_CONFIG_DIR", bob.data.join("cfg"))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("APPARATUS: restart scratch receiver");
-    bob._daemon = Some(Proc(child));
-    assert!(
-        until(Duration::from_secs(90), || bob
-            .vox(&["room", "list"], None)
-            .0),
-        "APPARATUS: restarted receiver never answered"
-    );
-    assert!(
-        !owed(bob, legacy.entry_hash()) && bob.reads(room, "LEGACY-PROOF-RECOVERED-CHAT"),
-        "PRODUCT: receiver restart lost classification or recovered chat"
-    );
-    assert_eq!(
-        can_drive(bob, room),
-        None,
-        "PRODUCT: receiver restart restored revoked Session discovery"
-    );
 }
 
 // ---- claim 7: the fold gates the Session append; a read meanwhile is provisional (ADR-037) ----

@@ -356,27 +356,65 @@ pub async fn open_for_hook(at: &NodeSocket) -> Result<IpcClient, AppError> {
     IpcClient::open_at(at).await.map_err(|e| said(at, e))
 }
 
+/// Follow a matching login item without starting a daemon. Both node and daemon-only
+/// commands use the same account, announcement and single manager patience.
+#[cfg(target_os = "macos")]
+pub(crate) async fn wait_for_managed(
+    account: &Account,
+    socket: &std::path::Path,
+    error: &Error,
+    announce: bool,
+    began: std::time::Instant,
+) -> Result<bool, AppError> {
+    use vox_core::error::IpcHandshake;
+    let (manager, previous) = match error {
+        Error::Ipc(IpcHandshake::DaemonStopping { pid }) => {
+            let Some(manager) = crate::update::restart::managed_daemon(*pid) else {
+                return Ok(false);
+            };
+            (manager, Some(*pid))
+        }
+        Error::Ipc(IpcHandshake::Unreachable { .. }) => {
+            #[cfg(feature = "test-knobs")]
+            if std::env::var_os("VOX_TEST_ONESHOT_PENDING_IMMEDIATE").is_some() {
+                eprintln!("test-knobs: one-shot takes the immediate unreachable path");
+                return Ok(false);
+            }
+            let manager = tokio::time::timeout(
+                vox_core::node::ipc::ANSWER_WITHIN.saturating_sub(began.elapsed()),
+                crate::update::restart::pending_login_item(account),
+            )
+            .await
+            .map_err(|_| AppError::Usage(
+                "the login item did not answer the daemon startup check within 10 s; no daemon was started. Check Keep Running in Vox.app and the daemon log, then retry.".into(),
+            ))??;
+            let Some(manager) = manager else {
+                return Ok(false);
+            };
+            (manager, None)
+        }
+        _ => return Ok(false),
+    };
+    manager.wait(socket, previous, announce, began).await?;
+    Ok(true)
+}
+
 /// A connection to `at` as its node, with each way it can fail said for a person: no daemon, a
 /// refusal (the node not attached, no such node), a socket that is not this user's.
 ///
 /// # Errors
 /// As above.
-pub async fn open(at: &NodeSocket) -> Result<IpcClient, AppError> {
+pub async fn open(at: &NodeSocket, _account: &Account) -> Result<IpcClient, AppError> {
     #[cfg(target_os = "macos")]
     {
-        use vox_core::error::IpcHandshake;
-        let first = IpcClient::open_at(at).await;
-        let Err(Error::Ipc(IpcHandshake::DaemonStopping { pid })) = &first else {
-            return first.map_err(|e| said(at, e));
-        };
         let began = std::time::Instant::now();
-        let Some(manager) = crate::update::restart::managed_daemon(*pid) else {
+        let first = IpcClient::open_at(at).await;
+        let Err(error) = &first else {
             return first.map_err(|e| said(at, e));
         };
-        let previous = *pid;
-        manager
-            .wait(&at.path, Some(previous), at.waiting.is_some(), began)
-            .await?;
+        if !wait_for_managed(_account, &at.path, error, at.waiting.is_some(), began).await? {
+            return first.map_err(|e| said(at, e));
+        }
         #[cfg(feature = "test-knobs")]
         if let Some(dir) = std::env::var_os("VOX_TEST_HOLD_AFTER_MANAGED_GREETING") {
             let dir = std::path::PathBuf::from(dir);
@@ -482,7 +520,7 @@ pub async fn hold(
     let node = name_of(paths)?;
     if paths.expected_identity.is_some() {
         let at = one_shot(paths)?;
-        let client = open(&at).await?;
+        let client = open(&at, &account).await?;
         return Ok(Held {
             me: client.me(),
             client,
@@ -528,7 +566,7 @@ pub async fn hold(
         waiting: Some(say_daemon_waiting),
         expected_identity: None,
     };
-    let client = open(&at).await?;
+    let client = open(&at, &account).await?;
     // What attaching the node said (a skipped anchors line, carrying on with no anchor), in the
     // person's own terminal as well as the daemon's log (R23, R36): the daemon this verb started
     // writes only to `<data root>/.daemon/log`.
@@ -558,7 +596,7 @@ pub async fn attach_to_stay(
     let account = paths.account();
     let node = name_of(paths)?;
     if paths.expected_identity.is_some() {
-        open(&one_shot(paths)?).await?;
+        open(&one_shot(paths)?, &account).await?;
         return Ok(());
     }
     if let Some(w) = waiting {
@@ -756,8 +794,8 @@ fn mismatch(debug: &str) -> String {
 
 /// A connection's subscription to its node's events, as the node it holds; `None`, having said
 /// why, when none could be had.
-pub async fn events(at: &NodeSocket) -> Result<IpcClient, AppError> {
-    let mut c = open(at).await?;
+pub async fn events(at: &NodeSocket, account: &Account) -> Result<IpcClient, AppError> {
+    let mut c = open(at, account).await?;
     c.subscribe()
         .await
         .map_err(|e| AppError::Usage(format!("cannot follow the node's events: {e}")))?;
@@ -1463,6 +1501,21 @@ pub async fn node_lock(args: &NodeArgs, name: &str) -> Result<(), AppError> {
         Err(e) => return Err(AppError::Usage(format!("the daemon did not answer: {e}"))),
     };
     // One request per control connection. Forget first, so a stopped node cannot return.
+    // A refused forget stops the node only once its remembered entry is gone, when nothing can
+    // bring it back; otherwise, or when the daemon cannot say, the node is left as it was.
+    let mut stops_it = false;
+    if let Some(error) = &forget_error {
+        let mut d = daemon(&account).await?;
+        let node = match d.request(DaemonRequest::Nodes).await {
+            Ok(DaemonFrame::Nodes(nodes)) => nodes.into_iter().find(|n| n.name == name),
+            _ => None,
+        };
+        let Some(node) = node.filter(|n| !n.keep) else {
+            eprintln!("vox: {error}");
+            return Err(AppError::Usage(format!("node {name} was not locked: its remembered state could not be forgotten, so the node is left as it was; correct the storage problem and run `vox node lock {name}` again")));
+        };
+        stops_it = node.status == Some(vox_core::node::daemonipc::NodeStatus::Ready);
+    }
     let mut d = daemon(&account).await?;
     match d
         .request(DaemonRequest::Detach { node: name.clone() })
@@ -1494,7 +1547,10 @@ pub async fn node_lock(args: &NodeArgs, name: &str) -> Result<(), AppError> {
             }
             if let Some(error) = &forget_error {
                 println!("vox: node {name} is Locked; its rooms and messages stay here; `vox node unlock {name}` makes it Ready again");
-                eprintln!("vox: {error}");
+                // Its words say this request did not stop the node: true only if it was not running.
+                if !stops_it {
+                    eprintln!("vox: {error}");
+                }
             } else {
                 println!(
                     "vox: node {name} is Locked and forgotten; its rooms and messages stay here; \
@@ -1504,7 +1560,7 @@ pub async fn node_lock(args: &NodeArgs, name: &str) -> Result<(), AppError> {
             Ok(())
         }
         Ok(DaemonFrame::Refused(r)) => {
-            if let Some(error) = &forget_error {
+            if let Some(error) = forget_error.as_ref().filter(|_| !stops_it) {
                 eprintln!("vox: {error}");
             }
             Err(AppError::Usage(r.to_string()))

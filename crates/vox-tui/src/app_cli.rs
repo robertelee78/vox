@@ -30,7 +30,7 @@ use crate::app::AppError;
 use crate::tunnel_cli::{resolve_fingerprint, resolve_prefix};
 
 async fn client(paths: &Paths) -> Result<IpcClient, AppError> {
-    crate::client::open(&crate::client::one_shot(paths)?).await
+    crate::client::open(&crate::client::one_shot(paths)?, &paths.account()).await
 }
 
 /// Resolve a room prefix against the rooms the node holds.
