@@ -183,6 +183,12 @@ fn daemon_on(dir: &Path, tag: &str, stdin_lines: &str, listen: &str) -> Daemon {
             std::env::var("VOX_MUTANT_EXPIRY").unwrap_or_default(),
         )
         .env("VOX_TEST_HOLD_EXPIRY_PRUNE_FILE", dir.join("hold-expiry"))
+        // Off unless the act creates the file: then this node serves redundantly expanded
+        // control proofs, as a hostile relay may (`proof_rows::fetch`).
+        .env(
+            "VOX_TEST_REDUNDANT_CONTROL_FILE",
+            dir.join("redundant-control"),
+        )
         .envs(
             std::env::var_os("VOX_MUTANT_RETENTION_FLOOR")
                 .map(|on| ("VOX_TEST_RETENTION_FLOOR_MUTANT", on)),
@@ -2173,7 +2179,9 @@ mod proof_rows {
     // Inspect a stopped COPY, decoding the object-index kind and its entire old value, not a
     // ciphertext-length histogram. Every other typed object remains separately counted.
     // Returns the kind counts, the ProofRange keys, and the keys of every piece a held
-    // inclusion receipt (its siblings) or prefix receipt (its consistency nodes) needs.
+    // inclusion receipt (its siblings) or prefix receipt (its consistency nodes) needs, or a
+    // held control coverage (head, lo..hi) needs: every node the serving walk of that interval
+    // visits under that head (ADR-053 MP-7).
     #[allow(clippy::type_complexity)] // One stopped-store reading, three views of it.
     fn inspect(
         dir: &Path,
@@ -2201,6 +2209,14 @@ mod proof_rows {
         let mut rows = std::collections::BTreeSet::new();
         let mut owned = std::collections::BTreeSet::new();
         let mut sealed = 0;
+        // Per head: its binding and the decoded rows, to walk each held coverage interval.
+        let mut by_head: std::collections::BTreeMap<
+            Digest32,
+            (
+                TreeBinding,
+                std::collections::BTreeMap<(u64, u64), Descriptor>,
+            ),
+        > = std::collections::BTreeMap::new();
         for row in objects {
             let row = array(&row);
             let key = bytes(&row[0]);
@@ -2247,20 +2263,92 @@ mod proof_rows {
                 "APPARATUS: exact cache key"
             );
             rows.insert(key[..32].try_into().unwrap());
+            by_head
+                .entry(head)
+                .or_insert_with(|| (binding, std::collections::BTreeMap::new()))
+                .1
+                .insert((start, descriptor.leaves), descriptor);
             sealed += profile
                 .store()
                 .get_segment(room, SegmentKind::EntryIndex, number(&at[1]))
                 .unwrap()
                 .map_or(0, |segment| segment.nonce.len() + segment.ciphertext.len());
         }
+        // Control coverage rows: key (head, lo), value hi. The walk starts at the head's root
+        // row and expands a node only where it meets lo..hi and counts a control, as serving
+        // does (`Source::control_proof`).
+        let mut intervals = Vec::new();
+        tree(
+            profile.store(),
+            &sek,
+            room,
+            number(&roots(&directory)[3]),
+            &mut Vec::new(),
+            &mut intervals,
+        );
+        let mut walked = 0;
+        let mut covered = std::collections::BTreeSet::new();
+        for row in intervals {
+            let row = array(&row);
+            let key = bytes(&row[0]);
+            let head: Digest32 = key[..32].try_into().unwrap();
+            let lo = u64::from_be_bytes(key[32..40].try_into().unwrap());
+            let hi = number(&array(&row[1])[1]);
+            let Some((binding, pieces)) = by_head.get(&head) else {
+                continue;
+            };
+            // The trace keeps its head's root; a shorter `[1,p]` is a receipt piece only.
+            let Some(root) = pieces
+                .iter()
+                .filter(|((start, _), _)| *start == 1)
+                .map(|(_, d)| d.leaves)
+                .max()
+                .filter(|leaves| *leaves >= hi)
+            else {
+                continue;
+            };
+            walked += 1;
+            let mut pending = vec![(1u64, root)];
+            while let Some((start, leaves)) = pending.pop() {
+                let Some(node) = pieces.get(&(start, leaves)) else {
+                    continue;
+                };
+                covered.insert(piece_key(&head, *binding, start, leaves));
+                let end = start + leaves - 1;
+                if leaves > 1 && node.controls != 0 && end >= lo && start <= hi {
+                    let left = vox_core::log::history::split(leaves).unwrap();
+                    pending.push((start + left, leaves - left));
+                    pending.push((start, left));
+                }
+            }
+        }
+        let coverage_only = rows
+            .iter()
+            .filter(|key| covered.contains(*key) && !owned.contains(*key))
+            .count();
+        owned.extend(covered);
+        // Covered control positions, one row per (head, position): the per-control-entry
+        // denominator for the by-hand cost of the kept traces.
+        let mut sources = Vec::new();
+        tree(
+            profile.store(),
+            &sek,
+            room,
+            number(&roots(&directory)[8]),
+            &mut Vec::new(),
+            &mut sources,
+        );
         let file_bytes = std::fs::metadata(profile.paths().store_file())
             .unwrap()
             .len();
         eprintln!(
             "STOPPED-STORE {dir:?}: file bytes {file_bytes}; decoded object kinds {counts:?}; \
-             ProofRange rows {} of {} receipt-owned pieces, their sealed records {sealed} bytes",
+             ProofRange rows {} of {} receipt- or coverage-owned pieces ({walked} coverage \
+             intervals walked, {} covered control positions, {coverage_only} rows owned by \
+             coverage alone), their sealed records {sealed} bytes",
             rows.len(),
-            owned.len()
+            owned.len(),
+            sources.len()
         );
         (counts, rows, owned)
     }
@@ -2276,7 +2364,7 @@ mod proof_rows {
             unowned,
             0,
             "PRODUCT: {unowned} of {} decoded ProofRange rows in the real room store are no \
-             held receipt's piece",
+             held receipt's or control coverage's piece",
             rows.len()
         );
         rows.len()
@@ -2613,8 +2701,62 @@ mod proof_rows {
         let id = full_room(&a, &room);
         (tmp, a, b, ad, bd, room, id)
     }
+    // The control proofs the hostile author served (`<a>/redundant-control.served`, one
+    // `<head hex> <lo> <hi>` per proof) that the stopped receiver holds as its own coverage
+    // (key (head, lo), value hi): the receiver verified and accepted each of these.
+    fn redundant_held(author: &Path, receiver: &Path, room: &Digest32) -> (usize, usize) {
+        let served =
+            std::fs::read_to_string(author.join("redundant-control.served")).unwrap_or_default();
+        let copy = tempfile::tempdir().unwrap();
+        copy_tree(receiver, copy.path());
+        let profile = profile(copy.path());
+        let sek = sek(&profile, room);
+        let directory = decoded(profile.store(), &sek, room, 0);
+        let mut intervals = Vec::new();
+        tree(
+            profile.store(),
+            &sek,
+            room,
+            number(&roots(&directory)[3]),
+            &mut Vec::new(),
+            &mut intervals,
+        );
+        let held: std::collections::BTreeMap<Vec<u8>, u64> = intervals
+            .iter()
+            .map(|row| {
+                let row = array(row);
+                (bytes(&row[0])[..40].to_vec(), number(&array(&row[1])[1]))
+            })
+            .collect();
+        let mut accepted = 0;
+        let mut count = 0;
+        for line in served.lines() {
+            let mut fields = line.split(' ');
+            let (Some(head), Some(lo), Some(hi), None) =
+                (fields.next(), fields.next(), fields.next(), fields.next())
+            else {
+                panic!("APPARATUS: redundant control marker line {line:?}");
+            };
+            let mut key: Vec<u8> = (0..head.len())
+                .step_by(2)
+                .map(|at| u8::from_str_radix(&head[at..at + 2], 16).unwrap())
+                .collect();
+            assert_eq!(key.len(), 32, "APPARATUS: redundant control marker head");
+            key.extend_from_slice(&lo.parse::<u64>().unwrap().to_be_bytes());
+            let hi = hi.parse::<u64>().unwrap();
+            count += 1;
+            if held.get(&key).is_some_and(|held| *held >= hi) {
+                accepted += 1;
+            }
+        }
+        (count, accepted)
+    }
     pub(super) fn fetch() {
         let (_tmp, a, b, ad, bd, room, id) = fresh();
+        // A hostile server: from here on the author serves every control proof with each
+        // subtree without controls inside the asked interval expanded once more. Such a proof
+        // verifies; the serving walk never visits those halves, so no row may keep them.
+        std::fs::write(a.join("redundant-control"), b"expand zero-control subtrees").unwrap();
         for i in 0..100 {
             post(&a, &room, &format!("PROOF-CACHE-{i:04}"));
             if i % 10 == 9 {
@@ -2625,6 +2767,20 @@ mod proof_rows {
         let blisten = listening(&b);
         drop(ad);
         drop(bd);
+        let (served, accepted) = redundant_held(&a, &b, &id);
+        eprintln!(
+            "REDUNDANT control proofs: the author served {served}; the receiver holds \
+             {accepted} of them as verified coverage"
+        );
+        assert!(
+            served > 0,
+            "APPARATUS: the author served no redundantly expanded control proof"
+        );
+        assert!(
+            accepted > 0,
+            "PRODUCT: the receiver holds none of the {served} redundantly expanded control \
+             proofs it was served as coverage"
+        );
         receipt_rows(&a, &id);
         receipt_rows(&b, &id);
         let ad = daemon_on(&a, "a-post", &format!("{IDENTITY}\n"), &alisten);

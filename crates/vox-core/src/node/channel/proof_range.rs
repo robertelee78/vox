@@ -22,6 +22,10 @@ pub(crate) struct ProofRangeRestore {
     scope: Option<([u8; 16], u64, u64, u64)>,
     tasks: Vec<Task>,
     values: Vec<Descriptor>,
+    /// The next earlier head to read a linked piece of this range under (see `restore`).
+    linked: Option<(TreeRange, Digest32)>,
+    /// A node no linked head kept: its descendants are not searched again (see `restore`).
+    unlinked: Option<TreeRange>,
 }
 pub(crate) enum ProofRangeStep {
     Complete(Descriptor),
@@ -56,6 +60,8 @@ impl ProofRangeRestore {
             scope: None,
             tasks,
             values: Vec::with_capacity(MAX_TREE_DEPTH + 1),
+            linked: None,
+            unlinked: None,
         })
     }
 }
@@ -199,6 +205,70 @@ impl ProofRangeRestore {
                     if !reconstruction_allowed {
                         return Ok(ProofRangeStep::Missing);
                     }
+                    // A full aligned block inside an earlier head is the same tree node, with the
+                    // same descriptor, in every head that extends it. Serve the piece kept under
+                    // an earlier head only along this node's own commit links: each link is the
+                    // consistency proof it verified when it committed the later head from the
+                    // earlier one (`history_prior_head`), so no unlinked or forked head is used.
+                    // Partial and unaligned nodes differ between heads and are never reused
+                    // (ADR-053 MP-7). The asker verifies every piece under its own head. One
+                    // search per node that no link kept, not one per descendant: below it this
+                    // repair reconstructs as before.
+                    let end = range.start + range.leaves - 1;
+                    let searched = cursor.unlinked.is_some_and(|above| {
+                        above.start <= range.start && end < above.start + above.leaves
+                    });
+                    if !searched
+                        && !linked_mutant()
+                        && range.leaves.is_power_of_two()
+                        && (range.start - 1) % range.leaves == 0
+                    {
+                        let mut at = match cursor.linked {
+                            Some((linked, at)) if linked == range => at,
+                            _ => cursor.head,
+                        };
+                        let mut found = None;
+                        loop {
+                            // The link, the earlier head record and the piece's index and record.
+                            for _ in 0..4 {
+                                if !work.take_object_load() {
+                                    cursor.linked = Some((range, at));
+                                    return Ok(ProofRangeStep::Progress);
+                                }
+                            }
+                            let Some(prior) = read.history_prior_head(&at)? else {
+                                break;
+                            };
+                            if prior.binding != cursor.binding {
+                                return Err(Error::MalformedAtRest("linked head binding differs"));
+                            }
+                            if prior.root.leaves < end {
+                                break;
+                            }
+                            found = read.history_proof_range(
+                                &prior.id(),
+                                cursor.binding,
+                                range.start,
+                                range.leaves,
+                            )?;
+                            if found.is_some() {
+                                break;
+                            }
+                            at = prior.id();
+                        }
+                        cursor.linked = None;
+                        if found.is_none() {
+                            cursor.unlinked = Some(range);
+                        }
+                        if let Some(value) = found {
+                            if cursor.values.len() == MAX_TREE_DEPTH + 1 {
+                                return Err(Error::SizeLimitExceeded("proof repair value depth"));
+                            }
+                            cursor.tasks.pop();
+                            cursor.values.push(value);
+                            continue;
+                        }
+                    }
                     if range.leaves != 1 {
                         if cursor.tasks.len() + 2 > 2 * MAX_TREE_DEPTH + 1 {
                             return Err(Error::SizeLimitExceeded("proof repair depth"));
@@ -313,4 +383,23 @@ impl ProofRangeRestore {
             return Ok(ProofRangeStep::Progress);
         }
     }
+}
+
+/// `VOX_MUTANT_LINKED_OFF=1`: a piece kept under an earlier linked head is never served under
+/// the later head (before ADR-053 MP-7). Says so once when the daemon first reads it.
+#[cfg(feature = "test-knobs")]
+fn linked_mutant() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let on = std::env::var_os("VOX_MUTANT_LINKED_OFF").is_some();
+        if on {
+            eprintln!("vox: VOX_MUTANT_LINKED_OFF engaged: no linked proof pieces");
+        }
+        on
+    });
+    *ON
+}
+
+#[cfg(not(feature = "test-knobs"))]
+const fn linked_mutant() -> bool {
+    false
 }

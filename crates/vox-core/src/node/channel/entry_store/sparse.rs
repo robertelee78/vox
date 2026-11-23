@@ -1585,6 +1585,32 @@ impl Read<'_> {
             })
             .transpose()
     }
+    /// The committed head this exact head was committed from, through this node's own verified
+    /// consistency proof (`commit_history_head`). None for a head committed from the empty
+    /// baseline or never committed here.
+    pub(crate) fn history_prior_head(&self, head: &Digest32) -> Result<Option<SignedHead>> {
+        let source = self.source();
+        source
+            .number(
+                self.sek,
+                self.channel,
+                self.directory.active.sparse.prior_heads,
+                &hashed(head),
+            )?
+            .map(|record| {
+                let prior = SignedHead::from_wire(&source.sparse_record(
+                    self.sek,
+                    self.channel,
+                    record,
+                    MAX_HEADER_BYTES,
+                )?)?;
+                if prior.binding.room != *self.channel || prior.id() == *head {
+                    return Err(invalid("prior head binding"));
+                }
+                Ok(prior)
+            })
+            .transpose()
+    }
     /// Head-scoped serving material is deliberately separate from canonical prefix ranges.
     /// A verified proof may name a signed head whose consistency is still unresolved.
     pub(crate) fn history_proof_range(
@@ -2604,9 +2630,9 @@ impl Write<'_, '_> {
             self.change_value(root, key, Some(Value::Number(id)))?;
         Ok(())
     }
-    /// One fully verified wire piece of a durable inclusion/prefix receipt, written in that
-    /// receipt's transaction so the receipt can be served again after a restart. An existing
-    /// key writes nothing. This does not change prefix acceptance.
+    /// One fully verified wire piece of a durable inclusion/prefix receipt or of a control
+    /// coverage's trace, written in that owner's transaction so it can be served again after a
+    /// restart. An existing key writes nothing. This does not change prefix acceptance.
     pub(crate) fn keep_history_proof_range(
         &mut self,
         head: Digest32,

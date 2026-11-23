@@ -1176,10 +1176,13 @@ impl Source {
         if lo == 0 || lo > hi || hi > head.root.leaves {
             return Err(Error::MalformedBundle("control interval differs from head"));
         }
+        let redundant = redundant_control();
         let tokens = 'interval: loop {
             let mut pending = vec![(1u64, head.root.leaves)];
             let mut tokens = Vec::new();
             let mut headers = 0;
+            // The end of the last node without controls served expanded (test-knobs only).
+            let mut expanded = 0;
             while let Some((start, leaves)) = pending.pop() {
                 self.current()?;
                 if pending.len() > MAX_TREE_DEPTH || tokens.len() >= MAX_PROOF_TOKENS {
@@ -1196,7 +1199,11 @@ impl Source {
                 let end = start
                     .checked_add(leaves - 1)
                     .ok_or(Error::MalformedAtRest("history range overflow"))?;
-                if end < lo || start > hi || descriptor.controls == 0 {
+                let wasteful = redundant.is_some()
+                    && descriptor.controls == 0
+                    && leaves > 1
+                    && start > expanded;
+                if end < lo || start > hi || (descriptor.controls == 0 && !wasteful) {
                     tokens.push(ControlToken::Collapse(descriptor));
                 } else if leaves == 1 {
                     if headers == MAX_CONTROL_HEADERS {
@@ -1225,12 +1232,34 @@ impl Source {
                         Lookup::Missing => return Ok(Lookup::Missing),
                     }
                 } else {
+                    if wasteful {
+                        expanded = end;
+                    }
                     let left = split(leaves)?;
                     tokens.push(ControlToken::Branch);
                     pending.push((start + left, leaves - left));
                     pending.push((start, left));
                 }
                 tokio::task::yield_now().await;
+            }
+            #[cfg(feature = "test-knobs")]
+            if let Some(path) = redundant.as_ref().filter(|_| expanded > 0) {
+                use std::fmt::Write as _;
+                use std::io::Write as _;
+                let mut line = String::with_capacity(96);
+                for byte in head.id() {
+                    let _ = write!(line, "{byte:02x}");
+                }
+                let _ = writeln!(line, " {lo} {hi}");
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path.with_extension("served"))
+                    .and_then(|mut file| file.write_all(line.as_bytes()))
+                    .map_err(|error| Error::Storage {
+                        op: "redundant control marker",
+                        detail: error.to_string(),
+                    })?;
             }
             break tokens;
         };
@@ -1245,6 +1274,23 @@ impl Source {
             _charge: charge,
         }))
     }
+}
+
+/// `VOX_TEST_REDUNDANT_CONTROL_FILE=<path>`: while `<path>` exists this node serves control
+/// proofs as a hostile relay may: each node without controls inside the asked interval, which
+/// the walk above collapses, is expanded once into its two collapsed halves. The proof still
+/// verifies, though no serving walk visits those halves. Each such proof is noted, as
+/// `<head hex> <lo> <hi>`, in `<path>.served`.
+#[cfg(feature = "test-knobs")]
+fn redundant_control() -> Option<std::path::PathBuf> {
+    std::env::var_os("VOX_TEST_REDUNDANT_CONTROL_FILE")
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.exists())
+}
+
+#[cfg(not(feature = "test-knobs"))]
+const fn redundant_control() -> Option<std::path::PathBuf> {
+    None
 }
 
 impl Source {
