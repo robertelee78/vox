@@ -1193,3 +1193,46 @@ writes. The second seeds the old serving-row shape in a real stopped room, opens
 after a committed cleanup batch and reopens it, preserving other object kinds and readable
 history. A second open preserves planted stopped-store canaries, proving the completed room
 does not scan again; each row-count observation also records the store's file length.
+
+## RG-15 release assets in disposable guests
+
+`scripts/release/guest-state.sh` runs one state in the existing `vox-app-proofs` Tart guest,
+using the shared guest lock and one build-slot hold per build or proof, then stops the guest.
+`scripts/release/linux.py` runs one journey in its own `vox-rg15-*` container and removes it.
+Neither runs the product on the host or changes its real profile. The dist's own `install.sh`,
+records and signed bytes are the inputs; every product command uses a private home/data/config.
+
+For a guest prerequisite check without building or running a journey, use
+`guest-state.sh <new-evidence-state> readiness readiness <dist>`. It takes the free guest lock
+without waiting, records the SSH and journey Node paths/versions and `Promise.withResolvers`,
+records free disk, then stops the guest and releases the lock. A missing Node22 runtime or less
+than10GiB free is APPARATUS, not a product verdict. Node runtime preparation belongs only in
+the apparatus's own directory, never a system-wide guest installation.
+
+The existing proof files have three optional entry points:
+
+- `install_sh_proof::a_shipped_release_installs_and_serves_a_fresh_node`: install the given
+  `VOX_PROOF_DIST`, check its version, create a Ready node and post/read a room.
+- `update_proof::a_published_install_updates_through_github_with_its_agent_turn`: install a
+  published previous dist, run its real GitHub updater, and require
+  `VOX_PROOF_EXPECTED_VERSION`, a surviving room and the same native agent conversation.
+- `update_proof::a_candidate_source_pair_updates_with_its_agent_turn`: before-tag observation
+  with `VOX_PROOF_DIST` and `VOX_PROOF_CANDIDATE_DIST` naming genuine **nonshipping**
+  test-knobs builds. This proves the candidate source's updater/restart/agent turn; it does not
+  prove the published previous updater or the real endpoint. macOS retains Apple verification.
+
+The two update observations are deliberately distinct. Before publication, normal assets have
+no release-base override. After publication the previous normal asset must update through
+`releases/latest`; never substitute a local copy or add a knob to make that observation green.
+`VOX_PROOF_JOURNEY_WORK` names a new scratch directory. The launcher uses
+`VOX_PROOF_JOURNEY_SCRIPT` only to locate the apparatus after copying it into a guest.
+For explicitly authorized refusal diagnosis only, `VOX_PROOF_INSPECT_REFUSED_UPDATE=1`
+records the installed version, status and saved post after a refused update, closes the native
+conversation, and records one further update and explicit daemon restart. The original refusal
+remains RED even if recovery succeeds; ordinary release journeys never enable this option.
+
+The busy-room journey already accepts `VOX_PROOF_SHIPPED_BINARY`; the guest runner points it at
+the binary the actual installer put in the scratch home. Build its release harness in a shared
+hold, then execute it alone. QEMU cannot judge its real-time posting/pause cadence, kernel-keyring
+retention, or other time-bound claims; such rows are APPARATUS/not judged under emulation, never
+a shipping GREEN. A non-timing install or updater verdict can still be measured there.
