@@ -1262,34 +1262,51 @@ remember or forget. A failure to revoke or unlink a key found in a working keyri
 remains an error. Retention itself cannot be judged under QEMU's missing keyring syscalls;
 run its typed-update triplet natively with both genuinely compiled native versions.
 
-### Fetch-serving cache and old-room cleanup (ADR-052 RG-13)
+### Fetch-serving cache, receipt witnesses and old-room cleanup (ADR-052 RG-13, RG-6)
 
 Fetch proof descriptors share one daemon-wide FIFO cache capped below 8 MiB, including keys,
-values and container/rehash allocation. They are not written to the store. Canonical prefix
-ranges, source headers, contexts, witnesses and receipts remain durable. Opening a room removes
-only that room's old ProofRange objects and index references in bounded atomic batches;
+values and container/rehash allocation. A proof fetched, rebuilt or served for one request is
+not written to the store. Canonical prefix ranges, source headers, contexts, witnesses and
+receipts remain durable, and each durable inclusion or prefix receipt keeps, in the same
+transaction, exactly the pieces that serve it again under its head (the inclusion siblings or
+the consistency nodes) as ProofRange rows: a member that verified another author's evidence
+serves it after a restart while that author is away. A repeated fetch under the same head,
+author and position writes nothing new. Opening a room created by an older build removes that
+room's old ProofRange objects and index references once, in bounded atomic batches;
 interruption leaves completed batches applied and the next open resumes by an idempotent scan.
 Completion is recorded once as one sealed bit (CBOR uint 1) in the existing per-room
 KeyMaterial segment namespace, slot 30; subsequent opens read that bit and do not scan
-the object tree. No directory or store-format version changes. Locked/unopened rooms
+the object tree, and a room created or joined by this build carries the bit from its first
+transaction. No directory or store-format version changes. Locked/unopened rooms
 are not converted by a whole-store startup pass.
 
-Both optional journeys extend `retention_proof.rs` and use private scratch profiles/Keychains:
+These optional journeys extend `retention_proof.rs` and
+`a_newcomer_reads_the_whole_history_proof.rs` and use private scratch profiles/Keychains:
 
 ```sh
 cargo test --release -p vox-tui --features test-knobs,optional-proofs --test retention_proof \
   fetching_keeps_serving_proofs_out_of_the_store -- --exact --ignored --nocapture
 cargo test --release -p vox-tui --features test-knobs,optional-proofs --test retention_proof \
   opening_a_room_reclaims_old_serving_proofs_across_interruption -- --exact --ignored --nocapture
+cargo test --release -p vox-tui --features test-knobs,optional-proofs \
+  --test a_newcomer_reads_the_whole_history_proof \
+  a_newcomer_reads_a_member_while_the_author_it_cites_is_stopped -- --exact --ignored --nocapture
 ```
 
 The first exchanges messages across changing signed heads, abandons verified fetches, restarts
-both members and pages back through every acknowledged message while decoded stopped-store
-ProofRange counts stay zero. Its independent mutants restore admission writes or reconstruction
-writes. The second seeds the old serving-row shape in a real stopped room, opens it, interrupts
+both members and pages back through every acknowledged message; every decoded stopped-store
+ProofRange row must be a piece of a receipt held in the same store, and two more restarts with
+a repeated history request leave both members' row counts unchanged. Its mutant
+`VOX_MUTANT_WITNESS=every-trace` (every range a completed proof touched is saved) turns it red.
+The second seeds the old serving-row shape in a real stopped room, opens it, interrupts
 after a committed cleanup batch and reopens it, preserving other object kinds and readable
 history. A second open preserves planted stopped-store canaries, proving the completed room
 does not scan again; each row-count observation also records the store's file length.
+The third: an author with 200 posts and a member that read them and posts; the author is
+stopped for good and the member restarted; a newcomer that reaches only that member reads its
+next post and trusts it. Red on 403218281 and under `VOX_MUTANT_WITNESS=unkept` (a receipt is
+saved without its pieces) or `VOX_MUTANT_NEW_ROOM_UNMARKED=1` (the restart's sweep deletes
+them): the newcomer then wants nothing from the member and needs only the stopped author.
 
 ### Reading while messages expire (#1373)
 

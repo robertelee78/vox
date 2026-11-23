@@ -452,15 +452,37 @@ pub(super) fn advance(
         }
         Ok(())
     };
+    let tree = crate::log::history::TreeBinding {
+        room: binding.room,
+        scope: LogScope::Public,
+        author: binding.author,
+    };
+    // A durable inclusion/prefix receipt keeps, in its own transaction, exactly the verified
+    // pieces that serve it again under this head: the inclusion siblings or the consistency
+    // nodes (ADR-052 RG-6). Reconstructed ancestors and control proofs stay cache-only.
+    let keep_witness = |index: &mut entry_store::Write<'_, '_>,
+                        needed: Vec<crate::log::history::TreeRange>|
+     -> Result<()> {
+        let mutant = witness_mutant();
+        if mutant == Some(WitnessMutant::Unkept) {
+            return Ok(());
+        }
+        for (start, descriptor) in &ranges {
+            let range = crate::log::history::TreeRange {
+                start: *start,
+                leaves: descriptor.leaves,
+            };
+            if needed.contains(&range) || mutant == Some(WitnessMutant::EveryTrace) {
+                index.keep_history_proof_range(binding.head, tree, *start, *descriptor)?;
+            }
+        }
+        Ok(())
+    };
     let cache_ranges = || -> Result<()> {
         for (start, descriptor) in &ranges {
             entry_store::sparse::cache_history_proof_range(
                 binding.head,
-                crate::log::history::TreeBinding {
-                    room: binding.room,
-                    scope: LogScope::Public,
-                    author: binding.author,
-                },
+                tree,
                 *start,
                 *descriptor,
             )?;
@@ -487,6 +509,13 @@ pub(super) fn advance(
         ResultStep::Included(included) => {
             room.history_write_tracked(store, committed, |index| {
                 keep_generated(index)?;
+                keep_witness(
+                    index,
+                    crate::log::history::inclusion_ranges(
+                        included.header().entry().skeleton.seq,
+                        included.root().leaves,
+                    )?,
+                )?;
                 index.keep_history_inclusion_receipt(&included)?;
                 index.finish_history_verifier_cursor(*binding)
             })?;
@@ -505,6 +534,13 @@ pub(super) fn advance(
         ResultStep::Prefix(prefix) => {
             room.history_write_tracked(store, committed, |index| {
                 keep_generated(index)?;
+                keep_witness(
+                    index,
+                    crate::log::history::consistency_ranges(
+                        prefix.prefix().leaves,
+                        prefix.root().leaves,
+                    )?,
+                )?;
                 index.keep_history_prefix_receipt(&prefix)?;
                 index.finish_history_verifier_cursor(*binding)
             })?;
@@ -1136,4 +1172,33 @@ pub(super) fn preflight(
     } else {
         Preflight::Complete
     })
+}
+
+#[cfg_attr(not(feature = "test-knobs"), allow(dead_code))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WitnessMutant {
+    /// A durable receipt is saved without the pieces that serve it again (before this repair).
+    Unkept,
+    /// Every range a completed proof touched is saved, reconstructed ancestors included.
+    EveryTrace,
+}
+
+/// `VOX_MUTANT_WITNESS=unkept|every-trace`: says so once when the daemon first reads it.
+#[cfg(feature = "test-knobs")]
+fn witness_mutant() -> Option<WitnessMutant> {
+    static ON: std::sync::LazyLock<Option<WitnessMutant>> = std::sync::LazyLock::new(|| {
+        let value = std::env::var("VOX_MUTANT_WITNESS").ok()?;
+        eprintln!("vox: VOX_MUTANT_WITNESS={value} engaged: receipt witness pieces");
+        match value.as_str() {
+            "unkept" => Some(WitnessMutant::Unkept),
+            "every-trace" => Some(WitnessMutant::EveryTrace),
+            _ => None,
+        }
+    });
+    *ON
+}
+
+#[cfg(not(feature = "test-knobs"))]
+const fn witness_mutant() -> Option<WitnessMutant> {
+    None
 }

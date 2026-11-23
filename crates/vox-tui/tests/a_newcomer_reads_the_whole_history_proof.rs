@@ -10013,6 +10013,15 @@ fn a_returning_reader_eight_thousand_entries_behind_reads_and_pages_back() {
     rg1::returning_reader();
 }
 
+/// ADR-052 RG-6: a member that verified another author's evidence serves it again after a
+/// restart. The author is stopped; a newcomer that reaches only that member reads its post.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "three real daemons, a stopped author and a restarted holder; optional"]
+fn a_newcomer_reads_a_member_while_the_author_it_cites_is_stopped() {
+    rg1::holder_serves_what_it_verified();
+}
+
 #[cfg(feature = "optional-proofs")]
 #[path = "support/port_forward.rs"]
 mod port_forward;
@@ -10619,6 +10628,177 @@ mod rg1 {
                 }
             }
             std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// The author's long feed is held sparsely by the holder, whose entries cite it. With the
+    /// author stopped and the holder restarted (no in-memory proof survives), the newcomer's
+    /// only source of the author's evidence is what the holder kept with its own receipts.
+    pub(super) fn holder_serves_what_it_verified() {
+        const POSTS: usize = 200;
+        let root = root();
+        let exe = binary();
+        let author = room::worker_as(root.path(), "witness-author", &exe);
+        let holder = room::worker_as(root.path(), "witness-holder", &exe);
+        let reader = room::worker_as(root.path(), "witness-reader", &exe);
+        let author_daemon = start(&author, "127.0.0.1:0", None);
+        let holder_daemon = start(&holder, "127.0.0.1:0", None);
+        let trust = |w: &Worker, peer: &Worker| {
+            w.vox_env(
+                None,
+                &[("VOX_IDENTITY_PASSPHRASE", room::ID_PASS)],
+                &["trust", "add", &peer.b32(), "--name", &peer.name],
+                None,
+            )
+            .expect_ok("trust before the room");
+        };
+        trust(&author, &holder);
+        trust(&holder, &author);
+        let id = create(&author);
+        for n in 1..=POSTS {
+            post(&author, &id, &format!("WK-A-{n:04}"), true);
+        }
+        let link = author.vox(None, &["room", "link", &id]);
+        link.expect_ok("author room link");
+        holder
+            .vox_in(
+                None,
+                &["room", "join", "--passphrase-file", "-", link.stdout.trim()],
+                Some(room::ROOM_PASS),
+            )
+            .expect_ok("holder joins the author's long room");
+        returning_reader_ready(&holder, &id);
+        let last = format!("WK-A-{POSTS:04}");
+        let staging = Instant::now();
+        while !read(&holder, &id, Some(&last)).0.contains(&last) {
+            assert!(
+                staging.elapsed() < Duration::from_secs(600),
+                "APPARATUS: holder never showed the author's newest post"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let held = status(&holder, &id);
+        eprintln!(
+            "[witness] holder's view of the author before its own post: {}",
+            member(&held, &author.b32()).cloned().unwrap_or(Value::Null)
+        );
+        post(&holder, &id, "WK-H-after-reading-A", true);
+        author_daemon.stop();
+        eprintln!("[witness] author stopped for the rest of the act");
+        holder_daemon.stop();
+        let _ = std::fs::copy(
+            holder.data.with_extension("err"),
+            holder.data.with_extension("first.err"),
+        );
+        let _holder_daemon = start(&holder, "127.0.0.1:0", None);
+        returning_reader_ready(&holder, &id);
+        eprintln!("[witness] holder restarted: no in-memory proof survives");
+        let _reader_daemon = start(&reader, "127.0.0.1:0", None);
+        trust(&holder, &reader);
+        trust(&reader, &holder);
+        let link = holder.vox(None, &["room", "link", &id]);
+        link.expect_ok("holder room link");
+        reader
+            .vox_in(
+                None,
+                &["room", "join", "--passphrase-file", "-", link.stdout.trim()],
+                Some(room::ROOM_PASS),
+            )
+            .expect_ok("newcomer joins through the holder");
+        post(&holder, &id, "WK-H-after-the-newcomer", true);
+        let wanted = "WK-H-after-the-newcomer";
+        let started = Instant::now();
+        let mut wedged = 0;
+        loop {
+            let page = reader.vox(None, &["room", "read", &id, "--json", "--limit", "200"]);
+            let shown: BTreeSet<String> = if page.ok {
+                page.ndjson()
+                    .iter()
+                    .filter_map(|row| row["text"].as_str().map(str::to_owned))
+                    .collect()
+            } else {
+                BTreeSet::new()
+            };
+            let report = reader.vox(None, &["status", "--json"]);
+            report.expect_ok("newcomer status");
+            let report = report.json();
+            let room = report["rooms"]
+                .as_array()
+                .and_then(|rows| rows.iter().find(|row| row["id"].as_str() == Some(&id)))
+                .cloned()
+                .unwrap_or(Value::Null);
+            if shown.contains(wanted) {
+                let row = member(&room, &holder.b32()).cloned().unwrap_or(Value::Null);
+                eprintln!(
+                    "[witness] newcomer shows {} of the author's posts and the holder's: \
+                     before-the-newcomer={}, after={}; holder row: {row}",
+                    shown.iter().filter(|t| t.starts_with("WK-A-")).count(),
+                    shown.contains("WK-H-after-reading-A"),
+                    shown.contains(wanted)
+                );
+                assert!(
+                    row["trusted"] == true,
+                    "RED PRODUCT: the newcomer shows the holder's post but does not report \
+                     trusting it: {row}"
+                );
+                eprintln!(
+                    "GREEN: with the author stopped and the holder restarted, the newcomer \
+                     reads the holder's post"
+                );
+                return;
+            }
+            // The wedge, from the newcomer's own status: the holder's advertised feed is not
+            // verified, no flow toward any reachable peer wants or runs anything, and the only
+            // peer it still needs is the author, which is stopped for the rest of the act.
+            let ports = report["lanes"]["ports"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let port = |peer: &str| {
+                ports
+                    .iter()
+                    .find(|port| port["peer"].as_str() == Some(peer))
+                    .cloned()
+                    .unwrap_or(Value::Null)
+            };
+            let row = member(&room, &holder.b32()).cloned().unwrap_or(Value::Null);
+            let unverified = row["advertised_through"]
+                .as_u64()
+                .is_some_and(|advertised| {
+                    row["verified_through"].as_u64().unwrap_or(0) < advertised
+                });
+            let idle = ports
+                .iter()
+                .filter(|port| port["peer"].as_str() != Some(&author.b32()))
+                .all(|port| {
+                    port["needs"] == false
+                        && port["queued"] == false
+                        && port["round_running"] == false
+                });
+            let needs_author =
+                port(&author.b32())["needs"] == true && port(&author.b32())["connected"] != true;
+            wedged = if unverified && idle && needs_author {
+                wedged + 1
+            } else {
+                0
+            };
+            if wedged == 3 {
+                panic!(
+                    "RED PRODUCT: the newcomer does not show {wanted:?} (shows {shown:?}) and, in \
+                     three status answers in a row, wants nothing from the holder it reaches \
+                     while it needs only the stopped author. Holder row: {row}; port toward the \
+                     holder: {}; port toward the author: {}",
+                    port(&holder.b32()),
+                    port(&author.b32())
+                );
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(900),
+                "APPARATUS: NO RESULT after 900 s: neither the holder's post nor a wedge; \
+                 shows {shown:?}; newcomer's room: {room}; lanes: {}",
+                report["lanes"]
+            );
+            std::thread::sleep(Duration::from_millis(500));
         }
     }
 
