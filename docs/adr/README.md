@@ -62,6 +62,7 @@ primitive) precedes ADR-007 (consent, which is stored on the log) in build order
 | [050](ADR-050-an-agent-turn-is-finished-or-shown-again.md) | An Agent Turn Is Finished, or Declared Uncertain (a turn that carried room news is committed, or pending until a later request completes, or declared uncertain; news is never silently lost or shown twice) — superseded for v0.4.31 by ADR-052 | 018, 020, 021, 028, 029, 031, 040, 041, 042, 044, 045, 046, 047, 048, 049 |
 | [051](ADR-051-the-linux-build-runs-where-it-installs.md) | The Linux Build Runs Where It Installs (the Linux asset is built for a stated floor; the installer and `vox update` run a candidate before they replace anything and say why it cannot run) — accepted for v0.4.31 | 014, 015, 018, 041, 044, 045 |
 | [052](ADR-052-fix-reproduced-causes-one-per-task.md) | v0.4.31 Fixes Reproduced Causes, One per Task (KISS; one busy-room journey decides the room requirements; a join is admitted by one member; a trust change applies room by room; every "not yet" is retried; the sync method is chosen by measurement; three journeys are the release bar) — accepted for v0.4.31 | 007, 012, 018, 043, 051 |
+| [053](ADR-053-a-message-is-shown-on-its-authors-own-proof.md) | A Message Is Shown on Its Author's Own Proof (a message needs its author's own signed prefix and the governing changes it acknowledged, nothing about other members' chat; shown is not citable; a removal cuts at the target's witnessed tip; control evidence is kept and served; one list of missing positions per member; each signed header kept once, then only the chain's fingerprint after expiry; the store file follows what it holds) — accepted for v0.4.31 | 007, 018, 036, 052 |
 
 ## Tiers
 
@@ -93,7 +94,8 @@ does not import that branch's unreleased command surface into the released manua
   needed), 048 (a trust change stays in its room and finishes), 049 (leaving and ending a room),
   050 (an agent turn is finished or declared uncertain), 051 (the Linux build runs where it
   installs), 052 (v0.4.31 fixes reproduced causes, one per task), which supersedes 040 to 050
-  for v0.4.31 and keeps 051.
+  for v0.4.31 and keeps 051, and 053 (a message is shown on its author's own proof), which
+  amends 036 and 052.
 
 ## Status (integrate/v0.3.0)
 
@@ -148,6 +150,7 @@ planned. This is the roll-up.
 | 050 | superseded for v0.4.31 by ADR-052 (the decider's rulings of 2026-11-20); **not built**; kept as the record of the failures found and the designs considered |
 | 051 | accepted for v0.4.31 (the decider, 2026-11-13), **not built**, each requirement is to land with its proof; amends no accepted ADR; built under ADR-052 RG-11 |
 | 052 | accepted for v0.4.31 (the decider, 2026-11-20), **not built**, each requirement is to land with its proof; supersedes 040 to 050 for v0.4.31 (043 except CJ-11, CJ-12 and CJ-17) and `docs/release/v0.4.31.md`; keeps 051; adds the KISS rule to AGENTS.md |
+| 053 | accepted for v0.4.31 (the decider, 2026-11-23, after gpt-6.1-sol's review), **not built**, each requirement is to land with its proof; amends 036 (H-2, H-4, the v2 signature-retention sentence) and 052 (RG-0, RG-5, RG-13); product question 3 deferred to a measurement |
 
 ## Conformance-vector obligations
 

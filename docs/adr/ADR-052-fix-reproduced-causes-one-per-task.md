@@ -141,7 +141,7 @@ Each requirement gives the rule, why, the change, and its proof. "Carries" names
   framework MUST NOT be added unless a requirement here cannot be met without it, and the task
   that adds it says why. Where a cause is UNKNOWN, the task traces it and changes nothing until
   it is known. One requirement carries one reproduced cause; smaller faults found in the same
-  code ride with it.
+  code ride with it. *(Amended 2026-11-23 by ADR-053: for sync and storage, one design fix replaces one cause per task; KISS stands.)*
   - *Why*: ruling 2. The 85 tasks came from 300, from eleven ADRs of 1,400 to 4,000 lines each;
     17 prescribed a fix the evidence does not support, and 8 were diagnostic only, 4 of them
     with no known cause.
@@ -230,7 +230,7 @@ Each requirement gives the rule, why, the change, and its proof. "Carries" names
   and the replacement prototype (branch `proto/range-sync`). No sync change lands in the
   product before that. If one passes, it is built. If both pass, the smaller change is built
   (RG-0). If neither passes, nothing is built on sync: the first step the timeline shows
-  missing is the next cause, and the decider is told.
+  missing is the next cause, and the decider is told. *(Superseded 2026-11-23 by ADR-053: neither passed; the sync is built by ADR-053's Order.)*
   - *Why*: ruling 4. Both methods failed for causes outside sync.
   - *Proof*: the two verdict lines of RG-1's journey, with each build's commit.
   - *Carries*: B38.
@@ -364,7 +364,7 @@ Each requirement gives the rule, why, the change, and its proof. "Carries" names
   Session steps are kept two days by default, not seven, and an admin's own setting holds (row
   49); a store with more than twice the space it uses is compacted at daemon start; `vox
   status` shows each store's size and the free disk. Existing stores keep working and are
-  converted in place only where one of these changes needs it.
+  converted in place only where one of these changes needs it. *(Amended 2026-11-23 by ADR-053: "fetching writes no proof rows" is narrowed by MP-7; compaction at daemon start is replaced by MP-15; per-message residue by MP-14 and MP-16.)*
   - *Why*: C-13; fix-list items 20, 22, 25, 76 to 80.
   - *Proof*: extends `retention_proof.rs`. Red on v0.4.30: the pages written for one step grow
     with the number of other Sessions in the room (100 against 1,500), and a new room keeps

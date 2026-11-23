@@ -83,7 +83,7 @@ For a new entry, verify a receipt for its own immediately preceding prefix and e
 their joined prefix frontiers: for every coordinate it preserves the same position/hash or
 names a later position with verified continuity. Extra coordinates are explicit causal
 references and need the same control verification. Each cited position requires complete control
-verification up to that position, not only inclusion of the last cited control. Own-author
+verification up to that position, not only inclusion of the last cited control. *(Amended 2026-11-23 by ADR-053 MP-1, MP-5: for Content, `seen` parents need no receipt.)* Own-author
 positions in a pre-context MUST be strictly before the entry. The first entry uses existing
 genesis and author-admission evidence; this introduces no membership certificate or roster.
 
@@ -219,7 +219,7 @@ operative causal parent, or claim its signature alone proves membership or a for
 The newest requested view and each explicit older-page request MUST have count, byte and work
 budgets, a durable continuation and cancellation. The proposed default is at most 128 entries per
 logical page and 1 MiB of archive wire work per request/continuation response, with at most two
-archive transfers across the daemon and one for a node, counting both serving and receiving.
+archive transfers across the daemon and one for a node, counting both serving and receiving. *(Amended 2026-11-23 by ADR-053 MP-13: the node-wide transfer slots go.)*
 These are work budgets, not retention limits. The existing stream MUST support a valid 16 MiB
 entry through bounded chunks; an oversized first entry MUST NOT bypass the byte budget. When
 that response budget is exhausted, return an explicit continuation bound to the same entry/hash
@@ -370,7 +370,7 @@ then appends `auth_type`, `signature`, `payload_present` and, when present, `pay
 `MAX_ENTRY_WIRE = 16 MiB + 8 KiB + 9` bounds the complete canonical record, including the
 largest CBOR byte-string length header. Signature type 1 is required for every v2 header. Retain
 those signatures even after body retention: a later live entry may require an exact receipt for any earlier content parent.
-Otherwise dropping a content signature could make the required parent evidence unavailable.
+Otherwise dropping a content signature could make the required parent evidence unavailable. *(Replaced 2026-11-23 by ADR-053 MP-16, once its conditions are proven.)*
 This deliberately preserves v1 dropped-signature behavior and adds no alternate sparse
 signature-authentication path. An unsigned sparse record cannot acquire authenticity merely
 by arriving or being described as checkpointed.
@@ -576,7 +576,7 @@ readiness.
 Every author's control entries from position 1 up to its known size MUST be fetched as one set,
 by control proof, with a bounded share of each peer's exchanges so that no author's bodies wait
 on another author's control backlog (ADR-046 SY-3, SY-15). A `seen` reference is never fetched
-for admission. *(Amended 2026-11-13 by ADR-046.)* Control proofs collapse subtrees without
+for admission. *(Amended 2026-11-13 by ADR-046; amended 2026-11-23 by ADR-053 MP-1, MP-2, MP-7.)* Control proofs collapse subtrees without
 controls, so this does not request an omitted archive Content body. The effect receipt is published
 only after every enumerated control through the head has finished its ordinary typed effect
 (including an addressed key-package body); merely completing the 128-entry live cursor is not
