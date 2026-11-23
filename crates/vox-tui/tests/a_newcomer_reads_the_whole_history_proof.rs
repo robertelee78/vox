@@ -10051,7 +10051,18 @@ fn a_follower_filled_while_the_author_keeps_posting_walks_each_position_once() {
 #[test]
 #[ignore = "three real daemons, a stopped author and a restarted holder; optional"]
 fn a_newcomer_reads_a_member_while_the_author_it_cites_is_stopped() {
-    rg1::holder_serves_what_it_verified();
+    rg1::holder_serves_what_it_verified(rg1::Cited::Posts);
+}
+
+/// ADR-053 MP-7 (a) without the misleading newer head: the holder's later post depends on a
+/// control in the stopped author's feed (the author's context advance after the holder's post).
+/// The holder restarts; a newcomer that reaches only the holder must verify that control
+/// evidence from it, and ends up trusted, keyed and reading the holder's post.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "three real daemons, a stopped author with a later control and a restarted holder; optional"]
+fn a_newcomer_reads_a_member_past_the_stopped_authors_control() {
+    rg1::holder_serves_what_it_verified(rg1::Cited::AfterControl);
 }
 
 #[cfg(feature = "optional-proofs")]
@@ -10675,6 +10686,16 @@ mod rg1 {
         AuthorKeepsPosting,
     }
 
+    /// What the holder's posts cite in the stopped author's feed.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(super) enum Cited {
+        /// The author's long run of posts (ADR-052 RG-6).
+        Posts,
+        /// A control after them: the author's context advance over the holder's post, written
+        /// before the author's next post; the holder posts again after showing it (MP-7).
+        AfterControl,
+    }
+
     /// Whether a live flow of the reader's is ready or running (`vox status --json`
     /// `lanes.bounded`): a still sample counts only when none is.
     fn live_in_flight(w: &Worker) -> (bool, Value) {
@@ -10887,8 +10908,9 @@ mod rg1 {
 
     /// The author's long feed is held sparsely by the holder, whose entries cite it. With the
     /// author stopped and the holder restarted (no in-memory proof survives), the newcomer's
-    /// only source of the author's evidence is what the holder kept with its own receipts.
-    pub(super) fn holder_serves_what_it_verified() {
+    /// only source of the author's evidence is what the holder kept with its own receipts and,
+    /// for `Cited::AfterControl`, with its control coverage.
+    pub(super) fn holder_serves_what_it_verified(cited: Cited) {
         const POSTS: usize = 200;
         let root = root();
         let exe = binary();
@@ -10937,6 +10959,54 @@ mod rg1 {
             member(&held, &author.b32()).cloned().unwrap_or(Value::Null)
         );
         post(&holder, &id, "WK-H-after-reading-A", true);
+        if cited == Cited::AfterControl {
+            // The author's context changes with the holder's post: its next post is preceded by
+            // a context advance (a control entry) citing the holder.
+            let staging = Instant::now();
+            while !read(&author, &id, Some("WK-H-after-reading-A"))
+                .0
+                .contains("WK-H-after-reading-A")
+            {
+                assert!(
+                    staging.elapsed() < Duration::from_secs(600),
+                    "APPARATUS: the author never showed the holder's post"
+                );
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            post(&author, &id, "WK-A-after-H", true);
+            let staging = Instant::now();
+            while !read(&holder, &id, Some("WK-A-after-H"))
+                .0
+                .contains("WK-A-after-H")
+            {
+                assert!(
+                    staging.elapsed() < Duration::from_secs(600),
+                    "APPARATUS: the holder never showed the author's post after its control"
+                );
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            // The holder holds the author's whole window before the author stops, so what the
+            // newcomer later lacks is evidence, not entries the holder never had.
+            let staging = Instant::now();
+            let view = loop {
+                let row = member(&status(&holder, &id), &author.b32())
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                if row["missing_live_entries"] == 0
+                    && row["holds_through"].as_u64().is_some()
+                    && row["holds_through"] == row["advertised_through"]
+                {
+                    break row;
+                }
+                assert!(
+                    staging.elapsed() < Duration::from_secs(600),
+                    "APPARATUS: the holder never held the author's whole window: {row}"
+                );
+                std::thread::sleep(Duration::from_millis(500));
+            };
+            eprintln!("[witness] holder's view of the author after its control: {view}");
+            post(&holder, &id, "WK-H-after-A-control", true);
+        }
         author_daemon.stop();
         eprintln!("[witness] author stopped for the rest of the act");
         holder_daemon.stop();

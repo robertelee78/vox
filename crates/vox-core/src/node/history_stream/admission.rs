@@ -459,7 +459,8 @@ pub(super) fn advance(
     };
     // A durable inclusion/prefix receipt keeps, in its own transaction, exactly the verified
     // pieces that serve it again under this head: the inclusion siblings or the consistency
-    // nodes (ADR-052 RG-6). Reconstructed ancestors and control proofs stay cache-only.
+    // nodes (ADR-052 RG-6). Reconstructed ancestors stay cache-only. Control coverage keeps its
+    // whole verified trace (ADR-053 MP-7, MP-8): see the Controls arm below.
     let keep_witness = |index: &mut entry_store::Write<'_, '_>,
                         needed: Vec<crate::log::history::TreeRange>|
      -> Result<()> {
@@ -571,23 +572,28 @@ pub(super) fn advance(
             let accepted = input.history_head_accepted(&controls.head_id(), controls.binding())?;
             drop(input);
             if !accepted {
-                // The finished cursor is kept with what it generated: the next turn, after
-                // the promotion, completes at once instead of verifying the range again.
-                room.history_write_tracked(store, committed, |index| {
-                    keep_generated(index)?;
-                    if !index.keep_history_verifier_cursor(*binding, &cursor)? {
-                        return Err(invalid("existing verifier capacity vanished"));
-                    }
-                    Ok(())
-                })?;
+                // The staged cursor is left as it was, unverified: the next turn, after the
+                // promotion, verifies the range again from its retained proof bytes, so the
+                // completion below holds the whole trace to keep. A cursor restored from a
+                // finished checkpoint carries only the proof's collapse tokens (ADR-053 MP-7).
+                room.history_write_tracked(store, committed, |index| keep_generated(index))?;
                 cache_ranges()?;
                 return Ok(match promote_head(room, store, committed, binding.head)? {
                     Advanced::Complete => Advanced::Progress,
                     other => other,
                 });
             }
+            // The coverage owns, in its own transaction, the whole verified trace under this
+            // exact head: every collapsed, joined and leaf node the serving walk visits again
+            // for any interval inside this one, the root included (ADR-053 MP-7; MP-8's full
+            // closure). Coverage rows are never retired, so neither are these.
             room.history_write_tracked(store, committed, |index| {
                 keep_generated(index)?;
+                if witness_mutant() != Some(WitnessMutant::ControlUnkept) {
+                    for (start, descriptor) in &ranges {
+                        index.keep_history_proof_range(binding.head, tree, *start, *descriptor)?;
+                    }
+                }
                 if index.keep_control_coverage(&controls, 0)?.is_some() {
                     return Err(invalid("bounded control coverage unexpectedly incomplete"));
                 }
@@ -1181,9 +1187,12 @@ enum WitnessMutant {
     Unkept,
     /// Every range a completed proof touched is saved, reconstructed ancestors included.
     EveryTrace,
+    /// Control coverage is saved without its verified trace (cache-only, before ADR-053 MP-7).
+    ControlUnkept,
 }
 
-/// `VOX_MUTANT_WITNESS=unkept|every-trace`: says so once when the daemon first reads it.
+/// `VOX_MUTANT_WITNESS=unkept|every-trace|control-unkept`: says so once when the daemon first
+/// reads it.
 #[cfg(feature = "test-knobs")]
 fn witness_mutant() -> Option<WitnessMutant> {
     static ON: std::sync::LazyLock<Option<WitnessMutant>> = std::sync::LazyLock::new(|| {
@@ -1192,6 +1201,7 @@ fn witness_mutant() -> Option<WitnessMutant> {
         match value.as_str() {
             "unkept" => Some(WitnessMutant::Unkept),
             "every-trace" => Some(WitnessMutant::EveryTrace),
+            "control-unkept" => Some(WitnessMutant::ControlUnkept),
             _ => None,
         }
     });

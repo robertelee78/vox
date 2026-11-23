@@ -2173,7 +2173,9 @@ mod proof_rows {
     // Inspect a stopped COPY, decoding the object-index kind and its entire old value, not a
     // ciphertext-length histogram. Every other typed object remains separately counted.
     // Returns the kind counts, the ProofRange keys, and the keys of every piece a held
-    // inclusion receipt (its siblings) or prefix receipt (its consistency nodes) needs.
+    // inclusion receipt (its siblings) or prefix receipt (its consistency nodes) needs, or a
+    // held control coverage (head, lo..hi) needs: every node the serving walk of that interval
+    // visits under that head (ADR-053 MP-7).
     #[allow(clippy::type_complexity)] // One stopped-store reading, three views of it.
     fn inspect(
         dir: &Path,
@@ -2201,6 +2203,14 @@ mod proof_rows {
         let mut rows = std::collections::BTreeSet::new();
         let mut owned = std::collections::BTreeSet::new();
         let mut sealed = 0;
+        // Per head: its binding and the decoded rows, to walk each held coverage interval.
+        let mut by_head: std::collections::BTreeMap<
+            Digest32,
+            (
+                TreeBinding,
+                std::collections::BTreeMap<(u64, u64), Descriptor>,
+            ),
+        > = std::collections::BTreeMap::new();
         for row in objects {
             let row = array(&row);
             let key = bytes(&row[0]);
@@ -2247,20 +2257,92 @@ mod proof_rows {
                 "APPARATUS: exact cache key"
             );
             rows.insert(key[..32].try_into().unwrap());
+            by_head
+                .entry(head)
+                .or_insert_with(|| (binding, std::collections::BTreeMap::new()))
+                .1
+                .insert((start, descriptor.leaves), descriptor);
             sealed += profile
                 .store()
                 .get_segment(room, SegmentKind::EntryIndex, number(&at[1]))
                 .unwrap()
                 .map_or(0, |segment| segment.nonce.len() + segment.ciphertext.len());
         }
+        // Control coverage rows: key (head, lo), value hi. The walk starts at the head's root
+        // row and expands a node only where it meets lo..hi and counts a control, as serving
+        // does (`Source::control_proof`).
+        let mut intervals = Vec::new();
+        tree(
+            profile.store(),
+            &sek,
+            room,
+            number(&roots(&directory)[3]),
+            &mut Vec::new(),
+            &mut intervals,
+        );
+        let mut walked = 0;
+        let mut covered = std::collections::BTreeSet::new();
+        for row in intervals {
+            let row = array(&row);
+            let key = bytes(&row[0]);
+            let head: Digest32 = key[..32].try_into().unwrap();
+            let lo = u64::from_be_bytes(key[32..40].try_into().unwrap());
+            let hi = number(&array(&row[1])[1]);
+            let Some((binding, pieces)) = by_head.get(&head) else {
+                continue;
+            };
+            // The trace keeps its head's root; a shorter `[1,p]` is a receipt piece only.
+            let Some(root) = pieces
+                .iter()
+                .filter(|((start, _), _)| *start == 1)
+                .map(|(_, d)| d.leaves)
+                .max()
+                .filter(|leaves| *leaves >= hi)
+            else {
+                continue;
+            };
+            walked += 1;
+            let mut pending = vec![(1u64, root)];
+            while let Some((start, leaves)) = pending.pop() {
+                let Some(node) = pieces.get(&(start, leaves)) else {
+                    continue;
+                };
+                covered.insert(piece_key(&head, *binding, start, leaves));
+                let end = start + leaves - 1;
+                if leaves > 1 && node.controls != 0 && end >= lo && start <= hi {
+                    let left = vox_core::log::history::split(leaves).unwrap();
+                    pending.push((start + left, leaves - left));
+                    pending.push((start, left));
+                }
+            }
+        }
+        let coverage_only = rows
+            .iter()
+            .filter(|key| covered.contains(*key) && !owned.contains(*key))
+            .count();
+        owned.extend(covered);
+        // Covered control positions, one row per (head, position): the per-control-entry
+        // denominator for the by-hand cost of the kept traces.
+        let mut sources = Vec::new();
+        tree(
+            profile.store(),
+            &sek,
+            room,
+            number(&roots(&directory)[8]),
+            &mut Vec::new(),
+            &mut sources,
+        );
         let file_bytes = std::fs::metadata(profile.paths().store_file())
             .unwrap()
             .len();
         eprintln!(
             "STOPPED-STORE {dir:?}: file bytes {file_bytes}; decoded object kinds {counts:?}; \
-             ProofRange rows {} of {} receipt-owned pieces, their sealed records {sealed} bytes",
+             ProofRange rows {} of {} receipt- or coverage-owned pieces ({walked} coverage \
+             intervals walked, {} covered control positions, {coverage_only} rows owned by \
+             coverage alone), their sealed records {sealed} bytes",
             rows.len(),
-            owned.len()
+            owned.len(),
+            sources.len()
         );
         (counts, rows, owned)
     }
@@ -2276,7 +2358,7 @@ mod proof_rows {
             unowned,
             0,
             "PRODUCT: {unowned} of {} decoded ProofRange rows in the real room store are no \
-             held receipt's piece",
+             held receipt's or control coverage's piece",
             rows.len()
         );
         rows.len()
