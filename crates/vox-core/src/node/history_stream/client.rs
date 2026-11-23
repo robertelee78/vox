@@ -293,7 +293,13 @@ impl Receiver {
         };
         let proof = match self
             .source
-            .proof(&work_job, &signed.value, kind, from, to)
+            .proof(
+                &work_job,
+                &crate::node::channel::ResolvedTarget::exact(&signed.value),
+                kind,
+                from,
+                to,
+            )
             .await?
         {
             Lookup::Found(proof) => proof,
@@ -2592,6 +2598,32 @@ impl Receiver {
         Grant {
             node: self.node,
             generation: self.generation,
+        }
+    }
+    /// The canonical body of this node's own held head that a head-bound request names (ADR-053
+    /// P). The provider treats it as an untrusted selector; this node keeps verifying every
+    /// response under the exact signed head.
+    pub(super) async fn request_target(
+        &self,
+        job: &crate::node::history_budget::Job,
+        head: Digest32,
+    ) -> Result<crate::log::history::HeadTarget> {
+        match self
+            .read(
+                job,
+                crate::log::history::MAX_HEADER_BYTES,
+                move |room, store| {
+                    Ok(room
+                        .history_read(store)?
+                        .history_head(&head)?
+                        .map(|signed| signed.target()))
+                },
+            )
+            .await?
+        {
+            Lookup::Found(held) => Ok(held.value),
+            Lookup::Busy => Err(Error::Unreachable("history request head read busy")),
+            Lookup::Missing => Err(Error::Unreachable("history request head is not held here")),
         }
     }
     async fn read<T, F>(

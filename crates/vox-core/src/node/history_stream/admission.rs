@@ -734,6 +734,13 @@ pub(super) fn promote_head(
     if conflict {
         return Err(invalid("conflicting authenticated heads retained"));
     }
+    // Staging evidence for the ADR-053 P acts: which head of which author this node committed.
+    #[cfg(feature = "test-knobs")]
+    eprintln!(
+        "vox: history head committed author={} size={}",
+        crate::node::link::b32_encode(&signed.binding.author),
+        signed.root.leaves
+    );
     room.note_role_progress(signed.binding.author, signed.root.leaves);
     if signed.binding.author != room.me() {
         room.role_owed().mark_key_dirty(signed.binding.author);

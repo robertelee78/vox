@@ -4,8 +4,8 @@
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
 use crate::log::entry::Entry;
-use crate::log::history::{MAX_CHUNK_BYTES, MAX_HEADER_BYTES, MAX_PAYLOAD_BYTES};
-use crate::node::channel::HistoryPayload;
+use crate::log::history::{HeadTarget, MAX_CHUNK_BYTES, MAX_HEADER_BYTES, MAX_PAYLOAD_BYTES};
+use crate::node::channel::{HistoryPayload, ResolvedTarget};
 
 use super::credit::Response;
 use super::source::{Lookup, Source};
@@ -53,12 +53,26 @@ struct EntryResult {
     role_complete: bool,
 }
 
+impl EntryResult {
+    /// The answer to an entry whose asked head this node could not resolve (ADR-053 P): the
+    /// same answer as an entry it lacks, with no header sent.
+    fn unresolved(status: Status, offset: u64) -> Self {
+        Self {
+            status,
+            hash: None,
+            offset,
+            role_complete: false,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // One bound stream and its node-owned scalar hint sink.
 pub(super) async fn answer(
     source: &Source,
     io: &mut Transport,
     preamble: Preamble,
     query: Query,
+    target: Option<HeadTarget>,
     handshake_bytes: usize,
     inbox: &super::HintInbox,
     inbox_generation: u64,
@@ -216,7 +230,36 @@ pub(super) async fn answer(
             let peer = ids.next();
             matches!(query, Query::Head(id) if author == Some(crate::node::link::b32_encode(&id).as_str()))
                 && peer == Some(crate::node::link::b32_encode(&source.peer).as_str())
-        });
+        })
+        // `VOX_TEST_HEADS_ONLY_FILE` = `<peer> [floor]`: that peer gets only heads, consistency
+        // proofs, contexts and inventory from this node, plus headers and inclusion proofs at
+        // positions from `floor` on (none without one): it commits a head whose tip is past the
+        // floor and holds no evidence below it (ADR-053 P availability act).
+        || std::env::var_os("VOX_TEST_HEADS_ONLY_FILE")
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .is_some_and(|text| {
+                let mut words = text.split_whitespace();
+                let named = words.next() == Some(crate::node::link::b32_encode(&source.peer).as_str());
+                let floor = words.next().and_then(|floor| floor.parse::<u64>().ok());
+                let below = |seq: u64| floor.is_none_or(|floor| seq < floor);
+                named
+                    && match &query {
+                        Query::Header { seq, .. } => below(*seq),
+                        Query::Proof {
+                            kind: super::ProofKind::Inclusion,
+                            from,
+                            ..
+                        } => below(*from),
+                        Query::Entry { .. }
+                        | Query::Page { .. }
+                        | Query::KeyBody { .. }
+                        | Query::Proof {
+                            kind: super::ProofKind::Control,
+                            ..
+                        } => true,
+                        _ => false,
+                    }
+            });
     #[cfg(not(feature = "test-knobs"))]
     let staged_unavailable = false;
     let (status, continuation) = if staged_unavailable {
@@ -224,7 +267,16 @@ pub(super) async fn answer(
     } else if credit.remaining_wire() < super::DONE_RESERVE {
         (Status::Busy, None)
     } else {
-        respond(source, io, preamble, &query, &mut credit, served_object).await?
+        respond(
+            source,
+            io,
+            preamble,
+            &query,
+            target,
+            &mut credit,
+            served_object,
+        )
+        .await?
     };
     // Source objects and their envelopes have been dropped before the terminal allocation.
     let done = Frame::Done {
@@ -283,12 +335,24 @@ async fn respond(
     io: &mut Transport,
     preamble: Preamble,
     query: &Query,
+    target: Option<HeadTarget>,
     credit: &mut Response,
     served_object: &mut bool,
 ) -> Result<(Status, Option<Continuation>)> {
     let job = io.job().clone();
     let request = preamble.request;
     let explicit_key_body = matches!(query, Query::KeyBody { .. });
+    // A head-bound query is served under the asker's head resolved to this node's own committed
+    // material (ADR-053 P); the codec already bound the target body to the named head.
+    let target = match (query.target_head(), target) {
+        (Some(_), Some(target)) => Some(target),
+        (None, None) => None,
+        _ => {
+            return Err(Error::MalformedBundle(
+                "history request target differs from query",
+            ))
+        }
+    };
     match *query {
         Query::Inventory => {
             let Lookup::Found(inventory) = source.inventory(&job).await? else {
@@ -433,18 +497,23 @@ async fn respond(
             };
             Ok((status, None))
         }
-        Query::Header { head, seq } => {
+        Query::Header { seq, .. } => {
+            let target = target.ok_or(Error::MalformedBundle("header query without target"))?;
+            if seq > target.root.leaves {
+                return Err(Error::MalformedBundle("requested header exceeds head"));
+            }
+            let resolved = match source.resolve(&job, target, "header").await? {
+                Lookup::Found(held) => held,
+                Lookup::Busy => return Ok((Status::Busy, None)),
+                Lookup::Missing => return Ok((Status::EvidenceUnavailable, None)),
+            };
+            let work_job = resolved.job();
+            let resolved = resolved.value;
             let found = source
-                .read(&job, 128 * 1024, move |room, store| {
-                    let Some(head) = room.history_head_by_id(store, &head)? else {
-                        return Ok(None);
-                    };
-                    if seq > head.root.leaves {
-                        return Err(Error::MalformedBundle("requested header exceeds head"));
-                    }
+                .read(&work_job, 128 * 1024, move |room, store| {
                     Ok(room
-                        .history_proof_header(store, &head, seq)?
-                        .map(|header| (head, header)))
+                        .history_proof_header(store, &resolved, seq)?
+                        .map(|header| (resolved, header)))
                 })
                 .await?;
             let held = match found {
@@ -460,7 +529,7 @@ async fn respond(
                 .map(|v2| vec![v2.pre_context])
                 .unwrap_or_default();
             if !source
-                .authorize_recovery_contexts(&job, &held.value.0, contexts)
+                .authorize_recovery_contexts(&work_job, &held.value.0, contexts)
                 .await?
             {
                 return Ok((Status::Busy, None));
@@ -489,12 +558,13 @@ async fn respond(
             from,
             to,
         } => {
-            let found = source
-                .read(&job, 128 * 1024, move |room, store| {
-                    room.history_head_by_id(store, &head)
-                })
-                .await?;
-            let held_head = match found {
+            let target = target.ok_or(Error::MalformedBundle("proof query without target"))?;
+            let stage = match kind {
+                super::ProofKind::Inclusion => "inclusion",
+                super::ProofKind::Consistency => "consistency",
+                super::ProofKind::Control => "control",
+            };
+            let held_head = match source.resolve(&job, target, stage).await? {
                 Lookup::Found(held) => held,
                 Lookup::Busy => return Ok((Status::Busy, None)),
                 Lookup::Missing => return Ok((Status::EvidenceUnavailable, None)),
@@ -508,7 +578,7 @@ async fn respond(
                 Lookup::Busy => return Ok((Status::Busy, None)),
                 Lookup::Missing => return Ok((Status::EvidenceUnavailable, None)),
             };
-            let mut contexts = vec![held_head.value.root.frontier];
+            let mut contexts = vec![held_head.value.target.root.frontier];
             match &held_proof.value {
                 Proof::Inclusion(proof) => {
                     contexts.extend(proof.siblings.iter().map(|node| node.frontier))
@@ -570,19 +640,54 @@ async fn respond(
                 Query::KeyBody { author, hash, .. } => Some((*author, *hash)),
                 _ => None,
             };
-            let result = entry(
-                source,
-                io,
-                preamble,
-                credit,
-                head,
-                seq,
-                offset,
-                explicit_key_body,
-                key_identity,
-                served_object,
-            )
-            .await?;
+            // KeyBody keeps its exact (author, seq, hash) provider source (inside `entry`).
+            let resolved = match target {
+                Some(target) => {
+                    if seq == 0 || seq > target.root.leaves {
+                        return Err(Error::MalformedBundle("requested entry exceeds head"));
+                    }
+                    Some(source.resolve(&job, target, "entry").await?)
+                }
+                None => None,
+            };
+            let result = match &resolved {
+                Some(Lookup::Found(resolved)) => {
+                    entry(
+                        source,
+                        io,
+                        preamble,
+                        credit,
+                        head,
+                        Some(resolved),
+                        seq,
+                        offset,
+                        explicit_key_body,
+                        key_identity,
+                        served_object,
+                    )
+                    .await?
+                }
+                Some(Lookup::Busy) => EntryResult::unresolved(Status::Busy, offset),
+                Some(Lookup::Missing) => {
+                    EntryResult::unresolved(Status::EvidenceUnavailable, offset)
+                }
+                None => {
+                    entry(
+                        source,
+                        io,
+                        preamble,
+                        credit,
+                        head,
+                        None,
+                        seq,
+                        offset,
+                        explicit_key_body,
+                        key_identity,
+                        served_object,
+                    )
+                    .await?
+                }
+            };
             let cursor = (result.status != Status::Complete
                 && (result.hash.is_some() || result.offset == 0))
                 .then_some(Continuation {
@@ -598,6 +703,35 @@ async fn respond(
             Ok((result.status, cursor))
         }
         Query::Page { head, lo, hi, .. } => {
+            let target = target.ok_or(Error::MalformedBundle("page query without target"))?;
+            if hi > target.root.leaves {
+                return Err(Error::MalformedBundle("requested entry exceeds head"));
+            }
+            // One resolution serves the whole page: every position is under the same asked head.
+            let resolved = match source.resolve(&job, target, "entry").await? {
+                Lookup::Found(resolved) => resolved,
+                unresolved => {
+                    // The same answer as a first position this node lacks.
+                    let status = if matches!(unresolved, Lookup::Busy) {
+                        Status::Busy
+                    } else {
+                        Status::EvidenceUnavailable
+                    };
+                    return Ok((
+                        status,
+                        Some(Continuation {
+                            query_kind: 4,
+                            head,
+                            lo,
+                            hi,
+                            next_seq: hi,
+                            entry: None,
+                            offset: 0,
+                            entries_remaining: credit.headers_left(),
+                        }),
+                    ));
+                }
+            };
             // Newest first (ADR-037 R1): a page is what a reader asked for below the oldest row
             // it shows, so its rows arrive from the top down and an interrupted page leaves a
             // contiguous top and a missing bottom, never a hole. Served oldest-first, a page the
@@ -610,6 +744,7 @@ async fn respond(
                     preamble,
                     credit,
                     head,
+                    Some(&resolved),
                     seq,
                     0,
                     false,
@@ -671,6 +806,7 @@ async fn entry(
     preamble: Preamble,
     credit: &mut Response,
     head: Digest32,
+    resolved: Option<&super::source::Held<ResolvedTarget>>,
     seq: u64,
     offset: u64,
     explicit_key_body: bool,
@@ -680,55 +816,60 @@ async fn entry(
     let job = io.job().clone();
     let request = preamble.request;
     let head_id = head;
-    let mut result = EntryResult {
-        status: Status::EvidenceUnavailable,
-        hash: None,
-        offset,
-        role_complete: false,
-    };
-    // A relay may have validated this exact package under a different signed head.
-    // The receiver retains its own head for admission; the provider serves only an
-    // independently validated matching author, sequence, and signed entry hash.
-    let provider_head = if let Some((author, hash)) = key_identity {
-        match source
-            .read(&job, 128 * 1024, move |room, store| {
-                let read = room.history_read(store)?;
-                Ok(read
-                    .history_validated_header(&author, seq)?
-                    .and_then(|(head, entry)| (entry.entry_hash() == hash).then_some(head)))
-            })
-            .await?
-        {
-            Lookup::Found(held) => held.value,
-            Lookup::Busy => {
-                result.status = Status::Busy;
-                return Ok(result);
-            }
-            Lookup::Missing => return Ok(result),
+    let mut result = EntryResult::unresolved(Status::EvidenceUnavailable, offset);
+    let provider;
+    let head = match resolved {
+        // Entry and Page: the asker's head, resolved by the caller (ADR-053 P).
+        Some(resolved) => resolved,
+        None => {
+            // A relay may have validated this exact package under a different signed head.
+            // The receiver retains its own head for admission; the provider serves only an
+            // independently validated matching author, sequence, and signed entry hash.
+            let Some((author, hash)) = key_identity else {
+                return Err(Error::Profile("history entry without a resolved head"));
+            };
+            let provider_head = match source
+                .read(&job, 128 * 1024, move |room, store| {
+                    let read = room.history_read(store)?;
+                    Ok(read
+                        .history_validated_header(&author, seq)?
+                        .and_then(|(head, entry)| (entry.entry_hash() == hash).then_some(head)))
+                })
+                .await?
+            {
+                Lookup::Found(held) => held.value,
+                Lookup::Busy => {
+                    result.status = Status::Busy;
+                    return Ok(result);
+                }
+                Lookup::Missing => return Ok(result),
+            };
+            provider = match source
+                .read(&job, 128 * 1024, move |room, store| {
+                    Ok(room
+                        .history_head_by_id(store, &provider_head)?
+                        .map(|head| ResolvedTarget::exact(&head)))
+                })
+                .await?
+            {
+                Lookup::Found(held) => held,
+                Lookup::Busy => {
+                    result.status = Status::Busy;
+                    return Ok(result);
+                }
+                Lookup::Missing => return Ok(result),
+            };
+            &provider
         }
-    } else {
-        head
-    };
-    let head = match source
-        .read(&job, 128 * 1024, move |room, store| {
-            room.history_head_by_id(store, &provider_head)
-        })
-        .await?
-    {
-        Lookup::Found(held) => held,
-        Lookup::Busy => {
-            result.status = Status::Busy;
-            return Ok(result);
-        }
-        Lookup::Missing => return Ok(result),
     };
     // Every dependent header/body read overlaps this held head. Keep its actual worker rather
     // than asking the original Control job to acquire another foreground permit.
     let job = head.job();
-    if seq == 0 || seq > head.value.root.leaves {
+    let target = head.value;
+    if seq == 0 || seq > target.target.root.leaves {
         return Err(Error::MalformedBundle("requested entry exceeds head"));
     }
-    let author = head.value.binding.author;
+    let author = target.target.binding.author;
     let header = match source
         .read(&job, 128 * 1024, move |room, store| {
             room.history_header(store, &author, seq)
@@ -745,7 +886,7 @@ async fn entry(
     let parsed = Entry::from_wire(&header.value.wire)?;
     if let Some(v2) = &parsed.skeleton.v2 {
         if !source
-            .authorize_recovery_contexts(&job, &head.value, vec![v2.pre_context])
+            .authorize_recovery_contexts(&job, &target, vec![v2.pre_context])
             .await?
         {
             result.status = Status::Busy;
@@ -808,7 +949,7 @@ async fn entry(
         }
     };
     let live = if preamble.purpose == Purpose::Live {
-        let through = head.value.root.leaves;
+        let through = target.target.root.leaves;
         let latest = source
             .read(&job, 128 * 1024, move |room, store| {
                 Ok(Some(room.history_head(store, &author)?.is_some_and(

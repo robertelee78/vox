@@ -189,9 +189,17 @@ fn daemon_on(dir: &Path, tag: &str, stdin_lines: &str, listen: &str) -> Daemon {
             "VOX_TEST_REDUNDANT_CONTROL_FILE",
             dir.join("redundant-control"),
         )
+        // Off unless the act creates the file: then this node is a hostile asker
+        // (`proof_rows::hostile_member`).
+        .env("VOX_TEST_CYCLE_TARGETS_FILE", dir.join("cycle-targets"))
         .envs(
             std::env::var_os("VOX_MUTANT_RETENTION_FLOOR")
                 .map(|on| ("VOX_TEST_RETENTION_FLOOR_MUTANT", on)),
+        )
+        // The P guards' mutant: serving-only state written as durable rows.
+        .envs(
+            std::env::var_os("VOX_MUTANT_PREFIX_PERSIST")
+                .map(|on| ("VOX_MUTANT_PREFIX_PERSIST", on)),
         )
         .env_remove("VOX_ROOM")
         .env_remove("VOX_NODE")
@@ -2674,6 +2682,10 @@ mod proof_rows {
             .env("VOX_TEST_KEYCHAIN", attach::keychain(dir))
             .env("VOX_PROXY", "127.0.0.1:0")
             .env(variable, hold)
+            .envs(
+                std::env::var_os("VOX_MUTANT_PREFIX_PERSIST")
+                    .map(|on| ("VOX_MUTANT_PREFIX_PERSIST", on)),
+            )
             .stdin(Stdio::piped())
             .stdout(std::fs::File::create(dir.join(format!("daemon-{tag}.out"))).unwrap())
             .stderr(std::fs::File::create(dir.join(format!("daemon-{tag}.err"))).unwrap())
@@ -2751,8 +2763,62 @@ mod proof_rows {
         }
         (count, accepted)
     }
+    // A third member whose every head-bound request is hostile (ADR-053 P guards): it trusts and
+    // is trusted by both, joins the room through the author and runs with
+    // `VOX_TEST_CYCLE_TARGETS_FILE` on, so each of its asks names an unsigned target it does not
+    // hold: a forged root of its own head's size, a size past any holder, smaller sizes with
+    // forged roots, and a request it abandons once sent.
+    fn hostile_member(a: &Path, b: &Path, room: &str) -> (PathBuf, Daemon) {
+        let c = a.parent().expect("APPARATUS: scratch root").join("c");
+        std::fs::create_dir_all(c.join("cfg")).expect("APPARATUS: a profile directory");
+        let fingerprint = |dir: &Path| {
+            let (ok, out, err) = vox(dir, &["id"], None);
+            assert!(ok, "PRODUCT (staging): vox id: {err}");
+            out.trim().to_owned()
+        };
+        let (fa, fb, fc) = (fingerprint(a), fingerprint(b), fingerprint(&c));
+        // Each profile names each peer once: a and b already call each other "peer".
+        for (dir, peer, name) in [
+            (c.as_path(), &fa, "author"),
+            (c.as_path(), &fb, "receiver"),
+            (a, &fc, "hostile"),
+            (b, &fc, "hostile"),
+        ] {
+            let (ok, _, err) = attach::Root::at(dir, IDENTITY).ensure("default", || {
+                vox(dir, &["trust", "add", peer, "--name", name], None)
+            });
+            assert!(ok, "PRODUCT (staging): vox trust add: {err}");
+        }
+        std::fs::write(c.join("cycle-targets"), b"hostile asker").unwrap();
+        let cd = daemon(&c, "c", &format!("{IDENTITY}\n"));
+        attached(&c, "c");
+        let (ok, link, err) = vox(a, &["room", "link", room], None);
+        assert!(ok, "PRODUCT (staging): vox room link: {err}");
+        let (ok, _, err) = vox(
+            &c,
+            &["room", "join", "--passphrase-file", "-", link.trim()],
+            Some(&format!("{ROOMPASS}\n")),
+        );
+        assert!(ok, "PRODUCT (staging): the hostile member joins: {err}");
+        (c, cd)
+    }
+    // The hostile member's own count of what it asked, per variant (its test-knobs lines).
+    fn hostile_sent(c: &Path) -> std::collections::BTreeMap<String, usize> {
+        let mut sent = std::collections::BTreeMap::new();
+        for line in std::fs::read_to_string(c.join("daemon-c.err"))
+            .unwrap_or_default()
+            .lines()
+        {
+            if let Some(rest) = line.split("hostile target sent variant=").nth(1) {
+                let variant = rest.split_whitespace().next().unwrap_or_default();
+                *sent.entry(variant.to_owned()).or_default() += 1;
+            }
+        }
+        sent
+    }
     pub(super) fn fetch() {
         let (_tmp, a, b, ad, bd, room, id) = fresh();
+        let (c, _cd) = hostile_member(&a, &b, &room);
         // A hostile server: from here on the author serves every control proof with each
         // subtree without controls inside the asked interval expanded once more. Such a proof
         // verifies; the serving walk never visits those halves, so no row may keep them.
@@ -2824,6 +2890,10 @@ mod proof_rows {
         drop(ad);
         drop(bd);
         let held = (receipt_rows(&a, &id), receipt_rows(&b, &id));
+        // Context rows are owned by verification, never by serving (ADR-053 P rule 6): repeated
+        // exchanges, with the hostile member asking throughout, add none.
+        let contexts = |dir: &Path| counts(dir, &id).get(&0).copied().unwrap_or(0);
+        let held_contexts = (contexts(&a), contexts(&b));
         // The same exchange again and again: both restart, the receiver asks its author for
         // the newest history once more and both page everything back. Rows stay as they were.
         for again in 0..2 {
@@ -2875,10 +2945,27 @@ mod proof_rows {
                 "PRODUCT: restarting and repeating the exchange moved the ProofRange rows \
                  (author, receiver) from {held:?} to {again_rows:?}"
             );
+            let again_contexts = (contexts(&a), contexts(&b));
+            assert_eq!(
+                again_contexts, held_contexts,
+                "PRODUCT: restarting and repeating the exchange, with a hostile member asking, \
+                 moved the context rows (author, receiver) from {held_contexts:?} to \
+                 {again_contexts:?}"
+            );
             eprintln!(
-                "REPEATED exchange {again}: ProofRange rows (author, receiver) {again_rows:?}"
+                "REPEATED exchange {again}: ProofRange rows (author, receiver) {again_rows:?}; \
+                 context rows {again_contexts:?}; hostile asks so far {:?}",
+                hostile_sent(&c)
             );
         }
+        let sent = hostile_sent(&c);
+        assert!(
+            ["0", "1", "2", "3"]
+                .iter()
+                .all(|variant| sent.get(*variant).is_some_and(|n| *n > 0)),
+            "APPARATUS: the hostile member did not ask every hostile variant: {sent:?}"
+        );
+        eprintln!("HOSTILE asker: {sent:?} head-bound asks, all with targets it does not hold");
     }
     pub(super) fn cleanup() {
         let (_tmp, a, b, ad, bd, room, id) = fresh();

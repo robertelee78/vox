@@ -1020,12 +1020,17 @@ impl ChannelState {
         read.history_head(&id)
     }
 
+    /// A durable context, or one a serving reconstruction generated for an asked prefix and
+    /// still holds only in the serving cache (ADR-053 P). Both are content-addressed.
     pub(crate) fn history_context(
         &self,
         store: &Store,
         hash: &Digest32,
     ) -> Result<Option<ControlContext>> {
-        self.history_read(store)?.history_context(hash)
+        Ok(match self.history_read(store)?.history_context(hash)? {
+            Some(context) => Some(context),
+            None => entry_store::sparse::serving_context(&self.channel_id, hash),
+        })
     }
 
     pub(crate) fn history_header(
@@ -1101,30 +1106,35 @@ impl ChannelState {
 
     /// Metadata-only fallback: an exact sealed inclusion receipt can retain a signed header
     /// before its source/effect has reached the canonical position index. This never supplies
-    /// Entry/Page bodies or publishes a canonical position.
+    /// Entry/Page bodies or publishes a canonical position. The receipt is the resolved source
+    /// head's: its prefix through the asked size is the asked head's (ADR-053 P).
     pub(crate) fn history_proof_header(
         &self,
         store: &Store,
-        head: &SignedHead,
+        target: &super::ResolvedTarget,
         seq: u64,
     ) -> Result<Option<HistoryHeader>> {
         let read = self.history_read(store)?;
-        if let Some(entry) = read.history_position_header(&head.binding.author, seq)? {
+        let binding = target.target.binding;
+        if let Some(entry) = read.history_position_header(&binding.author, seq)? {
             return Ok(Some(HistoryHeader {
                 wire: entry.header_wire(),
             }));
         }
         let Some(included) =
-            read.history_inclusion_receipt(&head.id(), &head.binding.author, seq)?
+            read.history_inclusion_receipt(&target.source, &binding.author, seq)?
         else {
             return Ok(None);
         };
+        let source = read
+            .history_head(&target.source)?
+            .ok_or(Error::MalformedAtRest("proof header source head missing"))?;
         let entry = included.header().entry();
-        if included.head_id() != head.id()
-            || included.binding() != head.binding
-            || included.root() != head.root
+        if included.head_id() != target.source
+            || included.binding() != binding
+            || included.root() != source.root
             || entry.skeleton.channel_id != self.channel_id
-            || entry.skeleton.author_id != head.binding.author
+            || entry.skeleton.author_id != binding.author
             || entry.skeleton.seq != seq
         {
             return Err(Error::MalformedAtRest("proof header receipt binding"));

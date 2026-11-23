@@ -10065,6 +10065,42 @@ fn a_newcomer_reads_a_member_past_the_stopped_authors_control() {
     rg1::holder_serves_what_it_verified(rg1::Cited::AfterControl);
 }
 
+/// ADR-053 P (moving-head ruling §5): a holder serves a newcomer under the author's head the
+/// newcomer committed, which the holder skipped: it rebuilds that prefix from its own committed
+/// larger head. The author is stopped; the newcomer reads the holder's post from the holder
+/// alone. Mutant: `VOX_MUTANT_PREFIX_GATE=header|proof|entry` (that stage serves committed
+/// heads only; `proof` is all three proof kinds).
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "three real daemons, a skipped head, a stopped author and a restarted holder; optional"]
+fn a_newcomer_reads_from_a_holder_that_skipped_its_head_of_the_author() {
+    rg1::holder_serves_a_prefix_it_never_committed(rg1::Provider::Honest);
+}
+
+/// ADR-053 P guard (moving-head ruling §5): the same staging, but the holder corrupts one
+/// descriptor in every proof it serves under the newcomer's head, which it never committed.
+/// The newcomer shows and applies nothing from it, stays pending on the author, calls nothing a
+/// fork, and still reads the same holder in another room. Mutant: `VOX_MUTANT_ASKER_ROOT=1`
+/// (the newcomer's verifiers skip the root check): it shows the holder's post.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "three real daemons, a corrupting holder, a stopped author; optional"]
+fn a_newcomer_shows_nothing_a_corrupting_holder_serves_under_its_head() {
+    rg1::holder_serves_a_prefix_it_never_committed(rg1::Provider::Corrupt);
+}
+
+/// ADR-053 P guard (moving-head ruling §5): the same staging, but the holder is on another fork
+/// of the author (a copy of the author's profile from before the newcomer's head wrote other
+/// posts there) and answers under the newcomer's head with its own branch's prefix. The
+/// newcomer shows and applies nothing from it, stays pending, calls nothing a fork from those
+/// proofs, and still reads the same holder in another room. Mutant: `VOX_MUTANT_ASKER_ROOT=1`.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "three real daemons, a copied author on another fork, a stopped author; optional"]
+fn a_newcomer_shows_nothing_a_holder_on_another_fork_serves_under_its_head() {
+    rg1::holder_serves_a_prefix_it_never_committed(rg1::Provider::Forked);
+}
+
 #[cfg(feature = "optional-proofs")]
 #[path = "support/port_forward.rs"]
 mod port_forward;
@@ -10134,6 +10170,16 @@ mod rg1 {
     }
 
     fn start(w: &Worker, listen: &str, anchor: Option<&str>) -> Daemon {
+        start_with(w, listen, anchor, &[])
+    }
+
+    /// [`start`] with staging knob variables for this one daemon (a relay mode it runs in).
+    fn start_with(
+        w: &Worker,
+        listen: &str,
+        anchor: Option<&str>,
+        knobs: &[(&str, std::path::PathBuf)],
+    ) -> Daemon {
         std::fs::create_dir_all(w.data.with_extension("home"))
             .expect("APPARATUS: daemon scratch HOME");
         // Headless `node create` can auto-start this scratch computer's daemon.
@@ -10159,6 +10205,7 @@ mod rg1 {
                 std::env::vars_os()
                     .filter(|(name, _)| name.to_string_lossy().starts_with("VOX_MUTANT_")),
             )
+            .envs(knobs.iter().map(|(name, value)| (*name, value)))
             .stdout(Stdio::from(
                 std::fs::File::create(w.data.with_extension("out"))
                     .expect("APPARATUS: daemon stdout"),
@@ -11145,6 +11192,683 @@ mod rg1 {
                 started.elapsed() < Duration::from_secs(900),
                 "APPARATUS: NO RESULT after 900 s: neither the holder's post nor a wedge; \
                  shows {shown:?}; newcomer's room: {room}; lanes: {}",
+                report["lanes"]
+            );
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    /// Wait (staging) until `w` shows `text` in room `id`.
+    fn await_shown(w: &Worker, id: &str, text: &str) {
+        let staging = Instant::now();
+        while !read(w, id, Some(text)).0.contains(text) {
+            assert!(
+                staging.elapsed() < Duration::from_secs(600),
+                "APPARATUS: {} never showed {text:?}",
+                w.name
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    /// Who the holder is when the newcomer finally asks it (ADR-053 P acts).
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(super) enum Provider {
+        /// The availability act: an honest holder on the author's branch.
+        Honest,
+        /// A guard: a holder on the author's branch that corrupts one descriptor in every proof
+        /// it serves under a head it never committed (`VOX_TEST_BAD_PREFIX_FILE` = `corrupt`).
+        Corrupt,
+        /// A guard: a holder on another fork of the author (the author's profile copied before
+        /// it wrote the newcomer's head, writing other posts there) that answers under the
+        /// newcomer's head with its own branch's prefix (`VOX_TEST_BAD_PREFIX_FILE` = `fork`).
+        Forked,
+    }
+
+    /// ADR-053 P (moving-head ruling §5, the availability act). The newcomer N commits a head
+    /// n of the author A that the holder H never committed: H commits A's head n0, delivers its
+    /// key to N and posts at that view, then is held still while A writes on and N commits A's
+    /// head n > n0 from A. A serves N only heads, consistency proofs and contexts, and H serves
+    /// N nothing while staging (`VOX_TEST_HEADS_ONLY_FILE`), so N holds A's head and none of
+    /// its evidence. H then commits a larger head of A from n0, skipping n. A stops; H restarts
+    /// and refuses N its own newer head of A (`VOX_TEST_UNAVAILABLE_HEAD_FILE`), so N stays
+    /// anchored on n. From H alone N must verify, under n, the author's grants and H's package
+    /// and post (headers, inclusion, consistency, control coverage and the bodies they need),
+    /// apply them and read H's post. H's own stderr names each stage it served under a head it
+    /// never committed (`prefix resolved`): that is the assertion that H never committed n.
+    ///
+    /// The guards (`Provider::Corrupt`, `Provider::Forked`) stage the same newcomer and author
+    /// against a bad holder. The newcomer must neither show nor apply anything it served, stay
+    /// pending on the author under n (anchor unchanged, still needing the stopped author, with
+    /// the holder answering it more bad proofs or its holder rounds completing), call nothing a
+    /// fork, and read the same holder's honest post in a second room. Mutant:
+    /// `VOX_MUTANT_ASKER_ROOT=1`, passed to the newcomer alone as `VOX_TEST_ASKER_ROOT_MUTANT`:
+    /// its verifiers skip the root check.
+    pub(super) fn holder_serves_a_prefix_it_never_committed(provider: Provider) {
+        let root = root();
+        let exe = binary();
+        let author = room::worker_as(root.path(), "prefix-author", &exe);
+        let holder = room::worker_as(root.path(), "prefix-holder", &exe);
+        let reader = room::worker_as(root.path(), "prefix-reader", &exe);
+        let author_only = author.data.with_extension("heads-only");
+        let holder_only = holder.data.with_extension("heads-only");
+        let refuse_head = holder.data.with_extension("refuse-author-head");
+        for file in [&author_only, &holder_only] {
+            std::fs::write(file, reader.b32()).expect("APPARATUS: heads-only staging file");
+        }
+        let author_knobs = [("VOX_TEST_HEADS_ONLY_FILE", author_only.clone())];
+        let bad_prefix = holder.data.with_extension("bad-prefix");
+        let holder_knobs = [
+            ("VOX_TEST_HEADS_ONLY_FILE", holder_only.clone()),
+            ("VOX_TEST_UNAVAILABLE_HEAD_FILE", refuse_head.clone()),
+            ("VOX_TEST_BAD_PREFIX_FILE", bad_prefix.clone()),
+        ];
+        let reader_knobs: Vec<(&str, std::path::PathBuf)> =
+            std::env::var_os("VOX_MUTANT_ASKER_ROOT")
+                .map(|on| ("VOX_TEST_ASKER_ROOT_MUTANT", std::path::PathBuf::from(on)))
+                .into_iter()
+                .collect();
+        let mut author_daemon = start_with(&author, "127.0.0.1:0", None, &author_knobs);
+        let mut holder_daemon = start_with(&holder, "127.0.0.1:0", None, &holder_knobs);
+        let reader_daemon = start_with(&reader, "127.0.0.1:0", None, &reader_knobs);
+        let trust = |w: &Worker, peer: &Worker| {
+            w.vox_env(
+                None,
+                &[("VOX_IDENTITY_PASSPHRASE", room::ID_PASS)],
+                &["trust", "add", &peer.b32(), "--name", &peer.name],
+                None,
+            )
+            .expect_ok("trust before the room");
+        };
+        for (w, peer) in [
+            (&author, &holder),
+            (&holder, &author),
+            (&author, &reader),
+            (&reader, &author),
+            (&holder, &reader),
+            (&reader, &holder),
+        ] {
+            trust(w, peer);
+        }
+        let id = create(&author);
+        for n in 1..=6 {
+            post(&author, &id, &format!("PX-A-{n:02}"), true);
+        }
+        let link = author.vox(None, &["room", "link", &id]);
+        link.expect_ok("author room link");
+        holder
+            .vox_in(
+                None,
+                &["room", "join", "--passphrase-file", "-", link.stdout.trim()],
+                Some(room::ROOM_PASS),
+            )
+            .expect_ok("holder joins the author's room");
+        returning_reader_ready(&holder, &id);
+        await_shown(&holder, &id, "PX-A-06");
+        reader
+            .vox_in(
+                None,
+                &["room", "join", "--passphrase-file", "-", link.stdout.trim()],
+                Some(room::ROOM_PASS),
+            )
+            .expect_ok("newcomer joins through the author");
+        // H verifies the author's grant for N, delivers its own key to N and posts at that view.
+        let staging = Instant::now();
+        loop {
+            let row = member(&status(&holder, &id), &reader.b32()).cloned();
+            if row
+                .as_ref()
+                .is_some_and(|row| row["key_delivery_pending"] == false)
+            {
+                break;
+            }
+            assert!(
+                staging.elapsed() < Duration::from_secs(600),
+                "APPARATUS: the holder never delivered its key to the newcomer: {row:?}"
+            );
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        post(&holder, &id, "PX-H-for-the-newcomer", true);
+        // Every head of the author a daemon committed, from its own test-knobs stderr lines.
+        let committed = |w: &Worker, files: &[&str]| -> Vec<u64> {
+            let needle = format!("history head committed author={} size=", author.b32());
+            files
+                .iter()
+                .flat_map(|ext| {
+                    std::fs::read_to_string(w.data.with_extension(ext))
+                        .unwrap_or_default()
+                        .lines()
+                        .filter_map(|line| {
+                            line.split(&needle)
+                                .nth(1)?
+                                .split_whitespace()
+                                .next()?
+                                .parse()
+                                .ok()
+                        })
+                        .collect::<Vec<u64>>()
+                })
+                .collect()
+        };
+        let n0 = committed(&holder, &["err"]).into_iter().max();
+        eprintln!(
+            "[prefix] holder's view of the author when it posted: committed {n0:?}; {:?}",
+            member(&status(&holder, &id), &author.b32())
+        );
+        assert!(
+            n0.is_some(),
+            "APPARATUS: the holder never committed a head of the author"
+        );
+        // H is held still. A now serves N headers and inclusion past its current size, so N
+        // can commit A's next heads, and A writes on until N commits one that is not a power of
+        // two: n, which H never sees.
+        // The forked guard's base: A's profile as it stands now, before it writes n. H stops
+        // outright there, so no socket buffer carries A's next posts to it.
+        let fork_base = author.data.with_extension("fork-base");
+        let profile_dirs =
+            |w: &Worker| [w.data.clone(), w.cfg.clone(), w.data.with_extension("home")];
+        if provider == Provider::Forked {
+            signal(holder_daemon.0.id(), "-TERM");
+            let _ = holder_daemon.0.wait();
+            author_daemon.stop();
+            std::fs::create_dir_all(&fork_base).expect("APPARATUS: fork base directory");
+            for (at, dir) in profile_dirs(&author).iter().enumerate() {
+                let out = Command::new("cp")
+                    .arg("-Rp")
+                    .arg(dir)
+                    .arg(fork_base.join(at.to_string()))
+                    .output()
+                    .expect("APPARATUS: copy the author's profile");
+                assert!(out.status.success(), "APPARATUS: copy {dir:?}: {out:?}");
+            }
+            author_daemon = start_with(&author, "127.0.0.1:0", None, &author_knobs);
+        } else {
+            signal(holder_daemon.0.id(), "-STOP");
+        }
+        let floor = committed(&reader, &["err"])
+            .into_iter()
+            .chain(n0)
+            .chain(
+                member(&status(&reader, &id), &author.b32())
+                    .and_then(|row| row["advertised_through"].as_u64()),
+            )
+            .max()
+            .unwrap_or(0)
+            + 1;
+        std::fs::write(&author_only, format!("{} {floor}", reader.b32()))
+            .expect("APPARATUS: open the author's tip to the newcomer");
+        let mut extra = 0;
+        let n = loop {
+            extra += 1;
+            post(&author, &id, &format!("PX-A-skipped-{extra:02}"), true);
+            let staging = Instant::now();
+            let size = loop {
+                if let Some(size) = committed(&reader, &["err"])
+                    .into_iter()
+                    .max()
+                    .filter(|size| *size >= floor + extra - 1)
+                {
+                    break size;
+                }
+                assert!(
+                    staging.elapsed() < Duration::from_secs(240),
+                    "APPARATUS: the newcomer committed no head of the author at or past {floor} \
+                     after {extra} posts; see {}",
+                    reader.data.with_extension("err").display()
+                );
+                std::thread::sleep(Duration::from_millis(300));
+            };
+            if !size.is_power_of_two() {
+                break size;
+            }
+        };
+        reader_daemon.stop();
+        let n = committed(&reader, &["err"]).into_iter().max().unwrap_or(n);
+        eprintln!(
+            "[prefix] the newcomer committed the author's head of size {n} (the holder is held \
+             still at {n0:?}; the author's tip was opened to the newcomer from {floor})"
+        );
+        assert!(
+            !n.is_power_of_two(),
+            "APPARATUS: the newcomer's last head of the author has a power-of-two size {n}"
+        );
+        let holder_heads = if provider == Provider::Forked {
+            // A stops for good. Its copy from before n, the same identity, writes other posts
+            // from there: another fork of A, which only H, started again, reads.
+            author_daemon.stop();
+            let _ = std::fs::copy(
+                author.data.with_extension("err"),
+                author.data.with_extension("branch.err"),
+            );
+            let aside = author.data.with_extension("branch-aside");
+            std::fs::create_dir_all(&aside).expect("APPARATUS: the author's branch aside");
+            for (at, dir) in profile_dirs(&author).iter().enumerate() {
+                std::fs::rename(dir, aside.join(at.to_string()))
+                    .expect("APPARATUS: set the author's branch aside");
+                std::fs::rename(fork_base.join(at.to_string()), dir)
+                    .expect("APPARATUS: the author's fork base in place");
+            }
+            author_daemon = start_with(&author, "127.0.0.1:0", None, &[]);
+            let _ = std::fs::copy(
+                holder.data.with_extension("err"),
+                holder.data.with_extension("staged.err"),
+            );
+            holder_daemon = start_with(&holder, "127.0.0.1:0", None, &holder_knobs);
+            let mut forked = 0;
+            loop {
+                forked += 1;
+                assert!(
+                    forked <= 64,
+                    "APPARATUS: the holder committed no head of the author's fork past {n}"
+                );
+                let text = format!("PX-A-fork-{forked:02}");
+                post(&author, &id, &text, true);
+                await_shown(&holder, &id, &text);
+                if committed(&holder, &["err"])
+                    .into_iter()
+                    .any(|size| size > n)
+                {
+                    break;
+                }
+            }
+            committed(&holder, &["staged.err", "err"])
+        } else {
+            // A writes on while H is still held, then H resumes: its next head of A is past n.
+            post(&author, &id, "PX-A-after-1", true);
+            post(&author, &id, "PX-A-after-2", true);
+            signal(holder_daemon.0.id(), "-CONT");
+            await_shown(&holder, &id, "PX-A-after-2");
+            committed(&holder, &["err"])
+        };
+        eprintln!(
+            "[prefix] holder committed the author's heads {holder_heads:?} (the newcomer's is \
+             {n}); holder's view before the stop: {:?}",
+            member(&status(&holder, &id), &author.b32())
+        );
+        // On the forked guard H's heads are of A's other branch: one of size n there is not
+        // the newcomer's head (another root), so only a larger one is required.
+        assert!(
+            (provider == Provider::Forked || !holder_heads.contains(&n))
+                && holder_heads.iter().any(|size| *size > n),
+            "APPARATUS: the holder was to skip the newcomer's head {n} and commit a larger one: \
+             {holder_heads:?}"
+        );
+        author_daemon.stop();
+        eprintln!("[prefix] author stopped for the rest of the act");
+        std::fs::remove_file(&holder_only).expect("APPARATUS: end the holder's staging refusal");
+        std::fs::write(&refuse_head, format!("{} {}", author.b32(), reader.b32()))
+            .expect("APPARATUS: the holder keeps its newer head of the author from N");
+        match provider {
+            Provider::Honest => {}
+            Provider::Corrupt => std::fs::write(&bad_prefix, "corrupt")
+                .expect("APPARATUS: the holder corrupts what it serves under n"),
+            Provider::Forked => std::fs::write(&bad_prefix, "fork")
+                .expect("APPARATUS: the forked holder answers under n anyway"),
+        }
+        holder_daemon.stop();
+        let _ = std::fs::copy(
+            holder.data.with_extension("err"),
+            holder.data.with_extension("first.err"),
+        );
+        let _holder_daemon = start_with(&holder, "127.0.0.1:0", None, &holder_knobs);
+        returning_reader_ready(&holder, &id);
+        eprintln!("[prefix] holder restarted: no in-memory proof survives");
+        let _reader_daemon = start_with(&reader, "127.0.0.1:0", None, &reader_knobs);
+        if provider != Provider::Honest {
+            return bad_holder_verdict(provider, &author, &holder, &reader, &id, n, &committed);
+        }
+        // Every serving stage the holder names (`prefix resolved stage=`): Header, the three
+        // proof kinds, and Entry/Page bodies.
+        const STAGES: [&str; 5] = ["header", "inclusion", "consistency", "control", "entry"];
+        let wanted = "PX-H-for-the-newcomer";
+        let resolved = |stage: &str| {
+            let needle = format!(
+                "prefix resolved stage={stage} author={} size={n} ",
+                author.b32()
+            );
+            std::fs::read_to_string(holder.data.with_extension("err"))
+                .unwrap_or_default()
+                .lines()
+                .filter(|line| line.contains(&needle))
+                .count()
+        };
+        let started = Instant::now();
+        let mut wedge_samples = Vec::new();
+        loop {
+            let page = reader.vox(None, &["room", "read", &id, "--json", "--limit", "200"]);
+            let shown: BTreeSet<String> = if page.ok {
+                page.ndjson()
+                    .iter()
+                    .filter_map(|row| row["text"].as_str().map(str::to_owned))
+                    .collect()
+            } else {
+                BTreeSet::new()
+            };
+            let report = reader.vox(None, &["status", "--json"]);
+            report.expect_ok("newcomer status");
+            let report = report.json();
+            let room = report["rooms"]
+                .as_array()
+                .and_then(|rows| rows.iter().find(|row| row["id"].as_str() == Some(&id)))
+                .cloned()
+                .unwrap_or(Value::Null);
+            if shown.contains(wanted) {
+                let row = member(&room, &holder.b32()).cloned().unwrap_or(Value::Null);
+                let stages: BTreeMap<&str, usize> = STAGES
+                    .into_iter()
+                    .map(|stage| (stage, resolved(stage)))
+                    .collect();
+                eprintln!(
+                    "[prefix] newcomer shows {shown:?}; holder row: {row}; author row: {}; the \
+                     holder served under the author's head of size {n} it never committed: \
+                     {stages:?}",
+                    member(&room, &author.b32()).cloned().unwrap_or(Value::Null)
+                );
+                assert!(
+                    row["trusted"] == true,
+                    "RED PRODUCT: the newcomer shows the holder's post but does not report \
+                     trusting it: {row}"
+                );
+                let holder_heads = committed(&holder, &["first.err", "err"]);
+                assert!(
+                    !holder_heads.contains(&n),
+                    "APPARATUS: the holder committed the newcomer's head {n} after all: \
+                     {holder_heads:?}"
+                );
+                assert!(
+                    stages.values().all(|count| *count > 0),
+                    "APPARATUS: the newcomer read the holder's post, but this staging did not make \
+                     the holder serve every stage ({STAGES:?}) under the author's head \
+                     of size {n}: {stages:?}; see {}",
+                    holder.data.with_extension("err").display()
+                );
+                eprintln!(
+                    "GREEN: with the author stopped, the newcomer anchored on the author's head \
+                     of size {n}, which the holder never committed, reads the holder's post \
+                     from the holder alone"
+                );
+                return;
+            }
+            let ports = report["lanes"]["ports"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let port = |peer: &str| {
+                ports
+                    .iter()
+                    .find(|port| port["peer"].as_str() == Some(peer))
+                    .cloned()
+                    .unwrap_or(Value::Null)
+            };
+            let row = member(&room, &holder.b32()).cloned().unwrap_or(Value::Null);
+            let unverified = row["advertised_through"]
+                .as_u64()
+                .is_some_and(|advertised| {
+                    row["verified_through"].as_u64().unwrap_or(0) < advertised
+                });
+            let idle = ports
+                .iter()
+                .filter(|port| port["peer"].as_str() != Some(&author.b32()))
+                .all(|port| {
+                    port["needs"] == false
+                        && port["queued"] == false
+                        && port["round_running"] == false
+                });
+            let needs_author =
+                port(&author.b32())["needs"] == true && port(&author.b32())["connected"] != true;
+            let sample = report["sync"].as_array().and_then(|rows| {
+                rows.iter()
+                    .find(|sync| {
+                        sync["room"].as_str() == Some(&id)
+                            && sync["peer"].as_str() == Some(&holder.b32())
+                    })
+                    .and_then(|sync| {
+                        Some((
+                            row["verified_through"].as_u64()?,
+                            sync["fetched_completed"].as_u64()?,
+                        ))
+                    })
+            });
+            if unverified && idle && needs_author {
+                if let Some(sample) = sample {
+                    wedge_samples.push(sample);
+                    if wedge_samples.len() > 3 {
+                        wedge_samples.remove(0);
+                    }
+                } else {
+                    wedge_samples.clear();
+                }
+            } else {
+                wedge_samples.clear();
+            }
+            if wedge_samples.len() == 3
+                && wedge_samples
+                    .iter()
+                    .all(|sample| sample.0 == wedge_samples[0].0)
+                && wedge_samples[2].1 > wedge_samples[0].1
+            {
+                panic!(
+                    "RED PRODUCT: the newcomer anchored on the author's head of size {n} does not \
+                     show {wanted:?} (shows {shown:?}) and, in three status answers in a row, \
+                     wants nothing from the holder it reaches while it needs only the stopped \
+                     author, despite completed holder rounds advancing with verified position \
+                     flat: {wedge_samples:?}. Holder row: {row}; port toward the holder: {}; \
+                     port toward the author: {}; holder resolutions under size {n}: {:?}",
+                    port(&holder.b32()),
+                    port(&author.b32()),
+                    STAGES
+                        .into_iter()
+                        .map(|stage| (stage, resolved(stage)))
+                        .collect::<BTreeMap<_, _>>()
+                );
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(900),
+                "APPARATUS: NO RESULT after 900 s: neither the holder's post nor a wedge; \
+                 shows {shown:?}; newcomer's room: {room}; lanes: {}",
+                report["lanes"]
+            );
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    /// The P guards' verdict (`Provider::Corrupt`, `Provider::Forked`), with the bad holder and
+    /// the newcomer N, anchored on the author's head n, running and the author stopped. Every
+    /// post in the author's room cites the author's grants, so all of them wait on the same
+    /// prefix of the author; the unrelated sender is the same holder in a second room it makes
+    /// now, whose key it delivers to N. RED if N shows anything in the author's room, calls the
+    /// author's history a fork, or commits another head of the author. GREEN when, in three
+    /// status answers in a row, N still needs the stopped author while the holder has answered
+    /// it bad proofs under n and keeps answering (or N's holder rounds keep completing), and N
+    /// reads the holder's post in the second room.
+    fn bad_holder_verdict(
+        provider: Provider,
+        author: &Worker,
+        holder: &Worker,
+        reader: &Worker,
+        id: &str,
+        n: u64,
+        committed: &dyn Fn(&Worker, &[&str]) -> Vec<u64>,
+    ) {
+        let ids = |w: &Worker| -> BTreeSet<String> {
+            let out = w.vox(None, &["status", "--json"]);
+            out.expect_ok("room ids");
+            out.json()["rooms"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|row| row["id"].as_str().map(str::to_owned))
+                .collect()
+        };
+        let before = ids(holder);
+        holder
+            .vox_in(
+                None,
+                &[
+                    "room",
+                    "create",
+                    "--name",
+                    "unrelated",
+                    "--passphrase-file",
+                    "-",
+                ],
+                Some(room::ROOM_PASS),
+            )
+            .expect_ok("the holder makes a second room");
+        let second = ids(holder)
+            .difference(&before)
+            .next()
+            .cloned()
+            .expect("APPARATUS: the holder's second room");
+        let link = holder.vox(None, &["room", "link", &second]);
+        link.expect_ok("second room link");
+        reader
+            .vox_in(
+                None,
+                &["room", "join", "--passphrase-file", "-", link.stdout.trim()],
+                Some(room::ROOM_PASS),
+            )
+            .expect_ok("the newcomer joins the holder's second room");
+        let staging = Instant::now();
+        loop {
+            let row = member(&status(holder, &second), &reader.b32()).cloned();
+            if row
+                .as_ref()
+                .is_some_and(|row| row["key_delivery_pending"] == false)
+            {
+                break;
+            }
+            assert!(
+                staging.elapsed() < Duration::from_secs(600),
+                "APPARATUS: the holder never delivered its second room's key to the newcomer: \
+                 {row:?}"
+            );
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        let unrelated = "UR-H-unrelated";
+        post(holder, &second, unrelated, true);
+        // The holder's own count of what it served badly under n, per proof kind or stage.
+        let bad = || -> BTreeMap<String, usize> {
+            let size = format!(" size={n}");
+            let mut served = BTreeMap::new();
+            for line in std::fs::read_to_string(holder.data.with_extension("err"))
+                .unwrap_or_default()
+                .lines()
+                .filter(|line| line.ends_with(&size))
+            {
+                if let Some(rest) = line.split("vox: bad prefix served ").nth(1) {
+                    let what = rest
+                        .split_whitespace()
+                        .take(2)
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    *served.entry(what).or_default() += 1;
+                }
+            }
+            served
+        };
+        let texts = |room: &str| -> BTreeSet<String> {
+            let page = reader.vox(None, &["room", "read", room, "--json", "--limit", "200"]);
+            if !page.ok {
+                return BTreeSet::new();
+            }
+            page.ndjson()
+                .iter()
+                .filter_map(|row| row["text"].as_str().map(str::to_owned))
+                .collect()
+        };
+        let started = Instant::now();
+        let mut samples: Vec<(usize, u64)> = Vec::new();
+        loop {
+            let shown = texts(id);
+            let served = bad();
+            let total: usize = served.values().sum();
+            assert!(
+                shown.is_empty(),
+                "RED PRODUCT: the newcomer shows {shown:?} in the author's room, which only the \
+                 {provider:?} holder could have served under the author's head of size {n}; the \
+                 holder's bad answers under {n}: {served:?}"
+            );
+            let report = reader.vox(None, &["status", "--json"]);
+            report.expect_ok("newcomer status");
+            let report = report.json();
+            let forks: Vec<Value> = report["equivocations"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|fork| fork["room"].as_str() == Some(id))
+                .cloned()
+                .collect();
+            assert!(
+                forks.is_empty(),
+                "RED PRODUCT: the newcomer calls a fork from the {provider:?} holder's answers: \
+                 {forks:?}; the holder's bad answers under {n}: {served:?}"
+            );
+            let anchors = committed(reader, &["err"]);
+            assert!(
+                anchors.iter().all(|size| *size == n),
+                "RED PRODUCT: the newcomer moved its anchor on the author from {n}: since its \
+                 restart it committed the author's heads {anchors:?}"
+            );
+            let room = report["rooms"]
+                .as_array()
+                .and_then(|rows| rows.iter().find(|row| row["id"].as_str() == Some(id)))
+                .cloned()
+                .unwrap_or(Value::Null);
+            let author_port = report["lanes"]["ports"]
+                .as_array()
+                .and_then(|ports| {
+                    ports
+                        .iter()
+                        .find(|port| port["peer"].as_str() == Some(&author.b32()))
+                })
+                .cloned()
+                .unwrap_or(Value::Null);
+            let needs_author = author_port["needs"] == true && author_port["connected"] != true;
+            let fetched = report["sync"]
+                .as_array()
+                .and_then(|rows| {
+                    rows.iter().find(|sync| {
+                        sync["room"].as_str() == Some(id)
+                            && sync["peer"].as_str() == Some(&holder.b32())
+                    })
+                })
+                .and_then(|sync| sync["fetched_completed"].as_u64())
+                .unwrap_or(0);
+            if needs_author {
+                samples.push((total, fetched));
+                if samples.len() > 3 {
+                    samples.remove(0);
+                }
+            } else {
+                samples.clear();
+            }
+            let unrelated_shown = texts(&second).contains(unrelated);
+            if samples.len() == 3
+                && unrelated_shown
+                && samples[0].0 > 0
+                && (samples[2].0 > samples[0].0 || samples[2].1 > samples[0].1)
+            {
+                eprintln!(
+                    "[prefix] the {provider:?} holder's bad answers under the author's head of \
+                     size {n}: {served:?}; newcomer samples (bad answers, completed holder \
+                     rounds): {samples:?}; holder row: {}; port toward the author: \
+                     {author_port}; second room shows {unrelated:?}",
+                    member(&room, &holder.b32()).cloned().unwrap_or(Value::Null)
+                );
+                eprintln!(
+                    "GREEN: the newcomer anchored on the author's head of size {n} shows nothing \
+                     the {provider:?} holder served under it, calls nothing a fork, keeps its \
+                     anchor and still needs the stopped author, and reads the same holder's post \
+                     in another room"
+                );
+                return;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(900),
+                "APPARATUS: NO RESULT after 900 s: samples {samples:?}; the holder's bad answers \
+                 under {n}: {served:?}; second room read {unrelated_shown}; newcomer's room: \
+                 {room}; lanes: {}",
                 report["lanes"]
             );
             std::thread::sleep(Duration::from_millis(500));
