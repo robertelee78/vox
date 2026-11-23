@@ -48,6 +48,8 @@
 //! R14 deleting every superseded generation whatever V210-45 still owes (as the merge had it) →
 //! D and B each read 3 of the six: generation one's key was gone before either joined.
 
+// The optional relay act reuses room/world's attachment and typed-command modules.
+#![cfg_attr(feature = "optional-proofs", allow(clippy::duplicate_mod))]
 #![cfg(unix)]
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
@@ -1042,4 +1044,479 @@ fn an_abandoned_key_request_is_selected_again() {
     );
     b.stop();
     a.stop();
+}
+
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(a_delayed_relay_keeps_up_with_a_two_per_second_author);
+
+#[cfg(feature = "optional-proofs")]
+#[path = "support/room.rs"]
+mod room;
+#[cfg(feature = "optional-proofs")]
+#[path = "support/world.rs"]
+mod world;
+
+/// A small, counted sync measurement; no product setting creates its latency.
+#[cfg(feature = "optional-proofs")]
+mod delayed_relay {
+    use super::*;
+    use room::{Out, Worker};
+    use serde_json::Value;
+    use std::collections::BTreeSet;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const POSTS: usize = 300;
+    // RG-6's two mutants: the newer-head cut restored, and the boundary re-selection skipped.
+    const MUTANTS: [&str; 2] = [
+        "VOX_MUTANT_FETCH_DISCARD",
+        "VOX_MUTANT_BOUNDARY_RESELECT_OFF",
+    ];
+    // The same per-client, dual-family UDP forwarding recipe as RcaWedge/udpdelay.py.
+    // Every datagram spends at least 75 ms in each direction of each member's anchor hop.
+    const FORWARDER: &str = r#"
+import heapq, selectors, socket, sys, time
+upstream = ('127.0.0.1', int(sys.argv[1]))
+sel, clients, owners, queue = selectors.DefaultSelector(), {}, {}, []
+serial, counts, minimum = 0, [0, 0], [999999., 999999.]
+fronts = []
+for family, host in [(socket.AF_INET, '127.0.0.1'), (socket.AF_INET6, '::1')]:
+    s = socket.socket(family, socket.SOCK_DGRAM)
+    if family == socket.AF_INET6:
+        s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+    s.bind((host, 0)); s.setblocking(False)
+    sel.register(s, selectors.EVENT_READ, ('front', s)); fronts.append(s)
+print('ready', fronts[0].getsockname()[1], fronts[1].getsockname()[1], flush=True)
+last = time.monotonic()
+while True:
+    now = time.monotonic()
+    wait = max(0., min(.05, queue[0][0] - now)) if queue else .05
+    for key, _ in sel.select(wait):
+        kind, s = key.data
+        while True:
+            try:
+                if kind == 'front':
+                    data, address = s.recvfrom(65535)
+                    identity = (s.fileno(), address)
+                    if identity not in clients:
+                        u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                        u.connect(upstream); u.setblocking(False)
+                        clients[identity] = u; owners[u.fileno()] = (s, address)
+                        sel.register(u, selectors.EVENT_READ, ('up', u))
+                    target, address, direction = clients[identity], None, 0
+                else:
+                    data = s.recv(65535)
+                    target, address = owners[s.fileno()]
+                    direction = 1
+            except BlockingIOError:
+                break
+            serial += 1
+            arrived = time.monotonic()
+            heapq.heappush(queue, (arrived + .075, serial, target, address, data, direction, arrived))
+    now = time.monotonic()
+    while queue and queue[0][0] <= now:
+        _, _, s, address, data, direction, arrived = heapq.heappop(queue)
+        try:
+            s.send(data) if address is None else s.sendto(data, address)
+        except OSError as error:
+            print('APPARATUS forward failed', error, flush=True); raise
+        counts[direction] += 1
+        minimum[direction] = min(minimum[direction], time.monotonic() - arrived)
+    if now - last >= 1:
+        print('delay', *counts, *(round(n * 1000, 3) for n in minimum), flush=True)
+        last = now
+"#;
+
+    struct ChildGuard(Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn accepted(out: Out) -> Out {
+        assert!(out.code.is_some(), "APPARATUS: command killed: {out:?}");
+        out.expect_ok("delayed relay command");
+        out
+    }
+
+    fn status(w: &Worker) -> Value {
+        let out = accepted(w.vox(None, &["status", "--json"]));
+        let all = out.json();
+        all["rooms"]
+            .as_array()
+            .and_then(|rows| rows.first())
+            .expect("APPARATUS: measurement room status")
+            .clone()
+    }
+
+    // This measurement needs the authenticated contiguous feed, not sparse retained rows.
+    // RG-7 calls it verified_through; older measurement trees call it holds_through.
+    fn held(status: &Value, author: &str) -> u64 {
+        let row = status["members"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["id"] == author))
+            .expect("APPARATUS: reader status names author");
+        row["verified_through"]
+            .as_u64()
+            .or_else(|| row["holds_through"].as_u64())
+            .expect("APPARATUS: contiguous feed position")
+    }
+
+    fn read(w: &Worker, id: &str) -> BTreeSet<String> {
+        let mut before = None::<String>;
+        let mut cursors = BTreeSet::new();
+        let mut texts = BTreeSet::new();
+        for page in 1.. {
+            let mut args = vec!["room", "read", id, "--json", "--limit", "200"];
+            if let Some(cursor) = before.as_deref() {
+                args.extend(["--before", cursor]);
+            }
+            let out = accepted(w.vox(None, &args));
+            for row in out.ndjson() {
+                if let Some(text) = row["text"].as_str() {
+                    texts.insert(text.to_owned());
+                }
+            }
+            let next = out
+                .stderr
+                .lines()
+                .find(|line| line.contains("older messages not shown:"))
+                .map(|line| {
+                    line.split_whitespace()
+                        .collect::<Vec<_>>()
+                        .windows(2)
+                        .find(|pair| pair[0] == "--before")
+                        .expect("APPARATUS: pageable footer")[1]
+                        .trim_matches(['\'', '"'])
+                        .to_owned()
+                });
+            eprintln!("[RG6 page] {} page={page} next={next:?}", w.name);
+            let Some(next) = next else { return texts };
+            assert!(
+                cursors.insert(next.clone()),
+                "APPARATUS: repeated paging cursor"
+            );
+            before = Some(next);
+        }
+        unreachable!()
+    }
+
+    fn start(w: &Worker, listen: &str, anchor: &str) -> ChildGuard {
+        room::reap_daemon(&w.data);
+        let mut command = Command::new(&w.exe);
+        room::strip_harness_env(&mut command);
+        let mut daemon = ChildGuard(
+            command
+                .args([
+                    "daemon",
+                    "--node",
+                    &w.name,
+                    "--listen",
+                    listen,
+                    "--anchor",
+                    anchor,
+                    "--passphrase-file",
+                ])
+                .arg(&w.pass)
+                .env("VOX_DATA_DIR", &w.data)
+                .env("VOX_CONFIG_DIR", &w.cfg)
+                .env("HOME", w.data.with_extension("home"))
+                .env("VOX_PROXY", "127.0.0.1:0")
+                // RG-6's mutant switches, forwarded as the knobs the daemon reads.
+                .envs(
+                    MUTANTS
+                        .iter()
+                        .filter_map(|name| std::env::var_os(name).map(|v| (*name, v))),
+                )
+                .stdin(Stdio::null())
+                .stdout(std::fs::File::create(w.data.with_extension("out")).unwrap())
+                .stderr(std::fs::File::create(w.data.with_extension("err")).unwrap())
+                .spawn()
+                .expect("APPARATUS: serving daemon"),
+        );
+        let since = Instant::now();
+        while !world::daemon_lock(&w.data).exists() {
+            assert!(
+                daemon.0.try_wait().unwrap().is_none() && since.elapsed().as_secs() < 120,
+                "APPARATUS: serving daemon did not acquire its scratch lock"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        loop {
+            if w.vox(None, &["room", "list"]).ok {
+                assert_eq!(
+                    world::daemon_pid(&w.data),
+                    Some(daemon.0.id()),
+                    "APPARATUS: foreground pid must serve this scratch profile"
+                );
+                return daemon;
+            }
+            assert!(
+                since.elapsed().as_secs() < 120,
+                "APPARATUS: daemon not ready"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    #[test]
+    #[ignore = "optional counted delayed-relay measurement; run ALONE"]
+    fn a_delayed_relay_keeps_up_with_a_two_per_second_author() {
+        watchdog::arm();
+        let tmp = room::diagnostic_tempdir();
+        eprintln!(
+            "[RG6] scratch={} author=2/s maximum={POSTS}",
+            tmp.path().display()
+        );
+        let (_anchor, spec) = room::spawn_anchor(tmp.path());
+        let upstream = world::spec_addr(&spec);
+        let mut emulator = ChildGuard(
+            Command::new("python3")
+                .args(["-u", "-c", FORWARDER, &upstream.port().to_string()])
+                .stdout(Stdio::piped())
+                .stderr(std::fs::File::create(tmp.path().join("emulator.err")).unwrap())
+                .spawn()
+                .expect("APPARATUS: UDP delay emulator"),
+        );
+        let output = collect(emulator.0.stdout.take().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (v4, v6) = loop {
+            let ready = output
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|line| line.starts_with("ready "))
+                .cloned();
+            if let Some(line) = ready {
+                let words: Vec<_> = line.split_whitespace().collect();
+                break (
+                    words[1].parse::<u16>().unwrap(),
+                    words[2].parse::<u16>().unwrap(),
+                );
+            }
+            assert!(Instant::now() < deadline, "APPARATUS: emulator not ready");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let a_spec = world::respec(&spec, format!("127.0.0.1:{v4}").parse().unwrap());
+        let b_spec = world::respec(&spec, format!("[::1]:{v6}").parse().unwrap());
+        let author = room::named_worker_as(tmp.path(), "author", "author", VOX);
+        let reader = room::named_worker_as(tmp.path(), "reader", "reader", VOX);
+        let _a = start(&author, "127.0.0.1:0", &a_spec);
+        let _b = start(&reader, "[::1]:0", &b_spec);
+        accepted(author.vox_in(
+            None,
+            &[
+                "room",
+                "create",
+                "--name",
+                "relay-count",
+                "--passphrase-file",
+                "-",
+            ],
+            Some(&format!("{}\n", room::ROOM_PASS)),
+        ));
+        let id = author
+            .vox(None, &["room", "list"])
+            .stdout
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_owned();
+        let link_out = accepted(author.vox(None, &["room", "link", &id]));
+        let link = link_out
+            .stdout
+            .lines()
+            .find(|line| line.starts_with("vox://"))
+            .unwrap();
+        accepted(reader.vox_in(
+            None,
+            &["room", "join", "--passphrase-file", "-", link],
+            Some(&format!("{}\n", room::ROOM_PASS)),
+        ));
+        // The typed-command stand-in also needs the empty headless passphrase explicitly.
+        accepted(author.vox(
+            None,
+            &[
+                "trust",
+                "add",
+                &reader.b32(),
+                "--name",
+                "reader",
+                "--identity-passphrase-file",
+                author.pass.to_str().unwrap(),
+            ],
+        ));
+        accepted(reader.vox(
+            None,
+            &[
+                "trust",
+                "add",
+                &author.b32(),
+                "--name",
+                "author",
+                "--identity-passphrase-file",
+                reader.pass.to_str().unwrap(),
+            ],
+        ));
+        for w in [&author, &reader] {
+            accepted(w.vox(None, &["room", "post", &id, &format!("ready-{}", w.name)]));
+        }
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            if read(&reader, &id).contains("ready-author")
+                && read(&author, &id).contains("ready-reader")
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "APPARATUS: quiet relay did not establish readable keys both ways"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let relay_log = format!(
+            "{}\n{}",
+            std::fs::read_to_string(tmp.path().join("anchor.out")).unwrap(),
+            std::fs::read_to_string(tmp.path().join("anchor.err")).unwrap()
+        );
+        let reader_status = status(&reader);
+        eprintln!("[RG6 route] reader={reader_status}; anchor={relay_log}");
+        assert!(
+            relay_log.lines().any(|line| line
+                .split_once(" circuit(s) carried")
+                .and_then(|(prefix, _)| prefix.split_whitespace().next_back())
+                .and_then(|n| n.parse::<usize>().ok())
+                .is_some_and(|n| n > 0)),
+            "APPARATUS: anchor did not report carrying a relay circuit: {relay_log}"
+        );
+        let stop = AtomicBool::new(false);
+        let acknowledged = Mutex::new(Vec::<u64>::new());
+        let failure = Mutex::new(None::<String>);
+        let progress = std::thread::scope(|scope| {
+            let poster = scope.spawn(|| {
+                let start = Instant::now();
+                for n in 1..=POSTS {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let due = start + Duration::from_millis((n as u64 - 1) * 500);
+                    if let Some(wait) = due.checked_duration_since(Instant::now()) {
+                        std::thread::sleep(wait);
+                    }
+                    if Instant::now().saturating_duration_since(due) > Duration::from_secs(1) {
+                        *failure.lock().unwrap() =
+                            Some("APPARATUS: 2/s posting cadence not attained".into());
+                        break;
+                    }
+                    let out = author.vox(None, &["room", "post", &id, &format!("rg6-post-{n:04}")]);
+                    if !out.ok {
+                        *failure.lock().unwrap() = Some(format!(
+                            "{}: post {n} refused: {out:?}",
+                            if out.code.is_none() {
+                                "APPARATUS"
+                            } else {
+                                "PRODUCT"
+                            }
+                        ));
+                        break;
+                    }
+                    let through = status(&author)["own_feed_through"]
+                        .as_u64()
+                        .expect("APPARATUS: author feed position");
+                    acknowledged.lock().unwrap().push(through);
+                    eprintln!(
+                        "[RG6 ACK] post={n} feed_seq={through} at_ms={}",
+                        start.elapsed().as_millis()
+                    );
+                }
+            });
+            let deadline = Instant::now() + Duration::from_secs(240);
+            let outcome = loop {
+                let texts = read(&reader, &id);
+                let ack = acknowledged.lock().unwrap().clone();
+                let newest = (1..=ack.len())
+                    .rev()
+                    .find(|n| texts.contains(&format!("rg6-post-{n:04}")))
+                    .unwrap_or(0);
+                let shown = (1..=ack.len())
+                    .filter(|n| texts.contains(&format!("rg6-post-{n:04}")))
+                    .count();
+                let raw = held(&status(&reader), &author.b32());
+                let count = ack.iter().filter(|seq| **seq <= raw).count();
+                eprintln!("[RG6 count] reader shows {shown} of {}; feed held through {count} of {}; raw_seq={raw}; latest_shown={newest}", ack.len(), ack.len());
+                if failure.lock().unwrap().is_some() {
+                    break (false, false);
+                }
+                if ack.len().saturating_sub(newest) >= 100 {
+                    eprintln!("[RG6 starvation] PRODUCT: author acknowledged {} further posts after last shown post {newest}; reader shows {shown} of {}; feed held through {count} of {}; raw_seq={raw}",
+                        ack.len() - newest, ack.len(), ack.len());
+                    break (false, false);
+                }
+                if ack.len() == POSTS && newest == POSTS {
+                    break (shown == POSTS, false);
+                }
+                if Instant::now() >= deadline {
+                    break (false, true);
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            };
+            stop.store(true, Ordering::Relaxed);
+            poster.join().expect("APPARATUS: poster panicked");
+            outcome
+        });
+        let texts = read(&reader, &id);
+        let own = read(&author, &id);
+        let ack = acknowledged.lock().unwrap();
+        let raw = held(&status(&reader), &author.b32());
+        let count = ack.iter().filter(|seq| **seq <= raw).count();
+        let shown = (1..=ack.len())
+            .filter(|n| texts.contains(&format!("rg6-post-{n:04}")))
+            .count();
+        let author_shown = (1..=ack.len())
+            .filter(|n| own.contains(&format!("rg6-post-{n:04}")))
+            .count();
+        let delays = output.lock().unwrap().clone();
+        std::fs::write(tmp.path().join("emulator.out"), delays.join("\n")).unwrap();
+        assert!(
+            emulator.0.try_wait().unwrap().is_none()
+                && delays.iter().any(|line| {
+                    let words: Vec<_> = line.split_whitespace().collect();
+                    words.len() == 5
+                        && words[0] == "delay"
+                        && words[1].parse::<u64>().unwrap_or(0) > 0
+                        && words[2].parse::<u64>().unwrap_or(0) > 0
+                        && words[3].parse::<f64>().unwrap_or(0.) >= 75.
+                        && words[4].parse::<f64>().unwrap_or(0.) >= 75.
+                }),
+            "APPARATUS: delay not attained: {delays:?}"
+        );
+        for name in MUTANTS
+            .iter()
+            .filter(|name| std::env::var_os(name).is_some())
+        {
+            let engaged = [&author, &reader].iter().find_map(|w| {
+                std::fs::read_to_string(w.data.with_extension("err"))
+                    .ok()?
+                    .lines()
+                    .find(|line| line.contains(&format!("{name} engaged")))
+                    .map(|line| format!("{}: {line}", w.name))
+            });
+            eprintln!("[RG6 mutant] {engaged:?}");
+            assert!(
+                engaged.is_some(),
+                "APPARATUS: {name} was set but no daemon said it engaged"
+            );
+        }
+        let failure = failure.lock().unwrap();
+        let apparatus = progress.1 || failure.as_ref().is_some_and(|s| s.starts_with("APPARATUS"));
+        let green =
+            progress.0 && failure.is_none() && shown == ack.len() && author_shown == ack.len();
+        let verdict = format!("{} {}: reader shows {shown} of {}; author shows {author_shown} of {}; feed held through {count} of {}; raw_seq={raw}; last-post deadman={}; failure={failure:?}",
+            if green { "GREEN" } else { "RED" }, if apparatus { "APPARATUS" } else { "PRODUCT" },
+            ack.len(), ack.len(), ack.len(), progress.1);
+        eprintln!("{verdict}");
+        assert!(green, "{verdict}");
+    }
 }

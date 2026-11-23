@@ -82,6 +82,7 @@
 mod optional_proof;
 optional_proof::not_run!(
     a_newcomer_trusted_before_every_post_reads_all_of_them,
+    a_newcomer_who_keeps_posting_is_trusted_back_on_a_slow_path,
     a_newcomer_talks_both_ways_at_one_wait_fresh_or_behind_a_backlog,
     hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port,
     a_quiet_room_costs_no_rounds_and_says_when_it_last_synced,
@@ -232,7 +233,8 @@ fn daemon_env(dir: &Path, tag: &str, env: &[(&str, &str)]) -> Daemon {
     daemon_with(dir, tag, &[], env)
 }
 
-/// The same, with more shipped daemon arguments (`--no-node`, for a multi-node host).
+/// The same, with more shipped daemon arguments (`--no-node`, for a multi-node host; a `--listen`
+/// of its own replaces the loopback default).
 fn daemon_with(dir: &Path, tag: &str, args: &[&str], env: &[(&str, &str)]) -> Daemon {
     let file = |kind: &str| {
         let at = dir.join(format!("daemon-{tag}.{kind}"));
@@ -240,8 +242,11 @@ fn daemon_with(dir: &Path, tag: &str, args: &[&str], env: &[(&str, &str)]) -> Da
             .unwrap_or_else(|e| panic!("APPARATUS: could not create {}: {e}", at.display()))
     };
     let mut cmd = Command::new(VOX);
-    cmd.args(["daemon", "--listen", "127.0.0.1:0"])
-        .args(args)
+    cmd.arg("daemon");
+    if !args.contains(&"--listen") {
+        cmd.args(["--listen", "127.0.0.1:0"]);
+    }
+    cmd.args(args)
         .env("VOX_DATA_DIR", dir)
         .env("VOX_CONFIG_DIR", dir.join("cfg"))
         .env_remove("VOX_ROOM");
@@ -1348,6 +1353,214 @@ fn a_newcomer_talks_both_ways_at_one_wait_fresh_or_behind_a_backlog() {
          {READY_WITHIN:?} whether the room is fresh or carrying a backlog (ADR-037 R1); over the \
          bound: {late:?}; every room: {measured:?}"
     );
+}
+
+/// Posts the newcomer makes, twice a second, from its join.
+#[cfg(feature = "optional-proofs")]
+const KEEP_POSTING: usize = 100;
+/// How long the proof's port forward holds each datagram from the newcomer to the member.
+#[cfg(feature = "optional-proofs")]
+const SLOW_PATH: Duration = Duration::from_millis(150);
+/// The mutant switch the daemon reads (ADR-052 RG-6): a fetch whose author posted again is cut.
+#[cfg(feature = "optional-proofs")]
+const FETCH_DISCARD_MUTANT: &str = "VOX_MUTANT_FETCH_DISCARD";
+
+/// A room member's trust sentence about `member` in `vox agent doctor --room <room> --json`, or
+/// what doctor says instead while the room or the member is not listed yet (a join returns before
+/// every side lists every member, and that state is observed, never a red).
+#[cfg(feature = "optional-proofs")]
+fn doctor_trust(dir: &Path, reader: &str, room: &str, member: &str) -> String {
+    let (_, out, err) = vox(dir, &["agent", "doctor", "--room", room, "--json"], None);
+    let report: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|error| {
+        panic!("PRODUCT: {reader}'s `vox agent doctor --json` was malformed ({error}): {out}{err}")
+    });
+    let checks = report["checks"].as_array().cloned().unwrap_or_default();
+    let id = format!("trust {member}");
+    checks
+        .iter()
+        .find(|check| check["check"].as_str() == Some(id.as_str()))
+        .or_else(|| checks.iter().find(|check| check["check"] == "room"))
+        .and_then(|check| check["detail"].as_str())
+        .map_or_else(
+            || format!("(doctor names no `{id}` check: {report})"),
+            str::to_owned,
+        )
+}
+
+/// **A newcomer who keeps posting is trusted back on a slow path** (ADR-052 RG-6: a fetch in
+/// flight is not discarded because its author posted again). Alice and bob trust each other before
+/// either daemon runs. Their only path is the proof's port forward, which holds every datagram from
+/// bob to alice [`SLOW_PATH`] (userspace; nothing in the product sets it). Bob joins alice's room
+/// and at once posts twice a second, [`KEEP_POSTING`] times. His consent to alice is an entry at
+/// the start of his feed, so alice's doctor says they trust each other only once she holds his feed
+/// from its start.
+///
+/// GREEN: alice's and bob's `vox agent doctor` both say `you trust each other` before bob's last
+/// post is acknowledged. RED PRODUCT: all acknowledged and alice's doctor still says bob has not
+/// trusted her. Each sample prints alice's contiguous hold of bob's feed and her rounds with him,
+/// as what explains a red, never as the verdict. Mutant: `VOX_MUTANT_FETCH_DISCARD` (forwarded to
+/// both daemons; the receipt must show alice's daemon saying it engaged).
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "two real daemons on a slow userspace path and a twice-a-second poster; optional, run it ALONE in release"]
+fn a_newcomer_who_keeps_posting_is_trusted_back_on_a_slow_path() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    watchdog::arm();
+    test_knobs::require(&["VOX_TEST_ADVERTISE"]);
+    let mutant = std::env::var_os(FETCH_DISCARD_MUTANT).map(|v| v.to_string_lossy().into_owned());
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: no temp dir: {e}"));
+    let alice = tmp.path().join("alice");
+    let bob = tmp.path().join("bob");
+    for d in [&alice, &bob] {
+        std::fs::create_dir_all(d.join("cfg"))
+            .unwrap_or_else(|e| panic!("APPARATUS: could not create {}: {e}", d.display()));
+    }
+    let mut fps = Vec::new();
+    for dir in [&alice, &bob] {
+        let (ok, out, err) = vox(dir, &["id"], None);
+        assert!(ok, "PRODUCT: `vox id` failed: {err}");
+        fps.push(out.trim().to_owned());
+    }
+    for (dir, fp, name) in [(&alice, &fps[1], "bob"), (&bob, &fps[0], "alice")] {
+        let (ok, _, err) = vox(dir, &["trust", "add", fp, "--name", name], None);
+        assert!(ok, "PRODUCT: `vox trust add` of {name} failed: {err}");
+    }
+    // Alice listens on 127.0.0.1 and advertises the forward on [::1]; bob listens on [::1], which
+    // cannot reach 127.0.0.1, so the forward is their only path.
+    let host = std::net::SocketAddr::from(([127, 0, 0, 1], port_forward::free_v4_udp_port()));
+    let forward = port_forward::PortForward::start(host, true);
+    forward.set_delay(SLOW_PATH);
+    let (listen, advertise) = (host.to_string(), forward.public.to_string());
+    let mut alice_env = vec![("VOX_TEST_ADVERTISE", advertise.as_str())];
+    let mut bob_env = Vec::new();
+    if let Some(value) = mutant.as_deref() {
+        alice_env.push((FETCH_DISCARD_MUTANT, value));
+        bob_env.push((FETCH_DISCARD_MUTANT, value));
+    }
+    let alice_daemon = daemon_with(&alice, "alice", &["--listen", &listen], &alice_env);
+    attached(&alice, "alice");
+    let (ok, _, err) = vox(
+        &alice,
+        &["room", "create", "--passphrase-file", "-", "--name", "slow"],
+        Some(&format!("{ROOMPASS}\n")),
+    );
+    assert!(ok, "PRODUCT: `vox room create` failed: {err}");
+    let listed = attached(&alice, "alice");
+    let room = listed
+        .split_whitespace()
+        .find(|w| w.len() >= 8 && w.chars().all(|c| c.is_ascii_alphanumeric()))
+        .unwrap_or_else(|| panic!("PRODUCT: `vox room list` shows no room id: {listed}"))
+        .to_owned();
+    let (ok, link, err) = vox(&alice, &["room", "link", &room], None);
+    assert!(ok, "PRODUCT: `vox room link` failed: {err}");
+    let link = link.trim().to_owned();
+    let bob_daemon = daemon_with(&bob, "bob", &["--listen", "[::1]:0"], &bob_env);
+    attached(&bob, "bob");
+    let (ok, _, err) = vox(
+        &bob,
+        &["room", "join", "--passphrase-file", "-", &link],
+        Some(&format!("{ROOMPASS}\n")),
+    );
+    assert!(ok, "PRODUCT: bob's `vox room join` was refused: {err}");
+
+    let acknowledged = AtomicUsize::new(0);
+    let done = AtomicBool::new(false);
+    let fault = std::sync::Mutex::new(None::<String>);
+    let mut last = (String::new(), String::new());
+    let trusted_at = std::thread::scope(|scope| {
+        let poster = scope.spawn(|| {
+            let start = Instant::now();
+            for n in 1..=KEEP_POSTING {
+                let due = start + Duration::from_millis((n as u64 - 1) * 500);
+                if let Some(wait) = due.checked_duration_since(Instant::now()) {
+                    std::thread::sleep(wait);
+                }
+                if done.load(Ordering::Relaxed) {
+                    return;
+                }
+                if Instant::now().saturating_duration_since(due) > Duration::from_secs(1) {
+                    *fault.lock().unwrap() = Some(format!(
+                        "APPARATUS: bob's twice-a-second cadence not attained at post {n}"
+                    ));
+                    return;
+                }
+                let (ok, out, err) = vox(&bob, &["room", "post", &room, &format!("bob {n}")], None);
+                if !ok {
+                    *fault.lock().unwrap() =
+                        Some(format!("PRODUCT: bob's post {n} was refused: {out}{err}"));
+                    return;
+                }
+                acknowledged.store(n, Ordering::SeqCst);
+            }
+        });
+        let outcome = loop {
+            // Read the count first: a sample proves only what was acknowledged before it began.
+            let posted = acknowledged.load(Ordering::SeqCst);
+            let finished = poster.is_finished();
+            let at_alice = doctor_trust(&alice, "alice", &room, "bob");
+            let at_bob = doctor_trust(&bob, "bob", &room, "alice");
+            println!(
+                "[slow-path trust] bob acknowledged {posted}; alice's doctor on bob: {at_alice:?}; \
+                 bob's doctor on alice: {at_bob:?}; alice holds bob through {:?}",
+                member_holds_through(&alice, &room, &fps[1])
+            );
+            last = (at_alice, at_bob);
+            if last.0 == "you trust each other" && last.1 == "you trust each other" {
+                break Some(posted);
+            }
+            if finished {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        };
+        done.store(true, Ordering::SeqCst);
+        outcome
+    });
+    let alice_said = said(&alice, "alice");
+    if mutant.is_some() {
+        let line = alice_said
+            .lines()
+            .find(|line| line.contains("VOX_MUTANT_FETCH_DISCARD engaged"));
+        println!("[slow-path trust] alice's daemon: {line:?}");
+        assert!(
+            line.is_some(),
+            "APPARATUS: {FETCH_DISCARD_MUTANT} was set but alice's daemon never said it engaged"
+        );
+    }
+    println!(
+        "[slow-path trust] the forward carried {} B bob → alice and {} B back",
+        forward.to_host(),
+        forward.to_guest()
+    );
+    assert!(
+        forward.to_host() > 0 && forward.to_guest() > 0,
+        "APPARATUS: the slow forward carried nothing; the slow path was not their path"
+    );
+    if let Some(fault) = fault.lock().unwrap().take() {
+        panic!(
+            "{fault}; last doctors: alice on bob {:?}, bob on alice {:?}",
+            last.0, last.1
+        );
+    }
+    let posted = acknowledged.load(Ordering::SeqCst);
+    let Some(n) = trusted_at else {
+        panic!(
+            "RED PRODUCT: bob posted {posted} of {KEEP_POSTING}, each acknowledged, over a path \
+             holding his datagrams {SLOW_PATH:?}, and alice's `vox agent doctor` never said they \
+             trust each other while he posted: alice on bob {:?}, bob on alice {:?}; alice holds \
+             bob through {:?}\nbob's daemon said: {}\nalice's daemon said: {alice_said}",
+            last.0,
+            last.1,
+            member_holds_through(&alice, &room, &fps[1]),
+            said(&bob, "bob"),
+        );
+    };
+    println!(
+        "GREEN PRODUCT: alice's and bob's `vox agent doctor` both say `you trust each other` with \
+         bob's post {n} of {KEEP_POSTING} the last acknowledged"
+    );
+    drop(bob_daemon);
+    drop(alice_daemon);
 }
 
 /// How long the converged room idles while its sync rounds are counted.
@@ -9827,6 +10040,9 @@ mod rg1 {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
+    /// ADR-052 RG-6's boundary mutant: a live walk keeps its first head to the window's end.
+    const BOUNDARY_MUTANT: &str = "VOX_MUTANT_BOUNDARY_RESELECT_OFF";
+
     fn root() -> tempfile::TempDir {
         let mut builder = tempfile::Builder::new();
         builder.prefix("rg1-");
@@ -9886,6 +10102,11 @@ mod rg1 {
             .env("VOX_DATA_DIR", &w.data)
             .env("VOX_CONFIG_DIR", &w.cfg)
             .env("VOX_PROXY", "127.0.0.1:0")
+            // Mutant switches, forwarded as the knobs the daemon reads.
+            .envs(
+                std::env::vars_os()
+                    .filter(|(name, _)| name.to_string_lossy().starts_with("VOX_MUTANT_")),
+            )
             .stdout(Stdio::from(
                 std::fs::File::create(w.data.with_extension("out"))
                     .expect("APPARATUS: daemon stdout"),
@@ -10258,6 +10479,10 @@ mod rg1 {
         let mut unrecorded = 0;
         let mut stalled = 0;
         let mut before = None::<String>;
+        // RG-6's boundary mutant reaches the reader's daemon through `start`; its receipt must
+        // carry that daemon's own engagement line before any red is pronounced.
+        let mutant = std::env::var_os(BOUNDARY_MUTANT).is_some();
+        let mut engaged = None::<String>;
         let mut numbered = BTreeMap::<usize, Value>::new();
         loop {
             let mut args = vec!["room", "read", &id, "--json", "--limit", "200"];
@@ -10279,10 +10504,28 @@ mod rg1 {
             while first > 1 && numbered.contains_key(&(first - 1)) {
                 first -= 1;
             }
+            if mutant && engaged.is_none() {
+                engaged = std::fs::read_to_string(bob.data.with_extension("err"))
+                    .ok()
+                    .and_then(|err| {
+                        err.lines()
+                            .find(|line| line.contains(&format!("{BOUNDARY_MUTANT} engaged")))
+                            .map(str::to_owned)
+                    });
+                if let Some(line) = &engaged {
+                    eprintln!("[RG-6 mutant] reader daemon: {line}");
+                }
+            }
             if let Some(status) = answered.take() {
                 let floor = demand
                     .take()
                     .expect("APPARATUS: terminal answer has no request");
+                assert!(
+                    !mutant || engaged.is_some() || first <= POSTS,
+                    "APPARATUS: {BOUNDARY_MUTANT} was set but the reader's daemon never said it \
+                     engaged; see {}",
+                    bob.data.with_extension("err").display()
+                );
                 assert!(
                     first <= POSTS || status["status"]["phase"] != "complete",
                     "RED PRODUCT: completed newest history still does not show RG6-away-{POSTS:04}; \

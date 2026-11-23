@@ -881,8 +881,10 @@ fn observe_reselection_without_walk(
         std::thread::sleep(Duration::from_millis(100));
     };
     receipt_mutant_witness(&healthy, Some(process));
-    std::fs::write(hold, format!("{} hold\n", w.host_fp))
-        .expect("APPARATUS: hold every author walk");
+    // Each author walk fails before its first position, as when the peer answers that the selected
+    // body is unavailable: the flow ends mid-walk and the next one re-selects the newer window.
+    std::fs::write(hold, format!("{} fail\n", w.host_fp))
+        .expect("APPARATUS: fail every author walk");
     let cid = vox_core::node::link::b32_decode(&w.room, "proof room").unwrap();
     let rt = tokio::runtime::Runtime::new().expect("APPARATUS: reselection runtime");
     let mut previous = head;

@@ -982,9 +982,15 @@ impl RenderView<'_> {
     }
     /// More than one native sweep still refuses. A complete bounded due set is instead
     /// excluded from this pinned read, without changing storage or admitting a writer.
-    pub(crate) fn retention_pending(&mut self, now: u64, ttl: u64, step_ttl: u64) -> Result<bool> {
+    pub(crate) fn retention_pending(
+        &mut self,
+        now: u64,
+        ttl: u64,
+        step_ttl: u64,
+        floor: [u64; 2],
+    ) -> Result<bool> {
         let read = &self.order.read;
-        if !read.retention_due(now, ttl, step_ttl, 0)?.1
+        if !read.retention_due(now, ttl, step_ttl, floor, 0)?.1
             && self.next_owed_expiry()?.is_none_or(|at| at > now)
         {
             return Ok(false);
@@ -992,7 +998,7 @@ impl RenderView<'_> {
         if expiry_mutant("refuse") {
             return Ok(true);
         }
-        let (selected, more) = read.retention_due(now, ttl, step_ttl, DUE_ENTRIES)?;
+        let (selected, more) = read.retention_due(now, ttl, step_ttl, floor, DUE_ENTRIES)?;
         if more {
             return Ok(true);
         }
