@@ -441,7 +441,13 @@ pub(super) fn advance(
     let ranges = match (&result, &mut cursor) {
         (ResultStep::Included(_), HistoryVerifier::Inclusion(v)) => v.take_verified_ranges()?,
         (ResultStep::Prefix(_), HistoryVerifier::Consistency(v)) => v.take_verified_ranges()?,
-        (ResultStep::Controls(_), HistoryVerifier::ControlRange(v)) => v.take_verified_ranges()?,
+        (ResultStep::Controls(_), HistoryVerifier::ControlRange(v)) => {
+            let mut ranges = v.take_verified_ranges()?;
+            // Preorder (start, then the larger node first): every node precedes the nodes
+            // inside it. The Controls arm below relies on it.
+            ranges.sort_unstable_by(|(a, x), (b, y)| a.cmp(b).then(y.leaves.cmp(&x.leaves)));
+            ranges
+        }
         (ResultStep::Missing(_), _) => Vec::new(),
         _ => return Err(invalid("completed proof range kind")),
     };
@@ -583,15 +589,25 @@ pub(super) fn advance(
                     other => other,
                 });
             }
-            // The coverage owns, in its own transaction, the whole verified trace under this
-            // exact head: every collapsed, joined and leaf node the serving walk visits again
-            // for any interval inside this one, the root included (ADR-053 MP-7; MP-8's full
-            // closure). Coverage rows are never retired, so neither are these.
+            // The coverage owns, in its own transaction, the verified trace the serving walk
+            // visits again under this exact head for any interval inside this one, the root
+            // included (ADR-053 MP-7; MP-8's full closure). That walk (`Source::control_proof`)
+            // collapses a node without controls, so nothing inside one is kept: a proof may
+            // still expand such a node and verify, and those pieces stay cache-only. In
+            // preorder a node inside the last kept node without controls starts at or before
+            // its end. Coverage rows are never retired, so neither are these.
             room.history_write_tracked(store, committed, |index| {
                 keep_generated(index)?;
                 if witness_mutant() != Some(WitnessMutant::ControlUnkept) {
+                    let mut collapsed = 0;
                     for (start, descriptor) in &ranges {
+                        if *start <= collapsed {
+                            continue;
+                        }
                         index.keep_history_proof_range(binding.head, tree, *start, *descriptor)?;
+                        if descriptor.controls == 0 {
+                            collapsed = start + descriptor.leaves - 1;
+                        }
                     }
                 }
                 if index.keep_control_coverage(&controls, 0)?.is_some() {
