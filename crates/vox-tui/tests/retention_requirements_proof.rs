@@ -68,13 +68,23 @@ const ROOMPASS: &str = "the room passphrase";
 /// Ten years, in milliseconds: how far behind R6's author's clock runs.
 const TEN_YEARS_MS: i64 = 10 * 365 * 24 * 3_600 * 1_000;
 
-/// A `vox daemon`, killed by its own PID when dropped.
-struct Daemon(Child);
+/// A `vox daemon`, killed by its own PID when dropped, and its stderr file.
+struct Daemon(Child, PathBuf);
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+        // A mutant run shows the daemon's own engagement line, also when the act failed.
+        if std::env::var_os("VOX_MUTANT_RETENTION_FLOOR").is_some() {
+            let said = std::fs::read_to_string(&self.1).unwrap_or_default();
+            for line in said
+                .lines()
+                .filter(|l| l.contains("test-knobs: retention floor"))
+            {
+                println!("[daemon {}] {line}", self.1.display());
+            }
+        }
     }
 }
 
@@ -175,12 +185,15 @@ fn daemon(
     for (k, v) in env {
         cmd.env(k, v);
     }
+    if let Some(on) = std::env::var_os("VOX_MUTANT_RETENTION_FLOOR") {
+        cmd.env("VOX_TEST_RETENTION_FLOOR_MUTANT", on);
+    }
     let mut child = cmd.spawn().expect("APPARATUS: spawn vox daemon");
     let mut pipe = child.stdin.take().expect("APPARATUS: the daemon's stdin");
     pipe.write_all(stdin_lines.as_bytes())
         .expect("APPARATUS: write the daemon's passphrases");
     drop(pipe);
-    let d = Daemon(child);
+    let d = Daemon(child, dir.join(format!("daemon-{tag}.err")));
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
         if vox(dir, &["room", "list"], None).0 {

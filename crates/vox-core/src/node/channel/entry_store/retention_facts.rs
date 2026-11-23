@@ -137,8 +137,10 @@ fn next_due(
         .transpose()
         .map(Option::flatten)
 }
-fn cutoff(now: u64, ttl: u64) -> Option<u64> {
-    (ttl != 0).then(|| now.saturating_sub(ttl.saturating_mul(1_000)))
+/// The newest due age: by lifetime, and never below what a lengthening kept expired.
+fn cutoff(now: u64, ttl: u64, floor: u64) -> Option<u64> {
+    let by_ttl = (ttl != 0).then(|| now.saturating_sub(ttl.saturating_mul(1_000)));
+    by_ttl.max((floor != 0).then_some(floor))
 }
 #[allow(clippy::too_many_arguments)]
 fn due(
@@ -149,6 +151,7 @@ fn due(
     now: u64,
     ttl: u64,
     step_ttl: u64,
+    floor: [u64; 2],
     limit: usize,
 ) -> Result<(Vec<(Digest32, Tracked)>, bool)> {
     let mut after = None;
@@ -157,8 +160,22 @@ fn due(
         .min(DUE_BYTES / std::mem::size_of::<(Digest32, Tracked)>());
     let mut rows = Vec::new();
     loop {
-        let regular = next_due(source, sek, room, roots.age, after, cutoff(now, ttl))?;
-        let steps = next_due(source, sek, room, roots.steps, after, cutoff(now, step_ttl))?;
+        let regular = next_due(
+            source,
+            sek,
+            room,
+            roots.age,
+            after,
+            cutoff(now, ttl, floor[0]),
+        )?;
+        let steps = next_due(
+            source,
+            sek,
+            room,
+            roots.steps,
+            after,
+            cutoff(now, step_ttl, floor[1]),
+        )?;
         let next = match (regular, steps) {
             (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
             (a, None) => a,
@@ -273,6 +290,7 @@ impl Read<'_> {
         now: u64,
         ttl: u64,
         step_ttl: u64,
+        floor: [u64; 2],
         limit: usize,
     ) -> Result<(Vec<(Digest32, Tracked)>, bool)> {
         if self.directory.retention_stage != 2 {
@@ -286,6 +304,7 @@ impl Read<'_> {
             now,
             ttl,
             step_ttl,
+            floor,
             limit,
         )
     }

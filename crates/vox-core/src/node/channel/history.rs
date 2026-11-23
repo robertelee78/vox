@@ -284,11 +284,10 @@ impl View<'_> {
                 self.ch.now_hint,
                 self.ch.effective_retention(),
                 self.ch.effective_step_retention(),
+                self.ch.retention_floor,
             )?)
         {
-            return Err(Failure::Request(
-                "the room is refreshing saved history; retry",
-            ));
+            return Err(Failure::Request(crate::node::api::HISTORY_REFRESHING));
         }
         self.body_answer(query, bytes)
     }
@@ -315,6 +314,7 @@ impl View<'_> {
                 self.ch.now_hint,
                 self.ch.effective_retention(),
                 self.ch.effective_step_retention(),
+                self.ch.retention_floor,
             )?
         {
             self.answer(select(), bytes)
@@ -364,6 +364,11 @@ impl View<'_> {
         } else {
             self.ch.effective_retention()
         };
+        // Made due by a shorter lifetime that a later, longer one replaced: expired already.
+        let floor = self.ch.retention_floor[usize::from(tracked.steps)];
+        if floor != 0 && tracked.base() <= floor {
+            return Ok(Some(floor));
+        }
         if ttl == 0 {
             return Ok(None);
         }
@@ -378,9 +383,7 @@ impl View<'_> {
 
     fn legacy_is_session_current(&self, hash: &Digest32) -> Result<bool> {
         if !self.ch.projection_ready {
-            return Err(Error::Profile(
-                "the room is refreshing saved history; retry",
-            ));
+            return Err(Error::Profile(crate::node::api::HISTORY_REFRESHING));
         }
         let entry = self
             .rendered
@@ -468,6 +471,7 @@ impl View<'_> {
                 self.ch.now_hint,
                 self.ch.effective_retention(),
                 self.ch.effective_step_retention(),
+                self.ch.retention_floor,
             )?
         {
             return Err(Failure::Request(LEGACY_HISTORY_REQUIRED));
@@ -1886,6 +1890,10 @@ pub(super) struct State {
     pub(super) cursor: Option<(Digest32, u64)>,
     pub(super) through: Option<(Digest32, u64)>,
     pub(super) cleanup_cursor: Option<(Digest32, u64)>,
+    /// `[messages, Session steps]`: rows aged from at or before this instant (ms) stay expired.
+    /// A longer lifetime sets it, when first projected, to what the shorter one had made due,
+    /// so a lengthening never brings back what a read already left out. `0`: none.
+    pub(super) floor: [u64; 2],
 }
 impl Default for State {
     fn default() -> Self {
@@ -1897,14 +1905,16 @@ impl Default for State {
             cursor: None,
             through: None,
             cleanup_cursor: None,
+            floor: [0; 2],
         }
     }
 }
 impl State {
-    /// Persist only bounded progress; incarnation remains new for every live room.
+    /// Persist only bounded progress; incarnation remains new for every live room. The
+    /// seventh element is the retention floor; a six-element record has none.
     pub(super) fn to_bytes(&self) -> Vec<u8> {
         let mut e = crate::cbor::Encoder::new();
-        e.array(6).uint(1);
+        e.array(7).uint(1);
         match self.policy {
             Some(policy) => {
                 e.array(3);
@@ -1927,11 +1937,13 @@ impl State {
                 }
             }
         }
+        e.array(2).uint(self.floor[0]).uint(self.floor[1]);
         e.finish()
     }
     pub(super) fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let mut d = crate::cbor::Decoder::new(bytes);
-        if d.array()? != 6 || d.uint()? != 1 {
+        let arity = d.array()?;
+        if !matches!(arity, 6 | 7) || d.uint()? != 1 {
             return Err(Error::MalformedAtRest("projection restart format"));
         }
         let policy = match d.array()? {
@@ -1957,6 +1969,13 @@ impl State {
                 _ => return Err(Error::MalformedAtRest("projection restart position")),
             };
         }
+        let floor = match arity {
+            6 => [0; 2],
+            _ => match d.array()? {
+                2 => [d.uint()?, d.uint()?],
+                _ => return Err(Error::MalformedAtRest("projection restart floor")),
+            },
+        };
         d.finish()?;
         Ok(Self {
             policy,
@@ -1964,6 +1983,7 @@ impl State {
             cursor: positions[0],
             through: positions[1],
             cleanup_cursor: positions[2],
+            floor,
             ..Self::default()
         })
     }
