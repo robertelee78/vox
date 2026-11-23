@@ -55,6 +55,8 @@ pub(crate) struct PendingText {
     sparse: bool,
     skipped: Vec<Digest32>,
     required_ancestors: Vec<Digest32>,
+    /// A removal's target: its latest settled tip keeps a `seen` slot (ADR-053 MP-6).
+    reserved_tip_author: Option<Digest32>,
     now_millis: u64,
     rotation_now: u64,
     removal_fence: Option<u64>,
@@ -391,6 +393,7 @@ impl ChannelState {
             sparse,
             skipped,
             required_ancestors: Vec::new(),
+            reserved_tip_author: None,
             now_millis,
             rotation_now,
             removal_fence: None,
@@ -450,6 +453,7 @@ impl ChannelState {
     ) -> Result<GovernancePreparation> {
         let me = signer.fingerprint();
         let mut required_ancestors = Vec::new();
+        let mut reserved_tip_author = None;
         let payload = match write {
             GovernanceWrite::Rename(name) => {
                 if !self.may_rename(store, &me, now)? {
@@ -546,6 +550,7 @@ impl ChannelState {
             GovernanceWrite::AddAdmin(member) => self.admin_payload(store, signer, member, now)?,
             GovernanceWrite::RemoveMember(member) => {
                 self.validate_member_removal(store, &me, member, now)?;
+                reserved_tip_author = Some(*member);
                 crate::governance::membership::MemberRemoval::build(
                     signer,
                     &self.channel_id,
@@ -601,6 +606,7 @@ impl ChannelState {
         };
         let mut pending = self.prepare_pending_control(store, owner, now)?;
         pending.required_ancestors.extend(required_ancestors);
+        pending.reserved_tip_author = reserved_tip_author;
         Ok(GovernancePreparation::Append(Box::new(pending), payload))
     }
 
@@ -931,6 +937,7 @@ impl PendingText {
                     .map_or(0, |feed| feed.max_seq()),
                 &signer.fingerprint(),
                 required,
+                self.reserved_tip_author.as_ref(),
             )
             .map(Some)
         })

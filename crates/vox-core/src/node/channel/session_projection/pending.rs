@@ -55,6 +55,8 @@ pub(crate) struct PendingProjection {
 pub(crate) struct CompletedProjection {
     pending: PendingProjection,
     entries_changed: bool,
+    /// A governance turn took already shown rows away (MP-11).
+    retracted: bool,
     pub(crate) result: Result<ProjectionProgress>,
 }
 
@@ -153,18 +155,30 @@ impl ChannelState {
 
     fn install_projection_result(
         &mut self,
-        _store: &Store,
+        store: &Store,
         completed: CompletedProjection,
     ) -> Result<ProjectionProgress> {
         if completed.entries_changed {
             self.entries.committed();
+        }
+        let mut retraction = Ok(());
+        if completed.retracted {
+            self.remove_display_rows();
+            match self
+                .entries
+                .render_view(store, &self.sek, &self.channel_id)
+                .and_then(|view| view.step(None, true, None, true))
+            {
+                Ok(row) => self.display_tail = row.map(|(key, _)| key),
+                Err(error) => retraction = Err(error),
+            }
         }
         let CompletedProjection {
             mut pending,
             result,
             ..
         } = completed;
-        let result = result.and_then(|progress| {
+        let result = retraction.and(result).and_then(|progress| {
             let ProjectionProgress::Governance(mut progress) = progress else {
                 return Ok(progress);
             };
@@ -270,6 +284,7 @@ impl PendingProjection {
     /// fold/build cursors and every original bounded helper remain the sole continuation.
     pub(crate) fn run(mut self, store: &Store) -> CompletedProjection {
         let sek = self.sek.clone();
+        let mut retracted = false;
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             sek.with(|sek| match self.work {
@@ -284,6 +299,7 @@ impl PendingProjection {
                         &self.me,
                         self.now,
                     )?;
+                    retracted = progress.retracted;
                     let mut ready = progress.ready;
                     if ready {
                         let view =
@@ -353,6 +369,7 @@ impl PendingProjection {
         CompletedProjection {
             pending: self,
             entries_changed,
+            retracted,
             result,
         }
     }

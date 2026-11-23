@@ -295,6 +295,15 @@ fn listed(w: &Worker, room: &str) -> Option<String> {
 /// Copy a stopped scratch profile's regular files, leaving transient sockets behind.
 fn copy_profile_tree(source: &std::path::Path, dest: &std::path::Path) {
     std::fs::create_dir_all(dest).expect("APPARATUS: create profile backup directory");
+    // A private directory stays private: the daemon refuses a computer management path another
+    // account could read.
+    std::fs::set_permissions(
+        dest,
+        std::fs::metadata(source)
+            .expect("APPARATUS: read profile backup directory mode")
+            .permissions(),
+    )
+    .expect("APPARATUS: keep profile backup directory mode");
     for entry in std::fs::read_dir(source).expect("APPARATUS: read profile backup source") {
         let entry = entry.expect("APPARATUS: read profile backup entry");
         let kind = entry
@@ -757,6 +766,264 @@ fn an_admin_removes_one_member_and_the_creator_readmits_it_forward_only() {
     );
 }
 
+/// One control-socket request to `w`'s daemon; a socket the harness cannot reach is APPARATUS.
+fn ipc(
+    rt: &tokio::runtime::Runtime,
+    w: &Worker,
+    request: vox_core::node::ipc::Request,
+) -> vox_core::node::ipc::Frame {
+    rt.block_on(async {
+        let mut client = support::attach::paths_client(&w.paths)
+            .await
+            .unwrap_or_else(|e| panic!("APPARATUS: {}'s control socket: {e}", w.name));
+        client
+            .request(&request)
+            .await
+            .unwrap_or_else(|e| panic!("APPARATUS: {}'s control socket reply: {e}", w.name))
+    })
+}
+
+/// ADR-053 MP-11 (ruling 8, "disappears"): **a message a reader already shows, whose author a
+/// removal the reader applies later puts outside the removal's cut, leaves the conversation.**
+///
+/// Staging: alice (creator), bob and carol. Alice posts a thread root; bob posts one message and
+/// one reply; alice posts again and bob, having read her, posts a tail, so a control of his own
+/// that alice holds follows his two posts. Alice and carol read all of them. Bob and carol stop;
+/// alice removes bob and stops. Bob and carol start again without alice, so neither has heard of
+/// the removal: bob posts one message and one reply above the cut, and carol shows both. Then
+/// alice starts again and carol applies the removal.
+///
+/// The removal's cut keeps bob's posts up to the tip alice held when she removed him (MP-6: her
+/// removal names his tail), so his two posts and his tail stay; before MP-6 the cut was his last
+/// control in alice's signed past and his tail was lost.
+///
+/// Asserted on carol, through `vox room read` and the control socket every client reads:
+/// once carol's roster no longer names bob, the two posts above the cut are gone while bob's
+/// three posts inside it stay; Count equals the rows the newest page holds and is what it was
+/// less the two rows that left; the thread's summary counts one reply and its page lists only the
+/// reply inside the cut; and all of it holds after carol's daemon restarts.
+/// The verdict on a kept row is structural, not a deadline: carol's roster has dropped bob and
+/// her node reports no governance work queued (`governance_pending`), twice in a row, and the
+/// row is still shown.
+///
+/// Main (before MP-11) is red here: the rows stay (the cached reader checks expiry, not
+/// membership). Mutant `VOX_MUTANT_MP11_KEEP_ROWS` (the decision is made, the rows are left):
+/// red as PRODUCT at "still shows".
+#[test]
+#[ignore = "three real daemons and an anchor, a removal one reader applies late; run in release"]
+fn a_post_shown_before_its_authors_removal_was_applied_disappears() {
+    use vox_core::node::ipc::{Frame, Request};
+    watchdog::arm();
+    let rt = runtime();
+    let tmp = support::diagnostic_tempdir();
+    let mut room = room_of(&rt, tmp.path(), &["alice", "bob", "carol"]);
+    let id = room.id.clone();
+    let cid = room.cid;
+    let id = id.as_str();
+    let [alice, bob, carol] = &mut room.workers[..] else {
+        unreachable!()
+    };
+    setup(alice, &["room", "post", id, "MP11-ROOT"]);
+    let Frame::RoomPage { rows, .. } = ipc(
+        &rt,
+        alice,
+        Request::RoomPage {
+            channel_id: cid,
+            before: None,
+            limit: 1,
+        },
+    ) else {
+        panic!("PRODUCT (staging): alice's newest page was refused")
+    };
+    let root = rows
+        .iter()
+        .find(|row| row.text == "MP11-ROOT")
+        .unwrap_or_else(|| panic!("PRODUCT (staging): alice's root is not her newest: {rows:?}"))
+        .entry_hash;
+    let thread = vox_core::node::link::b32_encode(&root);
+    let reply = |text: &str| {
+        serde_json::json!({"v":1,"type":"say","hops":8,"body":text,"thread":thread}).to_string()
+    };
+    setup(bob, &["room", "post", id, "MP11-BEFORE-POST"]);
+    setup(bob, &["room", "post", id, &reply("MP11-BEFORE-REPLY")]);
+    setup(alice, &["room", "post", id, "MP11-ALICE-AGAIN"]);
+    let (seen, read) = poll(bob, &["room", "read", id], WITHIN, |o| {
+        o.ok && o.stdout.contains("MP11-ALICE-AGAIN")
+    });
+    assert!(
+        seen,
+        "PRODUCT (staging): bob never read alice's second post: {read:?}"
+    );
+    setup(bob, &["room", "post", id, "MP11-BEFORE-TAIL"]);
+    for reader in [&*alice, &*carol] {
+        let (seen, read) = poll(reader, &["room", "read", id], WITHIN, |o| {
+            o.ok && o.stdout.contains("MP11-BEFORE-POST")
+                && o.stdout.contains("MP11-BEFORE-REPLY")
+                && o.stdout.contains("MP11-BEFORE-TAIL")
+        });
+        assert!(
+            seen,
+            "PRODUCT (staging): {} never read bob's posts before the removal: {read:?}",
+            reader.name
+        );
+    }
+    bob.stop_daemon();
+    carol.stop_daemon();
+    setup(alice, &["room", "remove-member", id, &bob.b32()]);
+    let (gone, roster) = poll(alice, &["room", "roster", id], WITHIN, |o| {
+        o.ok && !o.stdout.contains(&bob.b32())
+    });
+    assert!(gone, "PRODUCT (staging): alice still lists bob: {roster:?}");
+    alice.stop_daemon();
+    bob.restart_daemon(&tmp.path().join("bob-mp11.err"));
+    carol.restart_daemon(&tmp.path().join("carol-mp11.err"));
+    setup(bob, &["room", "post", id, "MP11-ABOVE-POST"]);
+    setup(bob, &["room", "post", id, &reply("MP11-ABOVE-REPLY")]);
+    let (shown, read) = poll(carol, &["room", "read", id], WITHIN, |o| {
+        o.ok && o.stdout.contains("MP11-ABOVE-POST") && o.stdout.contains("MP11-ABOVE-REPLY")
+    });
+    assert!(
+        shown,
+        "PRODUCT (staging): carol, not yet told of the removal, never showed bob's posts above \
+         the cut: {read:?}"
+    );
+    let roster = setup(carol, &["room", "roster", id]);
+    assert!(
+        roster.stdout.contains(&bob.b32()),
+        "APPARATUS: carol applied bob's removal before alice was back: {roster:?}"
+    );
+    let Frame::Count { n: before, .. } = ipc(
+        &rt,
+        carol,
+        Request::Count {
+            channel_id: cid,
+            since: None,
+        },
+    ) else {
+        panic!("PRODUCT: carol's Count was refused while she showed bob's posts")
+    };
+    let summary = |w: &Worker| match ipc(
+        &rt,
+        w,
+        Request::ThreadSummary {
+            channel_id: cid,
+            root,
+            after_author: None,
+        },
+    ) {
+        Frame::ThreadSummary { reply_count, .. } => reply_count,
+        other => panic!("PRODUCT: carol's thread summary was refused: {other:?}"),
+    };
+    let replies_before = summary(carol);
+    println!("[proof] carol shows bob's posts above the cut: Count {before}, thread replies {replies_before}");
+    assert_eq!(
+        replies_before, 2,
+        "APPARATUS: carol's thread did not hold both of bob's replies before alice returned"
+    );
+    alice.restart_daemon(&tmp.path().join("alice-mp11.err"));
+    let mut settled_and_shown = 0;
+    loop {
+        let roster = carol.vox(None, &["room", "roster", id]);
+        let applied = roster.ok && !roster.stdout.contains(&bob.b32());
+        let status = carol.vox(None, &["status", "--json"]);
+        let idle = status.ok && status.json()["governance_pending"] == false;
+        let read = carol.vox(None, &["room", "read", id]);
+        let kept =
+            read.stdout.contains("MP11-ABOVE-POST") || read.stdout.contains("MP11-ABOVE-REPLY");
+        if applied && read.ok && !kept {
+            break;
+        }
+        settled_and_shown = if applied && idle && read.ok {
+            settled_and_shown + 1
+        } else {
+            0
+        };
+        assert!(
+            settled_and_shown < 2,
+            "PRODUCT: carol applied bob's removal and reports no governance work queued, yet \
+             still shows bob's posts above the cut: {}",
+            read.stdout
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let check = |w: &Worker, when: &str| {
+        let read = setup(w, &["room", "read", id]);
+        assert!(
+            read.stdout.contains("MP11-BEFORE-POST")
+                && read.stdout.contains("MP11-BEFORE-REPLY")
+                && read.stdout.contains("MP11-BEFORE-TAIL"),
+            "PRODUCT: {when}, carol lost bob's posts inside the removal's cut: {}",
+            read.stdout
+        );
+        assert!(
+            !read.stdout.contains("MP11-ABOVE"),
+            "PRODUCT: {when}, carol shows bob's posts above the cut again: {}",
+            read.stdout
+        );
+        let left = 2;
+        let counted = ipc(
+            &rt,
+            w,
+            Request::Count {
+                channel_id: cid,
+                since: None,
+            },
+        );
+        let page = ipc(
+            &rt,
+            w,
+            Request::RoomPage {
+                channel_id: cid,
+                before: None,
+                limit: 64,
+            },
+        );
+        let Frame::RoomPage { rows, .. } = &page else {
+            panic!("PRODUCT: {when}, carol's newest page was refused: {page:?}")
+        };
+        assert!(
+            matches!(counted, Frame::Count { n, .. } if n + left == before && n == rows.len() as u64)
+                && !rows.iter().any(|row| row.text.contains("MP11-ABOVE")),
+            "PRODUCT: {when}, carol's Count must be {} ({before} less the {left} rows that left) \
+             and equal her newest page, which names neither post above the cut: {counted:?}, \
+             {rows:?}",
+            before - left
+        );
+        let replies = summary(w);
+        let thread_page = ipc(
+            &rt,
+            w,
+            Request::ThreadPage {
+                channel_id: cid,
+                root,
+                before: None,
+                after: None,
+            },
+        );
+        let Frame::ThreadPage { rows, .. } = &thread_page else {
+            panic!("PRODUCT: {when}, carol's thread page was refused: {thread_page:?}")
+        };
+        assert!(
+            replies == 1 && rows.len() == 1 && rows[0].text.contains("MP11-BEFORE-REPLY"),
+            "PRODUCT: {when}, carol's thread must count and list only bob's earlier reply: \
+             summary {replies}, page {rows:?}"
+        );
+        println!(
+            "[proof] {when}: carol shows bob's three earlier posts, none above the cut; Count {}, \
+             thread replies {replies}",
+            before - left
+        );
+    };
+    check(carol, "once carol applied the removal");
+    carol.restart_daemon(&tmp.path().join("carol-mp11-restart.err"));
+    let (open, read) = poll(carol, &["room", "read", id], WITHIN, |o| o.ok);
+    assert!(
+        open,
+        "PRODUCT: carol's room did not reopen after a restart: {read:?}"
+    );
+    check(carol, "after carol's daemon restarted");
+}
+
 #[test]
 #[ignore = "real daemons, queued sender keys and an offline sender; CI runs it in release"]
 fn a_queued_key_and_history_debt_cannot_cross_room_removal() {
@@ -949,6 +1216,664 @@ fn a_queued_key_and_history_debt_cannot_cross_room_removal() {
     eprintln!("[proof] FX62 queued-key: carol never read FX62-ALICE-PRE-DEBT while the removal fold was held");
     eprintln!("[proof] FX62 history-debt: both separately applied and offline-fold senders delivered fresh posts without pre-removal or removal-period debt");
 }
+
+// ADR-053 MP-6. The runner selects a mutation with `VOX_MUTANT_MP6` (`uncut`: the cut ignores
+// the removal's `seen` reference to its target; `absent-open`: a removal that names no tip of its
+// target cuts none of its posts). temp_home strips inherited knobs, so each arm passes it to the
+// daemons it starts.
+fn mp6_mutant() -> String {
+    if !cfg!(feature = "test-knobs") {
+        panic!("CANNOT MEASURE: the MP-6 arms stage with VOX_TEST_* knobs; build with test-knobs");
+    }
+    std::env::var("VOX_MUTANT_MP6").unwrap_or_default()
+}
+
+/// The entry hash of the row of `read` (`<entry-hash> <author> <text>`) that says `tag`.
+fn mp6_row_hash(read: &Out, tag: &str) -> String {
+    read.stdout
+        .lines()
+        .find(|line| line.contains(tag))
+        .and_then(|line| line.split_whitespace().next())
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            panic!("PRODUCT (staging): the author's own read has no row {tag}: {read:?}")
+        })
+}
+
+fn mp6_signed_entry(out: &Out) -> String {
+    out.stdout
+        .split("signed entry ")
+        .nth(1)
+        .and_then(|text| text.split(';').next())
+        .map(str::to_owned)
+        .unwrap_or_else(|| panic!("PRODUCT: removal result omitted its signed entry: {out:?}"))
+}
+
+/// Whether `vox room read --hashes` lists `hash` (a row may print a shortened hash).
+fn mp6_lists(order: &Out, hash: &str) -> bool {
+    order.stdout.lines().any(|line| {
+        line.split_whitespace()
+            .next()
+            .is_some_and(|held| held.starts_with(hash) || hash.starts_with(held))
+    })
+}
+
+/// Post `tag` as `author` until `reader` reads it (a removal rotates keys forward-only).
+fn mp6_post_until_read(author: &Worker, reader: &Worker, id: &str, tag: &str) {
+    let deadline = Instant::now() + WITHIN;
+    loop {
+        setup(author, &["room", "post", id, tag]);
+        let read = reader.vox(None, &["room", "read", id]);
+        if read.ok && read.stdout.contains(tag) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT (staging): {} never read {tag} from {}: {read:?}",
+            reader.name,
+            author.name
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// Every one of `workers` reports no governance work pending, so no control is in flight.
+fn mp6_quiet(workers: &[&Worker]) {
+    for w in workers {
+        let (quiet, status) = poll(w, &["status", "--json"], WITHIN, |o| {
+            o.ok && o.json()["governance_pending"] == false
+        });
+        assert!(
+            quiet,
+            "APPARATUS: {} never settled its governance work: {status:?}",
+            w.name
+        );
+    }
+}
+
+/// For ten seconds after the positive control, none of `readers` shows any of `tags`.
+fn mp6_never_shown(readers: &[&Worker], id: &str, tags: &[&str], claim: &str) {
+    let through = Instant::now() + Duration::from_secs(10);
+    loop {
+        for reader in readers {
+            let read = setup(reader, &["room", "read", id]);
+            let shown: Vec<_> = tags
+                .iter()
+                .filter(|tag| read.stdout.contains(**tag))
+                .collect();
+            assert!(
+                shown.is_empty(),
+                "PRODUCT [{claim}]: {} shows {shown:?}: {read:?}",
+                reader.name
+            );
+        }
+        if Instant::now() >= through {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// Every one of `readers` shows every one of `tags`, or a `PRODUCT (staging)` red naming the
+/// missing ones.
+fn mp6_all_shown(readers: &[&Worker], id: &str, tags: &[&str], what: &str) {
+    for reader in readers {
+        let (shown, read) = poll(reader, &["room", "read", id], WITHIN, |o| {
+            o.ok && tags.iter().all(|tag| o.stdout.contains(tag))
+        });
+        let missing: Vec<_> = tags
+            .iter()
+            .filter(|tag| !read.stdout.contains(**tag))
+            .collect();
+        assert!(
+            shown,
+            "PRODUCT (staging): {} never showed {what}: missing {missing:?}: {read:?}",
+            reader.name
+        );
+    }
+}
+
+/// The verdict on what a reader keeps once it applied a removal, by its state and not by a
+/// deadline. Green once `reader` shows every one of `tags`. Red (`PRODUCT [claim]`) when, twice
+/// in a row, its roster no longer names `target`, it reports no governance work queued, it holds
+/// every entry in `held` and shows `later` (a post made after the removal), and still does not
+/// show all of `tags`. `NO RESULT` if it never reaches that state.
+fn mp6_kept_once_applied(
+    reader: &Worker,
+    id: &str,
+    target: &str,
+    tags: &[&str],
+    held: &[String],
+    later: &str,
+    claim: &str,
+) {
+    let give_up = Instant::now() + Duration::from_secs(120);
+    let mut settled = 0;
+    loop {
+        let read = reader.vox(None, &["room", "read", id]);
+        if read.ok && tags.iter().all(|tag| read.stdout.contains(tag)) {
+            return;
+        }
+        let roster = reader.vox(None, &["room", "roster", id]);
+        let status = reader.vox(None, &["status", "--json"]);
+        let order = reader.vox(None, &["room", "read", id, "--hashes"]);
+        let state = roster.ok
+            && !roster.stdout.contains(target)
+            && status.ok
+            && status.json()["governance_pending"] == false
+            && order.ok
+            && held.iter().all(|hash| mp6_lists(&order, hash))
+            && read.ok
+            && read.stdout.contains(later);
+        settled = if state { settled + 1 } else { 0 };
+        let missing: Vec<_> = tags
+            .iter()
+            .filter(|tag| !read.stdout.contains(**tag))
+            .collect();
+        assert!(
+            settled < 2,
+            "PRODUCT [{claim}]: {} applied the removal, holds every one of the target's posts, \
+             reports no governance work queued and shows the later {later}, yet does not show \
+             {missing:?}: {}",
+            reader.name,
+            read.stdout
+        );
+        assert!(
+            Instant::now() < give_up,
+            "NO RESULT [{claim}]: {} never reached the state the verdict reads (removal applied, \
+             no governance work, every post held, {later} shown): roster={roster:?} \
+             status={status:?} order={order:?} read={read:?}",
+            reader.name
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// Hold `reader`'s governance fold, start it, and once it holds `removal` release the fold and
+/// supply a real governance fact (`nudge` renames the room), so the fold applies the removal
+/// before it decides any message it received meanwhile: one fold turn evaluates every admitted
+/// control before any message's eligibility (`channel/governance.rs` `advance`).
+///
+/// While the reader does not hold the removal yet, `nudge` posts once every two seconds, as the
+/// members of a live room do. A returning member's first history window has been seen to sit
+/// unanswered while no member's head moved: in one run dave's windows of alice and carol were
+/// selected and none passed for 30 s, with every connection up until the harness stopped the
+/// daemons; in every run that passed, a newer head re-selected them within a second. The post
+/// may be refused (it is not what this staging measures), so its result is only counted.
+#[allow(clippy::too_many_arguments)]
+fn mp6_apply_first(
+    reader: &mut Worker,
+    nudge: &Worker,
+    id: &str,
+    removal: &str,
+    unshown: &[&str],
+    hold: &std::path::Path,
+    env: &[(&str, &str)],
+    err: &std::path::Path,
+) {
+    std::fs::write(hold, b"hold").expect("APPARATUS: arm a reader's governance fold hold");
+    let hold_text = hold.to_str().expect("APPARATUS: UTF-8 hold path");
+    let mut env = env.to_vec();
+    env.push(("VOX_TEST_FOLD_HOLD_FILE", hold_text));
+    reader.restart_daemon_as(support::VOX, &env, err);
+    let reader: &Worker = reader;
+    let deadline = Instant::now() + WITHIN;
+    let mut nudges = 0;
+    loop {
+        let order = reader.vox(None, &["room", "read", id, "--hashes"]);
+        if order.ok && mp6_lists(&order, removal) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "APPARATUS: {} never received the removal while its fold was held, after {nudges} \
+             posts by {}: {order:?}",
+            reader.name,
+            nudge.name
+        );
+        nudges += 1;
+        let posted = nudge.vox(None, &["room", "post", id, &format!("MP6-NUDGE-{nudges}")]);
+        eprintln!(
+            "[proof] {} does not hold the removal yet; {} posted MP6-NUDGE-{nudges}: ok={}",
+            reader.name, nudge.name, posted.ok
+        );
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    let read = setup(reader, &["room", "read", id]);
+    let early: Vec<_> = unshown
+        .iter()
+        .filter(|tag| read.stdout.contains(**tag))
+        .collect();
+    assert!(
+        early.is_empty(),
+        "APPARATUS: {} showed {early:?} before its fold could apply the removal: {read:?}",
+        reader.name
+    );
+    std::fs::remove_file(hold).expect("APPARATUS: release a reader's governance fold");
+    // Releasing the marker does not wake the actor. A real new governance input does.
+    setup(
+        nudge,
+        &[
+            "room",
+            "rename",
+            id,
+            &format!("mp6-{}-applies", reader.name),
+        ],
+    );
+}
+
+/// ADR-053 MP-6 (a) with MP-11: **a removal keeps its target's posts up to the tip its remover
+/// held on every reader, and a later post a reader had already shown disappears.** alice
+/// (creator), bob (target), carol and dave. dave stops. alice posts a thread root; bob posts
+/// three messages and a reply to it in a row, so his last control entry (the context update before
+/// the first) is below all four, and alice and carol show them. With bob and carol stopped, alice
+/// removes bob (her removal names his reply, the latest tip she holds) and stops. bob, who never
+/// hears of it, posts once more and replies once more; carol, started again without alice, shows
+/// both. alice comes back and carol applies the removal. dave comes back with his fold held,
+/// receives the removal and applies it before he decides any of bob's posts: he reads the room as
+/// a reader that applies the removal first does. (A newcomer that joins after the removal cannot
+/// read bob at all: only bob releases bob's keys, ADR-006 §History, and a removed author's later
+/// key package is outside its cut.)
+///
+/// Asserted:
+/// - carol, which showed all six of bob's posts before applying the removal: once she applied it
+///   and reports no governance work queued, the four alice had shown stay (`MP6 witnessed`) and
+///   the two after them are gone (`MP11 disappears`); her Count is what it was less exactly those
+///   two and equals her newest page; the thread's summary counts one reply and its page lists
+///   only bob's earlier reply; the same after carol's daemon restarts;
+/// - dave shows all four, the last one included (`MP6 witnessed`, a verdict by dave's state, not
+///   a deadline), and his thread counts and lists that one reply; alice, the remover, still shows
+///   all four; no one shows bob's posts after the removal again (`MP6 after removal`).
+///
+/// Mutant `uncut` (`VOX_MUTANT_MP6`, the cut of main: bob's last control entry, below all four)
+/// is red at `MP6 witnessed` on carol: with MP-11 she loses the rows she showed. Mutant
+/// `VOX_MUTANT_MP11_KEEP_ROWS` (the decision is made, the rows are left, as on main) is red at
+/// `MP11 disappears`. Dropping the reserved slot cannot be staged red here: the picker
+/// gives every other author's tip a slot while there are at most sixteen
+/// (`channel/local_history.rs` `authored_context`).
+#[test]
+#[ignore = "real daemons and an anchor, production Argon2id; CI runs it in release"]
+fn a_removal_keeps_the_posts_its_remover_held_and_no_later_one() {
+    use vox_core::node::ipc::{Frame, Request};
+    watchdog::arm();
+    let mutant = mp6_mutant();
+    let keep_rows = std::env::var("VOX_MUTANT_MP11_KEEP_ROWS").ok();
+    let rt = runtime();
+    let tmp = support::diagnostic_tempdir();
+    let mut room = room_of(&rt, tmp.path(), &["alice", "bob", "carol", "dave"]);
+    let id = room.id.clone();
+    let cid = room.cid;
+    let id = id.as_str();
+    let [alice, bob, carol, dave] = &mut room.workers[..] else {
+        unreachable!()
+    };
+    // Each knob a reader's daemon reads is passed to it here, never inherited.
+    let mut env = vec![("VOX_TEST_MP6_MUTANT", mutant.as_str())];
+    if let Some(keep) = keep_rows.as_deref() {
+        env.push(("VOX_MUTANT_MP11_KEEP_ROWS", keep));
+    }
+    alice.restart_daemon_as(support::VOX, &env, &tmp.path().join("alice-mp6.err"));
+    for reader in [&*bob, &*carol, &*dave] {
+        mp6_post_until_read(alice, reader, id, "MP6-READY");
+    }
+    mp6_quiet(&[alice, bob, carol, dave]);
+    dave.stop_daemon_cleanly();
+    setup(alice, &["room", "post", id, "MP6-ROOT"]);
+    let Frame::RoomPage { rows, .. } = ipc(
+        &rt,
+        alice,
+        Request::RoomPage {
+            channel_id: cid,
+            before: None,
+            limit: 8,
+        },
+    ) else {
+        panic!("PRODUCT (staging): alice's newest page was refused")
+    };
+    let root = rows
+        .iter()
+        .find(|row| row.text == "MP6-ROOT")
+        .unwrap_or_else(|| {
+            panic!("PRODUCT (staging): alice's newest page lacks her root: {rows:?}")
+        })
+        .entry_hash;
+    let thread = vox_core::node::link::b32_encode(&root);
+    let reply = |text: &str| {
+        serde_json::json!({"v":1,"type":"say","hops":8,"body":text,"thread":thread}).to_string()
+    };
+    let tags = ["MP6-BOB-1", "MP6-BOB-2", "MP6-BOB-3", "MP6-BOB-4"];
+    for tag in &tags[..3] {
+        setup(bob, &["room", "post", id, *tag]);
+    }
+    setup(bob, &["room", "post", id, &reply(tags[3])]);
+    mp6_all_shown(&[alice, carol], id, &tags, "all four of bob's posts");
+    let at_remover = setup(alice, &["room", "read", id]);
+    let witnessed: Vec<String> = tags
+        .iter()
+        .map(|tag| mp6_row_hash(&at_remover, tag))
+        .collect();
+    bob.stop_daemon_cleanly();
+    carol.stop_daemon_cleanly();
+    let removal = unchanged_busy_retry(alice, &["room", "remove-member", id, &bob.b32()]);
+    assert!(
+        removal.ok,
+        "PRODUCT: the creator could not remove bob: {removal:?}"
+    );
+    let removal = mp6_signed_entry(&removal);
+    alice.stop_daemon_cleanly();
+    bob.restart_daemon(&tmp.path().join("bob-unaware.err"));
+    let after = "MP6-BOB-AFTER-REMOVAL";
+    let after_reply = "MP6-BOB-AFTER-REPLY";
+    setup(bob, &["room", "post", id, after]);
+    setup(bob, &["room", "post", id, &reply(after_reply)]);
+    let after_hash = mp6_row_hash(&setup(bob, &["room", "read", id]), after);
+    carol.restart_daemon_as(support::VOX, &env, &tmp.path().join("carol-unaware.err"));
+    mp6_all_shown(
+        &[carol],
+        id,
+        &[after, after_reply],
+        "bob's two posts after his removal, before alice was back",
+    );
+    let roster = setup(carol, &["room", "roster", id]);
+    assert!(
+        roster.stdout.contains(&bob.b32()),
+        "APPARATUS: carol applied bob's removal before alice was back: {roster:?}"
+    );
+    let count = |w: &Worker| match ipc(
+        &rt,
+        w,
+        Request::Count {
+            channel_id: cid,
+            since: None,
+        },
+    ) {
+        Frame::Count { n, .. } => n,
+        other => panic!("PRODUCT: {}'s Count was refused: {other:?}", w.name),
+    };
+    let summary = |w: &Worker| match ipc(
+        &rt,
+        w,
+        Request::ThreadSummary {
+            channel_id: cid,
+            root,
+            after_author: None,
+        },
+    ) {
+        Frame::ThreadSummary { reply_count, .. } => reply_count,
+        other => panic!(
+            "PRODUCT: {}'s thread summary was refused: {other:?}",
+            w.name
+        ),
+    };
+    let thread_page = |w: &Worker| match ipc(
+        &rt,
+        w,
+        Request::ThreadPage {
+            channel_id: cid,
+            root,
+            before: None,
+            after: None,
+        },
+    ) {
+        Frame::ThreadPage { rows, .. } => rows,
+        other => panic!("PRODUCT: {}'s thread page was refused: {other:?}", w.name),
+    };
+    let before = count(carol);
+    let replies_before = summary(carol);
+    println!(
+        "[proof] carol shows bob's posts after his removal: Count {before}, thread replies {replies_before}"
+    );
+    assert_eq!(
+        replies_before, 2,
+        "APPARATUS: carol's thread did not hold both of bob's replies before alice returned"
+    );
+    alice.restart_daemon_as(support::VOX, &env, &tmp.path().join("alice-back.err"));
+    let mut settled_and_shown = 0;
+    loop {
+        let roster = carol.vox(None, &["room", "roster", id]);
+        let applied = roster.ok && !roster.stdout.contains(&bob.b32());
+        let status = carol.vox(None, &["status", "--json"]);
+        let idle = status.ok && status.json()["governance_pending"] == false;
+        let read = carol.vox(None, &["room", "read", id]);
+        let kept = read.stdout.contains("MP6-BOB-AFTER");
+        if applied && read.ok && !kept {
+            break;
+        }
+        settled_and_shown = if applied && idle && read.ok {
+            settled_and_shown + 1
+        } else {
+            0
+        };
+        assert!(
+            settled_and_shown < 2,
+            "PRODUCT [MP11 disappears]: carol applied bob's removal and reports no governance \
+             work queued, yet still shows his posts after the tip alice held: {}",
+            read.stdout
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let check = |w: &Worker, when: &str| {
+        mp6_quiet(&[w]);
+        let read = setup(w, &["room", "read", id]);
+        let lost: Vec<_> = tags
+            .iter()
+            .filter(|tag| !read.stdout.contains(**tag))
+            .collect();
+        assert!(
+            lost.is_empty(),
+            "PRODUCT [MP6 witnessed]: {when}, carol lost {lost:?}, bob's posts alice had read: {}",
+            read.stdout
+        );
+        assert!(
+            !read.stdout.contains("MP6-BOB-AFTER"),
+            "PRODUCT [MP11 disappears]: {when}, carol shows bob's posts after the tip alice held: {}",
+            read.stdout
+        );
+        let n = count(w);
+        let Frame::RoomPage { rows, .. } = ipc(
+            &rt,
+            w,
+            Request::RoomPage {
+                channel_id: cid,
+                before: None,
+                limit: 64,
+            },
+        ) else {
+            panic!("PRODUCT: {when}, carol's newest page was refused")
+        };
+        assert!(
+            n + 2 == before
+                && n == rows.len() as u64
+                && !rows.iter().any(|row| row.text.contains("MP6-BOB-AFTER")),
+            "PRODUCT [MP11 disappears]: {when}, carol's Count must be {} ({before} less the two \
+             rows that left) and equal her newest page, which names neither later post: Count \
+             {n}, {rows:?}",
+            before - 2
+        );
+        let replies = summary(w);
+        let rows = thread_page(w);
+        assert!(
+            replies == 1 && rows.len() == 1 && rows[0].text.contains(tags[3]),
+            "PRODUCT [MP11 disappears]: {when}, carol's thread must count and list only bob's \
+             reply alice had read: summary {replies}, page {rows:?}"
+        );
+        println!(
+            "[proof] {when}: carol shows bob's four posts alice had read and neither later one; \
+             Count {n}, thread replies {replies}"
+        );
+    };
+    check(carol, "once carol applied the removal");
+    carol.restart_daemon_as(support::VOX, &env, &tmp.path().join("carol-restart.err"));
+    let (open, read) = poll(carol, &["room", "read", id], WITHIN, |o| o.ok);
+    assert!(
+        open,
+        "PRODUCT: carol's room did not reopen after a restart: {read:?}"
+    );
+    check(carol, "after carol's daemon restarted");
+    bob.stop_daemon_cleanly();
+    let mut unshown = tags.to_vec();
+    unshown.extend([after, after_reply]);
+    mp6_apply_first(
+        dave,
+        alice,
+        id,
+        &removal,
+        &unshown,
+        &tmp.path().join("dave-fold.hold"),
+        &env,
+        &tmp.path().join("dave-back.err"),
+    );
+    let (alice, carol, dave): (&Worker, &Worker, &Worker) = (alice, carol, dave);
+    let (gone, roster) = poll(dave, &["room", "roster", id], WITHIN, |o| {
+        o.ok && !o.stdout.contains(&bob.b32())
+    });
+    assert!(
+        gone,
+        "PRODUCT: dave never applied bob's removal: {roster:?}"
+    );
+    mp6_post_until_read(alice, dave, id, "MP6-ALICE-AFTER-REMOVAL");
+    mp6_kept_once_applied(
+        dave,
+        id,
+        &bob.b32(),
+        &tags,
+        &witnessed,
+        "MP6-ALICE-AFTER-REMOVAL",
+        "MP6 witnessed",
+    );
+    mp6_all_shown(&[dave], id, &["MP6-ROOT"], "alice's thread root");
+    let (replies, rows) = (summary(dave), thread_page(dave));
+    assert!(
+        replies == 1 && rows.len() == 1 && rows[0].text.contains(tags[3]),
+        "PRODUCT [MP6 witnessed]: dave's thread must count and list bob's reply alice had read: \
+         summary {replies}, page {rows:?}"
+    );
+    mp6_quiet(&[alice]);
+    let at_remover = setup(alice, &["room", "read", id]);
+    let lost: Vec<_> = tags
+        .iter()
+        .filter(|tag| !at_remover.stdout.contains(**tag))
+        .collect();
+    assert!(
+        lost.is_empty(),
+        "PRODUCT [MP6 witnessed]: alice, the remover, lost {lost:?}: {}",
+        at_remover.stdout
+    );
+    mp6_never_shown(
+        &[alice, carol, dave],
+        id,
+        &[after, after_reply],
+        "MP6 after removal",
+    );
+    let order = setup(dave, &["room", "read", id, "--hashes"]);
+    eprintln!(
+        "[proof] MP6 (a): dave, applying bob's removal first, carol, which showed bob's later posts, and alice show all four posts alice had shown and no one shows bob's posts after it; dave holds the first of those: {}",
+        mp6_lists(&order, &after_hash)
+    );
+}
+
+/// ADR-053 MP-6 (b): **a removal that names no tip of its target keeps only what its signed
+/// context reached: today's cut, never less.** bob, an admin alice named, runs a node built to
+/// leave the target out of its `seen` (`VOX_TEST_REMOVAL_OMITS_TARGET`), so its context does not
+/// join the target's own frontier either. dave stops. carol posts once, alice posts so carol's
+/// next post carries a context update, and carol posts three more; alice and bob show all four.
+/// alice posts again and bob reads it, so the context bob signs reaches carol's last control
+/// entry through alice's tip, as an honest removal's does today. bob removes carol. dave comes
+/// back with his fold held and applies the removal before he decides any of carol's posts.
+///
+/// Asserted on dave: carol's first post, below that control entry, stays (`MP6 omitted kept`);
+/// none of the three after it is ever shown (`MP6 omitted`). Main is green (this is today's
+/// cut). Mutant `absent-open` is red at `MP6 omitted`.
+#[test]
+#[ignore = "real daemons and an anchor, production Argon2id; CI runs it in release"]
+fn a_removal_that_names_no_tip_of_its_target_keeps_only_what_its_context_reached() {
+    watchdog::arm();
+    let mutant = mp6_mutant();
+    let rt = runtime();
+    let tmp = support::diagnostic_tempdir();
+    let mut room = room_of(&rt, tmp.path(), &["alice", "bob", "carol", "dave"]);
+    let id = room.id.clone();
+    let id = id.as_str();
+    let [alice, bob, carol, dave] = &mut room.workers[..] else {
+        unreachable!()
+    };
+    setup(alice, &["room", "admin", "add", id, &bob.b32()]);
+    let (admin, listed) = poll(bob, &["room", "admin", "list", id], WITHIN, |o| {
+        o.ok && o.stdout.contains(&bob.b32())
+    });
+    assert!(
+        admin,
+        "APPARATUS: bob's delegation was not staged: {listed:?}"
+    );
+    let env = [("VOX_TEST_MP6_MUTANT", mutant.as_str())];
+    bob.restart_daemon_as(
+        support::VOX,
+        &[
+            ("VOX_TEST_REMOVAL_OMITS_TARGET", "1"),
+            ("VOX_TEST_MP6_MUTANT", &mutant),
+        ],
+        &tmp.path().join("bob-mp6.err"),
+    );
+    for reader in [&*bob, &*carol, &*dave] {
+        mp6_post_until_read(alice, reader, id, "MP6-READY");
+    }
+    mp6_quiet(&[alice, bob, carol, dave]);
+    dave.stop_daemon_cleanly();
+    let kept = "MP6-INSIDE-CUT";
+    setup(carol, &["room", "post", id, kept]);
+    mp6_all_shown(&[alice, bob], id, &[kept], "carol's first post");
+    mp6_post_until_read(alice, carol, id, "MP6-ALICE-BETWEEN");
+    let tags = ["MP6-OMITTED-1", "MP6-OMITTED-2", "MP6-OMITTED-3"];
+    for tag in tags {
+        setup(carol, &["room", "post", id, tag]);
+    }
+    mp6_all_shown(&[alice, bob], id, &tags, "carol's three later posts");
+    mp6_post_until_read(alice, bob, id, "MP6-ALICE-AFTER-CAROL");
+    let at_remover = setup(bob, &["room", "read", id]);
+    let held: Vec<String> = std::iter::once(kept)
+        .chain(tags)
+        .map(|tag| mp6_row_hash(&at_remover, tag))
+        .collect();
+    let removal = unchanged_busy_retry(bob, &["room", "remove-member", id, &carol.b32()]);
+    assert!(
+        removal.ok,
+        "PRODUCT: the delegated admin could not remove carol: {removal:?}"
+    );
+    let removal = mp6_signed_entry(&removal);
+    let mut unshown = tags.to_vec();
+    unshown.push(kept);
+    mp6_apply_first(
+        dave,
+        alice,
+        id,
+        &removal,
+        &unshown,
+        &tmp.path().join("dave-fold.hold"),
+        &env,
+        &tmp.path().join("dave-back.err"),
+    );
+    let (alice, dave): (&Worker, &Worker) = (alice, dave);
+    let (gone, roster) = poll(dave, &["room", "roster", id], WITHIN, |o| {
+        o.ok && !o.stdout.contains(&carol.b32())
+    });
+    assert!(
+        gone,
+        "PRODUCT: dave never applied carol's removal: {roster:?}"
+    );
+    mp6_post_until_read(alice, dave, id, "MP6-AFTER-OMITTING-REMOVAL");
+    mp6_kept_once_applied(
+        dave,
+        id,
+        &carol.b32(),
+        &[kept],
+        &held,
+        "MP6-AFTER-OMITTING-REMOVAL",
+        "MP6 omitted kept",
+    );
+    mp6_never_shown(&[dave], id, &tags, "MP6 omitted");
+    eprintln!("[proof] MP6 (b): a removal naming no tip of carol keeps her post below her last control its context reached and none of the three after it");
+}
+
 #[test]
 #[ignore = "real daemons and an anchor, production Argon2id; CI runs it in release"]
 fn a_member_that_left_is_synced_with_and_delivered_to_no_more() {

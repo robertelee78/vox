@@ -182,6 +182,44 @@ fn target_row(
         .transpose()
 }
 
+/// ADR-053 MP-6: a removal keeps the messages of its target up to the target's tip it names in
+/// its signed `seen`, by exact branch-bound position and hash. Only signed Content by the
+/// removal's own target qualifies; a legacy removal, a removal naming no tip of its target, and
+/// every authority question keep the cut of the removal's signed context alone.
+fn witnessed_message(
+    writer: &Write<'_, '_>,
+    removal: &crate::log::entry::Entry,
+    target: &Digest32,
+    action: &crate::log::entry::Entry,
+) -> Result<bool> {
+    #[cfg(feature = "test-knobs")]
+    if std::env::var("VOX_TEST_MP6_MUTANT").as_deref() == Ok("uncut") {
+        return Ok(false);
+    }
+    if action.skeleton.author_id != *target
+        || !action
+            .skeleton
+            .v2
+            .as_ref()
+            .is_some_and(|v2| v2.kind == crate::log::history::SignedEntryKind::Content)
+    {
+        return Ok(false);
+    }
+    let Some(reference) = removal
+        .skeleton
+        .v2
+        .as_ref()
+        .and_then(|v2| v2.seen.iter().find(|reference| reference.author == *target))
+    else {
+        #[cfg(feature = "test-knobs")]
+        if std::env::var("VOX_TEST_MP6_MUTANT").as_deref() == Ok("absent-open") {
+            return Ok(true);
+        }
+        return Ok(false);
+    };
+    writer.reference_contains(reference, action)
+}
+
 /// Resolve removal/readmission status in an action's strict causal past.
 /// One step inspects at most one signed removal or readmission.
 pub(super) struct PastMembership {
@@ -333,6 +371,7 @@ impl PastMembership {
             };
             let action = writer.entry(action_log)?;
             !Scope(Some(hash)).contains(writer, &action)?
+                && !witnessed_message(writer, &entry, &self.target, &action)?
         } else {
             Scope(Some(self.action)).contains(writer, &entry)?
         };
@@ -1131,7 +1170,11 @@ fn current_step(writer: &mut Write<'_, '_>, state: &mut MembershipFold) -> Resul
 
 /// Advance at most one causal eligibility decision step. Source replay has a
 /// fixed receipt tail; later appends are independently queued at frontier completion.
-pub(super) fn advance_eligibility(writer: &mut Write<'_, '_>) -> Result<bool> {
+/// An entry decided ineligible as its author's content is added to `ineligible` (MP-11).
+pub(super) fn advance_eligibility(
+    writer: &mut Write<'_, '_>,
+    ineligible: &mut Vec<Digest32>,
+) -> Result<bool> {
     use super::facts::Cursor;
     if writer.eligibility_replaying() {
         return Ok(false);
@@ -1217,6 +1260,9 @@ pub(super) fn advance_eligibility(writer: &mut Write<'_, '_>) -> Result<bool> {
             .uint(u64::from(eligible));
         let record = writer.save_record(old, &e.finish())?;
         writer.put(table, key, Some(record))?;
+        if stage == 0 && !eligible {
+            ineligible.push(hash);
+        }
         if stage == 0 {
             let entry = writer.entry(log)?;
             if let Some(floor) = entry

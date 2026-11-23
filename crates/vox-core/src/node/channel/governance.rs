@@ -662,6 +662,8 @@ pub(super) use view::{Display, View};
 pub(super) struct Progress {
     pub ready: bool,
     pub pending: bool,
+    /// This turn took already shown rows away (MP-11); the room's readers must notice.
+    pub retracted: bool,
 }
 
 /// Initialize only the derived directory. Authoritative source rows are neither
@@ -719,6 +721,7 @@ pub(super) fn progress(store: &Store, sek: &Sek, room: &Digest32, now: u64) -> R
     Ok(Progress {
         ready: read.ready(now)?,
         pending: read.pending() || !read.current_ready()?,
+        retracted: false,
     })
 }
 
@@ -815,10 +818,12 @@ pub(super) fn advance(
         return Ok(Progress {
             ready: current.ready,
             pending: false,
+            retracted: false,
         });
     }
     advance_source(store, entries, sek, room, authors, root, me)?;
     advance_frontiers(store, entries, sek, room)?;
+    let mut retracted = false;
     {
         let input = entries.read(store, sek, room)?;
         let mut batch = store.batch()?;
@@ -845,6 +850,11 @@ pub(super) fn advance(
                     break;
                 }
             }
+            // MP-11 (ADR-053): a message this node already shows and that an eligibility
+            // decision now proves not acceptable (its author outside a removal's cut) leaves the
+            // conversation in the same transaction as the decision, so counts, pages and threads
+            // never name it again.
+            let mut ineligible = Vec::new();
             if fold_ready {
                 for _ in 0..FOLD_STEPS {
                     if started.elapsed() >= FOLD_BUDGET || !writer.causal_settled()? {
@@ -854,17 +864,35 @@ pub(super) fn advance(
                     if !writer.causal_settled()? {
                         break;
                     }
-                    let worked = member_fold::advance_eligibility(&mut writer)?;
+                    let worked = member_fold::advance_eligibility(&mut writer, &mut ineligible)?;
                     if !replayed && !worked {
                         break;
                     }
                 }
             }
             writer.seal()?;
+            #[cfg(feature = "test-knobs")]
+            if keep_rows_mutant() {
+                ineligible.clear();
+            }
+            if !ineligible.is_empty() {
+                let mut index = entries.write(&mut batch, sek, room)?;
+                for hash in &ineligible {
+                    if index.has_rendered(hash)? {
+                        index.remove_rendered(hash)?;
+                        retracted = true;
+                    }
+                    index.remove_read_receipt(hash)?;
+                }
+                index.seal()?;
+            }
             batch.commit()?;
         }
     }
-    progress(store, sek, room, now)
+    Ok(Progress {
+        retracted,
+        ..progress(store, sek, room, now)?
+    })
 }
 
 /// At most this many order/evaluation phase steps, and at most this long, per governance turn.
@@ -880,4 +908,18 @@ fn fold_held() -> bool {
     std::env::var_os(TEST_FOLD_HOLD_ENV)
         .filter(|path| !path.is_empty())
         .is_some_and(|path| std::path::Path::new(&path).exists())
+}
+
+/// `VOX_MUTANT_MP11_KEEP_ROWS`: a shown row stays when its author's eligibility is decided
+/// false (before MP-11). Says so once when the daemon first reads it.
+#[cfg(feature = "test-knobs")]
+fn keep_rows_mutant() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let on = std::env::var_os("VOX_MUTANT_MP11_KEEP_ROWS").is_some();
+        if on {
+            eprintln!("vox: VOX_MUTANT_MP11_KEEP_ROWS engaged: ineligible shown rows stay");
+        }
+        on
+    });
+    *ON
 }

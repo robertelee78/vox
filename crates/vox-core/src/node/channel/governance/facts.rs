@@ -1249,6 +1249,44 @@ impl<'a, 'store> Write<'a, 'store> {
         Ok(self.entry(ancestor_log)?.entry_hash() == ancestor_hash)
     }
 
+    /// ADR-053 MP-6: whether `ancestor` is in the prefix a removal witnessed through its signed
+    /// `seen` reference of the same author, by the exact branch-bound position and hash. The
+    /// reference passed the parent receipt check under this node's committed head of that author
+    /// at admission. As in `causal_contains`, position decides only before a fork is known; after
+    /// one, both the reference and the ancestor must be this node's accepted source rows. Used only
+    /// in the content-membership cut; it raises no frontier.
+    pub(super) fn reference_contains(
+        &self,
+        reference: &crate::log::history::EntryReference,
+        ancestor: &crate::log::entry::Entry,
+    ) -> Result<bool> {
+        let author = &ancestor.skeleton.author_id;
+        if reference.author != *author || reference.seq < ancestor.skeleton.seq {
+            return Ok(false);
+        }
+        if self.get(Table::ForkBoundary, &hash_key(author))?.is_none() {
+            return Ok(true);
+        }
+        let ancestor_hash = ancestor.entry_hash();
+        if reference.seq == ancestor.skeleton.seq {
+            return Ok(reference.hash == ancestor_hash);
+        }
+        let Some(tip) = self.get(Table::SourcePositions, &position(author, reference.seq))? else {
+            return Ok(false);
+        };
+        if self.entry(tip)?.entry_hash() != reference.hash {
+            return Ok(false);
+        }
+        let Some(log) = self.get(
+            Table::SourcePositions,
+            &position(author, ancestor.skeleton.seq),
+        )?
+        else {
+            return Ok(false);
+        };
+        Ok(self.entry(log)?.entry_hash() == ancestor_hash)
+    }
+
     pub(super) fn cursor(&self, cursor: Cursor) -> Result<Option<Zeroizing<Vec<u8>>>> {
         let id = self.header.cursors[cursor as usize];
         if id == 0 {
