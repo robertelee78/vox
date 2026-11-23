@@ -632,6 +632,47 @@ The first candidate that gets past the 100-post red is these shown-dependent bra
 first run; an APPARATUS fault or a hang there is a defect of this proof to fix, not the
 candidate's failure.
 
+## A posting newcomer on a slow path (ADR-052 RG-6; needs `test-knobs`)
+
+Symptom: a member who joined and keeps posting is shown by the others as `you trust it, but it
+has not trusted you` for as long as he posts, and their trust shows only after he stops. Two
+daemons whose only path is the proof's port forward, which holds every datagram from the
+newcomer to the member 150 ms (userspace; nothing in the product sets it). The newcomer posts
+twice a second, 100 times. Green: both `vox agent doctor` trust lines say `you trust each other`
+before his last post is acknowledged. Each sample also prints the member's `holds_through` for
+him, which explains a red (the start of his feed, where his consent sits, never held).
+
+```sh
+cargo test --release -p vox-tui --features optional-proofs,test-knobs \
+  --test a_newcomer_reads_the_whole_history_proof -- --ignored --exact \
+  a_newcomer_who_keeps_posting_is_trusted_back_on_a_slow_path --nocapture
+```
+
+Run it alone: its posting cadence is checked. `VOX_MUTANT_FETCH_DISCARD=1` puts back the timer cut
+ADR-052 RG-6 removed (a fetch whose author posted again is cut one second after its flow was
+built), and only that: not main's other two supersede paths (the turn-return supersede and the
+byte-wait supersede), nor the signalling of work a cut turn had already published. The proof
+forwards it to both daemons and requires alice's daemon to say it engaged.
+
+What replaced that cut: a live walk finishes the position it is fetching and, when the author's
+newer head is waiting, ends at that position boundary so the next round walks the newer head's
+window first. `a_returning_reader_eight_thousand_entries_behind_reads_and_pages_back` is its
+proof; `VOX_MUTANT_BOUNDARY_RESELECT_OFF=1` keeps the first head to the window's end instead, and
+that act must then fail PRODUCT ("completed newest history still does not show RG6-away-8000")
+with the reader daemon's engagement line printed as `[RG-6 mutant]`.
+
+The relay act is the same rule at RG-6's other proof line: an author posts twice a second, 300
+times, to a reader whose only path is a relay circuit with 75 ms each way on every member's hop
+(a userspace forwarder); green when the reader shows every acknowledged post. A red names how many
+the reader shows and holds. Run it quiet; the same mutant switch is forwarded to both daemons and
+one of them must say it engaged.
+
+```sh
+cargo test --release -p vox-tui --features optional-proofs,test-knobs --test key_package_proof \
+  delayed_relay::a_delayed_relay_keeps_up_with_a_two_per_second_author -- --ignored --exact \
+  --nocapture
+```
+
 ## The proofs
 
 ### Live model (needs `opencode` on PATH, logged in: `~/.local/share/opencode/auth.json`)
