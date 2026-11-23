@@ -814,13 +814,15 @@ async fn entry(
                 Ok(Some(room.history_head(store, &author)?.is_some_and(
                     |current| {
                         let bound = crate::log::history::MAX_PAGE_ENTRIES as u64;
-                        // An exact committed head may select only its newest 128 positions,
-                        // and only while that head is itself within 128 of the current head.
+                        // An exact committed head within 128 of the current head may select
+                        // any position under it: a reader that follows the author asks for
+                        // every position it lacks above its first window (ADR-052 RG-6).
                         // Arbitrarily old signed heads cannot turn Live into archive demand.
                         current.root.leaves >= through
                             && current.root.leaves - through < bound
                             && (current.root.leaves != through || current.id() == head_id)
-                            && seq >= through.saturating_sub(bound - 1).max(1)
+                            && (!live_floor_mutant()
+                                || seq >= through.saturating_sub(bound - 1).max(1))
                     },
                 )))
             })
@@ -1058,4 +1060,27 @@ async fn entry(
     }
     result.status = Status::Complete;
     Ok(result)
+}
+
+/// `VOX_MUTANT_LIVE_FLOOR`: this server refuses a Live body more than 128 positions below the
+/// head it is asked under, as every release from v0.4.6 to v0.4.30 did (ledger 66). Says so
+/// once on stderr when the daemon first reads it.
+#[cfg(feature = "test-knobs")]
+fn live_floor_mutant() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let on = std::env::var_os("VOX_MUTANT_LIVE_FLOOR").is_some();
+        if on {
+            eprintln!(
+                "vox: VOX_MUTANT_LIVE_FLOOR engaged: Live is refused below the newest 128 \
+                 positions"
+            );
+        }
+        on
+    });
+    *ON
+}
+
+#[cfg(not(feature = "test-knobs"))]
+const fn live_floor_mutant() -> bool {
+    false
 }

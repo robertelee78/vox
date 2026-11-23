@@ -91,6 +91,8 @@ optional_proof::not_run!(
     a_busy_room_newcomer_reads_every_member_with_a_delayed_path,
     the_busy_room_reader_finds_the_first_of_five_thousand_rows,
     a_returning_reader_eight_thousand_entries_behind_reads_and_pages_back,
+    a_follower_held_still_through_a_burst_holds_every_post,
+    a_follower_filled_while_the_author_keeps_posting_walks_each_position_once,
 );
 
 #[path = "support/test_knobs.rs"]
@@ -10005,12 +10007,42 @@ fn the_busy_room_reader_finds_the_first_of_five_thousand_rows() {
 }
 
 /// ADR-052 RG-6: a member returns after 8,000 acknowledged posts, reads the newest window and
-/// pages back explicitly. This does not exercise a Live request below that bounded window.
+/// pages back explicitly. The member followed the author before it left, so its node also
+/// fetches the posts it missed without being asked; this act asserts that the newest post shows
+/// and that paging back reaches every post.
 #[cfg(feature = "optional-proofs")]
 #[test]
 #[ignore = "eight thousand CLI posts and two real daemons; optional"]
 fn a_returning_reader_eight_thousand_entries_behind_reads_and_pages_back() {
     rg1::returning_reader();
+}
+
+/// ADR-052 RG-6 (ledger 66): "a missing body is asked for until it arrives". A member who
+/// follows an author is held still (SIGSTOP) while the author posts 300 times, more than twice
+/// the 128-position first window, then let go: with nobody paging and no `--history`, it comes
+/// to hold every post, and its status names nothing missing. Red when three samples 5 s apart
+/// show no advance while connected and nothing of the reader's runs on its live lane (`vox
+/// status --json` `lanes.bounded`). Mutant: `VOX_MUTANT_LIVE_FLOOR` (the author's node refuses
+/// Live below its newest 128 positions, as v0.4.6 to v0.4.30 did).
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "three hundred CLI posts and two real daemons; optional"]
+fn a_follower_held_still_through_a_burst_holds_every_post() {
+    rg1::follower_held_still(rg1::Follow::Plain);
+}
+
+/// The plain scene, with the author posting about once a second from the moment the reader is
+/// let go until it holds all 300 (ledger 66, open point c). Each new head is walked first and
+/// the walk then resumes the older gap where it stopped. Counted from the reader's own
+/// test-knobs lines after it is let go, no clock: its live walk's store writes (`live window
+/// passed`) stay within one per distinct position it walked, one per new head and 16 more.
+/// Mutant: `VOX_MUTANT_LIVE_RESUME_OFF` (the walk passes again, one write each, what it
+/// already walked).
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "three hundred CLI posts, a post a second during the fill and two real daemons; optional"]
+fn a_follower_filled_while_the_author_keeps_posting_walks_each_position_once() {
+    rg1::follower_held_still(rg1::Follow::AuthorKeepsPosting);
 }
 
 /// ADR-052 RG-6: a member that verified another author's evidence serves it again after a
@@ -10628,6 +10660,228 @@ mod rg1 {
                 }
             }
             std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Ledger 66's mutants, by name, forwarded to every daemon by `start`.
+    const FOLLOW_MUTANTS: [&str; 2] = ["VOX_MUTANT_LIVE_FLOOR", "VOX_MUTANT_LIVE_RESUME_OFF"];
+
+    /// What else happens while the follower is filled (ADR-052 RG-6, ledger 66).
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(super) enum Follow {
+        /// Nothing: the follower fills the burst by itself.
+        Plain,
+        /// The author posts about once a second while the follower fills (open point c).
+        AuthorKeepsPosting,
+    }
+
+    /// Whether a live flow of the reader's is ready or running (`vox status --json`
+    /// `lanes.bounded`): a still sample counts only when none is.
+    fn live_in_flight(w: &Worker) -> (bool, Value) {
+        let out = w.vox(None, &["status", "--json"]);
+        assert!(out.ok, "RED PRODUCT: {}'s status refused: {out:?}", w.name);
+        let bounded = out.json()["lanes"]["bounded"].clone();
+        let busy = [&bounded["ready"], &bounded["running"]]
+            .iter()
+            .any(|flows| flows.to_string().contains("\"lane\":\"live\""));
+        (busy, bounded)
+    }
+
+    /// Open point (c), from the reader's own test-knobs lines after it was let go (`since` is
+    /// the length of its stderr then): the live walk's store writes for the author (`live window
+    /// passed`), the distinct positions they walked and the heads it selected (`live window
+    /// selected`). RED when the writes exceed one per distinct position, one per head and 16.
+    fn walk_writes(bob: &Worker, author: &str, since: usize, posts: usize, engaged: bool) {
+        let err = bob.data.with_extension("err");
+        let text = std::fs::read_to_string(&err).unwrap_or_default();
+        let after = text.get(since..).unwrap_or_default();
+        let passed = format!("live window passed author={author} ");
+        let selected = format!("live window selected author={author} ");
+        let walked: Vec<u64> = after
+            .lines()
+            .filter(|line| line.contains(&passed))
+            .filter_map(|line| {
+                line.split_whitespace()
+                    .find_map(|word| word.strip_prefix("at="))
+                    .and_then(|at| at.parse().ok())
+            })
+            .collect();
+        assert!(
+            !walked.is_empty(),
+            "APPARATUS: the reader's build does not report its live walk's store writes (no \
+             `{passed}` line after it was let go); see {}",
+            err.display()
+        );
+        let writes = walked.len() as u64;
+        let distinct = walked.iter().collect::<BTreeSet<_>>().len() as u64;
+        let heads = after
+            .lines()
+            .filter(|line| line.contains(&selected))
+            .count() as u64;
+        let allowed = distinct + heads + 16;
+        eprintln!(
+            "[RG-6 rewalk] after the reader was let go the author posted {posts} times; the \
+             reader selected {heads} heads and its walk made {writes} store writes over \
+             {distinct} distinct positions (allowed {allowed})"
+        );
+        if writes > allowed {
+            assert!(
+                engaged || !FOLLOW_MUTANTS.iter().any(|m| std::env::var_os(m).is_some()),
+                "APPARATUS: a mutant was set but no daemon said it engaged"
+            );
+            panic!(
+                "RED PRODUCT: while the author kept posting, the reader's live walk made {writes} \
+                 store writes over {distinct} distinct positions for {heads} heads (allowed \
+                 {allowed}): it walked {} positions again",
+                writes - distinct
+            );
+        }
+        eprintln!("[RG-6 rewalk] verdict: {writes} store writes within {allowed}");
+    }
+
+    pub(super) fn follower_held_still(arm: Follow) {
+        const POSTS: usize = 300;
+        let root = root();
+        let exe = binary();
+        let alice = room::worker_as(root.path(), "follow-author", &exe);
+        let bob = room::worker_as(root.path(), "follow-reader", &exe);
+        let _alice_daemon = start(&alice, "127.0.0.1:0", None);
+        let bob_daemon = start(&bob, "127.0.0.1:0", None);
+        for (w, peer) in [(&alice, &bob), (&bob, &alice)] {
+            w.vox_env(
+                None,
+                &[("VOX_IDENTITY_PASSPHRASE", room::ID_PASS)],
+                &["trust", "add", &peer.b32(), "--name", &peer.name],
+                None,
+            )
+            .expect_ok("mutual trust before the room");
+        }
+        let id = create(&alice);
+        let link = alice.vox(None, &["room", "link", &id]);
+        link.expect_ok("follower room link");
+        bob.vox_in(
+            None,
+            &["room", "join", "--passphrase-file", "-", link.stdout.trim()],
+            Some(room::ROOM_PASS),
+        )
+        .expect_ok("reader joins and follows the author");
+        post(&alice, &id, "RG6-follow-before", true);
+        returning_reader_ready(&bob, &id);
+        let staging = Instant::now();
+        while !read(&bob, &id, Some("RG6-follow-before"))
+            .0
+            .contains("RG6-follow-before")
+        {
+            assert!(
+                staging.elapsed() < Duration::from_secs(240),
+                "APPARATUS: the reader never showed the author's post before the stall"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        // The reader follows the author now. Hold its daemon still while the author posts more
+        // than twice the first window, then let it go: the same path as a burst that outruns it.
+        signal(bob_daemon.0.id(), "-STOP");
+        for n in 1..=POSTS {
+            post(&alice, &id, &format!("RG6-follow-{n:03}"), true);
+        }
+        let since = std::fs::metadata(bob.data.with_extension("err")).map_or(0, |m| m.len());
+        signal(bob_daemon.0.id(), "-CONT");
+        eprintln!("[RG-6 follow] {POSTS} posts acknowledged while the reader was held still");
+        let wanted: Vec<String> = FOLLOW_MUTANTS
+            .iter()
+            .filter(|name| std::env::var_os(name).is_some())
+            .map(|name| format!("{name} engaged"))
+            .collect();
+        let mut engaged = None::<String>;
+        let mut last = None::<(usize, Option<u64>)>;
+        let mut unchanged = 0;
+        let mut sample = 0;
+        let mut live_posts = 0;
+        loop {
+            if arm == Follow::AuthorKeepsPosting {
+                // About a post a second while the reader fills (open point c).
+                for _ in 0..5 {
+                    live_posts += 1;
+                    post(&alice, &id, &format!("RG6-live-{live_posts:03}"), true);
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+            } else {
+                std::thread::sleep(Duration::from_secs(5));
+            }
+            sample += 1;
+            let report = status(&bob, &id);
+            let row = member(&report, &alice.b32())
+                .cloned()
+                .unwrap_or(Value::Null);
+            let connected = row["connected"] == true;
+            let missing = row["missing_live_entries"].as_u64();
+            let (in_flight, lane) = live_in_flight(&bob);
+            let (texts, pages, _) = read(&bob, &id, None);
+            let shown = |n: &usize| texts.contains(&format!("RG6-follow-{n:03}"));
+            let held = (1..=POSTS).filter(shown).count();
+            eprintln!(
+                "[RG-6 follow] sample={sample} held={held}/{POSTS} pages={pages} \
+                 connected={connected} missing_live_entries={missing:?} not_receiving={} \
+                 holds_through={} advertised_through={} live_in_flight={in_flight}",
+                report["not_receiving"], row["holds_through"], row["advertised_through"]
+            );
+            if !wanted.is_empty() && engaged.is_none() {
+                engaged = [&alice, &bob].iter().find_map(|w| {
+                    std::fs::read_to_string(w.data.with_extension("err"))
+                        .ok()?
+                        .lines()
+                        .find(|line| wanted.iter().any(|want| line.contains(want)))
+                        .map(|line| format!("{}: {line}", w.name))
+                });
+                if let Some(line) = &engaged {
+                    eprintln!("[RG-6 mutant] {line}");
+                }
+            }
+            if held == POSTS && missing == Some(0) {
+                if arm == Follow::AuthorKeepsPosting {
+                    walk_writes(
+                        &bob,
+                        &alice.b32(),
+                        since as usize,
+                        live_posts,
+                        engaged.is_some(),
+                    );
+                }
+                assert!(
+                    wanted.is_empty(),
+                    "APPARATUS: a mutant was set and the reader still finished; engagement line: \
+                     {engaged:?}"
+                );
+                eprintln!(
+                    "GREEN ({arm:?}): the follower holds all {POSTS} posts made while it was held \
+                     still, unasked, and its status names nothing missing (sample {sample})"
+                );
+                return;
+            }
+            // Only a connected reader's still samples with nothing in flight count: a reconnect
+            // or a slow body on a loaded machine is not a verdict.
+            let now = (held, missing);
+            unchanged = if connected && !in_flight && last == Some(now) {
+                unchanged + 1
+            } else {
+                0
+            };
+            last = Some(now);
+            if unchanged >= 2 {
+                assert!(
+                    wanted.is_empty() || engaged.is_some(),
+                    "APPARATUS: a mutant was set but no daemon said it engaged; see {}",
+                    bob.data.with_extension("err").display()
+                );
+                panic!(
+                    "RED PRODUCT: the follower holds {held} of {POSTS} posts made while it was \
+                     held still and did not advance over three samples 5 s apart while connected \
+                     to the author with no live flow ready or running ({lane}); its status says \
+                     missing_live_entries={missing:?}, not_receiving={}; missing posts: {:?}",
+                    report["not_receiving"],
+                    super::missing_ranges(&(1..=POSTS).filter(shown).collect(), POSTS)
+                );
+            }
         }
     }
 

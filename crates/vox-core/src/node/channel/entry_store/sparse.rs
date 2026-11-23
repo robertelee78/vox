@@ -405,8 +405,10 @@ pub(crate) struct AuthorState {
     pub live: Option<LiveWindow>,
 }
 
-/// At most 128 positions, visited newest first. A cursor is local demand, never authority
-/// or a claim that the author's older archive is held. It survives retired network workers.
+/// A node's walk over one author's feed, visited newest first. Only the first window is the
+/// newest 128 positions; after it every newer position stays wanted until it is walked. A
+/// cursor is local demand, never authority or a claim that the author's older archive is
+/// held. It survives retired network workers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LiveWindow {
     pub head: Digest32,
@@ -422,14 +424,51 @@ impl LiveWindow {
         if self.from == 0
             || self.through > crate::log::feed::MAX_SEQ
             || self.from > self.through.saturating_add(1)
-            || self.through.saturating_sub(self.from)
-                >= crate::log::history::MAX_PAGE_ENTRIES as u64
             || self.next > self.through
             || self.next.saturating_add(1) < self.from
         {
             return Err(invalid("live history window bounds"));
         }
         Ok(())
+    }
+}
+
+/// Memory only, per author: on the window for `head`, once position `at` is walked the walk
+/// continues at `to`, past the positions it walked before that newer head came (ADR-052
+/// RG-6). Without it every new head during a catch-up walked back down through everything
+/// held, one store write each (29,804 positions while 60 posts arrived). A restart loses it;
+/// the first walk after it passes the held run once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LiveResume {
+    pub head: Digest32,
+    pub at: u64,
+    pub to: u64,
+}
+impl LiveResume {
+    /// The jump for `new`, selected over the unfinished `old` whose jump was `prior`. Two
+    /// unwalked ranges and one jump: the walk passes again whichever is fewer, the positions
+    /// `old` walked or those walked between `old` and `prior`'s target.
+    pub(crate) fn select(old: LiveWindow, prior: Option<Self>, new: LiveWindow) -> Option<Self> {
+        let walked = old.through - old.next;
+        match prior.filter(|r| r.head == old.head && r.at <= old.next) {
+            Some(r) if walked <= r.at - 1 - r.to => Some(Self {
+                head: new.head,
+                ..r
+            }),
+            _ => (walked > 0).then_some(Self {
+                head: new.head,
+                at: old.through + 1,
+                to: old.next,
+            }),
+        }
+    }
+    /// Positions of `window` still ahead of its cursor that this jump passes.
+    pub(crate) fn passes(self, window: LiveWindow) -> u64 {
+        if self.head == window.head && self.at <= window.next {
+            self.at - 1 - self.to
+        } else {
+            0
+        }
     }
 }
 impl AuthorState {
@@ -2664,10 +2703,10 @@ impl Write<'_, '_> {
         Ok(())
     }
 
-    /// Resume an unfinished window while it remains live-eligible. A head at least 128
-    /// positions newer retires only that obsolete live demand and selects its newest suffix;
-    /// accepted headers, bodies and missing facts stay intact for explicit History recovery.
-    /// No selection turns the intervening disconnected archive gap into live demand.
+    /// Resume an unfinished window. Only this node's first window for an author starts at the
+    /// newest 128 positions, so a newcomer is never made to read from message one; after it a
+    /// newer head keeps the start, and every position between it and the head stays wanted
+    /// until held, expired or answered as not held (ADR-052 RG-6, ledger 66).
     pub(crate) fn select_history_live_window(
         &mut self,
         author: &Digest32,
@@ -2694,21 +2733,23 @@ impl Write<'_, '_> {
             }
         }
         let through = head.root.leaves;
-        let floor = through
-            .saturating_sub(crate::log::history::MAX_PAGE_ENTRIES as u64 - 1)
-            .max(1);
         // A newer head over a finished window starts just above it: everything below was
         // visited. Over an unfinished window it keeps that window's start, so the fresh
-        // positions above the old top are walked first and the old remainder after them,
-        // positions already held passing locally (ADR-036: live before history). The oldest
-        // positions a 128-wide window can no longer reach are older history, on demand.
-        let from = state.live.map_or(floor, |old| {
-            if old.complete() {
-                floor.max(old.through + 1)
-            } else {
-                floor.max(old.from)
-            }
-        });
+        // positions above the old top are walked first and the old remainder after them
+        // (ADR-036: live before history). A floor that rose with the head used to leave a
+        // burst that outran the walk below it for good: 146 to 362 of 1,000 held.
+        let from = state.live.map_or(
+            through
+                .saturating_sub(crate::log::history::MAX_PAGE_ENTRIES as u64 - 1)
+                .max(1),
+            |old| {
+                if old.complete() {
+                    old.through + 1
+                } else {
+                    old.from
+                }
+            },
+        );
         let window = LiveWindow {
             head: head_id,
             from,
@@ -2723,15 +2764,20 @@ impl Write<'_, '_> {
 
     /// CAS the selected position, not the committed head. The caller has completed normal
     /// admission or retained a verified missing-body position; this changes no effect flag.
+    /// `to` is the next position to walk: one below, or lower past a run already walked.
     pub(crate) fn advance_history_live_window(
         &mut self,
         author: &Digest32,
         expected: LiveWindow,
+        to: u64,
     ) -> Result<bool> {
         self.require_sparse_idle()?;
         expected.validate()?;
         if expected.complete() {
             return Ok(false);
+        }
+        if to >= expected.next || to.saturating_add(1) < expected.from {
+            return Err(invalid("live window advance target"));
         }
         let source = Source::Batch(self.batch);
         let roots = self.directory.active.sparse;
@@ -2751,7 +2797,7 @@ impl Write<'_, '_> {
             return Err(invalid("live window binding differs"));
         }
         state.live = Some(LiveWindow {
-            next: expected.next - 1,
+            next: to,
             ..expected
         });
         self.save_sparse_author(head.binding, state)?;

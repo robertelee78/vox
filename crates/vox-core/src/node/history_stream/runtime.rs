@@ -2360,7 +2360,7 @@ impl Flow {
                 let committed = Arc::clone(&self.work_committed);
                 enum Selection<P> {
                     Held(LiveWindow, u64),
-                    Write(P, u64),
+                    Write(P, u64, Option<LiveWindow>),
                 }
                 let found = source
                     .write_owned(
@@ -2396,13 +2396,14 @@ impl Flow {
                             // A head no newer than the window's top resumes it. A newer head
                             // selects a new window when this operation runs, even over an
                             // unfinished one, and the selector keeps the unfinished positions
-                            // inside the new window, walked newest first after the fresh ones,
-                            // held positions passing locally. A flow already fetching is not cut
-                            // for the newer head (ADR-052 RG-6): it finishes its position, then
-                            // ends at that boundary so the next flow selects the newer head.
-                            // Measured before the newer head selected at all: a joiner read the
-                            // creator's next post only when his drain of her 150-post window
-                            // ended, 51–59 s on.
+                            // inside the new window, walked newest first after the fresh ones;
+                            // the walk then jumps the run it had already passed and resumes
+                            // the old remainder where it stopped (`LiveResume`). A flow already
+                            // fetching is not cut for the newer head (ADR-052 RG-6): it finishes
+                            // its position, then ends at that boundary so the next flow selects
+                            // the newer head. Measured before the newer head selected at all: a
+                            // joiner read the creator's next post only when his drain of her
+                            // 150-post window ended, 51–59 s on.
                             if let Some(window) = state.live {
                                 if window.through >= target.root.leaves {
                                     return Ok(Selection::Held(window, target.root.leaves));
@@ -2412,19 +2413,42 @@ impl Flow {
                             drop(input);
                             let pending = channel
                                 .prepare_history_admission(store, Some((node, generation)))?;
-                            Ok(Selection::Write(pending, through))
+                            Ok(Selection::Write(pending, through, state.live))
                         },
                         move |selection, store| match selection {
-                            Selection::Held(window, through) => Ok((window, through)),
-                            Selection::Write(pending, through) => pending.with(|channel| {
+                            Selection::Held(window, through) => Ok((window, through, None)),
+                            Selection::Write(pending, through, old) => pending.with(|channel| {
                                 channel
                                     .history_write_tracked(store, &committed, |index| {
                                         index.select_history_live_window(&author, head)
                                     })
-                                    .map(|window| (window, through))
+                                    .map(|window| (window, through, Some(old)))
                             }),
                         },
-                        |_, _, value| Ok(value),
+                        move |channel, _, (window, through, selected)| {
+                            if let Some(old) = selected {
+                                let prior = channel.live_resume.get(&author).copied();
+                                let resume = old.filter(|old| !old.complete()).and_then(|old| {
+                                    crate::node::channel::entry_store::sparse::LiveResume::select(
+                                        old, prior, window,
+                                    )
+                                });
+                                #[cfg(feature = "test-knobs")]
+                                eprintln!(
+                                    "live window selected author={} from={} through={} \
+                                     resume={:?}",
+                                    crate::node::link::b32_encode(&author),
+                                    window.from,
+                                    window.through,
+                                    resume.map(|resume| (resume.at, resume.to))
+                                );
+                                match resume {
+                                    Some(resume) => channel.live_resume.insert(author, resume),
+                                    None => channel.live_resume.remove(&author),
+                                };
+                            }
+                            Ok((window, through))
+                        },
                     )
                     .await?;
                 let found = match found {
@@ -2693,19 +2717,45 @@ impl Flow {
                                 return Ok(None);
                             }
                             drop(input);
+                            // Past the run this walk passed before a newer head came, at once.
+                            let to = channel
+                                .live_resume
+                                .get(&author)
+                                .filter(|resume| {
+                                    resume.head == window.head
+                                        && resume.at == window.next
+                                        && !live_resume_off_mutant()
+                                })
+                                .map_or(window.next - 1, |resume| resume.to);
                             channel
                                 .prepare_history_admission(store, Some((node, generation)))
-                                .map(Some)
+                                .map(|pending| Some((pending, to)))
                         },
                         move |pending, store| match pending {
-                            None => Ok(true),
-                            Some(pending) => pending.with(|channel| {
-                                channel.history_write_tracked(store, &committed, |index| {
-                                    index.advance_history_live_window(&author, window)
-                                })
+                            None => Ok((true, None)),
+                            Some((pending, to)) => pending.with(|channel| {
+                                channel
+                                    .history_write_tracked(store, &committed, |index| {
+                                        index.advance_history_live_window(&author, window, to)
+                                    })
+                                    .map(|advanced| (advanced, Some(to)))
                             }),
                         },
-                        |_, _, value| Ok(value),
+                        move |channel, _, (advanced, to)| {
+                            if let (true, Some(to)) = (advanced, to) {
+                                if to + 1 < window.next {
+                                    channel.live_resume.remove(&author);
+                                }
+                                #[cfg(feature = "test-knobs")]
+                                eprintln!(
+                                    "live window passed author={} through={} at={} to={to}",
+                                    crate::node::link::b32_encode(&author),
+                                    window.through,
+                                    window.next
+                                );
+                            }
+                            Ok(advanced)
+                        },
                     )
                     .await?;
                 match advanced {
@@ -2988,7 +3038,7 @@ impl Flow {
                 } else {
                     task.request
                 };
-                let mut result = super::exchange(
+                let exchanged = super::exchange(
                     &receiver,
                     conn,
                     job.clone(),
@@ -3002,7 +3052,67 @@ impl Flow {
                     fence,
                     deadline,
                 )
-                .await?;
+                .await;
+                // A server from v0.4.6 to v0.4.30 refuses a Live body more than 128 positions
+                // below its head with a ProtocolLimits reset, as every server refuses a head the
+                // author has since moved more than 128 past. Neither is this connection's fault.
+                // Failed, the round put the member's port in a backoff of up to 30 s and its
+                // newest messages waited behind it. Instead the head is parked for this
+                // connection and the walk stops here; the position stays owed (and counted in
+                // `vox status`), asked again for a newer head or on another connection.
+                let refused = match (&exchanged, &query) {
+                    (
+                        Err(Error::PeerRefused(crate::wire::WireError::ProtocolLimits)),
+                        Query::Entry { head, seq, .. },
+                    ) if task.purpose == Purpose::Live => {
+                        self.tasks
+                            .iter()
+                            .find_map(|pending| match pending.operation {
+                                Operation::LiveAdvance { author, window, .. }
+                                    if window.head == *head && window.next == *seq =>
+                                {
+                                    Some((author, *head, *seq))
+                                }
+                                _ => None,
+                            })
+                    }
+                    _ => None,
+                };
+                if let Some((author, head, seq)) = refused {
+                    self.peer_answered = true;
+                    if !self
+                        .transient_decline(&source, job, inbox, inbox_generation, author, head)
+                        .await?
+                    {
+                        return Ok(());
+                    }
+                    let at = |pending: &Task| match pending.operation {
+                        Operation::LiveAdvance { window, .. } => {
+                            window.head == head && window.next == seq
+                        }
+                        Operation::Local(LocalStep::Entry {
+                            head: at,
+                            seq: position,
+                            ..
+                        }) => at == head && position == seq,
+                        _ => false,
+                    };
+                    self.tasks.retain(|pending| !at(pending));
+                    if self.replay.as_ref().is_some_and(at) {
+                        self.replay = None;
+                    }
+                    #[cfg(feature = "test-knobs")]
+                    eprintln!(
+                        "live body refused author={} seq={seq}: kept owed",
+                        crate::node::link::b32_encode(&author)
+                    );
+                    self.push(Task {
+                        operation: Operation::ReclaimUnavailable,
+                        ..task
+                    })?;
+                    return Ok(());
+                }
+                let mut result = exchanged?;
                 self.peer_answered = true;
                 if matches!(
                     result.status,
@@ -4233,5 +4343,27 @@ fn boundary_reselect_off_mutant() -> bool {
 
 #[cfg(not(feature = "test-knobs"))]
 const fn boundary_reselect_off_mutant() -> bool {
+    false
+}
+
+/// `VOX_MUTANT_LIVE_RESUME_OFF`: a live walk never jumps the run it passed before a newer head
+/// came, so it walks back down through it one store write each, as before ledger 66's repair.
+#[cfg(feature = "test-knobs")]
+fn live_resume_off_mutant() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let on = std::env::var_os("VOX_MUTANT_LIVE_RESUME_OFF").is_some();
+        if on {
+            eprintln!(
+                "vox: VOX_MUTANT_LIVE_RESUME_OFF engaged: a live walk passes again what it \
+                 already walked"
+            );
+        }
+        on
+    });
+    *ON
+}
+
+#[cfg(not(feature = "test-knobs"))]
+const fn live_resume_off_mutant() -> bool {
     false
 }
