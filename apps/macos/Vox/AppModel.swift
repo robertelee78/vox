@@ -54,8 +54,6 @@ final class AppModel: ObservableObject {
             }
         }
     }
-    /// The daemon's explanation while the selected node is preparing its storage.
-    @Published private(set) var startupReason: String?
     /// Whether the menu bar extra is shown: off until the person turns it on (M-22).
     @Published private(set) var menuBar = MenuBarChoice.on()
     /// The app's text size (Theme.scale): the window is drawn again when it changes.
@@ -406,23 +404,6 @@ final class AppModel: ObservableObject {
         self.client === client && nodeRequestGeneration == generation
     }
 
-    /// Keep the attaching screen current while the daemon prepares the selected node.
-    private func watchStartup(_ client: VoxClient, node: String, generation: UInt64) -> Task<Void, Never> {
-        Task { [weak self] in
-            while !Task.isCancelled {
-                if let nodes = try? await client.nodes() {
-                    guard let self, self.ownsNodeRequest(client, generation), !Task.isCancelled else { return }
-                    self.startupReason = nodes.first(where: { $0.name == node })?.startup
-                }
-                do {
-                    try await Task.sleep(nanoseconds: 250_000_000)
-                } catch {
-                    return
-                }
-            }
-        }
-    }
-
     private func refreshNodeState(_ client: VoxClient, generation: UInt64) async throws {
         let shown = node
         let fresh = try await client.nodes()
@@ -505,9 +486,6 @@ final class AppModel: ObservableObject {
         nodeActionInProgress = true
         defer { nodeActionInProgress = false }
         phase = .attaching(node: node)
-        startupReason = nil
-        let startupWatch = watchStartup(client, node: node, generation: generation)
-        defer { startupWatch.cancel() }
         let passphrase: Passphrase
         do {
             passphrase = try secret.passphrase()
@@ -877,9 +855,6 @@ final class AppModel: ObservableObject {
         }
         guard ownsNodeRequest(client, generation) else { return }
         phase = .attaching(node: node.name)
-        startupReason = node.startup
-        let startupWatch = watchStartup(client, node: node.name, generation: generation)
-        defer { startupWatch.cancel() }
         do {
             let fingerprint = try await client.attach(node: node.name, passphrase: nil)
             guard ownsNodeRequest(client, generation) else { return }

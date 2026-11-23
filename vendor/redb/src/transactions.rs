@@ -2428,6 +2428,22 @@ impl WriteTransaction {
         Ok(progress)
     }
 
+    /// Vox: one give-back step while the database is shared. Moves the highest pages into the
+    /// lowest free ones and trims, at this commit, all free space at the end of the file. The
+    /// pages it vacates are freed like any write's: only once no open read can still see them,
+    /// so reads go on, and a later commit ([`Self::trim_at_commit`]) trims that space. Unlike
+    /// [`crate::Database::compact`] it neither waits for reads nor needs the database alone;
+    /// the caller must make no savepoints, since moved pages are not tracked for one.
+    pub fn compact_pages_and_trim(&mut self) -> Result {
+        self.trim_at_commit();
+        self.compact_pages().map(|_| ())
+    }
+
+    /// Vox: this commit trims all free space at the end of the file, not only a quarter or more.
+    pub fn trim_at_commit(&mut self) {
+        self.set_shrink_policy(ShrinkPolicy::Maximum);
+    }
+
     // NOTE: must be called before store_system_freed_pages() during commit, since this can create
     // more pages freed by the current transaction
     fn process_freed_pages(&mut self, free_until: TransactionId) -> Result {
@@ -2804,6 +2820,17 @@ impl ReadTransaction {
     /// Vox decides whether to compact from allocator state without reading the store.
     pub fn allocated_bytes(&self) -> Result<u64> {
         Ok(self.mem.count_allocated_pages()? * self.mem.get_page_size() as u64)
+    }
+
+    /// Vox: bytes still allocated only because commits made without a flush freed them. The
+    /// next durable commit releases them, unless an open read can still see them.
+    pub fn awaiting_free_bytes(&self) -> u64 {
+        let page = self.mem.get_page_size() as u64;
+        self.mem
+            .unpersisted_data_freed_pages()
+            .iter()
+            .map(|freed| page << freed.page_order)
+            .sum()
     }
 
     /// Open the given table

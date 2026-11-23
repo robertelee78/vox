@@ -167,17 +167,6 @@ impl NodeStatus {
     }
 }
 
-/// Known startup storage work; decisions use its presence, never its human words.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StartupWork {
-    /// The same words shown by status and waiting clients.
-    pub reason: String,
-    /// Apparent file bytes before compaction.
-    pub file_bytes: u64,
-    /// Allocator-held bytes before compaction.
-    pub held_bytes: u64,
-}
-
 /// One node as the daemon reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeInfo {
@@ -193,8 +182,6 @@ pub struct NodeInfo {
     pub implicit: bool,
     /// Recorded with `--keep`, so it is attached again when the daemon starts (L-4).
     pub keep: bool,
-    /// Storage work still running before Ready, in words for the person; not a parser input.
-    pub startup: Option<StartupWork>,
 }
 
 /// How a `Use` attaches a node that is not attached (ADR-026 L-2).
@@ -1114,8 +1101,7 @@ fn state(d: &mut Decoder<'_>) -> Result<NodeState> {
 }
 
 fn put_info(e: &mut Encoder, i: &NodeInfo) {
-    e.array(if i.startup.is_some() { 7 } else { 6 })
-        .text(i.name.as_str());
+    e.array(6).text(i.name.as_str());
     put_state(e, i.state);
     put_fp(e, i.fingerprint.as_ref());
     e.uint(u64::from(i.implicit)).uint(u64::from(i.keep));
@@ -1124,20 +1110,15 @@ fn put_info(e: &mut Encoder, i: &NodeInfo) {
         Some(NodeStatus::Ready) => 1,
         Some(NodeStatus::Locked) => 2,
     });
-    if let Some(work) = &i.startup {
-        e.array(3)
-            .text(&work.reason)
-            .uint(work.file_bytes)
-            .uint(work.held_bytes);
-    }
 }
 
 fn info(d: &mut Decoder<'_>) -> Result<NodeInfo> {
     let fields = d.array().map_err(malformed("ipc node info"))?;
+    // A v0.4.30 daemon still sends a 7th field (its startup compaction notice) during an update.
     if fields != 6 && fields != 7 {
         return Err(Error::MalformedIpc("ipc node info"));
     }
-    Ok(NodeInfo {
+    let info = NodeInfo {
         name: name(d, "ipc node info name")?,
         state: state(d)?,
         fingerprint: fp(d, "ipc node info fingerprint")?,
@@ -1149,22 +1130,16 @@ fn info(d: &mut Decoder<'_>) -> Result<NodeInfo> {
             2 => Some(NodeStatus::Locked),
             _ => return Err(Error::MalformedIpc("ipc node status")),
         },
-        startup: if fields == 7 {
-            if d.array().map_err(malformed("ipc node startup"))? != 3 {
-                return Err(Error::MalformedIpc("ipc node startup"));
-            }
-            Some(StartupWork {
-                reason: d
-                    .text()
-                    .map_err(malformed("ipc node startup reason"))?
-                    .to_owned(),
-                file_bytes: d.uint().map_err(malformed("ipc node startup file bytes"))?,
-                held_bytes: d.uint().map_err(malformed("ipc node startup held bytes"))?,
-            })
-        } else {
-            None
-        },
-    })
+    };
+    if fields == 7 {
+        let read = d.array().ok().filter(|n| *n == 3).and_then(|_| {
+            d.text().ok()?;
+            d.uint().ok()?;
+            d.uint().ok()
+        });
+        read.ok_or(Error::MalformedIpc("ipc node startup"))?;
+    }
+    Ok(info)
 }
 
 fn put_infos(e: &mut Encoder, v: &[NodeInfo]) {

@@ -2311,16 +2311,17 @@ impl TransactionalMemory {
         if trailing_free == 0 {
             return Ok(false);
         }
-        if trailing_free < last_allocator_len / 2 && !force {
+        // Vox: an ordinary commit trims once a quarter of the last region is free at its end,
+        // and then trims all of it. Growth adds a quarter, which leaves a fifth free: no
+        // commit trims what the growth just added
+        if trailing_free < last_allocator_len / 4 && !force {
             return Ok(false);
         }
         let reduce_by = if layout.num_regions() > 1 && trailing_free == last_allocator_len {
             trailing_free
-        } else if force {
+        } else {
             // Do not shrink the database to zero size
             min(last_allocator_len - 1, trailing_free)
-        } else {
-            trailing_free / 2
         };
 
         let mut new_layout = layout;
@@ -2352,8 +2353,9 @@ impl TransactionalMemory {
                 layout.usable_bytes() + max_region_size
             }
         } else {
+            // Vox: grow by a quarter, not double, so the file stays near what it holds
             max(
-                layout.usable_bytes() * 2,
+                layout.usable_bytes() + layout.usable_bytes() / 4,
                 layout.usable_bytes() + required_growth * 2,
             )
         };

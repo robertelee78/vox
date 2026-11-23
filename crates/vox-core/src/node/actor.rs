@@ -40,7 +40,6 @@ use crate::node::api::{
     NodeView, Outcome, Secret,
 };
 use crate::node::channel::{ChannelState, Rendered, SessionAdvance, SessionRefresh};
-use crate::node::daemonipc::StartupWork;
 use crate::node::net::PeerPolicy;
 use crate::node::network::{BoardExchangeScope, Inbound, NodeNet};
 use crate::node::open_rooms::OpenRooms;
@@ -1036,8 +1035,6 @@ pub struct NodeConfig {
     /// (V210-100): before the node exists, so it cannot be an event. A CLI verb prints its words
     /// on stderr; `None` says nothing.
     pub on_profile_wait: Option<Arc<dyn Fn() + Send + Sync>>,
-    /// Publish or clear the reason storage work keeps this node from Ready.
-    pub on_startup_work: Option<Arc<dyn Fn(Option<StartupWork>) + Send + Sync>>,
 }
 
 /// [`crate::node::channel::CHECKPOINT_IDLE_SECS`], unless the **test-only**
@@ -1096,7 +1093,6 @@ impl NodeConfig {
             checkpoint_idle_secs: checkpoint_idle_from_env(),
             serve_only: None,
             on_profile_wait: None,
-            on_startup_work: None,
         }
     }
 
@@ -7184,7 +7180,6 @@ pub struct Node {
     /// [`LocalNode`]: crate::transport::quic::LocalNode
     stuck_after: Duration,
     argon2: Argon2Profile,
-    on_startup_work: Option<Arc<dyn Fn(Option<StartupWork>) + Send + Sync>>,
     view_tx: watch::Sender<NodeView>,
     /// A publication owed to network events, due by this instant (`publish_soon`).
     view_owed: Option<tokio::time::Instant>,
@@ -7400,7 +7395,6 @@ impl Node {
             checkpoint_idle_secs,
             serve_only,
             on_profile_wait,
-            on_startup_work,
         } = cfg;
         let profile_wait = move || {
             if let Some(notice) = &on_profile_wait {
@@ -7670,7 +7664,6 @@ impl Node {
             failed_post_reads: BTreeMap::new(),
             clock,
             argon2,
-            on_startup_work,
             view_tx: watch::Sender::new(NodeView::default()),
             view_owed: None,
             event_tx,

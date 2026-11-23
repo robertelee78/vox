@@ -68,8 +68,19 @@ const SEK_WRAPS: TableDefinition<Digest32, &[u8]> = TableDefinition::new("sek_wr
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const META_SCHEMA: &str = "schema_version";
 
-// redb can double a compacted file on its next write; reclaim only excess above that slack.
+// The file grows by a quarter and commits trim a quarter free at its end; give back only excess
+// above that slack.
 const MIN_COMPACTION_RECLAIM_BYTES: u64 = 64 * 1024 * 1024;
+
+/// What one give-back pass left: file and held bytes, its commits, how long it took, and the
+/// longest commit writers waited for.
+struct GaveBack {
+    file: u64,
+    held: u64,
+    steps: u32,
+    took: std::time::Duration,
+    longest: std::time::Duration,
+}
 
 /// Successful store-backend flush calls across this process, including opening, recovery and
 /// rewrite files. Count the completed I/O, not transactions classified as durable.
@@ -1593,29 +1604,104 @@ impl Store {
         Ok(())
     }
 
-    /// Startup only, before sharing the store: allocated pages include the metadata trees,
-    /// unlike the sum of row bodies. An overflowing comparison cannot exceed a u64 file.
-    pub(crate) fn compact_if_needed(&mut self, notice: impl FnOnce(u64, u64)) -> Result<bool> {
-        let used_bytes = {
-            let backing = self.db.get_mut().unwrap_or_else(PoisonError::into_inner);
-            let Backing::Writable(db) = backing else {
-                return Ok(false);
-            };
-            let txn = db.inner.begin_read().map_err(storage("measure store"))?;
-            txn.allocated_bytes().map_err(storage("measure store"))?
-        };
-        let file_bytes = std::fs::metadata(&self.path)
-            .map_err(storage("measure store file"))?
-            .len();
-        let Some((used_bytes, twice_used)) =
-            used_bytes.checked_mul(2).map(|twice| (used_bytes, twice))
-        else {
-            return Ok(false);
-        };
-        if file_bytes <= twice_used || file_bytes - twice_used < MIN_COMPACTION_RECLAIM_BYTES {
-            return Ok(false);
+    /// Give space back while the store is shared (RG-13), after a retention prune and once after
+    /// Ready: while the file exceeds 1.25 times what it holds by 64 MiB, trim the end of the file,
+    /// then move the highest pages into the lowest free ones, and trim again. Each step is one
+    /// durable commit under the writer: writers wait for one step at a time, reads never wait.
+    /// Pages an open read can still see are freed only after it ends: then the file does not
+    /// shrink, the pass stops, and the first commit after that read trims once a quarter is free
+    /// at the end. Best effort: a failure is logged and the node goes on. Held bytes are
+    /// allocated pages, metadata trees included, less what prunes committed without a flush
+    /// freed (the pass's first commit releases those). After Ready the pass first commits once:
+    /// pages the last run freed are released only by a commit.
+    pub(crate) fn give_back_space(&self, after_ready: bool) {
+        #[cfg(feature = "test-knobs")]
+        if super::computer::fx28_mutant("rg13-no-give-back") {
+            return;
         }
-        notice(file_bytes, used_bytes);
+        let node = self
+            .path
+            .parent()
+            .and_then(Path::file_name)
+            .map_or_else(|| "<node>".into(), |name| name.to_string_lossy());
+        match self.give_back_rounds(after_ready, |file, held| {
+            eprintln!(
+                "vox daemon: node {node}: giving back disk space (file {file} bytes, holds {held} bytes)"
+            );
+        }) {
+            Ok(Some(pass)) => eprintln!(
+                "vox daemon: node {node}: store file is now {} bytes, holds {} bytes; \
+                 {} steps in {} ms; writes waited at most {} ms",
+                pass.file,
+                pass.held,
+                pass.steps,
+                pass.took.as_millis(),
+                pass.longest.as_millis()
+            ),
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("vox daemon: node {node}: store compaction skipped: {error}; continuing");
+            }
+        }
+    }
+
+    /// What the pass left, or `None` when nothing was over the threshold or the store closed.
+    fn give_back_rounds(
+        &self,
+        after_ready: bool,
+        notice: impl FnOnce(u64, u64),
+    ) -> Result<Option<GaveBack>> {
+        let began = std::time::Instant::now();
+        let mut steps = 0_u32;
+        let measure = || -> Result<Option<(u64, u64)>> {
+            let held = match &*self.db.read().unwrap_or_else(PoisonError::into_inner) {
+                Backing::Writable(db) => {
+                    let txn = db.begin_read().map_err(storage("measure store"))?;
+                    txn.allocated_bytes()
+                        .map_err(storage("measure store"))?
+                        .saturating_sub(txn.awaiting_free_bytes())
+                }
+                Backing::ReadOnly(_) | Backing::Closed => return Ok(None),
+            };
+            let file = std::fs::metadata(&self.path)
+                .map_err(storage("measure store file"))?
+                .len();
+            Ok(Some((file, held)))
+        };
+        let over = |(file, held): (u64, u64)| {
+            file.saturating_sub(held.saturating_add(held / 4)) >= MIN_COMPACTION_RECLAIM_BYTES
+        };
+        let mut longest = std::time::Duration::ZERO;
+        // One durable commit: a trim, which first frees what no open read can still see, or a
+        // move of the highest pages. Then what the file is and holds.
+        let mut commit = |relocate: bool| -> Result<Option<(u64, u64)>> {
+            let mut epochs = self.writer()?;
+            let started = std::time::Instant::now();
+            let mut txn = match &*self.db.read().unwrap_or_else(PoisonError::into_inner) {
+                Backing::Writable(db) => db.begin_write().map_err(storage("begin give back"))?,
+                Backing::ReadOnly(_) | Backing::Closed => return Ok(None),
+            };
+            if relocate {
+                txn.compact_pages_and_trim()
+                    .map_err(storage("give back space"))?;
+            } else {
+                txn.trim_at_commit();
+            }
+            self.commit_flushed(txn, &mut epochs, "give back space")?;
+            drop(epochs);
+            longest = longest.max(started.elapsed());
+            steps += 1;
+            measure()
+        };
+        let measured = if after_ready {
+            commit(false)?
+        } else {
+            measure()?
+        };
+        let Some(first) = measured.filter(|first| over(*first)) else {
+            return Ok(None);
+        };
+        notice(first.0, first.1);
         #[cfg(feature = "test-knobs")]
         if std::env::var_os("VOX_TEST_COMPACT_FAIL").is_some() {
             return Err(Error::Storage {
@@ -1623,7 +1709,27 @@ impl Store {
                 detail: "compaction fault staged by proof".into(),
             });
         }
-        self.compact()
+        // The pages a move vacates are released by the next commit and trimmed only by the one
+        // after it: measured on a 2.8 GB store, the file never shrank at the first. A
+        // trim that then does not shrink the file means an open read still sees the moved pages,
+        // or nothing lower was free: stop rather than walk the store again.
+        let mut last = u64::MAX;
+        let done = loop {
+            let Some(now) = commit(false)? else {
+                return Ok(None);
+            };
+            if !over(now) || now.0 >= last || commit(true)?.is_none() || commit(false)?.is_none() {
+                break now;
+            }
+            last = now.0;
+        };
+        Ok(Some(GaveBack {
+            file: done.0,
+            held: done.1,
+            steps,
+            took: began.elapsed(),
+            longest,
+        }))
     }
 
     /// Repartition only this opened room. Each native transaction examines at most 64
@@ -1724,20 +1830,6 @@ impl Store {
                     std::thread::sleep(std::time::Duration::from_millis(20));
                 }
             }
-        }
-    }
-
-    /// Reclaim space after deletions. Returns whether anything was compacted.
-    pub fn compact(&mut self) -> Result<bool> {
-        match self.db.get_mut().unwrap_or_else(PoisonError::into_inner) {
-            Backing::Writable(db) => Arc::get_mut(&mut db.inner)
-                .ok_or_else(|| Error::Storage {
-                    op: "compact",
-                    detail: "the store still has active transactions".into(),
-                })?
-                .compact()
-                .map_err(storage("compact")),
-            Backing::ReadOnly(_) | Backing::Closed => Ok(false),
         }
     }
 }

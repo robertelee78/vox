@@ -51,9 +51,6 @@ pub async fn status(paths: &Paths, json: bool) -> Result<(), AppError> {
         let mut value = serde_json::json!({
             "node": name.as_str(), "status": info.status.map(|s| s.as_str()),
             "identity": info.fingerprint.map(|f| vox_core::node::link::b32_encode(&f)),
-            "startup": info.startup.as_ref().map(|work| &work.reason),
-            "startup_file_bytes": info.startup.as_ref().map(|work| work.file_bytes),
-            "startup_held_bytes": info.startup.as_ref().map(|work| work.held_bytes),
         });
         value["stores"] = stores;
         vox_core::node::status::set_anchor_inventory(
@@ -63,11 +60,7 @@ pub async fn status(paths: &Paths, json: bool) -> Result<(), AppError> {
         if json {
             println!("{value}");
         } else {
-            if let Some(work) = &info.startup {
-                println!("{}", work.reason);
-            } else {
-                println!("node {name}  {}", info.status.map_or("…", |s| s.as_str()));
-            }
+            println!("node {name}  {}", info.status.map_or("…", |s| s.as_str()));
             if info.status == Some(NodeStatus::Locked) {
                 println!(
                     "Unlock with {}",
