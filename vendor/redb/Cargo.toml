@@ -38,6 +38,8 @@ experimental-multiprocess = [
 experimental_cursor = ["experimental-api-5"]
 logging = ["dep:log"]
 std = []
+# Only Vox's real-binary crash proof enables its compaction relocation marker.
+vox-test-knobs = []
 
 [lib]
 name = "redb"

@@ -278,6 +278,36 @@ history remains available while the room recovers.
 **Confirm:** the room can save a new post again, and `vox room read` shows that post together
 with its previously saved messages.
 
+## Startup says it is giving back disk space
+
+After verifying an identity, the daemon compacts its store in place when the file exceeds
+twice its allocator-used bytes, including metadata, by at least 64 MiB. This keeps the
+engine's ordinary growth slack. There is no limit on how much the store holds.
+`vox status` and a waiting command say `giving back disk space`, with the file bytes and
+bytes held. The node becomes Ready when compaction finishes, then its rooms reopen.
+A waiting command prints the reason once; agent hooks retain their existing bounded wait.
+From v0.4.31 on, restart and update report that the daemon is running while this named
+startup work continues; they do not call the node Ready or treat disk-space reclamation as a
+failed handoff. The update FROM v0.4.30 is run by v0.4.30's own updater, which does not know
+this work: it waits 30 seconds for every kept node, and if compaction and the reopening of
+rooms take longer it reports that the daemon handoff failed although the new daemon is
+running and finishing the work. Nothing is lost: wait for `vox status` to show the node
+Ready. An older `vox` process still running beside the new daemon reads that node as
+unavailable until the work ends.
+On one measured Mac, unlocking a file holding 610 MB took 11.35 seconds with compaction,
+and 0.51 seconds without; disk speed and store shape affect this, not just file size.
+A start after an interrupted cleanup repeats it: one 2.6 GB file holding 300 MB reached
+Ready in 7.9 seconds, and every retained acknowledged row read back.
+There is no second store file or replacement rename. A locked identity is not compacted.
+
+The engine can grow beyond twice its previous size for a single very large allocation.
+Vox has no global stored-row limit below 64 MiB, so the floor is not a universal promise
+that a later unlock never compacts again; normal growth and retained-data changes matter.
+
+If compaction cannot run or fails, the daemon log names the node and the storage error, and
+startup continues using the last committed store. Compaction is optional, not a reason to
+keep an otherwise usable node Locked. Do not delete or reset the store.
+
 ## A restored node writes nothing until its own history is recovered
 
 **Symptom:** `this node's record of its own history in this room is behind what a member holds`.

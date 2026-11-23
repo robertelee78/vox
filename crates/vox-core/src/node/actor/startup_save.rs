@@ -188,7 +188,8 @@ fn run(
     argon2: Argon2Profile,
     decisions: &DecisionLog,
     events: &broadcast::Sender<NodeEvent>,
-) -> (Option<Profile>, std::result::Result<Loaded, Fault>) {
+    startup_work: Option<&(dyn Fn(Option<super::StartupWork>) + Send + Sync)>,
+) -> (Option<Profile>, std::result::Result<(), Fault>) {
     let waiting = || {
         let _ = events.send(NodeEvent::WaitingForProfile);
     };
@@ -237,14 +238,39 @@ fn run(
             };
             return (Some(profile), Err(fault));
         }
+        // Only this node's secret_work read lease is held here: no Room, Computer.state,
+        // changes or publications guard. Policy installation takes the computer gate later.
+        let name = profile
+            .paths()
+            .profile_dir
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "<unreadable>".into());
+        if let Err(error) = profile.compact_store(|file, used| {
+            let note = format!(
+                "node {name}: giving back disk space (file {file} bytes, holds {used} bytes); \
+                 this node becomes Ready when compaction finishes"
+            );
+            if let Some(publish) = startup_work {
+                publish(Some(super::StartupWork {
+                    reason: note.clone(),
+                    file_bytes: file,
+                    held_bytes: used,
+                }));
+            }
+            eprintln!("vox daemon: {note}");
+            let _ = events.send(NodeEvent::NodeNote { note });
+        }) {
+            let note =
+                format!("node {name}: store compaction skipped: {error}; continuing startup");
+            eprintln!("vox daemon: {note}");
+            let _ = events.send(NodeEvent::NodeNote { note });
+        }
+        if let Some(publish) = startup_work {
+            publish(None);
+        }
     }
-    let loaded = prepare(&profile, decisions, now)
-        .map_err(|error| fault_noting(events, "load the identity's saved state", &error));
-    if loaded.is_err() {
-        profile.lock();
-        decisions.lock();
-    }
-    (Some(profile), loaded)
+    (Some(profile), Ok(()))
 }
 impl Returned {
     fn settle_policy(&mut self, decisions: &DecisionLog, events: &broadcast::Sender<NodeEvent>) {
@@ -434,6 +460,7 @@ impl Node {
         let paths = self.paths.clone();
         let now = self.now_ms().get();
         let argon2 = self.argon2;
+        let startup_work = self.on_startup_work.clone();
         let decisions = self.decisions.clone();
         let worker_decisions = decisions.clone();
         let events = self.event_tx.clone();
@@ -443,29 +470,64 @@ impl Node {
         let output = Arc::clone(&result);
         let wake = Arc::clone(&self.post_save_wake);
         let task = tokio::spawn(async move {
-            // Startup owns no live Room and no Computer.state guard. The same exclusive
-            // transition crosses identity writes, native policy and the installation callback.
-            let exclusive = match computer.as_ref() {
-                Some(computer) => Some(Arc::new(computer.publication_transition().await)),
-                None => None,
-            };
-            let physical_exclusive = exclusive.clone();
-            #[cfg(feature = "test-knobs")]
-            proof_hold("policy").await;
-            let returned = tokio::task::spawn_blocking(move || {
-                let (profile, loaded) = run(work, paths, now, argon2, &worker_decisions, &events);
-                let mut returned = Returned {
-                    profile,
-                    loaded,
-                    _secret: secret,
-                    exclusive: physical_exclusive,
-                    computer,
-                    boundary: None,
-                    policy: None,
+            let returned = async {
+                let unlock_decisions = worker_decisions.clone();
+                let unlock_events = events.clone();
+                let (profile, unlocked, secret) = tokio::task::spawn_blocking(move || {
+                    let (profile, unlocked) = run(
+                        work,
+                        paths,
+                        now,
+                        argon2,
+                        &unlock_decisions,
+                        &unlock_events,
+                        startup_work.as_deref(),
+                    );
+                    (profile, unlocked, secret)
+                })
+                .await?;
+                // Compaction has finished before either daemon-wide publication guard is taken.
+                let exclusive = match computer.as_ref() {
+                    Some(computer) => Some(Arc::new(computer.publication_transition().await)),
+                    None => None,
                 };
-                returned.settle_policy(&worker_decisions, &events);
+                let physical_exclusive = exclusive.clone();
+                #[cfg(feature = "test-knobs")]
+                proof_hold("policy").await;
+                let returned = tokio::task::spawn_blocking(move || {
+                    let mut profile = profile;
+                    let loaded = unlocked.and_then(|()| {
+                        prepare(
+                            profile.as_ref().ok_or(Fault::NoIdentity)?,
+                            &worker_decisions,
+                            now,
+                        )
+                        .map_err(|error| {
+                            fault_noting(&events, "load the identity's saved state", &error)
+                        })
+                    });
+                    if loaded.is_err() {
+                        if let Some(profile) = profile.as_mut() {
+                            profile.lock();
+                        }
+                        worker_decisions.lock();
+                    }
+                    let mut returned = Returned {
+                        profile,
+                        loaded,
+                        _secret: secret,
+                        exclusive: physical_exclusive,
+                        computer,
+                        boundary: None,
+                        policy: None,
+                    };
+                    returned.settle_policy(&worker_decisions, &events);
+                    returned
+                })
+                .await;
+                drop(exclusive);
                 returned
-            })
+            }
             .await;
             let returned = match returned {
                 Ok(returned) => Some(returned),
@@ -479,7 +541,6 @@ impl Node {
             *output
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = returned;
-            drop(exclusive);
             wake.notify_one();
         });
         self.pending_startup = Some(Pending {

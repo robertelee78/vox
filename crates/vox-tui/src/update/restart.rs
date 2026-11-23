@@ -393,6 +393,26 @@ async fn restart_checked(
             kept.push(name);
         }
     }
+    let readiness = |daemon: &DaemonObservation| {
+        let mut words = String::new();
+        for work in daemon
+            .attached
+            .iter()
+            .filter_map(|node| node.startup.as_ref())
+        {
+            if words.is_empty() {
+                words.push_str("nodes are still starting: ");
+            } else {
+                words.push_str("; ");
+            }
+            words.push_str(&work.reason);
+        }
+        if words.is_empty() {
+            "its remembered nodes are Ready".to_owned()
+        } else {
+            words
+        }
+    };
     #[cfg(target_os = "macos")]
     if let (Some(intent), Some(existing)) = (intent, before.as_ref()) {
         let DaemonIntent::Running {
@@ -474,14 +494,17 @@ async fn restart_checked(
             require_daemon_executable(after.pid, helper)?;
         }
         println!(
-            "the vox daemon runs vox {} (pid {}), and its remembered nodes are Ready",
-            after.version, after.pid
+            "the vox daemon runs vox {} (pid {}), and {}",
+            after.version,
+            after.pid,
+            readiness(&after)
         );
         let missing = attached
             .iter()
             .filter(|name| {
                 !after.attached.iter().any(|node| {
-                    node.name.as_str() == name.as_str() && node.state == NodeState::Attached
+                    node.name.as_str() == name.as_str()
+                        && (node.state == NodeState::Attached || node.startup.is_some())
                 })
             })
             .map(|name| NodeName::parse(name).map_err(|e| AppError::Usage(e.to_string())))
@@ -507,13 +530,18 @@ async fn restart_checked(
         if intent.is_some() {
             require_daemon_executable(after.pid, helper)?;
         }
-        println!("the vox daemon was started and runs vox {} (pid {}), and its remembered nodes are Ready",
-                after.version, after.pid);
+        println!(
+            "the vox daemon was started and runs vox {} (pid {}), and {}",
+            after.version,
+            after.pid,
+            readiness(&after)
+        );
         let missing = attached
             .iter()
             .filter(|name| {
                 !after.attached.iter().any(|node| {
-                    node.name.as_str() == name.as_str() && node.state == NodeState::Attached
+                    node.name.as_str() == name.as_str()
+                        && (node.state == NodeState::Attached || node.startup.is_some())
                 })
             })
             .map(|name| NodeName::parse(name).map_err(|e| AppError::Usage(e.to_string())))
@@ -618,15 +646,19 @@ async fn restart_checked(
         ),
         (true, true) => String::new(),
     };
-    println!("the vox daemon was restarted and runs vox {} (pid {}), and its remembered nodes are Ready{ended}",
-        after.version, after.pid);
+    println!(
+        "the vox daemon was restarted and runs vox {} (pid {}), and {}{ended}",
+        after.version,
+        after.pid,
+        readiness(&after)
+    );
     let missing = attached
         .into_iter()
         .filter(|a| {
             !after
                 .attached
                 .iter()
-                .any(|n| &n.name == a && n.state == NodeState::Attached)
+                .any(|n| &n.name == a && (n.state == NodeState::Attached || n.startup.is_some()))
         })
         .collect::<Vec<_>>();
     Ok(missing)
@@ -701,15 +733,16 @@ async fn wait_for_replacement(
                     || daemon.protocol == vox_core::node::ipc::PROTOCOL_VERSION)
                 && Some(daemon.pid) != previous_pid
             {
-                let pending =
-                    kept.iter()
-                        .filter(|name| {
-                            !daemon.attached.iter().any(|node| {
-                                node.name == **name && node.state == NodeState::Attached
-                            })
+                let pending = kept
+                    .iter()
+                    .filter(|name| {
+                        !daemon.attached.iter().any(|node| {
+                            node.name == **name
+                                && (node.state == NodeState::Attached || node.startup.is_some())
                         })
-                        .map(NodeName::as_str)
-                        .collect::<Vec<_>>();
+                    })
+                    .map(NodeName::as_str)
+                    .collect::<Vec<_>>();
                 if pending.is_empty() {
                     return Ok(daemon);
                 }

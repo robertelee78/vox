@@ -68,6 +68,9 @@ const SEK_WRAPS: TableDefinition<Digest32, &[u8]> = TableDefinition::new("sek_wr
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const META_SCHEMA: &str = "schema_version";
 
+// redb can double a compacted file on its next write; reclaim only excess above that slack.
+const MIN_COMPACTION_RECLAIM_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Successful store-backend flush calls across this process, including opening, recovery and
 /// rewrite files. Count the completed I/O, not transactions classified as durable.
 static FULL_FLUSHES: AtomicU64 = AtomicU64::new(0);
@@ -1588,6 +1591,39 @@ impl Store {
         txn.commit().map_err(storage(op))?;
         Self::settle_durable_through(epochs, epochs.next_transaction);
         Ok(())
+    }
+
+    /// Startup only, before sharing the store: allocated pages include the metadata trees,
+    /// unlike the sum of row bodies. An overflowing comparison cannot exceed a u64 file.
+    pub(crate) fn compact_if_needed(&mut self, notice: impl FnOnce(u64, u64)) -> Result<bool> {
+        let used_bytes = {
+            let backing = self.db.get_mut().unwrap_or_else(PoisonError::into_inner);
+            let Backing::Writable(db) = backing else {
+                return Ok(false);
+            };
+            let txn = db.inner.begin_read().map_err(storage("measure store"))?;
+            txn.allocated_bytes().map_err(storage("measure store"))?
+        };
+        let file_bytes = std::fs::metadata(&self.path)
+            .map_err(storage("measure store file"))?
+            .len();
+        let Some((used_bytes, twice_used)) =
+            used_bytes.checked_mul(2).map(|twice| (used_bytes, twice))
+        else {
+            return Ok(false);
+        };
+        if file_bytes <= twice_used || file_bytes - twice_used < MIN_COMPACTION_RECLAIM_BYTES {
+            return Ok(false);
+        }
+        notice(file_bytes, used_bytes);
+        #[cfg(feature = "test-knobs")]
+        if std::env::var_os("VOX_TEST_COMPACT_FAIL").is_some() {
+            return Err(Error::Storage {
+                op: "compact",
+                detail: "compaction fault staged by proof".into(),
+            });
+        }
+        self.compact()
     }
 
     /// Repartition only this opened room. Each native transaction examines at most 64
