@@ -1084,7 +1084,7 @@ impl DaemonManager {
             }
             if !announced && began.elapsed() >= vox_core::node::profile::LOCK_PATIENCE {
                 if announce {
-                    eprintln!("vox: waiting for the login item to replace the daemon");
+                    eprintln!("vox: waiting for the login item to start or replace the daemon");
                 }
                 announced = true;
             }

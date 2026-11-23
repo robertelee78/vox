@@ -236,14 +236,25 @@ Phase changes never reset it. A missing, disabled or inactive job ends the wait,
 run count passing the first replacement without a greeting. Missing or changed manager fields
 fall back to the old fixed ten seconds. End-of-wait advice describes the current state;
 a deliberately stopped job does not promise a future replacement.
-When no socket answers, startup-capable clients also check whether the matching account's
-login item has a spawn pending, rather than race it with a client daemon.
-Hooks do not take the managed command wait: their node clients retain the original
-greeting/refusal path, and a pending managed spawn gives the existing bounded `Starting`
-answer inside the hook's existing 500ms startup patience.
-The managed wait names the login item's replacement without quoting the unrelated ten-second
-greeting bound. If a hook's login-item check itself exceeds that patience, it says the check did
-not finish and no daemon was started, rather than promising a restart.
+When no socket answers, commands also check whether the matching account's login item has a
+spawn pending. They wait for it rather than advise starting a daemon that would race launchd.
+`vox status` uses this same admission before its daemon-only node inventory.
+A prompt hook recognises a restart from the unmanaged restart lock, a daemon's typed stopping
+refusal, or a matching pending login item. It spends one existing ten-second registration
+patience, measured from hook entry, on the replacement's greeting, registration, node and
+selected room preparation, and this turn's room news. At that bound it gives the existing
+next-turn deferral without advancing the news cursor. A cold start keeps its existing 500ms
+probe/start path and immediate preparation response. An unfinished login-item check starts
+nothing and tells the agent to retry next turn, not to restart a daemon that may not exist.
+An unrecognised manager layout keeps the existing cold-start fallback; it is not evidence
+of a restart. The managed command wait says the login item will start or replace the daemon.
+The restart/news act in `the_daemon_and_its_nodes_proof` posts from another member, checks
+same-turn delivery with a held and a killed restarter, then holds replacement attachment
+past the hook patience and checks truthful deferral followed by next-turn news.
+The native OMP preparation uses the same restart/node/room wait; a bounded deferral completes
+its existing envelope/decision exchange and consumes no room news. Saved decisions still finish
+without rereading daemon state. The existing guest pending act also checks `vox status`, and
+`VOX_PROOF_HOOK_STOP_DETECTION=1` checks hook detection while the managed daemon is still stopping.
 The guest `--restart-vm` route accepts `VOX_PROOF_SHIPPED_DEFAULTS=1` with
 `VOX_PROOF_PENDING_START=1`: the shipped job has only its helper path adapted, and uses the guest
 user's default roots. The act preserves and restores any prior guest root. `VOX_PROOF_SLOW_HOOK_CHECK=1`
@@ -620,6 +631,47 @@ branches, a tail with a member refused at admission, or the all-posts-refused bo
 The first candidate that gets past the 100-post red is these shown-dependent branches'
 first run; an APPARATUS fault or a hang there is a defect of this proof to fix, not the
 candidate's failure.
+
+## A posting newcomer on a slow path (ADR-052 RG-6; needs `test-knobs`)
+
+Symptom: a member who joined and keeps posting is shown by the others as `you trust it, but it
+has not trusted you` for as long as he posts, and their trust shows only after he stops. Two
+daemons whose only path is the proof's port forward, which holds every datagram from the
+newcomer to the member 150 ms (userspace; nothing in the product sets it). The newcomer posts
+twice a second, 100 times. Green: both `vox agent doctor` trust lines say `you trust each other`
+before his last post is acknowledged. Each sample also prints the member's `holds_through` for
+him, which explains a red (the start of his feed, where his consent sits, never held).
+
+```sh
+cargo test --release -p vox-tui --features optional-proofs,test-knobs \
+  --test a_newcomer_reads_the_whole_history_proof -- --ignored --exact \
+  a_newcomer_who_keeps_posting_is_trusted_back_on_a_slow_path --nocapture
+```
+
+Run it alone: its posting cadence is checked. `VOX_MUTANT_FETCH_DISCARD=1` puts back the timer cut
+ADR-052 RG-6 removed (a fetch whose author posted again is cut one second after its flow was
+built), and only that: not main's other two supersede paths (the turn-return supersede and the
+byte-wait supersede), nor the signalling of work a cut turn had already published. The proof
+forwards it to both daemons and requires alice's daemon to say it engaged.
+
+What replaced that cut: a live walk finishes the position it is fetching and, when the author's
+newer head is waiting, ends at that position boundary so the next round walks the newer head's
+window first. `a_returning_reader_eight_thousand_entries_behind_reads_and_pages_back` is its
+proof; `VOX_MUTANT_BOUNDARY_RESELECT_OFF=1` keeps the first head to the window's end instead, and
+that act must then fail PRODUCT ("completed newest history still does not show RG6-away-8000")
+with the reader daemon's engagement line printed as `[RG-6 mutant]`.
+
+The relay act is the same rule at RG-6's other proof line: an author posts twice a second, 300
+times, to a reader whose only path is a relay circuit with 75 ms each way on every member's hop
+(a userspace forwarder); green when the reader shows every acknowledged post. A red names how many
+the reader shows and holds. Run it quiet; the same mutant switch is forwarded to both daemons and
+one of them must say it engaged.
+
+```sh
+cargo test --release -p vox-tui --features optional-proofs,test-knobs --test key_package_proof \
+  delayed_relay::a_delayed_relay_keeps_up_with_a_two_per_second_author -- --ignored --exact \
+  --nocapture
+```
 
 ## The proofs
 

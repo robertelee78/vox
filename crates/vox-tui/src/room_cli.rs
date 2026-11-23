@@ -37,7 +37,7 @@ use crate::tunnel_cli::{resolve_fingerprint, resolve_prefix};
 /// not this user's.
 pub(crate) async fn attach(paths: &Paths) -> Result<IpcClient, AppError> {
     let at = crate::client::one_shot(paths)?;
-    let mut client = crate::client::open(&at).await?;
+    let mut client = crate::client::open(&at, &paths.account()).await?;
     // Every author this command prints is named as this node names it (V210-162).
     crate::ident::load_names(&mut client).await;
     Ok(client)
@@ -5215,7 +5215,7 @@ async fn open_forward(
     // **Why a transfer failed is the node's to say** (ADR-020 11.8): followed from before the
     // forward opens, so its refusal is not missed.
     let events = match crate::client::one_shot(paths) {
-        Ok(at) => crate::client::events(&at).await.ok(),
+        Ok(at) => crate::client::events(&at, &paths.account()).await.ok(),
         Err(_) => None,
     };
     let bound = match client
@@ -7393,9 +7393,12 @@ pub fn print_identity(
             .build()?;
         let at = crate::client::one_shot(paths)?;
         rt.block_on(async {
-            crate::client::open(&at).await?.me().ok_or_else(|| {
-                AppError::Usage("the selected attached node supplied no fingerprint".into())
-            })
+            crate::client::open(&at, &paths.account())
+                .await?
+                .me()
+                .ok_or_else(|| {
+                    AppError::Usage("the selected attached node supplied no fingerprint".into())
+                })
         })?
     } else if vox_core::node::profile::Profile::exists(paths) {
         let attached = tokio::runtime::Builder::new_current_thread()

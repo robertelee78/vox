@@ -3131,13 +3131,11 @@ pub fn run() -> ExitCode {
             run_attached(async move { crate::share_cli::share(&paths, &room, &path, &opts).await })
         }
         Cmd::Tunnel(TunnelCmd::Close(args)) => {
-            let at = match args
-                .profile
-                .paths()
-                .map_err(AppError::from)
-                .and_then(|p| crate::client::one_shot(&p))
-            {
-                Ok(at) => at,
+            let (paths, at) = match args.profile.paths().map_err(AppError::from).and_then(|p| {
+                let at = crate::client::one_shot(&p)?;
+                Ok((p, at))
+            }) {
+                Ok(found) => found,
                 Err(e) => {
                     eprintln!("vox: {e}");
                     return ExitCode::FAILURE;
@@ -3160,7 +3158,19 @@ pub fn run() -> ExitCode {
             };
             // Only this node's own tunnels: the daemon answers it as the node the `Use` names
             // (ADR-026 P-1, §10.4).
-            match rt.block_on(vox_core::node::status::request_close(&at, &which)) {
+            // Opened as the other one-shot commands are: a login item's pending start is waited
+            // for, never answered with advice to start a competing daemon.
+            let closed = rt.block_on(async {
+                let mut client = crate::client::open(&at, &paths.account()).await?;
+                tokio::time::timeout(
+                    vox_core::node::ipc::ANSWER_WITHIN,
+                    vox_core::node::status::request_close_on(&mut client, &which),
+                )
+                .await
+                .unwrap_or_else(|_| Err(vox_core::node::ipc::silent()))
+                .map_err(|e| crate::client::said(&at, e))
+            });
+            match closed {
                 Ok((0, refused)) if !refused.is_empty() => {
                     eprintln!("vox: {refused}");
                     ExitCode::FAILURE
@@ -3177,7 +3187,7 @@ pub fn run() -> ExitCode {
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
-                    eprintln!("vox: {}", crate::client::said(&at, e));
+                    eprintln!("vox: {e}");
                     ExitCode::FAILURE
                 }
             }

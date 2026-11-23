@@ -47,6 +47,11 @@ pub enum HookDaemon {
     /// The existing daemon socket did not answer within the hook's bound. It must not be raced by
     /// another daemon start.
     Unanswered,
+    /// A restart owns startup: the hook may wait, but must never start a daemon.
+    Restarting,
+    /// The login-item lookup did not finish; daemon ownership is unknown.
+    #[cfg(target_os = "macos")]
+    StartupUnchecked,
 }
 
 /// Make sure `account`'s daemon is running: if its socket does not answer, start one detached,
@@ -126,6 +131,10 @@ pub async fn ensure_daemon_for_hook(
 ) -> Result<HookDaemon, AppError> {
     let began = Instant::now();
     let socket = account.socket();
+    if restarting(account)? {
+        eprintln!("vox: waiting for the daemon restart");
+        return Ok(HookDaemon::Restarting);
+    }
     let greeted = tokio::time::timeout(
         HOOK_WITHIN,
         DaemonClient::open_noting(&socket, Some(crate::client::say_daemon_waiting)),
@@ -134,7 +143,7 @@ pub async fn ensure_daemon_for_hook(
     match greeted {
         Err(_) if restarting(account)? => {
             eprintln!("vox: waiting for the daemon restart");
-            return Ok(HookDaemon::Starting);
+            return Ok(HookDaemon::Restarting);
         }
         Err(_) => return Ok(HookDaemon::Unanswered),
         Ok(Ok(_)) => return Ok(HookDaemon::Ready),
@@ -149,13 +158,9 @@ pub async fn ensure_daemon_for_hook(
         )) => return Err(AppError::Core(e)),
         Ok(Err(_)) => {}
     }
-    let remaining = HOOK_WITHIN.saturating_sub(began.elapsed());
     if restarting(account)? {
-        return Ok(if wait_for_restart(account, remaining).await? {
-            HookDaemon::Ready
-        } else {
-            HookDaemon::Starting
-        });
+        eprintln!("vox: waiting for the daemon restart");
+        return Ok(HookDaemon::Restarting);
     }
     #[cfg(target_os = "macos")]
     {
@@ -166,11 +171,11 @@ pub async fn ensure_daemon_for_hook(
             Ok(Ok(None)) => {}
             Ok(Ok(Some(_))) => {
                 eprintln!("vox: waiting for the daemon restart");
-                return Ok(HookDaemon::Starting);
+                return Ok(HookDaemon::Restarting);
             }
             Err(_) => {
                 eprintln!("vox: the login-item startup check did not finish; no daemon was started; retry on the next turn");
-                return Ok(HookDaemon::Unanswered);
+                return Ok(HookDaemon::StartupUnchecked);
             }
             Ok(Err(e)) => return Err(e),
         }

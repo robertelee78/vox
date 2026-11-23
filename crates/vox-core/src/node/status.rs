@@ -2188,27 +2188,9 @@ pub async fn serve_close(
     write_frame(stream, &e.finish()).await
 }
 
-/// Ask the node `at` names to close the tunnels `which` names: how many it closed,
-/// and each as `vox status` lists it — or none, and why not, when `which` named more than one
-/// member.
-///
-/// # Errors
-/// If the node cannot be reached, does not answer in time, or answers something else.
-pub async fn request_close(
-    at: &crate::node::ipc::NodeSocket,
-    which: &crate::transport::quic::TunnelSelector,
-) -> Result<(u64, String)> {
-    let body = tokio::time::timeout(
-        crate::node::ipc::ANSWER_WITHIN,
-        exchange(at, close_body(which)),
-    )
-    .await
-    .map_err(|_| crate::node::ipc::silent())??;
-    close_reply(&body)
-}
-
-/// [`request_close`] on a connection already acting as a node on the daemon's account socket
-/// (ADR-026 C-2): what a client of the daemon, the TUI first, closes a tunnel with.
+/// Ask the node `client` acts as, on the daemon's account socket (ADR-026 C-2), to close the
+/// tunnels `which` names: how many it closed, and each as `vox status` lists it — or none, and
+/// why not, when `which` named more than one member. The TUI and `vox tunnel close` use it.
 ///
 /// # Errors
 /// If the node cannot be reached or answers something else.

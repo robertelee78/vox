@@ -82,6 +82,32 @@ struct Account {
     cfg: PathBuf,
 }
 
+impl Drop for Account {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
+        let Some(destination) = std::env::var_os("VOX_PROOF_KEEP_PROFILE") else {
+            return;
+        };
+        let copied = Command::new("/bin/cp")
+            .arg("-R")
+            .arg(self._tmp.path())
+            .arg(&destination)
+            .status();
+        eprintln!(
+            "[proof] failure profile {} retained at {:?}: {copied:?}",
+            self._tmp.path().display(),
+            destination
+        );
+        for pid in daemons_of(&self.data) {
+            let _ = Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .status();
+        }
+    }
+}
+
 impl Account {
     fn new() -> Self {
         let tmp = tempfile::Builder::new()
@@ -135,7 +161,10 @@ impl Account {
     }
 
     fn cmd(&self, args: &[&str]) -> Command {
-        let mut c = Command::new(VOX);
+        let mut c = match std::env::var_os("VOX_PROOF_BINARY") {
+            Some(binary) => Command::new(binary),
+            None => Command::new(VOX),
+        };
         c.env_clear()
             // A proof's daemon never takes port 1080 (.cargo/config.toml).
             .env("VOX_PROXY", "127.0.0.1:0");
@@ -160,6 +189,15 @@ impl Account {
             .env("VOX_CONFIG_DIR", &self.cfg)
             .env("VOX_LISTEN", "127.0.0.1:0")
             .env("VOX_IDENTITY_PASSPHRASE", PASS);
+        if let Some(value) = std::env::var_os("VOX_MUTANT_HOOK_RESTART_IMMEDIATE") {
+            c.env("VOX_TEST_HOOK_RESTART_IMMEDIATE", value);
+        }
+        if let Some(value) = std::env::var_os("VOX_MUTANT_HOOK_RESTART_BLOCKING_SAVE") {
+            c.env("VOX_TEST_HOOK_RESTART_BLOCKING_SAVE", value);
+        }
+        if let Some(value) = std::env::var_os("VOX_MUTANT_HOOK_RESTART_UNBOUNDED") {
+            c.env("VOX_TEST_HOOK_RESTART_UNBOUNDED", value);
+        }
         c
     }
 
@@ -1079,8 +1117,9 @@ fn two_hooks_start_one_daemon_and_never_attach_its_node() {
         (one.join().unwrap(), two.join().unwrap())
     });
     for (n, (ok, out, err)) in [(1, &h1), (2, &h2)] {
+        eprintln!("[proof] cold hook {n}, exit ok={ok}: {out}{err}");
         assert!(
-            *ok && out.contains("node agent is Locked") && out.contains("vox node unlock agent"),
+            *ok && out.contains("node agent is Locked") && out.contains("vox node unlock -- agent"),
             "PRODUCT: hook {n} must exit 0 telling the agent its node is not attached and the \
              command for the operator (ADR-028 K-13): {out}{err}\nlog:\n{}",
             a.log()
@@ -1116,7 +1155,7 @@ fn two_hooks_start_one_daemon_and_never_attach_its_node() {
         notified
             .lines()
             .filter(|l| l.contains("node agent needs its passphrase")
-                && l.contains("vox node unlock agent"))
+                && l.contains("vox node unlock -- agent"))
             .count()
             == 2,
         "PRODUCT: the person must be notified once per session (two sessions, three turns) that \
@@ -1169,7 +1208,7 @@ fn two_hooks_start_one_daemon_and_never_attach_its_node() {
         let words = String::from_utf8_lossy(&out.stdout);
         assert!(
             out.status.success()
-                && words.contains("vox node unlock agent")
+                && words.contains("vox node unlock -- agent")
                 && !words.contains("Open Vox"),
             "PRODUCT: the SSH hook must give the terminal unlock command: {words}"
         );
@@ -2774,8 +2813,57 @@ fn a_restart_owns_its_replacement_while_a_client_waits() {
         std::fs::read_to_string(&foreground_output).unwrap_or_default()
     );
     let room = make_room(&a, "default");
-    let (ok, out, err) = a.run(&["room", "post", &room, "news across the restart"], "");
-    assert!(ok, "APPARATUS: post before restart: {out}{err}");
+    let peer = Account::new();
+    let peer_id = peer.make_node("default");
+    let own_id = a.make_node("default");
+    let peer_pass = peer._tmp.path().join("identity.pass");
+    let _peer_daemon = Daemon::start(
+        &peer,
+        &[
+            "--node",
+            "default",
+            "--passphrase-file",
+            peer_pass.to_str().unwrap(),
+        ],
+        &[],
+    );
+    assert!(
+        wait_until(Duration::from_secs(60), || peer
+            .log()
+            .contains("control socket")),
+        "APPARATUS: posting member never served: {}",
+        peer.log()
+    );
+    for (account, identity) in [(&a, peer_id.as_str()), (&peer, own_id.as_str())] {
+        let (ok, out) = typed::typed(
+            &account.cmd(&["trust", "add", identity, "--name", "peer"]),
+            PASS,
+        );
+        assert!(
+            ok,
+            "APPARATUS: trust the proof's other member at a terminal: {out}"
+        );
+    }
+    let (ok, link, err) = a.run(&["room", "link", &room], "");
+    assert!(ok, "APPARATUS: room link: {link}{err}");
+    let link = link
+        .lines()
+        .find(|line| line.starts_with("vox://"))
+        .expect("APPARATUS: room link output");
+    let (ok, out, err) = peer.run(&["room", "join", "--passphrase-file", "-", link], ROOM_PASS);
+    assert!(ok, "APPARATUS: other member joins: {out}{err}");
+    let (ok, out, err) = peer.run(&["room", "post", &room, "news across the restart"], "");
+    assert!(
+        ok,
+        "APPARATUS: other member posts before restart: {out}{err}"
+    );
+    assert!(
+        wait_until(Duration::from_secs(60), || {
+            let (ok, out, _) = a.run(&["room", "read", &room], "");
+            ok && out.contains("news across the restart")
+        }),
+        "APPARATUS: other member's news did not arrive before restart"
+    );
 
     for killed in [false, true] {
         let old = a
@@ -2825,14 +2913,16 @@ fn a_restart_owns_its_replacement_while_a_client_waits() {
         );
         let (client, hook) = std::thread::scope(|scope| {
             let hook = scope.spawn(|| {
-                a.hook(
-                    "default",
-                    if killed {
-                        "restart-killed"
-                    } else {
-                        "restart-held"
-                    },
-                    "UserPromptSubmit",
+                let session = if killed {
+                    "restart-killed"
+                } else {
+                    "restart-held"
+                };
+                let input =
+                    format!(r#"{{"hook_event_name":"UserPromptSubmit","session_id":"{session}"}}"#);
+                a.run(
+                    &["agent", "hook", "--node", "default", "--room", &room],
+                    &input,
                 )
             });
             let client = a.run(&["daemon", "--detach"], "");
@@ -2854,12 +2944,12 @@ fn a_restart_owns_its_replacement_while_a_client_waits() {
         let replacement = a.lock_pid().expect("PRODUCT: no daemon after restart");
         let (read_ok, news, read_err) = a.run(&["room", "read", &room], "");
         // Clean up before a failed assertion; never leave a proof's daemon behind.
-        if killed
-            || !client_ok
+        if !client_ok
             || !out.contains("already running")
             || !hook.0
             || !err.contains("daemon restart")
             || !hook.2.contains("daemon restart")
+            || !hook.1.contains("news across the restart")
         {
             stop_pid(replacement);
         }
@@ -2890,6 +2980,12 @@ fn a_restart_owns_its_replacement_while_a_client_waits() {
             hook.2
         );
         assert!(
+            hook.1.contains("news across the restart"),
+            "PRODUCT: the prompt's SAME turn did not get the other member's news: {}{}",
+            hook.1,
+            hook.2
+        );
+        assert!(
             killed || status.success(),
             "PRODUCT: restart failed: {restart}"
         );
@@ -2916,6 +3012,231 @@ fn a_restart_owns_its_replacement_while_a_client_waits() {
             a.log()
         );
     }
+    // The replacement greets, but the existing attach hold outlasts the hook's one patience.
+    // Its expiry must defer truthfully, without consuming the room's news.
+    let hold = a._tmp.path().join("hold-replacement-attach");
+    std::fs::write(&hold, "").unwrap();
+    let old = a
+        .lock_pid()
+        .expect("APPARATUS: daemon before bounded restart");
+    let from = a.log().len();
+    let mut caller = a
+        .cmd(&["daemon", "--restart"])
+        .env("VOX_TEST_ATTACH_HOLD_NODE", "default")
+        .env("VOX_TEST_ATTACH_HOLD_FILE", &hold)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    assert!(
+        wait_until(Duration::from_secs(30), || a
+            .log()
+            .get(from..)
+            .unwrap_or("")
+            .contains("shutting down")),
+        "APPARATUS: bounded restart never began stopping: {}",
+        a.log()
+    );
+    assert!(
+        a.lock_pid() == Some(old),
+        "APPARATUS: prompt missed the old daemon's held stop"
+    );
+    let input = r#"{"hook_event_name":"UserPromptSubmit","session_id":"restart-bounded"}"#;
+    // A confirmed restart must not take the cold-start synchronous registration lock.
+    // Keep it held through the existing registration patience, then release every fixture
+    // before asserting so even the blocking-save mutant can finish and be reaped.
+    let registration_lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(a.data.join("nodes/default/sessions.lock"))
+        .unwrap();
+    registration_lock.lock().unwrap();
+    let stdout = a._tmp.path().join("bounded-hook.stdout");
+    let stderr = a._tmp.path().join("bounded-hook.stderr");
+    let began = Instant::now();
+    let mut hook = a
+        .cmd(&["agent", "hook", "--node", "default", "--room", &room])
+        .stdin(Stdio::piped())
+        .stdout(std::fs::File::create(&stdout).unwrap())
+        .stderr(std::fs::File::create(&stderr).unwrap())
+        .spawn()
+        .unwrap();
+    hook.stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    let detected = wait_until(Duration::from_secs(10), || {
+        std::fs::read_to_string(&stderr)
+            .unwrap_or_default()
+            .contains("waiting for the daemon restart")
+    });
+    let returned_while_locked = wait_until(Duration::from_secs(10), || {
+        hook.try_wait().unwrap().is_some()
+    });
+    drop(registration_lock);
+    std::fs::remove_file(&hold).unwrap();
+    let ok = hook.wait().unwrap().success();
+    let out = std::fs::read_to_string(&stdout).unwrap();
+    let err = std::fs::read_to_string(&stderr).unwrap();
+    eprintln!(
+        "[proof] replacement and registration lock held through the hook patience: {ok}, \
+         returned while locked={returned_while_locked}, elapsed={:?}: {out}{err}",
+        began.elapsed()
+    );
+    let status = caller.wait().unwrap();
+    assert!(
+        status.success(),
+        "PRODUCT: held replacement failed: {}",
+        a.log()
+    );
+    assert!(
+        detected,
+        "APPARATUS: bounded hook did not detect the restart: {out}{err}"
+    );
+    assert!(
+        returned_while_locked,
+        "PRODUCT: confirmed-restart hook outlived its registration patience while the session \
+         registration lock was held: {out}{err}"
+    );
+    assert!(
+        ok && out.contains("your rooms show from your next turn"),
+        "PRODUCT: a restart beyond the hook patience must truthfully defer: {out}{err}"
+    );
+    assert!(
+        wait_until(Duration::from_secs(60), || a
+            .run(&["room", "read", &room], "")
+            .0),
+        "APPARATUS: released replacement room never prepared"
+    );
+    let (ok, out, err) = a.run(
+        &["agent", "hook", "--node", "default", "--room", &room],
+        input,
+    );
+    eprintln!("[proof] NEXT turn after bound: {ok}: {out}{err}");
+    stop_pid(
+        a.lock_pid()
+            .expect("PRODUCT: no daemon after bounded restart"),
+    );
+    assert!(
+        ok && out.contains("news across the restart"),
+        "PRODUCT: the NEXT turn after bounded restart lost the other member's news: {out}{err}"
+    );
+    // A turn already past its patience with no restart in sight, which then meets one: the hook
+    // still never waits for it without a bound (#408). The turn's input arrives only after the
+    // hook's own ten-second patience, so the turn runs late. A socket that accepts and closes
+    // stands where the daemon was, and the restart lock is taken once the hook has reached it,
+    // so the restart begins inside the turn, after its patience.
+    let daemon_dir = a.data.join(".daemon");
+    let socket = vox_core::node::paths::socket_path_in(&daemon_dir, "vox.sock");
+    assert!(
+        wait_until(Duration::from_secs(30), || a
+            .lock_pid()
+            .is_none_or(|pid| !alive(pid))),
+        "APPARATUS: the daemon before the late turn did not stop: {}",
+        a.log()
+    );
+    let _ = std::fs::remove_file(&socket);
+    let listener = std::os::unix::net::UnixListener::bind(&socket)
+        .unwrap_or_else(|e| panic!("APPARATUS: stand-in socket {}: {e}", socket.display()));
+    listener.set_nonblocking(true).unwrap();
+    let input = r#"{"hook_event_name":"UserPromptSubmit","session_id":"restart-late"}"#;
+    let stdout = a._tmp.path().join("late-hook.stdout");
+    let stderr = a._tmp.path().join("late-hook.stderr");
+    let mut hook = a
+        .cmd(&["agent", "hook", "--node", "default", "--room", &room])
+        .stdin(Stdio::piped())
+        .stdout(std::fs::File::create(&stdout).unwrap())
+        .stderr(std::fs::File::create(&stderr).unwrap())
+        .spawn()
+        .unwrap();
+    let mut prompt = hook.stdin.take().unwrap();
+    prompt.write_all(input.as_bytes()).unwrap();
+    // Past the hook's REGISTER_WITHIN (10 s), counted from its start, before its input ends.
+    std::thread::sleep(Duration::from_secs(11));
+    drop(prompt);
+    let t0 = Instant::now();
+    let reached = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break Some(stream),
+            Err(_) if t0.elapsed() < Duration::from_secs(10) => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(_) => break None,
+        }
+    };
+    let restart_lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(daemon_dir.join("restart-lock"))
+        .unwrap();
+    restart_lock.lock().unwrap();
+    std::fs::remove_file(&socket).unwrap();
+    drop(listener);
+    drop(reached.expect("APPARATUS: the late hook never reached the daemon socket"));
+    let detected = wait_until(Duration::from_secs(10), || {
+        std::fs::read_to_string(&stderr)
+            .unwrap_or_default()
+            .contains("waiting for the daemon restart")
+    });
+    // Its own wait for a restart in one open is ANSWER_WITHIN (10 s); its patience is 10 s more.
+    let returned_while_locked = wait_until(Duration::from_secs(20), || {
+        hook.try_wait().unwrap().is_some()
+    });
+    drop(restart_lock);
+    // A daemon serves again, so a hook still waiting can finish and be reaped.
+    let _late = Daemon::start(
+        &a,
+        &[
+            "--node",
+            "default",
+            "--keep",
+            "--passphrase-file",
+            pass.to_str().unwrap(),
+        ],
+        &[],
+    );
+    let ok = hook.wait().unwrap().success();
+    let out = std::fs::read_to_string(&stdout).unwrap();
+    let err = std::fs::read_to_string(&stderr).unwrap();
+    eprintln!(
+        "[proof] turn past its patience, then a restart: {ok}, detected={detected}, \
+         returned while locked={returned_while_locked}: {out}{err}"
+    );
+    assert!(
+        detected,
+        "APPARATUS: the late turn did not meet the restart: {out}{err}"
+    );
+    assert!(
+        returned_while_locked,
+        "PRODUCT: a restart met after the hook's patience kept the prompt waiting while the \
+         restart lock was held: {out}{err}"
+    );
+    assert!(
+        ok && out.contains("your rooms show from your next turn"),
+        "PRODUCT: a restart met after the hook's patience must truthfully defer: {out}{err}"
+    );
+    assert!(
+        wait_until(Duration::from_secs(60), || a
+            .run(&["room", "read", &room], "")
+            .0),
+        "APPARATUS: the room never prepared after the late restart"
+    );
+    let (ok, out, err) = a.run(
+        &["agent", "hook", "--node", "default", "--room", &room],
+        input,
+    );
+    eprintln!("[proof] NEXT turn after the late restart: {ok}: {out}{err}");
+    stop_pid(
+        a.lock_pid()
+            .expect("PRODUCT: no daemon after the late restart"),
+    );
+    assert!(
+        ok && out.contains("news across the restart"),
+        "PRODUCT: the NEXT turn after the late restart lost the other member's news: {out}{err}"
+    );
 }
 
 #[test]
@@ -3383,7 +3704,7 @@ fn a_hook_is_answered_within_its_bound_while_its_node_detaches() {
             a.log()
         );
         assert!(
-            out.contains("node agent's work is still stopping; this turn reads nothing"),
+            out.contains("node agent's work is still stopping"),
             "PRODUCT: the hook's one line does not say the node is still detaching: {out}"
         );
         let (_, _, _) = seal.join().unwrap();
@@ -3472,7 +3793,7 @@ fn a_hook_answers_within_a_second_while_the_daemon_attaches_its_kept_nodes() {
     for n in &kept {
         let (ok, out, err) = a.run(&["node", "attach", n, "--passphrase-file", &empty], "");
         assert!(
-            ok && out.contains("attaches it again by itself"),
+            ok && out.contains("becomes Ready whenever the daemon starts"),
             "APPARATUS (staging): node {n} must be attached and remembered: {out}{err}"
         );
     }
@@ -3614,7 +3935,7 @@ fn a_hooks_output_closes_while_the_daemon_it_started_runs() {
                     // Its node is not attached, and a hook never attaches it (ADR-028 K-13): the
                     // hook answers with the command for the operator, and ends.
                     assert!(
-                        out.contains("vox node unlock agent"),
+                        out.contains("vox node unlock -- agent"),
                         "PRODUCT (staging): round {round}, hook {}: {out}",
                         i + 1
                     );

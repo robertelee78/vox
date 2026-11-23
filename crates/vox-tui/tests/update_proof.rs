@@ -1495,7 +1495,7 @@ pathlib.Path(target).write_bytes(plistlib.dumps(p))
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
         while !std::fs::read_to_string(&read_log)
             .unwrap_or_default()
-            .contains("waiting for the login item to replace the daemon")
+            .contains("waiting for the login item to start or replace the daemon")
             && read
                 .0
                 .try_wait()
@@ -1604,7 +1604,7 @@ pathlib.Path(target).write_bytes(plistlib.dumps(p))
         );
         assert!(
             !read.success()
-                || read_text.contains("waiting for the login item to replace the daemon"),
+                || read_text.contains("waiting for the login item to start or replace the daemon"),
             "APPARATUS: successful read missed the held stopping window: {read_text}"
         );
         (
