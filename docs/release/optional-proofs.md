@@ -300,13 +300,19 @@ message in that turn, with exactly one launchd run added. The arm also stages la
 throttle: the replacement is killed as launchd spawns it. launchd prints `spawn scheduled` and
 spawns again only once the minimum runtime since that spawn has passed. A prompt typed at that
 kill and answered before any replacement greets must give the next-turn deferral, and the next
-turn must carry the message.
+turn must carry the message. That turn's staging has about half a second between the hook's
+answer and the replacement's greeting; on a loaded host it can stop as APPARATUS, which is not
+a product verdict. Not staged here: peers that do not answer while the old daemon stops, a
+Keychain prompt after an update, the first launch of a freshly installed signed helper, and an
+item registered through `SMAppService`.
 
 There are two mutants. `VOX_MUTANT_HOOK_RESTART_IMMEDIATE=1` (forwarded to the hook) fails the
 crash turn's same-turn assertion. That prompt finds no socket and takes the hook's
 restart-admission path. The knob does not reach the `vox daemon --restart` turn, whose prompt
 meets the old daemon still stopping and follows the restart in `restart_refusal`. That turn's
-mutant is an uncommitted source edit: it drops `restart_refusal`'s login-item check.
+mutant is an uncommitted source edit: in `crates/vox-tui/src/agent_hook.rs`, `restart_refusal`,
+remove the macOS-only statement that adds `pending_login_item(account)` to `restarting`, build
+the helper with `test-knobs`, run the arm, and put the statement back.
 
 `VOX_PROOF_GAP_TIMELINE=1` instead prints a millisecond timeline of each restart kind, three
 samples each, and asserts nothing about latency. `VOX_PROOF_GAP_SPIKE=1` with it compares
