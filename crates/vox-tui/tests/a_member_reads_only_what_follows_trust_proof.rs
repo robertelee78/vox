@@ -24,6 +24,11 @@
 //! a demand adds nothing. Precondition, or `PRODUCT (staging)`: alice's own paged reads show every
 //! post she made in both rooms.
 //!
+//! **Limit of arm B.** Its privacy half is tested only if bob's node received the rows below
+//! post 1,101; this act does not show that it did. `vox room read` lists only rows bob can open,
+//! and the act sees a demand's acknowledgement, not how it ended. Arm A's privacy half is real:
+//! bob's window there holds rows sealed before the decision and he reads none.
+//!
 //! **The clock-step attack cannot be staged here** (it needs clock control, and sudo is
 //! forbidden): the design makes it inexpressible, since no clock reading enters the order.
 //!
