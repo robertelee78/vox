@@ -195,6 +195,9 @@ impl Account {
         if let Some(value) = std::env::var_os("VOX_MUTANT_HOOK_RESTART_BLOCKING_SAVE") {
             c.env("VOX_TEST_HOOK_RESTART_BLOCKING_SAVE", value);
         }
+        if let Some(value) = std::env::var_os("VOX_MUTANT_HOOK_RESTART_UNBOUNDED") {
+            c.env("VOX_TEST_HOOK_RESTART_UNBOUNDED", value);
+        }
         c
     }
 
@@ -3119,6 +3122,120 @@ fn a_restart_owns_its_replacement_while_a_client_waits() {
     assert!(
         ok && out.contains("news across the restart"),
         "PRODUCT: the NEXT turn after bounded restart lost the other member's news: {out}{err}"
+    );
+    // A turn already past its patience with no restart in sight, which then meets one: the hook
+    // still never waits for it without a bound (#408). The turn's input arrives only after the
+    // hook's own ten-second patience, so the turn runs late. A socket that accepts and closes
+    // stands where the daemon was, and the restart lock is taken once the hook has reached it,
+    // so the restart begins inside the turn, after its patience.
+    let daemon_dir = a.data.join(".daemon");
+    let socket = vox_core::node::paths::socket_path_in(&daemon_dir, "vox.sock");
+    assert!(
+        wait_until(Duration::from_secs(30), || a
+            .lock_pid()
+            .is_none_or(|pid| !alive(pid))),
+        "APPARATUS: the daemon before the late turn did not stop: {}",
+        a.log()
+    );
+    let _ = std::fs::remove_file(&socket);
+    let listener = std::os::unix::net::UnixListener::bind(&socket)
+        .unwrap_or_else(|e| panic!("APPARATUS: stand-in socket {}: {e}", socket.display()));
+    listener.set_nonblocking(true).unwrap();
+    let input = r#"{"hook_event_name":"UserPromptSubmit","session_id":"restart-late"}"#;
+    let stdout = a._tmp.path().join("late-hook.stdout");
+    let stderr = a._tmp.path().join("late-hook.stderr");
+    let mut hook = a
+        .cmd(&["agent", "hook", "--node", "default", "--room", &room])
+        .stdin(Stdio::piped())
+        .stdout(std::fs::File::create(&stdout).unwrap())
+        .stderr(std::fs::File::create(&stderr).unwrap())
+        .spawn()
+        .unwrap();
+    let mut prompt = hook.stdin.take().unwrap();
+    prompt.write_all(input.as_bytes()).unwrap();
+    // Past the hook's REGISTER_WITHIN (10 s), counted from its start, before its input ends.
+    std::thread::sleep(Duration::from_secs(11));
+    drop(prompt);
+    let t0 = Instant::now();
+    let reached = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break Some(stream),
+            Err(_) if t0.elapsed() < Duration::from_secs(10) => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(_) => break None,
+        }
+    };
+    let restart_lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(daemon_dir.join("restart-lock"))
+        .unwrap();
+    restart_lock.lock().unwrap();
+    std::fs::remove_file(&socket).unwrap();
+    drop(listener);
+    drop(reached.expect("APPARATUS: the late hook never reached the daemon socket"));
+    let detected = wait_until(Duration::from_secs(10), || {
+        std::fs::read_to_string(&stderr)
+            .unwrap_or_default()
+            .contains("waiting for the daemon restart")
+    });
+    // Its own wait for a restart in one open is ANSWER_WITHIN (10 s); its patience is 10 s more.
+    let returned_while_locked = wait_until(Duration::from_secs(20), || {
+        hook.try_wait().unwrap().is_some()
+    });
+    drop(restart_lock);
+    // A daemon serves again, so a hook still waiting can finish and be reaped.
+    let _late = Daemon::start(
+        &a,
+        &[
+            "--node",
+            "default",
+            "--keep",
+            "--passphrase-file",
+            pass.to_str().unwrap(),
+        ],
+        &[],
+    );
+    let ok = hook.wait().unwrap().success();
+    let out = std::fs::read_to_string(&stdout).unwrap();
+    let err = std::fs::read_to_string(&stderr).unwrap();
+    eprintln!(
+        "[proof] turn past its patience, then a restart: {ok}, detected={detected}, \
+         returned while locked={returned_while_locked}: {out}{err}"
+    );
+    assert!(
+        detected,
+        "APPARATUS: the late turn did not meet the restart: {out}{err}"
+    );
+    assert!(
+        returned_while_locked,
+        "PRODUCT: a restart met after the hook's patience kept the prompt waiting while the \
+         restart lock was held: {out}{err}"
+    );
+    assert!(
+        ok && out.contains("your rooms show from your next turn"),
+        "PRODUCT: a restart met after the hook's patience must truthfully defer: {out}{err}"
+    );
+    assert!(
+        wait_until(Duration::from_secs(60), || a
+            .run(&["room", "read", &room], "")
+            .0),
+        "APPARATUS: the room never prepared after the late restart"
+    );
+    let (ok, out, err) = a.run(
+        &["agent", "hook", "--node", "default", "--room", &room],
+        input,
+    );
+    eprintln!("[proof] NEXT turn after the late restart: {ok}: {out}{err}");
+    stop_pid(
+        a.lock_pid()
+            .expect("PRODUCT: no daemon after the late restart"),
+    );
+    assert!(
+        ok && out.contains("news across the restart"),
+        "PRODUCT: the NEXT turn after the late restart lost the other member's news: {out}{err}"
     );
 }
 
