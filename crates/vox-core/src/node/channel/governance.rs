@@ -778,6 +778,52 @@ pub(super) fn refreshing(error: &Error) -> bool {
     matches!(error, Error::Profile(why) if *why == view::REFRESHING)
 }
 
+/// `VOX_TEST_MP10_SEND_EVERY_BODY=1` (ADR-053 MP-10, boundary 1 off): a provider sends a
+/// once-removed recipient every body it asks for, whatever its readmission cut says (#1171).
+/// Read only at the provider's two body sends. Says so once when first read.
+#[cfg(feature = "test-knobs")]
+pub(crate) fn send_every_body() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let on = std::env::var("VOX_TEST_MP10_SEND_EVERY_BODY").is_ok_and(|value| value == "1");
+        if on {
+            eprintln!(
+                "vox: VOX_TEST_MP10_SEND_EVERY_BODY engaged: bodies sent to a once-removed \
+                 recipient regardless of its readmission cut"
+            );
+        }
+        on
+    });
+    *ON
+}
+
+#[cfg(not(feature = "test-knobs"))]
+pub(crate) const fn send_every_body() -> bool {
+    false
+}
+
+/// `VOX_TEST_MP10_RENDER_EVERY_BODY=1` (ADR-053 MP-10, boundary 2 off): a node that knows its
+/// own applied removal renders every newly received body, whatever its readmission cut says
+/// (#1171). Read only at the two render gates. Says so once when first read.
+#[cfg(feature = "test-knobs")]
+pub(crate) fn render_every_body() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let on = std::env::var("VOX_TEST_MP10_RENDER_EVERY_BODY").is_ok_and(|value| value == "1");
+        if on {
+            eprintln!(
+                "vox: VOX_TEST_MP10_RENDER_EVERY_BODY engaged: newly received bodies rendered \
+                 regardless of this node's own readmission cut"
+            );
+        }
+        on
+    });
+    *ON
+}
+
+#[cfg(not(feature = "test-knobs"))]
+pub(crate) const fn render_every_body() -> bool {
+    false
+}
+
 fn published_clock(found: Option<u64>, clock: Option<u64>, expected: u64) -> Result<u64> {
     if found != Some(expected) {
         return Err(Error::MalformedAtRest(

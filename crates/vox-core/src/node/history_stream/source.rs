@@ -1225,6 +1225,10 @@ impl Source {
                         .await?;
                     match found {
                         Lookup::Found(found) => {
+                            #[cfg(feature = "mutant-sender")]
+                            if crate::log::sync::mutant::withholds(&found.value) {
+                                return Ok(Lookup::Missing);
+                            }
                             tokens.push(ControlToken::Leaf(Box::new(found.value)));
                             headers += 1;
                         }

@@ -453,6 +453,10 @@ async fn respond(
                 Lookup::Missing => return Ok((Status::EvidenceUnavailable, None)),
             };
             let parsed = Entry::from_wire(&held.value.1.wire)?;
+            #[cfg(feature = "mutant-sender")]
+            if crate::log::sync::mutant::withholds(&parsed) {
+                return Ok((Status::EvidenceUnavailable, None));
+            }
             let contexts = parsed
                 .skeleton
                 .v2
@@ -743,6 +747,10 @@ async fn entry(
         Lookup::Missing => return Ok(result),
     };
     let parsed = Entry::from_wire(&header.value.wire)?;
+    #[cfg(feature = "mutant-sender")]
+    if crate::log::sync::mutant::withholds(&parsed) {
+        return Ok(result);
+    }
     if let Some(v2) = &parsed.skeleton.v2 {
         if !source
             .authorize_recovery_contexts(&job, &head.value, vec![v2.pre_context])
@@ -794,6 +802,7 @@ async fn entry(
         {
             Lookup::Found(held) => match held.value {
                 crate::node::channel::governance::ContentEligibility::Eligible => false,
+                _ if crate::node::channel::governance::send_every_body() => false,
                 crate::node::channel::governance::ContentEligibility::Ineligible => true,
                 crate::node::channel::governance::ContentEligibility::Refreshing => {
                     result.status = Status::Busy;
@@ -807,6 +816,12 @@ async fn entry(
             Lookup::Missing => return Ok(result),
         }
     };
+    // The `strip-payload` mutant sender answers an ordinary body as not held: the stripped serve
+    // (V210-74) on the history path rooms sync by, beside the legacy serve's.
+    #[cfg(feature = "mutant-sender")]
+    let recipient_denied = recipient_denied
+        || (crate::log::sync::mutant::strips_payload()
+            && signed_kind == crate::log::history::SignedEntryKind::Content);
     let live = if preamble.purpose == Purpose::Live {
         let through = head.value.root.leaves;
         let latest = source

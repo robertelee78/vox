@@ -955,6 +955,21 @@ impl PendingText {
             )?;
             self.cleanup(store)?;
         }
+        // ADR-053 MP-10 (c): the attacker terminates its own feed and posts on past it.
+        #[cfg(feature = "mutant-sender")]
+        if crate::log::sync::mutant::terminates_now() {
+            self.append(
+                store,
+                signer,
+                Vec::new(),
+                EntryKind::Content,
+                SignedEntryKind::Termination,
+                None,
+                &[],
+                None,
+            )?;
+            self.cleanup(store)?;
+        }
         let plaintext = Zeroizing::new(content.to_canonical_vec());
         let payload = self.sender.encrypt(&plaintext)?.to_wire();
         #[cfg(feature = "mutant-sender")]
@@ -1105,7 +1120,7 @@ impl PendingText {
                     algo_ids: [algo::COMPOSITE_ED25519_ML_DSA_65, algo::AES_256_GCM],
                     payload_hash: sha256(&payload),
                     payload_len: payload.len() as u64,
-                    end_of_feed: false,
+                    end_of_feed: signed_kind == SignedEntryKind::Termination,
                     claimed_ms: self.now_millis,
                     seen,
                 },

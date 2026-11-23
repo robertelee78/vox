@@ -44,6 +44,17 @@ use crate::log::entry::{Entry, EntryRead, EntryWrite, ZERO_HASH};
 /// a value that could make its power-of-three loop diverge.
 pub const MAX_SEQ: u64 = 1 << 48;
 
+/// Whether `entry` ends its author's feed. A `mutant-sender` build in a `terminate*` mode keeps
+/// writing past its own `Termination` (ADR-053 MP-10 (c)); every other build reads the signed flag.
+#[must_use]
+pub fn ends_feed(entry: &Entry) -> bool {
+    #[cfg(feature = "mutant-sender")]
+    if crate::log::sync::mutant::keeps_writing_after_end() {
+        return false;
+    }
+    entry.skeleton.end_of_feed
+}
+
 /// The Bamboo lipmaa skip-link **target** sequence number for entry `n`
 /// (1-indexed): the predecessor whose hash entry `n` records in
 /// `lipmaa_backlink`. Returns `1` for `n == 1` (genesis — no predecessor; the
@@ -277,7 +288,7 @@ impl Feed {
         self.author_id = Some(entry.skeleton.author_id);
         self.head = entry.skeleton.seq;
         self.head_hash = entry.entry_hash();
-        self.ended = entry.skeleton.end_of_feed;
+        self.ended = ends_feed(entry);
         Ok(())
     }
     /// Drop one retained body while keeping its authenticated skeleton.
@@ -359,7 +370,7 @@ impl Feed {
             expected.author_id = self.author_id;
             expected.head = entry.skeleton.seq;
             expected.head_hash = entry.entry_hash();
-            expected.ended = entry.skeleton.end_of_feed;
+            expected.ended = ends_feed(&entry);
         }
         Ok(())
     }

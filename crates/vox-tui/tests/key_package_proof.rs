@@ -47,6 +47,12 @@
 //! held when the consent fell due (what it did before #226) → B reads 0 of the six, D all six.
 //! R14 deleting every superseded generation whatever V210-45 still owes (as the merge had it) →
 //! D and B each read 3 of the six: generation one's key was gone before either joined.
+//!
+//! ADR-053 MP-10 boundary 3 (**addressed-package open and install**), removed-author arm: a
+//! removed author's package installs nothing on a member that knows the removal
+//! (`a_removed_authors_package_opens_nothing`). The runner's `VOX_PROOF_MP10_KEYS=package-open`
+//! hands the boundary-off mutant to the recipient only; it turns PRODUCT red on the recipient's
+//! `vox status --json` received-key count.
 
 // The optional relay act reuses room/world's attachment and typed-command modules.
 #![cfg_attr(feature = "optional-proofs", allow(clippy::duplicate_mod))]
@@ -624,6 +630,253 @@ fn keys_reach_an_offline_member_through_an_always_on_member() {
     assert_eq!(
         early, 0,
         "PRODUCT: forward-only: a message sealed before the grant must stay unreadable to B"
+    );
+}
+
+/// `dir`'s `vox status --json` row for `room`, or `None` when status did not answer with it.
+fn room_status(dir: &std::path::Path, room: &str) -> Option<serde_json::Value> {
+    let (answered, said) = vox(dir, &["status", "--json"], "");
+    if !answered {
+        return None;
+    }
+    let status: serde_json::Value = serde_json::from_str(&said).ok()?;
+    status["rooms"]
+        .as_array()?
+        .iter()
+        .find(|r| r["id"].as_str().is_some_and(|id| id.starts_with(room)))
+        .cloned()
+}
+
+/// The mutant the proof runner chose for MP-10's key boundaries (`VOX_PROOF_MP10_KEYS`), as the
+/// environment of the one daemon it is aimed at. The runner's own variable never reaches a
+/// daemon, so every other daemon runs as shipped.
+fn mp10_keys_mutant() -> Vec<(&'static str, std::ffi::OsString)> {
+    std::env::var_os("VOX_PROOF_MP10_KEYS")
+        .map(|mode| vec![("VOX_MUTANT_MP10_KEYS", mode)])
+        .unwrap_or_default()
+}
+
+/// `vox room remove-member`, following only the product's explicit no-change instruction.
+fn remove_member(dir: &std::path::Path, room: &str, member: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let (removed, said) = vox(dir, &["room", "remove-member", room, member], "");
+        if removed {
+            return said;
+        }
+        assert!(
+            said.contains("still being applied") && Instant::now() < deadline,
+            "PRODUCT (staging): `vox room remove-member` failed: {said}"
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// ADR-053 MP-10 boundary 3, **a removed author's package opens nothing** (arm (i)).
+///
+/// Staged as the first act stages a package: C made the room and stays up; A posts three
+/// messages while B is down, so the only way B can ever read them is A's key-package for B,
+/// which C carries (`wait_for_log_delivery`). A goes down and C, the creator, removes A. B
+/// comes back and syncs with C only, its package work held (`VOX_TEST_HOLD_PACKAGES_FILE`,
+/// test-knobs) until it has applied A's removal and holds every log entry C holds (A's package
+/// among them), so the package meets a node that knows the removal. Its received sender-key
+/// generations are counted, the hold is released, and over three rounds made by C's posts
+/// (each complete when B holds C's entries and has no package work left) `vox room read` on B
+/// shows none of the three posts and `vox status --json` shows no more received generations
+/// than before. Today `pending_package.rs` refuses the package at open (`is_member_removed`)
+/// and again at install ("sender key author is removed").
+///
+/// Mutant (`VOX_PROOF_MP10_KEYS=package-open`, to B only): the boundary off at both lines; B
+/// installs A's package → PRODUCT red.
+#[test]
+#[ignore = "three real daemons restarted in turn, production Argon2id; CI runs it in release"]
+fn a_removed_authors_package_opens_nothing() {
+    watchdog::arm();
+    test_knobs::require(&["VOX_TEST_HOLD_PACKAGES_FILE"]);
+    let mutant = mp10_keys_mutant();
+    if !mutant.is_empty() {
+        test_knobs::require(&["VOX_MUTANT_MP10_KEYS"]);
+    }
+    let mut k = cast();
+    let (c, sent) = posts_only_a_package_opens(&mut k);
+
+    // ---- C, the creator, removes A ----
+    remove_a(&k, &c);
+    let c_entries = room_status(&k.c, &k.room)
+        .and_then(|r| r["log_entries"].as_u64())
+        .expect("CANNOT MEASURE (staging): C's status names no log_entries");
+
+    // ---- B comes back with only C up. Its package work is held (VOX_TEST_HOLD_PACKAGES_FILE)
+    // until it has applied A's removal, so the package meets a node that knows the removal ----
+    let hold = k._tmp.path().join("hold-packages");
+    std::fs::write(&hold, b"").expect("APPARATUS: write the package hold file");
+    let mut env: Vec<(&str, &std::ffi::OsStr)> =
+        mutant.iter().map(|(k, v)| (*k, v.as_os_str())).collect();
+    env.push(("VOX_TEST_HOLD_PACKAGES_FILE", hold.as_os_str()));
+    let b = Daemon::start_env("b", &k.b, &env);
+    b_catches_up(&k, &b, c_entries, false);
+    let baseline = room_status(&k.b, &k.room)
+        .and_then(|r| r["received_key_generations"].as_u64())
+        .expect("CANNOT MEASURE (staging): B's status names no received_key_generations");
+    eprintln!(
+        "[MP-10 b3 (i)] B applied A's removal and holds every entry C holds ({c_entries}) with \
+         its package work held; received_key_generations {baseline}; releasing package work"
+    );
+    std::fs::remove_file(&hold).expect("APPARATUS: release the package hold");
+    none_read_in_three_syncs(&k, &b, &sent, baseline, "b3 (i)");
+    eprintln!(
+        "[MP-10 b3 (i)] GREEN: B, knowing A's removal, installed no key of A's and across three \
+         rounds read none of A's posts sealed under A's package\nB stderr:\n{}",
+        b.stderr()
+    );
+    drop(b);
+    drop(c);
+}
+
+/// The staging of MP-10's removed-author arms: C up; A, still a member, writes three posts
+/// while B is down, so B can open them only through A's key-package, which C carries; A stops.
+/// Returns C's daemon and the three posts.
+fn posts_only_a_package_opens(k: &mut Cast) -> (Daemon, Vec<String>) {
+    let c = set_up(k, "mp10-before-the-grant");
+    let b_short: String = k.fps[1].chars().take(12).collect();
+    let a = Daemon::start("a", &k.a);
+    let unreachable_b = |l: &str| l.contains("could not reach") && l.contains(&b_short);
+    a.wait_err_count("that B cannot be reached", 0, 120, unreachable_b);
+    let sent: Vec<String> = (0..3).map(|i| format!("mp10-removed-author-{i}")).collect();
+    for t in &sent {
+        ok(&k.a, &["room", "post", &k.room, t], "");
+    }
+    ok(&k.a, &["room", "post", &k.room, "mp10-sentinel"], "");
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while !ok(&k.c, &["room", "read", &k.room], "").contains("mp10-sentinel") {
+        assert!(
+            Instant::now() < deadline,
+            "CANNOT MEASURE (staging): C never received A's last post\nA stderr:\n{}",
+            a.stderr()
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    wait_for_log_delivery(k, &a, &c, "CANNOT MEASURE (staging)");
+    a.stop();
+    (c, sent)
+}
+
+/// C, the creator, removes A and posts after it; A's three posts stay A's eligible history,
+/// which C still reads.
+fn remove_a(k: &Cast, c: &Daemon) {
+    remove_member(&k.c, &k.room, &k.fps[0]);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while ok(&k.c, &["room", "roster", &k.room], "").contains(&k.fps[0]) {
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT (staging): C still lists removed A\nC stderr:\n{}",
+            c.stderr()
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    ok(&k.c, &["room", "post", &k.room, "mp10-after-removal"], "");
+    let sent: Vec<String> = (0..3).map(|i| format!("mp10-removed-author-{i}")).collect();
+    assert_eq!(
+        readable(&k.c, &k.room, &sent),
+        sent.len(),
+        "CANNOT MEASURE (staging): C no longer reads A's three posts after the removal, so \
+         they are not A's eligible history and B's refusal would prove nothing"
+    );
+}
+
+/// B has A off its roster and holds every log entry C held after the removal (`c_entries`: A's
+/// package, A's posts and C's post after the removal among them), and, when `idle`, has no
+/// package work left. (C does not consent to B reading it, so C's post is held, not shown.)
+fn b_catches_up(k: &Cast, b: &Daemon, c_entries: u64, idle: bool) {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let roster = ok(&k.b, &["room", "roster", &k.room], "");
+        let room = room_status(&k.b, &k.room);
+        let held = room
+            .as_ref()
+            .and_then(|r| r["log_entries"].as_u64())
+            .is_some_and(|n| n >= c_entries);
+        let idle = !idle
+            || room
+                .as_ref()
+                .is_some_and(|r| r["key_packages_pending"] == false);
+        if !roster.contains(&k.fps[0]) && held && idle {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT (staging): B did not catch up with C (A off the roster: {}, every entry C \
+             holds: {held}, package work done: {idle})\nB status: {room:?}\nB stderr:\n{}",
+            !roster.contains(&k.fps[0]),
+            b.stderr()
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// Three delivery rounds in a row: C posts, and the round is complete when B holds every log
+/// entry C then holds and has no package work left (a quiet room runs no sync rounds, so the
+/// rounds are made, not waited for). After each, what a person sees: none of `sent` in
+/// `vox room read`, and `vox status --json` holding no more received sender-key generations
+/// than `baseline`, B's count before A's package could be worked on. Every round is observed
+/// before a red is raised, so a red says both what was installed and what was shown.
+fn none_read_in_three_syncs(k: &Cast, b: &Daemon, sent: &[String], baseline: u64, arm: &str) {
+    let mut reds = Vec::new();
+    for round in 1..=3 {
+        ok(
+            &k.c,
+            &["room", "post", &k.room, &format!("mp10-round-{round}")],
+            "",
+        );
+        let c_entries = room_status(&k.c, &k.room)
+            .and_then(|r| r["log_entries"].as_u64())
+            .expect("CANNOT MEASURE (staging): C's status names no log_entries");
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let room = loop {
+            let room = room_status(&k.b, &k.room);
+            let done = room.as_ref().is_some_and(|r| {
+                r["log_entries"].as_u64().is_some_and(|n| n >= c_entries)
+                    && r["key_packages_pending"] == false
+            });
+            if done {
+                break room.expect("a status row");
+            }
+            assert!(
+                Instant::now() < deadline,
+                "CANNOT MEASURE: B did not take C's round-{round} post ({c_entries} entries) \
+                 with its package work done\nB status: {room:?}\nB stderr:\n{}",
+                b.stderr()
+            );
+            std::thread::sleep(Duration::from_millis(500));
+        };
+        let (_, read) = vox(&k.b, &["room", "read", &k.room], "");
+        let got: Vec<&String> = sent.iter().filter(|t| read.contains(t.as_str())).collect();
+        let now = room["received_key_generations"].as_u64().unwrap_or(0);
+        eprintln!(
+            "[MP-10 {arm}] round {round}: B holds C's {c_entries} entries, no package work; it \
+             read {} of removed A's three posts {got:?}; received_key_generations {now} (before: \
+             {baseline})\nB read:\n{read}",
+            got.len()
+        );
+        if !got.is_empty() {
+            reds.push(format!(
+                "round {round}: B read {} of removed A's posts sealed under its package {got:?}",
+                got.len()
+            ));
+        }
+        if now > baseline {
+            reds.push(format!(
+                "round {round}: B installed removed A's key-package: received_key_generations \
+                 {baseline} -> {now}"
+            ));
+        }
+    }
+    assert!(
+        reds.is_empty(),
+        "PRODUCT: {}\nB status: {:?}\nB stderr:\n{}",
+        reds.join("; "),
+        room_status(&k.b, &k.room),
+        b.stderr()
     );
 }
 
