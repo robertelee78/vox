@@ -574,7 +574,14 @@ forward's probe and a product-reported RTT of at least 300 ms before the newcome
 
 The 3,000-row seed is split concurrently between `y1` and `z1`. X's personal node pairs
 its computer with Y, Z and W before the room is created on Y; no explicit all-pair trust
-is added. The three authors are `y1`, `z1`, and `n-old1` (the latter starts after its
+is added. Each pairing waits for both partners to report confirmed; their policy revisions
+are local counters and are not compared across computers. Only the exact
+`computer peer refused the request: node: this computer's policy changed while pairing; review again`
+refusal starts a fresh invitation and review, with three attempts total (the initial review
+plus two fresh reviews). Every refusal is printed with its attempt number; exhausting all
+three is APPARATUS staging and quotes all refusals. Any other pairing failure remains
+PRODUCT immediately. Both busy-room variants share this staging.
+The three authors are `y1`, `z1`, and `n-old1` (the latter starts after its
 join). Three OMP Sessions on `y1` alternate 400-character user/reply steps at one per second.
 Every post is a separately started process, offered on a one-second schedule without
 waiting for the previous answer. Several posts can therefore be in flight against the slow

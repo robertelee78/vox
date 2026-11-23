@@ -138,7 +138,8 @@ struct RootView: View {
             case let .passphrase(node, said):
                 PassphraseForm(node: node, said: said, model: model)
             case let .attaching(node):
-                ProgressView("Unlocking node \(node)…")
+                ProgressView(model.startupReason ?? "Unlocking node \(node)…")
+                    .accessibilityIdentifier("node-startup-progress")
             case .attached:
                 ProgressView("Opening the node…")
             case let .detached(node):

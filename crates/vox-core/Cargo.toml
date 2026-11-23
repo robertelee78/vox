@@ -84,7 +84,7 @@ mutant-sender = []
 # installs has none of them. Proofs build with it through vox-tui's `test-knobs`
 # (`cargo test --features vox-tui/test-knobs`); release.yml builds `--bin vox` without it, and
 # scripts/package-release.sh refuses an artifact that carries a `VOX_TEST_` string.
-test-knobs = []
+test-knobs = ["redb/vox-test-knobs"]
 
 [lints.rust]
 unsafe_code = "forbid"
