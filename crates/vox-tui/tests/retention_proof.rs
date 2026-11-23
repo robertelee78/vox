@@ -5382,6 +5382,7 @@ fn compaction_journey(failure: bool, large: bool, restart: bool) {
         drop(release);
         let out = std::fs::read_to_string(&stdout).unwrap();
         let err = std::fs::read_to_string(&stderr).unwrap();
+        eprintln!("RECEIPT completed vox room list stdout={out:?} stderr={err:?}");
         assert!(
             exit.success() && out.contains(&room[..12]),
             "PRODUCT: waiting room list failed: {exit}: {out}{err}"
