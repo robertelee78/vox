@@ -3993,9 +3993,13 @@ impl Computer {
         })
     }
 
-    /// Whether this computer's node `name` has no folder: only `NotFound` for that exact path.
-    /// Any other answer (unreadable, an invalid name) is not absence; it is logged and kept.
+    /// Whether this computer's node `name` has no folder: only `NotFound` for that exact path,
+    /// inside a nodes directory that itself resolves. Any other answer (unreadable, an invalid
+    /// name, a nodes directory that is gone or on an unmounted volume) is not absence; it is
+    /// logged and kept, so no single fault withdraws every node at once.
     fn local_folder_absent(&self, name: &str) -> bool {
+        static NODES_UNRESOLVED_SAID: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
         let path = match crate::node::paths::NodeName::parse(name) {
             Ok(node) => self.account.node_dir(&node),
             Err(error) => {
@@ -4007,7 +4011,27 @@ impl Computer {
         };
         match std::fs::symlink_metadata(&path) {
             Ok(_) => false,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let nodes = self.account.nodes_dir();
+                match std::fs::metadata(&nodes) {
+                    Ok(meta) if meta.is_dir() => {
+                        NODES_UNRESOLVED_SAID.store(false, std::sync::atomic::Ordering::Relaxed);
+                        true
+                    }
+                    other => {
+                        if !NODES_UNRESOLVED_SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            let why = other
+                                .err()
+                                .map_or("not a directory".to_owned(), |e| e.to_string());
+                            eprintln!(
+                                "vox daemon: computer kept every node: the nodes directory does not resolve; path {}: {why}",
+                                nodes.display()
+                            );
+                        }
+                        false
+                    }
+                }
+            }
             Err(error) => {
                 eprintln!(
                     "vox daemon: computer kept node {name}: its folder could not be checked; path {}: {error}",
@@ -4035,18 +4059,18 @@ impl Computer {
     /// look is never measured by it. Names never create a binding.
     pub fn retire_absent_local_nodes(&self) -> Result<()> {
         let local = self.signer.fingerprint();
+        // The first look decides only whether to look again: it decodes the binding names and
+        // verifies no signature (ADR-038 FX-28: nothing derived again when nothing changed). The
+        // transaction below reads the roster fully verified before it writes anything.
         let names: Vec<String> = {
             let state = lock(&self.state);
-            let Some(group) = state.group() else {
-                return Ok(());
-            };
-            if state.grant(&local).is_none() {
+            if state.group().is_none() || state.grant(&local).is_none() {
                 return Ok(());
             }
             let Some(roster) = state.rosters.get(&local) else {
                 return Ok(());
             };
-            let (_, _, bindings) = roster.read(&local, &group)?;
+            let bindings = roster.event()?.bindings;
             bindings.into_iter().map(|binding| binding.name).collect()
         };
         if !names.iter().any(|name| self.local_folder_absent(name)) {

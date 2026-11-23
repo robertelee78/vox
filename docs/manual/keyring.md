@@ -354,7 +354,8 @@ its trust, and the withdrawal is written to the daemon's log with the folder it 
 computers remove that fingerprint from their trust lists after they receive and apply the new
 roster. If this computer is off, nothing reaches them until it runs again. If a different node is
 made under the same folder name before the deletion is noticed, the old fingerprint stays trusted
-until the new node is unlocked; its unlock then replaces the old one.
+until the new node is unlocked; its unlock then replaces the old one. Renaming a locked node moves
+its folder, so the other computers stop trusting it until it is unlocked under its new name.
 
 If a computer-policy update meets room history that is still being saved, the daemon retains
 the accepted update until that exact publication settles instead of discarding it as a temporary
