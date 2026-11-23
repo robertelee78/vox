@@ -2109,7 +2109,12 @@ pub async fn run(
                 result = &mut work => return result,
                 () = tokio::time::sleep_until(turn.deadline) => {
                     if !turn.restarting.get() || turn.published.get() {
-                        return work.await;
+                        // A restart first met after the deadline stops at its next poll (#408),
+                        // and a turn that has not published defers as below.
+                        let result = work.await;
+                        if result.is_ok() || !turn.restarting.get() || turn.published.get() {
+                            return result;
+                        }
                     }
                 }
             }
@@ -2409,6 +2414,11 @@ pub async fn run(
         )
         .await;
     }
+    let defer = || {
+        let words = Unregistered::Attaching(daemon.node.clone()).said(&input, &daemon.account);
+        eprintln!("vox agent hook: {words}");
+        emit(format, &raw, &input.event, &format!("{words}\n"), "");
+    };
     let work = async {
         let drained = match daemon.register_turn(&input, room_arg, Some(&turn)).await {
             Ok(answer) => {
@@ -2479,6 +2489,15 @@ pub async fn run(
             Err(Unregistered::Failed(e)) => Err(e),
         };
         if let Err(e) = drained {
+            // A restart first met after the patience stopped at its next poll (#408): this turn
+            // defers, as one met within it does, and nothing was consumed.
+            if turn.restarting.get()
+                && !turn.published.get()
+                && tokio::time::Instant::now() >= turn.deadline
+            {
+                defer();
+                return Ok(());
+            }
             // Report and carry on: a hook must never break the turn it rides on. **But say so to
             // the agent too, in one line** (V210-163): on stderr alone, an agent whose node was down
             // heard nothing and could not tell that from a quiet room.
@@ -2500,14 +2519,11 @@ pub async fn run(
     tokio::select! {
         result = &mut work => result,
         () = tokio::time::sleep_until(turn.deadline) => {
-            if !turn.restarting.get() {
+            // A published (or reserved) turn finishes its bounded work, receipts included.
+            if !turn.restarting.get() || turn.published.get() {
                 return work.await;
             }
-            if !turn.published.get() {
-                let words = Unregistered::Attaching(daemon.node.clone()).said(&input, &daemon.account);
-                eprintln!("vox agent hook: {words}");
-                emit(format, &raw, &input.event, &format!("{words}\n"), "");
-            }
+            defer();
             Ok(())
         }
     }
@@ -2651,7 +2667,31 @@ const REGISTER_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
 struct RestartTurn {
     deadline: tokio::time::Instant,
     restarting: std::cell::Cell<bool>,
+    /// Set once the turn has reserved or published news: from then it finishes its own bounded
+    /// work instead of deferring, so no reservation or receipt is dropped at the deadline.
     published: std::cell::Cell<bool>,
+}
+
+/// Wait once more for a restart this turn has met. **Never without a bound** (#408): a restart
+/// first met after the turn's patience has passed is not waited for, and the turn defers.
+async fn restart_poll(turn: Option<&RestartTurn>) -> Result<(), AppError> {
+    let outlived = turn.is_some_and(|turn| tokio::time::Instant::now() >= turn.deadline);
+    #[cfg(feature = "test-knobs")]
+    let outlived = outlived && {
+        let ignored = std::env::var_os("VOX_TEST_HOOK_RESTART_UNBOUNDED").is_some();
+        if ignored {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| eprintln!("test-knobs: restart loops ignore the hook deadline"));
+        }
+        !ignored
+    };
+    if outlived {
+        return Err(AppError::Usage(
+            "the daemon restart did not finish within this turn; try again next turn".into(),
+        ));
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    Ok(())
 }
 
 /// Reuse the same restart signals even when the daemon changes between hook operations.
@@ -2693,7 +2733,7 @@ async fn open_for_turn(paths: &Paths, turn: Option<&RestartTurn>) -> Result<IpcC
             let opened = DaemonClient::open(&account.socket()).await;
             if let Err(error) = &opened {
                 if restart_refusal(account, Some(error), turn).await? {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    restart_poll(turn).await?;
                     continue;
                 }
             }
@@ -2703,12 +2743,12 @@ async fn open_for_turn(paths: &Paths, turn: Option<&RestartTurn>) -> Result<IpcC
                     if nodes.iter().any(|node| {
                         node.name == at.using.node && node.state == NodeState::Attaching
                     }) {
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        restart_poll(turn).await?;
                         continue;
                     }
                 }
                 DaemonFrame::Refused(vox_core::node::daemonipc::Refusal::Stopping) => {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    restart_poll(turn).await?;
                     continue;
                 }
                 other => return Err(crate::client::unexpected_daemon(&other)),
@@ -2724,7 +2764,7 @@ async fn open_for_turn(paths: &Paths, turn: Option<&RestartTurn>) -> Result<IpcC
                 }
             }
         }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        restart_poll(turn).await?;
     }
 }
 
@@ -2747,7 +2787,7 @@ async fn rooms_for_turn(
         {
             return Ok(rooms);
         }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        restart_poll(turn).await?;
     }
 }
 
@@ -2920,7 +2960,9 @@ impl Daemon {
             if let Err(error) = &opened {
                 if restart_refusal(&self.account, Some(error), turn).await? {
                     restarting = true;
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    restart_poll(turn)
+                        .await
+                        .map_err(|_| Unregistered::Attaching(self.node.clone()))?;
                     continue;
                 }
             }
@@ -2960,7 +3002,9 @@ impl Daemon {
                     if matches!(info.state, vox_core::node::daemonipc::NodeState::Attaching) =>
                 {
                     if restarting {
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        restart_poll(turn)
+                            .await
+                            .map_err(|_| Unregistered::Attaching(self.node.clone()))?;
                         continue;
                     }
                     Err(Unregistered::Attaching(self.node.clone()))
@@ -2976,7 +3020,9 @@ impl Daemon {
                 DaemonFrame::Refused(vox_core::node::daemonipc::Refusal::Stopping) => {
                     if restart_refusal(&self.account, None, turn).await? {
                         restarting = true;
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        restart_poll(turn)
+                            .await
+                            .map_err(|_| Unregistered::Attaching(self.node.clone()))?;
                         continue;
                     }
                     Err(Unregistered::Temporary("Vox daemon is stopping".into()))
@@ -3774,6 +3820,11 @@ async fn drain(
             let ticket = vox_core::identity::rng::random_array()
                 .map_err(|error| AppError::Usage(error.to_string()))?;
             attention_receipts.push((recipient.clone(), sources.clone(), ticket));
+            // From its first reservation the turn finishes or cancels them; the deadline never
+            // drops them unconfirmed.
+            if let Some(turn) = turn {
+                turn.published.set(true);
+            }
             for chunk in sources.chunks(6) {
                 let prepared = local(
                     &at,
