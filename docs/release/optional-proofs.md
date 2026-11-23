@@ -289,6 +289,29 @@ the manager's phases, then holds it only after the replacement's greeting and be
 It waits on the public saved-room result and releases that same read. Preparation observations
 and greeting-to-readiness intervals are printed; no room-readiness product behavior is changed.
 
+`VOX_PROOF_LOGIN_ITEM_NEWS=1` on the `--restart-vm` route (helper built with `test-knobs`) is
+RG-9's proof that a prompt typed during a login-item restart gets its news in that turn. A second
+scratch account on the guest joins a room and posts. The login item's daemon is replaced only
+after `ps` shows it has run past launchd's printed minimum runtime. It is replaced in three ways:
+by SIGKILL, by `vox daemon --restart` (one `kickstart -k`), and by the update's handoff (the same
+`kickstart -k` after the helper is swapped for a re-signed copy). A real hook is typed while
+launchd replaces the daemon, before the replacement greets. It must carry the other member's
+message in that turn, with exactly one launchd run added. The arm also stages launchd's
+throttle: the replacement is killed as launchd spawns it. launchd prints `spawn scheduled` and
+spawns again only once the minimum runtime since that spawn has passed. A prompt typed at that
+kill and answered before any replacement greets must give the next-turn deferral, and the next
+turn must carry the message.
+
+There are two mutants. `VOX_MUTANT_HOOK_RESTART_IMMEDIATE=1` (forwarded to the hook) fails the
+crash turn's same-turn assertion. That prompt finds no socket and takes the hook's
+restart-admission path. The knob does not reach the `vox daemon --restart` turn, whose prompt
+meets the old daemon still stopping and follows the restart in `restart_refusal`. That turn's
+mutant is an uncommitted source edit: it drops `restart_refusal`'s login-item check.
+
+`VOX_PROOF_GAP_TIMELINE=1` instead prints a millisecond timeline of each restart kind, three
+samples each, and asserts nothing about latency. `VOX_PROOF_GAP_SPIKE=1` with it compares
+launchd's throttled spawn with a second `kickstart` and with `ThrottleInterval 1`.
+
 Item 46's cached-flag clause has NO change in this release. A genuine native-app probe found
 the captured AppKit flag stale after quit, while the fresh lookup returned nil and the kernel
 process was a zombie. Current `still()` already guards this divergence through its nil check.
