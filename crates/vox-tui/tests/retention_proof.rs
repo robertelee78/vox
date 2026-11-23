@@ -98,26 +98,14 @@ fn vox_with(
     stdin: Option<&str>,
     identity: Option<&str>,
 ) -> (bool, String, String) {
-    let mut cmd = Command::new(VOX);
-    match identity {
-        Some(p) => cmd.env("VOX_IDENTITY_PASSPHRASE", p),
-        None => cmd.env_remove("VOX_IDENTITY_PASSPHRASE"),
-    };
-    cmd.args(args)
-        .env("VOX_DATA_DIR", dir)
-        .env("VOX_CONFIG_DIR", dir.join("cfg"))
-        .env("VOX_TEST_KEYCHAIN", attach::keychain(dir))
-        .env("VOX_PROXY", "127.0.0.1:0")
-        .env_remove("VOX_ROOM")
-        .env_remove("VOX_NODE")
-        .env_remove("VOX_SESSION")
-        .stdin(if stdin.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    let mut cmd = vox_command(dir, args, identity);
+    cmd.stdin(if stdin.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
     // A keyring change's passphrase is typed at a terminal, as a person types it (ADR-028 K-13).
     if typed::is_keyring_change(args) {
         let (ok, shown) = typed::keyring(&cmd);
@@ -139,6 +127,29 @@ fn vox_with(
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
     )
+}
+
+/// A `vox args` command on `dir`'s profile, before its stdio is chosen. The read wait's mutant
+/// reaches it as the knob the command reads.
+fn vox_command(dir: &Path, args: &[&str], identity: Option<&str>) -> Command {
+    let mut cmd = Command::new(VOX);
+    match identity {
+        Some(p) => cmd.env("VOX_IDENTITY_PASSPHRASE", p),
+        None => cmd.env_remove("VOX_IDENTITY_PASSPHRASE"),
+    };
+    cmd.args(args)
+        .env("VOX_DATA_DIR", dir)
+        .env("VOX_CONFIG_DIR", dir.join("cfg"))
+        .env("VOX_TEST_KEYCHAIN", attach::keychain(dir))
+        .env("VOX_PROXY", "127.0.0.1:0")
+        .envs(
+            std::env::var_os("VOX_MUTANT_REFRESH_WAIT")
+                .map(|on| ("VOX_TEST_REFRESH_WAIT_MUTANT", on)),
+        )
+        .env_remove("VOX_ROOM")
+        .env_remove("VOX_NODE")
+        .env_remove("VOX_SESSION");
+    cmd
 }
 
 fn daemon(dir: &Path, tag: &str, stdin_lines: &str) -> Daemon {
@@ -172,6 +183,10 @@ fn daemon_on(dir: &Path, tag: &str, stdin_lines: &str, listen: &str) -> Daemon {
             std::env::var("VOX_MUTANT_EXPIRY").unwrap_or_default(),
         )
         .env("VOX_TEST_HOLD_EXPIRY_PRUNE_FILE", dir.join("hold-expiry"))
+        .envs(
+            std::env::var_os("VOX_MUTANT_RETENTION_FLOOR")
+                .map(|on| ("VOX_TEST_RETENTION_FLOOR_MUTANT", on)),
+        )
         .env_remove("VOX_ROOM")
         .env_remove("VOX_NODE")
         .env_remove("VOX_SESSION")
@@ -1330,32 +1345,78 @@ fn a_room_stays_readable_while_messages_keep_expiring() {
         listed,
         "APPARATUS: restarted daemon never listed the backlog room"
     );
-    let (ok, out, err) = vox(dir, &["room", "read", "expiry", "--json"], None);
-    println!("[proof] stopped-daemon backlog first read: ok={ok} stdout={out:?} stderr={err:?}");
-    assert!(
-        !ok && err.contains("the room is refreshing saved history; retry"),
-        "PRODUCT: a backlog beyond one sweep must retain today's refusal: {out}{err}"
-    );
-    let mut caught_up = false;
+    // Hold the cleanup, so the backlog stays larger than one sweep while the act looks. The
+    // earlier arm's engagement mark is cleared first, so only this hold can set it.
+    let _ = std::fs::remove_file(dir.join("hold-expiry.engaged"));
+    std::fs::write(dir.join("hold-expiry"), b"hold the backlog's cleanup").unwrap();
+    let mut held = false;
     for _ in 0..512 {
-        let (ok, out, err) = vox(dir, &["room", "read", "expiry", "--json"], None);
-        if ok {
-            assert!(
-                out.is_empty(),
-                "PRODUCT: backlog read showed expired text: {out}"
-            );
-            caught_up = true;
+        if dir.join("hold-expiry.engaged").exists() {
+            held = true;
             break;
         }
-        assert!(
-            err.contains("the room is refreshing saved history; retry"),
-            "PRODUCT: backlog changed its refusal: {err}"
-        );
         std::thread::sleep(Duration::from_millis(20));
     }
+    assert!(held, "APPARATUS: the backlog's cleanup was never held");
+    // The daemon itself still refuses a backlog beyond one sweep (its own answer, asked over
+    // its socket).
+    let mut client = rt
+        .block_on(IpcClient::open_at(&socket))
+        .expect("APPARATUS: reopened expiry IPC");
+    let first = rt
+        .block_on(client.request(&Request::RoomPage {
+            channel_id: cid,
+            before: None,
+            limit: 0,
+        }))
+        .expect("APPARATUS: reopened expiry reply");
+    println!("[proof] stopped-daemon backlog first answer: {first:?}");
     assert!(
-        caught_up,
-        "PRODUCT: stopped-daemon expiry backlog never became readable"
+        matches!(&first, Frame::Error { reason }
+            if reason.contains(vox_core::node::api::HISTORY_REFRESHING)),
+        "PRODUCT: a backlog beyond one sweep must retain today's refusal: {first:?}"
+    );
+    // A person's `vox room read` waits for that cleanup, saying so, instead of being told to
+    // retry; it has not answered while the cleanup is held, and answers once it has run.
+    let mut cmd = vox_command(dir, &["room", "read", "expiry", "--json"], Some(IDENTITY));
+    let mut reader = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("APPARATUS: spawn vox room read");
+    let mut said = String::new();
+    std::io::BufRead::read_line(
+        &mut std::io::BufReader::new(reader.stderr.as_mut().expect("APPARATUS: its stderr")),
+        &mut said,
+    )
+    .expect("APPARATUS: read its stderr");
+    std::thread::sleep(Duration::from_millis(300));
+    let waiting = reader
+        .try_wait()
+        .expect("APPARATUS: the read's status")
+        .is_none();
+    std::fs::remove_file(dir.join("hold-expiry")).unwrap();
+    let answer = reader
+        .wait_with_output()
+        .expect("APPARATUS: wait for vox room read");
+    let rest = String::from_utf8_lossy(&answer.stderr);
+    println!(
+        "[proof] `vox room read` with the cleanup held: said {said:?}; still waiting 300 ms \
+         later: {waiting}; after release ok={} stderr={rest:?}",
+        answer.status.success()
+    );
+    assert!(
+        said.contains("waiting for room") && waiting,
+        "PRODUCT: `vox room read` across a held backlog must wait and say so, not refuse at \
+         once: {said}{rest}"
+    );
+    assert!(
+        answer.status.success() && answer.stdout.is_empty(),
+        "PRODUCT: once the cleanup ran, the waiting read must answer with no expired text: \
+         ok={} {}{rest}",
+        answer.status.success(),
+        String::from_utf8_lossy(&answer.stdout)
     );
 }
 
@@ -1365,6 +1426,10 @@ fn a_room_stays_readable_while_messages_keep_expiring() {
 /// 128-row render leaf) stay. With that prune held, the counts, `older`, every page and the
 /// thread's summary must be exact for the 145 alone. Its own act, so that each expiry mutant
 /// reaches these assertions instead of stopping on the earlier arms of the act above.
+///
+/// The 90 seconds are the node's own (`cfg/retention`), so the node can then keep longer while
+/// it is down: stopped with its removal still held, it reopens keeping everything, and must still
+/// show only the 145. A longer lifetime never brings back what a read already left out.
 #[cfg(feature = "optional-proofs")]
 #[test]
 #[ignore = "real binary, a 90-second message lifetime and a test-knobs native prune hold; release"]
@@ -1382,9 +1447,14 @@ fn a_partly_expired_room_counts_pages_and_threads_only_what_remains() {
     let scratch = tempfile::tempdir().expect("APPARATUS: partial expiry profile");
     let dir = scratch.path();
     std::fs::create_dir_all(dir.join("cfg")).expect("APPARATUS: partial expiry config");
+    std::fs::write(
+        dir.join("cfg").join("retention"),
+        format!("default {LIFETIME_S}\n"),
+    )
+    .expect("APPARATUS: the node's retention file");
     let (ok, _, err) = vox(dir, &["id"], None);
     assert!(ok, "PRODUCT (staging): identity refused: {err}");
-    let _daemon = daemon(dir, "partial", &format!("{IDENTITY}\n"));
+    let daemon_partial = daemon(dir, "partial", &format!("{IDENTITY}\n"));
     attached(dir, "partial");
     let (ok, _, err) = vox(
         dir,
@@ -1399,15 +1469,6 @@ fn a_partly_expired_room_counts_pages_and_threads_only_what_remains() {
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "PRODUCT (staging): create refused: {err}");
-    let (ok, _, err) = vox(
-        dir,
-        &["room", "retention", "partial", &LIFETIME_S.to_string()],
-        None,
-    );
-    assert!(
-        ok,
-        "PRODUCT (staging): {LIFETIME_S}-second lifetime refused: {err}"
-    );
     let mut settled = false;
     for _ in 0..512 {
         let (ok, out, err) = vox(dir, &["room", "read", "partial", "--json"], None);
@@ -1706,7 +1767,104 @@ fn a_partly_expired_room_counts_pages_and_threads_only_what_remains() {
         "PRODUCT: `vox room read --limit {LIMIT}` must show the newest {LIMIT} newer rows only: \
          ok={ok} {cli_texts:?} {err}"
     );
+
+    // Stop the node with that removal still held, let it keep longer than its 90 seconds (its
+    // file no longer limits the room, which keeps everything), and start it again: what the
+    // reads above left out was due under the 90 seconds, and must stay gone.
+    drop(client);
+    drop(daemon_partial);
+    std::fs::remove_file(dir.join("cfg").join("retention"))
+        .expect("APPARATUS: remove the node's retention file");
     std::fs::remove_file(dir.join("hold-expiry")).unwrap();
+    let _reopened = daemon(dir, "partial-restart", &format!("{IDENTITY}\n{ROOMPASS}\n"));
+    attached(dir, "partial-restart");
+    let mut reopened_at = None;
+    let mut last = String::new();
+    for _ in 0..1024 {
+        let (ok, _, err) = vox(
+            dir,
+            &["room", "read", "partial", "--json", "--limit", "1"],
+            None,
+        );
+        if ok {
+            reopened_at = Some(now_ms());
+            break;
+        }
+        last = err;
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let reopened_at = reopened_at.unwrap_or_else(|| {
+        panic!("PRODUCT (staging): the reopened room never answered a read: {last}")
+    });
+    assert!(
+        reopened_at < new_first_due,
+        "APPARATUS: the node answered again at {reopened_at} ms, after the first newer row's \
+         90 s ({new_first_due}); the restart arm proved nothing"
+    );
+    let mut client = rt
+        .block_on(IpcClient::open_at(&socket))
+        .expect("APPARATUS: reopened partial expiry IPC");
+    let counted = rt
+        .block_on(client.request(&Request::Count {
+            channel_id: cid,
+            since: None,
+        }))
+        .expect("APPARATUS: reopened partial expiry reply");
+    let mut pages_after = Vec::new();
+    let mut before = None;
+    for _ in 0..16 {
+        let page = rt
+            .block_on(client.request(&Request::RoomPage {
+                channel_id: cid,
+                before,
+                limit: 128,
+            }))
+            .expect("APPARATUS: reopened partial expiry reply");
+        let (rows, older) = match page {
+            Frame::RoomPage { rows, older, .. } => (rows, older),
+            other => panic!("PRODUCT: the reopened room's page was refused: {other:?}"),
+        };
+        before = rows.first().map(|row| row.entry_hash);
+        pages_after.push(rows);
+        if older == 0 {
+            break;
+        }
+    }
+    let after_restart: Vec<String> = pages_after
+        .iter()
+        .rev()
+        .flat_map(|rows| shown(rows))
+        .collect();
+    let back = after_restart
+        .iter()
+        .filter(|name| old.contains(name))
+        .count();
+    if std::env::var_os("VOX_MUTANT_RETENTION_FLOOR").is_some() {
+        let log = std::fs::read_to_string(dir.join("daemon-partial-restart.err")).unwrap();
+        for line in log
+            .lines()
+            .filter(|line| line.contains("test-knobs: retention floor"))
+        {
+            println!("[daemon] {line}");
+        }
+        assert!(
+            log.contains("test-knobs: retention floor"),
+            "APPARATUS: retention floor mutant never engaged"
+        );
+    }
+    println!(
+        "[proof] reopened keeping everything at {reopened_at} ms: {counted:?}; {} rows, {back} \
+         of the {} old ones",
+        after_restart.len(),
+        old.len()
+    );
+    assert!(
+        matches!(counted, Frame::Count { n, .. } if n == newer.len() as u64)
+            && after_restart == newer,
+        "PRODUCT: stopped while {} old rows were left out but not yet removed, the node reopened \
+         keeping everything and shows {back} of them again; Count {counted:?}, rows {after_restart:?}",
+        old.len()
+    );
 }
 
 /// The hook's continuation API must skip one native sweep of already-expired bodies.

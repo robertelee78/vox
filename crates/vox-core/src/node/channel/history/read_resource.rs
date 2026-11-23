@@ -24,6 +24,8 @@ pub(super) struct ReadFacts {
     me: Digest32,
     retention: u64,
     step_retention: u64,
+    /// What a lengthening kept expired, `[messages, Session steps]` (see `State::floor`).
+    pub retention_floor: [u64; 2],
     pub verified: BTreeMap<Digest32, u64>,
     members: Vec<Digest32>,
     pub held: BTreeMap<Digest32, u64>,
@@ -58,6 +60,7 @@ impl ReadFacts {
             me: ch.me(),
             retention: ch.effective_retention(),
             step_retention: ch.effective_step_retention(),
+            retention_floor: ch.projection_state.floor,
             verified: members
                 .iter()
                 .map(|author| (*author, ch.dag.verified_head(author)))
