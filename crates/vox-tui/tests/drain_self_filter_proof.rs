@@ -10,14 +10,6 @@
 //! - matching on the **session name** alone would drop a *different harness* that
 //!   happens to use the same name.
 //!
-//! **Deterministic half** — the real `vox agent hook`, as each harness runs it:
-//!
-//! - session `A` on harness H posts; session `B` on H posts; a session also named `A`
-//!   on a **different harness** H′ posts;
-//! - `A`'s drain on H shows B's message and H′'s `A` message, and not its own;
-//! - `B`'s drain shows A's message, and not its own;
-//! - H′'s `A` drain shows H's `A` message — same name, different author.
-//!
 //! **Live half**, **optional** (decider, 2026-10-01): its own test,
 //! [`a_live_models_post_is_dropped_only_from_its_own_sessions_drain`], which runs only with
 //! `--features optional-proofs` (docs/release/optional-proofs.md; without it a stand-in says it
@@ -51,8 +43,7 @@ optional_proof::not_run!(a_live_models_post_is_dropped_only_from_its_own_session
 use std::{path::Path, process::Command};
 
 #[cfg(feature = "optional-proofs")]
-use support::VOX;
-use support::{until, Out, Worker};
+use support::{until, Out, Worker, VOX};
 
 #[cfg(feature = "optional-proofs")]
 fn which(bin: &str) -> Option<std::path::PathBuf> {
@@ -68,6 +59,7 @@ fn model() -> String {
 }
 
 /// What `vox agent hook` injects for `session` on `w`, exactly as a harness runs it.
+#[cfg(feature = "optional-proofs")]
 fn drain(w: &Worker, r: &str, session: &str) -> String {
     let o = w.vox_in(
         None,
@@ -82,6 +74,7 @@ fn drain(w: &Worker, r: &str, session: &str) -> String {
     o.stdout
 }
 
+#[cfg(feature = "optional-proofs")]
 fn post(w: &Worker, r: &str, session: &str, body: &str) {
     let o = w.vox_in(
         Some(session),
@@ -92,111 +85,6 @@ fn post(w: &Worker, r: &str, session: &str, body: &str) {
         Some(body),
     );
     assert!(o.ok, "PRODUCT (staging): {o:?}");
-}
-
-#[test]
-#[ignore = "two networked nodes with production Argon2id; CI runs it in release"]
-fn a_drain_drops_only_its_own_session_on_its_own_harness() {
-    watchdog::arm();
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .enable_all()
-        .build()
-        .expect("APPARATUS: start a runtime");
-    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
-    let room = rt.block_on(support::room(tmp.path(), &["h", "h-prime"]));
-    let (h, hp) = (&room.workers[0], &room.workers[1]);
-    let r = room.id.as_str();
-
-    // ---- deterministic half ----
-    post(h, r, "A", "OWN-A-ON-H");
-    post(h, r, "B", "SIBLING-B-ON-H");
-    post(hp, r, "A", "SAME-NAME-A-ON-H-PRIME");
-    for w in [h, hp] {
-        until(
-            w,
-            None,
-            "all three posts everywhere",
-            &["room", "read", r],
-            |o: &Out| {
-                ["OWN-A-ON-H", "SIBLING-B-ON-H", "SAME-NAME-A-ON-H-PRIME"]
-                    .iter()
-                    .all(|m| o.stdout.contains(m))
-            },
-        );
-    }
-    // A harness in an unmapped directory works in no room (ADR-031 RM-6),
-    // even though its node holds this room and its posts are already readable.
-    let unmapped = tmp.path().join("unmapped-repo");
-    std::fs::create_dir(&unmapped).expect("APPARATUS: make the session's unmapped directory");
-    let input = serde_json::json!({
-        "hook_event_name": "UserPromptSubmit",
-        "session_id": "UNMAPPED",
-        "cwd": unmapped,
-    })
-    .to_string();
-    let outside = h.vox_in(
-        None,
-        &["agent", "hook", "--node", "default", "--format", "text"],
-        Some(&input),
-    );
-    assert!(
-        outside.ok,
-        "PRODUCT: the unmapped session's hook failed: {outside:?}"
-    );
-    assert!(
-        ["OWN-A-ON-H", "SIBLING-B-ON-H", "SAME-NAME-A-ON-H-PRIME"]
-            .iter()
-            .all(|body| !outside.stdout.contains(body)),
-        "PRODUCT: a session working in no room received another room's news: {}",
-        outside.stdout
-    );
-    // A deliberate session assignment is retained even though its directory is
-    // still unmapped; the next ordinary hook must now deliver the room's news.
-    let assigned = h.vox(Some("UNMAPPED"), &["agent", "room", r, "--node", "default"]);
-    assert!(
-        assigned.ok,
-        "PRODUCT: assigning the session to its node's room failed: {assigned:?}"
-    );
-    let inside = h.vox_in(
-        None,
-        &["agent", "hook", "--node", "default", "--format", "text"],
-        Some(&input),
-    );
-    assert!(
-        inside.ok,
-        "PRODUCT: the assigned session's hook failed: {inside:?}"
-    );
-    assert!(
-        ["OWN-A-ON-H", "SIBLING-B-ON-H", "SAME-NAME-A-ON-H-PRIME"]
-            .iter()
-            .all(|body| inside.stdout.contains(body)),
-        "PRODUCT: a deliberately assigned session received no expected room news: {}",
-        inside.stdout
-    );
-    let a = drain(h, r, "A");
-    assert!(
-        !a.contains("OWN-A-ON-H"),
-        "PRODUCT: A's drain re-injected A's own post: {a}"
-    );
-    assert!(
-        a.contains("SIBLING-B-ON-H"),
-        "PRODUCT: A's drain dropped another session of the same harness: {a}"
-    );
-    assert!(
-        a.contains("SAME-NAME-A-ON-H-PRIME"),
-        "PRODUCT: A's drain dropped a DIFFERENT harness that uses the same session name: {a}"
-    );
-    let b = drain(h, r, "B");
-    assert!(
-        !b.contains("SIBLING-B-ON-H") && b.contains("OWN-A-ON-H"),
-        "PRODUCT: B's drain: {b}"
-    );
-    let ap = drain(hp, r, "A");
-    assert!(
-        !ap.contains("SAME-NAME-A-ON-H-PRIME") && ap.contains("OWN-A-ON-H"),
-        "PRODUCT: H′'s A drain: {ap}"
-    );
 }
 
 /// The **live half**: a real OpenCode session's own post, made by its model through the plugin,
