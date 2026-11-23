@@ -5517,6 +5517,16 @@ impl NodeHandle {
     pub fn termination(&self) -> NodeTermination {
         self.termination.clone()
     }
+    pub(crate) fn reconcile_local_folders(&self) {
+        if let Some(computer) = &self.computer {
+            let computer = Arc::clone(computer);
+            tokio::task::spawn_blocking(move || {
+                if let Err(error) = computer.reconcile_local_folders() {
+                    eprintln!("vox daemon: computer roster pending: {error}");
+                }
+            });
+        }
+    }
 
     /// Where the node's files are.
     #[must_use]

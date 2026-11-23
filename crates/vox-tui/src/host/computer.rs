@@ -169,14 +169,7 @@ impl Router {
             eprintln!("vox daemon: computer roster pending: {e}");
             return;
         }
-        let names = self
-            .inner
-            .account
-            .nodes_on_disk()
-            .into_iter()
-            .map(|n| n.to_string())
-            .collect();
-        if let Err(e) = management.computer.retain_local_nodes(&names) {
+        if let Err(e) = management.computer.retire_absent_local_nodes() {
             eprintln!("vox daemon: computer roster pending: {e}");
             return;
         }
@@ -430,6 +423,12 @@ impl Router {
         let management = &self.inner.defaults.computer;
         let result = match request {
             DaemonRequest::ComputerStatus => {
+                let computer = Arc::clone(&management.computer);
+                tokio::task::spawn_blocking(move || {
+                    if let Err(error) = computer.reconcile_local_folders() {
+                        eprintln!("vox daemon: computer roster pending: {error}");
+                    }
+                });
                 #[cfg(feature = "test-knobs")]
                 let returned = mark_computer_status_accepted_for_proof();
                 let mut status = management.status();

@@ -5850,10 +5850,18 @@ impl Dispatch for Router {
             | DaemonRequest::ComputerPersonal { .. }
             | DaemonRequest::ComputerBinding { .. }
             | DaemonRequest::ComputerRemove { .. } => self.computer_request(request).await,
-            DaemonRequest::Nodes => match self.public_nodes().await {
-                Ok(nodes) => DaemonFrame::Nodes(nodes),
-                Err(r) => refused(r),
-            },
+            DaemonRequest::Nodes => {
+                let computer = Arc::clone(&self.inner.defaults.computer.computer);
+                tokio::task::spawn_blocking(move || {
+                    if let Err(error) = computer.reconcile_local_folders() {
+                        eprintln!("vox daemon: computer roster pending: {error}");
+                    }
+                });
+                match self.public_nodes().await {
+                    Ok(nodes) => DaemonFrame::Nodes(nodes),
+                    Err(r) => refused(r),
+                }
+            }
             DaemonRequest::Attach {
                 node,
                 passphrase,

@@ -2715,6 +2715,7 @@ pub(crate) enum ApplicationReceipt {
 /// One persistent management identity and transaction domain, owned by its account daemon.
 pub struct Computer {
     path: PathBuf,
+    account: Account,
     storage_failed: std::sync::atomic::AtomicBool,
     /// Fail closed across the gap between staging a policy replacement and publishing its new
     /// in-memory snapshot. Status reads do not consult this flag and therefore never wedge on I/O.
@@ -3234,6 +3235,7 @@ impl Computer {
             let Some(group) = self.binding_group() else {
                 return Ok(true);
             };
+            let mut retired = Vec::new();
             let bind = |s: &mut State| {
                 // `binding_group` and this transaction take the state lock separately. A remote
                 // removal or replacement incarnation can land between them; never use the
@@ -3289,6 +3291,25 @@ impl Computer {
                     bindings.retain(|b| b.verify(&local, &group).ok() != Some(key));
                 }
                 let mut changed = false;
+                #[cfg(feature = "test-knobs")]
+                let skip_replacement = fx28_mutant("same-name-node-replacement");
+                #[cfg(not(feature = "test-knobs"))]
+                let skip_replacement = false;
+                if !skip_replacement {
+                    let before = bindings.len();
+                    bindings.retain(|binding| {
+                        if binding.name != name {
+                            return true;
+                        }
+                        let old = binding.verify(&local, &group).ok();
+                        let keep = old == Some(key);
+                        if !keep {
+                            retired.push(old);
+                        }
+                        keep
+                    });
+                    changed |= bindings.len() != before;
+                }
                 if let Some(binding) = bindings
                     .iter_mut()
                     .find(|b| b.verify(&local, &group).ok() == Some(key))
@@ -3379,6 +3400,14 @@ impl Computer {
                 return Ok(false);
             };
             if current {
+                for old in retired.into_iter().flatten() {
+                    eprintln!(
+                        "vox daemon: computer {} retired node {} ({name}): replaced by a new signer; path {}",
+                        crate::node::link::b32_encode(&local),
+                        crate::node::link::b32_encode(&old),
+                        self.account.nodes_dir().join(name).display()
+                    );
+                }
                 return Ok(true);
             }
         }
@@ -3964,9 +3993,90 @@ impl Computer {
         })
     }
 
-    /// Remove only bindings whose local directories no longer exist. Names never create a binding.
-    pub fn retain_local_nodes(&self, names: &BTreeSet<String>) -> Result<()> {
+    /// Whether this computer's node `name` has no folder: only `NotFound` for that exact path,
+    /// inside a nodes directory that itself resolves. Any other answer (unreadable, an invalid
+    /// name, a nodes directory that is gone or on an unmounted volume) is not absence; it is
+    /// logged and kept, so no single fault withdraws every node at once.
+    fn local_folder_absent(&self, name: &str) -> bool {
+        static NODES_UNRESOLVED_SAID: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        let path = match crate::node::paths::NodeName::parse(name) {
+            Ok(node) => self.account.node_dir(&node),
+            Err(error) => {
+                eprintln!(
+                    "vox daemon: computer kept node {name}: its name is no folder name: {error}"
+                );
+                return false;
+            }
+        };
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => false,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let nodes = self.account.nodes_dir();
+                match std::fs::metadata(&nodes) {
+                    Ok(meta) if meta.is_dir() => {
+                        NODES_UNRESOLVED_SAID.store(false, std::sync::atomic::Ordering::Relaxed);
+                        true
+                    }
+                    other => {
+                        if !NODES_UNRESOLVED_SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            let why = other
+                                .err()
+                                .map_or("not a directory".to_owned(), |e| e.to_string());
+                            eprintln!(
+                                "vox daemon: computer kept every node: the nodes directory does not resolve; path {}: {why}",
+                                nodes.display()
+                            );
+                        }
+                        false
+                    }
+                }
+            }
+            Err(error) => {
+                eprintln!(
+                    "vox daemon: computer kept node {name}: its folder could not be checked; path {}: {error}",
+                    path.display()
+                );
+                false
+            }
+        }
+    }
+
+    /// The moments a deleted node folder is looked for beyond the daemon's own policy and
+    /// attachment passes (which call [`Self::retire_absent_local_nodes`] directly): a computer
+    /// exchange and a local status, node list or trust list request. Deleting a locked node's
+    /// folder wakes no pass of its own.
+    pub fn reconcile_local_folders(&self) -> Result<()> {
+        #[cfg(feature = "test-knobs")]
+        if fx28_mutant("deleted-node-folder-check") {
+            return Ok(());
+        }
+        self.retire_absent_local_nodes()
+    }
+
+    /// Retire this computer's bindings whose node folder does not exist. Each binding's own path
+    /// is tested again inside the roster transaction, so a node made and bound after an earlier
+    /// look is never measured by it. Names never create a binding.
+    pub fn retire_absent_local_nodes(&self) -> Result<()> {
         let local = self.signer.fingerprint();
+        // The first look decides only whether to look again: it decodes the binding names and
+        // verifies no signature (ADR-038 FX-28: nothing derived again when nothing changed). The
+        // transaction below reads the roster fully verified before it writes anything.
+        let names: Vec<String> = {
+            let state = lock(&self.state);
+            if state.group().is_none() || state.grant(&local).is_none() {
+                return Ok(());
+            }
+            let Some(roster) = state.rosters.get(&local) else {
+                return Ok(());
+            };
+            let bindings = roster.event()?.bindings;
+            bindings.into_iter().map(|binding| binding.name).collect()
+        };
+        if !names.iter().any(|name| self.local_folder_absent(name)) {
+            return Ok(());
+        }
+        let mut retired = Vec::new();
         self.change(|s| {
             let Some(group) = s.group() else {
                 return Ok(());
@@ -3979,7 +4089,13 @@ impl Computer {
             };
             let (_, personal, mut bindings) = roster.read(&local, &group)?;
             let was = bindings.len();
-            bindings.retain(|b| names.contains(&b.name));
+            bindings.retain(|binding| {
+                let keep = !self.local_folder_absent(&binding.name);
+                if !keep {
+                    retired.push((binding.name.clone(), binding.verify(&local, &group).ok()));
+                }
+                keep
+            });
             let retained: BTreeSet<_> = bindings
                 .iter()
                 .filter_map(|binding| binding.verify(&local, &group).ok())
@@ -3996,7 +4112,17 @@ impl Computer {
                 s.retain_roster(event)?;
             }
             Ok(())
-        })
+        })?;
+        for (name, node) in retired {
+            let Some(node) = node else { continue };
+            eprintln!(
+                "vox daemon: computer {} retired node {} ({name}): folder absent; path {}",
+                crate::node::link::b32_encode(&local),
+                crate::node::link::b32_encode(&node),
+                self.account.nodes_dir().join(&name).display()
+            );
+        }
+        Ok(())
     }
 
     /// Capture alias metadata before automatic grant consumption or removal.
@@ -4167,6 +4293,7 @@ impl Computer {
             }
             let c = Arc::new(Self {
                 path,
+                account: account.clone(),
                 storage_failed: std::sync::atomic::AtomicBool::new(false),
                 authority_blocked: std::sync::atomic::AtomicBool::new(false),
                 own_key_writers: Mutex::new(Vec::new()),
@@ -4246,6 +4373,7 @@ impl Computer {
         };
         let c = Arc::new(Self {
             path,
+            account: account.clone(),
             storage_failed: std::sync::atomic::AtomicBool::new(false),
             authority_blocked: std::sync::atomic::AtomicBool::new(false),
             own_key_writers: Mutex::new(Vec::new()),

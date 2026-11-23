@@ -345,6 +345,18 @@ connectivity. Receipts do not prove that a computer is currently online, nor do 
 room membership, consent or Session access. Use `vox computer status --details` for complete
 identities, revisions, counters and optional node-management actions.
 
+There is no command to delete just one local node. If you lock a node and delete its folder by
+hand, this computer withdraws the node from its roster the next time it checks: when its computer
+policy changes, when one of its nodes unlocks or locks, when it exchanges with another computer,
+or when `vox computer status`, `vox node list`, `vox status` or `vox trust list` asks its daemon.
+Only a folder that does not exist counts: a locked node, or a folder that cannot be read, keeps
+its trust, and the withdrawal is written to the daemon's log with the folder it checked. Other
+computers remove that fingerprint from their trust lists after they receive and apply the new
+roster. If this computer is off, nothing reaches them until it runs again. If a different node is
+made under the same folder name before the deletion is noticed, the old fingerprint stays trusted
+until the new node is unlocked; its unlock then replaces the old one. Renaming a locked node moves
+its folder, so the other computers stop trusting it until it is unlocked under its new name.
+
 If a computer-policy update meets room history that is still being saved, the daemon retains
 the accepted update until that exact publication settles instead of discarding it as a temporary
 busy error. Trust-dependent actions can report that computer policy is refreshing in the meantime.

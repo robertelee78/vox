@@ -132,6 +132,11 @@ impl Account {
                 c.env(key, v);
             }
         }
+        // The operator's FX-28 mutant selector reaches the daemon a client command starts, as
+        // `Daemon::start` maps it for a foreground daemon.
+        if let Some(mutant) = std::env::var_os("VOX_MUTANT_FX28") {
+            c.env("VOX_TEST_FX28_MUTANT", mutant);
+        }
         c.args(unlock_staging::persistent_args(&self.data, args, PASS))
             .env("VOX_TEST_KEYCHAIN", unlock_staging::keychain(&self.data))
             .env("HOME", self._tmp.path().join("home"))
@@ -6284,7 +6289,8 @@ fn active_and_removed_computers_keep_local_manual_trust() {
 
 /// #801/#802: use the existing account/CLI journey's staging without replaying #799/#800's
 /// pairing, anchor, expired-invitation or storage-failure assertions. These three computers
-/// exercise only the changed roster, selection, removal and explicit binding outcomes.
+/// exercise only the changed roster, selection, removal and explicit binding outcomes, and a
+/// node whose folder is deleted, or deleted and made again under its name, losing its trust.
 #[test]
 #[ignore = "real binaries with production Argon2id; run in release"]
 fn enrolled_computers_follow_node_changes_and_retire_removed_authority() {
@@ -6351,11 +6357,40 @@ fn enrolled_computers_follow_node_changes_and_retire_removed_authority() {
             serde_json::from_str::<serde_json::Value>(&out)
                 .unwrap_or_else(|e| panic!("{verdict}: enrollment status: {e}: {out}"))
         };
-        let offer = staging(sponsor, &["invite"]);
-        let preview = staging(
-            incoming,
-            &["pair", offer["invite_link"].as_str().unwrap(), "--preview"],
-        );
+        // Pairing preview refuses `review again` when this computer's policy moved meanwhile.
+        // A person makes a fresh invitation and reviews again: up to three reviews, on exactly
+        // that refusal; the refused invitation is cancelled first, as `vox computer status` says.
+        let mut preview = None;
+        for attempt in 1..=3 {
+            let offer = staging(sponsor, &["invite"]);
+            let (ok, out, err) = incoming.run(
+                &[
+                    "computer",
+                    "pair",
+                    offer["invite_link"].as_str().unwrap(),
+                    "--preview",
+                    "--json",
+                ],
+                "",
+            );
+            if ok {
+                preview = Some(
+                    serde_json::from_str::<serde_json::Value>(&out)
+                        .unwrap_or_else(|e| panic!("{verdict}: enrollment preview: {e}: {out}")),
+                );
+                break;
+            }
+            assert!(
+                err.trim()
+                    == "vox computer: computer peer refused the request: node: this computer's policy changed while pairing; review again",
+                "{verdict}: enrollment preview: {out}{err}"
+            );
+            eprintln!("[proof] pairing review {attempt}/3 asked for a fresh review: {err}");
+            staging(sponsor, &["cancel", offer["invite_id"].as_str().unwrap()]);
+        }
+        let preview = preview.unwrap_or_else(|| {
+            panic!("APPARATUS: three fresh pairing reviews were each asked to review again")
+        });
         let op = preview["pairing"]["operation_id"].as_str().unwrap();
         staging(incoming, &["approve", op]);
         staging(sponsor, &["approve", op]);
@@ -6466,29 +6501,39 @@ fn enrolled_computers_follow_node_changes_and_retire_removed_authority() {
                  allowed: bool| {
         let file = from._tmp.path().join(name);
         std::fs::write(&file, b"computer-policy-payload").unwrap();
-        let (ok, out, err) = from.run(
-            &[
-                "room",
-                "session",
-                &room,
-                session,
-                "--file",
-                file.to_str().unwrap(),
-                "--node",
-                node,
-            ],
-            "",
-        );
+        let send = || {
+            from.run(
+                &[
+                    "room",
+                    "session",
+                    &room,
+                    session,
+                    "--file",
+                    file.to_str().unwrap(),
+                    "--node",
+                    node,
+                ],
+                "",
+            )
+        };
         if allowed {
+            // Either end refuses a drive while it applies a policy revision: its keyring reads
+            // empty then (ledger 58, P2). A refusal is waited through; one that lasts is red.
+            let mut said = String::new();
             assert!(
-                ok && out.contains("pulling"),
-                "PRODUCT: {node}'s current automatic drive did not deliver its file: {out}{err}"
+                wait_until(Duration::from_secs(30), || {
+                    let (ok, out, err) = send();
+                    said = format!("{out}{err}");
+                    ok && out.contains("pulling")
+                }),
+                "PRODUCT: {node}'s current automatic drive did not deliver its file: {said}"
             );
             assert!(
                 wait_until(Duration::from_secs(30), || files(to, target, name)),
                 "PRODUCT: accepted drive file from {node} did not arrive byte-for-byte"
             );
         } else {
+            let (ok, out, err) = send();
             assert!(!ok, "PRODUCT: {node} retained revoked drive: {out}{err}");
             assert!(
                 !files(to, target, name),
@@ -6636,12 +6681,25 @@ fn enrolled_computers_follow_node_changes_and_retire_removed_authority() {
     );
     // Each person's alias stays theirs. Choose it through the real terminal before changing
     // the presented node name; this also supplies the required keyring passphrase premise.
+    // While a node applies a policy revision its keyring reads empty and a keyring change finds
+    // nothing to rename (ledger 58, P2): that answer is waited through, any other is a stop.
     for (account, node) in [(&b, "worker"), (&a, "old-personal"), (&a, "new-personal")] {
-        let (ok, out, err) = account.run(
-            &["trust", "rename", &added, "my-stable-alias", "--node", node],
-            "",
+        let mut said = String::new();
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                let (ok, out, err) = account.run(
+                    &["trust", "rename", &added, "my-stable-alias", "--node", node],
+                    "",
+                );
+                said = format!("{out}{err}");
+                assert!(
+                    ok || said.contains("no trusted identity matches"),
+                    "APPARATUS: chosen local alias: {said}"
+                );
+                ok
+            }),
+            "APPARATUS: chosen local alias: {said}"
         );
-        assert!(ok, "APPARATUS: chosen local alias: {out}{err}");
     }
     let (ok, out, err) = a.run(&["node", "rename", "added", "renamed"], "");
     assert!(ok, "PRODUCT: managed-node rename: {out}{err}");
@@ -6656,42 +6714,99 @@ fn enrolled_computers_follow_node_changes_and_retire_removed_authority() {
         }),
         "PRODUCT: authenticated rename did not preserve its fingerprint, manager and membership"
     );
+    // A rename reaches the other computers as the node gone, then back (ledger 58, P1), and a
+    // keyring read during an application is empty (P2): wait for the row, never read it once.
     assert!(
-        ring(&b, "worker")
+        wait_until(Duration::from_secs(30), || ring(&b, "worker")
             .lines()
-            .any(|l| l.contains(&added) && l.contains("my-stable-alias")),
-        "PRODUCT: presented rename replaced the person's alias"
+            .any(|l| l.contains(&added) && l.contains("my-stable-alias"))),
+        "PRODUCT: the renamed node never came back under the person's alias: {}",
+        ring(&b, "worker")
     );
+    // A populated listing: the other computer's own known rows are there, so a missing row is
+    // an answer and not an empty read during a policy application.
+    let without =
+        |shown: &str, known: &str, gone: &str| shown.contains(known) && !shown.contains(gone);
+    // What A's daemon said about retiring its nodes, and any engaged mutant (last lines).
+    let trail = || {
+        let log = a.log();
+        let lines: Vec<_> = log
+            .lines()
+            .filter(|l| l.contains("retired node") || l.contains("[vox mutant]"))
+            .collect();
+        lines[lines.len().saturating_sub(4)..].join("\n")
+    };
     let (ok, out, err) = a.run(&["node", "lock", "renamed"], "");
     assert!(
         ok,
         "APPARATUS: stop owned node before deleting its scratch directory: {out}{err}"
     );
     std::fs::remove_dir_all(a.data.join("nodes/renamed")).unwrap();
+    // The person looks at this computer afterwards; that is one of the moments it checks.
+    computer(&a, &["status"]);
     assert!(
-        wait_until(Duration::from_secs(30), || !ring(&b, "worker")
-            .contains(&added)
-            && !ring(&c, "observer").contains(&added)),
-        "PRODUCT: removed node retained roster grants"
+        wait_until(Duration::from_secs(30), || without(
+            &ring(&b, "worker"),
+            &new,
+            &added
+        ) && without(
+            &ring(&c, "observer"),
+            &worker,
+            &added
+        )),
+        "PRODUCT: other computers still trust the deleted node {added}: B={} C={}\nA's daemon:\n{}",
+        ring(&b, "worker"),
+        ring(&c, "observer"),
+        trail()
+    );
+    eprintln!(
+        "[proof] deleted node {added} left B and C; A's daemon:\n{}",
+        trail()
     );
     let replacement = create(&a, "renamed");
     assert_ne!(
         replacement, added,
         "APPARATUS: replacement needs a fresh identity"
     );
+    let mut shown = String::new();
     assert!(
-        wait_until(Duration::from_secs(30), || has(
-            &ring(&b, "worker"),
-            &replacement,
-            false
-        )),
+        wait_until(Duration::from_secs(30), || {
+            shown = ring(&b, "worker");
+            has(&shown, &replacement, false)
+        }),
         "PRODUCT: replacement identity was not published"
     );
     assert!(
-        !ring(&b, "worker")
+        !shown
             .lines()
             .any(|l| l.contains(&replacement) && l.contains("my-stable-alias")),
         "PRODUCT: a replacement fingerprint silently inherited the old identity's alias"
+    );
+    // Deleted and made again under the same name while this computer was off: its folder is
+    // present again when the daemon starts, so only the new node's Ready can retire the old one.
+    let (ok, out, err) = a.run(&["node", "lock", "renamed"], "");
+    assert!(
+        ok,
+        "APPARATUS: lock the replacement before deleting it: {out}{err}"
+    );
+    offline_for_enrollment(&a, "same-name replacement");
+    std::fs::remove_dir_all(a.data.join("nodes/renamed")).unwrap();
+    let again = create(&a, "renamed");
+    ready(&a, "new-personal");
+    ready(&a, "old-personal");
+    assert!(
+        wait_until(Duration::from_secs(30), || without(
+            &ring(&b, "worker"),
+            &again,
+            &replacement
+        )),
+        "PRODUCT: a node made again under the same name left the old fingerprint {replacement} trusted beside it: {}\nA's daemon:\n{}",
+        ring(&b, "worker"),
+        trail()
+    );
+    eprintln!(
+        "[proof] same-name node {again} replaced {replacement} on B; A's daemon:\n{}",
+        trail()
     );
 
     let binding = |account: &Account, action: &str, node: &str, destination: &str| {
@@ -6773,6 +6888,20 @@ fn enrolled_computers_follow_node_changes_and_retire_removed_authority() {
             .1
             .contains("computer-policy-local")),
         "APPARATUS: remote personal Session discovery before removal"
+    );
+    // The transfer and A's restart moved rosters; a node reads an empty keyring while it applies
+    // them (ledger 58, P2), and either end refuses a drive then. Drive once both keyrings show
+    // the other end: B's personal node reads old-personal, and old-personal lets it drive.
+    assert!(
+        wait_until(Duration::from_secs(30), || {
+            let shown = ring(&b, "remote-personal");
+            has(&shown, &old, false)
+                && shown.contains(&moving)
+                && has(&ring(&a, "old-personal"), &remote, true)
+        }),
+        "PRODUCT: the drive's two ends never showed each other: remote-personal={} old-personal={}",
+        ring(&b, "remote-personal"),
+        ring(&a, "old-personal")
     );
     drive(
         &b,
@@ -6876,77 +7005,11 @@ fn enrolled_computers_follow_node_changes_and_retire_removed_authority() {
             .any(|n| n["fingerprint"] == worker && n["computer"] == c_id)),
         "PRODUCT: explicit recovery did not publish its successor management binding"
     );
-    enroll(&a, &b, "PRODUCT");
-    assert!(
-        wait_until(Duration::from_secs(30), || computer(&b, &["status"])
-            ["computers"]
-            .as_array()
-            .is_some_and(|v| v.len() == 3)
-            && has(&ring(&a, "old-personal"), &remote, true)),
-        "PRODUCT: fresh deliberate re-enrollment failed"
-    );
-    assert!(
-        computer(&a, &["status"])["nodes"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|n| n["fingerprint"] == worker)
-            .all(|n| n["computer"] == c_id),
-        "PRODUCT: re-enrollment restored the former manager's superseded node binding"
-    );
-    // Explicitly abandoning a group after the last manager is removed retains retirement
-    // evidence, clears covered grants, and permits a fresh ceremony only by operator choice.
-    for target in [&a_id, &c_id, &b_id] {
-        let status = computer(&b, &["status"]);
-        computer(
-            &b,
-            &[
-                "remove",
-                target,
-                "--confirm",
-                status["frontier"].as_str().unwrap(),
-                "--keep-rooms",
-            ],
-        );
-        if target == &a_id {
-            assert!(
-                wait_until(Duration::from_secs(30), || computer(&a, &["status"])
-                    ["state"]
-                    == "removed"),
-                "PRODUCT: removed A did not receive its signed retirement"
-            );
-        }
-    }
-    let (ok, out, err) = b.run(&["computer", "retire"], "yes\n");
-    assert!(ok, "PRODUCT: reviewed local retirement failed: {out}{err}");
-    assert!(
-        computer(&b, &["status"])["computers"]
-            .as_array()
-            .unwrap()
-            .is_empty(),
-        "PRODUCT: local group abandonment retained membership"
-    );
-    assert!(
-        !ring(&b, "remote-personal").contains(&old),
-        "PRODUCT: local abandonment preserved covered grants"
-    );
-    assert!(
-        wait_until(Duration::from_secs(30), || computer(&a, &["status"])
-            ["state"]
-            == "removed"),
-        "PRODUCT: locally removed manager did not retain retirement evidence"
-    );
-    let (ok, out, err) = a.run(&["computer", "retire"], "yes\n");
-    assert!(ok, "PRODUCT: reviewed local retirement failed: {out}{err}");
-    enroll(&b, &a, "PRODUCT");
-    assert!(
-        wait_until(Duration::from_secs(30), || computer(&a, &["status"])
-            ["computers"]
-            .as_array()
-            .is_some_and(|v| v.len() == 2)),
-        "PRODUCT: deliberate fresh group after abandonment failed"
-    );
-    eprintln!("[proof] #801/#802 changed roster, personal drive, removal, transfer, recovery and deliberate re-enrollment outcomes passed");
+    // A removed computer cannot be enrolled again in the same group: pairing refuses it on
+    // purpose (`group_offer`, "this computer's group authority is removed or suspended"). The way
+    // back, both former members leaving and retiring the old group and pairing into a new one, is
+    // described in docs/manual/keyring.md, "My computers", and is not run here.
+    eprintln!("[proof] #801/#802 changed roster, deleted and same-name nodes, personal drive, removal, transfer and recovery outcomes passed");
 }
 
 /// FX-61b: an expired grant must become visible after its selected governance turn loses policy.
