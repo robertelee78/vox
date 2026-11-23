@@ -10023,7 +10023,9 @@ fn a_returning_reader_eight_thousand_entries_behind_reads_and_pages_back() {
 /// to hold every post, and its status names nothing missing. Red when three samples 5 s apart
 /// show no advance while connected and nothing of the reader's runs on its live lane (`vox
 /// status --json` `lanes.bounded`). Mutant: `VOX_MUTANT_LIVE_FLOOR` (the author's node refuses
-/// Live below its newest 128 positions, as v0.4.6 to v0.4.30 did).
+/// Live below its newest 128 positions, as v0.4.6 to v0.4.30 did). Also red when a sample shows
+/// any post as "(not received yet)": the author holds every body, so mid catch-up the reader
+/// shows what it holds and nothing in place of what it has yet to fetch (ADR-008 LS-33).
 #[cfg(feature = "optional-proofs")]
 #[test]
 #[ignore = "three hundred CLI posts and two real daemons; optional"]
@@ -10320,6 +10322,13 @@ mod rg1 {
         try_read(w, id, wanted, None).unwrap_or_else(|why| panic!("RED PRODUCT: {why}"))
     }
 
+    /// [`read`] to the start, also counting the rows shown as "(not received yet)".
+    fn read_owed(w: &Worker, id: &str) -> (BTreeSet<String>, usize, usize) {
+        let (texts, pages, _, owed) =
+            try_read_owed(w, id, None, None).unwrap_or_else(|why| panic!("RED PRODUCT: {why}"));
+        (texts, pages, owed)
+    }
+
     fn check_observation_process(
         name: &str,
         command: &str,
@@ -10354,11 +10363,21 @@ mod rg1 {
         wanted: Option<&str>,
         state: Option<&Mutex<LoadState>>,
     ) -> Result<(BTreeSet<String>, usize, Option<String>), String> {
+        try_read_owed(w, id, wanted, state).map(|(texts, pages, oldest, _)| (texts, pages, oldest))
+    }
+
+    fn try_read_owed(
+        w: &Worker,
+        id: &str,
+        wanted: Option<&str>,
+        state: Option<&Mutex<LoadState>>,
+    ) -> Result<(BTreeSet<String>, usize, Option<String>, usize), String> {
         let mut before = None::<String>;
         let mut cursors = BTreeSet::new();
         let mut texts = BTreeSet::new();
         let mut pages = 0;
         let mut oldest = None;
+        let mut owed = 0;
         loop {
             let mut args = vec!["room", "read", id, "--json", "--limit", "200"];
             if let Some(cursor) = before.as_deref() {
@@ -10388,7 +10407,9 @@ mod rg1 {
                 oldest = Some(hash.to_owned());
             }
             for row in rows {
-                if let Some(text) = row["text"].as_str() {
+                if row["owed"] == true {
+                    owed += 1;
+                } else if let Some(text) = row["text"].as_str() {
                     texts.insert(text.to_owned());
                 }
             }
@@ -10413,7 +10434,7 @@ mod rg1 {
                 || next.is_none()
                 || std::env::var_os("VOX_PROOF_RG1_NO_PAGING").is_some()
             {
-                return Ok((texts, pages, oldest));
+                return Ok((texts, pages, oldest, owed));
             }
             let next = next.expect("footer checked");
             if !cursors.insert(next.clone()) {
@@ -10903,14 +10924,23 @@ mod rg1 {
             let connected = row["connected"] == true;
             let missing = row["missing_live_entries"].as_u64();
             let (in_flight, lane) = live_in_flight(&bob);
-            let (texts, pages, _) = read(&bob, &id, None);
+            let (texts, pages, owed) = read_owed(&bob, &id);
             let shown = |n: &usize| texts.contains(&format!("RG6-follow-{n:03}"));
             let held = (1..=POSTS).filter(shown).count();
             eprintln!(
                 "[RG-6 follow] sample={sample} held={held}/{POSTS} pages={pages} \
-                 connected={connected} missing_live_entries={missing:?} not_receiving={} \
+                 not_received_yet_rows={owed} connected={connected} \
+                 missing_live_entries={missing:?} not_receiving={} \
                  holds_through={} advertised_through={} live_in_flight={in_flight}",
                 report["not_receiving"], row["holds_through"], row["advertised_through"]
+            );
+            // ADR-008 LS-33: only a body a holder no longer has, or will not send, is shown as
+            // not received yet. The author holds and sends every body here, so a reader mid
+            // catch-up shows what it holds and nothing in place of what it has yet to fetch.
+            assert_eq!(
+                owed, 0,
+                "RED PRODUCT: mid catch-up (sample {sample}, {held}/{POSTS} held) the follower \
+                 shows {owed} posts as not received yet, though the author holds every body"
             );
             if !wanted.is_empty() && engaged.is_none() {
                 engaged = [&alice, &bob].iter().find_map(|w| {

@@ -2016,16 +2016,142 @@ impl ChannelState {
         {
             return Ok(None);
         }
-        let created = entry.skeleton.claimed_ms;
         let ttl = self.entry_retention(Transaction::Batch(batch), entry)?;
-        if expired_at(created, self.now_hint, ttl) {
+        Ok(owed_window(entry, self.now_hint, ttl))
+    }
+
+    /// The "not received yet" row of a signed (v2) message whose body this node does not hold
+    /// (ADR-008 LS-33): its created/expiry pair, or `None` when no row stands for it: the body is
+    /// held, the entry is private, or it has expired by this node's own reckoning.
+    pub(super) fn signed_owed_visibility(
+        &self,
+        store: &Store,
+        entry: &Entry,
+        now: u64,
+    ) -> Result<Option<(u64, u64)>> {
+        if entry.payload.is_some() || self.private_id(store, &entry.entry_hash())?.is_some() {
             return Ok(None);
         }
-        let expires = if ttl == 0 {
-            u64::MAX
-        } else {
-            created.saturating_add(ttl.saturating_mul(1_000))
-        };
-        Ok(Some((created, expires)))
+        let snapshot = store.snapshot()?;
+        let ttl = self.entry_retention(Transaction::Snapshot(&snapshot), entry)?;
+        Ok(owed_window(entry, now, ttl))
     }
+
+    /// The row to write for a body-less signed message as its effect lands: `(created, expires,
+    /// removal generation)` when its body is owed to this node and has not expired here; `None`
+    /// when it is not for this node, not decidable yet (the retention sweep writes it once it
+    /// is), private or expired. The generation lets the save refuse a row a removal overtook.
+    pub(super) fn signed_owed_row(
+        &self,
+        store: &Store,
+        entry: &Entry,
+        now: u64,
+    ) -> Result<Option<(u64, u64, u64)>> {
+        if owed_rows_unwritten() {
+            return Ok(None);
+        }
+        let generation = self.removal_generation(store)?;
+        let owed = match self.checked_governance(store, now) {
+            Ok(view) => self.signed_body_owed_to_me(&view, generation, entry, now)?,
+            Err(error) if governance::refreshing(&error) => None,
+            Err(error) => return Err(error),
+        };
+        if owed != Some(true) {
+            return Ok(None);
+        }
+        Ok(self
+            .signed_owed_visibility(store, entry, now)?
+            .map(|(created, expires)| (created, expires, generation)))
+    }
+
+    /// Whether the body of a signed message is owed to this node, by this node's own decision
+    /// (ADR-036 H-4: owed "until held, expired or refused as not for this node"). It is the
+    /// decision recipient render makes (MP-10 boundary 2): the author's eligibility for the
+    /// entry, and once this node knows its own applied removal, its own readmission cut.
+    /// `Some(true)`: owed, a row may stand for it. `Some(false)`: not for this node, no row, ever.
+    /// `None`: not decidable yet, no row until it is. Only ordinary signed Content is shown;
+    /// a legacy entry keeps its legacy meaning.
+    pub(super) fn signed_body_owed_to_me(
+        &self,
+        view: &governance::View<'_>,
+        generation: u64,
+        entry: &Entry,
+        now: u64,
+    ) -> Result<Option<bool>> {
+        let Some(v2) = entry.skeleton.v2.as_ref() else {
+            return Ok(Some(true));
+        };
+        if v2.kind != crate::log::history::SignedEntryKind::Content {
+            return Ok(Some(false));
+        }
+        if owed_rows_unchecked() {
+            return Ok(Some(true));
+        }
+        let decide = |eligibility| match eligibility {
+            governance::ContentEligibility::Eligible => Some(true),
+            governance::ContentEligibility::Ineligible => Some(false),
+            governance::ContentEligibility::Refreshing => None,
+        };
+        let author = decide(view.content_eligibility(entry)?);
+        if author != Some(true) || generation == 0 {
+            return Ok(author);
+        }
+        Ok(decide(view.recipient_body_eligibility(
+            &self.me(),
+            entry,
+            now,
+        )?))
+    }
+}
+
+/// A "not received yet" row's created/expiry pair: `None` once the body has expired here.
+pub(super) fn owed_window(entry: &Entry, now: u64, ttl: u64) -> Option<(u64, u64)> {
+    let created = entry.skeleton.claimed_ms;
+    if expired_at(created, now, ttl) {
+        return None;
+    }
+    let expires = if ttl == 0 {
+        u64::MAX
+    } else {
+        created.saturating_add(ttl.saturating_mul(1_000))
+    };
+    Some((created, expires))
+}
+
+/// `VOX_TEST_OWED_ROW=unwritten` (ADR-008 LS-33, proofs only): a signed message whose body has
+/// not arrived gets no "not received yet" row.
+#[cfg(feature = "test-knobs")]
+pub(super) fn owed_rows_unwritten() -> bool {
+    owed_row_mutant() == Some("unwritten")
+}
+#[cfg(not(feature = "test-knobs"))]
+pub(super) const fn owed_rows_unwritten() -> bool {
+    false
+}
+
+/// `VOX_TEST_OWED_ROW=unchecked` (ADR-036 H-4, proofs only): a row is written for every
+/// body-less signed message, whether or not its body is for this node.
+#[cfg(feature = "test-knobs")]
+fn owed_rows_unchecked() -> bool {
+    owed_row_mutant() == Some("unchecked")
+}
+#[cfg(not(feature = "test-knobs"))]
+const fn owed_rows_unchecked() -> bool {
+    false
+}
+
+#[cfg(feature = "test-knobs")]
+fn owed_row_mutant() -> Option<&'static str> {
+    static MODE: std::sync::LazyLock<Option<&'static str>> = std::sync::LazyLock::new(|| {
+        let mode = match std::env::var("VOX_TEST_OWED_ROW").as_deref() {
+            Ok("unwritten") => Some("unwritten"),
+            Ok("unchecked") => Some("unchecked"),
+            _ => None,
+        };
+        if let Some(mode) = mode {
+            eprintln!("vox: VOX_TEST_OWED_ROW={mode} engaged");
+        }
+        mode
+    });
+    *MODE
 }

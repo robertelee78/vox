@@ -67,7 +67,10 @@
 //! boundary 1 off in one holder (`VOX_MUTANT_MP10_SEND=alice|bob|dave`: that holder sends a
 //! once-removed recipient every body) and boundary 2 off in carol (`VOX_MUTANT_MP10_RENDER=1`:
 //! she renders every body she is sent): the readmission-cut arm named for that boundary goes red
-//! through that holder;
+//! through that holder. In both, carol shows no gap post as "(not received yet)" either (ADR-036
+//! H-4: a body withheld because it is not for her is not owed to her); mutant
+//! `VOX_MUTANT_OWED_ROW=unchecked` (carol writes that row for every body-less message) turns the
+//! boundary-1 arm red on it;
 //! a post in a removal's rotation window refused as an internal error (post after removal,
 //! `VOX_MUTANT_POST_AFTER_REMOVAL=unmapped`).
 
@@ -994,6 +997,16 @@ fn a_queued_key_and_history_debt_cannot_cross_room_removal() {
 // boundary 1 off in the daemon that has it; `VOX_TEST_MP10_RENDER_EVERY_BODY=1` switches
 // boundary 2 off.
 
+/// `VOX_MUTANT_OWED_ROW=unchecked|unwritten` from the runner, for carol's daemon
+/// (`VOX_TEST_OWED_ROW`): the "not received yet" row knob.
+fn mp10_owed_knob() -> Option<(&'static str, &'static str)> {
+    match std::env::var("VOX_MUTANT_OWED_ROW").as_deref() {
+        Ok("unchecked") => Some(("VOX_TEST_OWED_ROW", "unchecked")),
+        Ok("unwritten") => Some(("VOX_TEST_OWED_ROW", "unwritten")),
+        _ => None,
+    }
+}
+
 /// A daemon's knobs for the act: boundary 1 off when `send`, boundary 2 off when `render`.
 fn mp10_env(send: bool, render: bool) -> Vec<(&'static str, &'static str)> {
     let mut env = Vec::new();
@@ -1106,13 +1119,23 @@ fn mp10_reached(holder: &Worker, carol: &Worker, id: &str, text: &str) {
 }
 
 /// Through `holder`, carol shows none of `gap` and every one of `before` while her sync rounds
-/// toward it complete three more times. Showing any of `gap` is the RED verdict, named `red`; it
-/// is given once three more rounds have completed after the first such text, naming every one
-/// shown by then. Rounds that never complete within 600 s is APPARATUS NO RESULT.
-fn mp10_holds(carol: &Worker, holder: &Worker, id: &str, gap: &[&str], before: &[&str], red: &str) {
+/// toward it complete three more times; nor does she show any gap post as "(not received yet)":
+/// `gap_rows` are the gap posts' rows as a holder prints them (`<entry> <author> <text>`). Showing
+/// any of `gap`, or such a placeholder, is the RED verdict, named `red`; it is given once three
+/// more rounds have completed after the first, naming every one shown by then. Rounds that never
+/// complete within 600 s is APPARATUS NO RESULT.
+fn mp10_holds(
+    carol: &Worker,
+    holder: &Worker,
+    id: &str,
+    gap: &[&str],
+    gap_rows: &[(String, &str)],
+    before: &[&str],
+    red: &str,
+) {
     let started = Instant::now();
     let first = mp10_rounds_toward(&carol.vox(None, &["status", "--json"]).json(), holder);
-    let mut shown: Vec<&str> = Vec::new();
+    let mut shown: Vec<String> = Vec::new();
     let mut red_at = None;
     loop {
         let read = carol.vox(None, &["room", "read", id]);
@@ -1122,8 +1145,21 @@ fn mp10_holds(carol: &Worker, holder: &Worker, id: &str, gap: &[&str], before: &
             holder.name
         );
         for text in gap {
-            if read.stdout.contains(text) && !shown.contains(text) {
-                shown.push(*text);
+            if read.stdout.contains(text) && !shown.iter().any(|s| s == text) {
+                shown.push((*text).to_owned());
+            }
+        }
+        for line in read
+            .stdout
+            .lines()
+            .filter(|l| l.ends_with(vox_core::node::api::NOT_RECEIVED_YET))
+        {
+            let entry = line.split(' ').next().unwrap_or_default();
+            if let Some((_, text)) = gap_rows.iter().find(|(row, _)| row == entry) {
+                let placeholder = format!("{text} as (not received yet)");
+                if !shown.contains(&placeholder) {
+                    shown.push(placeholder);
+                }
             }
         }
         for text in before {
@@ -1150,7 +1186,7 @@ fn mp10_holds(carol: &Worker, holder: &Worker, id: &str, gap: &[&str], before: &
         } else if rounds >= first + 3 {
             eprintln!(
                 "[proof] MP10 through {}: carol's rounds toward it {first} -> {rounds}; none of \
-                 {gap:?} shown; {before:?} kept",
+                 {gap:?} shown, nor as (not received yet); {before:?} kept",
                 holder.name
             );
             return;
@@ -1335,7 +1371,24 @@ fn mp10_readmitted_member_gets_no_gap_body(send: [bool; 3], render: bool, red: &
         "MP10-GAP-BOB",
         "MP10-GAP-DAVE",
     ];
-    let carol_env = mp10_env(false, render);
+    // Each gap post's row as alice prints it: carol must never show it as "(not received yet)".
+    let alice_read = setup(&room.workers[ALICE], &["room", "read", id]);
+    let gap_rows: Vec<(String, &str)> = gap
+        .iter()
+        .map(|text| {
+            let row = alice_read
+                .stdout
+                .lines()
+                .find(|l| l.ends_with(text))
+                .and_then(|l| l.split(' ').next())
+                .unwrap_or_else(|| {
+                    panic!("APPARATUS: alice's read has no row for {text}: {alice_read:?}")
+                });
+            (row.to_owned(), *text)
+        })
+        .collect();
+    let mut carol_env = mp10_env(false, render);
+    carol_env.extend(mp10_owed_knob());
     eprintln!("[proof] MP10 staged: carol removed, gap written, carol readmitted");
     // Carol comes back with every holder running. Then through each holder in turn: all run
     // until carol reads that holder's fresh post and completes a round toward it (dave restarts
@@ -1360,6 +1413,7 @@ fn mp10_readmitted_member_gets_no_gap_body(send: [bool; 3], render: bool, red: &
             &room.workers[h],
             id,
             &gap,
+            &gap_rows,
             &before,
             red,
         );
@@ -1374,6 +1428,7 @@ fn mp10_readmitted_member_gets_no_gap_body(send: [bool; 3], render: bool, red: &
         &room.workers[ALICE],
         id,
         &gap,
+        &gap_rows,
         &before,
         red,
     );

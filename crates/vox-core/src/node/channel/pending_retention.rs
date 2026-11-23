@@ -38,6 +38,11 @@ fn lengthening_unfenced() -> bool {
 enum Work {
     Cleanup {
         remove: Vec<(Digest32, u64, Option<Digest32>)>,
+        /// "Not received yet" rows of signed messages to write (`Some`: owed to this node, no
+        /// row yet) or take away (`None`: refused as not for this node), and the removal
+        /// generation those decisions were made under. The missing position itself is kept.
+        rows: Vec<(Digest32, Option<(u64, u64)>)>,
+        generation: u64,
         next: Option<(Digest32, u64)>,
     },
     KeyDebt {
@@ -165,27 +170,82 @@ impl ChannelState {
             Step::OwedCleanup => {
                 let (positions, next) =
                     read.missing_page(self.projection_state.cleanup_cursor, 64)?;
+                // ADR-036 H-4: a signed message's body is owed until held, expired or refused as
+                // not for this node, by this node's own decision; undecided, it waits for a later
+                // turn. Without a current authority view nothing is decided here.
+                let generation = self.removal_generation(store)?;
+                let view = match self.checked_governance(store, now_ms) {
+                    Ok(view) => Some(view),
+                    Err(error) if governance::refreshing(&error) => None,
+                    Err(error) => return Err(error),
+                };
+                let mut rendered = None;
                 let mut remove = Vec::new();
+                let mut rows = Vec::new();
                 for (author, seq) in positions {
                     let entry = read.get(&author, seq)?;
-                    let keep = match entry.as_ref() {
-                        Some(entry) => {
+                    let ttl = match entry.as_ref() {
+                        Some(entry) => Some(self.entry_retention(read.transaction(), entry)?),
+                        None => None,
+                    };
+                    let keep = match (entry.as_ref(), ttl) {
+                        (Some(entry), Some(ttl)) => {
                             entry.payload.is_none()
                                 && self.private_id(store, &entry.entry_hash())?.is_none()
                                 && !(self.governance_display_current(now_ms)
-                                    && expired_at(
-                                        entry.skeleton.claimed_ms,
-                                        now_ms,
-                                        self.entry_retention(read.transaction(), entry)?,
-                                    ))
+                                    && expired_at(entry.skeleton.claimed_ms, now_ms, ttl))
                         }
-                        None => false,
+                        _ => false,
+                    };
+                    let signed_content = entry.as_ref().is_some_and(|entry| {
+                        entry.skeleton.v2.as_ref().is_some_and(|v2| {
+                            v2.kind == crate::log::history::SignedEntryKind::Content
+                        })
+                    });
+                    let owed = match (&view, entry.as_ref()) {
+                        (Some(view), Some(entry)) if keep && signed_content => {
+                            self.signed_body_owed_to_me(view, generation, entry, now_ms)?
+                        }
+                        _ => None,
                     };
                     if !keep {
                         remove.push((author, seq, entry.map(|entry| entry.entry_hash())));
+                        continue;
+                    }
+                    let (Some(owed), Some(entry), Some(ttl)) = (owed, &entry, ttl) else {
+                        continue;
+                    };
+                    if owed && history::owed_rows_unwritten() {
+                        continue;
+                    }
+                    let hash = entry.entry_hash();
+                    if rendered.is_none() {
+                        rendered = Some(self.entries.render_view(
+                            store,
+                            &self.sek,
+                            &self.channel_id,
+                        )?);
+                    }
+                    let written = match &rendered {
+                        Some(view) => view.is_owed(&hash)?,
+                        None => false,
+                    };
+                    match (owed, written) {
+                        (true, false) => {
+                            if let Some(window) = history::owed_window(entry, now_ms, ttl) {
+                                rows.push((hash, Some(window)));
+                            }
+                        }
+                        (false, true) => rows.push((hash, None)),
+                        _ => {}
                     }
                 }
-                Work::Cleanup { remove, next }
+                Work::Cleanup {
+                    remove,
+                    rows,
+                    generation,
+                    next,
+                }
             }
             Step::KeyDebt => {
                 let debts = if retention.0 == 0 {
@@ -267,6 +327,13 @@ impl ChannelState {
                 }
                 let mut owed = Vec::new();
                 if state.pending {
+                    // A signed message's row stands only where its body is for this node
+                    // (ADR-036 H-4); undecided, none, and the owed sweep writes it later.
+                    let decider = match self.checked_governance(store, now_ms) {
+                        Ok(view) => Some((view, self.removal_generation(store)?)),
+                        Err(error) if governance::refreshing(&error) => None,
+                        Err(error) => return Err(error),
+                    };
                     let (positions, next) =
                         read.missing_page(state.cursor, entry_store::DUE_ENTRIES)?;
                     let mut through = false;
@@ -280,22 +347,23 @@ impl ChannelState {
                             .get(&author, seq)?
                             .ok_or(Error::MalformedAtRest("owed entry missing"))?;
                         let hash = entry.entry_hash();
+                        let signed_owed = match (&entry.skeleton.v2, &decider) {
+                            (None, _) => Some(true),
+                            (Some(_), Some((view, generation))) => {
+                                self.signed_body_owed_to_me(view, *generation, &entry, now_ms)?
+                            }
+                            (Some(_), None) => None,
+                        };
                         let visibility = if entry.payload.is_some()
+                            || signed_owed != Some(true)
+                            || (entry.skeleton.v2.is_some() && history::owed_rows_unwritten())
                             || self.private_id(store, &hash)?.is_some()
                             || self.legacy_is_session_in(read.transaction(), &hash)?
                         {
                             None
                         } else {
-                            let created = entry.skeleton.claimed_ms;
                             let ttl = self.entry_retention(read.transaction(), &entry)?;
-                            (!expired_at(created, now_ms, ttl)).then_some((
-                                created,
-                                if ttl == 0 {
-                                    u64::MAX
-                                } else {
-                                    created.saturating_add(ttl.saturating_mul(1_000))
-                                },
-                            ))
+                            history::owed_window(&entry, now_ms, ttl)
                         };
                         owed.push((hash, visibility));
                     }
@@ -663,10 +731,18 @@ impl PendingRetention {
         let result = self.sek.with(|sek| -> Result<Installed> {
             let mut installed = Installed::default();
             match &mut self.work {
-                Work::Cleanup { remove, .. } => {
-                    if !remove.is_empty() {
+                Work::Cleanup {
+                    remove,
+                    rows,
+                    generation,
+                    ..
+                } => {
+                    if !remove.is_empty() || !rows.is_empty() {
                         let mut batch = store.batch()?;
                         batch.derived();
+                        // A removal applied since the decision leaves the rows to the next turn.
+                        let current =
+                            governance::removal_generation_in(&batch, &self.room)? == *generation;
                         let mut index = self.index.write(&mut batch, sek, &self.room)?;
                         let mut changed = false;
                         for (author, seq, hash) in remove {
@@ -674,6 +750,12 @@ impl PendingRetention {
                                 index.set_owed(*hash, None)?;
                             }
                             changed |= index.set_missing(author, *seq, false)?;
+                        }
+                        for (hash, window) in rows.iter() {
+                            if window.is_none() || current {
+                                index.set_owed(*hash, *window)?;
+                                changed = true;
+                            }
                         }
                         index.seal()?;
                         batch.commit()?;

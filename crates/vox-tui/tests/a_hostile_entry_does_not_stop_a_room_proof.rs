@@ -53,6 +53,22 @@
 //! 3. once Alice is back, Bob reads both, and shows nothing as not received yet;
 //! 4. and still reads them after his daemon restarts.
 //!
+//! On the history path (rooms with authenticated history) the "not received yet" row is written
+//! with the entry's effect, where its text would have been shown, once Bob's own decision says the
+//! body is for him (ADR-036 H-4); before that change Bob took the envelope and showed nothing
+//! (ledger 74).
+//!
+//! ## A body its only holder no longer keeps ([`a_body_its_only_holder_no_longer_keeps_is_shown_as_not_received_yet`])
+//! The honest case of the same rule (LS-33: a node ships no body it no longer holds). All run the
+//! shipped binary. The room keeps a week; Carol's node keeps a minute (`cfg/retention`, ADR-023
+//! decision 2). Bob is stopped, Alice posts, Carol takes it and a minute later lets its body go;
+//! Alice and the anchor are stopped and Bob resumed, so Carol, who serves the envelope and answers
+//! the body as not held, is his only holder. Asserted:
+//! 1. Bob shows Alice's post as not received yet, in its place right after her first, without its
+//!    text, and his `vox status --json` counts it as a row;
+//! 2. once Alice is back, Bob reads the post, shows it no longer as not received yet, and his row
+//!    count stays the same (the text took the placeholder's row).
+//!
 //! ## A member that terminated its feed and hides it ([`a_post_after_a_hidden_termination_is_never_shown`])
 //! ADR-053 MP-10 (c). Mallory first runs as an ordinary member (mode `correct`) and posts; then her
 //! daemon restarts as `terminate-and-withhold`: her next post is preceded by a signed
@@ -104,7 +120,10 @@
 //! - no binding check of a governance body (`VOX_PROOF_GOV_BINDING=unchecked`): the misbound arm
 //!   goes red at (1), Bob takes the grant;
 //! - `VOX_PROOF_TERMINATION=unchecked`: the hidden-termination arm goes red at (2);
-//! - `VOX_PROOF_TERMINATION=admitted`: the hidden-termination arm goes red at (1), non-citable.
+//! - `VOX_PROOF_TERMINATION=admitted`: the hidden-termination arm goes red at (1), non-citable;
+//! - `VOX_MUTANT_OWED_ROW=unwritten` (Bob's daemon gets `VOX_TEST_OWED_ROW=unwritten`: no "not
+//!   received yet" row is written for a body-less signed message): the stripped arm goes red at
+//!   (2), and the kept-less arm at (1).
 
 #![cfg(unix)]
 
@@ -198,6 +217,28 @@ fn owed_rows(m: &Member, room: &str) -> Vec<String> {
         .filter(|l| l.ends_with(vox_core::node::api::NOT_RECEIVED_YET))
         .filter_map(|l| l.split(' ').next().map(str::to_owned))
         .collect()
+}
+
+/// The rows `m` reports for `room` in `vox status --json` (`entries`): every row `vox room read`
+/// pages through, a message not received yet counting as its placeholder.
+fn room_rows(m: &Member, room: &str) -> Option<u64> {
+    m.status()["rooms"]
+        .as_array()?
+        .iter()
+        .find(|r| r["id"].as_str().is_some_and(|id| id.starts_with(room)))?["entries"]
+        .as_u64()
+}
+
+/// The reader's daemon, given the runner's `VOX_MUTANT_OWED_ROW=unwritten|unchecked` as
+/// `VOX_TEST_OWED_ROW` (no "not received yet" row is written; or one for every body-less
+/// message). The runner's variable reaches no other daemon.
+fn reader_daemon(m: &Member, spec: &str) -> Proc {
+    let knob = match std::env::var("VOX_MUTANT_OWED_ROW").as_deref() {
+        Ok("unwritten") => vec![("VOX_TEST_OWED_ROW", "unwritten")],
+        Ok("unchecked") => vec![("VOX_TEST_OWED_ROW", "unchecked")],
+        _ => Vec::new(),
+    };
+    m.daemon_with_anchor(Some(spec), &knob)
 }
 
 /// The entry hash `m` shows `text` under in `room`, from the first column of `vox room read`.
@@ -371,7 +412,7 @@ fn a_stripped_body_is_owed_and_asked_for_until_it_arrives() {
         b.trust(a);
     }
     let alice_d = alice.daemon(Some(&spec));
-    let bob_d = bob.daemon(Some(&spec));
+    let bob_d = reader_daemon(&bob, &spec);
     let mallory_d = mallory.daemon_mutant(&sender, MODE, Some(&spec));
     let room = alice.create("stripped");
     let link = alice.invite(&room);
@@ -496,7 +537,7 @@ fn a_stripped_body_is_owed_and_asked_for_until_it_arrives() {
         bob.vox(&["room", "read", &room], None).1
     );
     drop(bob_d);
-    let _bob_d = bob.daemon(Some(&spec));
+    let _bob_d = reader_daemon(&bob, &spec);
     let reopened = arrives(&bob, &room, posts[1]);
     println!("[proof] stripped: after a restart bob reads it: {reopened:?}");
     if let Err(e) = &reopened {
@@ -506,6 +547,147 @@ fn a_stripped_body_is_owed_and_asked_for_until_it_arrives() {
             bob.status()
         );
     }
+}
+
+/// How long a node that keeps a minute may take to let a message go.
+const KEPT_A_MINUTE_GOES_WITHIN: Duration = Duration::from_secs(150);
+
+#[test]
+#[ignore = "real daemons and an anchor, a node that keeps a minute (about four minutes); CI runs it in release"]
+fn a_body_its_only_holder_no_longer_keeps_is_shown_as_not_received_yet() {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
+    let root = tmp.path();
+    let (anchor_d, spec) = anchor(root);
+    let alice = Member::new(root, "alice");
+    let bob = Member::new(root, "bob");
+    let carol = Member::new(root, "carol");
+    for (a, b) in [(&alice, &bob), (&alice, &carol), (&bob, &carol)] {
+        a.trust(b);
+        b.trust(a);
+    }
+    // Carol's node keeps a minute, whatever the room keeps (ADR-023 decision 2).
+    std::fs::write(carol.dir.join("cfg").join("retention"), "default 60\n")
+        .expect("APPARATUS: carol's node retention file");
+    let alice_d = alice.daemon(Some(&spec));
+    let bob_d = reader_daemon(&bob, &spec);
+    let _carol_d = carol.daemon(Some(&spec));
+    let room = alice.create("kept-less");
+    let (ok, out, err) = alice.vox(&["room", "retention", &room, "1w"], None);
+    assert!(
+        ok,
+        "PRODUCT (staging): alice's vox room retention 1w: {out}{err}"
+    );
+    let link = alice.invite(&room);
+    bob.join(&link, "kept-less");
+    carol.join(&link, "kept-less");
+    let warm = "alice, while everyone is up";
+    alice.post(&room, warm);
+    for m in [&bob, &carol] {
+        if let Err(e) = arrives(m, &room, warm) {
+            panic!(
+                "PRODUCT (staging): {} never read alice's first post: {e}",
+                m.name
+            );
+        }
+    }
+    let rows_before = room_rows(&bob, &room);
+
+    // ---- bob is away; alice posts; carol takes it and, a minute later, lets its body go ----
+    signal_took(&bob_d, "-STOP", "bob");
+    let post = "alice, while bob was away";
+    alice.post(&room, post);
+    if let Err(e) = arrives(&carol, &room, post) {
+        panic!("PRODUCT (staging): carol never read alice's post: {e}");
+    }
+    let hash = hash_of(&alice, &room, post)
+        .unwrap_or_else(|| panic!("PRODUCT (staging): alice's own read does not show her post"));
+    let t = Instant::now();
+    loop {
+        match reads(&carol, &room, post) {
+            Ok(false) => break,
+            Ok(true) if t.elapsed() < KEPT_A_MINUTE_GOES_WITHIN => {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            Ok(true) => panic!(
+                "PRODUCT (staging): carol's node keeps a minute and still shows alice's post after \
+                 {} s",
+                t.elapsed().as_secs()
+            ),
+            Err(e) => panic!("PRODUCT (staging): carol's read failed: {e}"),
+        }
+    }
+    println!(
+        "[proof] kept less: carol's node let alice's post go {} s after it arrived",
+        t.elapsed().as_secs()
+    );
+    // Alice and the anchor hold the body; with both stopped, carol is bob's only holder.
+    signal_took(&alice_d, "-STOP", "alice");
+    signal_took(&anchor_d, "-STOP", "the anchor");
+    signal_took(&bob_d, "-CONT", "bob");
+
+    // ---- bob shows it in place as not received yet, and counts it ---------------------------
+    let t = Instant::now();
+    let mut owed = false;
+    while t.elapsed() < ARRIVES_WITHIN * 2 {
+        owed = owed_rows(&bob, &room).contains(&hash);
+        if owed {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let (_, shown, _) = bob.vox(&["room", "read", &room], None);
+    assert!(
+        owed,
+        "PRODUCT: carol, bob's only holder, no longer keeps the body of alice's post, which has \
+         not expired for bob (the room keeps a week), and bob does not show it as not received \
+         yet\nbob reads: {shown:?}\nbob's status: {}",
+        bob.status()
+    );
+    let lines: Vec<&str> = shown.lines().collect();
+    let at_warm = lines.iter().position(|l| l.ends_with(warm));
+    let at_owed = lines.iter().position(|l| l.starts_with(hash.as_str()));
+    assert!(
+        matches!((at_warm, at_owed), (Some(w), Some(o)) if o == w + 1),
+        "PRODUCT: bob does not show alice's post as not received yet in its place, right after \
+         her first: {shown:?}"
+    );
+    assert!(
+        !shown.contains(post),
+        "PRODUCT: bob shows the text of a post whose body never reached him: {shown:?}"
+    );
+    let rows_owed = room_rows(&bob, &room);
+    assert_eq!(
+        rows_owed,
+        rows_before.map(|n| n + 1),
+        "PRODUCT: bob's `vox status` does not count the post not received yet as a row ({rows_before:?} before)"
+    );
+    println!(
+        "[proof] kept less: with carol his only holder, bob shows alice's post as not received \
+         yet in its place; rows {rows_before:?} -> {rows_owed:?}"
+    );
+
+    // ---- alice comes back: bob asks again and shows the text in its place --------------------
+    signal_took(&alice_d, "-CONT", "alice");
+    signal_took(&anchor_d, "-CONT", "the anchor");
+    if let Err(e) = arrives(&bob, &room, post) {
+        panic!(
+            "PRODUCT: bob never read alice's post once she was back ({e}): the body he was owed \
+             was not asked for again\nbob reads: {:?}",
+            bob.vox(&["room", "read", &room], None).1
+        );
+    }
+    let (_, shown, _) = bob.vox(&["room", "read", &room], None);
+    assert!(
+        !owed_rows(&bob, &room).contains(&hash),
+        "PRODUCT: bob reads alice's post and still shows it as not received yet: {shown:?}"
+    );
+    assert_eq!(
+        room_rows(&bob, &room),
+        rows_owed,
+        "PRODUCT: the text took the placeholder's row, so bob's row count must not change: {shown:?}"
+    );
+    println!("[proof] kept less: alice back, bob reads her post in its place:\n{shown}");
 }
 
 #[test]
