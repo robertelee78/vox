@@ -131,11 +131,14 @@ fn vox_node_starts_in_a_profile_with_an_identity_and_keeps_its_trust_list_sealed
         let mut all = Vec::new();
         files(&data, &mut all);
         // The proof's own staging (`support/attach.rs`) writes the identity passphrase into the
-        // profile as `proof-passphrase-<node>`; that file is the apparatus's, not the anchor's.
-        all.retain(|f| {
-            !f.file_name()
-                .is_some_and(|n| n.to_string_lossy().starts_with("proof-passphrase-"))
-        });
+        // profile as `proof-passphrase-<node>`; that one file is the apparatus's, not the anchor's.
+        let ours = data.join(format!("proof-passphrase-{}", world::DEFAULT_NODE));
+        assert!(
+            ours.is_file(),
+            "APPARATUS: the staging's passphrase file {} is not where `support/attach.rs` writes it",
+            ours.display()
+        );
+        all.retain(|f| f != &ours);
         let mut leaks = Vec::new();
         for f in &all {
             let Ok(bytes) = std::fs::read(f) else {
