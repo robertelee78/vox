@@ -477,6 +477,9 @@ impl Pending {
                 JoinPending::Adoption(pending) => {
                     retiring.spawn(pending.retire(room));
                 }
+                JoinPending::Ready(pending) => {
+                    let _ = pending.reply.send(Outcome::Failed(Fault::Locked));
+                }
             }
         }
         if let Some(prekeys) = self.prekeys {
@@ -503,7 +506,10 @@ impl Node {
                     .values()
                     .any(|pending| matches!(pending, PublicationPending::Native(_)))
                 || !pending.journals.is_empty()
-                || !pending.join_replies.is_empty()
+                || pending
+                    .join_replies
+                    .values()
+                    .any(|pending| !matches!(pending, JoinPending::Ready(_)))
         })
     }
 
@@ -3391,7 +3397,18 @@ impl Node {
                         if current {
                             self.install_metadata_journal(room, &delta);
                         }
-                        let _ = reply.send(outcome);
+                        self.pending_metadata
+                            .get_or_insert_with(Pending::default)
+                            .join_replies
+                            .insert(
+                                room,
+                                JoinPending::Ready(JoinReadyPending {
+                                    reply,
+                                    outcome,
+                                    instance: Arc::downgrade(&completed.instance),
+                                    deadline: tokio::time::Instant::now() + Self::BOARD_PATIENCE,
+                                }),
+                            );
                     }
                     Err(error) => self.begin_completed_join_abort(
                         room,
@@ -3933,6 +3950,14 @@ pub(super) fn abort_join_cleanup_native(
 enum JoinPending {
     Adoption(JoinAdoptionPending),
     Reply(JoinReplyPending),
+    Ready(JoinReadyPending),
+}
+/// Membership is already accepted: only its original answer waits, not a Store or rollback owner.
+struct JoinReadyPending {
+    reply: oneshot::Sender<Outcome>,
+    outcome: Outcome,
+    instance: std::sync::Weak<tokio::sync::Mutex<ChannelState>>,
+    deadline: tokio::time::Instant,
 }
 struct JoinAdoptionPending {
     peer: Digest32,
@@ -4157,7 +4182,7 @@ impl Node {
         }
     }
 
-    async fn advance_metadata_join_replies(&mut self) {
+    pub(super) async fn advance_metadata_join_replies(&mut self) {
         let rooms: Vec<_> = self
             .pending_metadata
             .as_ref()
@@ -4173,6 +4198,49 @@ impl Node {
             };
             let mut pending = match pending {
                 JoinPending::Reply(pending) => pending,
+                JoinPending::Ready(pending) => {
+                    if pending.reply.is_closed() {
+                        continue;
+                    }
+                    let Some(instance) = pending.instance.upgrade().filter(|instance| {
+                        self.channels
+                            .get(&room)
+                            .is_some_and(|current| Arc::ptr_eq(current, instance))
+                    }) else {
+                        let _ = pending.reply.send(Outcome::Failed(Fault::ChannelNotOpen));
+                        continue;
+                    };
+                    // The actor does not wait for a room's lock: a session holding it is asked
+                    // again on the next tick.
+                    let Ok(channel) = instance.try_lock() else {
+                        self.pending_metadata
+                            .get_or_insert_with(Pending::default)
+                            .join_replies
+                            .insert(room, JoinPending::Ready(pending));
+                        continue;
+                    };
+                    if channel.has_left(&channel.me()) {
+                        let _ = pending.reply.send(Outcome::Failed(Fault::ChannelNotOpen));
+                        continue;
+                    }
+                    #[cfg(feature = "test-knobs")]
+                    let answer_early =
+                        crate::node::computer::fx28_mutant("rejoin-answers-before-own-history");
+                    #[cfg(not(feature = "test-knobs"))]
+                    let answer_early = false;
+                    if answer_early
+                        || !channel.own_history_behind()
+                        || tokio::time::Instant::now() >= pending.deadline
+                    {
+                        let _ = pending.reply.send(pending.outcome);
+                    } else {
+                        self.pending_metadata
+                            .get_or_insert_with(Pending::default)
+                            .join_replies
+                            .insert(room, JoinPending::Ready(pending));
+                    }
+                    continue;
+                }
                 JoinPending::Adoption(pending) => {
                     if self.pending_posts.contains_key(&room) {
                         self.pending_metadata

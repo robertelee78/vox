@@ -2083,7 +2083,14 @@ fn drain_as(d: &Daemon, session: &str) -> String {
 #[ignore = "two daemons with production Argon2id; drives the real binary; CI runs it in release"]
 fn an_offer_for_the_agents_node_is_shown_in_its_turn_and_only_the_operator_accepts_it() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
+    let mut tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
+    if std::env::var_os("VOX_PROOF_KEEP_DIRS").is_some() {
+        tmp.disable_cleanup(true);
+        eprintln!(
+            "[proof] retained daemon directory: {}",
+            tmp.path().display()
+        );
+    }
     let alice = Daemon::start(&tmp.path().join("alice"));
     let mut bob = Daemon::start_bare(&tmp.path().join("bob"));
     let alice_pass = alice
@@ -2288,6 +2295,14 @@ fn an_offer_for_the_agents_node_is_shown_in_its_turn_and_only_the_operator_accep
         std::thread::sleep(Duration::from_millis(500));
     };
     println!("[proof] (5) offered bob after dave left and joined again: {again:?}");
+    if !again.contains(&dave.fingerprint) {
+        for (name, node) in [("dave", &dave), ("bob", &bob)] {
+            let (ok, status, error) = hook(&node.data, &node.cfg, &["status", "--json"], "");
+            eprintln!(
+                "[proof] {name} status after missing renewed offer: ok={ok}\n{status}{error}"
+            );
+        }
+    }
     assert!(
         again.contains(&dave.fingerprint),
         "PRODUCT: dave left and joined again, a new join, so bob must be offered him again \

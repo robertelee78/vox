@@ -1303,7 +1303,7 @@ fn status_names_a_connected_member_whose_posts_are_not_received() {
         "PRODUCT: fresh receipt clock advanced although its only provider refused all unseen heads and every earlier flow was retired: {after}");
     let text = status_text(&w.guest_dir, "withheld reader");
     assert!(
-        text.contains("live entries have not been held for over 60s")
+        text.contains("live entries behind it for over 60s")
             && !text.contains("no live-window receipt progress observed"),
         "PRODUCT: status overstates what its receipt samples prove: {text}"
     );
