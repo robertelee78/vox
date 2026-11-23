@@ -1,5 +1,40 @@
-//! V210-70 — **`vox node --serve trusted` in a profile that has an identity**, through the
-//! shipped binary. (Plain `vox node` in such a profile is the operator first-run proof's, #298.)
+//! V210-70 — **`vox node --serve trusted` starts in a profile that has an identity**, and leaves
+//! neither the identity passphrase nor the trust list readable, through the shipped binary. (Plain
+//! `vox node` in such a profile is the operator first-run proof's, #298.)
+//!
+//! `--serve trusted` keeps the anchor's trust list in its own profile, which means the profile
+//! has an identity (`vox id`). A person who did that saw `vox node` refuse to start:
+//!
+//! ```text
+//! vox node: node: another vox already has this node open
+//! ```
+//!
+//! The headless node opened the profile's vault — whose store it then held — and then opened
+//! the same store again for its anchored logs. A headless node networks as its key file and
+//! holds no room, so it never needs the vault.
+//!
+//! **Staging.** One profile, `vox id` in it, `vox trust add` of one fingerprint, then
+//! `vox node --serve trusted`.
+//!
+//! **Asserted.**
+//! 1. It prints its `--anchor` spec within 120 s (it fails the proof if it exits first), never
+//!    says the profile is already open, and says it serves only the 1 trusted identity's rooms.
+//! 2. With `--serve trusted` running, neither the identity passphrase nor the trusted
+//!    fingerprint (as text or as its 32 bytes) appears in anything the anchor printed or in any
+//!    file under the profile's data or config directory, and the passphrase is not on its
+//!    command line.
+//!
+//! Everything runs as the shipped binary: the trusted member is another profile made with
+//! `vox id`, and its 32 bytes are only the printed fingerprint decoded, to search files for.
+//!
+//! **Mutations that must turn it red.** `vox node --serve trusted` writing the fingerprints it
+//! serves into its node directory in the clear: red on (2), naming the file.
+//!
+//! The one this proof was written for — `spawn_config` opening the vault for a headless node (no
+//! `headless.is_none()` guard) — **no longer turns it red** (measured 2026-10-03): since ADR-026
+//! a headless key and a vault are two nodes, and `vox node` runs as `nodes/default-anchor/`, which
+//! holds no vault, so there is nothing for that guard to keep it from opening. Assertion (1) still
+//! holds the start to its words.
 
 #![cfg(unix)]
 
@@ -9,8 +44,142 @@ mod watchdog;
 mod world;
 
 use std::path::Path;
+use std::time::Duration;
 
-use world::IDENTITY;
+use world::{args, vox_once, VoxProc, IDENTITY};
+
+/// How long `vox node` may take to print its spec. A start takes seconds; the defect exits at
+/// once.
+const START_BOUND: Duration = Duration::from_secs(120);
+
+/// Every file under `dir`, recursively.
+fn files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            files(&p, out);
+        } else {
+            out.push(p);
+        }
+    }
+}
+
+fn contains(hay: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Start `vox node` with `extra` and wait for its spec. A node that exits first fails here,
+/// with everything it said.
+fn start(data: &Path, extra: &[&str]) -> VoxProc {
+    let mut argv = vec!["node", "--listen", "127.0.0.1:0"];
+    argv.extend_from_slice(extra);
+    let mut p = VoxProc::spawn("anchor", data, &args(&argv));
+    p.expect_within(START_BOUND, "its --anchor spec", |l| {
+        l.contains("@/ip4/127.0.0.1/udp/")
+    });
+    p
+}
+
+#[test]
+#[ignore = "real vox processes with production Argon2id; run in release"]
+fn vox_node_starts_in_a_profile_with_an_identity_and_keeps_its_trust_list_sealed() {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
+    let data = profile_dir(tmp.path(), "anchor");
+    world::fingerprint(&data, "the anchor");
+    // The trusted member: another person's `vox id`.
+    let trusted_b32 = world::fingerprint(&profile_dir(tmp.path(), "friend"), "the friend");
+    let trusted_fp = vox_core::node::link::b32_decode(&trusted_b32, "fingerprint")
+        .unwrap_or_else(|e| panic!("PRODUCT (staging): `vox id` printed {trusted_b32:?}: {e:?}"));
+    let (ok, out, err) = vox_once(
+        &data,
+        &args(&["trust", "add", &trusted_b32, "--name", "friend"]),
+    );
+    assert!(
+        ok,
+        "PRODUCT (staging): vox trust add in the anchor's profile: {out}{err}"
+    );
+
+    // ---- 1. the start --------------------------------------------------------------------------
+    {
+        let mut node = start(&data, &["--serve", "trusted"]);
+        let said = node.transcript();
+        println!("[proof] vox node --serve trusted in a profile with an identity: started");
+        assert!(
+            !said.contains("already has this node open"),
+            "PRODUCT: `vox node --serve trusted` said the profile is already open:\n{said}"
+        );
+        assert!(
+            said.contains("serving only rooms made by the 1 identity this node trusts"),
+            "PRODUCT: `vox node --serve trusted` did not say it serves only the trusted identity's rooms:\n{said}"
+        );
+
+        // ---- 2. nothing readable, while it runs ----------------------------------------------
+        let pid = node.child.id();
+        let argv = std::process::Command::new("ps")
+            .args(["-o", "command=", "-p", &pid.to_string()])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        assert!(
+            !argv.trim().is_empty(),
+            "APPARATUS, CANNOT MEASURE: `ps` could not read the anchor's command line"
+        );
+        let mut all = Vec::new();
+        files(&data, &mut all);
+        // The proof's own staging (`support/attach.rs`) writes the identity passphrase into the
+        // profile as `proof-passphrase-<node>`; that file is the apparatus's, not the anchor's.
+        all.retain(|f| {
+            !f.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("proof-passphrase-"))
+        });
+        let mut leaks = Vec::new();
+        for f in &all {
+            let Ok(bytes) = std::fs::read(f) else {
+                continue;
+            };
+            for (what, needle) in [
+                ("the identity passphrase", IDENTITY.as_bytes()),
+                ("the trusted fingerprint", trusted_b32.as_bytes()),
+                ("the trusted fingerprint's bytes", &trusted_fp[..]),
+            ] {
+                if contains(&bytes, needle) {
+                    leaks.push(format!("{what} in {}", f.display()));
+                }
+            }
+        }
+        for (what, needle) in [
+            ("the identity passphrase", IDENTITY),
+            ("the trusted fingerprint", trusted_b32.as_str()),
+        ] {
+            if said.contains(needle) {
+                leaks.push(format!("{what} in what the anchor printed"));
+            }
+            if argv.contains(needle) {
+                leaks.push(format!("{what} on the anchor's command line"));
+            }
+        }
+        println!(
+            "[proof] --serve trusted: {} file(s) under the profile checked, {} leak(s)",
+            all.len(),
+            leaks.len()
+        );
+        assert!(
+            all.len() >= 3,
+            "APPARATUS, CANNOT MEASURE (the proof's premise): only {} file(s) under the anchor's \
+             profile, so the scan for secrets covers too little",
+            all.len()
+        );
+        assert!(
+            leaks.is_empty(),
+            "PRODUCT: `vox node --serve trusted` left its secrets readable: {leaks:?}"
+        );
+        drop(node);
+    }
+}
 
 /// **`vox node --serve trusted` says what is wrong when it cannot read its trust list.** A profile
 /// with no identity has no list and needs one made; a profile whose store this user cannot read

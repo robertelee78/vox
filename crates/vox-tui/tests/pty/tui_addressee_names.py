@@ -17,7 +17,7 @@ never either bare; and "@alice …" typed in his composer must carry Alice's who
 
 Exit 0 = pass, 1 = red (the product's), 2 = apparatus (CANNOT MEASURE). A `vox` step on the way that
 fails is the product's red (`PRODUCT (staging):`). Every process is recorded and killed by PID.
-Every wait is bounded by what the product allows, as in `tui_member_names.py`.
+Every wait is bounded by what the product allows.
 """
 import json, os, re, subprocess, sys, time
 
@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from vox_pty import Hung, Tui, arm, disarm, pane, pyte, stage, is_keyring_change, typed_run  # noqa: E402
 
 VOX, TAG = sys.argv[1], sys.argv[2]
-# Sized for the debug build, as `tui_member_names.py` is: two joins at JOIN_SECS each, and the rest.
+# Sized for the debug build: two joins at JOIN_SECS each, and the rest.
 BUDGET = int(os.environ.get("VOX_PTY_BUDGET_SECS", "1260"))
 JOIN_SECS = 540
 MARK = "ADDRESSEE-MARK"
