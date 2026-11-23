@@ -17,6 +17,29 @@ They are kept "at the ready for troubleshooting". When a user reports one of the
   - A product failure fails as the product's verdict.
 - **CI compiles them on every run and never runs them.** The CI step is "Compile optional proofs (not run; troubleshooting kit)": `cargo test --release -p vox-tui --features optional-proofs --no-run`, with `-D warnings`. A change that breaks one is caught at once, not on the day it is needed.
 
+### First post after leaving and rejoining (ADR-052 RG-6)
+
+`a_room_can_be_left_and_ended_proof::a_node_that_left_rejoins_and_posts_at_once`
+leaves, rejoins once, posts immediately, and requires the other member to read that post.
+Run with `--features test-knobs,optional-proofs --test a_room_can_be_left_and_ended_proof a_node_that_left_rejoins_and_posts_at_once -- --ignored --exact --nocapture`.
+
+`an_unheard_departure_keeps_the_left_copy_until_a_member_returns` takes the only
+other member offline, checks the bounded refusal and retained-copy words, then brings
+the member back and requires a once-only rejoin and immediate post to be read.
+`a_waiting_rejoin_does_not_hold_independently_deferred_other_room_commands` holds
+only the other room's local receiver and requires its independently deferred post,
+read and trust command to answer before the waiting rejoin. Run either with the same
+command, substituting its exact name; both need `test-knobs`, and the held-receiver
+act needs an exclusive proof slot.
+`creator_end_wound_down_while_away_clears_the_verified_checkpoint` keeps the node that
+left stopped until the creator has ended the room and both members have closed it, then
+requires its rejoin to be told the room has ended and its checkpoint to be cleared.
+`a_waiting_rejoin_is_answered_when_its_left_copy_is_deleted` leaves a room while its only
+other member is offline, steps the leaver's product clock past the room's idle end, starts a
+rejoin that waits on the unheard departure, deletes the ended left copy with `vox room leave`,
+and requires the waiting join to be answered as an ordinary join, never "shutting down". It
+needs `test-knobs` and is run with the same command, substituting its exact name.
+
 ### Reading during a daemon restart (ADR-052 RG-9)
 
 The daemon journey stages a real restart with its old node's stop held by a file. A room read,

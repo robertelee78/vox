@@ -140,7 +140,8 @@ pub(crate) fn erase_continuity(
     Ok(())
 }
 
-/// Confirm an End with the creator key retained in the former member's checkpoint.
+/// Confirm an End with the creator key retained in the former member's checkpoint, and with
+/// `erase` clear that checkpoint when it is confirmed.
 pub(crate) fn confirm_creator_end(
     store: &Store,
     signer: &crate::atrest::vault::VaultRootSigner,
@@ -148,6 +149,7 @@ pub(crate) fn confirm_creator_end(
     supplied_genesis: Option<&crate::governance::genesis::Genesis>,
     withdrawals: &[crate::nat::withdraw::BoardWithdraw],
     now: u64,
+    erase: bool,
 ) -> Result<bool> {
     let me = signer.fingerprint();
     let key = continuity_key(signer)?;
@@ -219,7 +221,7 @@ pub(crate) fn confirm_creator_end(
     let erase_without_evidence = crate::node::computer::fx28_mutant("end-erases-without-evidence");
     #[cfg(not(feature = "test-knobs"))]
     let erase_without_evidence = false;
-    if marker.is_some() && ((verified && !keep_marker) || erase_without_evidence) {
+    if erase && marker.is_some() && ((verified && !keep_marker) || erase_without_evidence) {
         erase_continuity(&mut batch, room, &me)?;
         batch.commit()?;
     }
