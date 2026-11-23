@@ -83,7 +83,11 @@ def managed_guest_proof():
               f"data=config={default_root}; no VOX/XDG root overrides", flush=True)
     hold = fixture / "stop-hold"
     daemon_log = fixture / "daemon.stderr"
-    if mode == "restart" and not shipped_defaults:
+    gap = bool(os.environ.get("VOX_PROOF_GAP_TIMELINE"))
+    news = bool(os.environ.get("VOX_PROOF_LOGIN_ITEM_NEWS"))
+    if (gap or news) and (mode != "restart" or shipped_defaults):
+        raise RuntimeError("the gap timeline and the news arm need the scratch restart act")
+    if mode == "restart" and not shipped_defaults and not gap and not news:
         hold.touch()
         env["VOX_TEST_STOP_HOLD_NODE"] = "default"
         env["VOX_TEST_STOP_HOLD_FILE"] = str(hold)
@@ -103,6 +107,8 @@ def managed_guest_proof():
         job["EnvironmentVariables"] = env
     if mode == "restart" and not shipped_defaults:
         job["StandardErrorPath"] = str(daemon_log)
+    if gap:
+        job["StandardOutPath"] = str(fixture / "daemon.stdout")
     failure_listener = None
     failure_switch = fixture / "fail-replacement"
     if os.environ.get("VOX_PROOF_FAIL_REPLACEMENT"):
@@ -287,6 +293,12 @@ def managed_guest_proof():
                 raise RuntimeError(f"APPARATUS: could not stage node: {staged.stdout}{staged.stderr}")
         if not shipped_defaults and ready() != (first, first_runs):
             raise RuntimeError("APPARATUS: staging did not retain the initial managed daemon")
+        if news:
+            login_item_news(helper, env, fixture, state, greeting, until)
+            return
+        if gap:
+            gap_timeline(helper, env, fixture, control, daemon_log, state, greeting, plist)
+            return
         if mode == "restart" and not shipped_defaults:
             restart_log_start = daemon_log.stat().st_size if daemon_log.exists() else 0
             with caller_log.open("w+") as output:
@@ -597,6 +609,585 @@ def managed_guest_proof():
         marker.unlink(missing_ok=True)
 
 
+def login_item_news(helper, env, fixture, state, greeting, until):
+    """ADR-052 RG-9 on a Mac's login item: a prompt typed while launchd restarts the daemon.
+
+    A daemon that has run past launchd's minimum runtime is replaced at once, so the prompt's
+    turn carries the other member's news, with one launchd generation, after a crash, `vox
+    daemon --restart` (one `kickstart -k`) and the update's handoff (the same `kickstart -k` onto
+    a swapped helper). A replacement killed as launchd spawns it waits for launchd's throttled
+    spawn ("spawn scheduled"); a prompt answered before any replacement greets gets the truthful
+    deferral and the NEXT turn has the news.
+    """
+    news = "news across the restart"
+    deferral = "your rooms show from your next turn"
+    restarter = fixture / "vox-restarter"
+    shutil.copy2(helper, restarter)
+    passfile = fixture / "passphrase"
+    room_pass = fixture / "room-passphrase"
+    room_pass.write_text("rg9 login item room\n")
+    home = fixture / "peer"
+    peer = {"HOME": str(home), "VOX_DATA_DIR": str(home / "data"),
+            "VOX_CONFIG_DIR": str(home / "config"), "VOX_LISTEN": "127.0.0.1:0",
+            "VOX_PROXY": "127.0.0.1:0"}
+    (home / "data").mkdir(parents=True)
+    (home / "config").mkdir(parents=True)
+    hook_env = dict(env)
+    if os.environ.get("VOX_MUTANT_HOOK_RESTART_IMMEDIATE"):
+        hook_env["VOX_TEST_HOOK_RESTART_IMMEDIATE"] = "1"
+
+    def vox(args, environment=env, stdin=None):
+        done = subprocess.run([str(helper), *args], env=environment, input=stdin,
+                              stdin=None if stdin is not None else subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=120)
+        print(f"[proof] vox {' '.join(args)} exit={done.returncode}\n{done.stdout}{done.stderr}",
+              flush=True)
+        return done
+
+    def staged(args, environment=env, stdin=None):
+        done = vox(args, environment, stdin)
+        if done.returncode:
+            raise RuntimeError(f"APPARATUS: staging `vox {' '.join(args)}` failed")
+        return done.stdout + done.stderr
+
+    def fingerprint(environment):
+        found = re.findall(r"\b[a-z2-7]{52}\b", staged(["node", "list"], environment))
+        if not found:
+            raise RuntimeError("APPARATUS: no node fingerprint listed")
+        return found[0]
+
+    # The other member: its own scratch account and client-started daemon on this guest.
+    staged(["node", "create", "default", "--passphrase-file", str(passfile)], peer)
+    staged(["daemon", "--detach"], peer)
+    own, other = fingerprint(env), fingerprint(peer)
+    staged(["trust", "add", other, "--name", "peer"])
+    staged(["trust", "add", own, "--name", "peer"], peer)
+    staged(["room", "create", "--name", "rg9", "--node", "default",
+            "--passphrase-file", str(room_pass)])
+    rooms = re.findall(r"(?m)^([a-z2-7]{12})\b", staged(["room", "list", "--node", "default"]))
+    if not rooms:
+        raise RuntimeError("APPARATUS: the created room is not listed")
+    room = rooms[0]
+    link = next((line for line in staged(["room", "link", room]).splitlines()
+                 if line.startswith("vox://")), None)
+    if link is None:
+        raise RuntimeError("APPARATUS: no room link")
+    staged(["room", "join", "--passphrase-file", "-", link], peer, room_pass.read_text())
+    staged(["room", "post", room, news], peer)
+    until("the other member's news on this node",
+          lambda: news in subprocess.run([str(helper), "room", "read", room, "--node", "default"],
+                                         env=env, stdin=subprocess.DEVNULL, capture_output=True,
+                                         text=True, timeout=60).stdout)
+    minimum = int(re.search(r"(?m)^\s*minimum runtime = (\d+)\s*$", state()[2]).group(1))
+
+    def age(pid):
+        text = subprocess.run(["/bin/ps", "-o", "etime=", "-p", str(pid)],
+                              capture_output=True, text=True).stdout.strip()
+        if not text:
+            return None
+        days, _, rest = text.rpartition("-")
+        parts = [int(p) for p in rest.split(":")]
+        while len(parts) < 3:
+            parts.insert(0, 0)
+        return (int(days) if days else 0) * 86400 + parts[0] * 3600 + parts[1] * 60 + parts[2]
+
+    def alive(pid):
+        stat = subprocess.run(["/bin/ps", "-o", "stat=", "-p", str(pid)],
+                              capture_output=True, text=True).stdout.strip()
+        return bool(stat) and not stat.startswith("Z")
+
+    def hook(session):
+        child = subprocess.Popen([str(helper), "agent", "hook", "--node", "default", "--room", room],
+                                 env=hook_env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, text=True)
+        return child, json.dumps({"hook_event_name": "UserPromptSubmit", "session_id": session})
+
+    def turn(kind, session):
+        """Restart the login item's daemon as `kind` and type a prompt while it is replaced."""
+        old, runs, _ = state()
+        lived = age(old)
+        began = time.monotonic()
+        caller = None
+        if kind in ("crash", "young"):
+            os.kill(old, signal.SIGKILL)
+        if kind == "young":
+            # The replacement crashes as launchd spawns it: launchd holds the next spawn until
+            # its minimum runtime since this spawn has passed.
+            killed = old
+            spawned = until("launchd spawns the replacement",
+                            lambda: (lambda pid: pid if pid and pid != killed else None)(state()[0]))
+            lived, runs = age(spawned) or 0, state()[1]
+
+            def crashed():
+                # Until launchd's xpcproxy (root) has become the job's own process, it is not ours.
+                try:
+                    os.kill(spawned, signal.SIGKILL)
+                except PermissionError:
+                    return False
+                return True
+            until("launchd's spawn becomes the job's own process", crashed)
+            old, began = spawned, time.monotonic()
+        elif kind != "crash":
+            caller = subprocess.Popen([str(restarter), "daemon", "--restart"], env=env,
+                                      stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                      stderr=subprocess.STDOUT, text=True)
+            until("launchd stops the old daemon",
+                  lambda: "state = SIGTERMed" in state()[2] or not alive(old))
+        typed = time.monotonic()
+        child, prompt = hook(session)
+        phases = []
+        greeted = []
+        import threading
+        watching = threading.Event()
+
+        def watch():
+            last = None
+            while not watching.is_set():
+                pid, count, text = state()
+                phase = re.search(r"(?m)^\s*state = (.+)$", text).group(1).strip()
+                if (phase, pid, count) != last:
+                    phases.append((round((time.monotonic() - began) * 1000), phase, pid, count))
+                    last = (phase, pid, count)
+                if not greeted and pid and pid != old and greeting() == pid:
+                    greeted.append(time.monotonic())
+                time.sleep(.02)
+        watcher = threading.Thread(target=watch, daemon=True)
+        watcher.start()
+        out, err = child.communicate(prompt, timeout=120)
+        answered = time.monotonic()
+        said = caller.communicate(timeout=120)[0] if caller else ""
+        until("launchd's replacement greets", lambda: (lambda pid: pid and pid != old and greeting() == pid)(state()[0]))
+        until("the watcher sees the greeting", lambda: greeted)
+        watching.set()
+        watcher.join(timeout=5)
+        new, after, text = state()
+        before_greeting = answered < greeted[0]
+        print(f"[proof] {kind}: old pid {old} had run {lived}s (launchd minimum runtime {minimum}s); "
+              f"prompt typed at +{round((typed - began) * 1000)}ms, answered at "
+              f"+{round((answered - began) * 1000)}ms; replacement greeted at "
+              f"+{round((greeted[0] - began) * 1000)}ms; launchd runs {runs} -> {after}, pid {new}; "
+              f"greeting {greeting()}\n[proof] launchd phases (ms, state, pid, runs): {phases}\n"
+              f"[proof] hook exit={child.returncode} stdout:\n{out}\n[proof] hook stderr:\n{err}"
+              f"[proof] restart caller:\n{said}", flush=True)
+        if typed >= greeted[0]:
+            raise RuntimeError(f"APPARATUS: the prompt was typed after the {kind} replacement greeted")
+        if after != runs + 1 or new == old or greeting() != new:
+            raise RuntimeError(f"PRODUCT: the {kind} restart did not leave one launchd generation: {text}")
+        return lived, phases, out, child.returncode, before_greeting
+
+    def ready_next_turn(session):
+        until("the replacement's room serves", lambda: news in subprocess.run(
+            [str(helper), "room", "read", room, "--node", "default"], env=env,
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60).stdout)
+        child, prompt = hook(session)
+        out, err = child.communicate(prompt, timeout=120)
+        print(f"[proof] next turn of {session}: exit={child.returncode}\n{out}\n{err}", flush=True)
+        return out
+
+    def mature():
+        pid = state()[0]
+        until(f"the login item's daemon outlives launchd's {minimum}s minimum runtime",
+              lambda: (age(pid) or 0) > minimum)
+
+    def same_turn(kind, session):
+        mature()
+        lived, _, out, code, _ = turn(kind, session)
+        if lived <= minimum:
+            raise RuntimeError(f"APPARATUS: the {kind} daemon was not past launchd's minimum runtime")
+        if code or news not in out or deferral in out:
+            raise RuntimeError(f"PRODUCT: a prompt during a {kind} restart of a login-item daemon "
+                               f"that had run {lived}s did not get the other member's news in "
+                               f"that turn: {out}")
+        print(f"[proof] {kind}: the prompt's own turn carried the other member's news", flush=True)
+
+    # A crash first: its prompt finds no socket, so the hook's admission sees launchd's pending
+    # job. `vox daemon --restart` next: its prompt meets the old daemon still stopping.
+    same_turn("crash", "rg9-login-item-crash")
+    same_turn("restart", "rg9-login-item-restart")
+    lived, phases, out, code, before_greeting = turn("young", "rg9-login-item-young")
+    if lived >= minimum or not any(phase == "spawn scheduled" for _, phase, _, _ in phases):
+        raise RuntimeError(f"APPARATUS: the young replacement was not throttled by launchd: {phases}")
+    if not before_greeting:
+        raise RuntimeError("APPARATUS: launchd's throttled spawn greeted before the prompt's bound; "
+                           "the deferral case was not staged")
+    # Answered before any replacement greeted, the turn cannot carry news: it must say so.
+    if code or deferral not in out or news in out:
+        raise RuntimeError(f"PRODUCT: a prompt during launchd's throttled respawn did not get "
+                           f"the truthful deferral: {out}")
+    if news not in ready_next_turn("rg9-login-item-young"):
+        raise RuntimeError("PRODUCT: the deferred turn's news did not reach the next turn")
+    print("[proof] young: launchd held the spawn ('spawn scheduled'); the prompt was answered "
+          "before any replacement greeted, deferred truthfully, and its next turn carried the news",
+          flush=True)
+    # The update's handoff: the same kickstart -k onto a helper swapped under the running daemon.
+    swapped = fixture / "vox-next"
+    shutil.copy2(restarter, swapped)
+    signed = subprocess.run(["/usr/bin/codesign", "--force", "--sign", "-", "--identifier",
+                             "us.vox.rg9.next", str(swapped)], capture_output=True, text=True)
+    if signed.returncode:
+        raise RuntimeError(f"APPARATUS: could not make the swapped helper: {signed.stderr}")
+    os.replace(swapped, helper)
+    same_turn("update", "rg9-login-item-update")
+
+
+def gap_timeline(helper, env, fixture, control, daemon_log, state, greeting, plist):
+    """Time each segment of a login item's daemon restart; staging and observation only."""
+    import threading
+    started_wall = datetime.datetime.now()
+    daemon_out = fixture / "daemon.stdout"
+    restarter_copy = fixture / "vox-restarter"
+    shutil.copy2(helper, restarter_copy)
+
+    def say(text):
+        print(text, flush=True)
+
+    def vox(*args, binary=helper, timeout=120):
+        done = subprocess.run([str(binary), *args], env=env, stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=timeout)
+        say(f"[gap] vox {' '.join(args)} exit={done.returncode}\n{done.stdout}{done.stderr}")
+        return done
+
+    def age(pid):
+        text = subprocess.run(["/bin/ps", "-o", "etime=", "-p", str(pid)],
+                              capture_output=True, text=True).stdout.strip()
+        if not text:
+            return None
+        days, _, rest = text.rpartition("-")
+        parts = [int(p) for p in rest.split(":")]
+        while len(parts) < 3:
+            parts.insert(0, 0)
+        return (int(days) if days else 0) * 86400 + parts[0] * 3600 + parts[1] * 60 + parts[2]
+
+    def alive(pid):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        stat = subprocess.run(["/bin/ps", "-o", "stat=", "-p", str(pid)],
+                              capture_output=True, text=True).stdout.strip()
+        return bool(stat) and not stat.startswith("Z")
+
+    # Staging: one room on the passphrase-free node, and a protected node whose passphrase
+    # `vox node unlock` keeps in the guest's Keychain, as a person's Mac does.
+    room_pass = fixture / "room-passphrase"
+    room_pass.write_text("gap room passphrase\n")
+    made = vox("room", "create", "--name", "gap", "--node", "default",
+               "--passphrase-file", str(room_pass))
+    listed = vox("room", "list", "--node", "default")
+    found = re.findall(r"\b[a-z2-7]{12,}\b", made.stdout + made.stderr + listed.stdout)
+    room = next((candidate for candidate in dict.fromkeys(found)
+                 if vox("room", "post", candidate, "before the restarts",
+                        "--node", "default").returncode == 0), None)
+    if made.returncode or room is None:
+        raise RuntimeError("APPARATUS: the gap room could not be staged")
+    kept_pass = fixture / "kept-passphrase"
+    kept_pass.write_text("gap kept passphrase\n")
+    kept = False
+    if vox("node", "create", "kept", "--passphrase-file", str(kept_pass)).returncode == 0:
+        # A protected node's attach cost (identity unlock) without the Keychain read: the
+        # fixture HOME has no keychain, so the daemon cannot remember it across a restart.
+        for n in (1, 2, 3):
+            began = time.monotonic()
+            unlocked = vox("node", "unlock", "kept", "--passphrase-file", str(kept_pass))
+            say(f"[gap] protected unlock #{n}: exit={unlocked.returncode} "
+                f"elapsed_ms={round((time.monotonic() - began) * 1000)}")
+            words = unlocked.stdout + unlocked.stderr
+            kept = (unlocked.returncode == 0 and "not remembered" not in words
+                    and "no keychain" not in words)
+            if n < 3:
+                vox("node", "lock", "kept")
+    say(f"[gap] protected node remembered across restarts: {kept}")
+
+    def hook(session, log):
+        out = log.open("w")
+        child = subprocess.Popen([str(helper), "agent", "hook", "--node", "default"], env=env,
+                                 stdin=subprocess.PIPE, stdout=out, stderr=subprocess.STDOUT,
+                                 text=True)
+        child.stdin.write(json.dumps({"hook_event_name": "UserPromptSubmit",
+                                      "session_id": session}))
+        child.stdin.close()
+        out.close()
+        return child
+
+    warm = hook("gap-session", fixture / "hook-warm.log")
+    warm.wait(timeout=60)
+    say(f"[gap] warm-up hook exit={warm.returncode}:\n{(fixture / 'hook-warm.log').read_text()}")
+
+    samples = []
+
+    def sample(kind, n, binary=None, nudge=False):
+        old, runs0, before_text = state()
+        before_age = age(old)
+        events = []
+        lock = threading.Lock()
+        t0 = time.monotonic()
+        t0_wall = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds")
+        stop = threading.Event()
+
+        def record(source, detail, at=None):
+            with lock:
+                events.append((round(((at or time.monotonic()) - t0) * 1000), source, detail))
+
+        def launchd_poll():
+            last = None
+            while not stop.is_set():
+                at = time.monotonic()
+                try:
+                    text = state()[2]
+                except RuntimeError as error:
+                    record("launchd", f"print failed: {error}", at)
+                    continue
+                fields = "; ".join(line.strip() for line in text.splitlines() if re.match(
+                    r"\s*(state|pid|runs|last exit code|immediate reason|last terminating signal)\s*=", line))
+                if fields != last:
+                    record("launchd", fields, at)
+                    last = fields
+
+        def greeting_poll():
+            last = "unset"
+            while not stop.is_set():
+                at = time.monotonic()
+                hello = greeting()
+                if hello != last:
+                    record("greeting", hello, at)
+                    last = hello
+                time.sleep(.01)
+
+        offsets = {path: (path.stat().st_size if path.exists() else 0)
+                   for path in (daemon_log, daemon_out)}
+
+        def log_poll():
+            gone = False
+            while not stop.is_set():
+                at = time.monotonic()
+                for path in offsets:
+                    if path.exists() and path.stat().st_size > offsets[path]:
+                        with path.open("rb") as f:
+                            f.seek(offsets[path])
+                            data = f.read()
+                        end = data.rfind(b"\n") + 1
+                        offsets[path] += end
+                        for line in data[:end].decode(errors="replace").splitlines():
+                            record(path.name, line, at)
+                if not gone and not alive(old):
+                    record("old", f"pid {old} exited", at)
+                    gone = True
+                time.sleep(.01)
+
+        threads = [threading.Thread(target=f, daemon=True)
+                   for f in (launchd_poll, greeting_poll, log_poll)]
+        for thread in threads:
+            thread.start()
+        restarter = None
+        restart_log = fixture / f"restart-{kind}-{n}.log"
+        if kind == "crash":
+            os.kill(old, signal.SIGKILL)
+            record("action", f"SIGKILL to pid {old}")
+        elif kind == "signal":
+            os.kill(old, signal.SIGTERM)
+            record("action", f"foreign SIGTERM to pid {old}")
+        else:
+            with restart_log.open("w") as out:
+                restarter = subprocess.Popen([str(binary or restarter_copy), "daemon", "--restart"],
+                                             env=env, stdin=subprocess.DEVNULL, stdout=out,
+                                             stderr=subprocess.STDOUT)
+            record("action", "vox daemon --restart spawned")
+
+            # The prompt and the command arrive once the old daemon has been told to stop.
+            def told():
+                with lock:
+                    return any(source == "launchd" and "SIGTERMed" in detail
+                               for _, source, detail in events) or not alive(old)
+            deadline = time.monotonic() + 60
+            while not told() and time.monotonic() < deadline:
+                time.sleep(.005)
+            if nudge:
+                # Spike: ask launchd to start the job now while it holds the throttled spawn.
+                while time.monotonic() < deadline and not any(
+                        source == "launchd" and "spawn scheduled" in (detail or "")
+                        for _, source, detail in list(events)):
+                    time.sleep(.005)
+                full = subprocess.run(["/bin/launchctl", "print", target],
+                                      capture_output=True, text=True).stdout
+                say(f"[gap] launchctl print while scheduled ({kind} #{n}):\n{full}")
+                kicked = subprocess.run(["/bin/launchctl", "kickstart", target],
+                                        capture_output=True, text=True)
+                record("action", f"launchctl kickstart (no -k) exit={kicked.returncode} "
+                       f"{kicked.stdout.strip()} {kicked.stderr.strip()}")
+        hook_log = fixture / f"hook-{kind}-{n}.log"
+        read_log = fixture / f"read-{kind}-{n}.log"
+        hook_child = hook("gap-session", hook_log)
+        record("action", "hook spawned")
+        with read_log.open("w") as out:
+            reader = subprocess.Popen([str(helper), "room", "read", room, "--node", "default"],
+                                      env=env, stdin=subprocess.DEVNULL, stdout=out,
+                                      stderr=subprocess.STDOUT)
+        record("action", "room read spawned")
+        ends = {}
+
+        def finished():
+            for name, child in (("hook", hook_child), ("read", reader), ("restarter", restarter)):
+                if child is not None and name not in ends and child.poll() is not None:
+                    record(name, f"exited {child.returncode}")
+                    ends[name] = child.returncode
+            with lock:
+                lines = [d for _, s, d in events if s == daemon_log.name]
+                pids = [d for _, s, d in events if s == "greeting" and d not in (None, old)]
+            ready = any("node default is Ready" in line for line in lines)
+            kept_done = not kept or any(("node kept" in line and ("Ready" in line or "could not" in line))
+                                        or "remembered node kept" in line for line in lines)
+            return (ready and kept_done and pids and "hook" in ends and "read" in ends
+                    and (restarter is None or "restarter" in ends))
+        deadline = time.monotonic() + 90
+        while not finished() and time.monotonic() < deadline:
+            time.sleep(.01)
+        complete = finished()
+        time.sleep(.3)
+        stop.set()
+        for thread in threads:
+            thread.join(timeout=5)
+        for child in (hook_child, reader, restarter):
+            if child is not None and child.poll() is None:
+                child.kill()
+                child.wait()
+        new, runs1, after_text = state()
+        events.sort(key=lambda event: event[0])
+
+        def first(source, needle=None, after=None):
+            for at, s, d in events:
+                if s == source and (needle is None or (d is not None and needle(d))) and (after is None or at >= after):
+                    return at
+            return None
+        told_at = 0 if kind in ("crash", "signal") else first("launchd", lambda d: "SIGTERMed" in d)
+        exited_at = first("old")
+        spawned_at = first("launchd", lambda d: re.search(r"pid = (\d+)", d) is not None
+                           and int(re.search(r"pid = (\d+)", d).group(1)) != old)
+        serving_at = first("daemon.stdout", lambda d: "serving" in d)
+        listening_at = first("greeting", lambda d: d == new)
+        ready_at = first(daemon_log.name, lambda d: "node default is Ready" in d, spawned_at)
+        kept_at = first(daemon_log.name, lambda d: "node kept" in d and ("Ready" in d or "could not" in d), spawned_at)
+        scheduled_at = first("launchd", lambda d: "spawn scheduled" in d)
+        hook_words = hook_log.read_text()
+        result = {
+            "kind": kind, "n": n, "t0_wall": t0_wall, "complete": complete, "old_pid": old, "new_pid": new,
+            "runs": [runs0, runs1], "old_age_s": before_age,
+            "ms": {"ask": 0 if restarter else None, "told_to_stop": told_at,
+                   "old_exited": exited_at, "spawn_scheduled_seen": scheduled_at,
+                   "launchd_spawned": spawned_at, "new_serving_line": serving_at,
+                   "new_listening": listening_at, "default_ready": ready_at, "kept_ready": kept_at,
+                   "hook_spawned": first("action", lambda d: d == "hook spawned"),
+                   "hook_exited": first("hook"), "read_exited": first("read"),
+                   "restarter_exited": first("restarter")},
+            "hook_deferred": "your rooms show from your next turn" in hook_words,
+            "hook_exit": ends.get("hook"), "read_exit": ends.get("read"),
+            "restarter_exit": ends.get("restarter"),
+        }
+        samples.append(result)
+        say(f"[gap] events {kind} #{n} (ms since ask/kill):")
+        for at, source, detail in events:
+            say(f"[gap]   {at:>7} {source:<14} {detail}")
+        say(f"[gap] hook {kind} #{n}:\n{hook_words}")
+        say(f"[gap] read {kind} #{n}:\n{read_log.read_text()}")
+        if restarter is not None:
+            say(f"[gap] restarter {kind} #{n}:\n{restart_log.read_text()}")
+        say("[gap] sample " + json.dumps(result))
+        if not complete:
+            raise RuntimeError(f"APPARATUS: gap sample {kind} #{n} did not complete within 90 s")
+
+    def mature():
+        pid = state()[0]
+        until_at = time.monotonic() + 60
+        while (age(pid) or 0) < 12 and time.monotonic() < until_at:
+            time.sleep(.2)
+
+    target = f"gui/{os.getuid()}/us.vox.daemon"
+    domain = f"gui/{os.getuid()}"
+    if os.environ.get("VOX_PROOF_GAP_SPIKE"):
+        stream_log = fixture / "launchd-stream.log"
+        with stream_log.open("w") as out:
+            stream = subprocess.Popen(["/usr/bin/log", "stream", "--level", "debug", "--style",
+                                       "compact", "--predicate", 'process == "launchd"'],
+                                      stdout=out, stderr=subprocess.STDOUT)
+        try:
+            time.sleep(2)
+            for n in (1, 2, 3):
+                mature()
+                sample("restart", n)
+                sample("young", n)
+            for n in (1, 2, 3):
+                mature()
+                sample("restart", n)
+                sample("nudge", n, nudge=True)
+            # ThrottleInterval 1 in the job, as a changed shipped plist would carry it.
+            job = plistlib.loads(plist.read_bytes())
+            job["ThrottleInterval"] = 1
+            out = subprocess.run(["/bin/launchctl", "bootout", domain, str(plist)],
+                                 capture_output=True, text=True)
+            say(f"[gap] bootout for ThrottleInterval 1: exit={out.returncode} {out.stderr.strip()}")
+            gone_until = time.monotonic() + 60
+            while (subprocess.run(["/bin/launchctl", "print", target], capture_output=True).returncode == 0
+                   and time.monotonic() < gone_until):
+                time.sleep(.1)
+            plist.write_bytes(plistlib.dumps(job))
+            out = subprocess.run(["/bin/launchctl", "bootstrap", domain, str(plist)],
+                                 capture_output=True, text=True)
+            say(f"[gap] bootstrap with ThrottleInterval 1: exit={out.returncode} {out.stderr.strip()}")
+            if out.returncode:
+                raise RuntimeError("APPARATUS: could not bootstrap the ThrottleInterval 1 job")
+            ready_until = time.monotonic() + 60
+            while time.monotonic() < ready_until:
+                pid = state()[0]
+                if pid and greeting() == pid:
+                    break
+                time.sleep(.1)
+            minimum = [line.strip() for line in state()[2].splitlines() if "minimum runtime" in line]
+            say(f"[gap] job with ThrottleInterval 1: {minimum}")
+            for n in (1, 2, 3):
+                mature()
+                sample("restart", n)
+                sample("throttle1", n)
+        finally:
+            stream.terminate()
+            stream.wait(timeout=30)
+        lines = stream_log.read_text(errors="replace").splitlines()
+        said = [line for line in lines if "us.vox.daemon" in line]
+        say(f"[gap] launchd stream: {len(lines)} lines, {len(said)} name us.vox.daemon:\n"
+            + "\n".join(said))
+        say("[gap] summary " + json.dumps(samples))
+        return
+    for n in (1, 2, 3):
+        mature()
+        sample("restart", n)
+        sample("young", n)
+    for n in (1, 2, 3):
+        mature()
+        swapped = fixture / f"vox-next-{n}"
+        shutil.copy2(restarter_copy, swapped)
+        signed = subprocess.run(["/usr/bin/codesign", "--force", "--sign", "-", "--identifier",
+                                 f"us.vox.gap.{n}", str(swapped)], capture_output=True, text=True)
+        digest = subprocess.run(["/usr/bin/codesign", "-dvvv", str(swapped)],
+                                capture_output=True, text=True)
+        say(f"[gap] update #{n}: re-signed copy exit={signed.returncode} {signed.stderr.strip()}; "
+            + " ".join(line for line in digest.stderr.splitlines() if line.startswith(("CDHash=", "Identifier="))))
+        os.replace(swapped, helper)
+        sample("update", n)
+    for kind in ("crash", "signal"):
+        for n in (1, 2, 3):
+            mature()
+            sample(kind, n)
+    say("[gap] summary " + json.dumps(samples))
+    own_log = fixture / "data/.daemon/log"
+    say(f"[gap] daemon's own log:\n{own_log.read_text(errors='replace') if own_log.exists() else 'absent'}")
+    shown = subprocess.run(["/usr/bin/log", "show", "--style", "compact", "--info", "--debug",
+                            "--start", started_wall.strftime("%Y-%m-%d %H:%M:%S"),
+                            "--predicate", 'eventMessage CONTAINS "us.vox.daemon"'],
+                           capture_output=True, text=True, timeout=300)
+    say(f"[gap] log show exit={shown.returncode} lines={len(shown.stdout.splitlines())}\n"
+        f"{shown.stdout}{shown.stderr}")
+    if kept:
+        vox("node", "lock", "kept")
+
+
 def run(argv, **kwargs):
     return subprocess.run(argv, check=True, **kwargs)
 
@@ -709,6 +1300,10 @@ def recovery_guest(ssh, options, destination, out):
             "exec env VOX_PROOF_VM_GUEST=1 "
             + ("VOX_PROOF_FAIL_REPLACEMENT=1 " if os.environ.get("VOX_PROOF_FAIL_REPLACEMENT") else "")
             + ("VOX_PROOF_PENDING_START=1 " if os.environ.get("VOX_PROOF_PENDING_START") else "")
+            + ("VOX_PROOF_GAP_TIMELINE=1 " if os.environ.get("VOX_PROOF_GAP_TIMELINE") else "")
+            + ("VOX_PROOF_GAP_SPIKE=1 " if os.environ.get("VOX_PROOF_GAP_SPIKE") else "")
+            + ("VOX_PROOF_LOGIN_ITEM_NEWS=1 " if os.environ.get("VOX_PROOF_LOGIN_ITEM_NEWS") else "")
+            + ("VOX_MUTANT_HOOK_RESTART_IMMEDIATE=1 " if os.environ.get("VOX_MUTANT_HOOK_RESTART_IMMEDIATE") else "")
             + ("VOX_PROOF_HOOK_STOP_DETECTION=1 " if os.environ.get("VOX_PROOF_HOOK_STOP_DETECTION") else "")
             + ("VOX_MUTANT_ONESHOT_PENDING_IMMEDIATE=1 " if os.environ.get("VOX_MUTANT_ONESHOT_PENDING_IMMEDIATE") else "")
             + ("VOX_PROOF_SHIPPED_DEFAULTS=1 " if os.environ.get("VOX_PROOF_SHIPPED_DEFAULTS") else "")
