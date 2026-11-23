@@ -10,7 +10,7 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
   measurement (ruling 9). This record writes down that acceptance; its text was not itself put to
   him. Nothing in it is built except what is named below as landed, accepted or built:
   implementation, acceptance and delivery are recorded on the source-bound issues, separately
-  from decision status. *(Amended 2026-11-23, amendment 1: the head-mismatch ruling of gpt-6.1-sol (MP-7, MP-8a, MP-9; B-10 resolved), and the coordinating session's engineering decisions on the Order and on MP-9's transport, each marked where it applies.)*
+  from decision status. *(Amended 2026-11-23, amendment 1: the head-mismatch ruling of gpt-6.1-sol (MP-7, MP-8a, MP-9; B-10 resolved), and the coordinating session's engineering decisions on the Order and on MP-9's transport, each marked where it applies. Amendment 2: the M0 ruling of gpt-6.1-sol, `design/step3-m0-ruling.md`, given after its review of the step-3 plan answered DO NOT BUILD (`design/step3-plan-review.md`): MP-1 to MP-5, the Terms, MP-13, MP-17, the Order and B-1/B-2, each marked where it applies.)*
 - **Date**: 2026-11-23
 - **Deciders**: Robert E. Lee
 - **Tags**: sync, admission, governance, removal, fork detection, store, retention, compaction,
@@ -154,10 +154,10 @@ per expired post (`rg-13/follows/report.md:48`).
 
 ## Terms
 
-- **Display receipt**: what a node records when a message passes MP-1 and MP-2. It lets the
-  message be shown, and nothing else (MP-3).
-- **Cut receipt**: the record of the exact eligibility facts a removal or readmission cut needs
-  about one message (MP-3, MP-6).
+- **Display receipt**, **cut receipt**: withdrawn by amendment 2 (the M0 ruling): no such types
+  are built. A message passing MP-1 and MP-2 is a causal source (MP-3); a removal or readmission
+  cut reads the message's checked context and own chain, never its `seen` (MP-3, MP-6). The
+  accepted definitions stay in the git history. *(Amended 2026-11-23.)*
 - **Causal source**: an entry fully validated by today's full validator
   (`ValidatedSparseEntry`, `node/channel/governance/sparse.rs:578-583`), which may be cited by a
   control entry and may carry authority. "Citable" means a causal source.
@@ -176,7 +176,7 @@ per expired post (`rg-13/follows/report.md:48`).
 its author's own signed history, the governing changes its author had acknowledged, and the
 reader's key; nothing about other members' chat history. A trust or membership change is applied
 only on full proof of what it depends on, kept and served by those who verified it. A message
-shown this way is never, by being shown, evidence for a trust or membership change.
+shown this way is never, by being shown, evidence for a trust or membership change. *(Amended 2026-11-23 by the M0 ruling: a message is a full causal source; a control may cite it only through its exact own-chain parent receipt, and its `seen` hints are never such evidence, MP-3.)*
 
 Each requirement gives the rule, *Why*, and its *Proof*. **Proof form** (ADR-018 and the ruling of
 2026-11-22 on tests): each proof is an act or journey on the real `vox` binary, or a real wire peer
@@ -199,7 +199,7 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
   its sender MUST be named as waiting on membership evidence, and every other already-safe message
   stays usable (review §6: "Safety dictates that boundary"). Author eligibility is a membership
   decision, not "the author is currently present" (`node/channel/governance/view.rs:829-872`;
-  `node/channel/governance/member_fold.rs:282-343`).
+  `node/channel/governance/member_fold.rs:282-343`). Binding form (M0 ruling §7, rule 1): "**The reader MUST** retain current exact committed-head/inclusion/body/context bindings, own predecessor and exact preceding aggregate check, own-control full-source/effect readiness, every context coordinate's full validation and required effects, author/recipient cuts, consent/reset, termination, private classification and all generation/physical-egress fences. Only ordinary v2 Content's `seen` parent receipts, parent closure and domination requirements are removed; controls and legacy admission remain unchanged." What changes against the record as accepted: the message check keeps today's FULL validation of the author's own prefix and of every context coordinate, and effect readiness, not a governing projection; it drops only the proof about the members named in its `seen`. *(Amended 2026-11-23 by the M0 ruling of gpt-6.1-sol, `design/step3-m0-ruling.md`.)*
   - *Why*: today these bindings and own-prefix inheritance are checked
     (`node/channel/governance/sparse.rs:456-468,512-550`), and author eligibility and the
     recipient-body cut consume them (`node/channel/governance/view.rs:829-872,991-1046`). Without
@@ -222,7 +222,7 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
   coordinates, including transitive relevant controls. Preserve the current local
   withdrawal/removal-generation and physical key-send fences. Never read post-removal room content
   while continuing to release replies/keys under the exposed pre-removal state." This MUST NOT be
-  weakened to consulting a last-good display view.
+  weakened to consulting a last-good display view. As amended (M0 ruling §7, "Amendment to MP-1 and MP-2"): "For ordinary v2 Content, retain today's full author-own-prefix and exact context-coordinate source checks and required effect readiness, omitting only receipts/closure/domination for its non-authority `seen` hints; missing required facts remain pending for the affected sender. Before newly displaying text or using a package, apply all required controls exposed by that authenticated own-prefix/context, not merely a governing projection, preserving current author/recipient cuts, withdrawal/removal-generation and physical key-send fences. An unverified Content hint is not an acknowledgement of its referent's governing state." *(Amended 2026-11-23 by the M0 ruling.)*
   - *Why*: a reader behind on governance (ordinary lag, a returning member, a relay that withholds
     the creator's newest) would otherwise read the room after a removal while still sealing its
     replies to the removed member (`m1-security.md` P1-B; `sync-sol-on-m1.md` §1, "a direct
@@ -237,30 +237,30 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
     applied R; after N applies R, M stays unshown (it lies outside R's cut) and N's key has
     rotated. Mutant: show M against N's last-good view.
 
-- **MP-3. Shown is not citable (C3).** "A display receipt cannot construct `ValidatedSparseEntry`,
-  set causal/control Complete, raise an authority frontier, advance a control-ready prefix, become
-  an authoring settled tip, or install key/Session effects. A separate cut receipt supplies only
-  the exact eligibility facts it proves. Full validation is required before promotion to a causal
-  source; already-valid old sources retain their stronger status." The three meanings MUST be
-  distinct tokens and distinct stored meanings, not one "validated" boolean with a branch around
-  its verifier. Old or malformed entries MUST NOT gain authority through the display path; derived
-  cuts and eligibility rows written under the old meaning MUST be rebuilt or versioned before the
-  new policy uses them. *(Amended 2026-11-23, the coordinating session's engineering decision: the separate display and cut receipt types are built as the first change of Order step 3.)*
-  - *Why*: publication today requires the stronger token and installs its context and authority
-    obligation (`node/channel/entry_store/sparse.rs:2107-2129,2200-2209`); authoring consumes
-    settled tips and their prefix frontiers (`node/channel/local_history.rs:493-542`). A message
-    shown on lighter checks and then cited by the next honest control writer would launder a
-    made-up coordinate into that control: the *poisoned tip* (`m1-security.md` P1-A), after which
-    the room can remove nobody.
-  - *Proof*: *the poisoned tip*. A real wire peer member signs one message whose context holds a
-    made-up coordinate; the creator then removes another member. Every reader applies that removal,
-    and the creator's later controls validate. Mutant: let a display receipt become a settled tip.
+- **MP-3. A message is a full causal source; its `seen` references are ordering hints only (C3).**
+  "Ordinary v2 Content remains a causal source under the existing source publication and stored
+  meanings after full exact context/own-prefix/control-source validation and required effects; its
+  signed `seen` references are nonblocking ordering hints only, never control ancestry, cut, key,
+  Session or required-ancestor evidence. A later control may cite that Content only through its
+  exact committed-branch parent receipt and independently authenticated prefix frontier, with
+  today's full control closure and domination. No distinct display/cut admission type or display-only stored meaning is introduced by this step; already-valid sources retain their meaning."
+  Binding form (M0 ruling §7, rules 2 and 3): "**Every authority, membership, cut, key, private-access and required-ancestor consumer MUST** ignore Content `seen` as proof or independently verify its exact needed fact. In particular `contains_cut` MUST bypass its entire Content `seen` loop, and raw hint-graph ancestry/referenced/display-order state MUST NOT become an authority predicate. Ordering MAY use held hints without fetching or gating on them." "**A Content source MUST** publish and settle through the existing single strong token/source/effect paths only after rule 1; authoring MUST join settled tips' authenticated own-chain prefix frontiers, never their Content hint closures. Controls' direct parent receipts/domination and MP-6's exact target observation MUST remain enforced."
+  *(Amended 2026-11-23 by the M0 ruling of gpt-6.1-sol, `design/step3-m0-ruling.md` §7, "Amendment replacing MP-3". It withdraws the accepted text, which made a shown message a separate kind of entry ("A display receipt cannot construct `ValidatedSparseEntry` … A separate cut receipt supplies only the exact eligibility facts it proves"; "The three meanings MUST be distinct tokens and distinct stored meanings"), and amendment 1's note that those types are the first change of Order step 3: no such types are built. The earlier text stays in the git history.)*
+  - *Why*: the accepted text's plan for separate display and cut receipts was reviewed DO NOT
+    BUILD: a display-only stored state needs a cut-only reader, source-versus-display dispatch in
+    observe, replay, refill and live progress, and a migration (`design/step3-plan-review.md`).
+    Keeping Content a full source keeps every existing stored meaning. A signed-format leaf's
+    frontier is its pre-context, never its `seen`, so an unverified hint cannot reach a later
+    control through it (M0 ruling §1, §2, §4); the recipient cut was the one surviving shortcut.
+  - *Proof* (M0 ruling §5): (a) *the poisoned hint*: a hostile member signs an otherwise fully valid M with a made-up or wrong-branch `seen`; M is shown; an honest creator then removes another member and the creator's later controls validate, and the creator's context contains no invented hint coordinate. Mutant: join Content hints into source/authoring Frontiers.
+    (b) A control citing M validates M's exact own-chain prefix and cannot gain M's hinted other branch.
+    (c) *The recipient-cut forgery*, separately at provider send and at recipient render, covering all three old positive alternatives of `contains_cut` (a raw parent hash equal to the cut, a later unforked parent position of its author, a parent's causal containment): a body signed on a valid pre-readmission context, with the readmitted recipient's covering readmission named only in `seen`, is neither served to nor rendered by that recipient. Mutant: restore Content's `seen` cut shortcut; the real binary then discloses a body it withholds. If `Dag::happened_before` is kept as a hint-ancestry API, its boundary guard is added too.
 
 - **MP-4. A writer advances its signed context only for real control and cut changes.** A message
   MUST carry its author's preceding context plus the required governance ancestors (the room cut,
   ADR-007:300); a writer MUST NOT write an artificial control entry before each post merely to
   absorb other authors' tips. A writer MUST still advance its context, by a control entry before
-  the message, whenever a genuine control or cut it has applied changes (ADR-036:90-93).
+  the message, whenever a genuine control or cut it has applied changes (ADR-036:90-93). Binding form (M0 ruling §7, rule 4): "**Both writer paths MUST** advance before Content for every applied Governance/StepPolicy coordinate and required ancestor absent from the own committed frontier, independently of the sixteen hint slots; own real controls already advance it. They MUST NOT insert a carrier solely to absorb other authors' Content or empty ContextUpdates. Content MUST then sign the exact own aggregate and keep bounded ordering hints." *(Amended 2026-11-23 by the M0 ruling.)*
   - *Why*: today `authored_context` joins every other author's settled tip
     (`node/channel/local_history.rs:493-542`), so in a busy room `append_text` writes a
     `ContextUpdate` before nearly every post (`node/channel/pending_text.rs:939-957`): two signed
@@ -269,21 +269,21 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
     (review §3).
   - *Proof*: in the busy-room journey each author's feed grows about one entry per post, read from
     the stores. ADR-007's removed-member act (ADR-007:410) stays green. Mutant: write the
-    per-post carrier again (feed grows two per post).
+    per-post carrier again (feed grows two per post). Both writer routes (`PendingText::append_text` and `local_history::authored_kind`'s own ContextUpdate branch) and an upgrade's first post: Content signs its unchanged own aggregate after any required real advance and absorbs no other author's empty ContextUpdate (M0 ruling §4, §5). *(Amended 2026-11-23.)*
 
 - **MP-5. `seen` stays, as nonblocking display hints outside authority.** A message SHOULD name
   recent tips in its signed `seen` field (at most sixteen, `log/entry.rs:65-67`). A reader MUST use
   them only for display order: a hint MUST NOT need a receipt, MUST NOT gate text, MUST NOT be
   fetched for admission, and MUST NOT raise or poison a control frontier. The display clock's
   current behaviour (parents from `seen`, context and own predecessor; claimed time clamped to a
-  parent-derived bound) MUST be preserved (`node/channel/entry_store/dag_facts.rs:524-557,603-678`).
+  parent-derived bound) MUST be preserved (`node/channel/entry_store/dag_facts.rs:524-557,603-678`). The field keeps its sixteen-slot bound and canonical projection and order checks; a required governing or cut advance never depends on one of those slots (MP-4), and a seventeenth unknown author is not a gate (M0 ruling §4, rule 4: "keep bounded ordering hints"). *(Amended 2026-11-23 by the M0 ruling.)*
   - *Why*: without fresh parents a message's clock is capped at its own previous entry plus ten
     minutes, so a member who posts after a pause is shown in the past and a reply can sort before
     its question (`m1-security.md` P1-C). "No reordering … unchanged" is true only if this is kept
     (review §1).
   - *Proof*: two members on skewed clocks; one posts after a pause of more than ten minutes and the
     other replies at once; every member shows the question before the reply. A message whose hints
-    name an unknown tip is shown at once. Mutant: drop `seen` from messages.
+    name an unknown tip is shown at once. Mutant: drop `seen` from messages. A room with more than sixteen authors, unknown hints nonblocking (M0 ruling §5). *(Amended 2026-11-23.)*
 
 - **MP-6. A removal cuts its target at the target's latest tip the remover holds, by a narrow
   branch-aware cut (C4).** "The removal explicitly reserves one of the sixteen signed `seen` slots
@@ -536,24 +536,24 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
 
 - **MP-13. The machinery this decision makes dead is deleted, not kept beside it.** After step 3
   of the Order is active and its acts are green, each of the following MUST be deleted with its
-  acts kept green (line numbers in `sync-land`; `sync-opus.md` §2; `sync-glm.md` §2):
+  acts kept green (line numbers in `sync-land`; `sync-opus.md` §2; `sync-glm.md` §2). *(Amended 2026-11-23 by the M0 ruling: the list is what M0 makes dead: only the cross-author parent-receipt, closure and domination machinery for ordinary v2 Content's `seen`, the artificial per-post carrier, and scheduling machinery independently shown obsolete; the author's own predecessor/prefix receipts and full own-control source/effect readiness are retained; items that only the withdrawn display/source split would have made dead are withdrawn or made optional below.)*
   1. *The per-post tip join for Content*: the join of every other author's settled tip into a
      message's context (`node/channel/local_history.rs:493-542`, for Content only; controls keep
      it). `append_text`'s context-advance path (`node/channel/pending_text.rs:939-957`) stays and
      fires only on real changes (MP-4).
-  2. *Parent receipts for Content*: the Content branch of the parent-reference loop of
-     `node/history_stream/admission.rs:875-944`, its preflight and the target helpers that only it
-     uses. Control kinds keep them (MP-16's C7).
-  3. *The control-closure gate before showing*: the live window's control closure
-     (`node/history_stream/runtime.rs:1048`, `push_control_closure`, and the `LiveWindow`,
-     `LiveRetry`, `LiveAdvance` operations from :2417), `select_/advance_/cover_history_live_window`
-     (`node/channel/entry_store/sparse.rs:2678-2800`) as a gate, and per-head closure progress; the
-     list of MP-12 replaces the window.
+  2. *Cross-author parent receipts for ordinary v2 Content's `seen` only*: remove only those
+     references' receipt fetching, preflight, control closure and domination, and helpers exclusively used by that work. MUST retain Content's own predecessor/header/prefix authentication, exact preceding-aggregate check and full own-control source/effect preflight, together with their required receipt/proof machinery. Control kinds and legacy admission retain their existing parent checks (MP-16's C7, M0 rules 1 and 3).
+     *(Amended 2026-11-23 by the M0 ruling's author, `design/amendment-2-verdict.md`.)*
+  3. *Withdrawn by amendment 2 (the M0 ruling).* The accepted text listed the live window's control
+     closure (`node/history_stream/runtime.rs:1048`, `push_control_closure`) as a gate to delete. M0
+     keeps the author's own control-source/effect readiness and every coordinate's full validation
+     (MP-1, rule 1), so that closure is not dead; only the closure fetched for Content's `seen`
+     parents goes, with item 2. *(Amended 2026-11-23.)*
   4. *Node-wide singletons*: the `Live`, `Control` and `Archive` slots (`node/history_demand.rs:55-61`),
      the serve lanes including `try_serve` (`node/history_budget.rs:399`) and the Live refusal
      "live request is outside the bounded newest window" (`node/history_budget.rs:1088-1091`), and
      the server's newest-128 clause (`node/history_stream/server.rs:823`, removed by #1385). What
-     stays: one request per peer and room at a time, and one byte cap per node as a memory bound.
+     stays: one request per peer and room at a time, and one byte cap per node as a memory bound. *(Amended 2026-11-23 by amendment 2: M0 does not by itself make these dead, and existing scheduling limits remain (M0 ruling §6); each MAY be deleted only where its acts show it dead. The newest-128 clause is already gone with #1385.)*
   5. *Content's stored parent and per-post receipts* once MP-14 no longer writes them.
   The following disposition is the coordinating session's reading of ruling 2, not a separate
   ruling by the decider. **The parked candidate** (`rg-5/dep-first/full4.patch`;
@@ -564,7 +564,7 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
   their own and MAY land, each as its own change with its own red (RG-0). The second-lane burst fix
   is not built.
   - *Why*: ruling 2; each deleted rule scheduled demand that the gate of Context property 1
-    created.
+    created. Under M0 the parent gate for Content's `seen` is what goes (M0 ruling §6), so these rules lose their reason; whether that is enough for the busy room is measured by the journey, not proven by the ruling. *(Amended 2026-11-23.)*
   - *Proof*: *two authors on a slow path*: the `two` relay arm of `key_package_proof.rs` (two
     members posting at once at 75 ms a hop) keeps the reader within its newest-end rule;
     `a_slow_member_delays_only_itself` green with no pull-back rule; and the whole busy-room
@@ -714,7 +714,7 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
   Session support and floors, not only "tens in a room's life" (`log/history.rs:60-97`). A
   creator-summary payload or a new expired-leaf proof representation is an explicit additional
   encoding and verification change, decided on its own. How soon a removal is applied at a busy
-  member is an objective to measure, not a claim.
+  member is an objective to measure, not a claim. Under M0 they also MUST NOT claim (M0 ruling §3, §6): that a message naming a parent in `seen` is an authenticated acknowledgement of what that parent acknowledged (it is not; a malicious author can be shown against an old view, which is the existing unaware-author window, not a new one, and once the removal is applied MP-6 and MP-11 govern); that a healthy member's message never waits on a slow member (it can, where the author's own controls, its inherited context, or a key package or consent grant cite that member); or that the busy room passes (that is measured by the journey, not proven by the ruling). *(Amended 2026-11-23 by the M0 ruling.)*
   - *Why*: review §5. The busy-room figures of the proposal's §2 are derived, not run.
   - *Proof*: the release notes and `vox status` words read against this list; the newcomer and
     removal waits of MP-7 (d) and MP-2 recorded as measurements.
@@ -759,14 +759,14 @@ internal paths; each step handles them.
    lands only together with MP-6. Measured on the real binary (`mp/tokens/runs/mp11-change-green.log`):
    today's cut for a removed member falls at its last control entry, which is written before each
    post, so the target's last witnessed posts are outside the cut; MP-11 alone would take them
-   from readers that had shown them. In the coordinating session's reading, landing MP-11 in step 2 together with MP-6 means it is already in place when step 3 switches the reader policy on, which is what the head-mismatch ruling's "must accompany that policy" requires; it is the decider's decided behaviour ("disappears") and does not wait for step 3 because it weakens no check.
-3. **The new writer and reader policy, activated together** (MP-1, MP-2, MP-4, MP-5), its first
-   change being MP-3's distinct display and cut receipt types with their producer: no
-   artificial per-post carrier; still advance for real controls and cuts; display-only hints;
-   effect-scoped message admission; no promotion of lightweight data to causal Complete. Derived
-   cuts and eligibility are rebuilt or versioned before use, and stale work is fenced at the
-   existing publication and generation boundaries. Old valid causal sources stay valid. No cluster
-   agreement service and no second permanent protocol is built for the all-upgraded cohort.
+   from readers that had shown them. In the coordinating session's reading, landing MP-11 in step 2 together with MP-6 means it is already in place when step 3 switches the reader policy on, which is what the head-mismatch ruling's "must accompany that policy" requires; it is the decider's decided behaviour ("disappears") and does not wait for step 3 because it weakens no check. *(Amended 2026-11-23 by the M0 ruling: note (a) is superseded, since no display or cut receipt type is built (MP-3); the consumer map stays as documentation with its policy assumptions corrected (M0 ruling §4). Step 2's prerequisites are otherwise unchanged, and all of them and their acts bind before step 3 (M0 ruling §4, last paragraph).)*
+3. **The new writer and reader policy, activated together** (MP-1 to MP-5 as amended by the M0
+   ruling). Binding form (M0 ruling §7, rule 5): "**Upgrade and activation MUST** retain old strong row meanings and full-context effects, safely decode/finish or restage captured old verifier work without losing exact obligations, and switch the writer and reader together after G and all Order-step-2 security prerequisites/acts are in place. Head selection MUST remain non-starving scheduling, not a holder veto. MP-6/MP-11 and the unchanged release journey remain mandatory."
+   G is the ruling's guard (MP-3's rule 2: `contains_cut` bypasses its entire Content `seen` loop, and hint-graph ancestry is never an authority predicate). No display or cut receipt type is built and no eligibility, source or display data is migrated; captured format-1 verifier checkpoints stay decodable and either finish their stronger checks or restart from a safe phase with exact obligations kept (M0 ruling §4).
+   Acts (M0 ruling §5): old format-1 verifier checkpoints and an upgrade's first post; both writer routes; a room with more than sixteen authors; skewed-clock question and reply with unknown hints nonblocking; the `two` relay and slow-member acts; feed growth near one entry per post; and the unchanged sixteen-direction journey.
+   Old valid causal sources stay valid, and stale work is fenced at the existing publication and
+   generation boundaries. No cluster agreement service and no second permanent protocol is built.
+   *(Amended 2026-11-23 by the M0 ruling of gpt-6.1-sol, which replaces the accepted step 3 ("its first change being MP-3's distinct display and cut receipt types with their producer … display-only hints; effect-scoped message admission; no promotion of lightweight data to causal Complete. Derived cuts and eligibility are rebuilt or versioned before use"); the earlier text stays in the git history.)*
 4. **Delete the obsolete machinery and prove the product** (MP-13; the proofs of MP-1 to MP-12;
    MP-18's busy-room journey in all sixteen directions; MP-7 (d)'s newcomer in a copy of the
    decider's real rooms, measured). A creator summary is not built unless that measurement shows
@@ -791,7 +791,7 @@ kind; key rotation; the busy-room gate.
 **What a person is told:**
 - *The unaware-partition window stays.* A removal that has not reached a sender yet cannot stop
   that sender; no peer-to-peer design can (ADR-007:286-287, :372; `proposal.md:96`). What closes is
-  the worse case of reading the post-removal room while still sealing to the removed member (MP-2).
+  the worse case of reading the post-removal room while still sealing to the removed member (MP-2). Under M0, a message naming another member's post in `seen` is not an authenticated acknowledgement of what that post acknowledged: an author that never put a removal into its own state can be shown against a reader's old view. That is the existing unaware-author window, not a new one; once the reader applies the removal, MP-6 and MP-11 govern (M0 ruling §3). *(Amended 2026-11-23.)*
 - *A split view is found when views meet.* Today a third member's message that cites a forker
   forces the comparison before that message is shown; under this design a fork is found when two
   members, or a holder between them, compare that author's heads (MP-9), possibly later than today.
@@ -800,7 +800,7 @@ kind; key rotation; the busy-room gate.
   remover held stay; posts concurrent with the removal and outside that prefix are not shown
   (MP-6), as today.
 - *A sender whose membership evidence has not arrived is named as waiting*; the room's other
-  messages are shown (MP-1).
+  messages are shown (MP-1). *A healthy member's message can still wait on a slow member* where the author's own controls, its inherited context, or a key package or consent grant cite that member; whether the busy room passes is measured by the journey, not proven by the ruling (M0 ruling §6). *(Amended 2026-11-23.)*
 - *A message later proven not acceptable disappears.* When a removal or a fork reaches a member,
   that member's view drops the messages it shows of the removed author outside the cut, or of the
   rejected branch, so every member ends with the same room; what a person already read stays read
@@ -813,9 +813,9 @@ kind; key rotation; the busy-room gate.
 
 ## Consequences
 
-- The cross-member gate on each message goes, and with it the reason for the sixteen scheduling
-  rules; a slow member's evidence is needed only for that member's own messages and for controls
-  that cite it, which holders serve (MP-7).
+- The cross-member gate on each message's `seen` goes, and with it the reason for the sixteen
+  scheduling rules; a slow member's evidence is still needed where the author's own controls, its
+  inherited context, a key package or a control cite it, which holders serve (MP-7). *(Amended 2026-11-23 by the M0 ruling §6.)*
 - Controls are not made cheaper by this ADR: applying one still needs its full closure (MP-8). In
   old rooms the governing feeds carry long histories of per-post control entries written before
   this change; whether a newcomer meets the experience there is measured on a copy of the
@@ -828,8 +828,8 @@ kind; key rotation; the busy-room gate.
   today, chosen by the decider so the room looks the same to every member.
 - The give-back pass runs on the events that free space, not on a clock. The record reads this as
   meeting ruling 3's "periodically while vox is running" through those events.
-- New stored meanings (display, cut and source receipts) and a changed receipt format are added;
-  RG-0 permits them because MP-3 and MP-14 cannot be met without them, and this record says why.
+- No new stored meaning for messages is added (amendment 2 withdrew the display and cut receipts); a
+  changed receipt format is added (MP-14), which RG-0 permits because MP-14 cannot be met without it. *(Amended 2026-11-23.)*
 
 ## What this ADR supersedes and amends
 
@@ -922,10 +922,10 @@ Put to him on 2026-11-23 by the coordinating session.
   whose omitted coordinates never enter authority/cuts/authoring." The first binds until a
   projection is specified and reviewed. Inside the same question: whether a reader still closes an
   author's own control history from position 1 before showing that author's messages, or only the
-  governing effects its prefix exposes plus that author's own per-sender facts (ADR-036:576-578).
+  governing effects its prefix exposes plus that author's own per-sender facts (ADR-036:576-578). *(Amended 2026-11-23 by the M0 ruling: still open, and no longer on this release's path. M0 keeps today's full own-prefix and coordinate validation for messages (MP-1), so no narrower projection is needed for v0.4.31.)*
 - **B-2. The smallest check of "what the author had acknowledged" for old entries and legacy
   Session carriers** (review §7: "The strongest remaining design obligation is an exact
-  effect-scoped control projection for old entries—not a new timer"; `sync-sol-on-m1.md` §7).
+  effect-scoped control projection for old entries—not a new timer"; `sync-sol-on-m1.md` §7). *(Amended 2026-11-23 by the M0 ruling: still open, and no longer on this release's path, for the same reason as B-1.)*
 - **B-3. Old busy rooms.** Whether the governing feeds' old per-post control entries make a
   newcomer's bootstrap, measured on a copy of the decider's real rooms, exceed the required
   experience (MP-7 (d)); only then is question 3 put to him.
@@ -957,7 +957,7 @@ Put to him on 2026-11-23 by the coordinating session.
 |---|---|
 | C1 (lightweight admission; own preceding prefix) | MP-1 |
 | C2 (acknowledged governing effects; fences) | MP-2 |
-| C3 (shown and citable; display, cut, source receipts) | MP-3 |
+| C3 (shown and citable; as amended by the M0 ruling, a message is a full source and its `seen` are hints) | MP-3 |
 | C4 (reserved `seen` slot; narrow branch-aware cut) | MP-6 |
 | C5 (durable serveable control evidence; governing set) | MP-7 |
 | C5 (the "full proof of everything it cites" contradiction) | MP-8, B-1 |
@@ -987,6 +987,7 @@ Put to him on 2026-11-23 by the coordinating session.
 | P3: creator-fork edge | MP-6 |
 | P3: Session floors; termination | MP-10, B-5 |
 | P3: stale consent display; key-package standing checks | MP-7, MP-10 |
+| The M0 ruling (`design/step3-m0-ruling.md`; rules 1 to 5, the amendments to MP-1, MP-2 and MP-3, what M0 does not promise) | MP-1, MP-2, MP-3, MP-4, MP-5, MP-13, MP-17, Order step 3, B-1, B-2 |
 
 ## Links
 
