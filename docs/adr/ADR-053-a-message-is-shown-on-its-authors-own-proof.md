@@ -10,7 +10,7 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
   measurement (ruling 9). This record writes down that acceptance; its text was not itself put to
   him. Nothing in it is built except what is named below as landed, accepted or built:
   implementation, acceptance and delivery are recorded on the source-bound issues, separately
-  from decision status. *(Amended 2026-11-23, amendment 1: the head-mismatch ruling of gpt-6.1-sol (MP-7, MP-8a, MP-9; B-10 resolved), and the coordinating session's engineering decisions on the Order and on MP-9's transport, each marked where it applies. Amendment 2: the M0 ruling of gpt-6.1-sol, `design/step3-m0-ruling.md`, given after its review of the step-3 plan answered DO NOT BUILD (`design/step3-plan-review.md`): MP-1 to MP-5, the Terms, MP-13, MP-17, the Order and B-1/B-2, each marked where it applies.)*
+  from decision status. *(Amended 2026-11-23, amendment 1: the head-mismatch ruling of gpt-6.1-sol (MP-7, MP-8a, MP-9; B-10 resolved), and the coordinating session's engineering decisions on the Order and on MP-9's transport, each marked where it applies. Amendment 2: the M0 ruling of gpt-6.1-sol, `design/step3-m0-ruling.md`, given after its review of the step-3 plan answered DO NOT BUILD (`design/step3-plan-review.md`): MP-1 to MP-5, the Terms, MP-13, MP-17, the Order and B-1/B-2, each marked where it applies. Amendment 3: the decider's ruling 10 with the forked-target ruling of gpt-6.1-sol, `design/forked-target/ruling.md` (MP-9a, MP-6, MP-8), and the moving-head ruling of gpt-6.1-sol, `design/moving-head/ruling.md` (MP-7's prefix serving P, MP-8a's head choice H, W not approved, MP-17), and the Order, each marked where it applies.)*
 - **Date**: 2026-11-23
 - **Deciders**: Robert E. Lee
 - **Tags**: sync, admission, governance, removal, fork detection, store, retention, compaction,
@@ -83,10 +83,10 @@ journey of ADR-052 RG-1 decides it, in all sixteen directions, unchanged.
    answer, "disappears". It leaves the conversation so the room looks the same to every member;
    it never authorizes a control or a key release; nothing can recall what was already read
    (MP-11).
-9. **The creator's signed summary for old busy rooms is not decided and was not asked** (the
-   review's question 3): it is deferred until a newcomer joining a copy of the decider's real rooms
-   has been measured after the redesign. It is not built unless measured to be needed; then the
-   decider is asked, because it means trusting the creator's account of the past.
+9. **The creator's signed summary for old busy rooms is not decided and was not asked** (the review's question 3): it is deferred until a newcomer joining a copy of the decider's real rooms
+   has been measured after the redesign. It is not built unless measured to be needed; then the decider is asked, because it means trusting the creator's account of the past.
+10. **A member that splits its own history must not escape its removal** (2026-11-23, evening, by the question form; ledger 73; `exec/deviations.md`, "Answer of the owner on 2026-11-23 (evening)"). The defect: a member running altered software signs two versions of its own history; after the creator removes it, members who saw the other version never apply the removal, keep releasing keys to it and stop receiving the creator's later posts, in every release since v0.4.6. "Offered: fix it in v0.4.31, the release waiting for it as well; or ship with the first half, name the rest in the notes and fix next."
+    "His answer: **fix it in v0.4.31** (his standing rule; the form's value `fix_now`)." Carried by MP-9a, with MP-6 and MP-8 as amended. *(Amended 2026-11-23, amendment 3.)*
 
 **Earlier rulings that stand:** KISS is the law (ADR-052 ruling 2, RG-0); the release bar is the
 three journeys on the shipped assets (ADR-052 RG-15); a feature is proven on the real binary or a
@@ -293,7 +293,7 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
   position, hash and accepted branch), never a bare `max(seq)`; known-fork rejection, inclusion and
   consistency stay enforced. That tip MUST pass the exact receipt and branch checks of a causal
   source; being displayable MUST NOT satisfy them. "Earlier messages stay" means messages in the
-  remover's witnessed accepted prefix, not every message that came earlier in wall time.
+  remover's witnessed accepted prefix, not every message that came earlier in wall time. *(Amended 2026-11-23, amendment 3, by the forked-target ruling of gpt-6.1-sol, `design/forked-target/ruling.md` rule 7, for the decider's ruling 10; the cut is by branch, not by position:)* "A removal's witnessed-message exception MUST mean exact authenticated membership in the prefix W named by the remover's signed target reference, intersected with the messages otherwise eligible on this reader; it MUST NOT mean all local messages with sequence at most p, nor automatically the whole local branch or only a guessed shared prefix." "Equal prefix descriptors under the two roots, or independently verified exact ancestry, may establish shared history; absence of that proof is pending for the affected eligibility, not a false ancestry result." Where the reference names a branch other than the one this reader accepted, it is looked up through the retained exact fork-parent witness (MP-9a).
   - *Why*: without per-post control entries, a cut at the target's last control could fall weeks
     back and hide its legitimate earlier messages (ADR-007 G-32; `m1-security.md` P2-D). The
     generic tip picker can discard an author (`node/channel/local_history.rs:493-527`). The message
@@ -308,7 +308,7 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
     replayed after reconnection, is refused (ADR-007:410). Mutant: drop the reserved slot.
     (b) *Fork below the cut*: the removed member forks its own feed below the cut and serves a
     different entry at a witnessed position; no reader shows it, and the fork is recorded. Mutant:
-    compare positions only.
+    compare positions only. (c) *The forked target*: MP-9a's act and its positions-only cut mutant. *(Amended 2026-11-23, amendment 3.)*
 
 - **MP-7. Control evidence that standing, keys or later controls depend on is kept durably and
   served (C5).** "Before publishing/adopting a control on which standing, keys or future controls
@@ -323,15 +323,62 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
   delays only itself. A newcomer's bootstrap MUST close the governing feeds and obtain each
   sender's own relevant control state and packages, with a pending status per sender rather than a
   barrier across all senders.
-  The holder MUST persist the entire verified control-serving trace and its complete semantic
-  verification closure under their exact original heads, atomically with the coverage/source
+  The holder MUST persist the entire verified control-serving trace and its complete semantic verification closure under their exact original heads, atomically with the coverage/source
   owners, and retain the signed heads, contexts and verified consistency links those owners
-  require across restart. The holder MUST answer a request under h2 using pieces owned under h1
-  only when its own retained verified commit links establish that h2 extends h1 and the reused
-  piece is the identical full aligned subtree; it MUST reconstruct other nodes from authenticated
-  inputs, leave unavailable pieces unavailable, and never insert serving pieces into the canonical
-  acceptance-range index. *(Amended 2026-11-23 by the head-mismatch ruling of gpt-6.1-sol,
-  `design/head-mismatch/ruling.md` rules 4 and 5.)*
+  require across restart. "A provider may reconstruct another exact prefix for serving from that owned authenticated material; doing so neither rebinds the original owner nor creates permanent ownership of every requested prefix. Do not eagerly store every possible head or prefix."
+  *(Amended 2026-11-23, amendment 3, by the moving-head ruling §3, which keeps head-mismatch rule 4 with this addition and replaces rule 5's exclusive commit-link condition:)*
+  "The holder MUST serve under an exact requested prefix target only from independently authenticated material on its own accepted branch, either using its retained verified links or by reconstructing [1,n] beneath an independently committed source H with |H|>=n and checking equality of the complete requested Descriptor. Identical aligned nodes may be reused; other nodes are reconstructed. The requested head need never have been observed or committed here. The asker independently verifies under its own signed anchor; serving never changes canonical acceptance, source/effect readiness or evidence ownership."
+  This makes a holder that skipped head n useful once it has accepted a larger H; it does not let a
+  holder at h1 prove a genuinely unavailable suffix to an asker at a larger h2 (moving-head ruling
+  §3). *(Rules 4 and 5 first: 2026-11-23 by the head-mismatch ruling of gpt-6.1-sol,
+  `design/head-mismatch/ruling.md`; amended the same day by `design/moving-head/ruling.md`.)*
+  *Serving any prefix a holder holds: P.* *(Added 2026-11-23, amendment 3, by the moving-head
+  ruling of gpt-6.1-sol, `design/moving-head/ruling.md` §2.)*
+  1. "An exact-head-dependent request MUST identify the immutable requested head and carry enough
+     fixed-size target metadata to resolve it without the provider having stored that head: its
+     TreeBinding, tail epoch and complete Descriptor, whose leaves field is n, with canonical
+     head-body hashing checked against the requested head ID."
+  2. "The holder MUST choose and pin one independently committed, authenticated source head H of
+     the same room/scope/author with |H|>=n, reconstruct the exact canonical prefix [1,n] only from
+     material authenticated on that source branch, and compare the ENTIRE reconstructed Descriptor
+     with the requested one before claiming that target can be served."
+  3. "The holder MUST reuse only identical authenticated aligned blocks, reconstruct
+     partial/right-edge nodes for the requested size, retain the independently committed
+     source/validated-leaf requirements, and return unavailable when any required node, control
+     header or context is absent, n exceeds every available source, or the computed prefix
+     differs."
+  4. "The same resolver MUST cover Header and the head-bound Entry/Page paths needed to finish the
+     operation, not only Query::Proof; exact hash binding, body-held status, current membership,
+     recipient cut, live/archive bounds, purpose, key-package recipient and physical-send fences
+     MUST remain enforced."
+  5. "The asker MUST retain its exact signed committed head, requested coordinates/hashes and
+     ordinary verifiers, independently verify every response against that head, and keep missing
+     or mismatched evidence pending without rollback, root retargeting, invented absence of
+     controls or a fork verdict from a relay's bad proof."
+  6. "Serving MUST NOT commit/observe the supplied target, publish a source, advance control-ready
+     state, insert a synthesized prefix into the canonical acceptance index, or create durable
+     proof/head rows merely because a size was requested; generated request-only contexts and
+     intermediate ranges MUST stay in charged bounded serving state/cache unless a genuine existing
+     owner requires their durable retention."
+  7. "Each incoming request MUST retain the existing admitted lane/byte limits, one response
+     quantum, cancellation, lifetime and per-slice WorkBudget bounds; root reconstruction and all
+     proof kinds MUST share that request's accounting and never reset its lifetime, fetch remote
+     evidence or start a hidden archive catch-up to complete the ask."
+  The target is the canonical head body/Descriptor plus its existing ID, not a size alone and not a
+  retransmitted signature; the holder treats it as an untrusted selector checked by equality with
+  its own verified prefix, and no SignedHead signature is fabricated internally (ruling §2). #1387
+  persists the response contexts it generates; rule 6 makes such contexts transient unless an
+  existing owner needs them. P changes no writer, admission or authority policy.
+  *Considered and not approved: W* (a control names, in `seen`, each other author's latest control
+  instead of its newest post). Its prefix facts hold under conditions, but control clocks are not
+  display-only: the clock clamp reads held `seen`, so W can move a new control behind the posts it
+  followed, and the largest authority-row clock signs the board's AdminRoster timestamp, which the
+  board uses to ignore an equal or older roster and to authorize a room withdrawal; a back-clamped
+  creator revocation could leave a stale roster installed (the ruling's inference, not run;
+  `design/moving-head/ruling.md` §1). A later W proposal MUST separately preserve notice ordering
+  and strictly fresh signed-roster authorization and prove the paused-writer/admin-revocation case
+  on the real board. P covers every wait where a holder owns the requested prefix, so W is not
+  needed there. *(Amended 2026-11-23, amendment 3.)*
   - *Why*: #1384 keeps inclusion and consistency witnesses but leaves `ControlRange` pieces
     cache-only (`node/history_stream/admission.rs:439-462,558-597`): a locally completed verdict is
     not a transferable proof, and "members hold the governing controls" does not mean they can
@@ -343,7 +390,7 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
     one control entry written by an author after a holder verified it strands a newcomer joining
     through that holder with the author stopped; the holder declines pieces it holds under the
     earlier head (`mp/control/runs/ctl-base`, RED). *(Amended 2026-11-23, the head-mismatch ruling
-    and its question, `design/head-mismatch/question.md`.)*
+    and its question, `design/head-mismatch/question.md`.)* Measured with M0 built (main `b3d7fb75d` with #1387 and the M0 patch, `m0/journey1/`): the busy room shows 0 of 16 directions, against 5 to 7 on main without M0; every reader verifies every author only to the end of its join-era entries. The cause is the builder's reading (`m0/journey1/cause.md`), not yet confirmed: readers ask under their own newest committed head of an author, which in a busy room no holder has committed because every post is a new head, so holders decline and the ask goes to the author. It stays the builder's reading until the per-wait trace (`m0/journey2/`, a run in flight) shows, for each blocked join control, the reader, the citing author/position/kind, the required author/position/hash, the fixed target head and size, the phase, the provider's source head and size and the exact missing item, distinguishing a head-ID refusal from genuinely absent material (moving-head ruling §6). If every provider is behind the asked size, P does not cover that wait. *(Amended 2026-11-23, amendment 3.)*
   - *Proof*: (a) *the stopped author with the holder restarted and a misleading newer head first*
     (extends the act of `rg-6/witness/`, green on v0.4.30, red on `403218281`): "An author stops
     after a holder has verified and durably retained the complete control closure needed by its
@@ -365,7 +412,7 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
     with long governing feeds (the decider's real rooms among them); the newcomer joins with the
     creator and a long-history member stopped, and shows the others' recent posts; its wait is
     measured and recorded, not promised (MP-17). This measurement decides whether ruling 9's
-    question is put to the decider.
+    question is put to the decider. (e) *A holder answers for a prefix it never committed* (moving-head ruling §5): on real daemons or wire peers, N commits A's signed head n; holder H skips that head, later accepts a strictly larger consistent head while keeping the needed prefix material; A stops and H restarts; from H alone N obtains the exact Header, Inclusion, Consistency, Control and the retained authorized body, applies a real join grant or package and reads the citing member's post; n is not a power of two and lies below H's window, with deliberately owned witnesses, and the act asserts H never committed n. Mutant: restore the committed-ID gate at any required serving stage; the operation fails structurally, not merely because Proof alone was fixed. (f) *P guards*: a forked provider or corrupt relay supplies another prefix, and N never renders or applies it while withholding stays pending (mutant: let N retarget its anchor or skip its root check); authenticated clients cycle historical sizes, including missing-piece and n>|H| cases, cancellation and a concurrent honest client: requests stay bounded, no synthetic durable target, proof or context rows accumulate, and useful progress survives (mutants: persist serving-only synthetic state; bypass credit, lifetime or authorization checks). *(Amended 2026-11-23, amendment 3.)*
 
 - **MP-8. What validating a control closes.** The full validator today closes every context
   coordinate and parent prefix of a control, non-admins included
@@ -377,7 +424,7 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
   narrower projection is specified, reviewed and recorded as an amendment of this ADR, the first
   alternative binds: a control is applied only after today's full closure, and MP-7 makes that
   closure durable and serveable. Omitted coordinates of any later projection MUST never enter
-  authority, cuts or authoring.
+  authority, cuts or authoring. *(Amended 2026-11-23, amendment 3, by the forked-target ruling §4:)* MP-9a's fork-parent evidence path is a narrow amendment to this rule for a proved forker only: it replaces an impossible committed-branch requirement with equally exact evidence-only proof; it is not a narrower projection and not a global replacement of MP-8a's no-unlinked-authority rule.
   - *Why*: the proposal the decider read says controls keep "full proof of everything it cites, as
     today" (`proposal.md:19`); the first alternative is today's behaviour, so it adds no new
     validator.
@@ -398,7 +445,7 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
      control-ready, and MUST wait for every newer control coordinate exposed by the operation's
      authenticated dependencies before that operation takes effect."
   No timeout converts a withheld link into either consistency or a fork; other already-safe work
-  stays usable.
+  stays usable. *Head choice: H.* *(Amended 2026-11-23, amendment 3, by the moving-head ruling §4:)* "H MUST be scheduling preference only: before choosing an anchor for new work, prefer an already available, connected holder's advertised committed head that covers the needed coordinates; after selection keep exact obligations fixed. The author's newer signed observations retain ordinary non-starving processing and consistency-gated promotion. Do not wait for a holder advertisement, roll back an existing commitment, retarget captured work, or require holder approval before newer governing coordinates can be processed." It uses existing ownership and fair queues, not a promote-only-when-useful candidate/demotion state machine.
   - *Why*: a holder could otherwise offer an older head h1 to hide an author's later removal or key
     change under the newer h2 the asker already holds, and an author that signed inconsistent h1
     and h2 could have h1's authority imported while MP-9 investigates; an exact cited terminal
@@ -413,7 +460,7 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
     unsupported control or key effect while an unrelated safe sender stays readable; then supply
     authenticated contradictory openings and assert durable fork restrictions, never a fork verdict
     from withholding alone. Mutant: bypass continuity for historical control dependencies; this
-    arm turns red.
+    arm turns red. *H act* (moving-head ruling §5): a newcomer sees a holder's usable committed head and an author's larger head, shows the intended initial preference with unchanged exact-root work, then obtains and processes a genuine newer removal or key change without waiting for holder endorsement; repeated with only the author available. Mutants: author-first only for the availability arm; an indefinite holder endorsement for the newer-control arm. *(Amended 2026-11-23, amendment 3.)*
 
 - **MP-9. A member's split view is detectable across all authors and unequal sizes (C6).** Nodes
   MUST "Propagate all-author signed head observations through honest holders; retain unequal-size
@@ -457,6 +504,88 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
     second branch. Mutants: exchange fork proofs only, without the unresolved observations (the
     arm before any proof exists turns red); drop the `forks` list (the second arm turns red).
     *(Amended 2026-11-23.)*
+
+- **MP-9a. A member that splits its own history cannot escape its removal (ruling 10).** "A proved
+  fork changes parent evidence, not authority." *(Added 2026-11-23, amendment 3, by the
+  forked-target ruling of gpt-6.1-sol, `design/forked-target/ruling.md` §1, for the decider's
+  ruling 10; question in `question.md` beside it; ledger 73.)* Rule 7 of that ruling is MP-6's cut.
+  1. "A reader MUST enable the fork-parent path only for an author T whose attributable,
+     room-bound fork proof has been independently verified and durably recorded; a hint,
+     equal-size head conflict, failed consistency proof, peer's `frozen` claim or elapsed wait MUST
+     NOT enable it."
+  2. "For another author's exact cross-author reference `(T,p,hash)`, the reader MUST obtain the
+     exact signed header, authenticated inclusion and authenticated prefix through p under one
+     retained author-signed head of T, match every binding and the referenced hash, and treat that
+     result as fork-parent evidence rather than a committed T head or a canonical T source."
+  3. "The fork-parent verifier MUST authenticate and close that branch's complete required
+     control/context/parent evidence through p, including no-omission coverage and transitive
+     dependencies, and MUST check the citing entry's signed frontier domination against that exact
+     branch prefix, not a truncated or locally convenient prefix."
+  4. "The reader MUST keep T's alternate-branch inputs evidence-only: they MUST NOT construct a
+     canonical `ValidatedSparseEntry` for T, enter T's accepted positions, become an authoring tip,
+     make T control-ready, install T's packages/floors/keys, or supply non-exclusion authority
+     outside the already verified common authority prefix." "Authenticated exclusionary controls
+     encountered in the closure MUST be retained and evaluated through the existing fork-exclusion
+     rules, with their required authority/causal evidence; they are neither silently dropped nor
+     made effective merely by being signed."
+  5. "The reader MUST preserve every coordinate of R's signed context and every independently
+     validated dependency, while treating T's rejected-branch coordinates only as exact fork
+     dependencies, not as authority-bearing canonical T source positions or an increased general
+     authority frontier."
+  6. "The reader MUST persist and serve the exact branch witnesses and their verification closure
+     with the citing source's evidence ownership, and MUST re-establish the verified-fork predicate
+     and exact bindings when consuming/restoring them; missing evidence remains a resumable, named
+     pending obligation, not a fake receipt or an author-fault verdict." It uses the existing
+     receipt encodings with an evidence-only parent writer; no new signed format, wire message,
+     timer or stored receipt shape.
+  7. Written into MP-6: the cut is exact authenticated membership in the prefix W the remover's
+     reference names, by branch, not by position.
+  8. "Once R's own ordinary admission, fork-parent closure and unchanged authorization/effect gates
+     pass, the reader MUST apply its valid control and resume R's later entries through the same
+     full validator; the cross-author fork-parent rule MUST also cover the context carriers and
+     subsequent full-validation entries needed to avoid immediately blocking the feed again."
+     Missing genuine dependencies can still delay R; what goes is the impossible committed-branch
+     demand, not the need for withheld closure.
+  *What a person sees, and which messages stay* (ruling §3): before the proof arrives, the reader
+  names the remover as waiting for the exact fork-parent and membership evidence and does not claim
+  the removal applied; once the target's fork is recorded, the existing fork warning and freeze stay
+  visible whether or not the remover still waits; other already-safe authors stay usable and the
+  egress fences hold. After the complete witness arrives and the removal is authorized, the target
+  leaves the roster, no new reply or key is released to it, and the remover's later valid controls
+  and posts proceed; the target's proof-only material is not shown merely because it was fetched.
+  Of the target's already-shown messages, those in `shown ∩ W ∩ otherwise eligible` stay: a reader
+  of the remover's branch keeps the eligible messages through the witnessed tip and loses later or
+  unwitnessed ones; a reader of the other branch keeps only messages proved also to be in W,
+  normally the true shared prefix, and loses its other-branch messages even below that tip (MP-11).
+  The recorded `ForkBoundary` is not necessarily the shared-prefix length (mismatched predecessor
+  hashes set it to 1), so the cut proves shared ancestry rather than using it as a display cutoff.
+  Nothing recalls plaintext or keys already disclosed.
+  - *Why*: measured on real binaries (ledger 73; `mp/cut/arm-c.md`; runs `mp/cut/runs/r2/change-c.log`
+    and `base-c`, `mp/fork/runs/cand-armc.log`). Carol signs two branches of her own feed of equal
+    length; Dave accepted branch B; Alice, holding branch A, removes Carol naming her A tip. On
+    main Dave never records the fork (`"equivocations":[]`), never admits the removal, keeps Carol
+    as a member and holds every later entry of Alice. With MP-9's comparison built the fork is
+    recorded (`frozen=[carol]`), but the removal still never applies and Alice's feed stops at 11:
+    the removal's exact parent receipt under the reader's committed branch of the target can never
+    be satisfied (`question.md`). The ruling rejects waiving the receipt once frozen and restricting
+    the path to exclusions of the forker: an honest remover's preceding context carrier and later
+    entries can cite the same branch, so a removal-only exception would not release the remover's
+    feed; and "dominate only through the shared prefix" could discard another author's later
+    governing coordinate acknowledged on the cited branch (ruling §2).
+  - *Proof* (ruling §4): extends `a_target_that_forks_itself_is_removed_once_its_reader_holds_both_branches`
+    on retained real binaries: with the equal-length branches and Carol stopped, Dave records the
+    fork, admits and applies Alice's removal from Alice's exact branch witnesses, drops Carol from
+    the roster, shows Alice's next post, and shows exactly the retained/intersected history above
+    (Alice keeps the common base and the witnessed A posts; Dave keeps the common base and loses
+    both B posts once the removal and MP-11 apply), also after Dave restarts. A control or context
+    carrier citing Carol's other branch before the removal is included, so a removal-only special
+    case cannot pass. Mutants: restore the committed-parent-only gate for a proved forker (the
+    removal and later-post arm fails structurally although fork recording succeeds); waive the
+    exact referenced receipt once frozen (a signed malicious remover's nonexistent `(p,hash)` must
+    not apply its control); compare the cut by position (Dave's B-only posts must not survive the A
+    cut). Also: a forged frozen claim, a withheld prefix or closure, and a branch frontier exposing
+    a separately withheld governing exclusion all stay pending or inert, with no unsupported
+    authority or key effect.
 
 - **MP-10. Recipient, package and private-Session boundaries are named and kept one by one.** Each
   is a distinct check today and MUST stay one:
@@ -714,7 +843,7 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
   Session support and floors, not only "tens in a room's life" (`log/history.rs:60-97`). A
   creator-summary payload or a new expired-leaf proof representation is an explicit additional
   encoding and verification change, decided on its own. How soon a removal is applied at a busy
-  member is an objective to measure, not a claim. Under M0 they also MUST NOT claim (M0 ruling §3, §6): that a message naming a parent in `seen` is an authenticated acknowledgement of what that parent acknowledged (it is not; a malicious author can be shown against an old view, which is the existing unaware-author window, not a new one, and once the removal is applied MP-6 and MP-11 govern); that a healthy member's message never waits on a slow member (it can, where the author's own controls, its inherited context, or a key package or consent grant cite that member); or that the busy room passes (that is measured by the journey, not proven by the ruling). *(Amended 2026-11-23 by the M0 ruling.)*
+  member is an objective to measure, not a claim. Under M0 they also MUST NOT claim (M0 ruling §3, §6): that a message naming a parent in `seen` is an authenticated acknowledgement of what that parent acknowledged (it is not; a malicious author can be shown against an old view, which is the existing unaware-author window, not a new one, and once the removal is applied MP-6 and MP-11 govern); that a healthy member's message never waits on a slow member (it can, where the author's own controls, its inherited context, or a key package or consent grant cite that member); or that the busy room passes (that is measured by the journey, not proven by the ruling). *(Amended 2026-11-23 by the M0 ruling.)* Under P (MP-7) they also MUST NOT claim availability when every holder is behind the asked size: when n>|H| for every holder, P cannot manufacture bytes or evidence, and P is not an unconditional sixteen-direction liveness proof; H can avoid some poor initial anchors but cannot guarantee that a reader is never ahead of every holder (moving-head ruling §4). *(Amended 2026-11-23, amendment 3.)*
   - *Why*: review §5. The busy-room figures of the proposal's §2 are derived, not run.
   - *Proof*: the release notes and `vox status` words read against this list; the newcomer and
     removal waits of MP-7 (d) and MP-2 recorded as measurements.
@@ -747,7 +876,7 @@ internal paths; each step handles them.
    green here before any admission check is weakened. Every prerequisite named in this step MUST be
    implemented and proven, not merely listed as an open question or left unexercised by these
    acts. Complete control serviceability is not put after step 4's claims.
-   *The work may pause here: the old gate still wins.*
+   *The work may pause here: the old gate still wins.* *(Amended 2026-11-23, amendment 3:)* step 2 also carries MP-9a (the forked target's fork-parent evidence path, with MP-6's branch cut and MP-11, before the reader switch; forked-target ruling §4) and MP-7's prefix serving P, built first as a serving-only change against the old full admission gate, its focused acts proven before any journey improvement is attributed to it (moving-head ruling §4). Their acts join the acts above that MUST be green before any admission check is weakened. #1387 (MP-7's holder side as first ruled: a member serves the membership proof it verified, across its own linked heads) is merged (`29b808afa`); P generalises its serving rule from linked heads to any authenticated prefix the holder holds.
    *(Amended 2026-11-23: the coordinating session's engineering decisions, `exec/deviations.md`
    "Engineering decisions on 2026-11-23 while building ADR-053's step 2"; not the decider's ruling
    and not the review's.)* (a) MP-3's separate display and cut receipt types move from this step
@@ -765,7 +894,7 @@ internal paths; each step handles them.
    G is the ruling's guard (MP-3's rule 2: `contains_cut` bypasses its entire Content `seen` loop, and hint-graph ancestry is never an authority predicate). No display or cut receipt type is built and no eligibility, source or display data is migrated; captured format-1 verifier checkpoints stay decodable and either finish their stronger checks or restart from a safe phase with exact obligations kept (M0 ruling §4).
    Acts (M0 ruling §5): old format-1 verifier checkpoints and an upgrade's first post; both writer routes; a room with more than sixteen authors; skewed-clock question and reply with unknown hints nonblocking; the `two` relay and slow-member acts; feed growth near one entry per post; and the unchanged sixteen-direction journey.
    Old valid causal sources stay valid, and stale work is fenced at the existing publication and
-   generation boundaries. No cluster agreement service and no second permanent protocol is built.
+   generation boundaries. No cluster agreement service and no second permanent protocol is built. Head choice here is MP-8a's H: scheduling preference only, never a holder veto. *(Amended 2026-11-23, amendment 3.)*
    *(Amended 2026-11-23 by the M0 ruling of gpt-6.1-sol, which replaces the accepted step 3 ("its first change being MP-3's distinct display and cut receipt types with their producer … display-only hints; effect-scoped message admission; no promotion of lightweight data to causal Complete. Derived cuts and eligibility are rebuilt or versioned before use"); the earlier text stays in the git history.)*
 4. **Delete the obsolete machinery and prove the product** (MP-13; the proofs of MP-1 to MP-12;
    MP-18's busy-room journey in all sixteen directions; MP-7 (d)'s newcomer in a copy of the
@@ -798,7 +927,7 @@ kind; key rotation; the busy-room gate.
   A refused or bad proof is not reported as a fork.
 - *A removal keeps what the remover witnessed.* Posts of the removed member up to the tip the
   remover held stay; posts concurrent with the removal and outside that prefix are not shown
-  (MP-6), as today.
+  (MP-6), as today. *A member that splits its own history is still removed* on members who saw its other version: they record its fork, apply the removal from the remover's exact branch evidence and keep only its messages the remover witnessed; until that evidence arrives they name the remover as waiting and do not claim the removal applied (MP-9a; ruling 10). *(Amended 2026-11-23, amendment 3.)*
 - *A sender whose membership evidence has not arrived is named as waiting*; the room's other
   messages are shown (MP-1). *A healthy member's message can still wait on a slow member* where the author's own controls, its inherited context, or a key package or consent grant cite that member; whether the busy room passes is measured by the journey, not proven by the ruling (M0 ruling §6). *(Amended 2026-11-23.)*
 - *A message later proven not acceptable disappears.* When a removal or a fork reaches a member,
@@ -949,7 +1078,7 @@ Put to him on 2026-11-23 by the coordinating session.
   author's evidence that a holder can serve only under an older signed head of that author, when
   the reader already holds a newer one. Ruled by gpt-6.1-sol (`design/head-mismatch/ruling.md`,
   question in `question.md` beside it): continuity before authority. Written into MP-7 (rules 4
-  and 5, and proof (a)), MP-8a (rules 1 to 3) and MP-9 (rules 6 and 7).
+  and 5, and proof (a)), MP-8a (rules 1 to 3) and MP-9 (rules 6 and 7). *(Amended 2026-11-23, amendment 3: rule 5 is replaced in MP-7 by the moving-head ruling §3, and rule 4 gains its addition.)*
 
 ## C1 to C9 and the security findings, by requirement
 
@@ -988,6 +1117,8 @@ Put to him on 2026-11-23 by the coordinating session.
 | P3: Session floors; termination | MP-10, B-5 |
 | P3: stale consent display; key-package standing checks | MP-7, MP-10 |
 | The M0 ruling (`design/step3-m0-ruling.md`; rules 1 to 5, the amendments to MP-1, MP-2 and MP-3, what M0 does not promise) | MP-1, MP-2, MP-3, MP-4, MP-5, MP-13, MP-17, Order step 3, B-1, B-2 |
+| The forked-target ruling (`design/forked-target/ruling.md`; rules 1 to 8, the decider's ruling 10, ledger 73) | MP-9a (rules 1 to 6, 8), MP-6 (rule 7), MP-8, Order step 2 |
+| The moving-head ruling (`design/moving-head/ruling.md`; P rules 1 to 7, the amendment of head-mismatch rules 4 and 5, H, W not approved) | MP-7, MP-8a, MP-17, Order steps 2 and 3 |
 
 ## Links
 
