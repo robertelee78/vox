@@ -8508,6 +8508,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             }),
         },
         Request::TrustList { after, .. } => {
+            handle.reconcile_local_folders();
             let view = handle.view();
             let rows = view
                 .trusted

@@ -2999,6 +2999,12 @@ impl Management {
         if op == REACHABILITY_WAKE_OP {
             return Ok(());
         }
+        if let Err(error) = self.computer.reconcile_local_folders() {
+            eprintln!(
+                "vox daemon: computer node folder check did not finish before this exchange; path {}: {error}",
+                self.computer.account.nodes_dir().display()
+            );
+        }
         if op == 2 {
             let payload = frame_until(recv, deadline).await?;
             #[cfg(feature = "test-knobs")]
@@ -4286,6 +4292,12 @@ impl Management {
         #[cfg(feature = "test-knobs")]
         self.hold_first_computer_exchange_for_proof(peer, _serial)
             .await;
+        if let Err(error) = self.computer.reconcile_local_folders() {
+            eprintln!(
+                "vox daemon: computer node folder check did not finish before this exchange; path {}: {error}",
+                self.computer.account.nodes_dir().display()
+            );
+        }
         let link = url.as_ref().map(|l| Link::parse(l)).transpose()?;
         let endpoints = link.as_ref().map(|l| &l.endpoints).unwrap_or(&endpoints);
         let conn = self
