@@ -1600,6 +1600,8 @@ pub enum Fault {
     SessionCleanupBusy,
     /// The hosted daemon's reliable Session cleanup handler has gone away.
     SessionCleanupUnavailable,
+    /// Rejoining must keep the last copy of a signed departure until a member acknowledges it.
+    DepartureNotHeard,
     /// Making an identity, its file (`vault.cbor`) could not be written. Not [`Fault::Storage`],
     /// which named the store when the store was fine (V210-77).
     IdentityFileUnwritable,
@@ -1870,10 +1872,13 @@ impl Fault {
                 "an admin change is already being applied on this node\n       wait for its answer before making another admin change"
             }
             Fault::SessionCleanupBusy => {
-                "an earlier room's Session cleanup is still pending; no deletion started for this request\n       try again after that cleanup finishes"
+                "an earlier room's Session cleanup is still pending\n       try again after that cleanup finishes"
             }
             Fault::SessionCleanupUnavailable => {
                 "the daemon's Session cleanup handler is unavailable; no deletion started for this request\n       restart the daemon before trying again"
+            }
+            Fault::DepartureNotHeard => {
+                "no member of this room has acknowledged this node's signed departure; the left copy was kept and this join made no change\n       try joining again when a member of the room is reachable"
             }
             Fault::RetentionFileUnwritable => {
                 "your retention for this room could not be saved: the node's retention file (`retention`, in its configuration directory) could not be written\n       check free disk space, and that the configuration directory is writable; then run it again"
@@ -2118,6 +2123,7 @@ fault_names!(
     AdminChangePending,
     SessionCleanupBusy,
     SessionCleanupUnavailable,
+    DepartureNotHeard,
     IdentityFileUnwritable,
     RetentionFileUnwritable,
     SealedUnreadable,

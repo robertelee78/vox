@@ -138,7 +138,7 @@ impl Node {
         let prepared = (|| {
             if self
                 .session_rooms_retiring
-                .iter()
+                .keys()
                 .any(|item| item.room == room)
             {
                 return Err(Error::Profile(

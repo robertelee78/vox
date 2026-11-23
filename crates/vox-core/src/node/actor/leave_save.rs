@@ -739,7 +739,7 @@ impl Node {
         }
         if self
             .session_rooms_retiring
-            .iter()
+            .keys()
             .any(|pending| pending.room == room)
         {
             self.refuse_owned_purge(room, purpose, Fault::SessionCleanupBusy);
@@ -963,8 +963,17 @@ impl Node {
                 if let Some(ended) = ended {
                     self.ended_rooms = ended;
                 }
-                if let Some(retirement) = retirement {
-                    self.session_rooms_retiring.insert(retirement);
+                // Its receipt may already have been acknowledged before this install.
+                let waiting = retirement.filter(|retirement| {
+                    self.profile.as_ref().is_some_and(|profile| {
+                        crate::node::session_ingress::retirements(profile)
+                            .is_ok_and(|pending| pending.contains(retirement))
+                    })
+                });
+                if let Some(retirement) = waiting {
+                    self.session_rooms_retiring
+                        .entry(retirement)
+                        .or_insert(None);
                 }
                 let outcome = if current {
                     self.finish_saved_purge(&room, transition, result).await
@@ -978,9 +987,30 @@ impl Node {
                         link,
                         passphrase,
                         reply,
+                        deadline,
                     }) => {
                         if outcome.is_done() && current {
-                            self.begin_join_channel(link, passphrase, reply).await;
+                            #[cfg(feature = "test-knobs")]
+                            let waiting = if crate::node::computer::fx28_mutant(
+                                "rejoin-before-session-retirement",
+                            ) {
+                                None
+                            } else {
+                                waiting
+                            };
+                            if let Some(retirement) = waiting {
+                                self.session_rooms_retiring.insert(
+                                    retirement,
+                                    Some(super::RetiringJoin {
+                                        link,
+                                        passphrase,
+                                        reply,
+                                        deadline,
+                                    }),
+                                );
+                            } else {
+                                self.begin_join_channel(link, passphrase, reply).await;
+                            }
                         } else {
                             let _ = reply.send(if outcome.is_done() {
                                 Outcome::Failed(Fault::ChannelNotOpen)

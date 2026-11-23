@@ -793,6 +793,25 @@ impl Source {
         let recovery_owner = Arc::clone(&owner);
         let task = tokio::task::spawn_blocking(move || {
             let PreparedRead { charge, scratch } = admission;
+            #[cfg(feature = "test-knobs")]
+            if let Some(path) = std::env::var_os("VOX_TEST_HOLD_ROOM_WRITE")
+                .map(std::path::PathBuf::from)
+                .filter(|path| {
+                    !publication
+                        && std::fs::read(path).is_ok_and(|bytes| bytes.as_slice() == input_channel)
+                })
+            {
+                let detail = format!(
+                    "history receiver {}; publication={publication}",
+                    std::any::type_name::<P>()
+                );
+                let _ = std::fs::write(path.with_extension("engaged"), &detail);
+                eprintln!("vox: holding {detail}");
+                while path.exists() {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                eprintln!("vox: released {detail}");
+            }
             // Every physical callback and its room guard unwind before failure releases the
             // exact reservation. Dropping the async waiter never cancels this native owner.
             let completed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

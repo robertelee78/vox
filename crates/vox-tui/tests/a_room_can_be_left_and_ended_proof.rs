@@ -57,6 +57,14 @@
 
 #![cfg(unix)]
 
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(
+    a_node_that_left_rejoins_and_posts_at_once,
+    an_unheard_departure_keeps_the_left_copy_until_a_member_returns,
+    a_waiting_rejoin_does_not_hold_independently_deferred_other_room_commands
+);
+
 #[path = "support/pty_driver.rs"]
 mod pty_driver;
 #[path = "support/room.rs"]
@@ -1645,7 +1653,9 @@ fn rejoin_ended_with_status(worker: &Worker, link: &str) -> Out {
     out
 }
 
-fn end_while_away(delegated: bool) {
+/// `through_end`: she stays away until both members have closed the ended room, so no member
+/// is left that could take her departure when she comes back and joins.
+fn end_while_away(delegated: bool, through_end: bool) {
     watchdog::arm();
     let rt = runtime();
     let tmp = support::diagnostic_tempdir();
@@ -1727,12 +1737,30 @@ fn end_while_away(delegated: bool) {
         #[cfg(not(feature = "test-knobs"))]
         worker.restart_daemon(log);
     };
-    restart_former(
-        &mut room.workers[2],
-        &tmp.path().join("carol-after-leave.err"),
-    );
+    if !through_end {
+        restart_former(
+            &mut room.workers[2],
+            &tmp.path().join("carol-after-leave.err"),
+        );
+    }
     let ender = if delegated { 1 } else { 0 };
     setup(&room.workers[ender], &["room", "end", &id]);
+    if through_end {
+        for w in &room.workers[..2] {
+            let (gone, o) = poll(w, &["room", "list"], GONE, |o| {
+                o.ok && !o.stdout.lines().any(|l| l.starts_with(&id[..12]))
+            });
+            assert!(
+                gone,
+                "APPARATUS: {} kept the ended room listed, so carol was not away through its end: {o:?}",
+                w.name
+            );
+        }
+        restart_former(
+            &mut room.workers[2],
+            &tmp.path().join("carol-after-end.err"),
+        );
+    }
     let deadline = Instant::now() + GONE;
     loop {
         let result = rejoin_ended_with_status(&room.workers[2], &link);
@@ -1777,13 +1805,22 @@ fn end_while_away(delegated: bool) {
 #[test]
 #[ignore = "real daemons and anchor; run on demand in release"]
 fn creator_end_while_away_clears_the_verified_checkpoint() {
-    end_while_away(false);
+    end_while_away(false, false);
 }
 
 #[test]
 #[ignore = "real daemons and anchor; run on demand in release"]
 fn delegated_end_while_away_gets_creator_endorsement() {
-    end_while_away(true);
+    end_while_away(true, false);
+}
+
+/// A node that left and was away while the creator ended the room, until both members had
+/// closed it, is told at its rejoin that the room has ended, and its checkpoint is cleared
+/// by the creator's verified End: no member is left to take its departure.
+#[test]
+#[ignore = "real daemons and anchor; run on demand in release"]
+fn creator_end_wound_down_while_away_clears_the_verified_checkpoint() {
+    end_while_away(false, true);
 }
 
 #[cfg(feature = "test-knobs")]
@@ -2943,4 +2980,418 @@ fn an_unreadable_store_is_left_exactly_as_it_is() {
         |out| out.ok && out.stdout.contains(marker),
     );
     assert!(problems.is_empty(), "PRODUCT: {}", problems.join("\n"));
+}
+
+/// RG-6: no roster/readiness wait or second post command between rejoining and the first post.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "two real daemons and production identity work; optional, run in release"]
+fn a_node_that_left_rejoins_and_posts_at_once() {
+    watchdog::arm();
+    let rt = runtime();
+    let tmp = support::diagnostic_tempdir();
+    let room = room_of(&rt, tmp.path(), &["alice", "bob"]);
+    let [alice, bob] = &room.workers[..] else {
+        unreachable!()
+    };
+    let id = room.id.as_str();
+    let old = "RG6 Alice before leaving";
+    alice
+        .vox(None, &["room", "post", id, old])
+        .expect_ok("APPARATUS: establish Alice's pre-leave history");
+    let (held, seen) = poll(bob, &["room", "read", id], WITHIN, |out| {
+        out.ok && out.stdout.contains(old)
+    });
+    assert!(
+        held,
+        "APPARATUS: Bob did not hold Alice's pre-leave post: {seen:?}"
+    );
+    let link = bob
+        .vox(None, &["room", "link", id])
+        .expect_ok("APPARATUS: Bob's room link")
+        .stdout
+        .trim()
+        .to_owned();
+    let started = Instant::now();
+    let left = alice.vox(None, &["room", "leave", id]);
+    eprintln!("[proof] leave after {:?}: {left:?}", started.elapsed());
+    assert!(left.ok, "PRODUCT: once-only leave was refused: {left:?}");
+    let mutant_log_offset = std::fs::metadata(tmp.path().join("alice.daemon.err"))
+        .expect("APPARATUS: stat Alice's daemon log")
+        .len() as usize;
+    let joined_at = Instant::now();
+    let joined = alice.vox_in(
+        None,
+        &["room", "join", "--passphrase-file", "-", &link],
+        Some(support::ROOM_PASS),
+    );
+    eprintln!("[proof] rejoin after {:?}: {joined:?}", joined_at.elapsed());
+    match std::env::var("VOX_MUTANT_FX28") {
+        Ok(mutant)
+            if [
+                "rejoin-purge-unheard-departure",
+                "rejoin-before-session-retirement",
+                "rejoin-answers-before-own-history",
+            ]
+            .contains(&mutant.as_str()) =>
+        {
+            let log = std::fs::read_to_string(tmp.path().join("alice.daemon.err"))
+                .expect("APPARATUS: read Alice's daemon mutant log");
+            let marker = format!("[vox mutant] engaged {mutant}");
+            assert!(
+                log.get(mutant_log_offset..)
+                    .is_some_and(|tail| tail.contains(&marker)),
+                "APPARATUS: mutant did not engage during rejoin: {marker}\n{log}"
+            );
+            eprintln!("{marker}");
+        }
+        _ => {}
+    }
+    assert!(
+        joined.ok,
+        "PRODUCT: once-only rejoin was refused: {joined:?}"
+    );
+    let text = "RG6 first post immediately after rejoining";
+    let mut command = std::process::Command::new(&alice.exe);
+    command
+        .args(["room", "post", id, text])
+        .env("VOX_DATA_DIR", &alice.data)
+        .env("VOX_CONFIG_DIR", &alice.cfg)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    support::strip_harness_env(&mut command);
+    let mut child = command.spawn().expect("APPARATUS: spawn first rejoin post");
+    let started = Instant::now();
+    while child
+        .try_wait()
+        .expect("APPARATUS: inspect first post")
+        .is_none()
+    {
+        if started.elapsed() > Duration::from_secs(35) {
+            let _ = child.kill();
+            let output = child
+                .wait_with_output()
+                .expect("APPARATUS: reap stalled post");
+            panic!(
+                "PRODUCT: first rejoin post exceeded the client's thirty-second patience plus reply allowance: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let output = child
+        .wait_with_output()
+        .expect("APPARATUS: reap first post");
+    let posted = Out {
+        ok: output.status.success(),
+        code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        argv: format!("vox room post {id} {text:?}"),
+    };
+    eprintln!(
+        "[proof] once-only first post after {:?}: {posted:?}",
+        started.elapsed()
+    );
+    assert!(
+        posted.ok,
+        "PRODUCT: once-only first post immediately after rejoining was refused: {posted:?}"
+    );
+    let (read, seen) = poll(bob, &["room", "read", id], WITHIN, |out| {
+        out.ok && out.stdout.contains(text)
+    });
+    assert!(
+        read,
+        "PRODUCT: Bob did not read the accepted first rejoin post: {seen:?}"
+    );
+    eprintln!("[proof] Bob read the once-only first rejoin post: {seen:?}");
+}
+
+/// An unheard signed departure must survive the bounded join and be deliverable later.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "two real daemons and an offline member; optional, run in release"]
+fn an_unheard_departure_keeps_the_left_copy_until_a_member_returns() {
+    watchdog::arm();
+    let rt = runtime();
+    let tmp = support::diagnostic_tempdir();
+    let mut room = room_of(&rt, tmp.path(), &["alice", "bob"]);
+    let id = room.id.clone();
+    let link = room.workers[1]
+        .vox(None, &["room", "link", &id])
+        .expect_ok("APPARATUS: Bob's room link")
+        .stdout
+        .trim()
+        .to_owned();
+    room.stop(1);
+    let alice = &room.workers[0];
+    alice
+        .vox(None, &["room", "leave", &id])
+        .expect_ok("APPARATUS: leave while Bob is offline");
+    let started = Instant::now();
+    let refused = alice.vox_in(
+        None,
+        &["room", "join", "--passphrase-file", "-", &link],
+        Some(support::ROOM_PASS),
+    );
+    eprintln!(
+        "[proof] offline rejoin after {:?}: {refused:?}",
+        started.elapsed()
+    );
+    assert!(
+        !refused.ok && refused.stderr.contains("no member of this room has acknowledged")
+            && refused.stderr.contains("the left copy was kept")
+            && refused.stderr.contains("when a member of the room is reachable"),
+        "PRODUCT: offline rejoin did not explain the unheard departure and retained copy: {refused:?}"
+    );
+    assert!(
+        started.elapsed() >= Duration::from_secs(30),
+        "PRODUCT: offline rejoin refused before the product's 30-second board patience: {refused:?}"
+    );
+    room.restart(1);
+    let alice = &room.workers[0];
+    let bob = &room.workers[1];
+    let joined = alice.vox_in(
+        None,
+        &["room", "join", "--passphrase-file", "-", &link],
+        Some(support::ROOM_PASS),
+    );
+    assert!(
+        joined.ok,
+        "PRODUCT: rejoin after Bob returned was refused: {joined:?}"
+    );
+    let text = "RG6 retained departure first post";
+    let posted = alice.vox(None, &["room", "post", &id, text]);
+    assert!(
+        posted.ok,
+        "PRODUCT: immediate post after rejoin was refused: {posted:?}"
+    );
+    let (read, seen) = poll(bob, &["room", "read", &id], WITHIN, |out| {
+        out.ok && out.stdout.contains(text)
+    });
+    assert!(
+        read,
+        "PRODUCT: Bob did not read the immediate post: {seen:?}"
+    );
+}
+
+/// The hold affects only B's receiver, not the reason A's join is waiting.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "three real daemons, an offline member and a local receiver hold; optional"]
+fn a_waiting_rejoin_does_not_hold_independently_deferred_other_room_commands() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct Release(std::path::PathBuf);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    watchdog::arm();
+    let rt = runtime();
+    let tmp = support::diagnostic_tempdir();
+    let mut room = room_of(&rt, tmp.path(), &["alice", "bob"]);
+    let (_anchor, spec) = support::spawn_anchor(&tmp.path().join("charlie-anchor"));
+    let mut charlie = support::worker(tmp.path(), "charlie");
+    support::start_daemon(&mut charlie, &spec, &tmp.path().join("charlie.daemon.err"));
+    charlie
+        .vox_in(
+            None,
+            &[
+                "room",
+                "create",
+                "--name",
+                "other",
+                "--passphrase-file",
+                "-",
+            ],
+            Some(support::ROOM_PASS),
+        )
+        .expect_ok("APPARATUS: Charlie creates B");
+    let b_link = charlie
+        .vox(None, &["room", "link", "other"])
+        .expect_ok("APPARATUS: B link")
+        .stdout
+        .trim()
+        .to_owned();
+    let b = b_link
+        .strip_prefix("vox://")
+        .expect("APPARATUS: B link scheme")
+        .split('?')
+        .next()
+        .expect("APPARATUS: B room id")
+        .to_owned();
+    room.workers[0]
+        .vox_in(
+            None,
+            &["room", "join", "--passphrase-file", "-", &b_link],
+            Some(support::ROOM_PASS),
+        )
+        .expect_ok("APPARATUS: Alice joins B");
+    for (from, to) in [(&room.workers[0], &charlie), (&charlie, &room.workers[0])] {
+        from.vox(
+            None,
+            &[
+                "trust",
+                "add",
+                &to.b32(),
+                "--name",
+                &to.name,
+                "--identity-passphrase-file",
+                from.pass.to_str().expect("APPARATUS: passphrase path"),
+            ],
+        )
+        .expect_ok("APPARATUS: trust B member");
+    }
+    let seed = "RG6 B already readable";
+    charlie
+        .vox(None, &["room", "post", &b, seed])
+        .expect_ok("APPARATUS: seed B");
+    let (read, seen) = poll(&room.workers[0], &["room", "read", &b], WITHIN, |out| {
+        out.ok && out.stdout.contains(seed)
+    });
+    assert!(read, "APPARATUS: B was not readable: {seen:?}");
+    let a = room.id.clone();
+    let a_full = vox_core::node::link::b32_encode(&room.cid);
+    let a_link = room.workers[1]
+        .vox(None, &["room", "link", &a])
+        .expect_ok("APPARATUS: A link")
+        .stdout
+        .trim()
+        .to_owned();
+    let hold = tmp.path().join("b-local-hold");
+    let log = tmp.path().join("alice-cross-room.err");
+    room.workers[0].restart_daemon_as(
+        support::VOX,
+        &[(
+            "VOX_TEST_HOLD_ROOM_WRITE",
+            hold.to_str().expect("APPARATUS: hold path"),
+        )],
+        &log,
+    );
+    let alice = &room.workers[0];
+    let (read, seen) = poll(alice, &["room", "read", &b], WITHIN, |out| {
+        out.ok && out.stdout.contains(seed)
+    });
+    assert!(
+        read,
+        "APPARATUS: B did not reopen after Alice's restart: {seen:?}"
+    );
+    alice
+        .vox(
+            None,
+            &[
+                "trust",
+                "add",
+                &charlie.b32(),
+                "--name",
+                "charlie",
+                "--identity-passphrase-file",
+                alice.pass.to_str().expect("APPARATUS: passphrase path"),
+            ],
+        )
+        .expect_ok("APPARATUS: warm Alice's trust save before the held command");
+    room.stop(1);
+    let alice = &room.workers[0];
+    alice
+        .vox(None, &["room", "leave", &a])
+        .expect_ok("APPARATUS: leave A with Bob offline");
+    let answered = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let _release = Release(hold.clone());
+        let join = scope.spawn(|| {
+            let out = alice.vox_in(
+                None,
+                &["room", "join", "--passphrase-file", "-", &a_link],
+                Some(support::ROOM_PASS),
+            );
+            answered.store(true, Ordering::SeqCst);
+            out
+        });
+        let wait_marker = |marker: &str| {
+            let start = Instant::now();
+            loop {
+                let text = std::fs::read_to_string(&log).unwrap_or_default();
+                if text.contains(marker) {
+                    eprintln!("[staging] {marker}");
+                    break;
+                }
+                assert!(
+                    !join.is_finished() && start.elapsed() < WITHIN,
+                    "APPARATUS: marker not reached while join waited: {marker}\n{text}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        wait_marker(&format!("vox: rejoin waiting for departure room={a_full}"));
+        let b_cid = vox_core::node::link::b32_decode(&b, "room").expect("APPARATUS: B full id");
+        std::fs::write(&hold, b_cid).expect("APPARATUS: arm B receiver hold");
+        charlie
+            .vox(None, &["room", "post", &b, "RG6 B receiver input"])
+            .expect_ok("APPARATUS: trigger B receiver");
+        let start = Instant::now();
+        while !hold.with_extension("engaged").exists() {
+            assert!(
+                !join.is_finished() && start.elapsed() < WITHIN,
+                "APPARATUS: B receiver did not engage while A waited"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let engaged = std::fs::read_to_string(hold.with_extension("engaged"))
+            .expect("APPARATUS: receiver marker");
+        assert!(
+            engaged.contains("publication=false"),
+            "APPARATUS: not a local receiver hold: {engaged}"
+        );
+        let first =
+            scope.spawn(|| alice.vox(None, &["room", "post", &b, "RG6 B first pending post"]));
+        // Let the first command reach B's held authored save before issuing the second.
+        std::thread::sleep(Duration::from_millis(25));
+        let second = scope.spawn(|| {
+            let out = alice.vox(
+                None,
+                &["room", "post", &b, "RG6 B independently deferred post"],
+            );
+            (out, !answered.load(Ordering::SeqCst))
+        });
+        wait_marker(&format!("vox: rejoin cross-room deferred room={b} own_post=true text=\"RG6 B independently deferred post\""));
+        let trust = scope.spawn(|| {
+            let out = alice.vox(
+                None,
+                &[
+                    "trust",
+                    "add",
+                    &charlie.b32(),
+                    "--name",
+                    "charlie",
+                    "--identity-passphrase-file",
+                    alice.pass.to_str().expect("APPARATUS: passphrase path"),
+                ],
+            );
+            (out, !answered.load(Ordering::SeqCst))
+        });
+        let read = alice.vox(None, &["room", "read", &b]);
+        let read_before = !answered.load(Ordering::SeqCst);
+        assert!(
+            !join.is_finished(),
+            "APPARATUS: A answered before B was released"
+        );
+        std::fs::remove_file(&hold).expect("APPARATUS: release B receiver");
+        let first = first.join().expect("APPARATUS: B first thread");
+        let (second, second_before) = second.join().expect("APPARATUS: B second thread");
+        let (trust, trust_before) = trust.join().expect("APPARATUS: trust thread");
+        let a_result = join.join().expect("APPARATUS: A join thread");
+        assert!(
+            read.ok && read.stdout.contains(seed) && read_before,
+            "PRODUCT: B read did not answer before A: {read:?}; A={a_result:?}"
+        );
+        assert!(first.ok && second.ok && second_before, "PRODUCT: independently deferred B post did not answer before A after B release: first={first:?}; second={second:?}; A={a_result:?}");
+        assert!(
+            trust.ok && trust_before,
+            "PRODUCT: trust did not answer before A after B release: {trust:?}; A={a_result:?}"
+        );
+    });
 }
