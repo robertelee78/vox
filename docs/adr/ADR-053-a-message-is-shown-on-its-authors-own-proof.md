@@ -10,7 +10,7 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
   measurement (ruling 9). This record writes down that acceptance; its text was not itself put to
   him. Nothing in it is built except what is named below as landed, accepted or built:
   implementation, acceptance and delivery are recorded on the source-bound issues, separately
-  from decision status.
+  from decision status. *(Amended 2026-11-23, amendment 1: the head-mismatch ruling of gpt-6.1-sol (MP-7, MP-8a, MP-9; B-10 resolved), and the coordinating session's engineering decisions on the Order and on MP-9's transport, each marked where it applies.)*
 - **Date**: 2026-11-23
 - **Deciders**: Robert E. Lee
 - **Tags**: sync, admission, governance, removal, fork detection, store, retention, compaction,
@@ -245,7 +245,7 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
   distinct tokens and distinct stored meanings, not one "validated" boolean with a branch around
   its verifier. Old or malformed entries MUST NOT gain authority through the display path; derived
   cuts and eligibility rows written under the old meaning MUST be rebuilt or versioned before the
-  new policy uses them.
+  new policy uses them. *(Amended 2026-11-23, the coordinating session's engineering decision: the separate display and cut receipt types are built as the first change of Order step 3.)*
   - *Why*: publication today requires the stronger token and installs its context and authority
     obligation (`node/channel/entry_store/sparse.rs:2107-2129,2200-2209`); authoring consumes
     settled tips and their prefix frontiers (`node/channel/local_history.rs:493-542`). A message
@@ -323,6 +323,15 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
   delays only itself. A newcomer's bootstrap MUST close the governing feeds and obtain each
   sender's own relevant control state and packages, with a pending status per sender rather than a
   barrier across all senders.
+  The holder MUST persist the entire verified control-serving trace and its complete semantic
+  verification closure under their exact original heads, atomically with the coverage/source
+  owners, and retain the signed heads, contexts and verified consistency links those owners
+  require across restart. The holder MUST answer a request under h2 using pieces owned under h1
+  only when its own retained verified commit links establish that h2 extends h1 and the reused
+  piece is the identical full aligned subtree; it MUST reconstruct other nodes from authenticated
+  inputs, leave unavailable pieces unavailable, and never insert serving pieces into the canonical
+  acceptance-range index. *(Amended 2026-11-23 by the head-mismatch ruling of gpt-6.1-sol,
+  `design/head-mismatch/ruling.md` rules 4 and 5.)*
   - *Why*: #1384 keeps inclusion and consistency witnesses but leaves `ControlRange` pieces
     cache-only (`node/history_stream/admission.rs:439-462,558-597`): a locally completed verdict is
     not a transferable proof, and "members hold the governing controls" does not mean they can
@@ -330,13 +339,24 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
     removals still stand, so closing only today's admins lets a newcomer treat a removed member as
     present (`m1-security.md` §4). Consent and reset decide rendering
     (`node/channel/governance/view.rs:169-220`); private readiness needs per-author control coverage
-    (`node/channel/private_session/pending_upgrade.rs:2327-2367`).
-  - *Proof*: (a) *the stopped author with the holder restarted and a misleading newer head first*:
-    an author stops; a holder that verified its controls restarts; a peer offers the newcomer a
-    newer signed head of that author first; the newcomer verifies the author's governing evidence
-    from the holder alone and shows the holder's posts (extends the act of `rg-6/witness/`, green on
-    v0.4.30, red on `403218281`). Mutant: keep control-range pieces cache-only. (b) *Revoked admin*:
-    an admin removes a member, then the creator revokes that admin; a newcomer joining after both
+    (`node/channel/private_session/pending_upgrade.rs:2327-2367`). Measured on main `193224043`:
+    one control entry written by an author after a holder verified it strands a newcomer joining
+    through that holder with the author stopped; the holder declines pieces it holds under the
+    earlier head (`mp/control/runs/ctl-base`, RED). *(Amended 2026-11-23, the head-mismatch ruling
+    and its question, `design/head-mismatch/question.md`.)*
+  - *Proof*: (a) *the stopped author with the holder restarted and a misleading newer head first*
+    (extends the act of `rg-6/witness/`, green on v0.4.30, red on `403218281`): "An author stops
+    after a holder has verified and durably retained the complete control closure needed by its
+    posts, including the consistency evidence linking that closure's exact heads to the newer signed
+    head used in the act; the holder restarts, a peer offers that newer head to the newcomer first,
+    and the newcomer independently verifies the required governing/dependency evidence from the
+    holder alone and shows the holder's posts after joining. If that link or any required newer
+    governing fact was never held, only the affected obligation remains pending, with no rollback
+    of its anchor and no authority granted from the unlinked alternative." Mutants: the cache-only
+    Control trace mutant and the linked-piece-lookup-disabled mutant each turn this linked
+    availability arm red. *(Amended 2026-11-23 by the head-mismatch ruling §§5 and 6.)*
+    (b) *Revoked admin*: an admin removes a member, then the creator revokes that admin; a newcomer
+    joining after both
     treats the member as removed, releases it no key and shows none of its later posts; an act of
     the admin after its revocation has no effect. Mutant: close only current admins. (c)
     *Non-admin controls*: a non-admin revokes its consent toward a member, and a second non-admin's
@@ -363,6 +383,38 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
     validator.
   - *Proof*: MP-7 (c) and (d), and MP-6 (a), green with the first alternative.
 
+- **MP-8a. An author's evidence under another signed head grants authority only across a verified
+  link.** *(Added 2026-11-23 by the head-mismatch ruling of gpt-6.1-sol, the reviewer who wrote C5
+  and C6, `design/head-mismatch/ruling.md` rules 1 to 3; it resolves B-10.)*
+  1. "The asker MUST keep its committed anchor and use a different signed head for authority only
+     through the existing consistency acceptance gates, without treating a signature, an exact
+     cited header hash, or a pending fork comparison as a consistency verdict."
+  2. "The asker MUST keep each evidence obligation's exact root, interval and referenced hashes
+     fixed, independently verify its complete required closure, and leave an unlinked
+     alternative's evidence serving-only and the affected obligation pending until continuity is
+     proved."
+  3. "The asker MUST use older linked evidence only for the exact historical facts and prefix it
+     proves, never as evidence that later controls are absent or that the newer head is
+     control-ready, and MUST wait for every newer control coordinate exposed by the operation's
+     authenticated dependencies before that operation takes effect."
+  No timeout converts a withheld link into either consistency or a fork; other already-safe work
+  stays usable.
+  - *Why*: a holder could otherwise offer an older head h1 to hide an author's later removal or key
+    change under the newer h2 the asker already holds, and an author that signed inconsistent h1
+    and h2 could have h1's authority imported while MP-9 investigates; an exact cited terminal
+    header does not authenticate every earlier control leaf under h2 (ruling §2 (a), (b)). Nothing
+    from unlinked evidence is applied, so nothing needs undoing if a fork is later proved (§2 (e)).
+    Today, with h2 committed, promoting a smaller offered h1 already asks for consistency from h1
+    to h2 under h2 (main `193224043`, `node/history_stream/admission.rs:649-669`; ruling §3); this
+    requirement keeps that gate.
+  - *Proof*: the adversarial arm of MP-7 (a): give the newcomer a newer head for which the holder
+    cannot supply a valid link to its older head, including an unequal fork with a matching overlap
+    terminal header but a differing earlier prefix; the affected operation stays pending with no
+    unsupported control or key effect while an unrelated safe sender stays readable; then supply
+    authenticated contradictory openings and assert durable fork restrictions, never a fork verdict
+    from withholding alone. Mutant: bypass continuity for historical control dependencies; this
+    arm turns red.
+
 - **MP-9. A member's split view is detectable across all authors and unequal sizes (C6).** Nodes
   MUST "Propagate all-author signed head observations through honest holders; retain unequal-size
   competing observations and request authenticated overlapping openings/prefix evidence when
@@ -371,6 +423,23 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
   The queried overlap position MUST fit both heads, and header or opening evidence MUST authenticate
   both sides under their own roots; where heads disagree about an earlier prefix although a
   terminal header matches, prefix or range evidence is compared. Withholding is not a proved fork.
+  "MP-9 MUST retain and make discoverable and retrievable the signed unequal-size observations
+  whose continuity is unresolved, including the second unlinked head, and MUST propagate verified
+  fork evidence once extracted without replacing that observation exchange with fork-proof
+  exchange alone." "MP-9 MUST authenticate both sides of an overlap within both heads, beginning
+  at m=min(|h1|,|h2|) when nonzero, continue with authenticated prefix/range comparison if
+  matching terminal headers do not establish continuity, and classify withheld or invalid relay
+  proofs as pending rather than author equivocation." *(Amended 2026-11-23 by the head-mismatch
+  ruling, rules 6 and 7.)*
+  *Transport.* A recorded fork travels between members as the proof itself (the two signed entries
+  at one position), by a `forks` list on the existing Have frame and one added query, and
+  unresolved second heads are retrievable by exact head. Today a recorded fork never leaves the
+  node that found it: it is restored only from this node's own store (`node/channel.rs:2709-2731`)
+  and the Have frame carries no forks (main `193224043`, `node/history_stream.rs:692-708`). One
+  version per room is assumed (ruling 4), so these wire additions are allowed; no new signed record
+  is added. *(Amended 2026-11-23: the coordinating session's engineering decision,
+  `exec/deviations.md` "Engineering decisions on 2026-11-23 while building ADR-053's step 2"; not
+  the decider's ruling and not the review's.)*
   - *Why*: today a message citing the forker's other branch is refused, so the room visibly stops;
     under this design messages cite nobody, and the explicit observed-conflict pair is equal-size
     only (`node/channel/entry_store/sparse.rs:2847-2854`; smaller queued hints are collapsed behind
@@ -382,7 +451,12 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
     group and a different 60-entry history to another; the groups never connect directly, only
     through an honest holder and a non-member relay. A member of each group records F's fork, and
     both groups apply the fork restrictions. A relay that withholds or corrupts the opening yields
-    pending, never a fork verdict. Mutant: keep only equal-size conflicts.
+    pending, never a fork verdict. Mutant: keep only equal-size conflicts. A second unlinked head
+    survives a restart of the member that holds it and is retrieved by exact head by a member that
+    never met that branch; a fork proof recorded by one member reaches a member that never met the
+    second branch. Mutants: exchange fork proofs only, without the unresolved observations (the
+    arm before any proof exists turns red); drop the `forks` list (the second arm turns red).
+    *(Amended 2026-11-23.)*
 
 - **MP-10. Recipient, package and private-Session boundaries are named and kept one by one.** Each
   is a distinct check today and MUST stay one:
@@ -427,7 +501,7 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
   built, no record or release note may say that membership or fork replay retracts shown text. It
   applies to the *author's* ineligible messages only: what a once-removed *recipient* rendered
   before its removal stays with it, as today (`node/channel/semantic_projection.rs:294-309`;
-  ADR-007:299-300).
+  ADR-007:299-300). *(Amended 2026-11-23, the coordinating session's engineering decision: MP-11 lands only together with MP-6, Order step 2.)*
   - *Why*: ruling 8; review §5 ("Choose the later-invalidated-row behavior explicitly") and §6
     question 2. Under MP-1 a message whose author had not heard of a removal is shown until the
     reader applies that removal (the unaware-partition window); without this requirement it would
@@ -664,16 +738,30 @@ internal paths; each step handles them.
    intervals, finite per-peer response work and holder-local `BodyNotHeld` handling complete it.
    With one version per room (ruling 4) no old-server compatibility state machine is built.
    *The work may pause here.*
-2. **The security prerequisites, while today's full validation stays active** (MP-3's distinct
-   tokens and stored meanings, MP-6's reserved tip and narrow cut with exact cut proofs, MP-9,
-   MP-7 and MP-8's durable serveable control evidence, MP-10, MP-11's disappearance of messages
-   later proven not acceptable, and per-sender bootstrap). The adversarial acts of MP-1, MP-2,
-   MP-3, MP-6, MP-7, MP-9, MP-10 (including the hidden-termination act) and MP-11 MUST be green
-   here before any admission check is weakened. Every prerequisite named in this step MUST be
+2. **The security prerequisites, while today's full validation stays active** (MP-6's reserved tip
+   and narrow cut with exact cut proofs, MP-9, MP-7, MP-8 and MP-8a's durable serveable control
+   evidence and linked serving, MP-10, MP-11's disappearance of messages later proven not
+   acceptable, together with MP-6, and per-sender bootstrap; and the map of every consumer of the
+   one validator that MP-3's types will split). The adversarial acts of MP-1, MP-2,
+   MP-3, MP-6, MP-7, MP-8a, MP-9, MP-10 (including the hidden-termination act) and MP-11 MUST be
+   green here before any admission check is weakened. Every prerequisite named in this step MUST be
    implemented and proven, not merely listed as an open question or left unexercised by these
    acts. Complete control serviceability is not put after step 4's claims.
    *The work may pause here: the old gate still wins.*
-3. **The new writer and reader policy, activated together** (MP-1, MP-2, MP-4, MP-5): no
+   *(Amended 2026-11-23: the coordinating session's engineering decisions, `exec/deviations.md`
+   "Engineering decisions on 2026-11-23 while building ADR-053's step 2"; not the decider's ruling
+   and not the review's.)* (a) MP-3's separate display and cut receipt types move from this step
+   to the first change of step 3: in this step nothing produces a display receipt (today's full
+   check admits everything), so the types would be dead code, and adding them means restructuring
+   the one validator four other slices are touching here. They are built together with their
+   producer and before the reader policy is switched, so the guard exists before any check is
+   weakened; this step delivers the consumer map (`mp/tokens/consumer-map.raw.md`). (b) MP-11
+   lands only together with MP-6. Measured on the real binary (`mp/tokens/runs/mp11-change-green.log`):
+   today's cut for a removed member falls at its last control entry, which is written before each
+   post, so the target's last witnessed posts are outside the cut; MP-11 alone would take them
+   from readers that had shown them. In the coordinating session's reading, landing MP-11 in step 2 together with MP-6 means it is already in place when step 3 switches the reader policy on, which is what the head-mismatch ruling's "must accompany that policy" requires; it is the decider's decided behaviour ("disappears") and does not wait for step 3 because it weakens no check.
+3. **The new writer and reader policy, activated together** (MP-1, MP-2, MP-4, MP-5), its first
+   change being MP-3's distinct display and cut receipt types with their producer: no
    artificial per-post carrier; still advance for real controls and cuts; display-only hints;
    effect-scoped message admission; no promotion of lightweight data to causal Complete. Derived
    cuts and eligibility are rebuilt or versioned before use, and stale work is fenced at the
@@ -857,12 +945,11 @@ Put to him on 2026-11-23 by the coordinating session.
   grants (its verdict's P3-a); a restart with a re-walk jump pending was not run by hand.
 - **B-9. Conversion**: 12 of 8,843 pruned log tails differ from their `Header` object, unexplained
   (`store-opus.md:72`); MP-14 keeps them; the cause is to be traced.
-- **B-10. OPEN, ruling pending: evidence under an older signed head.** How a reader uses an
+- **B-10. Resolved 2026-11-23: evidence under an older signed head.** How a reader uses an
   author's evidence that a holder can serve only under an older signed head of that author, when
-  the reader already holds a newer one (MP-7's "a newer announcement never retargets that
-  obligation" against MP-9's fork safety). The question is `design/head-mismatch/question.md`;
-  the ruling is to appear at `design/head-mismatch/ruling.md` and is to be written into MP-7 and
-  MP-9 as an amendment when it does. Until then MP-7 (a) and MP-9 bind as written.
+  the reader already holds a newer one. Ruled by gpt-6.1-sol (`design/head-mismatch/ruling.md`,
+  question in `question.md` beside it): continuity before authority. Written into MP-7 (rules 4
+  and 5, and proof (a)), MP-8a (rules 1 to 3) and MP-9 (rules 6 and 7).
 
 ## C1 to C9 and the security findings, by requirement
 
@@ -874,6 +961,7 @@ Put to him on 2026-11-23 by the coordinating session.
 | C4 (reserved `seen` slot; narrow branch-aware cut) | MP-6 |
 | C5 (durable serveable control evidence; governing set) | MP-7 |
 | C5 (the "full proof of everything it cites" contradiction) | MP-8, B-1 |
+| C5 and C6 (evidence under another signed head; the head-mismatch ruling) | MP-7, MP-8a, MP-9 |
 | C6 (all-author, unequal-size fork detection) | MP-9 |
 | C6 section, point 8 (`seen` as display hints) | MP-5 |
 | C6 section, point 5 (recipient, package, private boundaries) | MP-10 |
