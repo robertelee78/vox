@@ -849,7 +849,6 @@ fn net_event_name(e: &NetEvent) -> &'static str {
     match e {
         NetEvent::JoinRequest { .. } => "answering somebody's join",
         NetEvent::SyncRequest { .. } => "answering a sync",
-        NetEvent::Served { .. } => "filing a request answered off the actor",
         NetEvent::Pairwise(..) => "taking a pairwise stream",
         NetEvent::OwnKeyDonorBusy { .. }
         | NetEvent::OwnKeyDonorSlot { .. }
@@ -1617,13 +1616,6 @@ enum NetEvent {
         /// The stream's receive half.
         recv: quinn::RecvStream,
     },
-    /// A member's bounded request was answered on its connection's own task (see
-    /// `answer_off_actor`): its port exists, and a new inventory hint wakes the room.
-    Served {
-        channel_id: Digest32,
-        peer: Digest32,
-        inventory_added: bool,
-    },
     /// A peer's pairwise stream, its frames **already read** off the actor (V210-71).
     Pairwise(PairwiseIn),
     /// A bounded worker has prepared an encrypted own-key response; current authority and
@@ -2368,15 +2360,13 @@ fn spawn_stream_loop(
 }
 
 /// **A member's bounded history request is accepted and answered on its connection's own task**,
-/// authorized from the room's published snapshot ([`crate::node::channel::RoomSnapshot`]): it
-/// never waits for the actor's turn, the room's lock or this node's own saving. A peer the room
-/// does not know is read up to its opening Hello: the board record it carries goes on this
-/// node's board and to the roster admission, and it is told "not yet a member" meanwhile
-/// (ledger 91). Everything else (a room not open or not at that epoch, a departed or removed
-/// peer) goes to the actor as before: the streams come back.
+/// authorized from the room's published snapshot ([`crate::node::channel::RoomSnapshot`]): its
+/// reads of headers, proofs and bodies take neither the actor's turn nor the room's lock, so
+/// they do not wait behind this node's own pending save. Everything else (a room not open or not
+/// at that epoch, a peer the room does not know yet, a departed or removed peer) goes to the
+/// actor as before: the streams come back.
 async fn answer_off_actor(
     net: &Arc<NodeNet>,
-    tx: &mpsc::Sender<NetEvent>,
     conn: Arc<VoxConnection>,
     peer: Digest32,
     preamble: crate::node::history_stream::Preamble,
@@ -2494,13 +2484,7 @@ async fn answer_off_actor(
     drop(running);
     if let Ok((result, inventory_added, moved)) = answered {
         note_served(&serving.book, channel_id, peer, current, &result, moved);
-        let _ = tx
-            .send(NetEvent::Served {
-                channel_id,
-                peer,
-                inventory_added: current && inventory_added,
-            })
-            .await;
+        serving.answered(channel_id, peer, current && inventory_added);
     }
     None
 }
@@ -2753,16 +2737,9 @@ async fn serve_typed(
                 let (history, send, recv) = match preamble {
                     crate::node::syncstream::RequestPreamble::Legacy { .. } => (None, send, recv),
                     crate::node::syncstream::RequestPreamble::Bounded(preamble) => {
-                        let Some((send, recv)) = answer_off_actor(
-                            &net,
-                            &tx,
-                            Arc::clone(&conn),
-                            peer,
-                            preamble,
-                            send,
-                            recv,
-                        )
-                        .await
+                        let Some((send, recv)) =
+                            answer_off_actor(&net, Arc::clone(&conn), peer, preamble, send, recv)
+                                .await
                         else {
                             return;
                         };
@@ -8287,6 +8264,7 @@ impl Node {
         let own_key_completions = Arc::clone(&self.own_key_completions);
         let own_key_transition_wake = Arc::clone(&self.own_key_transition_wake);
         let post_save_wake = Arc::clone(&self.post_save_wake);
+        let serving = Arc::clone(&self.serving);
         let mut ticker = tokio::time::interval(TICK);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Preparation, cleanup, governance and package scans share one select slot. Rotate between
@@ -8420,6 +8398,22 @@ impl Node {
                     }
                 }
                 () = self.availability_wake.notified() => { self.accept_availability(); self.schedule().await; }
+                // Members answered off the actor (`answer_off_actor`): each has a port for the
+                // room held now, as the actor made sure when it accepted requests itself, and a
+                // new inventory hint wakes its room. Like any store work, not while a save is
+                // admitted: the marks wait in `Serving`, the answering tasks do not.
+                () = serving.answered_wake.notified(), if !save_pending => {
+                    let started = std::time::Instant::now();
+                    for ((channel_id, peer), inventory_added) in serving.take_answered() {
+                        self.ensure_port(&channel_id, &peer).await;
+                        if inventory_added {
+                            self.sched_rooms.insert(channel_id);
+                        }
+                    }
+                    self.note_if_stalled("filing requests answered off the actor", started);
+                    self.publish_soon();
+                    self.schedule().await;
+                }
                 () = own_key_completions.notify.notified() => {
                     for completed in own_key_completions.take() {
                         match completed {
@@ -12388,18 +12382,6 @@ impl Node {
             } => {
                 self.run_sync_session(conn, peer, channel_id, epoch, history, send, recv, false)
                     .await;
-            }
-            NetEvent::Served {
-                channel_id,
-                peer,
-                inventory_added,
-            } => {
-                // The peer spoke first: its port exists for the room held now, as the actor made
-                // sure when it accepted requests itself.
-                self.ensure_port(&channel_id, &peer).await;
-                if inventory_added {
-                    self.sched_rooms.insert(channel_id);
-                }
             }
             NetEvent::AddressesDiscovered => {
                 // Re-publish every open channel's records: the addresses in them were

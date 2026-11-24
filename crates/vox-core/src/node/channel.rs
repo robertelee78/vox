@@ -3786,7 +3786,7 @@ impl ChannelState {
             )
         };
         if let Err(e) = save {
-            self.poisoned = true;
+            self.mark_poisoned();
             self.save_error = Some(e.to_string());
             return Err(e);
         }
@@ -3868,7 +3868,7 @@ impl ChannelState {
             SEG_AUTHORS,
             &seg,
         ) {
-            self.poisoned = true;
+            self.mark_poisoned();
             self.save_error = Some(e.to_string());
             return Err(e);
         }
@@ -4078,7 +4078,7 @@ impl ChannelState {
             SEG_SERVICES,
             &seg,
         ) {
-            self.poisoned = true;
+            self.mark_poisoned();
             self.save_error = Some(e.to_string());
             return Err(e);
         }
@@ -4371,7 +4371,7 @@ impl ChannelState {
             batch.commit()
         })();
         if let Err(e) = persisted {
-            self.poisoned = true;
+            self.mark_poisoned();
             self.save_error = Some(e.to_string());
             return Err(e);
         }
@@ -4427,7 +4427,7 @@ impl ChannelState {
             SEG_KNOWN_MEMBERS,
             &seg,
         ) {
-            self.poisoned = true;
+            self.mark_poisoned();
             self.save_error = Some(e.to_string());
             return Err(e);
         }
@@ -4817,7 +4817,7 @@ impl ChannelState {
                 batch.commit()
             })();
             if let Err(e) = persisted {
-                self.poisoned = true;
+                self.mark_poisoned();
                 self.save_error = Some(e.to_string());
                 return Err(e);
             }
@@ -5194,7 +5194,7 @@ impl ChannelState {
                     SEG_TRUST_MARKS,
                     &prepared.sealed,
                 ) {
-                    self.poisoned = true;
+                    self.mark_poisoned();
                     self.save_error = Some(e.to_string());
                     return Err(e);
                 }
@@ -5294,7 +5294,7 @@ impl ChannelState {
         {
             return;
         }
-        self.poisoned = true;
+        self.mark_poisoned();
         // The original cause survives every later refusal (`save_failure`); never wrap it in
         // itself.
         if self.save_error.is_none() {

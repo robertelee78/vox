@@ -42,6 +42,11 @@ pub(crate) struct Serving {
     pub(crate) budget: Arc<Budget>,
     pub(crate) book: SharedSyncBook,
     pub(crate) inbox: Arc<HintInbox>,
+    /// The members answered since the actor last took them, by room and member; `true` when an
+    /// answer accepted a new inventory hint. See [`Self::answered`].
+    answered: StdMutex<BTreeMap<(Digest32, Digest32), bool>>,
+    /// Woken when a member is marked answered; the actor takes the marks when it next runs.
+    pub(crate) answered_wake: tokio::sync::Notify,
 }
 
 impl Serving {
@@ -52,11 +57,32 @@ impl Serving {
             budget,
             book,
             inbox,
+            answered: StdMutex::new(BTreeMap::new()),
+            answered_wake: tokio::sync::Notify::new(),
         }
     }
 
     fn rooms(&self) -> std::sync::MutexGuard<'_, BTreeMap<Digest32, Entry>> {
         self.rooms.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A finished answer marks its member and wakes the actor, never waiting for it. What the
+    /// actor does with answers (make sure of the member's port, wake the room for a new
+    /// inventory hint) is the same for one as for many, so the marks coalesce: one per room and
+    /// member however many answers finish while the actor is busy, and no task is left waiting.
+    pub(crate) fn answered(&self, id: Digest32, peer: Digest32, inventory_added: bool) {
+        *self
+            .answered
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry((id, peer))
+            .or_default() |= inventory_added;
+        self.answered_wake.notify_one();
+    }
+
+    /// The members answered since the last take (see [`Self::answered`]).
+    pub(crate) fn take_answered(&self) -> BTreeMap<(Digest32, Digest32), bool> {
+        std::mem::take(&mut *self.answered.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     /// Answer `id` from this room instance from now on; answers for a replaced instance end.

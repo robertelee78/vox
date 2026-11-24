@@ -1,6 +1,7 @@
 //! The room's published read snapshot: what answering another member needs, taken from the room
-//! after every committed history write, so that a request is authorized and read without the
-//! room's lock, the node actor's turn or this node's own pending save.
+//! after every committed history write, so that a member's requests for headers, proofs and
+//! bodies are authorized and read without the room's lock, the node actor's turn or this node's
+//! own pending save.
 //!
 //! It holds the room's key, its epoch, who its authors and members are, who left and who may
 //! recover its own history, frozen authors, inventory incarnations and role state. It holds no
@@ -123,21 +124,52 @@ pub(super) fn departed_as_member(author: &Digest32, me: &Digest32) -> bool {
     }
 }
 
+/// `VOX_MUTANT_POISON_KEEPS_SNAPSHOT` (test-knobs only): a poisoned room keeps the snapshot it
+/// last published, through its poisoning and every publication after it; said as it is poisoned.
+fn poison_keeps_snapshot(room: &Digest32, say: bool) -> bool {
+    #[cfg(feature = "test-knobs")]
+    if std::env::var_os("VOX_MUTANT_POISON_KEEPS_SNAPSHOT").is_some() {
+        if say {
+            eprintln!(
+                "vox: VOX_MUTANT_POISON_KEEPS_SNAPSHOT engaged: room {} keeps its snapshot",
+                crate::node::link::b32_encode(room)
+            );
+        }
+        return true;
+    }
+    let _ = (room, say);
+    false
+}
+
 impl ChannelState {
     /// The cell serving reads this room's published snapshot from.
     pub(crate) fn room_snapshot(&self) -> Arc<RoomSnapshotCell> {
         Arc::clone(&self.room_snapshot)
     }
 
-    /// Publish what serving needs after a committed history write. A poisoned room serves
-    /// nothing, as its room-locked reads did not.
+    /// Publish what serving needs after a committed history write. A poisoned room publishes
+    /// nothing (see [`Self::mark_poisoned`]).
     pub(crate) fn publish_room_snapshot(&self, store: &Store) {
-        let snapshot = if self.poisoned {
-            None
-        } else {
+        let snapshot = if !self.poisoned {
             self.capture_room_snapshot(store).ok().map(Arc::new)
+        } else if poison_keeps_snapshot(&self.channel_id, false) {
+            return;
+        } else {
+            None
         };
         self.room_snapshot.set(snapshot);
+    }
+
+    /// The one way a room becomes poisoned. Its published snapshot is revoked in the same step,
+    /// so a poisoned room answers nobody's request: there is no snapshot to answer from, and none
+    /// is published while it stays poisoned. Its storage recovery opens a new room instance,
+    /// which publishes its own snapshot when the actor installs it (`Node::open_room`).
+    pub(super) fn mark_poisoned(&mut self) {
+        let keeps = poison_keeps_snapshot(&self.channel_id, !self.poisoned);
+        self.poisoned = true;
+        if !keeps {
+            self.room_snapshot.revoke();
+        }
     }
 
     fn capture_room_snapshot(&self, store: &Store) -> Result<RoomSnapshot> {

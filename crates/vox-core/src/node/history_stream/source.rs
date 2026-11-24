@@ -271,8 +271,10 @@ impl Source {
         }
     }
 
-    /// Answer a peer from the room's published snapshot (see [`RoomSnapshot`]): no read of
-    /// this source waits on the room's lock, the actor or this node's own pending save.
+    /// Answer a peer from the room's published snapshot (see [`RoomSnapshot`]): its reads of
+    /// headers, proofs and bodies wait on neither the room's lock, the actor nor this node's own
+    /// pending save. Served inventory still takes the store's writer
+    /// ([`Self::flush_authors_before_ack`], a changed decline's forget).
     pub(super) fn serving(mut self, snapshot: Arc<RoomSnapshotCell>) -> Self {
         self.snapshot = Some(snapshot);
         self

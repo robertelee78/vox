@@ -11408,14 +11408,27 @@ fn a_returned_author_knows_the_newcomer_admitted_while_it_was_away() {
     rg1::a_returned_author_knows_the_newcomer();
 }
 
-/// A member whose own room save is held still answers another member at once: the reader, back
-/// after the author posted, shows the author's posts while the author's save stays held, the
-/// only holder of their headers and proofs being the author.
+/// A member whose own room save is held still answers another member's requests for headers,
+/// proofs and bodies at once: the reader, back after the author posted, shows the author's posts
+/// while the author's save stays held, the only holder of their headers and proofs being the
+/// author.
 #[cfg(feature = "optional-proofs")]
 #[test]
 #[ignore = "three real daemons and a held save; optional"]
 fn a_member_whose_own_save_is_held_still_answers() {
     rg1::a_held_member_answers();
+}
+
+/// A member whose room cannot save (poisoned, as a failed write poisons it) answers nobody that
+/// room's history, and answers again once the room has recovered: the reader, back after the
+/// author posted, does not show the author's post while the author turns its requests away, and
+/// shows it once the author's room can save again. RED PRODUCT when the reader shows the post
+/// while the author's room is poisoned. Mutant: `VOX_MUTANT_POISON_KEEPS_SNAPSHOT`.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "three real daemons and a poisoned room; optional"]
+fn a_member_whose_room_cannot_save_answers_nobody_until_it_recovers() {
+    rg1::a_poisoned_member_answers_nobody();
 }
 
 /// A flow whose body ask the holder answered Busy, and whose holder then stopped, gives back its
@@ -13059,6 +13072,168 @@ mod rg1 {
             "RED PRODUCT: bob, back after alice posted, did not show {wanted:?} within {BOUND:?} \
              while alice's own save was held; carol serves bob only heads, so only alice could \
              answer him"
+        );
+    }
+
+    /// See [`super::a_member_whose_room_cannot_save_answers_nobody_until_it_recovers`]. As in
+    /// [`a_held_member_answers`], Carol serves Bob only heads, so Bob's headers, proofs and
+    /// bodies come from Alice alone. Alice's room is poisoned (`VOX_TEST_POISON_ROOM_FILE`: as a
+    /// failed write poisons it, and its storage recovery fails while the file names it) before
+    /// Bob starts again; the file is removed once Alice has turned two of Bob's requests away.
+    pub(super) fn a_poisoned_member_answers_nobody() {
+        const MUTANT: &str = "VOX_MUTANT_POISON_KEEPS_SNAPSHOT";
+        const STAGING: Duration = Duration::from_secs(120);
+        const RECOVERED: Duration = Duration::from_secs(180);
+        let root = root();
+        let exe = binary();
+        crate::test_knobs::require_in(
+            &exe,
+            &[
+                "VOX_TEST_HEADS_ONLY_FILE",
+                "VOX_TEST_POISON_ROOM_FILE",
+                "to the actor: no snapshot",
+            ],
+        );
+        if std::env::var_os(MUTANT).is_some() {
+            crate::test_knobs::require_in(&exe, &["VOX_MUTANT_POISON_KEEPS_SNAPSHOT engaged"]);
+        }
+        let alice = room::worker_as(root.path(), "sick-alice", &exe);
+        let carol = room::worker_as(root.path(), "sick-carol", &exe);
+        let bob = room::worker_as(root.path(), "sick-bob", &exe);
+        let poison = alice.data.with_extension("poison");
+        let heads_only = carol.data.with_extension("heads-only");
+        std::fs::write(&heads_only, bob.b32()).expect("APPARATUS: heads-only staging file");
+        let _alice_daemon = start_with(
+            &alice,
+            "127.0.0.1:0",
+            None,
+            &[("VOX_TEST_POISON_ROOM_FILE", poison.clone())],
+        );
+        let _carol_daemon = start_with(
+            &carol,
+            "127.0.0.1:0",
+            None,
+            &[("VOX_TEST_HEADS_ONLY_FILE", heads_only.clone())],
+        );
+        let bob_daemon = start(&bob, "127.0.0.1:0", None);
+        for (w, peers) in [
+            (&alice, [&bob, &carol]),
+            (&bob, [&alice, &carol]),
+            (&carol, [&alice, &bob]),
+        ] {
+            for peer in peers {
+                w.vox_env(
+                    None,
+                    &[("VOX_IDENTITY_PASSPHRASE", room::ID_PASS)],
+                    &["trust", "add", &peer.b32(), "--name", &peer.name],
+                    None,
+                )
+                .expect_ok("trust before the room");
+            }
+        }
+        let id = create(&alice);
+        let link = alice.vox(None, &["room", "link", &id]);
+        link.expect_ok("alice room link");
+        for w in [&bob, &carol] {
+            w.vox_in(
+                None,
+                &["room", "join", "--passphrase-file", "-", link.stdout.trim()],
+                Some(room::ROOM_PASS),
+            )
+            .expect_ok("join alice's room");
+            returning_reader_ready(w, &id);
+        }
+        post(&alice, &id, "SICK-A-00", true);
+        await_shown(&bob, &id, "SICK-A-00");
+        await_shown(&carol, &id, "SICK-A-00");
+        bob_daemon.stop();
+        eprintln!("[sick] bob stopped");
+        for n in 1..=5 {
+            post(&alice, &id, &format!("SICK-A-{n:02}"), true);
+        }
+        await_shown(&carol, &id, "SICK-A-05");
+        let wanted = "SICK-A-05";
+        let alice_err = alice.data.with_extension("err");
+        let log = || std::fs::read_to_string(&alice_err).unwrap_or_default();
+        let unhealthy = || alice.vox(None, &["status", "--json"]).json()["unhealthy"].clone();
+        std::fs::write(&poison, &id).expect("APPARATUS: name alice's room in the poison file");
+        let engaged = format!("VOX_TEST_POISON_ROOM_FILE engaged: room {id} cannot save");
+        let staging = Instant::now();
+        while !log().contains(&engaged) {
+            assert!(
+                staging.elapsed() < STAGING,
+                "APPARATUS: NO RESULT: alice's room was never poisoned; see {}",
+                alice_err.display()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        eprintln!("[sick] alice's room cannot save: {}", unhealthy());
+        let turned_away = format!(
+            "history request peer={} to the actor: no snapshot",
+            bob.b32()
+        );
+        let back = Instant::now();
+        let _bob_daemon = start(&bob, "127.0.0.1:0", None);
+        loop {
+            if read(&bob, &id, Some(wanted)).0.contains(wanted) {
+                panic!(
+                    "RED PRODUCT: bob showed {wanted:?} {:?} after starting while alice's room \
+                     could not save; carol serves bob only heads, so alice answered him from a \
+                     poisoned room (alice unhealthy: {}; {MUTANT} engaged {} times)",
+                    back.elapsed(),
+                    unhealthy(),
+                    log()
+                        .matches("VOX_MUTANT_POISON_KEEPS_SNAPSHOT engaged")
+                        .count()
+                );
+            }
+            if log().matches(turned_away.as_str()).count() >= 2 {
+                break;
+            }
+            assert!(
+                back.elapsed() < STAGING,
+                "APPARATUS: NO RESULT: in {STAGING:?} bob neither showed {wanted:?} nor asked \
+                 alice twice while her room could not save; bob's status: {}",
+                status(&bob, &id)
+            );
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        assert!(
+            !read(&bob, &id, Some(wanted)).0.contains(wanted),
+            "RED PRODUCT: bob showed {wanted:?} after alice turned two of his requests away \
+             while her room could not save"
+        );
+        eprintln!(
+            "[sick] alice turned bob away twice {:?} after he started, her room still unable to \
+             save ({}); bob does not show {wanted:?}",
+            back.elapsed(),
+            unhealthy()
+        );
+        std::fs::remove_file(&poison).expect("APPARATUS: let alice's room save again");
+        let healed = Instant::now();
+        let shown = loop {
+            if read(&bob, &id, Some(wanted)).0.contains(wanted) {
+                break Some(healed.elapsed());
+            }
+            if healed.elapsed() > RECOVERED {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        };
+        eprintln!(
+            "[sick] bob showed {wanted:?} {shown:?} after alice's room could save again; alice \
+             unhealthy: {}; bob's status: {}",
+            unhealthy(),
+            status(&bob, &id)
+        );
+        assert!(
+            shown.is_some(),
+            "RED PRODUCT: once alice's room could save again, bob did not show {wanted:?} within \
+             {RECOVERED:?}"
+        );
+        eprintln!(
+            "GREEN: while alice's room could not save she answered bob nothing, and once it \
+             recovered bob showed {wanted:?}"
         );
     }
 
