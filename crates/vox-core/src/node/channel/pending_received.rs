@@ -131,9 +131,20 @@ impl ChannelState {
                 .min(context.coordinates.len());
             let mut waiting = None;
             for coordinate in &context.coordinates[cursor.next..end] {
-                let (head, control) = input
-                    .history_validated_header(&coordinate.author, coordinate.seq)?
-                    .ok_or(Error::MalformedAtRest("validated history control vanished"))?;
+                let Some((head, control)) =
+                    input.history_validated_header(&coordinate.author, coordinate.seq)?
+                else {
+                    // `VOX_MUTANT_TERMINATION=admitted` (test-knobs, ADR-053 MP-10 (c)): an
+                    // absent control of the entry's own author (its withheld termination) is
+                    // passed over.
+                    if coordinate.author == header.skeleton.author_id
+                        && super::governance::termination_admitted()
+                    {
+                        cursor.next += 1;
+                        continue;
+                    }
+                    return Err(Error::MalformedAtRest("validated history control vanished"));
+                };
                 if control.entry_hash() != coordinate.hash {
                     return Err(Error::MalformedAtRest("history control binding changed"));
                 }

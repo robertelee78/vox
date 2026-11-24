@@ -2476,6 +2476,12 @@ impl Flow {
                     head,
                     size: target_through,
                 });
+                // `VOX_MUTANT_TERMINATION=admitted` (test-knobs, ADR-053 MP-10 (c)): the head's
+                // control closure goes below its ordinary-body work instead of above it, so a
+                // body is fetched and validated while a control under the head is withheld.
+                if crate::node::channel::governance::termination_admitted() {
+                    self.push_control_closure(&task, window)?;
+                }
                 if !window.complete() {
                     self.live_visited = true;
                     // Each staged body needs a fresh demand ID, even though its enclosing

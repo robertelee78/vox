@@ -1964,7 +1964,7 @@ impl<'s> Write<'_, 's> {
             if entry.skeleton.seq >= state.tail_seq {
                 state.tail_seq = entry.skeleton.seq;
                 state.tail_hash = entry.entry_hash();
-                state.ended = entry.skeleton.end_of_feed;
+                state.ended = crate::log::feed::ends_feed(entry);
             }
             if entry.is_signed() {
                 state.pending_witness = state.pending_witness.max(entry.skeleton.seq);

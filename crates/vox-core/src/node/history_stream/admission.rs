@@ -1122,12 +1122,17 @@ pub(super) fn preflight(
         // control coordinates named in its frontier. Finish it before taking a body
         // slot; validation then cannot recursively discover an earlier control.
         let through = receipt.prefix().prefix().leaves;
+        // `VOX_MUTANT_TERMINATION=admitted` (test-knobs, ADR-053 MP-10 (c)): the author's own
+        // parent prefix is not waited for.
+        let own_unchecked =
+            own == 1 && parent == 0 && crate::node::channel::governance::termination_admitted();
         for effects in [false, true] {
-            let complete = if effects {
-                input.control_effects_complete(&parent_head, through)?
-            } else {
-                input.control_sources_complete(&parent_head, through)?
-            };
+            let complete = own_unchecked
+                || if effects {
+                    input.control_effects_complete(&parent_head, through)?
+                } else {
+                    input.control_sources_complete(&parent_head, through)?
+                };
             if !complete {
                 return Ok(Preflight::Control {
                     head: parent_head,
@@ -1153,6 +1158,13 @@ pub(super) fn preflight(
         let Some((control_head, control)) =
             input.history_validated_header(&coordinate.author, coordinate.seq)?
         else {
+            // `VOX_MUTANT_TERMINATION=admitted`: an absent control of the entry's own author
+            // (its withheld termination) is passed over.
+            if coordinate.author == entry.skeleton.author_id
+                && crate::node::channel::governance::termination_admitted()
+            {
+                continue;
+            }
             let Some(control_head) = input
                 .sparse_author(&coordinate.author, LogScope::Public)?
                 .and_then(|state| state.committed)

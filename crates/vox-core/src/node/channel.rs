@@ -2539,7 +2539,7 @@ impl ChannelState {
             if entry.skeleton.channel_id != *channel_id
                 || entry.skeleton.epoch != epoch
                 || entry.entry_hash() != head.hash
-                || entry.skeleton.end_of_feed != head.ended
+                || crate::log::feed::ends_feed(&entry) != head.ended
             {
                 return Err(Error::MalformedAtRest("restart head source differs"));
             }
@@ -8143,7 +8143,11 @@ impl ChannelState {
             // body, whichever peer relayed it. Already rendered or cached plaintext stays.
             let fetched;
             let held = match pending_sparse_entry {
-                _ if !self.recipient_removal_row_in(batch, &me)? => None,
+                _ if governance::render_every_body()
+                    || !self.recipient_removal_row_in(batch, &me)? =>
+                {
+                    None
+                }
                 Some(entry) => Some(entry),
                 None => {
                     fetched = self.dag.get_by_hash(

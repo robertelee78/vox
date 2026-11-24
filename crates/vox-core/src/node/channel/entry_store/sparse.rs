@@ -1526,6 +1526,16 @@ impl Read<'_> {
             .unwrap_or(0)
             >= through)
     }
+    /// The position at which `author` terminated its feed, once that Termination is a held
+    /// source here (recorded at publication, `index_source_head`).
+    pub(crate) fn history_termination(&self, author: &Digest32) -> Result<Option<u64>> {
+        self.source().number(
+            self.sek,
+            self.channel,
+            self.directory.active.sparse.terminations,
+            &hashed(author),
+        )
+    }
     pub(crate) fn history_position_header(
         &self,
         author: &Digest32,

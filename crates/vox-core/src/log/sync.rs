@@ -1678,11 +1678,17 @@ where
 ///   its signature intact;
 /// - `author-unclassifiable` (V210-74): what it posts is a signed entry whose payload is neither a
 ///   governance body nor a sender-key message;
-/// - `author-misbound` (V210-74): what it posts is a signed consent grant whose body names an
-///   epoch 7 past the entry's own, so it classifies as governance and does not bind;
+/// - `author-misbound` (V210-74): what it posts is a consent grant signed with kind Governance
+///   whose body names an epoch 7 past the entry's own, so it is governance and does not bind; its
+///   own node skips that binding (`GovEntry::body_bound_to`) so it holds and serves the grant;
 /// - `refuse-sessions` (PRD-001 R36, #85): it refuses every sync session a peer opens to it, with
 ///   the coded reason `EpochMismatch`, so the peer's session ends as the peer's refusal and the
 ///   correct node's log is what a proof reads.
+/// - `terminate-and-withhold` (ADR-053 MP-10 (c)): the first post this process makes is preceded
+///   by a signed `Termination` of its own feed, and it keeps posting after it; its history server
+///   never serves a `Termination` header (Entry, Header and control-range answers), so a reader
+///   learns of later positions while the termination stays hidden;
+/// - `terminated-serves`: it keeps a feed it terminated open, as above, and serves everything.
 ///
 /// Any other value, or none, sends correctly. The first session announces the build and the mode
 /// on stderr, [`MARKER`](mutant::MARKER), which the proofs require before they measure anything.
@@ -1705,6 +1711,8 @@ pub mod mutant {
         WithdrawUnentitled,
         AdminUnentitled,
         RefuseSessions,
+        TerminateAndWithhold,
+        TerminatedServes,
     }
 
     fn mode() -> Mode {
@@ -1721,6 +1729,8 @@ pub mod mutant {
                 "withdraw-unentitled" => Mode::WithdrawUnentitled,
                 "admin-unentitled" => Mode::AdminUnentitled,
                 "refuse-sessions" => Mode::RefuseSessions,
+                "terminate-and-withhold" => Mode::TerminateAndWithhold,
+                "terminated-serves" => Mode::TerminatedServes,
                 _ => Mode::Correct,
             };
             eprintln!(
@@ -1742,6 +1752,28 @@ pub mod mutant {
     #[must_use]
     pub fn admins_unentitled() -> bool {
         mode() == Mode::AdminUnentitled
+    }
+
+    /// `terminate-and-withhold`: true exactly once per process, for the post that is to be
+    /// preceded by this author's own `Termination`.
+    #[must_use]
+    pub fn terminates_now() -> bool {
+        static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        mode() == Mode::TerminateAndWithhold
+            && !DONE.swap(true, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Both `terminate*` modes: this node treats no feed as ended, so it can write and reopen its
+    /// own feed past the `Termination` it signed.
+    #[must_use]
+    pub fn keeps_writing_after_end() -> bool {
+        matches!(mode(), Mode::TerminateAndWithhold | Mode::TerminatedServes)
+    }
+
+    /// `terminate-and-withhold`: this signed header is a `Termination` and is not served.
+    #[must_use]
+    pub fn withholds(entry: &Entry) -> bool {
+        mode() == Mode::TerminateAndWithhold && entry.skeleton.end_of_feed
     }
 
     /// The `HAVE` to send, and the entries to serve unasked.
@@ -1801,7 +1833,12 @@ pub mod mutant {
             | Mode::AuthorMisbound
             | Mode::WithdrawUnentitled
             | Mode::AdminUnentitled
-            | Mode::RefuseSessions => asked,
+            | Mode::RefuseSessions
+            | Mode::TerminatedServes => asked,
+            Mode::TerminateAndWithhold => asked
+                .into_iter()
+                .filter(|w| Entry::from_wire(w).map_or(true, |e| !withholds(&e)))
+                .collect(),
             Mode::ServeNothing => Vec::new(),
             Mode::ServeUnasked => asked.into_iter().chain(unasked).collect(),
             Mode::StripPayload => asked
@@ -1817,8 +1854,16 @@ pub mod mutant {
         }
     }
 
+    /// `strip-payload`: an ordinary body asked for on the history path is answered as not held
+    /// (its header only), as the legacy serve above strips every payload.
+    #[must_use]
+    pub fn strips_payload() -> bool {
+        mode() == Mode::StripPayload
+    }
+
     /// Whether what this build posts is a governance body bound to another epoch
-    /// (`author-misbound`): a signed consent grant whose body epoch is the entry's own plus 7.
+    /// (`author-misbound`): a consent grant signed with kind Governance whose body epoch is the
+    /// entry's own plus 7.
     #[must_use]
     pub fn misbound() -> bool {
         mode() == Mode::AuthorMisbound

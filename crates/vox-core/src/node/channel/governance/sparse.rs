@@ -486,11 +486,29 @@ impl SparseValidation {
                 ));
             }
             let through = parent.prefix.prefix().leaves;
-            if !input.control_sources_complete(&parent.included.head_id(), through)? {
+            // ADR-053 MP-10: the author-local termination evidence. The own parent's prefix
+            // is this author's own signed head and positions; every control it commits,
+            // a Termination among them, must be a held source before a later position is
+            // usable, so a withheld termination keeps this entry pending, never accepted.
+            let own_parent = self.parent == 0 && entry.skeleton.seq > 1;
+            let waits = !(own_parent && termination_unchecked());
+            if waits && !input.control_sources_complete(&parent.included.head_id(), through)? {
                 return Ok(SparseValidationStep::ControlPrefixPending {
                     head: parent.included.head_id(),
                     through,
                 });
+            }
+            // A termination in that prefix is now recorded: a later position is the
+            // author's fault, refused here rather than at publication.
+            if own_parent
+                && !termination_unchecked()
+                && input
+                    .history_termination(&entry.skeleton.author_id)?
+                    .is_some_and(|end| entry.skeleton.seq > end)
+            {
+                return Err(Error::MalformedBundle(
+                    "sparse entry follows its author's termination",
+                ));
             }
             if !budget.take_context_load() {
                 return Ok(SparseValidationStep::Yielded);
@@ -546,8 +564,10 @@ impl SparseValidation {
                 if !budget.take_control_lookup() {
                     return Ok(SparseValidationStep::Yielded);
                 }
-                if let Some(pending) = validate_control_coordinate(input, &pre, earlier)? {
-                    return Ok(pending);
+                if !(termination_unchecked() && earlier.author == entry.skeleton.author_id) {
+                    if let Some(pending) = validate_control_coordinate(input, &pre, earlier)? {
+                        return Ok(pending);
+                    }
                 }
                 self.parent_coordinate += 1;
             }
@@ -567,8 +587,10 @@ impl SparseValidation {
             if !budget.take_control_lookup() {
                 return Ok(SparseValidationStep::Yielded);
             }
-            if let Some(pending) = validate_control_coordinate(input, &pre, coordinate)? {
-                return Ok(pending);
+            if !(termination_unchecked() && coordinate.author == entry.skeleton.author_id) {
+                if let Some(pending) = validate_control_coordinate(input, &pre, coordinate)? {
+                    return Ok(pending);
+                }
             }
             self.coordinate += 1;
         }
@@ -582,6 +604,55 @@ impl SparseValidation {
             payload_state: self.payload_state,
         }))
     }
+}
+
+/// `VOX_MUTANT_TERMINATION=unchecked` (ADR-053 MP-10 (c)): accept a later position without the
+/// author-local termination evidence — no wait for the author's own control prefix or own
+/// context coordinates, no read of its recorded termination. `admitted` does the same, and
+/// [`termination_admitted`] holds too. Says so once when first read.
+#[cfg(feature = "test-knobs")]
+fn termination_unchecked() -> bool {
+    termination_mode().is_some()
+}
+
+#[cfg(not(feature = "test-knobs"))]
+const fn termination_unchecked() -> bool {
+    false
+}
+
+/// `VOX_MUTANT_TERMINATION=admitted` (ADR-053 MP-10 (c)): a later position is admitted as a
+/// source while its author's termination is withheld. Besides [`termination_unchecked`] here,
+/// every other place that needs the author's own controls under the head passes over them when
+/// absent: admission's preflight (`history_stream/admission.rs`), the effect stage
+/// (`pending_received.rs`), and the history runtime, which fetches a head's ordinary bodies
+/// before that head's control closure.
+#[cfg(feature = "test-knobs")]
+pub(crate) fn termination_admitted() -> bool {
+    termination_mode() == Some("admitted")
+}
+
+#[cfg(not(feature = "test-knobs"))]
+pub(crate) const fn termination_admitted() -> bool {
+    false
+}
+
+#[cfg(feature = "test-knobs")]
+fn termination_mode() -> Option<&'static str> {
+    static MODE: std::sync::LazyLock<Option<&'static str>> = std::sync::LazyLock::new(|| {
+        let mode = match std::env::var("VOX_MUTANT_TERMINATION").as_deref() {
+            Ok("unchecked") => Some("unchecked"),
+            Ok("admitted") => Some("admitted"),
+            _ => None,
+        };
+        if let Some(mode) = mode {
+            eprintln!(
+                "vox: VOX_MUTANT_TERMINATION={mode} engaged: later positions accepted without \
+                 the author's own termination evidence"
+            );
+        }
+        mode
+    });
+    *MODE
 }
 
 fn validate_control_coordinate(
