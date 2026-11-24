@@ -1475,14 +1475,16 @@ final class NodeModel: ObservableObject {
                 && epoch == nodeObservationEpoch && revision == roomMessageRevision
                 && follows == timelineFollowingNewest
         }
+        // The older window's selection is what it asked for, not only what came back: a row left
+        // out while it is not shown (a placeholder whose decision is open) is asked for again, in
+        // its place, and returns to the window once it is shown, also when nothing of the window
+        // is shown meanwhile. An older window is open while the newest is not followed and it
+        // shows rows or asked for some.
+        let window = instance.map { "\(id)|\(viewGeneration)|\($0.base64EncodedString())" }
+        let previous = window != nil && roomWindowSelection.window == window
+            ? roomWindowSelection : (window: window ?? "", ids: [], unanswered: Set<String>())
         do {
-            if !follows, let instance, !loaded.isEmpty {
-                // The window's selection is what it asked for, not only what came back: a row
-                // left out while it is not shown (a placeholder whose decision is open) is asked
-                // for again, in its place, and returns to the window once it is shown.
-                let window = "\(id)|\(viewGeneration)|\(instance.base64EncodedString())"
-                let previous = roomWindowSelection.window == window
-                    ? roomWindowSelection : (window: window, ids: [], unanswered: Set<String>())
+            if !follows, let instance, let window, !(loaded.isEmpty && previous.ids.isEmpty) {
                 let held = Set(loaded)
                 var before: [String: [String]] = [:], waiting: [String] = []
                 for prior in previous.ids {
