@@ -634,6 +634,12 @@ pub async fn find(
 /// as having woken it, fetched by hash, and every row after the oldest of them, where a reply to
 /// any of them can be. Not the room's whole history.
 ///
+/// A message that comes back after a removal took it away arrives again, after replies made to
+/// it before (ADR-053 MP-11), so the node refuses a read from its hash. Read from the position
+/// recorded for each wake: a record written before positions (nothing writes a new one since
+/// d1dec07b3) is read from the oldest wake's hash, and, when the node refuses it, once from the
+/// room's first message, which records each wake's position so no later post does that again.
+///
 /// # Errors
 /// If the node cannot answer.
 pub async fn wake_context(
@@ -643,48 +649,91 @@ pub async fn wake_context(
     session: &str,
     room: &str,
 ) -> Result<Vec<MessageRow>, AppError> {
-    let entries: Vec<Digest32> = crate::wake::recorded_wakes(paths, session, room)
+    let recorded: Vec<(String, Digest32, Option<HistoryCursor>)> =
+        crate::wake::recorded_wakes(paths, session, room)
+            .into_iter()
+            .filter_map(|(entry, at)| {
+                let hash = vox_core::node::link::b32_decode(entry.trim(), "wake").ok()?;
+                let at = match at.as_deref().and_then(Since::position) {
+                    Some(Since::At(at)) => Some(at),
+                    _ => None,
+                };
+                Some((entry, hash, at))
+            })
+            .collect();
+    if recorded.is_empty() {
+        return Ok(Vec::new());
+    }
+    let entries: Vec<Digest32> = recorded.iter().map(|(_, hash, _)| *hash).collect();
+    let found = find(client, channel_id, &entries).await?;
+    // `Find` answers in display order; replies follow a wake by arrival.
+    let Some(oldest) = found.iter().min_by_key(|r| r.arrival).map(|r| r.entry_hash) else {
+        return Ok(Vec::new());
+    };
+    let positions: Option<Vec<HistoryCursor>> = found
         .iter()
-        .filter_map(|e| vox_core::node::link::b32_decode(e.trim(), "wake").ok())
+        .map(|r| {
+            recorded
+                .iter()
+                .find(|(_, hash, _)| *hash == r.entry_hash)
+                .and_then(|(_, _, at)| *at)
+        })
         .collect();
-    if entries.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut found: Vec<MessageRow> = Vec::new();
-    for chunk in entries.chunks(vox_core::node::ipc::MAX_FIND) {
-        match ask(
-            client,
-            &Request::Find {
-                channel_id,
-                entries: chunk.to_vec(),
-            },
-        )
-        .await?
-        {
-            Frame::Rows { rows } => found.extend(rows),
-            other => return Err(crate::client::unexpected(&other)),
-        }
-    }
-    let Some(oldest) = found.first().map(|r| r.entry_hash) else {
-        return Ok(Vec::new());
+    let from = positions.and_then(|at| at.into_iter().min_by_key(|at| at.arrival));
+    let positioned = match from {
+        Some(from) => feed(client, channel_id, Since::At(from), 0).await?,
+        None => None,
+    };
+    let after = match positioned {
+        Some(feed) => feed.rows,
+        // No position recorded (or one of another saved instance of the room): from the oldest
+        // wake's hash.
+        None => match feed(client, channel_id, Since::Message(oldest), 0).await {
+            Ok(Some(feed)) => feed.rows,
+            Ok(None) => {
+                return Err(AppError::Usage(
+                    "the message that woke this session is not in the room's timeline".into(),
+                ))
+            }
+            Err(AppError::Usage(reason)) if reason == vox_core::node::ipc::CAME_BACK => {
+                let head = match ask(client, &Request::ArrivalHead { channel_id }).await? {
+                    Frame::ArrivalHead { head } => head,
+                    other => return Err(crate::client::unexpected(&other)),
+                };
+                let all = read_all(client, channel_id, None).await?;
+                // Each wake's replies come after it and after its first reply seen; one with
+                // neither in the room is replied to after now.
+                let positions: Vec<(String, String)> = recorded
+                    .iter()
+                    .map(|(entry, hash, _)| {
+                        let re = b32_encode(hash);
+                        let first = all
+                            .iter()
+                            .filter(|r| {
+                                r.entry_hash == *hash
+                                    || Envelope::parse(&r.text).is_ok_and(|e| {
+                                        e.re.is_some_and(|x| x.trim().eq_ignore_ascii_case(&re))
+                                    })
+                            })
+                            .map(|r| r.arrival.saturating_sub(1))
+                            .min()
+                            .unwrap_or(head.arrival);
+                        let at = Since::At(HistoryCursor {
+                            instance: head.instance,
+                            arrival: first,
+                        });
+                        (entry.clone(), at.text())
+                    })
+                    .collect();
+                crate::wake::note_wake_positions(paths, session, room, &positions);
+                all
+            }
+            Err(e) => return Err(e),
+        },
     };
     let mut seen: std::collections::HashSet<Digest32> =
         found.iter().map(|r| r.entry_hash).collect();
     let mut rows = found;
-    // From the oldest by arrival; from the room's first message when the node refuses it as a
-    // message that came back after a removal took it away (ADR-053 MP-11): it arrived again,
-    // after replies made to it before.
-    let after = match client
-        .read_rows(channel_id, Some(oldest))
-        .await
-        .map_err(|e| AppError::Usage(e.to_string()))?
-    {
-        Frame::Rows { rows } => rows,
-        Frame::Error { reason } if reason.ends_with(vox_core::node::ipc::CAME_BACK) => {
-            read_all(client, channel_id, None).await?
-        }
-        other => return Err(crate::client::unexpected(&other)),
-    };
     rows.extend(after.into_iter().filter(|r| seen.insert(r.entry_hash)));
     Ok(rows)
 }

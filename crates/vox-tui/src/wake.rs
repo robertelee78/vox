@@ -1516,17 +1516,54 @@ pub fn note_woke(paths: &Paths, session: &str, room: &str, entry: &Digest32) {
     let _ = vox_core::node::paths::write_private_file(&path, (keep.join("\n") + "\n").as_bytes());
 }
 
-/// The entries of `room` recorded as having woken `session` (V210-121), oldest first.
+/// The entries of `room` recorded as having woken `session` (V210-121), oldest first, each with
+/// the position its replies come after (`@<arrival>:<instance>`) once one is recorded
+/// ([`note_wake_positions`]).
 #[must_use]
-pub fn recorded_wakes(paths: &Paths, session: &str, room: &str) -> Vec<String> {
+pub fn recorded_wakes(paths: &Paths, session: &str, room: &str) -> Vec<(String, Option<String>)> {
     let Ok(body) = std::fs::read_to_string(woke_file(paths, session)) else {
         return Vec::new();
     };
     body.lines()
-        .filter_map(|l| l.split_once(' '))
-        .filter(|(r, _)| *r == room)
-        .map(|(_, e)| e.to_owned())
+        .filter_map(wake_line)
+        .filter(|(r, _, _)| *r == room)
+        .map(|(_, e, at)| (e.to_owned(), at.map(str::to_owned)))
         .collect()
+}
+
+/// A line of the record: the room, the entry, and the position its replies come after, if one is
+/// recorded. A build before positions wrote the first two only.
+fn wake_line(line: &str) -> Option<(&str, &str, Option<&str>)> {
+    let mut words = line.split_whitespace();
+    Some((words.next()?, words.next()?, words.next()))
+}
+
+/// Record, for the entries of `room` in `positions`, the position their replies come after
+/// (ADR-053 MP-11): a message that comes back after a removal took it away arrives again, past
+/// replies made to it before, so a reader from its hash would miss them; a position does not
+/// move. Best effort, as the record is: one not saved is found again.
+pub fn note_wake_positions(
+    paths: &Paths,
+    session: &str,
+    room: &str,
+    positions: &[(String, String)],
+) {
+    let path = woke_file(paths, session);
+    let Ok(old) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let mut body = String::new();
+    for line in old.lines() {
+        match wake_line(line).and_then(|(r, entry, _)| {
+            let (_, at) = positions.iter().find(|(e, _)| r == room && e == entry)?;
+            Some(format!("{r} {entry} {at}"))
+        }) {
+            Some(positioned) => body.push_str(&positioned),
+            None => body.push_str(line),
+        }
+        body.push('\n');
+    }
+    let _ = vox_core::node::paths::write_private_file(&path, body.as_bytes());
 }
 
 /// How many wakes a session's record keeps: far more than a session leaves unanswered.
@@ -1555,7 +1592,7 @@ pub fn open_wakes(
         .collect();
     let mut open: Vec<String> = Vec::new();
     for line in body.lines() {
-        let Some((r, entry)) = line.split_once(' ') else {
+        let Some((r, entry, _)) = wake_line(line) else {
             continue;
         };
         if r != room || answered.contains(entry) || open.iter().any(|o| o == entry) {

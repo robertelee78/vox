@@ -2584,18 +2584,36 @@ fn a_post_a_removal_took_away_comes_back_when_the_removal_no_longer_holds() {
 /// One turn of `vox agent hook` on `w` for `session` in room `id`, as Claude Code's hook runs it:
 /// what it injects.
 fn hook_turn(w: &Worker, id: &str, session: &str) -> String {
+    // Just after a restart the hook can find the room's authorization still refreshing: it then
+    // holds the news and its cursor and sends nothing, so the turn is taken again, on exactly
+    // that refusal.
+    const HELD: &str = "Vox could not read your rooms this turn: room pause state could not be \
+                        read; news and its cursor are held: room authorization changed or is \
+                        refreshing; nothing was sent";
     let input = format!(r#"{{"session_id":"{session}","cwd":"/tmp"}}"#);
-    let o = w.vox_in(
-        None,
-        &["agent", "hook", "--node", "default", "--room", &id[..8]],
-        Some(&input),
-    );
-    assert!(
-        o.ok,
-        "PRODUCT: {}'s `vox agent hook` for session {session} failed: {o:?}",
-        w.name
-    );
-    o.stdout
+    let deadline = Instant::now() + WITHIN;
+    loop {
+        let o = w.vox_in(
+            None,
+            &["agent", "hook", "--node", "default", "--room", &id[..8]],
+            Some(&input),
+        );
+        assert!(
+            o.ok,
+            "PRODUCT: {}'s `vox agent hook` for session {session} failed: {o:?}",
+            w.name
+        );
+        if o.stdout.trim() != HELD {
+            return o.stdout;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "NO RESULT: {}'s room authorization was still refreshing after {WITHIN:?}; each turn \
+             of session {session} held its news: {o:?}",
+            w.name
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
 }
 
 /// The full entry hash of the row of `w`'s newest page whose text says `tag`.
@@ -2813,6 +2831,30 @@ fn resume_since(said: &str) -> Option<String> {
         .map(|token| token.trim_matches(['\'', '"', '`']).to_owned())
 }
 
+/// Every one of `others` reports bob (`bob_fp`) disconnected in room `id`: carol posts once every
+/// other node has seen bob go. While their connections to him are still closing, dave was once
+/// not offered her posts at all (fix3 `runs/n-first.log`).
+fn mp11n_bob_gone(others: &[&Worker], bob_fp: &str, id: &str) {
+    for w in others {
+        let (gone_from, status) = poll(w, &["status", "--json"], WITHIN, |o| {
+            o.ok && o.json()["rooms"].as_array().is_some_and(|rooms| {
+                rooms.iter().filter(|r| r["id"] == id).any(|r| {
+                    r["members"].as_array().is_some_and(|members| {
+                        members
+                            .iter()
+                            .any(|m| m["id"] == bob_fp && m["connected"] == false)
+                    })
+                })
+            })
+        });
+        assert!(
+            gone_from,
+            "APPARATUS: {} still reports bob connected after his daemon stopped: {status:?}",
+            w.name
+        );
+    }
+}
+
 /// Stage the removal that takes carol's later posts away on dave and the revocation that brings
 /// them back, as `a_post_a_removal_took_away_comes_back_when_the_removal_no_longer_holds` does:
 /// bob, a delegated admin, removes carol while alice, carol and dave are stopped; alice, alone,
@@ -2927,8 +2969,8 @@ fn mp11n_returned(
 /// carol's reply. Asserted on dave:
 /// - M is in its place in `vox room read` and in its thread, before H (`MP11 in place`,
 ///   `MP11 thread`);
-/// - page 2 of each read, from carol's reply's hash, is refused; from the position page 1 ended
-///   at, it gives bob's reply, which arrived between, and carol's again (`MP11 thread page`,
+/// - page 2 of each read, from the position page 1 ended at, gives bob's reply, which arrived
+///   between, and carol's again; from carol's reply's hash, it is refused (`MP11 thread page`,
 ///   `MP11 filtered page`);
 /// - a `vox room tail` from the script's position prints H and carol's posts that came back,
 ///   last; its output closed, dave's next post stops it, and the command it prints resumes it
@@ -2951,16 +2993,17 @@ fn mp11n_returned(
 ///   position it was printed gives H and M once each (`MP11 script position`);
 /// - a post after the restart is given once, and M not again (`MP11 allocator`).
 ///
-/// The page, tail and high-water claims are said together at the end, so one run shows each.
+/// Each claim is asserted where it is made, so a later stop cannot hide an earlier red.
 /// `de48c97ee` (M comes back at its old arrival) is red at `MP11 arrives again`; `1b1cd3da8`
 /// (pages and the tail's resume continue by hash) at the page and tail claims. Mutants, each red
-/// at its claim: `VOX_MUTANT_MP11_SAME_ARRIVAL` (M comes back at its old arrival) at `MP11
-/// arrives again`; `VOX_MUTANT_MP11_HASH_CURSOR` (the hook keeps a hash and the node answers it
-/// by M's new arrival) at `MP11 cursor`; `VOX_MUTANT_MP11_THREAD_ARRIVAL` (thread pages by
+/// at its claim: `VOX_MUTANT_MP11_SAME_ARRIVAL` (M comes back at its old arrival) at `MP11 thread
+/// page`, the first claim that needs carol's reply to arrive again (page 2 from the position
+/// does not give it); `VOX_MUTANT_MP11_HASH_CURSOR` (the hook keeps a hash and the node answers
+/// it by M's new arrival) at `MP11 cursor`; `VOX_MUTANT_MP11_THREAD_ARRIVAL` (thread pages by
 /// arrival) at `MP11 thread`; `VOX_MUTANT_MP11_FILTERED_HASH` (a filtered or thread read from a
-/// message that came back is answered from its new arrival) at `MP11 thread page` and `MP11
-/// filtered page`; `VOX_MUTANT_MP11_NO_HIGH_WATER` (the governance turn's allocator advance is
-/// not installed) at `MP11 high water`.
+/// message that came back is answered from its new arrival) at `MP11 thread page`, from the
+/// hash; `VOX_MUTANT_MP11_NO_HIGH_WATER` (the governance turn's allocator advance is not
+/// installed) at `MP11 high water`.
 #[test]
 #[ignore = "four real daemons and an anchor, a removal and a concurrent revocation; run in release"]
 fn a_message_that_comes_back_arrives_again_and_no_reader_skips_what_came_meanwhile() {
@@ -3021,27 +3064,7 @@ fn a_message_that_comes_back_arrives_again_and_no_reader_skips_what_came_meanwhi
         "PRODUCT (staging): dave's session \"unseen\" was not told carol's first post: {first}"
     );
     bob.stop_daemon_cleanly();
-    // carol posts once every other node has seen bob go: while their connections to him are
-    // still closing, dave was once not offered her posts at all (fix3 `runs/n-first.log`).
-    let bob_fp = bob.b32();
-    for w in [&*alice, &*carol, &*dave] {
-        let (gone_from, status) = poll(w, &["status", "--json"], WITHIN, |o| {
-            o.ok && o.json()["rooms"].as_array().is_some_and(|rooms| {
-                rooms.iter().filter(|r| r["id"] == id).any(|r| {
-                    r["members"].as_array().is_some_and(|members| {
-                        members
-                            .iter()
-                            .any(|m| m["id"] == bob_fp.as_str() && m["connected"] == false)
-                    })
-                })
-            })
-        });
-        assert!(
-            gone_from,
-            "APPARATUS: {} still reports bob connected after his daemon stopped: {status:?}",
-            w.name
-        );
-    }
+    mp11n_bob_gone(&[alice, carol, dave], &bob.b32(), id);
     // carol posts ten more, replies in alice's thread, then posts M: an agent session is told M,
     // and is not shown replies in threads it is not in, so M is the last thing "trap" is given.
     // dave may take them in one window, and then M arrives first: nothing here depends on their
@@ -3129,8 +3152,6 @@ fn a_message_that_comes_back_arrives_again_and_no_reader_skips_what_came_meanwhi
             (what, of, last.entry_hash, last.arrival)
         })
         .collect();
-    // What this act's new claims found red, said together at its end, so one run shows each.
-    let mut reds: Vec<String> = Vec::new();
     mp11n_removed(&mut room.workers, id, &env, tmp.path(), seen, gone);
     let [alice, bob, carol, dave] = &mut room.workers[..] else {
         unreachable!()
@@ -3180,49 +3201,51 @@ fn a_message_that_comes_back_arrives_again_and_no_reader_skips_what_came_meanwhi
         "[proof] M came back in its place before H, and carol's reply before bob's in the thread"
     );
     // Page 2 of each read, after carol's reply came back with bob's arriving meanwhile: from the
-    // hash a reader of page 1 held, refused (it would be answered from her reply's new arrival,
-    // past bob's); from the position page 1 ended at, bob's reply and hers again.
+    // position page 1 ended at, bob's reply and hers again (she arrived again); from the hash a
+    // reader of page 1 held, refused (it would be answered from her reply's new arrival, past
+    // bob's).
     for &(what, of, boundary, arrival) in &first_pages {
         let count = |rows: &[vox_core::node::api::MessageRow], tag: &str| {
             rows.iter().filter(|r| r.text.contains(tag)).count()
         };
+        let request =
+            selected_request(cid, of, None, Some((instance, arrival))).unwrap_or_else(|e| {
+                panic!(
+                    "PRODUCT [MP11 {what} page]: this vox takes no position to continue a {what} \
+                     read (`Request::from_bytes`: {e}), so its page 2 can only follow a hash"
+                )
+            });
+        match ipc(&rt, dave, request) {
+            vox_core::node::ipc::Frame::Rows { rows }
+                if count(&rows, meanwhile_reply) == 1 && count(&rows, gone_reply) == 1 => {}
+            other => panic!(
+                "PRODUCT [MP11 {what} page]: page 2 of dave's {what} read from the position page 1 \
+                 ended at must give bob's reply, which arrived between, and carol's again: \
+                 {other:?}"
+            ),
+        }
         let request = selected_request(cid, of, Some(&boundary), None)
             .unwrap_or_else(|e| panic!("APPARATUS: a {what} page from a hash: {e}"));
         match ipc(&rt, dave, request) {
             vox_core::node::ipc::Frame::Error { reason }
-                if reason.ends_with(vox_core::node::ipc::CAME_BACK) => {}
-            vox_core::node::ipc::Frame::Rows { rows } => reds.push(format!(
+                if reason.ends_with(vox_core::node::ipc::CAME_BACK) =>
+            {
+                println!(
+                    "[proof] page 2 of dave's {what} read from where page 1 ended gave bob's \
+                     reply and carol's again; from her hash it was refused"
+                );
+            }
+            vox_core::node::ipc::Frame::Rows { rows } => panic!(
                 "PRODUCT [MP11 {what} page]: carol's reply ended page 1 of dave's {what} read, \
                  went and came back while bob's reply arrived; page 2 from its hash must be \
                  refused, yet was answered, giving bob's reply {} times (0: skipped): {:?}",
                 count(&rows, meanwhile_reply),
                 rows.iter().map(|r| &r.text).collect::<Vec<_>>()
-            )),
-            other => reds.push(format!(
+            ),
+            other => panic!(
                 "PRODUCT [MP11 {what} page]: page 2 of dave's {what} read from the hash of carol's \
                  reply, which came back, must be refused in plain words: {other:?}"
-            )),
-        }
-        match selected_request(cid, of, None, Some((instance, arrival))) {
-            Err(e) => reds.push(format!(
-                "PRODUCT [MP11 {what} page]: this vox takes no position to continue a {what} read \
-                 (`Request::from_bytes`: {e}), so its page 2 can only follow a hash"
-            )),
-            Ok(request) => match ipc(&rt, dave, request) {
-                vox_core::node::ipc::Frame::Rows { rows }
-                    if count(&rows, meanwhile_reply) == 1 && count(&rows, gone_reply) == 1 =>
-                {
-                    println!(
-                        "[proof] page 2 of dave's {what} read from where page 1 ended gave bob's \
-                         reply and carol's again; from her hash it was refused"
-                    );
-                }
-                other => reds.push(format!(
-                    "PRODUCT [MP11 {what} page]: page 2 of dave's {what} read from the position \
-                     page 1 ended at must give bob's reply, which arrived between, and carol's \
-                     again: {other:?}"
-                )),
-            },
+            ),
         }
     }
     // A tail from the script's position prints H, bob's reply and carol's posts that came back,
@@ -3309,10 +3332,10 @@ fn a_message_that_comes_back_arrives_again_and_no_reader_skips_what_came_meanwhi
             "APPARATUS: the tail whose output was closed did not stop when dave's post arrived"
         ),
         Some(said) => match resume_since(&said) {
-            None => reds.push(format!(
+            None => panic!(
                 "PRODUCT [MP11 tail resume]: a tail stopped after printing a post that came back \
                  must print a command that resumes it from there: {said}"
-            )),
+            ),
             Some(since) => {
                 let resumed = tail_from(
                     dave,
@@ -3329,12 +3352,12 @@ fn a_message_that_comes_back_arrives_again_and_no_reader_skips_what_came_meanwhi
                              `--since {since}`; that resumed with dave's post first"
                         );
                     }
-                    printed => reds.push(format!(
+                    printed => panic!(
                         "PRODUCT [MP11 tail resume]: the tail stopped after printing a post that \
                          came back said to resume with `--since {since}`; that must print \
                          dave's post, the row it stopped at, first: {printed:?}; stderr {}",
                         std::fs::read_to_string(&resumed.err).unwrap_or_default()
-                    )),
+                    ),
                 }
             }
         },
@@ -3371,10 +3394,10 @@ fn a_message_that_comes_back_arrives_again_and_no_reader_skips_what_came_meanwhi
             "[proof] a tail from {head} that printed nothing stopped with its node and printed \
              that position to resume from"
         ),
-        Some(said) => reds.push(format!(
+        Some(said) => panic!(
             "PRODUCT [MP11 tail position]: a tail from {head} that printed nothing, stopped by its \
              node, must print `--since {head}` to resume from: {said}"
-        )),
+        ),
     }
     drop(idle);
     dave.restart_daemon_as(support::VOX, &env, &tmp.path().join("dave-restart.err"));
@@ -3494,7 +3517,6 @@ fn a_message_that_comes_back_arrives_again_and_no_reader_skips_what_came_meanwhi
          M not again: {next}"
     );
     println!("[proof] a post after the restart was given once, after M; M not again");
-    assert!(reds.is_empty(), "{}", reds.join("\n"));
 }
 
 /// ADR-053 MP-11, candidate N: **a message that comes back keeps its original lifetime.** dave
