@@ -57,6 +57,9 @@ pub(crate) mod legacy_provisional;
 /// Unsupported room or required history formats cannot be opened; saved data remains untouched.
 pub(crate) const UNSUPPORTED_ROOM_FORMAT: &str =
     "This room uses an unsupported room or history format; leave it and create a new one.";
+/// A removal is applied, and the fresh sender chain it owes is not saved yet: the daemon saves
+/// it next, by itself, so a refusal for this is a change still being applied.
+pub(crate) const KEYS_ROTATING: &str = "room authorization keys are rotating";
 mod legacy_session;
 mod legacy_session_sender;
 pub(crate) use legacy_session_sender::{CompletedAnnouncement, PendingAnnouncement};
@@ -5435,7 +5438,7 @@ impl ChannelState {
             return Err(Error::StreamRefused("room member was removed"));
         }
         if self.room_removal_rotation_needed(profile.store())? {
-            return Err(Error::StreamRefused("room authorization keys are rotating"));
+            return Err(Error::StreamRefused(KEYS_ROTATING));
         }
         match self.entitled.get(target) {
             Some(&(c, i)) if c == self.sender.chain_id() => self.release_generation(profile, c, i),
@@ -5542,7 +5545,7 @@ impl ChannelState {
             return Ok(Vec::new());
         }
         if self.room_removal_rotation_needed(profile.store())? {
-            return Err(Error::StreamRefused("room authorization keys are rotating"));
+            return Err(Error::StreamRefused(KEYS_ROTATING));
         }
         let Some((from_chain, from_iteration)) = self.entitled_from(target) else {
             return Ok(Vec::new());

@@ -624,9 +624,10 @@ impl Node {
             .room_removal_rotation_needed(profile.store())
             .map_err(|error| fault_of(&error))?
         {
-            return Err(fault_of(&Error::StreamRefused(
-                "room authorization keys are rotating",
-            )));
+            // As the consent preparation refuses this state (`governance::REFRESHING`): the
+            // room is skipped and its key stays owed for redelivery. Not `RoomChangePending`,
+            // whose selection refresh would retake the room before its rotation can be saved.
+            return Err(Fault::GovernanceRefreshing);
         }
         // A creator readmission is a new forward boundary regardless of the
         // retained global trust history setting or an old pending SKDM.

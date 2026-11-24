@@ -274,7 +274,7 @@ impl ChannelState {
             return Err(Error::StreamRefused("this node was removed from the room"));
         }
         if self.room_removal_rotation_needed(store)? {
-            return Err(Error::StreamRefused("room authorization keys are rotating"));
+            return Err(Error::StreamRefused(crate::node::channel::KEYS_ROTATING));
         }
         governance::check_removal_generation(
             store,
