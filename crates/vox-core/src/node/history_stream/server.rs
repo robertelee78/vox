@@ -259,6 +259,22 @@ pub(super) async fn answer(
                         } => true,
                         _ => false,
                     }
+            })
+        // `VOX_TEST_REFUSE_ENTRIES_FILE` = `<peer> <from> <to>`: that peer's body asks
+        // (`Query::Entry`) at positions `from..=to` are answered EvidenceUnavailable; every other
+        // ask is served as usual.
+        || std::env::var_os("VOX_TEST_REFUSE_ENTRIES_FILE")
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .is_some_and(|text| {
+                let mut words = text.split_whitespace();
+                let named = words.next() == Some(crate::node::link::b32_encode(&source.peer).as_str());
+                let mut bound = || words.next().and_then(|at| at.parse::<u64>().ok());
+                let (from, to) = (bound(), bound());
+                named
+                    && matches!(
+                        (&query, from, to),
+                        (Query::Entry { seq, .. }, Some(from), Some(to)) if (from..=to).contains(seq)
+                    )
             });
     #[cfg(not(feature = "test-knobs"))]
     let staged_unavailable = false;

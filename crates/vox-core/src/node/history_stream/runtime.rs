@@ -161,6 +161,27 @@ impl BodySlots {
         wake
     }
 }
+/// `VOX_MUTANT_REROUTE_KEEPS_BODY_SLOT`: a flow moved to its dependency author's port keeps the
+/// body slot of the refused body, as before. Says so once on stderr when it first keeps one.
+#[cfg(feature = "test-knobs")]
+fn reroute_keeps_body_slot_mutant() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("VOX_MUTANT_REROUTE_KEEPS_BODY_SLOT").is_some()
+    });
+    static SAID: std::sync::Once = std::sync::Once::new();
+    if *ON {
+        SAID.call_once(|| {
+            eprintln!(
+                "vox: VOX_MUTANT_REROUTE_KEEPS_BODY_SLOT engaged: a rerouted flow kept its body slot"
+            );
+        });
+    }
+    *ON
+}
+#[cfg(not(feature = "test-knobs"))]
+fn reroute_keeps_body_slot_mutant() -> bool {
+    false
+}
 fn body_slot(purpose: Purpose, key_body: bool) -> Option<usize> {
     if key_body && purpose == Purpose::Control {
         return Some(2);
@@ -3586,6 +3607,17 @@ impl Flow {
                             // one wire turn, then returns the same flow to this advertising peer.
                             // No missing evidence is accepted and no whole-head surrogate can
                             // complete without satisfying this exact query.
+                            // The body slot is not kept across that move: the author's port may
+                            // never run (a stopped author), and every sibling flow of this daemon
+                            // waiting for the slot wakes only on its release. End this body's
+                            // staging (at most the part of this one body already received is
+                            // dropped); the retained query stages it again when it runs.
+                            if matches!(query, Query::Entry { .. })
+                                && task.purpose != Purpose::History
+                                && !reroute_keeps_body_slot_mutant()
+                            {
+                                while !self.reclaim_stage(task.purpose, job, true).await? {}
+                            }
                             self.push(task)?;
                             self.reroute = dependency.map(|head| head.author);
                             return Ok(());

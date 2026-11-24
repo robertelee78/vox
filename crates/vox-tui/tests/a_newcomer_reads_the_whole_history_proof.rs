@@ -10054,6 +10054,15 @@ fn a_newcomer_reads_a_member_while_the_author_it_cites_is_stopped() {
     rg1::holder_serves_what_it_verified(rg1::Cited::Posts);
 }
 
+/// A flow moved to a stopped author's port gives back its body slot: the newcomer still reads
+/// the holder it reaches (byte-gate: a flow waited for good on a slot the moved flow kept).
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "three real daemons, a stopped author and a holder refusing its bodies; optional"]
+fn a_newcomer_reads_the_holder_while_a_body_waits_on_the_stopped_author() {
+    rg1::a_moved_flow_leaves_the_body_slot();
+}
+
 /// ADR-053 MP-7 (a) without the misleading newer head: the holder's later post depends on a
 /// control in the stopped author's feed (the author's context advance after the holder's post).
 /// The holder restarts; a newcomer that reaches only the holder must verify that control
@@ -11214,6 +11223,206 @@ mod rg1 {
                 report["lanes"]
             );
             std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    /// A newcomer's flow that walks a stopped author's window through a holder is moved to the
+    /// author's port when the holder refuses a body (`VOX_TEST_REFUSE_ENTRIES_FILE`: the holder
+    /// answers the newcomer EvidenceUnavailable for the bodies of the author's last twenty posts;
+    /// the knob names positions, not authors, so the holder's own short feed stays below them;
+    /// the author's grants for the holder come after them and are served, so the holder's own
+    /// post needs nothing refused). The author is stopped, so
+    /// the moved flow waits for good. Once the newcomer's stderr names that move, the holder
+    /// posts; the newcomer must read the holder's post. Before the fix the moved flow kept the
+    /// daemon's one live body slot, and the holder's post waited for it.
+    /// Mutant: `VOX_MUTANT_REROUTE_KEEPS_BODY_SLOT=1`.
+    pub(super) fn a_moved_flow_leaves_the_body_slot() {
+        const POSTS: usize = 30;
+        const MUTANT: &str = "VOX_MUTANT_REROUTE_KEEPS_BODY_SLOT";
+        let root = root();
+        let exe = binary();
+        let mut knobs = vec!["VOX_TEST_REFUSE_ENTRIES_FILE", "history reroute origin="];
+        let mutant = std::env::var_os(MUTANT).is_some();
+        if mutant {
+            knobs.push(MUTANT);
+        }
+        crate::test_knobs::require_in(&exe, &knobs);
+        let author = room::worker_as(root.path(), "slot-author", &exe);
+        let holder = room::worker_as(root.path(), "slot-holder", &exe);
+        let reader = room::worker_as(root.path(), "slot-reader", &exe);
+        let refuse = holder.data.with_extension("refuse-entries");
+        let author_daemon = start(&author, "127.0.0.1:0", None);
+        let _holder_daemon = start_with(
+            &holder,
+            "127.0.0.1:0",
+            None,
+            &[("VOX_TEST_REFUSE_ENTRIES_FILE", refuse.clone())],
+        );
+        let trust = |w: &Worker, peer: &Worker| {
+            w.vox_env(
+                None,
+                &[("VOX_IDENTITY_PASSPHRASE", room::ID_PASS)],
+                &["trust", "add", &peer.b32(), "--name", &peer.name],
+                None,
+            )
+            .expect_ok("trust before the room");
+        };
+        trust(&author, &holder);
+        trust(&holder, &author);
+        let id = create(&author);
+        let feed = || {
+            status(&author, &id)["own_feed_through"]
+                .as_u64()
+                .expect("APPARATUS: the author's status has no own_feed_through")
+        };
+        let before_posts = feed();
+        for n in 1..=POSTS {
+            post(&author, &id, &format!("SL-A-{n:02}"), true);
+        }
+        // The holder refuses the newcomer the bodies of the last twenty of these posts; the
+        // author's entries before them and its grants for the holder after them are served, and
+        // the holder's own feed (a few entries) stays below them.
+        std::fs::write(
+            &refuse,
+            format!("{} {} {}", reader.b32(), before_posts + 11, feed()),
+        )
+        .expect("APPARATUS: refuse-entries staging file");
+        let link = author.vox(None, &["room", "link", &id]);
+        link.expect_ok("author room link");
+        holder
+            .vox_in(
+                None,
+                &["room", "join", "--passphrase-file", "-", link.stdout.trim()],
+                Some(room::ROOM_PASS),
+            )
+            .expect_ok("holder joins the author's room");
+        returning_reader_ready(&holder, &id);
+        await_shown(&holder, &id, &format!("SL-A-{POSTS:02}"));
+        author_daemon.stop();
+        eprintln!("[slot] author stopped for the rest of the act");
+        let _reader_daemon = start(&reader, "127.0.0.1:0", None);
+        trust(&holder, &reader);
+        trust(&reader, &holder);
+        let link = holder.vox(None, &["room", "link", &id]);
+        link.expect_ok("holder room link");
+        reader
+            .vox_in(
+                None,
+                &["room", "join", "--passphrase-file", "-", link.stdout.trim()],
+                Some(room::ROOM_PASS),
+            )
+            .expect_ok("newcomer joins through the holder");
+        // Staging: the newcomer's walk of the author's window met a refused body at the holder
+        // and its flow moved to the stopped author's port.
+        let moved = format!(
+            "history reroute origin={} target={}",
+            holder.b32(),
+            author.b32()
+        );
+        let err = reader.data.with_extension("err");
+        let staging = Instant::now();
+        while !std::fs::read_to_string(&err)
+            .unwrap_or_default()
+            .contains(&moved)
+        {
+            assert!(
+                staging.elapsed() < Duration::from_secs(600),
+                "APPARATUS: the newcomer never moved a flow to the stopped author; see {}",
+                err.display()
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        eprintln!("[slot] the newcomer moved a flow to the stopped author's port");
+        let wanted = "SL-H-after-the-move";
+        post(&holder, &id, wanted, true);
+        // The staging refuses positions, not authors: the holder's own post must lie below them,
+        // or the staging itself would refuse it.
+        let holder_through = status(&holder, &id)["own_feed_through"]
+            .as_u64()
+            .expect("APPARATUS: the holder's status has no own_feed_through");
+        assert!(
+            holder_through < before_posts + 11,
+            "APPARATUS: the holder's own feed reached position {holder_through}, inside the \
+             refused positions (from {}); the staging itself would refuse its post",
+            before_posts + 11
+        );
+        let started = Instant::now();
+        let mut last: Option<String> = None;
+        let mut unchanged = 0;
+        loop {
+            if read(&reader, &id, Some(wanted)).0.contains(wanted) {
+                eprintln!(
+                    "GREEN: with a flow moved to the stopped author's port, the newcomer reads \
+                     the holder's post"
+                );
+                return;
+            }
+            let report = reader.vox(None, &["status", "--json"]);
+            report.expect_ok("newcomer status");
+            let report = report.json();
+            let lanes = &report["lanes"];
+            let bounded = &lanes["bounded"];
+            let budget = &lanes["budget"];
+            let empty = |slots: &Value| {
+                slots
+                    .as_array()
+                    .is_some_and(|slots| slots.iter().all(Value::is_null))
+            };
+            let waits: Vec<String> = bounded["admissions"]
+                .as_array()
+                .map(|rows| {
+                    rows.iter()
+                        .filter(|row| {
+                            row["gate"] == "bytes" && row["peer"].as_str() == Some(&holder.b32())
+                        })
+                        .map(|row| row["admission"].to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let author_unreached = lanes["ports"].as_array().is_some_and(|ports| {
+                ports.iter().any(|port| {
+                    port["peer"].as_str() == Some(&author.b32()) && port["connected"] != true
+                })
+            });
+            // Nothing runs, nothing is ready, no budget is held, and a flow toward the holder
+            // waits on a byte admission: only a release can wake it, and nothing that runs can
+            // release anything.
+            let wedged = !waits.is_empty()
+                && author_unreached
+                && empty(&bounded["running"])
+                && empty(&bounded["ready"])
+                && budget["control"] == 0
+                && budget["foreground"] == 0
+                && budget["flow_state"]["in_use"] == 0;
+            let now = wedged.then(|| waits.join(","));
+            unchanged = if now.is_some() && now == last {
+                unchanged + 1
+            } else {
+                0
+            };
+            last = now;
+            if unchanged >= 4 {
+                assert!(
+                    !mutant
+                        || std::fs::read_to_string(&err)
+                            .unwrap_or_default()
+                            .contains(&format!("{MUTANT} engaged")),
+                    "APPARATUS: {MUTANT} was set but the newcomer never said it engaged; see {}",
+                    err.display()
+                );
+                panic!(
+                    "RED PRODUCT: the newcomer does not show {wanted:?}: in five status answers \
+                     in a row its flow toward the holder waits on byte admission(s) {} while \
+                     nothing runs, nothing is ready and no budget is held; lanes: {lanes}",
+                    last.unwrap_or_default()
+                );
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(600),
+                "APPARATUS: NO RESULT after 600 s: neither the holder's post nor a wedge; \
+                 lanes: {lanes}"
+            );
+            std::thread::sleep(Duration::from_secs(1));
         }
     }
 
