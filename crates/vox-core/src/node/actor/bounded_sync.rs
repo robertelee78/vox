@@ -1738,6 +1738,22 @@ impl Controller {
         self.pool_admission.remove(&(room, peer, service));
     }
 
+    /// A connection-close edge: a parked Flow toward that peer cannot run until the peer
+    /// returns, so it keeps no body slot whose body waits on that peer
+    /// (`Flow::release_waiting_body_slots`); its partial stays on disk.
+    pub(super) fn release_body_slots_toward(&mut self, peer: Digest32) {
+        for flow in self
+            .ready
+            .iter_mut()
+            .flatten()
+            .chain(self.deferred.iter_mut())
+        {
+            if flow.peer == peer {
+                flow.release_waiting_body_slots();
+            }
+        }
+    }
+
     /// A real connection-close edge retires every exact continuation for that peer before the
     /// scheduler publishes or considers other work. Return the rooms whose parked Flows remain
     /// owned and must be reconsidered after reach/reconnect.
@@ -3454,6 +3470,11 @@ impl Node {
             }) {
                 self.sched_rooms.insert(work.room);
             }
+            // The peer's connection closed while this worker ran: the close edge could not reach
+            // a running Flow, and it cannot run again until that peer returns.
+            if !self.connected.contains(&work.peer) {
+                flow.release_waiting_body_slots();
+            }
             // A policy intent captured this exact sparse request and immutable Running root
             // before retiring the fence. The physical worker may have settled that request and
             // removed it from the Flow before returning; its absence now is not an owner error.
@@ -3789,12 +3810,13 @@ impl Node {
             if let Some(target) = flow.reroute.take() {
                 #[cfg(feature = "test-knobs")]
                 eprintln!(
-                    "history reroute origin={} target={} serial={} owner={:?} transient={}",
+                    "history reroute origin={} target={} serial={} owner={:?} transient={} ask={}",
                     crate::node::link::b32_encode(&work.peer),
                     crate::node::link::b32_encode(&target),
                     flow.availability_connection,
                     flow.hint_owner,
-                    flow.transient_refused
+                    flow.transient_refused,
+                    flow.retained_ask()
                 );
                 // EvidenceUnavailable named the author of the exact missing signed dependency.
                 // Keep this flow, its in-flight hint owner and its exact query/continuation

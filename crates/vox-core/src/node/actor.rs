@@ -3580,6 +3580,113 @@ async fn seat_round(
     Err(refusal)
 }
 
+/// **A join refused because its room is catching up asks again only once it may not be** (ledger
+/// 75). A member that has just restarted folds what it received into the room's governance before
+/// it can admit anyone; until then a join's seat and its admission are answered "refreshing", and
+/// while a save holds the room, or a Computer policy transition holds its publication lease, its
+/// admission is answered "room publication is busy". All end by themselves. Called after such a
+/// refusal (`busy` for the second); says whether to ask again, and says yes only before
+/// `patience`.
+///
+/// The refusal itself is not progress. An admission refused "refreshing" ended its own room save,
+/// and that save's completion woke every publication waiter before the refusal reached this task
+/// (`complete_pending_maintenance`, then the admission's answer), so a wake armed before the
+/// request proves nothing. The wake waited on here is subscribed after the refusal, under the room
+/// lock and before the check, and the check is the readiness both doors ask: yes when it answers
+/// anything but "refreshing" (the actor then gives the real answer).
+///
+/// "Busy" comes from two gates, and each is seen free before the admission is asked again,
+/// whichever refused it (the other's wait ends at once when its gate is free):
+/// - the room's publication: another save holds the room (`begin_pending_maintenance`, refused
+///   without a save or a wake, so `armed`, subscribed before that request, waits for a save of the
+///   room to end), or its write or history publication is in flight when the worker prepares
+///   (`reserve_pending_write`); then, under the room lock, a fresh wake is subscribed before
+///   checking that condition (`history_publication_busy`), and while it holds that wake is waited
+///   for;
+/// - this node's Computer publication lease (`maintenance_save`'s worker): that failed worker's
+///   room save ends with the same wake, so `armed` proves nothing for it; the lease's own read
+///   (`Computer::wait_publication_writer`, subscribed before it checks) waits for the writer to
+///   release it.
+async fn join_may_ask_again(
+    room: &std::sync::Weak<tokio::sync::Mutex<ChannelState>>,
+    computer: Option<&std::sync::Weak<crate::node::computer::Computer>>,
+    store: &crate::node::store::Store,
+    clock: &crate::time::Clock,
+    armed: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + Sync>>>,
+    busy: bool,
+    patience: tokio::time::Instant,
+) -> bool {
+    #[cfg(feature = "test-knobs")]
+    let mut lease_waited = true;
+    #[cfg(feature = "test-knobs")]
+    match std::env::var("VOX_MUTANT_JOIN_REFRESH").ok().as_deref() {
+        // The refused request's own completion taken for progress, as in the first version.
+        Some("self-wake") => {
+            return match armed {
+                Some(armed) => {
+                    tokio::time::timeout_at(patience, armed).await.is_ok()
+                        && tokio::time::Instant::now() < patience
+                }
+                None => false,
+            }
+        }
+        // A busy refusal's own completion taken for the lease's release, as in the second version.
+        Some("busy-own-wake") => lease_waited = false,
+        // Refused at once, as before ledger 75.
+        Some(_) => return false,
+        None => {}
+    }
+    if busy {
+        let Some(armed) = armed else {
+            return false;
+        };
+        if tokio::time::timeout_at(patience, armed).await.is_err() {
+            return false;
+        }
+        #[cfg(feature = "test-knobs")]
+        let computer = computer.filter(|_| lease_waited);
+        if let Some(computer) = computer.and_then(std::sync::Weak::upgrade) {
+            if tokio::time::timeout_at(patience, computer.wait_publication_writer())
+                .await
+                .is_err()
+            {
+                return false;
+            }
+        }
+    }
+    loop {
+        let Some(room) = room.upgrade() else {
+            return false;
+        };
+        let Ok(channel) = tokio::time::timeout_at(patience, room.lock()).await else {
+            return false;
+        };
+        let wake = channel.history_publication_wake();
+        let ready = channel
+            .require_governance_ready(store, crate::time::Ms(clock()))
+            .map(drop);
+        #[cfg(feature = "test-knobs")]
+        let ready = {
+            use crate::node::channel::pending_roster::join_refresh_hold;
+            join_refresh_hold("", None, join_refresh_hold(".seat", None, ready))
+        };
+        let held = busy && channel.history_publication_busy(store).unwrap_or(false);
+        drop(channel);
+        drop(room);
+        if tokio::time::Instant::now() >= patience {
+            return false;
+        }
+        if !held
+            && !ready.is_err_and(|error| matches!(fault_of(&error), Fault::GovernanceRefreshing))
+        {
+            return true;
+        }
+        if tokio::time::timeout_at(patience, wake).await.is_err() {
+            return false;
+        }
+    }
+}
+
 /// The room's epoch, and the members to ask for a newcomer's place, each with its connection.
 type SeatsToAsk = (u64, Vec<(Digest32, Arc<VoxConnection>)>);
 
@@ -12495,6 +12602,7 @@ impl Node {
                     self.role_connection_serials.remove(&peer);
                 }
                 self.connected.remove(&peer);
+                self.bounded_sync.release_body_slots_toward(peer);
                 self.status
                     .receipt_waits
                     .retain(|(_, member), _| *member != peer);
@@ -14647,11 +14755,14 @@ impl Node {
             .unwrap_or_default()
             .to_string_lossy()
             .into_owned();
+        let admission_clock = Arc::clone(&self.clock);
+        let admission_computer = self.computer.as_ref().map(Arc::downgrade);
         self.join_tasks.spawn(async move {
             let _slot = slot;
             let _carried = conn;
             let proposal_room = Arc::clone(&shared);
             let proposal_store = Arc::clone(&store);
+            let admission_store = Arc::clone(&store);
             let original = admission_room.clone();
             let mut lifetime = None;
             let admission_lifetime = &mut lifetime;
@@ -14680,32 +14791,109 @@ impl Node {
                     // this task, so the actor is never the thing waiting — which is the whole point
                     // of the slot. See `NetEvent::JoinAdmit`.
                     |identity, witness| async move {
-                        // Hold the place and collect answering members' promises before admission.
                         let joiner = identity.fingerprint();
-                        let promised = seat_round(&log_node, &admit_tx, channel_id, joiner).await?;
-                        let (ack, wait) = tokio::sync::oneshot::channel();
-                        let admitted = if admit_tx
-                            .send(NetEvent::JoinAdmit {
+                        // **A room still catching up is waited for, not refused** (ledger 75): a
+                        // member that has just restarted folds what it received into the room's
+                        // governance before it can admit anyone, and until then the join's seat
+                        // and its admission are answered "refreshing" (the admission "busy" while
+                        // a save holds the room). Both end by themselves, so either is asked again
+                        // once `join_may_ask_again` says the reason may have ended, and only
+                        // within the admission patience counted from here: no request follows a
+                        // refusal at or after it. A refused attempt wrote nothing; past the
+                        // patience the joiner is refused with the last answer, as before.
+                        let stopped = || {
+                            Error::JoinRefused("the member stopped before it admitted the joiner")
+                        };
+                        let patience = tokio::time::Instant::now()
+                            + crate::node::joinstream::ADMISSION_PATIENCE;
+                        // The refusal a request is made again after; the answer if it is not made.
+                        let mut refused = None;
+                        // Hold the place and collect answering members' promises before admission.
+                        // A seat refused "refreshing" was not reserved, so nothing is held.
+                        let promised = loop {
+                            let error =
+                                match seat_round(&log_node, &admit_tx, channel_id, joiner).await {
+                                    Ok(promised) => break promised,
+                                    Err(error) => error,
+                                };
+                            if !matches!(fault_of(&error), Fault::GovernanceRefreshing)
+                                || !join_may_ask_again(
+                                    &admission_room,
+                                    admission_computer.as_ref(),
+                                    &admission_store,
+                                    &admission_clock,
+                                    None,
+                                    false,
+                                    patience,
+                                )
+                                .await
+                            {
+                                return Err(error);
+                            }
+                            refused = Some(error);
+                        };
+                        let admitted = loop {
+                            // Subscribed before the request: a busy refusal wakes no one, so only
+                            // the save that held the room ending fires this.
+                            let armed = match admission_room.upgrade() {
+                                Some(room) => tokio::time::timeout_at(patience, room.lock())
+                                    .await
+                                    .ok()
+                                    .map(|channel| channel.history_publication_wake()),
+                                None => None,
+                            };
+                            let (ack, wait) = tokio::sync::oneshot::channel();
+                            let request = admit_tx.send(NetEvent::JoinAdmit {
                                 channel_id,
-                                original: admission_room,
+                                original: admission_room.clone(),
                                 attachment,
                                 peer,
-                                identity: Box::new(identity),
-                                witness: Box::new(witness),
+                                identity: Box::new(identity.clone()),
+                                witness: Box::new(witness.clone()),
                                 ack,
-                            })
-                            .await
-                            .is_ok()
-                        {
-                            // A dropped sender resolves this too, so a shutting-down actor cannot
-                            // strand a joiner mid-exchange; nothing admitted it, so it is refused.
-                            wait.await.unwrap_or(Err(Error::JoinRefused(
-                                "the member stopped before it admitted the joiner",
-                            )))
-                        } else {
-                            Err(Error::JoinRefused(
-                                "the member stopped before it admitted the joiner",
-                            ))
+                            });
+                            // A request after a refusal is made before the patience or not at all
+                            // (a `send` given up has sent nothing); the first is made as before.
+                            let sent = match &refused {
+                                Some(_) if tokio::time::Instant::now() >= patience => false,
+                                Some(_) => tokio::time::timeout_at(patience, request)
+                                    .await
+                                    .is_ok_and(|sent| sent.is_ok()),
+                                None => request.await.is_ok(),
+                            };
+                            let answer = if sent {
+                                // A request made is answered, past the patience too: it may have
+                                // admitted. A dropped sender resolves this as well, so a
+                                // shutting-down actor cannot strand a joiner mid-exchange; nothing
+                                // admitted it, so it is refused.
+                                wait.await.unwrap_or_else(|_| Err(stopped()))
+                            } else {
+                                Err(refused.take().unwrap_or_else(stopped))
+                            };
+                            let error = match answer {
+                                Ok(admitted) => break Ok(admitted),
+                                Err(error) => error,
+                            };
+                            let busy = match fault_of(&error) {
+                                Fault::GovernanceRefreshing => false,
+                                Fault::RoomChangePending => true,
+                                _ => break Err(error),
+                            };
+                            if !sent
+                                || !join_may_ask_again(
+                                    &admission_room,
+                                    admission_computer.as_ref(),
+                                    &admission_store,
+                                    &admission_clock,
+                                    armed,
+                                    busy,
+                                    patience,
+                                )
+                                .await
+                            {
+                                break Err(error);
+                            }
+                            refused = Some(error);
                         };
                         let abort = crate::node::seatstream::Abort { channel_id, joiner };
                         if admitted.is_ok() {
@@ -18570,7 +18758,13 @@ impl Node {
             ));
         }
         let profile = self.profile.as_ref().ok_or(Error::Profile("locked"))?;
-        c.require_governance_ready(profile.store(), self.now_ms())?;
+        let ready = c
+            .require_governance_ready(profile.store(), self.now_ms())
+            .map(drop);
+        #[cfg(feature = "test-knobs")]
+        let ready =
+            crate::node::channel::pending_roster::join_refresh_hold(".seat", Some(&joiner), ready);
+        ready?;
         let removed = c.is_member_removed(profile.store(), &joiner)?;
         #[cfg(feature = "test-knobs")]
         let removed = removed
