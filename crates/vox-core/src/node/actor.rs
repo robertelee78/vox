@@ -7898,15 +7898,14 @@ impl Node {
             }
         }
         let report = self.status_report(&budget);
-        // What the store holds is measured under its writer, which a give-back step may hold:
-        // never on the actor (RG-13).
+        // What the store holds is measured off the actor, and only when no writer holds the
+        // store: a held writer never delays this answer (RG-12, RG-13).
         match self.profile.as_ref().map(Profile::store_handle) {
             Some(store) => {
                 tokio::spawn(async move {
                     let mut report = report;
                     report.store = match tokio::task::spawn_blocking(move || store.space()).await {
-                        Ok(Ok(space)) => space.map(Ok),
-                        Ok(Err(error)) => Some(Err(error.to_string())),
+                        Ok(space) => space.map(Ok),
                         Err(error) => Some(Err(error.to_string())),
                     };
                     let _ = reply.send(report);

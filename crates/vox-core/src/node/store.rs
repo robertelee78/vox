@@ -72,19 +72,22 @@ const META_SCHEMA: &str = "schema_version";
 // above that slack.
 const MIN_COMPACTION_RECLAIM_BYTES: u64 = 64 * 1024 * 1024;
 
-// One give-back step moves at most this many bytes of pages, so writers wait for a short step
-// whatever the store's size; a pass takes more steps instead. Chosen from a 2.75 GB store after
-// a restart (RG-13 fix2).
+// One give-back move step copies at most this many bytes of pages, unless its first group (a
+// page and the parents rewritten with it) alone is larger, as a leaf holding one value over
+// 16 MiB is. Choosing the pages still walks every table page, so a step's time grows with the
+// store's pages. Chosen from a 2.75 GB store after a restart (RG-13 fix2).
 const GIVE_BACK_STEP_BYTES: u64 = 16 * 1024 * 1024;
 
 /// What one give-back pass left: file and held bytes, its commits, how long it took, the
-/// longest commit writers waited for, and the retired bytes it left for reads to release.
+/// longest commit writers waited for, the most bytes one move step copied, and the retired
+/// bytes it left for reads to release.
 struct GaveBack {
     file: u64,
     held: u64,
     steps: u32,
     took: std::time::Duration,
     longest: std::time::Duration,
+    largest_move: u64,
     waiting: u64,
 }
 
@@ -100,11 +103,15 @@ struct Measured {
 }
 
 /// What `vox status` says of a store: what it holds, and whether it is giving space back or
-/// waits for reads to end to go on (RG-13).
+/// waits for reads to end to go on (RG-13). It never waits for the store's writer (RG-12).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoreSpace {
-    /// Bytes the store holds: allocated, less pages committed transactions retired.
-    pub held_bytes: u64,
+    /// Bytes the store holds: allocated, less pages committed transactions retired. `None`
+    /// until the store has measured them.
+    pub held_bytes: Option<u64>,
+    /// `held_bytes` was measured for this answer. Otherwise a write held the store, and it is
+    /// the store's last measure: at a give-back step or an earlier answer.
+    pub held_now: bool,
     /// A give-back pass is started and not finished.
     pub giving_back: bool,
     /// A pass stopped where reads still see the pages it retired; their end resumes it.
@@ -134,6 +141,10 @@ struct GiveBackNow {
     passes: u32,
     /// The `waits` count of the wait reads may end, while a pass waits for them.
     waiting: Option<u64>,
+    /// A read begun after that count ended while the pass waited.
+    missed: bool,
+    /// What the store held when it last measured, under its writer.
+    held: Option<u64>,
 }
 
 impl GiveBack {
@@ -145,8 +156,32 @@ impl GiveBack {
     /// after that trim freed what it could always finds it set.
     fn wait_for_reads(&self) -> u64 {
         let wait = self.waits.fetch_add(1, Ordering::SeqCst);
-        self.now().waiting = Some(wait);
+        let mut now = self.now();
+        now.waiting = Some(wait);
+        now.missed = false;
         wait
+    }
+
+    /// The last trim left retired pages. Reads begun after `wait` may see some of them: one
+    /// begun before a commit (an ordinary post, or that trim itself) retired pages it sees.
+    /// Wait for every read begun until now, which includes each read that can still see one;
+    /// or, when one of those later reads already ended (after the trim, perhaps, so its pages
+    /// are still retired), `false`: wait and trim again. `true` too when a read the pass waited
+    /// for ended and resumed it.
+    fn wait_again(&self, wait: u64) -> bool {
+        let mut now = self.now();
+        #[cfg(feature = "test-knobs")]
+        if super::computer::fx28_mutant("rg13-no-rewait") {
+            return true;
+        }
+        if now.waiting != Some(wait) {
+            return true;
+        }
+        if now.missed {
+            return false;
+        }
+        now.waiting = Some(self.waits.fetch_add(1, Ordering::SeqCst));
+        true
     }
 
     fn stop_waiting(&self, wait: u64) {
@@ -170,7 +205,11 @@ impl GiveBack {
                     now.passes += 1;
                     Some(wait)
                 }
-                _ => None,
+                Some(_) => {
+                    now.missed = true;
+                    None
+                }
+                None => None,
             }
         };
         if let Some(wait) = resume {
@@ -1805,12 +1844,13 @@ impl Store {
         }) {
             Ok(Some(pass)) => eprintln!(
                 "vox daemon: node {node}: store file is now {} bytes, holds {} bytes; \
-                 {} steps in {} ms; writes waited at most {} ms{}",
+                 {} steps in {} ms; writes waited at most {} ms; one step moved at most {} bytes{}",
                 pass.file,
                 pass.held,
                 pass.steps,
                 pass.took.as_millis(),
                 pass.longest.as_millis(),
+                pass.largest_move,
                 if pass.waiting > 0 {
                     format!(
                         "; reads still see {} retired bytes, and giving back goes on when they end",
@@ -1840,6 +1880,7 @@ impl Store {
         let began = std::time::Instant::now();
         let mut steps = 0_u32;
         let mut longest = std::time::Duration::ZERO;
+        let mut largest_move = 0_u64;
         let over = |at: &Measured| {
             at.file.saturating_sub(at.held.saturating_add(at.held / 4))
                 >= MIN_COMPACTION_RECLAIM_BYTES
@@ -1866,8 +1907,10 @@ impl Store {
                     };
                     #[cfg(not(feature = "test-knobs"))]
                     let most = GIVE_BACK_STEP_BYTES;
-                    txn.compact_pages_and_trim(most)
+                    let moved = txn
+                        .compact_pages_and_trim(most)
                         .map_err(storage("give back space"))?;
+                    largest_move = largest_move.max(moved);
                 } else {
                     txn.trim_at_commit();
                 }
@@ -1884,10 +1927,12 @@ impl Store {
                 .map_err(storage("measure store file"))?
                 .len();
             drop(epochs);
+            let held = space.allocated.saturating_sub(space.retired);
+            self.give_back.now().held = Some(held);
             longest = longest.max(started.elapsed());
             Ok(Some(Measured {
                 file,
-                held: space.allocated.saturating_sub(space.retired),
+                held,
                 retired: space.retired,
                 free_at_end: space.free_at_end,
             }))
@@ -1905,32 +1950,47 @@ impl Store {
             });
         }
         // A trim's last free pass runs after the trim, so what it releases the next trim gives
-        // back: trim again while a trim shrinks the file or releases pages. Retired pages left
-        // after that are seen by reads. A move whose trims gave nothing back found nothing lower.
+        // back: trim again while a trim shrinks the file, releases retired pages or frees more
+        // of the end. Retired pages left after that are seen by reads. A move is always followed
+        // by a trim: the system pages it vacated (and those its commit rewrote) are freed only
+        // by the next commit, and no measure counts them until then. A move whose trims gave
+        // nothing back found nothing lower.
         let mut trims_progress = true;
+        let mut moved = false;
         let mut moved_at = u64::MAX;
         let waiting = loop {
             if !over(&now) {
                 break 0;
             }
-            if trims_progress && (now.free_at_end > 0 || now.retired > 0) {
+            if moved || (trims_progress && (now.free_at_end > 0 || now.retired > 0)) {
                 let Some(after) = step(Some(false))? else {
                     return Ok(None);
                 };
-                trims_progress = after.file < now.file || after.retired < now.retired;
+                trims_progress = after.file < now.file
+                    || after.retired < now.retired
+                    || after.free_at_end > now.free_at_end;
+                moved = false;
                 now = after;
                 continue;
             }
             if now.retired > 0 {
                 // Wait for the reads begun until now, before one more trim frees what those
-                // that already ended let go: a read ending after it resumes the pass.
+                // that already ended let go: a read ending after it resumes the pass. Reads
+                // begun meanwhile are waited for once that trim shows what is left.
+                #[cfg(feature = "test-knobs")]
+                Self::hold_wait_for_proof("before");
                 let wait = self.give_back.wait_for_reads();
+                #[cfg(feature = "test-knobs")]
+                Self::hold_wait_for_proof("armed");
                 let Some(after) = step(Some(false))? else {
                     return Ok(None);
                 };
                 now = after;
                 if now.retired > 0 {
-                    break now.retired;
+                    if self.give_back.wait_again(wait) {
+                        break now.retired;
+                    }
+                    continue;
                 }
                 self.give_back.stop_waiting(wait);
                 trims_progress = true;
@@ -1944,7 +2004,13 @@ impl Store {
                 return Ok(None);
             };
             now = after;
-            trims_progress = true;
+            moved = true;
+            // Mutant: the move judged by what its own commit shows, as before RG-13 fix3.
+            #[cfg(feature = "test-knobs")]
+            if super::computer::fx28_mutant("rg13-no-trim-after-move") {
+                moved = false;
+                trims_progress = true;
+            }
         };
         if waiting == 0 {
             self.give_back.now().waiting = None;
@@ -1955,60 +2021,91 @@ impl Store {
             steps,
             took: began.elapsed(),
             longest,
+            largest_move,
             waiting,
         }))
     }
 
-    /// What `vox status` says of this store, measured under the writer: between two steps of a
-    /// pass, never inside one. `None` while it is not open for writing.
-    pub(crate) fn space(&self) -> Result<Option<StoreSpace>> {
-        let epochs = self.writer()?;
-        let txn = match &*self.db.read().unwrap_or_else(PoisonError::into_inner) {
-            Backing::Writable(db) => db.begin_write().map_err(storage("measure store"))?,
-            Backing::ReadOnly(_) | Backing::Closed => return Ok(None),
-        };
-        let space = txn.space().map_err(storage("measure store"))?;
-        drop(txn);
+    /// What `vox status` says of this store, without waiting for its writer (RG-12): measured
+    /// now when no writer holds the store, between two steps of a pass, never inside one;
+    /// otherwise what it last measured. `None` while it is not open for writing.
+    pub(crate) fn space(&self) -> Option<StoreSpace> {
+        let mut held_now = false;
+        if let Ok(epochs) = self.writer.try_lock() {
+            if !epochs.replacement {
+                let space = match self.db.try_read().as_deref() {
+                    Ok(Backing::Writable(db)) => {
+                        db.begin_write().ok().and_then(|txn| txn.space().ok())
+                    }
+                    Ok(Backing::ReadOnly(_) | Backing::Closed) => return None,
+                    Err(_) => None,
+                };
+                if let Some(space) = space {
+                    self.give_back.now().held = Some(space.allocated.saturating_sub(space.retired));
+                    held_now = true;
+                }
+            }
+            drop(epochs);
+        }
         let now = self.give_back.now();
-        let said = StoreSpace {
-            held_bytes: space.allocated.saturating_sub(space.retired),
+        Some(StoreSpace {
+            held_bytes: now.held,
+            held_now,
             giving_back: now.passes > 0,
             waiting_for_reads: now.waiting.is_some(),
-        };
-        drop(now);
-        drop(epochs);
-        Ok(Some(said))
+        })
     }
 
-    /// Test apparatus (RG-13): while the file `VOX_TEST_HOLD_STORE_READ_FILE` names exists, one
-    /// read of this store stays open, as a pending save's pinned read does; `<file>.open` exists
-    /// while it is open. Each time the file appears again, a new read is held.
+    /// Test apparatus (RG-13): while the file `VOX_TEST_HOLD_GIVE_BACK_WAIT_FILE` names exists,
+    /// a pass about to wait for reads stops before it begins to wait (`<file>.before` exists)
+    /// and again after (`<file>.armed`), each time until that marker is removed.
     #[cfg(feature = "test-knobs")]
-    pub(crate) fn hold_read_for_proof(self: &Arc<Self>) {
-        let Some(path) = std::env::var_os("VOX_TEST_HOLD_STORE_READ_FILE").map(PathBuf::from)
+    fn hold_wait_for_proof(stage: &str) {
+        let Some(path) = std::env::var_os("VOX_TEST_HOLD_GIVE_BACK_WAIT_FILE").map(PathBuf::from)
         else {
             return;
         };
-        let store = Arc::downgrade(self);
-        let open = path.with_extension("open");
-        let pause = || std::thread::sleep(std::time::Duration::from_millis(20));
-        std::thread::spawn(move || loop {
-            while !path.exists() {
-                if store.strong_count() == 0 {
-                    return;
+        if !path.exists() {
+            return;
+        }
+        let marker = path.with_extension(stage);
+        let _ = std::fs::write(&marker, stage);
+        while marker.exists() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// Test apparatus (RG-13): while a file `VOX_TEST_HOLD_STORE_READ_FILE` names exists (a
+    /// path list: one held read each), one read of this store stays open, as a pending save's
+    /// pinned read does; `<file>.open` exists while it is open. Each time the file appears
+    /// again, a new read is held.
+    #[cfg(feature = "test-knobs")]
+    pub(crate) fn hold_read_for_proof(self: &Arc<Self>) {
+        let Some(paths) = std::env::var_os("VOX_TEST_HOLD_STORE_READ_FILE") else {
+            return;
+        };
+        for path in std::env::split_paths(&paths) {
+            let store = Arc::downgrade(self);
+            let open = path.with_extension("open");
+            let pause = || std::thread::sleep(std::time::Duration::from_millis(20));
+            std::thread::spawn(move || loop {
+                while !path.exists() {
+                    if store.strong_count() == 0 {
+                        return;
+                    }
+                    pause();
                 }
-                pause();
-            }
-            let Some(read) = store.upgrade().and_then(|store| store.begin_read().ok()) else {
-                return;
-            };
-            let _ = std::fs::write(&open, "a store read is open");
-            while path.exists() {
-                pause();
-            }
-            drop(read);
-            let _ = std::fs::remove_file(&open);
-        });
+                let Some(read) = store.upgrade().and_then(|store| store.begin_read().ok()) else {
+                    return;
+                };
+                let _ = std::fs::write(&open, "a store read is open");
+                while path.exists() {
+                    pause();
+                }
+                drop(read);
+                let _ = std::fs::remove_file(&open);
+            });
+        }
     }
 
     /// Repartition only this opened room. Each native transaction examines at most 64

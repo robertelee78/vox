@@ -1365,15 +1365,6 @@ impl Node {
         instance: SharedChannel,
         attachment: u64,
     ) -> bool {
-        // Test apparatus (RG-13): with the periodic sweep held too, only a private drive's own
-        // expiry removes expired Session steps while this file exists.
-        #[cfg(feature = "test-knobs")]
-        if std::env::var_os("VOX_TEST_HOLD_ROOM_SWEEP_FILE")
-            .filter(|path| !path.is_empty())
-            .is_some_and(|path| std::path::Path::new(&path).is_file())
-        {
-            return false;
-        }
         if attachment != self.delivery_epoch
             || !self
                 .channels

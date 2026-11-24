@@ -2361,13 +2361,13 @@ impl WriteTransaction {
     // Returns true if a page(s) was moved
     pub(crate) fn compact_pages(&mut self) -> Result<bool> {
         self.compact_pages_within(MAX_PAGES_PER_COMPACTION, u64::MAX)
+            .map(|moved| moved > 0)
     }
 
     // Vox: `compact_pages`, choosing at most `most_pages` of the highest pages and copying at most
     // `most_bytes`: the moved pages and the parents rewritten with them, at least one page.
-    fn compact_pages_within(&mut self, most_pages: usize, most_bytes: u64) -> Result<bool> {
-        let mut progress = false;
-
+    // Returns the bytes it copied; zero when no page moved.
+    fn compact_pages_within(&mut self, most_pages: usize, most_bytes: u64) -> Result<u64> {
         // Find the highest pages
         let mut highest_pages = BTreeMap::new();
         let mut tables = self.tables.lock().unwrap();
@@ -2395,7 +2395,6 @@ impl WriteTransaction {
             if !relocation_map.is_empty() && moved.saturating_add(copies) > most_bytes {
                 break;
             }
-            moved = moved.saturating_add(copies);
             let old_page = page_allocator.get_page(path.page_number(), PageHint::None)?;
             let mut new_page =
                 page_allocator.allocate_lowest(old_page.memory().len(), &PageTracker::ignore())?;
@@ -2406,6 +2405,7 @@ impl WriteTransaction {
             drop(new_page);
             // We're able to move this to a lower page, so insert it and rewrite all its parents
             if new_page_number < path.page_number() {
+                moved = moved.saturating_add(copies);
                 relocation_map.insert(path.page_number(), new_page_number);
                 for parent in path.parents() {
                     if relocation_map.contains_key(parent) {
@@ -2427,13 +2427,11 @@ impl WriteTransaction {
             }
         }
 
-        if !relocation_map.is_empty() {
-            progress = true;
-        }
-
         table_tree.relocate_tables(&relocation_map)?;
         #[cfg(feature = "vox-test-knobs")]
-        if progress && let Some(marker) = std::env::var_os("VOX_TEST_COMPACT_RELOCATED") {
+        if !relocation_map.is_empty()
+            && let Some(marker) = std::env::var_os("VOX_TEST_COMPACT_RELOCATED")
+        {
             std::fs::write(&marker, "table pages relocated before commit")
                 .map_err(crate::StorageError::from)?;
             while std::path::Path::new(&marker).exists() {
@@ -2442,24 +2440,24 @@ impl WriteTransaction {
         }
         system_table_tree.relocate_tables(&relocation_map)?;
 
-        Ok(progress)
+        Ok(moved)
     }
 
     /// Vox: one give-back step while the database is shared. Moves at most `most_bytes` of the
-    /// highest pages (with the parents rewritten for them; at least one page) into the lowest
-    /// free ones and trims, at this commit, all free space at the end of the file. The pages it
-    /// vacates are freed like any write's: only once no open read can still see them, so reads
-    /// go on, and a later commit ([`Self::trim_at_commit`]) trims that space. Unlike
+    /// highest pages (with the parents rewritten for them; at least one page, however large)
+    /// into the lowest free ones and trims, at this commit, all free space at the end of the
+    /// file; returns the bytes it copied. The pages it vacates are freed like any write's: only
+    /// once no open read can still see them, so reads go on, and a later commit
+    /// ([`Self::trim_at_commit`]) trims that space. Unlike
     /// [`crate::Database::compact`] it neither waits for reads nor needs the database alone;
     /// the caller must make no savepoints, since moved pages are not tracked for one.
-    pub fn compact_pages_and_trim(&mut self, most_bytes: u64) -> Result {
+    pub fn compact_pages_and_trim(&mut self, most_bytes: u64) -> Result<u64> {
         self.trim_at_commit();
         let page = self.mem.get_page_size() as u64;
         let most_pages = usize::try_from(most_bytes / page)
             .unwrap_or(usize::MAX)
             .clamp(1, MAX_PAGES_PER_COMPACTION);
         self.compact_pages_within(most_pages, most_bytes)
-            .map(|_| ())
     }
 
     /// Vox: this commit trims all free space at the end of the file, not only a quarter or more.

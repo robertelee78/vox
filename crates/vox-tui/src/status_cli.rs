@@ -120,7 +120,9 @@ fn store_inventory(paths: &Paths, nodes: &[vox_core::node::daemonipc::NodeInfo])
 }
 
 /// What the node's own store holds, and whether it is giving space back, from its report
-/// (RG-13): only the node that answered can measure its store; another node's says it.
+/// (RG-13): only the node that answered can measure its store; another node's says it. The
+/// node measures without waiting for a write: while one holds the store it says what it last
+/// measured, or that it has not measured yet.
 fn held_by_node(v: &mut Value, node: &str) {
     let report = v
         .as_object_mut()
@@ -134,6 +136,12 @@ fn held_by_node(v: &mut Value, node: &str) {
             store["held_error"] = "said by that node's own vox status".into();
         } else if let Some(held) = report["held_bytes"].as_u64() {
             store["held_bytes"] = held.into();
+            store["held_now"] = report["held_now"].clone();
+            store["giving_back"] = report["giving_back"].clone();
+            store["waiting_for_reads"] = report["waiting_for_reads"].clone();
+        } else if report["giving_back"].is_boolean() {
+            store["held_error"] = "not measured yet: a write holds the store".into();
+            store["held_now"] = false.into();
             store["giving_back"] = report["giving_back"].clone();
             store["waiting_for_reads"] = report["waiting_for_reads"].clone();
         } else {
@@ -165,7 +173,14 @@ fn render_stores(v: &Value) -> String {
         }
         out.push_str("; holds ");
         if let Some(bytes) = store["held_bytes"].as_u64() {
-            let _ = write!(out, "{bytes} bytes");
+            if store["held_now"] == false {
+                let _ = write!(
+                    out,
+                    "{bytes} bytes when last measured (a write holds the store now)"
+                );
+            } else {
+                let _ = write!(out, "{bytes} bytes");
+            }
         } else {
             let _ = write!(out, "unavailable ({})", s(store, "held_error"));
         }

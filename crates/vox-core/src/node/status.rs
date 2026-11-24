@@ -401,8 +401,8 @@ pub struct StatusReport {
     /// projection remains the last complete one while this is true.
     pub governance_pending: bool,
     /// What the node's store holds, and whether it is giving disk space back or waits for
-    /// reads to end to go on (RG-13); the error when it could not be measured. `None` while
-    /// the store is not open for writing.
+    /// reads to end to go on (RG-13), said without waiting for its writer; the error when the
+    /// measuring task failed. `None` while the store is not open for writing.
     pub store: Option<std::result::Result<crate::node::store::StoreSpace, String>>,
     /// When the machine's network last changed, unix milliseconds, and the change in one line
     /// (ADR-012 N-52); `None` if it has not since the daemon started.
@@ -606,8 +606,13 @@ impl StatusReport {
             match &self.store {
                 None => "null".to_owned(),
                 Some(Ok(space)) => format!(
-                    "{{\"held_bytes\":{},\"giving_back\":{},\"waiting_for_reads\":{}}}",
-                    space.held_bytes, space.giving_back, space.waiting_for_reads
+                    "{{\"held_bytes\":{},\"held_now\":{},\"giving_back\":{},\"waiting_for_reads\":{}}}",
+                    space
+                        .held_bytes
+                        .map_or_else(|| "null".to_owned(), |held| held.to_string()),
+                    space.held_now,
+                    space.giving_back,
+                    space.waiting_for_reads
                 ),
                 Some(Err(error)) => format!("{{\"held_error\":{}}}", q(error)),
             }
