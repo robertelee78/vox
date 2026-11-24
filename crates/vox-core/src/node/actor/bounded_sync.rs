@@ -270,6 +270,24 @@ fn parked_flow_keeps_ready_mutant() -> bool {
     *ON
 }
 
+/// `VOX_MUTANT_ARCHIVE_TURN_CANCELS_OTHER_PORT`: a port that reaches the node's one archive turn
+/// cancels another port's queued ticket whose owner is still retained, and queues its own at the
+/// back, as before this fix. Says so once on stderr when first read.
+#[cfg(feature = "test-knobs")]
+fn archive_turn_cancels_other_port_mutant() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let on = std::env::var_os("VOX_MUTANT_ARCHIVE_TURN_CANCELS_OTHER_PORT").is_some();
+        if on {
+            eprintln!(
+                "vox: VOX_MUTANT_ARCHIVE_TURN_CANCELS_OTHER_PORT engaged: a port's archive turn \
+                 cancels another port's queued ticket"
+            );
+        }
+        on
+    });
+    *ON
+}
+
 fn retirement_key(flow: &Flow) -> RetirementKey {
     RetirementKey {
         actor: flow.actor_incarnation(),
@@ -2457,7 +2475,9 @@ impl Controller {
         self.poll_cleanup();
     }
 
-    // The queue ticket binds one exact node, room, peer and retained request.
+    // The queue ticket binds one exact node, room, peer and retained request. Another port's
+    // ticket whose owner is still retained (`held_elsewhere`) is that port's place in the
+    // daemon's archive queue: this port waits, and asks again once that ticket is spent.
     #[allow(clippy::too_many_arguments)]
     fn archive_turn(
         &mut self,
@@ -2470,7 +2490,14 @@ impl Controller {
         request: stream::RequestId,
         generation: Digest32,
         instance: [u8; 16],
+        held_elsewhere: bool,
     ) -> ArchiveTurn {
+        #[cfg(feature = "test-knobs")]
+        let held_elsewhere = held_elsewhere && !archive_turn_cancels_other_port_mutant();
+        if held_elsewhere {
+            return ArchiveTurn::Waiting;
+        }
+        // What is left to replace: this port's own earlier ticket, or one whose owner has ended.
         if self.archive_admission.as_ref().is_some_and(|admission| {
             admission.room != room
                 || admission.peer != peer
@@ -2923,6 +2950,36 @@ impl Node {
         }
         // A stale driver's Drop retains its remaining exact debt in the existing daemon ledger.
         result
+    }
+
+    /// Whether the node's one queued archive turn belongs to another port than `(room, peer)`
+    /// and its owner is still retained: the exact dispatch not yet consumed, or the exact parked
+    /// Flow it was queued for. That ticket is the other port's place in the daemon's archive
+    /// queue; a start of this port must not drop it.
+    fn archive_turn_held_elsewhere(&self, room: Digest32, peer: Digest32) -> bool {
+        self.bounded_sync
+            .archive_admission
+            .as_ref()
+            .is_some_and(|admission| {
+                (admission.room != room || admission.peer != peer)
+                    && (self
+                        .history_demand
+                        .unstarted_binding(admission.room, admission.peer)
+                        == Some((admission.request, admission.generation, admission.instance))
+                        || self
+                            .bounded_sync
+                            .ready
+                            .iter()
+                            .flatten()
+                            .chain(self.bounded_sync.deferred.iter())
+                            .any(|flow| {
+                                flow.room == admission.room
+                                    && flow.peer == admission.peer
+                                    && flow.archive_request == Some(admission.request)
+                                    && flow.generation == admission.generation
+                                    && flow.instance == admission.instance
+                            }))
+            })
     }
 
     /// A flow whose start ended before its round retains the exact work already consumed while
@@ -4553,6 +4610,7 @@ impl Node {
                         if let Some((request, generation, instance)) =
                             self.history_demand.ready_binding(room, peer)
                         {
+                            let held_elsewhere = self.archive_turn_held_elsewhere(room, peer);
                             match self.bounded_sync.archive_turn(
                                 &self.history_budget,
                                 &self.net_tx,
@@ -4563,6 +4621,7 @@ impl Node {
                                 request,
                                 generation,
                                 instance,
+                                held_elsewhere,
                             ) {
                                 ArchiveTurn::Ready(job) => admitted_archive = Some(job),
                                 ArchiveTurn::Waiting => {
@@ -5120,6 +5179,7 @@ impl Node {
                     self.bounded_sync.dispose(flow);
                     return false;
                 };
+                let held_elsewhere = self.archive_turn_held_elsewhere(flow.room, flow.peer);
                 match self.bounded_sync.archive_turn(
                     &self.history_budget,
                     &self.net_tx,
@@ -5130,6 +5190,7 @@ impl Node {
                     request,
                     flow.generation,
                     flow.instance,
+                    held_elsewhere,
                 ) {
                     ArchiveTurn::Ready(job) => job,
                     ArchiveTurn::Waiting => {
