@@ -112,7 +112,8 @@ impl Drop for Daemon {
     }
 }
 
-/// Start `vox daemon` on the profile and wait until its control socket answers.
+/// Start `vox daemon` on the profile and wait until its control socket answers. A proof may hold
+/// the daemon's expiry sweeps by creating `<err>.prune-hold` (a test-only knob, inert otherwise).
 fn daemon(data: &Path, cfg: &Path, pass: &Path, err: &Path) -> Daemon {
     let mut cmd = Command::new(VOX);
     support::strip_harness_env(&mut cmd);
@@ -121,6 +122,10 @@ fn daemon(data: &Path, cfg: &Path, pass: &Path, err: &Path) -> Daemon {
         .arg(pass)
         .env("VOX_DATA_DIR", data)
         .env("VOX_CONFIG_DIR", cfg)
+        .env(
+            "VOX_TEST_HOLD_EXPIRY_PRUNE_FILE",
+            err.with_extension("prune-hold"),
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(std::fs::File::create(err).unwrap_or_else(
@@ -869,6 +874,15 @@ fn a_debug_daemon_makes_a_room_takes_a_post_and_keeps_running() {
             std::fs::read_to_string(&daemon_err).unwrap_or_default()
         )
     };
+    // Diagnostic: the test-only mutants the daemon says it engaged.
+    let engaged = || {
+        std::fs::read_to_string(&daemon_err)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains(" engaged"))
+            .map(|line| format!("\n[the daemon said] {line}"))
+            .collect::<String>()
+    };
 
     let (ok, _, err) = vox(
         &data,
@@ -1062,25 +1076,47 @@ fn a_debug_daemon_makes_a_room_takes_a_post_and_keeps_running() {
             && collision_ids.iter().any(|entry| older_ids.contains(entry)),
         "APPARATUS: the staged prefix {ambiguous} did not span newest and older pages"
     );
-    let (ok, out, err) = vox(
-        &data,
-        &cfg,
-        &[
-            "room",
-            "post",
-            &room,
-            "--re",
-            &ambiguous,
-            "PREFIX-AMBIGUOUS",
-        ],
-        None,
-    );
-    assert!(
-        !ok
-            && err.contains("entry prefix is ambiguous")
-            && collision_ids.iter().all(|entry| err.contains(entry)),
-        "PRODUCT: an ambiguous reply prefix must name every matching entry {collision_ids:?}: {out}{err}"
-    );
+    // The node answers a prefix from one snapshot, so it is ambiguous also while messages arrive.
+    // Mutant `VOX_MUTANT_PREFIX_FIRST_MATCH`: the first match is taken and the reply posted.
+    let attempts = std::thread::scope(|scope| {
+        let poster = scope.spawn(|| {
+            for i in 0..10 {
+                post(&[&format!("PREFIX-ARRIVES-WHILE-AMBIGUOUS-{i}")]);
+            }
+        });
+        let mut attempts = 0;
+        loop {
+            let (ok, out, err) = vox(
+                &data,
+                &cfg,
+                &[
+                    "room",
+                    "post",
+                    &room,
+                    "--re",
+                    &ambiguous,
+                    "PREFIX-AMBIGUOUS",
+                ],
+                None,
+            );
+            attempts += 1;
+            assert!(
+                !ok && err.contains("entry prefix is ambiguous")
+                    && collision_ids.iter().all(|entry| err.contains(entry)),
+                "PRODUCT: an ambiguous reply prefix must name every matching entry \
+                 {collision_ids:?}, while messages arrive: {out}{err}{}",
+                engaged()
+            );
+            if poster.is_finished() {
+                break;
+            }
+        }
+        poster
+            .join()
+            .expect("APPARATUS: the poster thread panicked");
+        attempts
+    });
+    println!("[proof] {attempts} ambiguous replies refused while 10 messages arrived");
     let (read_ok, after_ambiguous, read_err) =
         vox(&data, &cfg, &["room", "read", &room, "--json"], None);
     assert!(
@@ -1136,14 +1172,125 @@ fn a_debug_daemon_makes_a_room_takes_a_post_and_keeps_running() {
         "PRODUCT: unique older-page prefix {older_prefix} did not reply to canonical parent {older_target}: {canonical_parent}"
     );
 
-    // A multi-page selector is one logical read. Hold the shipped CLI after its first page,
-    // change the room through a second shipped CLI, then let it continue. It must refuse the
-    // stale scan and post nothing. Mutant: remove the display-revision comparison; the reply is
-    // posted against a collection that never existed as one room view.
+    // The node resolves a reply prefix in one request, from one snapshot (ledger 95).
+    // - A prefix naming a message that has expired finds nothing: refused, nothing posted. The
+    //   sweep is held, so the message is still stored, only no longer readable. Mutant
+    //   `VOX_MUTANT_PREFIX_MATCHES_UNREADABLE`: the prefix finds it.
+    // - A unique prefix: the reply goes to it although a message arrives after it is resolved
+    //   (the shipped CLI is held there). Mutant `VOX_MUTANT_PREFIX_REFUSES_ARRIVALS`: refused.
     #[cfg(feature = "test-knobs")]
     {
-        test_knobs::require(&["VOX_TEST_REPLY_PREFIX_HOLD_FILE"]);
-        let (changing_target, changing_prefix) = older_ids
+        test_knobs::require(&[
+            "VOX_TEST_REPLY_PREFIX_HOLD_FILE",
+            "VOX_TEST_HOLD_EXPIRY_PRUNE_FILE",
+        ]);
+        // A plain read, once it answers: a room removing expired messages says so until it has.
+        let rows_now = |room: &str| loop {
+            let (ok, rows, err) = vox(&data, &cfg, &["room", "read", room, "--json"], None);
+            if !ok && err.contains("the room is refreshing saved history; retry") {
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            assert!(ok, "PRODUCT: room read failed: {rows}{err}");
+            break rows
+                .lines()
+                .map(|line| {
+                    serde_json::from_str::<serde_json::Value>(line).unwrap_or_else(|error| {
+                        panic!("PRODUCT: room read returned invalid JSON row {line:?}: {error}")
+                    })
+                })
+                .collect::<Vec<_>>();
+        };
+        let shown = |rows: &[serde_json::Value], entry: &str| {
+            rows.iter().any(|row| row["entry_hash"] == entry)
+        };
+
+        let (ok, _, err) = vox(
+            &data,
+            &cfg,
+            &[
+                "room",
+                "create",
+                "--passphrase-file",
+                "-",
+                "--name",
+                "expiring-in-debug",
+            ],
+            Some("channel passphrase"),
+        );
+        assert!(
+            ok,
+            "PRODUCT (staging): vox room create expiring-in-debug failed: {err}"
+        );
+        let (ok, out, err) = vox(&data, &cfg, &["room", "list"], None);
+        let expiring = out
+            .lines()
+            .find(|l| l.contains("expiring-in-debug"))
+            .and_then(|l| l.split_whitespace().next())
+            .filter(|_| ok)
+            .unwrap_or_else(|| {
+                panic!("PRODUCT (staging): the daemon does not list expiring-in-debug: {out}{err}")
+            })
+            .to_owned();
+        let (ok, out, err) = vox(&data, &cfg, &["room", "retention", &expiring, "8"], None);
+        assert!(
+            ok,
+            "PRODUCT (staging): vox room retention 8 failed: {out}{err}"
+        );
+        rows_now(&expiring);
+        let prune_hold = daemon_err.with_extension("prune-hold");
+        std::fs::write(&prune_hold, b"hold").expect("APPARATUS: could not stage the prune hold");
+        let (ok, out, err) = vox(
+            &data,
+            &cfg,
+            &[
+                "room",
+                "post",
+                &expiring,
+                "--json",
+                "EXPIRES-BEFORE-ITS-REPLY",
+            ],
+            None,
+        );
+        assert!(ok, "PRODUCT (staging): room post failed: {out}{err}");
+        let expired = serde_json::from_str::<serde_json::Value>(&out)
+            .ok()
+            .and_then(|row| row["entry_hash"].as_str().map(str::to_owned))
+            .unwrap_or_else(|| panic!("PRODUCT (staging): the post named no entry: {out}"));
+        assert!(
+            shown(&rows_now(&expiring), &expired),
+            "APPARATUS: expiring-in-debug did not show {expired} before it expired"
+        );
+        while shown(&rows_now(&expiring), &expired)
+            || !prune_hold.with_extension("engaged").exists()
+        {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let (ok, out, err) = vox(
+            &data,
+            &cfg,
+            &[
+                "room",
+                "post",
+                &expiring,
+                "--re",
+                &expired[..51],
+                "REPLY-TO-THE-EXPIRED",
+            ],
+            None,
+        );
+        let posted = rows_now(&expiring)
+            .iter()
+            .any(|row| row.to_string().contains("REPLY-TO-THE-EXPIRED"));
+        assert!(
+            !ok && err.contains("no message printed by room read matches") && !posted,
+            "PRODUCT: a reply prefix naming {expired}, which expired and a plain read no longer \
+             shows, found it (or posted): {out}{err}{}",
+            engaged()
+        );
+        std::fs::remove_file(&prune_hold).expect("APPARATUS: could not release the prune hold");
+
+        let (target, target_prefix) = older_ids
             .iter()
             .find_map(|entry| {
                 let prefix = entry.get(..51)?;
@@ -1156,52 +1303,46 @@ fn a_debug_daemon_makes_a_room_takes_a_post_and_keeps_running() {
             })
             .expect("APPARATUS: no older printed entry had a unique 51-character prefix");
         let hold = tmp.path().join("reply-prefix.hold");
-        let reached = hold.with_extension("reached");
-        std::fs::write(&hold, b"hold")
-            .expect("APPARATUS: could not stage the reply-prefix scan hold");
-
-        let scan_data = data.clone();
-        let scan_cfg = cfg.clone();
-        let scan_room = room.clone();
-        let scan_hold = hold.clone();
-        let scan = std::thread::spawn(move || {
+        std::fs::write(&hold, b"hold").expect("APPARATUS: could not stage the reply hold");
+        let (reply_data, reply_cfg, reply_room, reply_hold) =
+            (data.clone(), cfg.clone(), room.clone(), hold.clone());
+        let reply = std::thread::spawn(move || {
             vox_with_env(
-                &scan_data,
-                &scan_cfg,
+                &reply_data,
+                &reply_cfg,
                 &[
                     "room",
                     "post",
-                    &scan_room,
+                    &reply_room,
                     "--re",
-                    &changing_prefix,
-                    "PREFIX-CHANGED-SCAN",
+                    &target_prefix,
+                    "PREFIX-REPLY-PAST-AN-ARRIVAL",
                 ],
                 None,
-                &[("VOX_TEST_REPLY_PREFIX_HOLD_FILE", scan_hold.as_os_str())],
+                &[("VOX_TEST_REPLY_PREFIX_HOLD_FILE", reply_hold.as_os_str())],
             )
         });
-        while !reached.exists() {
+        while !hold.with_extension("reached").exists() {
             assert!(
-                !scan.is_finished(),
-                "APPARATUS: reply-prefix command ended before reaching its staged first-page hold"
+                !reply.is_finished(),
+                "APPARATUS: the reply ended before reaching its staged hold"
             );
             std::thread::sleep(Duration::from_millis(10));
         }
-        let changed = post(&["PREFIX-CHANGES-WHILE-SCANNED"]);
-        std::fs::remove_file(&hold)
-            .expect("APPARATUS: could not release the staged reply-prefix scan");
-        let (changed_ok, changed_out, changed_err) = scan
+        let arrived = post(&["PREFIX-ARRIVES-WHILE-REPLYING"]);
+        std::fs::remove_file(&hold).expect("APPARATUS: could not release the staged reply");
+        let (ok, out, err) = reply
             .join()
-            .expect("APPARATUS: reply-prefix command thread panicked");
+            .expect("APPARATUS: the reply's thread panicked");
+        let replied = rows_now(&room)
+            .into_iter()
+            .find(|row| row.to_string().contains("PREFIX-REPLY-PAST-AN-ARRIVAL"));
         assert!(
-            !changed_ok && changed_err.contains("room changed"),
-            "PRODUCT: reply-prefix scan accepted stale pages after room entry {changed} changed revision while resolving {changing_target}: {changed_out}{changed_err}"
-        );
-        let (read_ok, after_changed, read_err) =
-            vox(&data, &cfg, &["room", "read", &room, "--json"], None);
-        assert!(
-            read_ok && !after_changed.contains("PREFIX-CHANGED-SCAN"),
-            "PRODUCT: stale reply-prefix scan posted after the room changed: {after_changed}{read_err}"
+            ok && replied
+                .as_ref()
+                .is_some_and(|row| row["envelope"]["re"] == target),
+            "PRODUCT: a reply by the unique prefix of {target} did not go to it after message \
+             {arrived} arrived: {replied:?} {out}{err}"
         );
     }
     #[cfg(not(feature = "test-knobs"))]

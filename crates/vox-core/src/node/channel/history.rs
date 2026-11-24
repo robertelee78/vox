@@ -42,6 +42,13 @@ pub(crate) enum Query {
     },
     Governance(crate::node::api::GovernanceQuery),
     DisplayRevision,
+    ReadRevision,
+    /// The readable messages whose id starts with a base32 prefix, up to
+    /// [`crate::node::ipc::PREFIX_MATCHES`] and one past it, answered as [`Reply::Order`]: what a
+    /// reply by prefix resolves.
+    Prefix {
+        prefix: String,
+    },
     ArrivalHead,
     OperationPage {
         author: Digest32,
@@ -208,37 +215,50 @@ impl Selection {
     }
 }
 
+/// The next hash in byte order, none past the last.
+fn successor_hash(mut hash: Digest32) -> Option<Digest32> {
+    for byte in hash.iter_mut().rev() {
+        let (next, carry) = byte.overflowing_add(1);
+        *byte = next;
+        if !carry {
+            return Some(hash);
+        }
+    }
+    None
+}
+
 /// A short query may be followed by a client wait, but no Store snapshot or room lock is.
-/// This token rejects a changed room before another part of one Find answer is read.
+/// A read that takes several requests gives each row as it is when that request is answered:
+/// any row may change the instant after it is read, in one request or five. This token refuses
+/// such a read only when the order of rows it has already given changed (an entry moved by a
+/// late parent), which would show a row twice or skip it across pages anchored on an entry.
 #[derive(Clone)]
 pub(crate) struct Revision {
     incarnation: Arc<std::sync::atomic::AtomicU64>,
-    facts: [u64; 8],
-    rendered_roots: [u64; 4],
+    order: u64,
 }
 
 impl Revision {
     fn of(ch: &ReadFacts, rendered: &entry_store::RenderView<'_>) -> Result<Self> {
+        #[allow(unused_mut)]
+        let mut order = rendered.order().revision();
+        #[cfg(feature = "test-knobs")]
+        {
+            if crate::node::mp11_mutant(
+                "VOX_MUTANT_READ_REFUSES_ARRIVALS",
+                "a read spanning requests is refused when a message arrives",
+            ) {
+                order = order.wrapping_add(ch.generation);
+            }
+        }
         Ok(Self {
             incarnation: ch.gen.clone(),
-            facts: [
-                ch.generation,
-                ch.display_rewrite,
-                rendered.count()?,
-                ch.reorder_generation,
-                ch.body_generation,
-                ch.classification_revision,
-                ch.effective_retention(),
-                ch.effective_step_retention(),
-            ],
-            rendered_roots: rendered.display_roots(),
+            order,
         })
     }
     fn current(&self, ch: &ReadFacts, rendered: &entry_store::RenderView<'_>) -> Result<bool> {
         let now = Self::of(ch, rendered)?;
-        Ok(Arc::ptr_eq(&self.incarnation, &now.incarnation)
-            && self.facts == now.facts
-            && self.rendered_roots == now.rendered_roots)
+        Ok(Arc::ptr_eq(&self.incarnation, &now.incarnation) && self.order == now.order)
     }
 }
 
@@ -277,6 +297,7 @@ impl View<'_> {
                 | Query::Agreement { .. }
                 | Query::OperationPage { .. }
                 | Query::Order { .. }
+                | Query::Prefix { .. }
                 | Query::ThreadPage { .. }
                 | Query::ThreadSummary { .. }
         ) && (!self.ch.projection_ready
@@ -453,6 +474,7 @@ impl View<'_> {
                 | Query::ViewRows { .. }
                 | Query::ViewRevision { .. }
                 | Query::DisplayRevision
+                | Query::ReadRevision
                 | Query::ArrivalHead
                 | Query::NoticeState
                 | Query::NoticeExact { .. }
@@ -1245,7 +1267,10 @@ impl View<'_> {
                 }
                 Ok(Reply::DisplayRevision(hash.finalize().into()))
             }
-            Query::DisplayRevision => {
+            // The display token moves with whatever a person could see change, an arrival too:
+            // a client caching a summary refreshes on it. The read token moves only when the
+            // order of rows already read changed: a read spanning requests compares it.
+            query @ (Query::DisplayRevision | Query::ReadRevision) => {
                 use sha2::{Digest, Sha256};
                 let revision = Revision::of(self.ch, &self.rendered)?;
                 let mut hash = Sha256::new();
@@ -1253,13 +1278,73 @@ impl View<'_> {
                 hash.update(self.ch.channel_id());
                 hash.update(self.rendered.history_instance());
                 hash.update(self.ch.incarnation.to_be_bytes());
-                for fact in revision.facts {
-                    hash.update(fact.to_be_bytes());
-                }
-                for root in revision.rendered_roots {
-                    hash.update(root.to_be_bytes());
+                hash.update(revision.order.to_be_bytes());
+                if matches!(query, Query::DisplayRevision) {
+                    for fact in [
+                        self.ch.generation,
+                        self.ch.display_rewrite,
+                        self.rendered.count()?,
+                        self.ch.body_generation,
+                        self.ch.classification_revision,
+                        self.ch.effective_retention(),
+                        self.ch.effective_step_retention(),
+                    ] {
+                        hash.update(fact.to_be_bytes());
+                    }
+                    for root in self.rendered.display_roots() {
+                        hash.update(root.to_be_bytes());
+                    }
                 }
                 Ok(Reply::DisplayRevision(hash.finalize().into()))
+            }
+            // One snapshot answers the whole question, so it is never refused because the room
+            // moved. Rendered rows are keyed by their hash: a prefix is one range of that index.
+            Query::Prefix { prefix } => {
+                // The lowest hash with this prefix: the prefix padded with zero bits ('a').
+                if prefix.is_empty() {
+                    return Err(Failure::Request("invalid entry prefix"));
+                }
+                let start = crate::node::link::b32_decode(&format!("{prefix:a<52}"), "prefix")
+                    .map_err(|_| Failure::Request("invalid entry prefix"))?;
+                let mut entries = Vec::new();
+                let mut from = Some(start);
+                while let Some(at) = from {
+                    let Some(hash) = self.rendered.rendered_from(&at)? else {
+                        break;
+                    };
+                    if !crate::node::link::b32_encode(&hash).starts_with(prefix.as_str()) {
+                        break;
+                    }
+                    // Only what this reader may read now, as a plain read: not an expired row.
+                    if self.row(&hash)?.is_some()
+                        || crate::node::mp11_mutant(
+                            "VOX_MUTANT_PREFIX_MATCHES_UNREADABLE",
+                            "a reply prefix matches a message this reader cannot read",
+                        )
+                    {
+                        let (clock, _) = self
+                            .rendered
+                            .order()
+                            .key(&hash)?
+                            .ok_or(Error::MalformedAtRest("rendered entry not published"))?;
+                        entries.push((hash, clock));
+                        if entries.len() > crate::node::ipc::PREFIX_MATCHES
+                            || crate::node::mp11_mutant(
+                                "VOX_MUTANT_PREFIX_FIRST_MATCH",
+                                "a reply prefix resolves to its first match",
+                            )
+                        {
+                            break;
+                        }
+                    }
+                    from = successor_hash(hash);
+                }
+                entries.sort_by_key(|&(hash, clock)| (clock, hash));
+                Ok(Reply::Order {
+                    entries,
+                    next: None,
+                    revision: self.rendered.order().revision(),
+                })
             }
             Query::Governance(_) => Err(Failure::Request(
                 "governance requires its checked authority reader",
@@ -1620,7 +1705,24 @@ impl View<'_> {
                 revision,
                 limit,
             } => {
-                let current = self.rendered.order().revision();
+                // Only an entry that moved breaks the cursor; an added one lands where the walk
+                // finds it or in the part already listed. Another saved room is another order.
+                let token = crate::hash::sha256_concat(&[
+                    &self.rendered.history_instance(),
+                    &self.rendered.order().revision().to_be_bytes(),
+                ]);
+                let mut current = [0; 8];
+                current.copy_from_slice(&token[..8]);
+                let current = u64::from_be_bytes(current);
+                #[cfg(feature = "test-knobs")]
+                let current = if crate::node::mp11_mutant(
+                    "VOX_MUTANT_READ_REFUSES_ARRIVALS",
+                    "a read spanning requests is refused when a message arrives",
+                ) {
+                    self.rendered.directory_revision()
+                } else {
+                    current
+                };
                 if revision.is_some_and(|r| r != current) {
                     return Err(Failure::Request(CHANGED));
                 }

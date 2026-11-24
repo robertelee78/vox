@@ -69,10 +69,11 @@ pub struct OrderView<'a> {
     pub(super) read: Read<'a>,
 }
 impl OrderView<'_> {
-    /// Revision of the pinned published roots. A mismatch calls for explicit refresh.
+    /// How many times a published entry has moved in this order (a late parent arrived after
+    /// it). An entry merely added does not move it: a cursor across views is still exact.
     #[must_use]
     pub fn revision(&self) -> u64 {
-        self.read.directory.revision
+        self.read.order_revision()
     }
     /// One exact published entry's display-order key, or absence; storage failures remain errors.
     pub fn key(&self, hash: &Digest32) -> Result<Option<OrderKey>> {

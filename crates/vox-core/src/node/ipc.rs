@@ -350,6 +350,10 @@ const T_THREAD_SUMMARY_REQ: u64 = 7540;
 const T_THREAD_SUMMARY: u64 = 7541;
 const T_ROOM_DISPLAY_REVISION_REQ: u64 = 7542;
 const T_ROOM_DISPLAY_REVISION: u64 = 7543;
+const T_ROOM_READ_REVISION_REQ: u64 = 7544;
+const T_ENTRY_PREFIX_REQ: u64 = 7545;
+/// How many matches an [`Request::EntryPrefix`] answer names; one more says there are more.
+pub const PREFIX_MATCHES: usize = 32;
 // ADR-028 RR-1: entries shown or drained, for a read record. Numbered by its story (#503).
 const T_MARK_READ: u64 = 503;
 // V210-164: leaving a room over the socket, as joining and creating one are. Numbered by its item,
@@ -1301,6 +1305,20 @@ pub enum Request {
         /// The selected node's room.
         channel_id: Digest32,
     },
+    /// The token a read spanning requests compares, as [`Frame::RoomDisplayRevision`]: it
+    /// moves when the order of rows already read changed, not when a message arrives.
+    RoomReadRevision {
+        /// The selected node's room.
+        channel_id: Digest32,
+    },
+    /// The readable messages whose id starts with `prefix`, from one snapshot, as
+    /// [`Frame::Order`]: none, one, or the first few and one more when it is ambiguous.
+    EntryPrefix {
+        /// The selected node's room.
+        channel_id: Digest32,
+        /// Lowercase base32.
+        prefix: String,
+    },
     /// How many rows of a room follow `since` (all of them when absent), as [`Frame::Count`]
     /// (V210-120): what a reader that reads a page at a time says is still waiting.
     Count {
@@ -1630,6 +1648,15 @@ impl Request {
                 e.array(2)
                     .uint(T_ROOM_DISPLAY_REVISION_REQ)
                     .bytes(channel_id);
+            }
+            Request::RoomReadRevision { channel_id } => {
+                e.array(2).uint(T_ROOM_READ_REVISION_REQ).bytes(channel_id);
+            }
+            Request::EntryPrefix { channel_id, prefix } => {
+                e.array(3)
+                    .uint(T_ENTRY_PREFIX_REQ)
+                    .bytes(channel_id)
+                    .text(prefix);
             }
             Request::Unread { channel_id } => {
                 e.array(2).uint(T_UNREAD_REQ).bytes(channel_id);
@@ -2618,6 +2645,19 @@ impl Request {
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::RoomDisplayRevision { channel_id })
             }
+            (T_ROOM_READ_REVISION_REQ, 2) => {
+                let channel_id = digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::RoomReadRevision { channel_id })
+            }
+            (T_ENTRY_PREFIX_REQ, 3) => {
+                let channel_id = digest(&mut d)?;
+                let prefix = d.text()?.to_owned();
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::EntryPrefix { channel_id, prefix })
+            }
             (T_UNREAD_REQ, 2) => {
                 let channel_id = digest(&mut d)?;
                 d.finish()
@@ -3474,7 +3514,7 @@ pub enum Frame {
         /// The rendered entries.
         rows: Vec<MessageRow>,
     },
-    /// The order a [`Request::Order`] asked for.
+    /// The order a [`Request::Order`] asked for, or the matches of a [`Request::EntryPrefix`].
     Order {
         /// `(entry hash, clock in ms)`, first to last.
         entries: Vec<(Digest32, u64)>,
@@ -8023,6 +8063,8 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         | Request::Thread { channel_id, .. }
         | Request::ThreadSummary { channel_id, .. }
         | Request::RoomDisplayRevision { channel_id, .. }
+        | Request::RoomReadRevision { channel_id, .. }
+        | Request::EntryPrefix { channel_id, .. }
         | Request::Count { channel_id, .. }
         | Request::Unread { channel_id, .. }
         | Request::Find { channel_id, .. }
@@ -8849,6 +8891,33 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         Request::RoomDisplayRevision { channel_id } => {
             match handle.room_display_revision(&channel_id).await {
                 Ok(revision) => Frame::RoomDisplayRevision { revision },
+                Err(reason) => Frame::Error { reason },
+            }
+        }
+        Request::RoomReadRevision { channel_id } => {
+            match handle.room_read_revision(&channel_id).await {
+                Ok(revision) => Frame::RoomDisplayRevision { revision },
+                Err(reason) => Frame::Error { reason },
+            }
+        }
+        Request::EntryPrefix { channel_id, prefix } => {
+            use crate::node::channel::history::{Query, Reply};
+            match handle
+                .room_history(channel_id, Query::Prefix { prefix })
+                .await
+            {
+                Ok(Reply::Order {
+                    entries,
+                    next,
+                    revision,
+                }) => Frame::Order {
+                    entries,
+                    next,
+                    revision,
+                },
+                Ok(_) => Frame::Error {
+                    reason: "unexpected room prefix answer".into(),
+                },
                 Err(reason) => Frame::Error { reason },
             }
         }

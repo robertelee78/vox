@@ -6207,6 +6207,19 @@ impl NodeHandle {
         .await
     }
 
+    /// The same, moving only when the order of rows already read changed: what a read spanning
+    /// requests compares, so a message that arrives or a row that changes does not refuse it.
+    pub(crate) async fn room_read_revision(
+        &self,
+        channel_id: &Digest32,
+    ) -> std::result::Result<Digest32, String> {
+        self.room_revision(
+            channel_id,
+            crate::node::channel::history::Query::ReadRevision,
+        )
+        .await
+    }
+
     /// A held window's current visibility and body locators, with the same current-name
     /// and actor-lifetime fences as the whole-room revision. Unselected arrivals do not
     /// change this token. Every call still passes the authoritative history gates.
