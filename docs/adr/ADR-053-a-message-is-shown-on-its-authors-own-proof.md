@@ -11,6 +11,7 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
   him. Nothing in it is built except what is named below as landed, accepted or built:
   implementation, acceptance and delivery are recorded on the source-bound issues, separately
   from decision status. *(Amended 2026-11-23, amendment 1: the head-mismatch ruling of gpt-6.1-sol (MP-7, MP-8a, MP-9; B-10 resolved), and the coordinating session's engineering decisions on the Order and on MP-9's transport, each marked where it applies. Amendment 2: the M0 ruling of gpt-6.1-sol, `design/step3-m0-ruling.md`, given after its review of the step-3 plan answered DO NOT BUILD (`design/step3-plan-review.md`): MP-1 to MP-5, the Terms, MP-13, MP-17, the Order and B-1/B-2, each marked where it applies. Amendment 3: the decider's ruling 10 with the forked-target ruling of gpt-6.1-sol, `design/forked-target/ruling.md` (MP-9a, MP-6, MP-8), and the moving-head ruling of gpt-6.1-sol, `design/moving-head/ruling.md` (MP-7's prefix serving P, MP-8a's head choice H, W not approved, MP-17), and the Order, each marked where it applies.)*
+  *(Amended 2026-11-24, amendment 4: the decider's rulings 11 to 13 (the private-step gap stays in v0.4.31 and is named; v0.4.31 is the busy room, and MP-14 and MP-16 move to v0.4.32; the stack of sync fixes is not the fix); the acknowledgement ruling of gpt-6.1-sol, `design/busy-room/ack-ruling.md` (MP-4); the control-closure ruling of gpt-6.1-sol, `design/busy-room/control-closure-ruling.md` (MP-7); the return ruling of the reviewer of #1393, `mp/cut-disappear/ruling-n.md` (MP-11); what has landed (MP-6 and MP-11 in #1393, MP-10's boundaries in #1392, MP-15 in #1391 with ADR-052 RG-13 closed); and ADR-054, which is to replace the fetching machinery this record's Order assumed (MP-9, MP-12, MP-13, the Order). Each is marked where it applies; the text it amends stays as it was, beside the mark. The coordinator's draft of this amendment is `design/amendment-4-draft.md`.)*
 - **Date**: 2026-11-23
 - **Deciders**: Robert E. Lee
 - **Tags**: sync, admission, governance, removal, fork detection, store, retention, compaction,
@@ -19,6 +20,7 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
   RG-13); records against ADR-046 and ADR-047, both already superseded for v0.4.31 by ADR-052,
   which of their lines this decision overtakes. The exact lines are under "What this ADR
   supersedes and amends".
+- **Amended by**: ADR-054 (fetching is one pull loop per connection), recorded here as amendment 4.
 - **Related**: ADR-007 (G-29 to G-32), ADR-018, ADR-023, ADR-036, ADR-046, ADR-047, ADR-052
   (RG-1, RG-6, RG-13, RG-15)
 - **Source**: in the release's evidence archive `/opt/vox-evidence/v0431/`: the decider's words in
@@ -87,6 +89,10 @@ journey of ADR-052 RG-1 decides it, in all sixteen directions, unchanged.
    has been measured after the redesign. It is not built unless measured to be needed; then the decider is asked, because it means trusting the creator's account of the past.
 10. **A member that splits its own history must not escape its removal** (2026-11-23, evening, by the question form; ledger 73; `exec/deviations.md`, "Answer of the owner on 2026-11-23 (evening)"). The defect: a member running altered software signs two versions of its own history; after the creator removes it, members who saw the other version never apply the removal, keep releasing keys to it and stop receiving the creator's later posts, in every release since v0.4.6. "Offered: fix it in v0.4.31, the release waiting for it as well; or ship with the first half, name the rest in the notes and fix next."
     "His answer: **fix it in v0.4.31** (his standing rule; the form's value `fix_now`)." Carried by MP-9a, with MP-6 and MP-8 as amended. *(Amended 2026-11-23, amendment 3.)*
+11. **The private-step gap stays in v0.4.31 and is named** (2026-11-23, late afternoon, by the question form; ledger 76; `exec/deviations.md`, "Answer of the owner on 2026-11-23 (late afternoon)"). The gap: a removed person running altered software writes a private Session step after being removed and gets it shown to a member who was offline when the removal happened and has not processed it yet; once that member processes the removal, further such steps are refused, but the one already taken stays. The reviewer found no small sound rule (`design/private-unaware/ruling.md`).
+    "His answer: **leave it and say so in the release notes** (the form's value `keep_and_name`). This is his exception to "every known defect is fixed in the current release", for this one defect." Carried by MP-10 as amended. *(Added 2026-11-24, amendment 4.)*
+12. **v0.4.31 is the busy room; disk-shrinking moves to v0.4.32** (2026-11-24, morning, in chat; `exec/deviations.md:168-183`). On disk space: "this shouldn't be complicated", and then, to the question whether v0.4.31 waits for the disk-shrinking work: "we can do the busy room as v0.4.31, then be better about disk space for v0.4.32". His other words that morning: "still the same 4 open tasks 🙁"; on the fixes that existed only as patches, "get that done"; "but dang -- we just need to actuallly land tasks better"; "we are prone to over engineered messes". The coordinating session's reading (`exec/deviations.md:180`), not a further quotation: MP-14 and MP-16 move to v0.4.32; what is already done for disk space ships in v0.4.31 (#1364, #1354, #1355, and MP-15, #1391); RG-13 closes when #1391 has merged, with MP-14 and MP-16 named on its issue as moved; for v0.4.32 the design is to be the simplest one that works, "to be re-decided then". Carried by MP-14, MP-15 and MP-16 as amended. *(Added 2026-11-24, amendment 4.)*
+13. **The stack of sync fixes is not the fix** (2026-11-24, later the same morning; `exec/deviations.md:185-189`). "yeah -- we have made an ever more elaborate set of if then else conditional messes -- we took something that was a bad design, very brittle, and with our "fix" made it worse -- worse design, more brittle" … "instead of fixing the design". The coordinating session's reading (`exec/deviations.md:189`), not a further quotation: the stack is a prototype, "evidence of what the room needs, not what lands"; what lands is "a design fix of the fetching side of sync: one mechanism in place of the rules, fewer states than today, code deleted rather than added". That design is ADR-054; it is to replace the fetching machinery this record's Order assumed (MP-13, the Order); nothing of it has landed. *(Added 2026-11-24, amendment 4.)*
 
 **Earlier rulings that stand:** KISS is the law (ADR-052 ruling 2, RG-0); the release bar is the
 three journeys on the shipped assets (ADR-052 RG-15); a feature is proven on the real binary or a
@@ -151,6 +157,23 @@ per expired post (`rg-13/follows/report.md:48`).
   commits, and a give-back pass runs after retention prunes and once after Ready; startup
   compaction before Ready is removed. Its crash, pause and mutant acts had not reported when this
   record was written.
+- *(Amended 2026-11-24, amendment 4: landed since this record was accepted.)* **#1391, merged**
+  2026-11-24 (merge commit `9cbb105b9`, `exec/review-audit.md:62`; its pull request text,
+  `rg-13/follows/fix4/pr-body.md`): MP-15, the store file follows what it holds (the bullet above,
+  "RG-13 A"). ADR-052 RG-13 is closed as completed with its work phase Release ready
+  (`exec/awa/receipt-integrate-1327.json`), on an audit that found it closable at `9cbb105b9`, with
+  MP-14 and MP-16 excluded by the decider's ruling, not treated as completed, and its limits listed
+  for the issue and the release notes (`rg-13/close/requirement-audit.md:1-3`, "Limits to state on
+  the issue and in the release notes"). **#1392, merged**: the reviewer accepted its merge commit
+  `24b15f8b7` (`exec/review-audit.md:42`), which reached main as the pull request's merge
+  `febb6459e` (`exec/found-reds.md:167` names both); MP-10's boundaries, each proven alone where
+  stated under MP-10. **#1393, merged**
+  2026-11-24 (merge commit `36c60c821`, `exec/review-audit.md:66`; its pull request text,
+  `mp/cut-disappear/fix6/pr-body.md`): MP-6 and MP-11 together. Not landed when amendment 4 is
+  written: MP-9, one commit on `36c60c821`, not pushed (`mp/fork/rebase3/report.md:3`); MP-9a, the
+  second half of ledger 73, "not built here" (`mp/fork/rebase3/report.md:12`; ruling 10); M0 with
+  its narrowed rule 4 (MP-4), built in a landing tree and not committed (`m0/land/report.md:3`);
+  and ADR-054.
 
 ## Terms
 
@@ -261,6 +284,7 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
   ADR-007:300); a writer MUST NOT write an artificial control entry before each post merely to
   absorb other authors' tips. A writer MUST still advance its context, by a control entry before
   the message, whenever a genuine control or cut it has applied changes (ADR-036:90-93). Binding form (M0 ruling §7, rule 4): "**Both writer paths MUST** advance before Content for every applied Governance/StepPolicy coordinate and required ancestor absent from the own committed frontier, independently of the sixteen hint slots; own real controls already advance it. They MUST NOT insert a carrier solely to absorb other authors' Content or empty ContextUpdates. Content MUST then sign the exact own aggregate and keep bounded ordering hints." *(Amended 2026-11-23 by the M0 ruling.)*
+  *(Amended 2026-11-24, amendment 4, by the acknowledgement ruling of gpt-6.1-sol, `design/busy-room/ack-ruling.md`, which narrows M0 rule 4. Asked after a count showed 186 of about 210 acknowledgement triggers in an eight-member room were other members' consent grants (ack-ruling.md:3; `design/amendment-4-draft.md:21`, from `mp/sync-stack/c15/controls.md`). Nothing was built or run for the ruling. The rule 4 text above stays as written for every other trigger.)* In plain words: before a post, a writer may write a context entry recording the governance changes it has applied, its *acknowledgement*; a reader then resolves those before showing the writer's post (ack-ruling.md:13). The rule, as ruled: "**Both writer paths MUST acknowledge every currently required Governance/StepPolicy change and required ancestor, except another author's validated epoch-0 ConsentGrant. Own controls, all existing prefix coordinates and all reader source/effect checks remain unchanged. Other epochs and unclassified governance variants retain the current conservative trigger.**" (ack-ruling.md:29.) The writer MUST "Filter during that backwards scan, before selecting and breaking—not after selecting the highest position. If the latest entry is an excluded grant, continue searching for an earlier unacknowledged removal, revocation or reset. Otherwise a later grant would mask precisely the change that must be acknowledged." (ack-ruling.md:33.) The same predicate MUST serve the Content trigger and the ContextUpdate construction (ack-ruling.md:35). Everything else still triggers: removal and readmission, admin certificates and revocations, StepPolicy, retention and lifecycle, Presence, rename and anchors (ack-ruling.md:11-23). No reader check changes and no ConsentGrant is skipped from validation; an unavailable required prefix still defers acknowledgement and never silently disappears (ack-ruling.md:45, :53). Soundness rests on *non-interference*: a grant between other members, by A toward X or toward B, cannot change any decision about B's post, since a reader shows B's post by consent toward B and B's recipients use consent toward B; it does not rest on a reader proving what the writer applied, which no rule gives, before or after (ack-ruling.md:20-21, :47-49; `design/step3-m0-ruling.md:33-35`). Built with M0 in a landing tree whose product patch is the narrowed candidate (`m0/land/report.md:7`); not committed when this amendment is written (`m0/land/report.md:3`). Runs there, once each (`m0/land/report.md:16`): the grants act `G-1` GREEN (eight posts with no advance; a revocation and a reset under later grants each advanced); RED, each engaged: `G-newest-only-1` (a filter of the newest row only, on the revocation case), `G-reset-newest-only-1` (the same, on the reset case) and `G-no-governance-1` (no Governance trigger). The lagging-reader arm (the ruling's step 3) is compiled and not run, because the knob it needs is not on main (`m0/land/report.md:23`, :28). The rule against a post whose context goes back behind its acknowledgement, the ruling's third mutant, rests on review: its act was taken out of the proof (`m0/land/report.md:31`).
   - *Why*: today `authored_context` joins every other author's settled tip
     (`node/channel/local_history.rs:493-542`), so in a busy room `append_text` writes a
     `ContextUpdate` before nearly every post (`node/channel/pending_text.rs:939-957`): two signed
@@ -270,6 +294,7 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
   - *Proof*: in the busy-room journey each author's feed grows about one entry per post, read from
     the stores. ADR-007's removed-member act (ADR-007:410) stays green. Mutant: write the
     per-post carrier again (feed grows two per post). Both writer routes (`PendingText::append_text` and `local_history::authored_kind`'s own ContextUpdate branch) and an upgrade's first post: Content signs its unchanged own aggregate after any required real advance and absorbs no other author's empty ContextUpdate (M0 ruling §4, §5). *(Amended 2026-11-23.)*
+    *(Amended 2026-11-24, amendment 4: the "Required real-binary act" of the acknowledgement ruling, ack-ruling.md:55-62. It is to establish:)* (1) in a stable room, with many grants by A toward X, A toward B among them, while B keeps posting: no ContextUpdate is generated solely for those grants, and B's recipient set and readability are unchanged; (2) when the creator removes X, then writes a later ConsentGrant on that same creator feed before B posts: B's next post exposes the removal despite the later excluded grant; (3) when lagging N is given B's post and key without the removal evidence: N does not show that post or continue key or reply release to X through the exposed old state, and supplying the evidence applies the removal with its cut and rotation; (4) the masking case repeated with reset and revocation, with acknowledged-then-regressed-context rejection kept. Mutants: filter only the newest row and stop searching; ignore all Governance triggers; permit regression behind B's acknowledged prefix.
 
 - **MP-5. `seen` stays, as nonblocking display hints outside authority.** A message SHOULD name
   recent tips in its signed `seen` field (at most sixteen, `log/entry.rs:65-67`). A reader MUST use
@@ -294,6 +319,7 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
   consistency stay enforced. That tip MUST pass the exact receipt and branch checks of a causal
   source; being displayable MUST NOT satisfy them. "Earlier messages stay" means messages in the
   remover's witnessed accepted prefix, not every message that came earlier in wall time. *(Amended 2026-11-23, amendment 3, by the forked-target ruling of gpt-6.1-sol, `design/forked-target/ruling.md` rule 7, for the decider's ruling 10; the cut is by branch, not by position:)* "A removal's witnessed-message exception MUST mean exact authenticated membership in the prefix W named by the remover's signed target reference, intersected with the messages otherwise eligible on this reader; it MUST NOT mean all local messages with sequence at most p, nor automatically the whole local branch or only a guessed shared prefix." "Equal prefix descriptors under the two roots, or independently verified exact ancestry, may establish shared history; absence of that proof is pending for the affected eligibility, not a false ancestry result." Where the reference names a branch other than the one this reader accepted, it is looked up through the retained exact fork-parent witness (MP-9a).
+  *(Amended 2026-11-24, amendment 4:)* MP-6 landed together with MP-11 in #1393 (merged 2026-11-24, merge commit `36c60c821`; `exec/review-audit.md:66`). A consequence, by the coordinating session's engineering decision of 2026-11-24 (`exec/deviations.md:193`), which follows the decider's ruling that such messages disappear ("disappears", ruling 8; `exec/deviations.md:127`): a message a member posted just before it was removed, which the member who removed it had not received, is gone from the room for everyone, its author included, when that member is readmitted. The decision was told to him the same day as one he can overrule, and he did not (`exec/deviations.md:193`); his own words on the author's copy are not recorded. The behaviour is as #1393's pull request describes it, from an observation of one run and not an assertion of an act; that text gives the reason: "Nobody can tell such a message from one written after the removal, and a post that only its author still sees would mislead her" (`mp/cut-disappear/fix6/pr-body.md:15-19`). The release notes draft says it (`release/notes-draft.md:82`).
   - *Why*: without per-post control entries, a cut at the target's last control could fall weeks
     back and hide its legitimate earlier messages (ADR-007 G-32; `m1-security.md` P2-D). The
     generic tip picker can discard an author (`node/channel/local_history.rs:493-527`). The message
@@ -379,6 +405,7 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
   and strictly fresh signed-roster authorization and prove the paused-writer/admin-revocation case
   on the real board. P covers every wait where a holder owns the requested prefix, so W is not
   needed there. *(Amended 2026-11-23, amendment 3.)*
+  *(Amended 2026-11-24, amendment 4, by the control-closure ruling of gpt-6.1-sol, `design/busy-room/control-closure-ruling.md`; nothing was built or run for it.)* What a newcomer must obtain per author before showing its posts: "authenticated no-omission coverage and individually admitted control sources through A’s preceding prefix, with required effects settled—not every ordinary entry’s body" (§1, :11). By signed kind (§1, :15-22): Governance and StepPolicy need their body; Checkpoint, SessionFloor and PrivateSupport need it under today's full validator; a KeyPackage's header can be admitted without its body, its addressed delivery remaining a separate obligation; a ContextUpdate and a Termination have no body; Content, encrypted read records included, is not part of the control enumeration. A Governance entry cannot be skipped from its header, which says only Governance (§2, :34). An existing signed kind MUST NOT be moved out of the control class for old entries: that class sets both the committed control bit and the leaf's post-context, and existing roots keep their original interpretation (§2, :38). "**Dependencies constrain validation/application, not acquisition of provisional bytes.**" (§3, :42): bodies may be fetched ahead and across authors and are validated and applied only when their exact prerequisites permit; one staging record per node and purpose is "a **real invariant of the current staging implementation**, not a security requirement" (:44), so removing the slot lock alone would corrupt ownership, and parallel staging needs independently fenced owners, bounded in aggregate (:51). Its build order (§4, :59-65): first a bounded control-body page over the already authenticated control enumeration, "without fetching intervening Content", with proofs that a holder cannot omit or substitute a control, mix heads or authors, inject a misclassified removal, serve another recipient's sealed package, exceed byte credit, or turn fetched-but-unvalidated bytes into Complete, and that an interruption and restart mid-batch keep the exact unfinished obligations (:59, :61); then independently fenced, byte-accounted staging for several authors, preserving bounded aggregate storage and memory and publication transactions, with proofs that one stalled or oversized author cannot block unrelated authors, cancellation cannot reclaim another request's bytes, and restart cannot admit stale work (:63). The coordinator's draft takes that order "only as far as measurement requires" (`design/amendment-4-draft.md:33`). Fetching is to be ADR-054's; how ADR-054's control-interval request relates to that build order is not decided.
   - *Why*: #1384 keeps inclusion and consistency witnesses but leaves `ControlRange` pieces
     cache-only (`node/history_stream/admission.rs:439-462,558-597`): a locally completed verdict is
     not a transferable proof, and "members hold the governing controls" does not mean they can
@@ -487,6 +514,7 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
   is added. *(Amended 2026-11-23: the coordinating session's engineering decision,
   `exec/deviations.md` "Engineering decisions on 2026-11-23 while building ADR-053's step 2"; not
   the decider's ruling and not the review's.)*
+  *(Amended 2026-11-24, amendment 4:)* Under ADR-054 the signed heads, with unresolved unequal observations, are to travel in each node's Have (ADR-054 PL-2), and the inventory paging and hint queue named in this requirement's *Why* are to be deleted (ADR-054 PL-11); MP-9's rule stands. Whether the `forks` list rides on ADR-054's Have is not decided. MP-9 has not landed when this amendment is written: it is one commit on `36c60c821`, not pushed (`mp/fork/rebase3/report.md:3`).
   - *Why*: today a message citing the forker's other branch is refused, so the room visibly stops;
     under this design messages cite nobody, and the explicit observed-conflict pair is equal-size
     only (`node/channel/entry_store/sparse.rs:2847-2854`; smaller queued hints are collapsed behind
@@ -604,6 +632,7 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
   termination keeps blocking later source positions (`node/channel/entry_store/sparse.rs:2132-2141,
   2365-2378`), and the hidden-termination gap MUST be closed using author-local evidence, not
   silently accepted (review §2; open question B-5).
+  *(Amended 2026-11-24, amendment 4:)* #1392 landed (the reviewer accepted merge commit `24b15f8b7`, `exec/review-audit.md:42`; it reached main as `febb6459e`; `exec/found-reds.md:167` names both). Proven alone, each by an act that goes red when that one protection alone is switched off (`release/notes-draft.md:76`): a holder never sends a readmitted member a message written outside its readmission; a readmitted member never shows such a message, even when every holder sends it; a member never installs the key of an author it knows was removed. Not proven alone (`design/amendment-4-draft.md:50`): a key package from an author the reader does not yet know was removed; legacy Session carriers ("cannot arise" by reading); boundary 5, item 5 above, the current membership-generation commit, which "holds twice by construction (no act)"; which two checks hold it is not named in that draft. Boundary 4 (the restored Drive floor) is not among those statements and is not recorded by this amendment. The private-floor boundary is proven only for a reader that has applied the removal: the gap of ruling 11 stays in v0.4.31, and the release notes draft names that boundary as not proven alone (`release/notes-draft.md:76`; ledger 76).
   - *Why*: the review's paragraph on point 5 (§1); `sync-sol-on-m1.md` §1, §5. "Signature, place and
     keyring" is not an adequate description of the package path.
   - *Proof*: (a) *readmission gap, recipient side*: a member removed and readmitted receives,
@@ -631,6 +660,7 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
   applies to the *author's* ineligible messages only: what a once-removed *recipient* rendered
   before its removal stays with it, as today (`node/channel/semantic_projection.rs:294-309`;
   ADR-007:299-300). *(Amended 2026-11-23, the coordinating session's engineering decision: MP-11 lands only together with MP-6, Order step 2.)*
+  *(Amended 2026-11-24, amendment 4:)* MP-11 landed with MP-6 in #1393 (merge commit `36c60c821`, `exec/review-audit.md:66`). As #1393's pull request describes it, it retracts by author eligibility: when an eligibility decision says a shown message's author is outside the cut, its rendered row, its place in counts, pages and threads, and its read receipt go in the same transaction; only author eligibility retracts (`mp/cut-disappear/fix6/pr-body.md:32-37`). The sentence above, "until it is built, no record or release note may say that membership or fork replay retracts shown text", is therefore met for membership; the fork arm of the proof below needs MP-9, which has not landed. For a message its remover never held, see MP-6's amendment 4. *The return half* (a removal that took messages away stops holding). The decider's word covers the first half only; the coordinating session decided the return (`design/amendment-4-draft.md:12`), and the reviewer ruled "BUILD N WITH CHANGES" (`mp/cut-disappear/ruling-n.md:5`). A message that comes back **arrives again**: it gets a new arrival, keeps its place in the conversation (its display clock, hash and created time) and every input to its lifetime, and never gets a fresh lifetime; it is news once more to every reader, including one that had it before it went, and that second telling is accepted, described as the message having returned (ruling-n.md:8, :12, :15; pr-body:100-104). The new arrival MUST be allocated through the shared log and cache allocator, with its advanced high-water mark installed in memory, and the cache, the render and filter indexes and the retention locator MUST be rewritten in one transaction, the old cache retired (ruling-n.md:11). Read marks and receipts, reply references and FFI message IDs stay keyed by hash and are kept; a message already read may stay read although it is announced again; existing deduplication is not cleared globally; the revision and publication fences of reads in flight are kept (ruling-n.md:13-14). A reader that continues page by page holds a *position* (a continuation cursor naming an arrival place), not a message hash: a message that came back has a new arrival place, so continuing from its hash could jump past what arrived while it was away (ruling-n.md:10); such a hash is refused in plain words, and the retention fact carries one optional field for this (pr-body:105-113). Draft B's "A thread page is ordered as the room is" is, as built, the thread page the Mac app reads: it is in the room's order, so a reply that came back is in its place; the terminal app's thread view and the agent hook's thread context read by arrival, unchanged (ruling-n.md:9; pr-body:118-120). No per-reader record of what was withheld exists: the request first built for it was rejected in review and deleted (ruling-n.md:15; pr-body:98-99).
   - *Why*: ruling 8; review §5 ("Choose the later-invalidated-row behavior explicitly") and §6
     question 2. Under MP-1 a message whose author had not heard of a removal is shown until the
     reader applies that removal (the unaware-partition window); without this requirement it would
@@ -651,6 +681,7 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
   it is declared gone by retention. Per-peer response work MUST be finite. A holder's
   `BodyNotHeld` or unavailable answer is holder-local: that holder is not asked again on that
   connection, and the position stays owed from other holders; it MUST NOT be abandoned.
+  *(Amended 2026-11-24, amendment 4, by ADR-054:)* "that holder is not asked again on that connection" is to be met by the holder's corrected extent in its answer (ADR-054 PL-7), not by a refusal flag the reader keeps (ADR-054 PL-13; `design/simple-sync/design.md:52,69,72`). The rest of MP-12 stands; its missing intervals are the debt ADR-054's loops are to work from (ADR-054 PL-3).
   - *Why*: ledger 66 (Context). The second-lane fix (about 1,100 lines, a marker, a grace period,
     set-aside rules) is not built. The review's step 1. With one version per room (ruling 4) no
     compatibility path for old servers is built.
@@ -692,6 +723,7 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
   (per-peer turns), 3.4 (the per-room save gate) and 3.5 (the lost-wake fix) each repair a defect of
   their own and MAY land, each as its own change with its own red (RG-0). The second-lane burst fix
   is not built.
+  *(Amended 2026-11-24, amendment 4, on the decider's ruling 13; ADR-054:)* For fetching this paragraph is superseded. None of the parked candidate's rules lands in any form, and neither does the coordinating session's later approval of a narrower rule about who can answer (`exec/deviations.md:156`); the machinery those rules schedule (the hint inbox, routed, parked and deferred flows, announcements and their rearm) is to be deleted by ADR-054's first slice (ADR-054 PL-11). Of the rules this paragraph allowed to land, each peer its own turn is kept from the prototype as structural (`exec/deviations.md:189`); rules 3.4 and 3.5 are not named by ADR-054's sources: not decided. Item 4 is not changed by this amendment.
   - *Why*: ruling 2; each deleted rule scheduled demand that the gate of Context property 1
     created. Under M0 the parent gate for Content's `seen` is what goes (M0 ruling §6), so these rules lose their reason; whether that is enough for the busy room is measured by the journey, not proven by the ruling. *(Amended 2026-11-23.)*
   - *Proof*: *two authors on a slow path*: the `two` relay arm of `key_package_proof.rs` (two
@@ -711,6 +743,7 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
   checked in the same transaction; a row whose header differs from its `Header` object is kept and
   logged. The schema marker MUST advance with the first converted row, so an older binary refuses
   the store rather than misreading it.
+  *(Amended 2026-11-24, amendment 4, by the decider's ruling 12:)* MP-14 moves to v0.4.32. Stage 1's half-built work is kept as it stands (`rg-13/stage1/handoff.md`); for v0.4.32 the design is to be the simplest one that works, not the six-part plan as written, "to be re-decided then" (`exec/deviations.md:180`).
   - *Why*: ruling 3 ("storing the wrong way"); the four signed copies (`rg-13/checkpoint/report.md`
     §1). Estimated by reading, not measured: author about 15 KB, reader about 16 KB per expired
     message (`store-opus.md:20`). These are targets to measure, not promises.
@@ -731,6 +764,7 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
   about 2 GB, warm and cold (review §5). Built, not committed (`rg-13/follows/report.md`); the
   pass runs after the room's save completes and counts held bytes without pages awaiting a durable
   free, for the reasons that report gives.
+  *(Amended 2026-11-24, amendment 4:)* landed as #1391, merged 2026-11-24 (merge commit `9cbb105b9`, `exec/review-audit.md:62`; its pull request text, `rg-13/follows/fix4/pr-body.md`). ADR-052 RG-13 is closed as completed with its work phase Release ready (`exec/awa/receipt-integrate-1327.json`), on the audit `rg-13/close/requirement-audit.md` (closable at `9cbb105b9`, with its limits listed). "Built, not committed" above describes it when this record was accepted.
   - *Why*: ruling 3; deviation 17 is superseded by it. The file today steps up and never comes down
     while the daemon runs (Context).
   - *Proof*: the running-growth measurement on main and on the change, same script
@@ -803,6 +837,7 @@ green on every step's binary (Order), and its named mutant (the weakened check) 
      under the parent author's signed head; today full admission asks for the exact header and
      receipt (`node/history_stream/admission.rs:875-944`; `log/history.rs:2171-2219`).
   Known fork pairs and exclusion records MUST never be expired away.
+  *(Amended 2026-11-24, amendment 4, by the decider's ruling 12:)* MP-16 moves to v0.4.32, with MP-14; its form for v0.4.32 is to be re-decided then (`exec/deviations.md:180`). Until then the signatures stay, as ADR-036:371-373 says.
   - *Why*: ruling 7. The entry hash excludes the signature and a signed head commits the leaf
     (`log/history.rs:796-819`; `log/entry.rs:215-259`), so a kept leaf under a kept head proves an
     expired entry's place and fingerprint; a leaf cannot recover the skeleton's fields
@@ -908,6 +943,7 @@ internal paths; each step handles them.
 
 MP-15 changes no evidence the sync reads and waits for none of steps 1 to 4; it lands when its own
 proof is in. MP-17 applies to every step's notes.
+*(Amended 2026-11-24, amendment 4, on the decider's rulings 12 and 13:)* Steps 1, 2 and 4 assumed today's fetching machinery; ADR-054 is to replace it with one pull loop per connection, and the parked rules of step 4 (MP-13) do not land. MP-7's prefix serving P, built first in step 2, stays (#1394, merged: `exec/review-audit.md:42`); ADR-054's page experiment served through it unchanged (`design/simple-sync/experiment.md:26`). MP-6 and MP-11 have landed (#1393). Step 5 moves to v0.4.32 (MP-14, MP-16); MP-15 has landed (#1391). MP-18 is unchanged.
 
 ## What does not change, and what a person is told
 
@@ -934,10 +970,20 @@ kind; key rotation; the busy-room gate.
   that member's view drops the messages it shows of the removed author outside the cut, or of the
   rejected branch, so every member ends with the same room; what a person already read stays read
   (MP-11).
+- *A message posted just before its author was removed, which the remover had not received, is gone
+  for everyone, its author included, when the author is readmitted* (MP-6, MP-11; #1393): the
+  coordinating session's engineering decision of 2026-11-24 following ruling 8
+  (`exec/deviations.md:193`); the decider's own words on the author's copy are not recorded (MP-6's
+  amendment 4). If the removal is overturned, the messages it
+  took come back in their place and arrive again (MP-11). *(Amended 2026-11-24, amendment 4.)*
+- *A removed member running altered software can have one private Session step taken by a member
+  that was offline for the removal*; the release notes draft names it (`release/notes-draft.md:108`;
+  ruling 11; MP-10). *(Amended 2026-11-24, amendment 4.)*
 - *An expired ordinary message leaves its chain fingerprint on a node that has applied MP-16.*
   Once its conditions are proven and that node retires the header/skeleton, it no longer supplies
   the discarded sender/time/length metadata; another member may retain an old copy. Permanently
   owned fork/exclusion evidence is not expired, and rooms kept for ever keep everything.
+  *(Amended 2026-11-24, amendment 4: MP-16 moves to v0.4.32, ruling 12.)*
 - *Every computer in a room updates together* (ruling 4); the release notes say so.
 
 ## Consequences
@@ -953,6 +999,9 @@ kind; key rotation; the busy-room gate.
 - Feeds grow one entry per post instead of two (MP-4); each signed header is stored once (MP-14);
   after expiry only the leaf stays (MP-16), once all six of its consumers have their replacements.
   Recovery from a backup and paging change so that they read no expired header.
+  *(Amended 2026-11-24, amendment 4: MP-14 and MP-16 move to v0.4.32, ruling 12; fetching is to
+  be ADR-054's, which is to delete the hint inbox and routed flows instead of adding scheduling
+  rules; nothing of it has landed.)*
 - Shown messages can now disappear after a removal or fork (MP-11): a change of behaviour from
   today, chosen by the decider so the room looks the same to every member.
 - The give-back pass runs on the events that free space, not on a clock. The record reads this as
@@ -1019,7 +1068,13 @@ kind; key rotation; the busy-room gate.
   is owned durably. Fetching to serve a request still writes nothing. **RG-13 (:365)**, "a store
   with more than twice the space it uses is compacted at daemon start": replaced by MP-15 (and
   deviation 17 with it). RG-13's "A store grows with what it holds" is met by MP-14 to MP-16.
+  *(Amended 2026-11-24, amendment 4: with MP-14 and MP-16 moved to v0.4.32 by ruling 12, RG-13 is
+  closed as completed, Release ready (`exec/awa/receipt-integrate-1327.json`), with MP-15 (#1391)
+  and the limits its audit lists, `rg-13/close/requirement-audit.md`.)*
 - **ADR-052 RG-1 and RG-15** stand unchanged (MP-18).
+- **ADR-053's own Order and MP-13**: the fetching machinery they assumed is to be replaced by
+  **ADR-054**, which amends this record by reference; nothing of ADR-054 has landed. *(Amended
+  2026-11-24, amendment 4.)*
 
 ## The decider's answers to the review's product questions
 
@@ -1119,6 +1174,10 @@ Put to him on 2026-11-23 by the coordinating session.
 | The M0 ruling (`design/step3-m0-ruling.md`; rules 1 to 5, the amendments to MP-1, MP-2 and MP-3, what M0 does not promise) | MP-1, MP-2, MP-3, MP-4, MP-5, MP-13, MP-17, Order step 3, B-1, B-2 |
 | The forked-target ruling (`design/forked-target/ruling.md`; rules 1 to 8, the decider's ruling 10, ledger 73) | MP-9a (rules 1 to 6, 8), MP-6 (rule 7), MP-8, Order step 2 |
 | The moving-head ruling (`design/moving-head/ruling.md`; P rules 1 to 7, the amendment of head-mismatch rules 4 and 5, H, W not approved) | MP-7, MP-8a, MP-17, Order steps 2 and 3 |
+| The acknowledgement ruling (`design/busy-room/ack-ruling.md`; M0 rule 4 narrowed) *(amendment 4)* | MP-4 |
+| The control-closure ruling (`design/busy-room/control-closure-ruling.md`) *(amendment 4)* | MP-7 |
+| The return ruling on #1393 (`mp/cut-disappear/ruling-n.md`) *(amendment 4)* | MP-11 |
+| The decider's rulings 11 to 13 (2026-11-23 and 2026-11-24) *(amendment 4)* | MP-10; MP-14, MP-15, MP-16; MP-13, the Order, ADR-054 |
 
 ## Links
 
@@ -1129,3 +1188,10 @@ Put to him on 2026-11-23 by the coordinating session.
   `brief-sync.md`, `brief-store.md`; `rg-5/measurements.md`; `rg-6/sync-land/report.md`;
   `rg-6/witness/`; `rg-13/checkpoint/report.md`, `rg-13/running-growth/report.md`,
   `rg-13/follows/report.md`; `found-reds/burst-gap/small/report.md` and `verdict.md` (#1385).
+- Added by amendment 4: ADR-054; `exec/deviations.md` (the owner's answers of 2026-11-23, late
+  afternoon, and 2026-11-24); `design/amendment-4-draft.md`; `design/busy-room/ack-ruling.md`;
+  `design/busy-room/control-closure-ruling.md`; `mp/cut-disappear/ruling-n.md` and
+  `fix6/pr-body.md` (#1393); `rg-13/follows/fix4/pr-body.md` (#1391);
+  `rg-13/close/requirement-audit.md`; `exec/awa/receipt-integrate-1327.json`;
+  `exec/review-audit.md`; `exec/found-reds.md`; `m0/land/report.md`; `mp/fork/rebase3/report.md`; `design/simple-sync/`
+  (ADR-054's sources); `release/notes-draft.md`.
