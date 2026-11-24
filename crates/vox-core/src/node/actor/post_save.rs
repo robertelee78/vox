@@ -724,6 +724,8 @@ impl Node {
                         ) {
                             Ok(pending) => pending,
                             Err(error) => {
+                                #[cfg(feature = "test-knobs")]
+                                super::governance_save::note_room_rotation_met(&error);
                                 let fault = fault_of(&error);
                                 if matches!(fault, Fault::Internal) {
                                     eprintln!(

@@ -48,6 +48,9 @@
 //!   them and keeps what she had read. Each boundary is proven with the other switched off: the
 //!   holders' send with carol rendering everything (`a_readmitted_member_is_sent_no_body…`),
 //!   carol's render with every holder sending everything (`a_readmitted_member_shows_no_body…`).
+//! - **A post right after a removal.** Alice removes carol and posts while the key rotation the
+//!   removal owes is held unsaved (a `test-knobs` hold). Her post waits for the rotation, exits
+//!   0, and bob reads it; carol does not.
 //!
 //! **Every red names which it is.** `PRODUCT:` — `vox` did the wrong thing, and what it said is
 //! quoted; `PRODUCT (staging):` — a `vox` step of the staging failed (a create, join, post or list
@@ -64,7 +67,9 @@
 //! boundary 1 off in one holder (`VOX_MUTANT_MP10_SEND=alice|bob|dave`: that holder sends a
 //! once-removed recipient every body) and boundary 2 off in carol (`VOX_MUTANT_MP10_RENDER=1`:
 //! she renders every body she is sent): the readmission-cut arm named for that boundary goes red
-//! through that holder.
+//! through that holder;
+//! a post in a removal's rotation window refused as an internal error (post after removal,
+//! `VOX_MUTANT_POST_AFTER_REMOVAL=unmapped`).
 
 #![cfg(unix)]
 
@@ -1397,6 +1402,104 @@ fn a_readmitted_member_shows_no_body_from_outside_its_cut() {
     let render = std::env::var("VOX_MUTANT_MP10_RENDER").is_ok_and(|v| v == "1");
     mp10_readmitted_member_gets_no_gap_body([true; 3], render, "MP10 boundary 2, recipient render");
 }
+
+/// A member who removes another and posts at once (ledger 77). The removal is applied by one save
+/// and the fresh sender chain it owes by the next; the window between them is held open here
+/// (`VOX_TEST_HOLD_ROOM_ROTATION_FILE`) so the post lands in it every run. The post must wait
+/// out the rotation and succeed, not be refused as "an internal error".
+/// Mutant: `VOX_MUTANT_POST_AFTER_REMOVAL=unmapped` (the refusal reported as an internal fault).
+#[test]
+#[ignore = "real daemons and a held key rotation; CI runs it in release"]
+fn a_post_made_right_after_a_removal_waits_for_the_new_keys() {
+    watchdog::arm();
+    test_knobs::require(&["VOX_TEST_HOLD_ROOM_ROTATION_FILE"]);
+    let rt = runtime();
+    let tmp = support::diagnostic_tempdir();
+    let mut room = room_of(&rt, tmp.path(), &["alice", "bob", "carol"]);
+    let id = room.id.clone();
+    let id = id.as_str();
+    let hold = tmp.path().join("rotation.hold");
+    let engaged = tmp.path().join("rotation.hold.engaged");
+    let met = tmp.path().join("rotation.hold.met");
+    let held_log = tmp.path().join("alice-held.err");
+    let daemon = || std::fs::read_to_string(&held_log).unwrap_or_default();
+    // temp_home strips inherited knobs: the runner's mutant reaches alice's daemon only here.
+    let mutant = std::env::var("VOX_MUTANT_POST_AFTER_REMOVAL").unwrap_or_default();
+    let mut knobs = vec![(
+        "VOX_TEST_HOLD_ROOM_ROTATION_FILE",
+        hold.to_str().expect("APPARATUS: UTF-8 hold path"),
+    )];
+    if !mutant.is_empty() {
+        knobs.push(("VOX_TEST_POST_AFTER_REMOVAL_MUTANT", mutant.as_str()));
+    }
+    room.workers[0].restart_daemon_as(support::VOX, &knobs, &held_log);
+    let [alice, bob, carol] = &room.workers[..] else {
+        unreachable!()
+    };
+    let (ready, read) = poll(alice, &["room", "read", id], WITHIN, |o| o.ok);
+    assert!(
+        ready,
+        "APPARATUS: alice's restarted daemon never read the room: {read:?}"
+    );
+    std::fs::write(&hold, id).expect("APPARATUS: arm the rotation hold");
+    setup(alice, &["room", "remove-member", id, &carol.b32()]);
+    let deadline = Instant::now() + WITHIN;
+    while !engaged.is_file() {
+        assert!(
+            Instant::now() < deadline,
+            "APPARATUS: alice's removal of carol never reached its held key rotation; daemon:\n{}",
+            daemon()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let roster = alice.vox(None, &["room", "roster", id]);
+    assert!(
+        roster.ok && !roster.stdout.contains(&carol.b32()),
+        "APPARATUS: the rotation was held before alice's roster dropped carol: {roster:?}"
+    );
+    eprintln!("[proof] post-after-removal staged: carol's removal applied, its key rotation held");
+    let text = "POST-RIGHT-AFTER-REMOVAL";
+    let (answered_while_held, post) = std::thread::scope(|s| {
+        let post = s.spawn(|| alice.vox(None, &["room", "post", id, text]));
+        // The post is in the window once the daemon refused it there at least once.
+        let deadline = Instant::now() + WITHIN;
+        while !met.is_file() && !post.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "APPARATUS: alice's post never reached the held window; daemon:\n{}",
+                daemon()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let answered_while_held = post.is_finished();
+        std::fs::remove_file(&hold).expect("APPARATUS: release the rotation hold");
+        (
+            answered_while_held,
+            post.join().expect("APPARATUS: the post's thread"),
+        )
+    });
+    assert!(
+        post.ok && !answered_while_held,
+        "PRODUCT: alice's post made inside the held window (carol's removal applied, its key \
+         rotation not yet saved) did not wait for the rotation and succeed (answered while the \
+         rotation was still held: {answered_while_held}): {post:?}; daemon:\n{}",
+        daemon()
+    );
+    let (seen, read) = poll(bob, &["room", "read", id], WITHIN, |o| {
+        o.ok && o.stdout.contains(text)
+    });
+    assert!(
+        seen,
+        "PRODUCT: remaining bob never read alice's post made right after the removal: {read:?}"
+    );
+    let removed = carol.vox(None, &["room", "read", id]);
+    assert!(
+        !removed.stdout.contains(text),
+        "PRODUCT: removed carol read alice's post made after her removal: {removed:?}"
+    );
+    eprintln!("[proof] post-after-removal: alice's post waited for the new keys, exited 0, bob read it and carol did not");
+}
+
 #[test]
 #[ignore = "real daemons and an anchor, production Argon2id; CI runs it in release"]
 fn a_member_that_left_is_synced_with_and_delivered_to_no_more() {

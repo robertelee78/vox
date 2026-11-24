@@ -26482,6 +26482,16 @@ pub fn fault_of(e: &Error) -> Fault {
             Fault::RoomAuthorization
         }
         Error::StreamRefused("this node was removed from the room") => Fault::RoomMemberRemoved,
+        // The removal is applied and the daemon saves the fresh sender chain it owes next, by
+        // itself: a change still being applied, which a post waits out, not an internal fault.
+        #[cfg(not(feature = "test-knobs"))]
+        Error::StreamRefused(crate::node::channel::KEYS_ROTATING) => Fault::RoomChangePending,
+        #[cfg(feature = "test-knobs")]
+        Error::StreamRefused(crate::node::channel::KEYS_ROTATING)
+            if std::env::var("VOX_TEST_POST_AFTER_REMOVAL_MUTANT").as_deref() != Ok("unmapped") =>
+        {
+            Fault::RoomChangePending
+        }
         Error::JoinRefused(_) | Error::RendezvousRejected(_) => Fault::Refused,
         Error::JoinSolveTooSlow { .. } => Fault::SolveTooSlow,
         Error::JoinResponderBusy | Error::JoinEndedForNewcomer => Fault::MembersBusy,
