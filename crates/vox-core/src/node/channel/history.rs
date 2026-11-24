@@ -801,6 +801,20 @@ impl View<'_> {
                     "cursor not among this room's selected messages",
                 ));
             }
+            // As `Query::Read`: a message that came back (MP-11) arrived again, past what
+            // arrived while it was away, so its hash no longer says where a reader was.
+            if self
+                .rendered
+                .read_index()
+                .retention(&hash)?
+                .is_some_and(|tracked| tracked.returned)
+                && !crate::node::mp11_mutant(
+                    "VOX_MUTANT_MP11_FILTERED_HASH",
+                    "a filtered or thread read from a message that came back is answered",
+                )
+            {
+                return Err(Failure::Request(crate::node::ipc::CAME_BACK));
+            }
             let arrival = self
                 .rendered
                 .fact(&hash)?
@@ -1450,6 +1464,12 @@ impl View<'_> {
                         "choose either earlier or later thread replies",
                     ));
                 }
+                // In the room's order, by the thread filter's display index: a reply that came
+                // back after a removal took it away (MP-11) arrived again but is in its place.
+                let display = !crate::node::mp11_mutant(
+                    "VOX_MUTANT_MP11_THREAD_ARRIVAL",
+                    "a thread page is in arrival order",
+                );
                 let filter = Filter::Thread(root);
                 let anchor = before.or(after);
                 let mut cursor = if let Some(hash) = anchor {
@@ -1458,10 +1478,14 @@ impl View<'_> {
                             "cursor not among this room's thread replies",
                         ));
                     }
-                    let fact = self.rendered.fact(&hash)?.ok_or(Failure::Request(
+                    let key = if display {
+                        self.rendered.order().key(&hash)?
+                    } else {
+                        self.rendered.fact(&hash)?.map(|fact| (fact.cache, hash))
+                    };
+                    Some(key.ok_or(Failure::Request(
                         "cursor not among this room's thread replies",
-                    ))?;
-                    Some((fact.cache, hash))
+                    ))?)
                 } else {
                     None
                 };
@@ -1474,7 +1498,7 @@ impl View<'_> {
                 for _ in 0..crate::node::ipc::PAGE_ENTRIES {
                     let Some((key, _)) =
                         self.rendered
-                            .step(Some(&filter), false, cursor, backwards)?
+                            .step(Some(&filter), display, cursor, backwards)?
                     else {
                         break;
                     };
@@ -1506,7 +1530,7 @@ impl View<'_> {
                     Some(key)
                         if self
                             .rendered
-                            .step(Some(&filter), false, Some(key), true)?
+                            .step(Some(&filter), display, Some(key), true)?
                             .is_some() =>
                     {
                         Some(key.1)
@@ -1517,7 +1541,7 @@ impl View<'_> {
                     Some(key)
                         if self
                             .rendered
-                            .step(Some(&filter), false, Some(key), false)?
+                            .step(Some(&filter), display, Some(key), false)?
                             .is_some() =>
                     {
                         Some(key.1)
@@ -1625,8 +1649,25 @@ impl View<'_> {
                         "a read takes a cursor or a page mark, not both",
                     ));
                 }
+                // A cursor naming a message that came back (MP-11) is refused: it arrived again,
+                // and its new arrival is past what arrived while it was away.
                 let mut arrival = match since {
-                    Some(h) => Some(self.mark(h, true, cursor_error)?.arrival),
+                    Some(h) => {
+                        let row = self.mark(h, true, cursor_error)?;
+                        if self
+                            .rendered
+                            .read_index()
+                            .retention(&h)?
+                            .is_some_and(|tracked| tracked.returned)
+                            && !crate::node::mp11_mutant(
+                                "VOX_MUTANT_MP11_HASH_CURSOR",
+                                "a hash cursor naming a message that came back is answered",
+                            )
+                        {
+                            return Err(Failure::Request(crate::node::ipc::CAME_BACK));
+                        }
+                        Some(row.arrival)
+                    }
                     None => None,
                 };
                 let mut display = match after {

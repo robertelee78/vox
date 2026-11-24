@@ -1356,6 +1356,10 @@ pub struct ChannelState {
     /// Readable rows removed from the rendered prefix (pruning, retention, missing-position
     /// cleanup); a late arrival that only reorders the prefix leaves it alone.
     display_removals: u64,
+    /// A governance turn took shown rows away or brought retained ones back (ADR-053 MP-11)
+    /// since the node last said so: what it says as [`crate::node::api::NodeEvent::Synced`] with
+    /// nothing applied, so a client re-reads the room's preview and unread.
+    display_news: bool,
     /// entry hash -> the `LogDb` page it is stored in, so a signature dropped under a
     /// checkpoint (ADR-023 decision 3) can be rewritten in place.
     entries: entry_store::EntryIndex,
@@ -2320,6 +2324,7 @@ impl ChannelState {
             display_shown_at: 0,
             display_rewrite: 0,
             display_removals: 0,
+            display_news: false,
             entries,
             legacy_preparation: entry_store::Preparation::Ready,
             legacy_cache_trusted: None,
@@ -2965,6 +2970,7 @@ impl ChannelState {
             display_shown_at: 0,
             display_rewrite: 0,
             display_removals: 0,
+            display_news: false,
             entries,
             legacy_preparation,
             legacy_cache_trusted: None,
@@ -3466,6 +3472,7 @@ impl ChannelState {
             display_shown_at: 0,
             display_rewrite: 0,
             display_removals: 0,
+            display_news: false,
             entries,
             legacy_preparation: entry_store::Preparation::Ready,
             legacy_cache_trusted: None,
@@ -6450,6 +6457,7 @@ impl ChannelState {
                 first_seen_ms: now_ms,
                 claimed_ms,
                 cache_id: None,
+                returned: false,
             }),
         )
     }
@@ -7611,6 +7619,12 @@ impl ChannelState {
         news.sort_unstable();
         news.dedup();
         news
+    }
+
+    /// Whether a governance turn changed this room's shown rows since the last call
+    /// (`display_news`).
+    pub fn take_display_news(&mut self) -> bool {
+        std::mem::take(&mut self.display_news)
     }
 
     /// Open one Session entry with the drive key it names, if this node holds it, queueing its

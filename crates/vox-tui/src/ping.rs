@@ -19,7 +19,6 @@ use vox_agentcomms::envelope::{Envelope, PING, PONG};
 use vox_core::hash::Digest32;
 use vox_core::node::actor::NodeHandle;
 use vox_core::node::api::{MessageRow, NodeCommand, NodeView, Outcome};
-use vox_core::node::ipc::Frame;
 use vox_core::node::link::b32_encode;
 use vox_core::node::paths::Paths;
 
@@ -147,10 +146,14 @@ pub async fn ping(
         .entry_hash;
     let ping_key = b32_encode(&posted);
 
+    // Polled from the ping's position once known, not its hash: a message that comes back after
+    // a removal took it away arrives again, and the node refuses its hash (ADR-053 MP-11).
+    let mut from = crate::coord::Since::Message(posted);
     let start = tokio::time::Instant::now();
     let answer = loop {
-        if let Ok(Frame::Rows { rows }) = client.read_rows(channel_id, Some(posted)).await {
-            let pong = rows.iter().find_map(|r| {
+        if let Ok(Some(feed)) = crate::coord::feed(&mut client, channel_id, from, 0).await {
+            from = crate::coord::Since::At(feed.start);
+            let pong = feed.rows.iter().find_map(|r| {
                 let env = Envelope::parse(&r.text).ok()?;
                 (r.author == target && env.kind == PONG && env.re.as_deref() == Some(&ping_key))
                     .then_some(env)

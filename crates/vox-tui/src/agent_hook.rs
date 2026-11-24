@@ -44,11 +44,13 @@ use std::io::Read as _;
 
 use vox_agentcomms::attention::CHATTER;
 use vox_core::hash::Digest32;
+use vox_core::node::api::HistoryCursor;
 use vox_core::node::ipc::{Frame, IpcClient, Request};
 use vox_core::node::link::{b32_decode, b32_encode};
 use vox_core::node::paths::{Account, Paths};
 
 use crate::app::AppError;
+use crate::coord::Since;
 use crate::tunnel_cli::resolve_prefix;
 
 /// What the harness tells us. Only the fields we actually use — a harness may add
@@ -677,8 +679,9 @@ async fn notice_pending(
     }
 }
 
-/// Read this session's cursor for `room`, if it has one: the first line of its cursor file.
-pub(crate) fn load_cursor(paths: &Paths, room: &str, session: &str) -> Option<Digest32> {
+/// Read this session's cursor for `room`, if it has one: the first line of its cursor file, a
+/// position (`@<arrival>:<instance>`), or a message id as a build before positions wrote it.
+pub(crate) fn load_cursor(paths: &Paths, room: &str, session: &str) -> Option<Since> {
     SavedHashes::open(&paths.cursor_file(room, session), true, false)
         .ok()?
         .cursor
@@ -692,7 +695,7 @@ pub(crate) struct SavedHashes {
     identity: Option<(u64, u64, u64)>,
     start: u64,
     len: u64,
-    cursor: Option<Digest32>,
+    cursor: Option<Since>,
     has_cursor: bool,
     encoded_order: bool,
 }
@@ -749,16 +752,39 @@ impl SavedHashes {
         };
         let metadata = file.metadata()?;
         if has_cursor {
-            let mut first = [0];
-            file.read_exact_at(&mut first, 0)?;
-            if first[0] == b'\n' {
-                out.start = 1;
-            } else {
-                let mut line = [0; 53];
-                file.read_exact_at(&mut line, 0)?;
-                out.cursor = Some(saved_hash(&line)?);
-                out.start = HASH_LINE;
+            // The cursor line: empty, a position (`@<arrival>:<instance>`, ADR-053 MP-11), or a
+            // message id (a scan's position, or a read cursor a build before positions saved,
+            // read once and saved as a position by the next turn that reads the room).
+            let mut head = [0; 64];
+            let mut n = 0;
+            while n < head.len() {
+                let read = file.read_at(&mut head[n..], n as u64)?;
+                if read == 0 {
+                    break;
+                }
+                n += read;
             }
+            let bad = || {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "malformed saved hook cursor line",
+                )
+            };
+            let end = head[..n].iter().position(|b| *b == b'\n').ok_or_else(bad)?;
+            out.cursor = match &head[..end] {
+                [] => None,
+                [b'@', ..] => Some(
+                    std::str::from_utf8(&head[..end])
+                        .ok()
+                        .and_then(Since::position)
+                        .ok_or_else(bad)?,
+                ),
+                _ => {
+                    let line: [u8; 53] = head[..=end].try_into().map_err(|_| bad())?;
+                    Some(Since::Message(saved_hash(&line)?))
+                }
+            };
+            out.start = end as u64 + 1;
         }
         let bytes = metadata.len().checked_sub(out.start).ok_or_else(|| {
             std::io::Error::new(
@@ -819,7 +845,7 @@ impl SavedHashes {
     fn merge(
         &self,
         path: &std::path::Path,
-        cursor: Option<Digest32>,
+        cursor: Option<Since>,
         add: &std::collections::BTreeSet<Digest32>,
         remove: &std::collections::BTreeSet<Digest32>,
     ) -> std::io::Result<()> {
@@ -856,7 +882,7 @@ impl SavedHashes {
                 writeln!(
                     out,
                     "{}",
-                    cursor.as_ref().map(b32_encode).unwrap_or_default()
+                    cursor.as_ref().map(Since::text).unwrap_or_default()
                 )?;
             }
             let mut previous = None;
@@ -932,17 +958,12 @@ fn save_read(
     paths: &Paths,
     room: &str,
     session: &str,
-    cursor: Option<&Digest32>,
+    cursor: Option<Since>,
     ahead: &SavedHashes,
     add: &std::collections::BTreeSet<Digest32>,
     remove: &std::collections::BTreeSet<Digest32>,
 ) -> std::io::Result<()> {
-    ahead.merge(
-        &paths.cursor_file(room, session),
-        cursor.copied(),
-        add,
-        remove,
-    )
+    ahead.merge(&paths.cursor_file(room, session), cursor, add, remove)
 }
 
 /// Where a session records the claims it held at its last drain (ADR-021 M21.9): under
@@ -1816,7 +1837,7 @@ fn render(
     reader: &Reader,
     parents: &Parents,
     budget: &mut Budget,
-    cursor_after: &dyn Fn(usize) -> Option<Digest32>,
+    cursor_after: &dyn Fn(usize) -> Option<HistoryCursor>,
 ) -> (String, usize) {
     let mut out = format!("\nIn room {room}, {} new:\n", rows.len() + beyond);
     if let Some(n) = notice {
@@ -1901,12 +1922,7 @@ fn render(
     }
     let rest = rows.len() - shown + beyond;
     if rest > 0 {
-        out.push_str(&rest_line(
-            room_label,
-            node,
-            rest,
-            cursor_after(shown).as_ref(),
-        ));
+        out.push_str(&rest_line(room_label, node, rest, cursor_after(shown)));
     }
     budget.messages = budget.messages.saturating_sub(full);
     budget.bytes = budget.bytes.saturating_sub(out.len());
@@ -1914,11 +1930,18 @@ fn render(
 }
 
 /// The closing line for `rest` messages a bounded drain had no room for: they follow on the next
-/// turn, and `vox room read` has them now, from the session's cursor `since`.
-fn rest_line(room_label: &str, node: &str, rest: usize, since: Option<&Digest32>) -> String {
+/// turn, and `vox room read` has them now, from the session's position `since`.
+fn rest_line(room_label: &str, node: &str, rest: usize, since: Option<HistoryCursor>) -> String {
     let read = match since {
         Some(c) => vox_text::shell::node_command(
-            &["vox", "room", "read", room_label, "--since", &b32_encode(c)],
+            &[
+                "vox",
+                "room",
+                "read",
+                room_label,
+                "--since",
+                &Since::At(c).text(),
+            ],
             node,
         ),
         None => vox_text::shell::node_command(&["vox", "room", "read", room_label], node),
@@ -3078,6 +3101,7 @@ async fn plumbing_after(client: &mut IpcClient, channel_id: Digest32, arrival: u
                 .collect(),
             ops: Vec::new(),
             since: None,
+            resume: None,
         })
         .await
     {
@@ -3169,11 +3193,11 @@ impl Pulling {
         let scan_file = under_cursors(paths, room, session, PULLING_SCAN_DIR);
         let scan = SavedHashes::open(&scan_file, true, false)?.cursor;
         let mut start = match scan {
-            Some(hash) => {
+            Some(Since::Message(hash)) => {
                 let at = saved.lower_bound(&hash)?;
                 at + u64::from(at < saved.len && saved.entry(at)? == hash)
             }
-            None => 0,
+            Some(Since::At(_)) | None => 0,
         };
         if start >= saved.len {
             start = 0;
@@ -3227,7 +3251,12 @@ impl Pulling {
         )?;
         let file = under_cursors(paths, room, session, PULLING_SCAN_DIR);
         let scan = SavedHashes::open(&file, true, false)?;
-        scan.merge(&file, self.next, &Default::default(), &Default::default())
+        scan.merge(
+            &file,
+            self.next.map(Since::Message),
+            &Default::default(),
+            &Default::default(),
+        )
     }
 }
 
@@ -3242,7 +3271,9 @@ struct RoomDrain {
     /// How the injection names it.
     heading: String,
     /// This session's cursor in it when the turn began.
-    since: Option<Digest32>,
+    since: Option<HistoryCursor>,
+    /// The saved room instance the page was read in: a position names an arrival of it.
+    instance: [u8; 16],
     /// The page read past this session's cursor, in the room's order.
     rows: Vec<vox_core::node::api::MessageRow>,
     /// Of those, what is news to this session: what it is owed first (V030-15), then the rest
@@ -3295,7 +3326,7 @@ impl RoomDrain {
         &self,
         shown: usize,
     ) -> (
-        Option<Digest32>,
+        Option<HistoryCursor>,
         std::collections::BTreeSet<Digest32>,
         std::collections::BTreeSet<Digest32>,
     ) {
@@ -3320,7 +3351,11 @@ impl RoomDrain {
             .filter(|h| shown_now.contains(h))
             .collect();
         let remove = self.rows[..end].iter().map(|r| r.entry_hash).collect();
-        (upto.map(|i| self.rows[i].entry_hash), add, remove)
+        let at = |i: usize| HistoryCursor {
+            instance: self.instance,
+            arrival: self.rows[i].arrival,
+        };
+        (upto.map(at), add, remove)
     }
 
     /// Record only after output. Pending share evidence is sealed before moving the read
@@ -3349,15 +3384,18 @@ impl RoomDrain {
             };
         }
         let (cursor, add, remove) = self.read_to(shown);
-        if let Err(e) = save_read(
-            paths,
-            &self.key,
-            session,
-            cursor.as_ref().or(self.since.as_ref()),
-            &self.ahead,
-            &add,
-            &remove,
+        let mut saved = cursor.or(self.since).map(Since::At);
+        if vox_core::node::mp11_mutant(
+            "VOX_MUTANT_MP11_HASH_CURSOR",
+            "the hook saves its cursor as the last message's hash",
         ) {
+            if let Some(row) =
+                cursor.and_then(|c| self.rows.iter().find(|r| r.arrival == c.arrival))
+            {
+                saved = Some(Since::Message(row.entry_hash));
+            }
+        }
+        if let Err(e) = save_read(paths, &self.key, session, saved, &self.ahead, &add, &remove) {
             eprintln!("vox agent hook: could not record the cursor: {e}");
             if strict {
                 return Err(AppError::Usage(e.to_string()));
@@ -4140,7 +4178,7 @@ async fn first_arrivals(
     client: &mut IpcClient,
     channel_id: Digest32,
     limit: usize,
-) -> Result<Vec<vox_core::node::api::MessageRow>, AppError> {
+) -> Result<crate::coord::Feed, AppError> {
     let head = match client
         .request(&Request::ArrivalHead { channel_id })
         .await
@@ -4151,52 +4189,26 @@ async fn first_arrivals(
     };
     // The head supplies the saved instance, not the starting arrival: read from zero, so
     // every retained row is eligible, including one that arrived below a canonical boundary.
-    let mut after = vox_core::node::api::HistoryCursor {
+    let start = HistoryCursor {
         instance: head.instance,
         arrival: 0,
     };
-    let mut selected = Vec::new();
-    loop {
-        let (rows, instance, next) = match client
-            .request(&Request::ArrivalPage { channel_id, after })
-            .await
-            .map_err(|e| AppError::Usage(e.to_string()))?
-        {
-            Frame::ArrivalPage {
-                rows,
-                instance,
-                next,
-            } => (rows, instance, next),
-            other => return Err(crate::client::unexpected(&other)),
-        };
-        // The server deliberately reanchors an old instance; a hook must restart selection
-        // explicitly instead of combining rows from two saved rooms in one delivery.
-        if instance != head.instance || next.is_some_and(|next| next.instance != head.instance) {
-            return Err(AppError::Usage(
-                "the saved room changed while selecting hook news; retry".into(),
-            ));
-        }
-        let mut last = after.arrival;
-        for row in rows {
-            if row.arrival <= last {
-                return Err(AppError::Usage("ipc arrival page did not advance".into()));
-            }
-            last = row.arrival;
-            selected.push(row);
-            if selected.len() == limit {
-                return Ok(selected);
-            }
-        }
-        let Some(next) = next else {
-            return Ok(selected);
-        };
-        if next.arrival <= after.arrival || next.arrival < last {
-            return Err(AppError::Usage(
-                "ipc arrival continuation did not advance".into(),
-            ));
-        }
-        after = next;
-    }
+    next_arrivals(client, channel_id, start, limit).await
+}
+
+/// The hook's feed after `after`. The server deliberately reanchors an old instance; a hook must
+/// restart selection explicitly instead of combining rows from two saved rooms in one delivery.
+async fn next_arrivals(
+    client: &mut IpcClient,
+    channel_id: Digest32,
+    after: HistoryCursor,
+    limit: usize,
+) -> Result<crate::coord::Feed, AppError> {
+    crate::coord::feed(client, channel_id, Since::At(after), limit)
+        .await?
+        .ok_or_else(|| {
+            AppError::Usage("the saved room changed while selecting hook news; retry".into())
+        })
 }
 
 /// Read one room for this session: the page past its cursor, what of it is news, and the
@@ -4214,49 +4226,58 @@ async fn read_room(
 
     let attention_pending = notice_pending(paths, channel_id, me, &input.session_id).await?;
     let ahead = delivered_ahead(paths, &room_key, &input.session_id)?;
-    let mut since = ahead.cursor;
+    let mut since = None;
     let ahead_slots = AHEAD_WINDOW.saturating_sub(usize::try_from(ahead.len).unwrap_or(usize::MAX));
     let mut notice = None;
     // **Only what a turn can show** (V210-120): a drain injects at most
     // `MAX_INJECTED_MESSAGES`, and moves its cursor no further than the last it showed, so it
     // reads a page of that size past its cursor rather than everything after it. A session
     // behind by a long history read all of it on every turn while it caught up.
+    //
+    // The cursor is a position, an arrival of the saved room, never a message's hash: a message
+    // that comes back after a removal took it away arrives again (ADR-053 MP-11), and a hash
+    // cursor naming it would move past what arrived while it was away. A cursor a build before
+    // positions saved (a hash) is read once by hash and saved as the position it stands for.
     let page = MAX_INJECTED_MESSAGES + 1;
-    let initial = match since {
-        Some(_) => crate::coord::read_upto(client, channel_id, since, page).await?,
-        None => Some(first_arrivals(client, channel_id, page).await?),
+    let initial = match ahead.cursor {
+        Some(saved) => match crate::coord::feed(client, channel_id, saved, page).await {
+            Ok(Some(feed)) => {
+                since = Some(feed.start);
+                Ok(feed)
+            }
+            Ok(None) => Err("cursor not in this room's timeline".to_owned()),
+            Err(AppError::Usage(reason)) if reason == vox_core::node::ipc::CAME_BACK => Err(reason),
+            Err(error) => return Err(error),
+        },
+        None => Ok(first_arrivals(client, channel_id, page).await?),
     };
-    let mut rows = match initial {
-        Some(rows) => rows,
+    let mut feed = match initial {
+        Ok(feed) => feed,
         // A cursor the node no longer holds — the room was re-opened, or the log
         // was pruned. Start from the beginning rather than failing: the agent
         // seeing a message twice is recoverable, an agent stuck forever is not.
         // **But say so**, in the injection itself: this used to re-read the whole
         // history silently, and on *any* error, so an agent could not tell a backlog
         // from a replay (PRD-001 D9).
-        None => {
-            since = None;
-            notice = Some(
-                "(Your read position in this room was not found — cursor not in this room's \
-                 timeline — so this starts again from the room's first message.)"
-                    .to_owned(),
-            );
+        Err(reason) => {
+            notice = Some(format!(
+                "(Your read position in this room was not found — {reason} — so this starts \
+                 again from the room's first message.)"
+            ));
             first_arrivals(client, channel_id, page).await?
         }
     };
     // A page that is all this session's own posts is no news, but news may follow it: read on,
     // a page at a time, rather than make the agent wait a turn per page of its own posts.
-    while rows.len() >= page && rows.iter().all(|r| is_own(r, me, &input.session_id)) {
-        let from = rows.last().map(|r| r.entry_hash);
-        let more = crate::coord::read_upto(client, channel_id, from, page)
-            .await?
-            .unwrap_or_default();
-        if more.last().map(|r| r.entry_hash) == from {
-            return Err(AppError::Usage("ipc rows page did not advance".into()));
-        }
-        since = from;
-        rows = more;
+    while feed.rows.len() >= page && feed.rows.iter().all(|r| is_own(r, me, &input.session_id)) {
+        let Some(from) = feed.rows.last().map(|r| feed.after(r)) else {
+            break;
+        };
+        feed = next_arrivals(client, channel_id, from, page).await?;
+        since = Some(from);
     }
+    let instance = feed.instance;
+    let mut rows = feed.rows;
     let contiguous = rows.len();
     // What waits past the page read, counted by the node rather than read: said in the header
     // as before, so an agent still learns how far behind it is.
@@ -4287,21 +4308,26 @@ async fn read_room(
     let mut beyond = beyond;
     if beyond > 0 && attention_pending && ahead_slots > 0 {
         let me_fp = me.map(|m| b32_encode(&m));
-        let mut from = rows.last().map(|r| r.entry_hash);
+        let mut from = rows.last().map(|r| HistoryCursor {
+            instance,
+            arrival: r.arrival,
+        });
         let held: std::collections::HashSet<Digest32> = rows.iter().map(|r| r.entry_hash).collect();
         let mut extra = Vec::new();
         while let Some(at) = from {
-            let more = crate::coord::read_upto(client, channel_id, Some(at), page)
-                .await?
-                .unwrap_or_default();
+            let more = next_arrivals(client, channel_id, at, page).await?;
             // Progress belongs to the raw source page. Removing already selected rows
             // must not make a full source page look exhausted.
-            from = if more.len() >= page {
-                more.last().map(|r| r.entry_hash)
+            from = if more.rows.len() >= page {
+                more.rows.last().map(|r| more.after(r))
             } else {
                 None
             };
-            for r in more.into_iter().filter(|r| !held.contains(&r.entry_hash)) {
+            for r in more
+                .rows
+                .into_iter()
+                .filter(|r| !held.contains(&r.entry_hash))
+            {
                 if !r.owed
                     && !ahead.contains(&r.entry_hash)?
                     && !extra
@@ -4467,13 +4493,16 @@ async fn read_room(
             threads.insert(root);
             continue;
         }
-        let mut since = None;
+        // Each next page follows the last reply's arrival as a position, never its hash, which
+        // the node refuses once it names a message that came back (ADR-053 MP-11).
+        let mut resume: Option<HistoryCursor> = None;
         loop {
             let history = match client
                 .request(&Request::Thread {
                     channel_id,
                     root,
-                    since,
+                    since: None,
+                    resume,
                 })
                 .await
                 .map_err(|e| AppError::Usage(e.to_string()))?
@@ -4488,13 +4517,16 @@ async fn read_room(
                 threads.insert(root);
                 break;
             }
-            let Some(last) = history.last() else {
+            let (Some(first), Some(last)) = (history.first(), history.last()) else {
                 break;
             };
-            if since == Some(last.entry_hash) {
+            if resume.is_some_and(|at| first.arrival <= at.arrival) {
                 return Err(AppError::Usage("ipc thread page did not advance".into()));
             }
-            since = Some(last.entry_hash);
+            resume = Some(HistoryCursor {
+                instance,
+                arrival: last.arrival,
+            });
         }
     }
 
@@ -4552,6 +4584,7 @@ async fn read_room(
         key: room_key,
         label,
         since,
+        instance,
         rows,
         fresh,
         owed,

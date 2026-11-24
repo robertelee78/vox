@@ -45,6 +45,9 @@ pub(crate) struct PendingProjection {
     authors: BTreeMap<Digest32, CompositePublicKey>,
     policy: SourcePolicy,
     now: u64,
+    /// The room's shared log/cache allocator as prepared: a row that comes back takes its new
+    /// arrival from it in the governance turn (MP-11); the advanced mark is installed after.
+    next_log_id: u64,
     paused_views: bool,
     work: ProjectionWork,
     entries: entry_store::EntryIndex,
@@ -55,6 +58,8 @@ pub(crate) struct PendingProjection {
 pub(crate) struct CompletedProjection {
     pending: PendingProjection,
     entries_changed: bool,
+    /// A governance turn took already shown rows away (MP-11).
+    retracted: bool,
     pub(crate) result: Result<ProjectionProgress>,
 }
 
@@ -112,6 +117,7 @@ impl ChannelState {
                 step_retention: self.effective_step_retention(),
             },
             now: now.get(),
+            next_log_id: self.next_log_id,
             work,
             entries: entry_store::EntryIndex::default(),
             history_pin: Some(pin),
@@ -140,6 +146,11 @@ impl ChannelState {
         store: &Store,
         completed: CompletedProjection,
     ) -> Result<ProjectionProgress> {
+        // A committed governance turn may have taken arrivals from the shared allocator (a row
+        // that came back, MP-11), whether or not its result installs here.
+        if completed.pending.room == self.channel_id {
+            self.install_next_log(completed.pending.next_log_id);
+        }
         if !completed
             .pending
             .owner
@@ -153,18 +164,31 @@ impl ChannelState {
 
     fn install_projection_result(
         &mut self,
-        _store: &Store,
+        store: &Store,
         completed: CompletedProjection,
     ) -> Result<ProjectionProgress> {
         if completed.entries_changed {
             self.entries.committed();
+        }
+        let mut retraction = Ok(());
+        if completed.retracted {
+            self.remove_display_rows();
+            self.display_news = true;
+            match self
+                .entries
+                .render_view(store, &self.sek, &self.channel_id)
+                .and_then(|view| view.step(None, true, None, true))
+            {
+                Ok(row) => self.display_tail = row.map(|(key, _)| key),
+                Err(error) => retraction = Err(error),
+            }
         }
         let CompletedProjection {
             mut pending,
             result,
             ..
         } = completed;
-        let result = result.and_then(|progress| {
+        let result = retraction.and(result).and_then(|progress| {
             let ProjectionProgress::Governance(mut progress) = progress else {
                 return Ok(progress);
             };
@@ -238,6 +262,7 @@ impl ChannelState {
                 step_retention: self.effective_step_retention(),
             },
             now: now.get(),
+            next_log_id: self.next_log_id,
             work: ProjectionWork::Governance,
             paused_views: false,
             entries: entry_store::EntryIndex::default(),
@@ -261,7 +286,20 @@ impl ChannelState {
         completed: CompletedProjection,
     ) -> Result<()> {
         self.now_hint = self.now_hint.max(completed.pending.now);
+        self.install_next_log(completed.pending.next_log_id);
         self.install_projection_result(store, completed).map(|_| ())
+    }
+
+    /// The shared log/cache allocator's high-water mark after a governance turn that may have
+    /// taken arrivals from it (MP-11): never lowered, so no id is used twice.
+    pub(in crate::node::channel) fn install_next_log(&mut self, next_log_id: u64) {
+        if crate::node::mp11_mutant(
+            "VOX_MUTANT_MP11_NO_HIGH_WATER",
+            "a governance turn's allocator advance is not installed",
+        ) {
+            return;
+        }
+        self.next_log_id = self.next_log_id.max(next_log_id);
     }
 }
 
@@ -270,6 +308,7 @@ impl PendingProjection {
     /// fold/build cursors and every original bounded helper remain the sole continuation.
     pub(crate) fn run(mut self, store: &Store) -> CompletedProjection {
         let sek = self.sek.clone();
+        let mut retracted = false;
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             sek.with(|sek| match self.work {
@@ -283,7 +322,9 @@ impl PendingProjection {
                         &self.root,
                         &self.me,
                         self.now,
+                        &mut self.next_log_id,
                     )?;
+                    retracted = progress.retracted;
                     let mut ready = progress.ready;
                     if ready {
                         let view =
@@ -353,6 +394,7 @@ impl PendingProjection {
         CompletedProjection {
             pending: self,
             entries_changed,
+            retracted,
             result,
         }
     }

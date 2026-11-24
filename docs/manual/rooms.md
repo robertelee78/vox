@@ -131,9 +131,14 @@ vox room tail family --node robertgpt
 vox room read family --json --node robertgpt
 ```
 
-`vox room tail` prints messages as they arrive until you press Ctrl-C. `--since` takes a whole
-entry hash from an earlier read; add it to the read command above with `--since`. It returns
-what arrived after it, including late messages from members who were offline. `--json` gives one object per row for programs. `--json --notices` also
+`vox room tail` prints messages as they arrive until you press Ctrl-C. `--since` takes the
+position `vox room read` prints for its next page (`@<arrival>:<instance>`) or a whole entry hash
+from an earlier read; add it to the read command above with `--since`. It returns
+what arrived after it, including late messages from members who were offline. A message a
+removal took away that comes back when the removal stops holding arrives again: it is news once
+more, and a hash naming it is refused, since its place in arrival moved. A tail that stops (its
+node stopped, the room closed, its output failed) prints the command that resumes it from where it
+was, as a position. `--json` gives one object per row for programs. `--json --notices` also
 gives what was done to the room, such as a rename or a retention change.
 
 A newly created room builds its first saved-history projection before it is shown as readable.
@@ -158,6 +163,9 @@ In the app and TUI, General shows conversation roots. Opening a reply thread sho
 separately, so a busy thread does not crowd every root off the room page. Selecting a tag shows
 its matching conversation, including matching replies. The CLI's ordinary `room read` remains
 the chronological room stream; it is not the app's General filter.
+In the app a thread lists its replies in the room's order, as `room read` shows them: a reply
+that reached this node late, or came back after a removal, is in its place, not at the end. The
+TUI's thread lists replies in the order they arrived.
 
 Older pages are explicit. In the app use **Show older entries** for the timeline, or
 **Earlier replies**/**More replies** in an open thread. A held older page does not jump to the latest

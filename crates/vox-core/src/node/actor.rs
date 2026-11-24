@@ -24749,23 +24749,33 @@ impl Node {
 
     /// Say [`NodeEvent::SessionEntry`] once for each session of the room `channel_id` with an
     /// entry placed since it was last said (ADR-029 CL-2): its entries are not room messages, so no
-    /// other event tells a client of them.
+    /// other event tells a client of them. And say [`NodeEvent::Synced`], with nothing applied,
+    /// once a governance turn took shown rows away or brought retained ones back since it was last
+    /// said (ADR-053 MP-11): no row arrived, so no other event tells a client to read the room's
+    /// preview and unread again.
     async fn say_session_news(&self, channel_id: &Digest32) {
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return;
         };
-        let news = {
+        let (news, display) = {
             let mut ch = shared.lock().await;
             // A room this identity left is out of sight (ADR-023 RL-8.1a): nothing of it is said.
             if is_leaving(&ch) {
                 return;
             }
-            ch.take_session_news()
+            (ch.take_session_news(), ch.take_display_news())
         };
         for session_id in news {
             let _ = self.event_tx.send(NodeEvent::SessionEntry {
                 channel_id: *channel_id,
                 session_id,
+            });
+        }
+        if display {
+            let _ = self.event_tx.send(NodeEvent::Synced {
+                channel_id: *channel_id,
+                applied: 0,
+                rendered: 0,
             });
         }
     }

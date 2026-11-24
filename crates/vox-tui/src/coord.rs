@@ -25,7 +25,7 @@ use vox_agentcomms::envelope::{
 use vox_agentcomms::ops::{self, OpIndex, Verdict};
 use vox_agentcomms::version::{self, Stamp, VersionTable, CLAIMS_KEY, CLAIM_RULES, VOX_KEY};
 use vox_core::hash::Digest32;
-use vox_core::node::api::MessageRow;
+use vox_core::node::api::{HistoryCursor, MessageRow};
 use vox_core::node::ipc::{Frame, IpcClient, Request};
 use vox_core::node::link::b32_encode;
 
@@ -469,6 +469,12 @@ pub async fn structured(
             "too many names for a bounded coordination read".into(),
         ));
     }
+    // Each next page follows the last row's arrival as a position, never its hash, which the
+    // node refuses once it names a message that came back (ADR-053 MP-11).
+    let instance = match ask(client, &Request::ArrivalHead { channel_id }).await? {
+        Frame::ArrivalHead { head } => head.instance,
+        other => return Err(crate::client::unexpected(&other)),
+    };
     // At most `MAX_FIND` names to a request, types and ids together.
     let room = vox_core::node::ipc::MAX_FIND
         .saturating_sub(types.len())
@@ -478,7 +484,7 @@ pub async fn structured(
         if t.is_empty() && ids.is_empty() {
             continue;
         }
-        let mut cursor = None;
+        let mut resume: Option<HistoryCursor> = None;
         loop {
             let page = match ask(
                 client,
@@ -486,7 +492,8 @@ pub async fn structured(
                     channel_id,
                     types: t.iter().map(|t| (*t).to_owned()).collect(),
                     ops: ids.to_vec(),
-                    since: cursor,
+                    since: None,
+                    resume,
                 },
             )
             .await?
@@ -494,13 +501,16 @@ pub async fn structured(
                 Frame::Rows { rows } => rows,
                 other => return Err(crate::client::unexpected(&other)),
             };
-            let Some(last) = page.last().map(|row| row.entry_hash) else {
+            let (Some(first), Some(last)) = (page.first(), page.last()) else {
                 break;
             };
-            if cursor == Some(last) {
+            if resume.is_some_and(|at| first.arrival <= at.arrival) {
                 return Err(AppError::Usage("coordination page did not advance".into()));
             }
-            cursor = Some(last);
+            resume = Some(HistoryCursor {
+                instance,
+                arrival: last.arrival,
+            });
             for row in page {
                 if seen.contains(&row.entry_hash) {
                     continue;
@@ -620,52 +630,6 @@ pub async fn find(
     Ok(found)
 }
 
-/// What [`crate::wake::open_wakes`] needs of a room for `session` (V210-120): the entries recorded
-/// as having woken it, fetched by hash, and every row after the oldest of them, where a reply to
-/// any of them can be. Not the room's whole history.
-///
-/// # Errors
-/// If the node cannot answer.
-pub async fn wake_context(
-    client: &mut IpcClient,
-    channel_id: Digest32,
-    paths: &vox_core::node::paths::Paths,
-    session: &str,
-    room: &str,
-) -> Result<Vec<MessageRow>, AppError> {
-    let entries: Vec<Digest32> = crate::wake::recorded_wakes(paths, session, room)
-        .iter()
-        .filter_map(|e| vox_core::node::link::b32_decode(e.trim(), "wake").ok())
-        .collect();
-    if entries.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut found: Vec<MessageRow> = Vec::new();
-    for chunk in entries.chunks(vox_core::node::ipc::MAX_FIND) {
-        match ask(
-            client,
-            &Request::Find {
-                channel_id,
-                entries: chunk.to_vec(),
-            },
-        )
-        .await?
-        {
-            Frame::Rows { rows } => found.extend(rows),
-            other => return Err(crate::client::unexpected(&other)),
-        }
-    }
-    let Some(oldest) = found.first().map(|r| r.entry_hash) else {
-        return Ok(Vec::new());
-    };
-    let mut seen: std::collections::HashSet<Digest32> =
-        found.iter().map(|r| r.entry_hash).collect();
-    let mut rows = found;
-    let after = read_all(client, channel_id, Some(oldest)).await?;
-    rows.extend(after.into_iter().filter(|r| seen.insert(r.entry_hash)));
-    Ok(rows)
-}
-
 /// The operation index over `posted`.
 #[must_use]
 pub fn index_of(posted: &[Posted]) -> OpIndex {
@@ -676,70 +640,207 @@ pub fn index_of(posted: &[Posted]) -> OpIndex {
     idx
 }
 
-/// Up to `limit` rows after `since` (all of them when `limit` is 0), paged from the node and no
-/// further than asked (V210-120). `Ok(None)` when the node does not hold the cursor.
-///
-/// A read from a cursor is a feed by arrival, so its next page follows the last row as a cursor;
-/// a read of the whole room is in the room's order (ADR-023 decision 1), so its next page follows
-/// the last row as a page mark. Paging the room by cursor showed a late arrival twice: once in the
-/// room's order, and again in the feed after the page boundary.
+/// Where a feed by arrival continues: after a message, named by its hash (the arrival it has
+/// now), or after a numeric position, printed `@<arrival>:<saved instance>`. A message that
+/// comes back after a removal took it away arrives again (ADR-053 MP-11), so its hash can move
+/// past what arrived while it was away; a position cannot, and the node refuses a hash cursor
+/// naming such a message ([`vox_core::node::ipc::CAME_BACK`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Since {
+    /// After this message's arrival.
+    Message(Digest32),
+    /// After this arrival of this saved room.
+    At(HistoryCursor),
+}
+
+impl Since {
+    /// As `--since` takes it: the message id, or `@<arrival>:<instance>`.
+    #[must_use]
+    pub fn text(&self) -> String {
+        match self {
+            Self::Message(hash) => b32_encode(hash),
+            Self::At(at) => {
+                let instance: String = at.instance.iter().map(|b| format!("{b:02x}")).collect();
+                format!("@{}:{instance}", at.arrival)
+            }
+        }
+    }
+
+    /// A position `@<arrival>:<instance>`; `None` for anything else.
+    #[must_use]
+    pub fn position(text: &str) -> Option<Self> {
+        let (arrival, hex) = text.trim().strip_prefix('@')?.split_once(':')?;
+        if hex.len() != 32 || !hex.is_ascii() {
+            return None;
+        }
+        let mut instance = [0u8; 16];
+        for (i, byte) in instance.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+        }
+        Some(Self::At(HistoryCursor {
+            instance,
+            arrival: arrival.parse().ok()?,
+        }))
+    }
+}
+
+/// What a feed read returned: rows by arrival, in the saved room `instance`, and `start`, the
+/// position equal to where it began (a message cursor becomes one, so it can be saved as a
+/// position).
+pub struct Feed {
+    /// The rows, by arrival.
+    pub rows: Vec<MessageRow>,
+    /// The saved room they were read in.
+    pub instance: [u8; 16],
+    /// Where the read began, as a position.
+    pub start: HistoryCursor,
+}
+
+impl Feed {
+    /// The position just after `row`, one of [`Self::rows`].
+    #[must_use]
+    pub fn after(&self, row: &MessageRow) -> HistoryCursor {
+        HistoryCursor {
+            instance: self.instance,
+            arrival: row.arrival,
+        }
+    }
+}
+
+/// Up to `limit` rows after `since` by arrival (all of them when `limit` is 0), paged from the
+/// node and no further than asked (V210-120). `Ok(None)` when the node does not hold the cursor:
+/// a message not in the room's timeline, or a position of another saved instance of the room.
+/// Past the first page it continues by position, never by a hash that can move.
 ///
 /// # Errors
-/// If the node cannot answer.
-pub async fn read_upto(
+/// If the node cannot answer, or refuses the cursor (a message that came back:
+/// [`vox_core::node::ipc::CAME_BACK`]).
+pub async fn feed(
     client: &mut IpcClient,
     channel_id: Digest32,
-    since: Option<Digest32>,
+    since: Since,
     limit: usize,
-) -> Result<Option<Vec<MessageRow>>, AppError> {
-    let mut rows: Vec<MessageRow> = Vec::new();
-    let (mut cursor, mut mark) = (since, None);
-    loop {
-        let want = if limit == 0 {
-            0
-        } else {
-            u64::try_from(limit - rows.len()).unwrap_or(u64::MAX)
-        };
-        match client
-            .request(&Request::Read {
-                channel_id,
-                since: cursor,
-                after: mark,
-                limit: want,
-            })
-            .await
-            .map_err(|e| AppError::Usage(e.to_string()))?
-        {
-            Frame::Rows { rows: page } => {
-                let Some(last) = page.last() else {
-                    return Ok(Some(rows));
-                };
-                let marker = if since.is_some() {
-                    &mut cursor
-                } else {
-                    &mut mark
-                };
-                if *marker == Some(last.entry_hash) {
-                    return Err(AppError::Usage("ipc rows page did not advance".into()));
-                }
-                *marker = Some(last.entry_hash);
-                rows.extend(page);
-                if limit > 0 && rows.len() >= limit {
-                    rows.truncate(limit);
-                    return Ok(Some(rows));
-                }
-            }
-            Frame::Error { reason }
-                if reason == "cursor not in this room's timeline"
-                    && since.is_some()
-                    && rows.is_empty()
-                    && cursor == since =>
+) -> Result<Option<Feed>, AppError> {
+    let (instance, start, mut rows) = match since {
+        Since::At(at) => (at.instance, at, Vec::new()),
+        Since::Message(hash) => {
+            let head = match ask(client, &Request::ArrivalHead { channel_id }).await? {
+                Frame::ArrivalHead { head } => head,
+                other => return Err(crate::client::unexpected(&other)),
+            };
+            let rows = match client
+                .request(&Request::Read {
+                    channel_id,
+                    since: Some(hash),
+                    after: None,
+                    limit: u64::try_from(limit).unwrap_or(u64::MAX),
+                })
+                .await
+                .map_err(|e| AppError::Usage(e.to_string()))?
             {
-                return Ok(None)
+                Frame::Rows { rows } => rows,
+                // A refusal from the node's saved view comes prefixed ("node: …"): the words
+                // decide, not the prefix.
+                Frame::Error { reason }
+                    if reason.ends_with("cursor not in this room's timeline") =>
+                {
+                    return Ok(None)
+                }
+                Frame::Error { reason } if reason.ends_with(vox_core::node::ipc::CAME_BACK) => {
+                    return Err(AppError::Usage(vox_core::node::ipc::CAME_BACK.to_owned()))
+                }
+                Frame::Error { reason } => return Err(AppError::Usage(reason)),
+                other => return Err(crate::client::unexpected(&other)),
+            };
+            // Nothing visible lies between the message and the first row after it, nor after
+            // the head when nothing follows it: either is the message's position.
+            let start = HistoryCursor {
+                instance: head.instance,
+                arrival: rows
+                    .first()
+                    .map_or(head.arrival, |r| r.arrival.saturating_sub(1)),
+            };
+            if rows.is_empty() {
+                return Ok(Some(Feed {
+                    rows,
+                    instance: head.instance,
+                    start,
+                }));
             }
-            Frame::Error { reason } => return Err(AppError::Usage(reason)),
-            other => return Err(crate::client::unexpected(&other)),
+            (head.instance, start, rows)
         }
+    };
+    if limit > 0 && rows.len() >= limit {
+        rows.truncate(limit);
+        return Ok(Some(Feed {
+            rows,
+            instance,
+            start,
+        }));
+    }
+    let after = rows.last().map_or(start, |last| HistoryCursor {
+        instance,
+        arrival: last.arrival,
+    });
+    let first = rows.is_empty();
+    if !arrivals_after(client, channel_id, after, limit, &mut rows).await? {
+        if first {
+            return Ok(None);
+        }
+        return Err(AppError::Usage(
+            "the saved room changed while reading; read again".into(),
+        ));
+    }
+    Ok(Some(Feed {
+        rows,
+        instance,
+        start,
+    }))
+}
+
+/// Append to `rows` what arrived after `after`, until `rows` holds `limit` (0: no limit). False,
+/// adding nothing more, when the node answers from another saved instance of the room.
+async fn arrivals_after(
+    client: &mut IpcClient,
+    channel_id: Digest32,
+    mut after: HistoryCursor,
+    limit: usize,
+    rows: &mut Vec<MessageRow>,
+) -> Result<bool, AppError> {
+    loop {
+        let (page, instance, next) =
+            match ask(client, &Request::ArrivalPage { channel_id, after }).await? {
+                Frame::ArrivalPage {
+                    rows,
+                    instance,
+                    next,
+                } => (rows, instance, next),
+                other => return Err(crate::client::unexpected(&other)),
+            };
+        // The node answers an old instance from its first row; that is another room's feed.
+        if instance != after.instance || next.is_some_and(|n| n.instance != after.instance) {
+            return Ok(false);
+        }
+        let mut last = after.arrival;
+        for row in page {
+            if row.arrival <= last {
+                return Err(AppError::Usage("ipc arrival page did not advance".into()));
+            }
+            last = row.arrival;
+            rows.push(row);
+            if limit > 0 && rows.len() >= limit {
+                return Ok(true);
+            }
+        }
+        let Some(next) = next else {
+            return Ok(true);
+        };
+        if next.arrival <= after.arrival || next.arrival < last {
+            return Err(AppError::Usage(
+                "ipc arrival continuation did not advance".into(),
+            ));
+        }
+        after = next;
     }
 }
 

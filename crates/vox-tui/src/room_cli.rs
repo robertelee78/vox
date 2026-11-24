@@ -850,16 +850,7 @@ pub(crate) async fn post_structured(
             data.insert("attempt".into(), a);
         }
     }
-    let (re, hops_of_reply, known_thread) = answers(
-        &mut client,
-        cid,
-        paths,
-        (!session.is_empty()).then_some(session.as_str()),
-        &snap.me,
-        opts.re.as_deref(),
-        opts.urgent,
-    )
-    .await?;
+    let (re, hops_of_reply, known_thread) = answers(&mut client, cid, opts.re.as_deref()).await?;
     // An operation keeps the root its first post used even if a missing parent arrives, or
     // retention removes one, before a retry. Changed --re/--thread still goes through normal
     // refusal and semantic conflict checks; post_once checks every other semantic field.
@@ -986,47 +977,31 @@ pub(crate) async fn post_structured(
     // to this session can land after its last drain and before it reports; the result
     // still posts, and the caller is shown every such message so it can follow up.
     let unread = if is_result {
-        // What follows this session's drain cursor, read from there (V210-120); the whole room
-        // only if the node no longer holds that cursor.
-        let cursor = crate::agent_hook::load_cursor(paths, &room_key, &session);
-        let mut feed = cursor;
-        let mut after = None;
-        let mut unread = Vec::new();
-        loop {
-            let rows = match client
-                .request(&Request::Read {
-                    channel_id: cid,
-                    since: feed,
-                    after,
-                    limit: 200,
-                })
+        // What follows this session's drain position, read from there (V210-120); the whole room
+        // only if the node no longer holds it, or the cursor (one a build before positions
+        // saved) names a message that came back (ADR-053 MP-11).
+        let from_cursor = match crate::agent_hook::load_cursor(paths, &room_key, &session) {
+            Some(since) => coord::feed(&mut client, cid, since, 0)
+                .await
+                .ok()
+                .flatten()
+                .map(|feed| feed.rows),
+            None => None,
+        };
+        let rows = match from_cursor {
+            Some(rows) => rows,
+            None => match client
+                .read_rows(cid, None)
                 .await
                 .map_err(|e| AppError::Usage(e.to_string()))?
             {
                 Frame::Rows { rows } => rows,
-                Frame::Error { .. } if feed.is_some() => {
-                    feed = None;
-                    after = None;
-                    unread.clear();
-                    continue;
-                }
                 other => return Err(crate::client::unexpected(&other)),
-            };
-            let Some(next) = rows.last().map(|r| r.entry_hash) else {
-                break;
-            };
-            let mark = if feed.is_some() {
-                &mut feed
-            } else {
-                &mut after
-            };
-            if *mark == Some(next) {
-                return Err(AppError::Usage("the unread page did not advance".into()));
-            }
-            *mark = Some(next);
-            unread.extend(unread_addressed(&session, &posting, &rows));
-        }
-        unread
+            },
+        };
+        unread_addressed(&session, &posting, &rows)
+            .into_iter()
+            .collect()
     } else {
         Vec::new()
     };
@@ -1123,32 +1098,6 @@ pub async fn post_cmd(
                      operation id and a version stamp. Use `vox room {}`.",
                     env.kind, env.kind
                 )));
-            }
-            // **A raw envelope cannot start an urgent chain of its own from a woken session**
-            // (V210-121): it is posted exactly as given, so it would not inherit the `re` a
-            // structured post takes, and two agents answering each other that way woke each
-            // other for ever.
-            if env.urgent && env.re.is_none() {
-                if let Some(session) = coord::posting_session(paths, opts.coord.session.as_deref())?
-                {
-                    let (mut client, cid, room_key) = open_room(paths, room).await?;
-                    let me = client
-                        .me()
-                        .ok_or_else(|| AppError::Usage("the node did not say who it is".into()))?;
-                    // The wakes and what followed the oldest of them (V210-120).
-                    let rows =
-                        coord::wake_context(&mut client, cid, paths, &session, &room_key).await?;
-                    let open = crate::wake::open_wakes(paths, &session, &room_key, &rows, &me);
-                    if !open.is_empty() {
-                        return Err(AppError::Usage(format!(
-                            "refusing a raw urgent message with no `re` from session {session}: \
-                             it was woken by {} and has not answered. Reply with `--re <entry>`, \
-                             or post with the structured flags (`--type`, `--to`, `--urgent`), \
-                             which answer the message that woke it when only one is open.",
-                            open.join(", ")
-                        )));
-                    }
-                }
             }
         }
         return post(
@@ -1942,59 +1891,19 @@ async fn reply_entry(
 }
 
 /// What a post answers, its hop budget and its known thread root, by the rule `vox room post` and
-/// `vox share` follow (V210-121, ADR-020 §9): `re` if given, else the one unanswered message that
-/// woke `session`; and that parent's budget less one.
+/// `vox share` follow (ADR-020 §9): `re` if given, and that parent's budget less one.
 ///
 /// # Errors
-/// An urgent post from a session woken by several unanswered messages names none of them, or
-/// the node cannot answer. An unavailable parent leaves the root unknown: callers must use
+/// The node cannot answer. An unavailable parent leaves the root unknown: callers must use
 /// `reply_thread` before a new post, after checking for an existing operation retry.
 pub(crate) async fn answers(
     client: &mut IpcClient,
     cid: Digest32,
-    paths: &Paths,
-    session: Option<&str>,
-    me: &Digest32,
     re: Option<&str>,
-    urgent: bool,
 ) -> Result<(Option<String>, Option<u32>, Option<String>), AppError> {
-    // **A woken session's post answers what woke it** (V210-121). With no `--re` it started a
-    // chain of its own with a fresh hop budget, and two agents answering each other urgently
-    // that way woke each other for ever. When exactly one wake is unanswered, that is the reply;
-    // with several, the agent must say which.
-    let re = match (re, session) {
-        (Some(re), _) => Some(reply_entry(client, cid, re).await?),
-        (None, None) => None,
-        (None, Some(session)) => {
-            // The wakes and what followed the oldest of them, read from there (V210-120).
-            let rows = coord::wake_context(client, cid, paths, session, &id(&cid)).await?;
-            let open = crate::wake::open_wakes(paths, session, &id(&cid), &rows, me);
-            match &open[..] {
-                [] => None,
-                [only] => {
-                    eprintln!(
-                        "vox: replying to {} (the message that woke this session); pass --re to \
-                         answer another",
-                        &only[..12.min(only.len())]
-                    );
-                    Some(only.clone())
-                }
-                // **Several unanswered, and an urgent post must say which it answers** (V210-121).
-                // Sent with no `re` it started a chain of its own at a fresh budget, and a session
-                // that left two wakes unanswered stayed that way: every later wake added to the
-                // set rather than being inherited, and two such sessions woke each other for ever.
-                several if urgent => {
-                    return Err(AppError::Usage(format!(
-                        "refusing an urgent message with no --re from session {session}: it was \
-                         woken by {} messages it has not answered ({}). Pass --re <entry> to say \
-                         which one this answers.",
-                        several.len(),
-                        several.join(", ")
-                    )));
-                }
-                _ => None,
-            }
-        }
+    let re = match re {
+        Some(re) => Some(reply_entry(client, cid, re).await?),
+        None => None,
     };
     // **A reply spends a hop** (ADR-020 §9): what it may still travel is its parent's budget
     // less one. Its parents are fetched by entry hash (V210-120), not by reading the room.
@@ -2098,13 +2007,13 @@ fn refresh_wait_off() -> bool {
 async fn rows_of(
     client: &mut IpcClient,
     channel_id: Digest32,
-    since: Option<Digest32>,
+    since: Option<coord::Since>,
     before: Option<Digest32>,
     limit: usize,
     tagged: &Tagged,
 ) -> Result<Option<Vec<vox_core::node::api::MessageRow>>, AppError> {
     if tagged.tags.is_empty() {
-        if since.is_none() {
+        let Some(since) = since else {
             return match room_page_waiting(client, channel_id, before, limit as u64).await? {
                 vox_core::node::ipc::Frame::RoomPage {
                     rows,
@@ -2145,18 +2054,18 @@ async fn rows_of(
                 vox_core::node::ipc::Frame::Error { reason } => Err(AppError::Usage(reason)),
                 other => Err(crate::client::unexpected(&other)),
             };
-        }
+        };
         let limit = if limit == 0 {
             vox_core::node::ipc::SESSION_PAGE_ROWS
         } else {
             limit.min(vox_core::node::ipc::SESSION_PAGE_ROWS)
         };
-        let rows = coord::read_upto(client, channel_id, since, limit).await?;
-        if let Some(last) = rows
-            .as_ref()
-            .filter(|r| r.len() == limit)
-            .and_then(|r| r.last())
-        {
+        let Some(feed) = coord::feed(client, channel_id, since, limit).await? else {
+            return Ok(None);
+        };
+        // The next page continues from a position, the last row's arrival in this saved room:
+        // never from its hash, which moves when a message comes back (ADR-053 MP-11).
+        if let Some(last) = feed.rows.last().filter(|_| feed.rows.len() == limit) {
             eprintln!(
                 "For the next page: {}",
                 vox_text::shell::node_command(
@@ -2166,7 +2075,7 @@ async fn rows_of(
                         "read",
                         &id(&channel_id),
                         "--since",
-                        &id(&last.entry_hash)
+                        &coord::Since::At(feed.after(last)).text()
                     ],
                     client
                         .node_name()
@@ -2177,7 +2086,7 @@ async fn rows_of(
                 )
             );
         }
-        return Ok(rows);
+        return Ok(Some(feed.rows));
     }
     if let Some(bad) = tagged
         .tags
@@ -2396,7 +2305,7 @@ pub async fn read(
     };
     let since = match since {
         None => None,
-        Some(s) => Some(parse_cursor(s)?),
+        Some(s) => Some(parse_since(s)?),
     };
     let before = before.map(parse_cursor).transpose()?;
     if let Some(action) = history {
@@ -2458,7 +2367,7 @@ pub async fn read(
         }) else {
             return Err(AppError::Usage(format!(
                 "cursor {} is not in this room's timeline",
-                since.map(|c| id(&c)).unwrap_or_default()
+                since.map(|c| c.text()).unwrap_or_default()
             )));
         };
         let held_back = equivocations_in(paths, &channel_id).await;
@@ -2571,7 +2480,7 @@ pub async fn read(
     }) else {
         return Err(AppError::Usage(format!(
             "cursor {} is not in this room's timeline",
-            since.map(|c| id(&c)).unwrap_or_default()
+            since.map(|c| c.text()).unwrap_or_default()
         )));
     };
     let take = if take == 0 { usize::MAX } else { take };
@@ -2924,8 +2833,10 @@ pub async fn sessions(paths: &Paths, room: &str, json: bool) -> Result<(), AppEr
 /// need neither a second delivery route nor a lifetime set of already printed hashes.
 ///
 /// Duplicates across a restart are permitted and gaps are not: the caller persists its last
-/// entry hash after processing and resumes with `--since`. A removed room instance refuses
-/// explicitly rather than applying an old arrival position to a new room.
+/// entry hash after processing and resumes with `--since`; when the tail stops, it prints the
+/// command that resumes from its own last position (`--since @<arrival>:<instance>`), which a
+/// message that comes back after a removal took it away cannot move (ADR-053 MP-11). A removed
+/// room instance refuses explicitly rather than applying an old arrival position to a new room.
 ///
 /// With `--json`, rows are `vox.room.row/1`; a newly conflicting operation also re-emits its
 /// earlier rows with `conflict`, so the consumer learns of the change from the stream alone.
@@ -2941,39 +2852,40 @@ pub async fn tail(
     use vox_core::node::api::NodeEvent;
 
     let (mut lookup, channel_id, room_key) = open_room(paths, room).await?;
+    // Where this tail is: the head, the position supplied, then each row delivered. It is what
+    // the resume command printed when the tail stops continues from.
     let mut cursor = tail_head(&mut lookup, channel_id).await?;
-    let mut shown = TailRows::default();
     if let Some(since) = since {
-        let hash = parse_cursor(since)?;
-        let row = match lookup
-            .request(&Request::Find {
-                channel_id,
-                entries: vec![hash],
-            })
-            .await
-            .map_err(|e| AppError::Usage(e.to_string()))?
-        {
-            Frame::Rows { mut rows } if rows.len() == 1 && rows[0].entry_hash == hash => {
-                rows.remove(0)
+        // A position is taken as given, in this saved room only. A message id resolves to the
+        // position it stands for; the node refuses one naming a message that came back after
+        // a removal took it away (ADR-053 MP-11): its arrival moved past what came meanwhile.
+        let since = parse_since(since)?;
+        let at = match since {
+            coord::Since::At(at) => {
+                if at.instance != cursor.instance {
+                    return Err(AppError::Usage(
+                        "that position is from another saved copy of this room (it was removed \
+                         and joined again); tail without --since"
+                            .into(),
+                    ));
+                }
+                at
             }
-            Frame::Rows { .. } => {
-                return Err(AppError::Usage("cursor not in this room's timeline".into()))
+            coord::Since::Message(_) => {
+                let at = coord::feed(&mut lookup, channel_id, since, 1)
+                    .await?
+                    .ok_or_else(|| AppError::Usage("cursor not in this room's timeline".into()))?
+                    .start;
+                if at.instance != cursor.instance {
+                    return Err(AppError::Usage(
+                        "the saved room changed while locating the cursor; run the command again"
+                            .into(),
+                    ));
+                }
+                at
             }
-            Frame::Error { reason } => return Err(AppError::Usage(reason)),
-            other => return Err(crate::client::unexpected(&other)),
         };
-        if row.owed || row.arrival == 0 {
-            return Err(AppError::Usage(
-                "cursor is not a readable arrival in this room".into(),
-            ));
-        }
-        if tail_head(&mut lookup, channel_id).await?.instance != cursor.instance {
-            return Err(AppError::Usage(
-                "the saved room changed while locating the cursor; run the command again".into(),
-            ));
-        }
-        cursor.arrival = row.arrival;
-        shown.last = Some(hash);
+        cursor.arrival = at.arrival;
     }
 
     // Both connections are held as the same node. The head predates registration, and the
@@ -3006,7 +2918,7 @@ pub async fn tail(
                     after: cursor,
                 })
                 .await
-                .map_err(|e| tail_stopped(paths, room, shown.last, json, &e.to_string()))?
+                .map_err(|e| tail_stopped(paths, room, cursor, json, &e.to_string()))?
             {
                 Frame::ArrivalPage {
                     rows,
@@ -3014,7 +2926,7 @@ pub async fn tail(
                     next,
                 } => (rows, instance, next),
                 Frame::Error { reason } => {
-                    return Err(tail_stopped(paths, room, shown.last, json, &reason))
+                    return Err(tail_stopped(paths, room, cursor, json, &reason))
                 }
                 other => return Err(crate::client::unexpected(&other)),
             };
@@ -3039,18 +2951,17 @@ pub async fn tail(
             }
             for row in rows {
                 let arrival = row.arrival;
-                shown
-                    .deliver(
-                        &mut lookup,
-                        channel_id,
-                        &room_key,
-                        cursor.instance,
-                        row,
-                        &mut out,
-                        json,
-                    )
-                    .await
-                    .map_err(|e| tail_stopped(paths, room, shown.last, json, &e.to_string()))?;
+                deliver_tail_row(
+                    &mut lookup,
+                    channel_id,
+                    &room_key,
+                    cursor.instance,
+                    row,
+                    &mut out,
+                    json,
+                )
+                .await
+                .map_err(|e| tail_stopped(paths, room, cursor, json, &e.to_string()))?;
                 cursor.arrival = arrival;
             }
             if let Some(next) = next {
@@ -3075,7 +2986,7 @@ pub async fn tail(
                     return Err(tail_stopped(
                         paths,
                         room,
-                        shown.last,
+                        cursor,
                         json,
                         "the room closed on this node",
                     ));
@@ -3093,15 +3004,9 @@ pub async fn tail(
                 }
                 Ok(Some(_)) => {}
                 Ok(None) => {
-                    return Err(tail_stopped(
-                        paths,
-                        room,
-                        shown.last,
-                        json,
-                        "the node stopped",
-                    ))
+                    return Err(tail_stopped(paths, room, cursor, json, "the node stopped"))
                 }
-                Err(e) => return Err(tail_stopped(paths, room, shown.last, json, &e.to_string())),
+                Err(e) => return Err(tail_stopped(paths, room, cursor, json, &e.to_string())),
             }
         }
     }
@@ -3122,10 +3027,12 @@ async fn tail_head(
     }
 }
 
+/// Why the tail stopped, and the command that resumes it from `at`, its last position: the one
+/// it was given or started from until a row is delivered, then the last row delivered.
 fn tail_stopped(
     paths: &Paths,
     room: &str,
-    last: Option<Digest32>,
+    at: vox_core::node::api::HistoryCursor,
     json: bool,
     reason: &str,
 ) -> AppError {
@@ -3139,10 +3046,9 @@ fn tail_stopped(
         "room".to_owned(),
         "tail".to_owned(),
         room.to_owned(),
+        "--since".to_owned(),
+        coord::Since::At(at).text(),
     ];
-    if let Some(hash) = last {
-        words.extend(["--since".to_owned(), b32_encode(&hash)]);
-    }
     if json {
         words.push("--json".to_owned());
     }
@@ -3150,55 +3056,44 @@ fn tail_stopped(
     AppError::Usage(format!("{reason}, so this tail stopped\n       restore the node and room, then resume with `{resume}`"))
 }
 
-/// Only a resume hint survives delivery. Operation context is bounded and scoped to one
-/// arriving row, then dropped; unchanged event wakes never query that context again.
-#[derive(Default)]
-struct TailRows {
-    last: Option<Digest32>,
-}
-
-impl TailRows {
-    #[allow(clippy::too_many_arguments)]
-    async fn deliver(
-        &mut self,
-        lookup: &mut IpcClient,
-        channel_id: Digest32,
-        room_key: &str,
-        instance: [u8; 16],
-        row: vox_core::node::api::MessageRow,
-        out: &mut std::io::StdoutLock<'_>,
-        json: bool,
-    ) -> Result<(), AppError> {
-        if row.owed {
-            return Err(AppError::Usage(
-                "the tail received an unreadable arrival".into(),
-            ));
-        }
-        if !json {
-            // Session lifecycle records remain absent from the plain conversation.
-            if !crate::agent_hook::is_session_record(&row) {
-                writeln!(out, "{}", plain_row(&row))?;
-                out.flush()?;
-            }
-        } else if let Some(envelope) = Envelope::parse(&row.text)
-            .ok()
-            .filter(|e| vox_agentcomms::ops::op_of(e).is_some())
-        {
-            let mut operation =
-                TailOperation::load(lookup, channel_id, room_key, instance, &row, &envelope)
-                    .await?;
-            operation.emit(room_key, &row, out)?;
-        } else {
-            writeln!(
-                out,
-                "{}",
-                row_json(room_key, &row, &vox_agentcomms::ops::OpIndex::new(), None)
-            )?;
+/// Print one arriving row. Operation context is bounded and scoped to that row, then dropped;
+/// unchanged event wakes never query that context again.
+async fn deliver_tail_row(
+    lookup: &mut IpcClient,
+    channel_id: Digest32,
+    room_key: &str,
+    instance: [u8; 16],
+    row: vox_core::node::api::MessageRow,
+    out: &mut std::io::StdoutLock<'_>,
+    json: bool,
+) -> Result<(), AppError> {
+    if row.owed {
+        return Err(AppError::Usage(
+            "the tail received an unreadable arrival".into(),
+        ));
+    }
+    if !json {
+        // Session lifecycle records remain absent from the plain conversation.
+        if !crate::agent_hook::is_session_record(&row) {
+            writeln!(out, "{}", plain_row(&row))?;
             out.flush()?;
         }
-        self.last = Some(row.entry_hash);
-        Ok(())
+    } else if let Some(envelope) = Envelope::parse(&row.text)
+        .ok()
+        .filter(|e| vox_agentcomms::ops::op_of(e).is_some())
+    {
+        let mut operation =
+            TailOperation::load(lookup, channel_id, room_key, instance, &row, &envelope).await?;
+        operation.emit(room_key, &row, out)?;
+    } else {
+        writeln!(
+            out,
+            "{}",
+            row_json(room_key, &row, &vox_agentcomms::ops::OpIndex::new(), None)
+        )?;
+        out.flush()?;
     }
+    Ok(())
 }
 
 /// One exact operation's completed disk staging. Only one bounded row page and scalar
@@ -3429,6 +3324,22 @@ fn parse_cursor(s: &str) -> Result<Digest32, AppError> {
              characters in the first column of `vox room read`"
         ))
     })
+}
+
+/// Parse `--since`: a position `@<arrival>:<instance>`, as the line "For the next page" prints
+/// it, or a full entry hash. A position stays where it is; a hash names the arrival its message
+/// has now, and the node refuses one that came back after a removal took it away (ADR-053
+/// MP-11), since that arrival moved past what came meanwhile.
+fn parse_since(s: &str) -> Result<coord::Since, AppError> {
+    match coord::Since::position(s) {
+        Some(at) => Ok(at),
+        None if s.trim().starts_with('@') => Err(AppError::Usage(
+            "--since @… is a position: @<arrival>:<32 hex digits>, as \"For the next page\" \
+             prints it"
+                .into(),
+        )),
+        None => parse_cursor(s).map(coord::Since::Message),
+    }
 }
 
 // ---------------------------------------------------------------------------

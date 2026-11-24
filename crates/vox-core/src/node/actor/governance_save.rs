@@ -1273,6 +1273,8 @@ impl Node {
             self.publish().await;
         }
         drop(continuation);
+        // A turn that took shown rows away or brought them back says so (ADR-053 MP-11).
+        self.say_session_news(&room).await;
         self.resume_computer_room_removals(room).await;
         if let Some(reply) = reply {
             let _ = reply.send(Outcome::Done);

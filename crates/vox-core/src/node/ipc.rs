@@ -54,7 +54,7 @@ use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, IpcHandshake, Result};
 use crate::hash::Digest32;
 use crate::node::actor::{EventStream, EventStreamItem, NodeHandle};
-use crate::node::api::{MessageRow, NodeEvent};
+use crate::node::api::{HistoryCursor, MessageRow, NodeEvent};
 
 #[path = "ipc_omp_media.rs"]
 mod ipc_omp_media;
@@ -149,6 +149,13 @@ pub const ROW_OVERHEAD: usize = 128;
 /// a page too ([`ROWS_BUDGET`]); the count keeps pages small enough that a proof can
 /// show paging with a hundred entries rather than thousands.
 pub const PAGE_ENTRIES: usize = 64;
+
+/// What a `Read` from a cursor answers when the cursor names a message that came back after a
+/// removal took it away (ADR-053 MP-11). It arrived again, so the hash no longer says where the
+/// reader was; continuing from its new arrival would skip what arrived while it was away. The
+/// numeric position a feed prints (`--since @<arrival>:<instance>`) does not move.
+pub const CAME_BACK: &str = "this message came back after it was taken away; its place in \
+                             arrival moved; continue from the position printed with the last page";
 
 /// Everything a `Rooms` or `Trusted` entry carries besides its name — a 32-byte id,
 /// a flag and the CBOR around them — rounded up.
@@ -664,7 +671,7 @@ pub enum Request {
         /// The most rows requested; zero uses the daemon's bounded page size.
         limit: u64,
     },
-    /// A bounded previous/next page in one thread's existing arrival index.
+    /// A bounded previous/next page of one thread in the room's order (its display index).
     ThreadPage {
         /// Selected room.
         channel_id: Digest32,
@@ -1238,8 +1245,15 @@ pub enum Request {
         types: Vec<String>,
         /// The operation ids wanted; at most [`MAX_FIND`] with `types`.
         ops: Vec<String>,
-        /// Return only matching rows **after** this one. Absent reads from the first.
+        /// Return only matching rows **after** this one. Absent reads from the first. One naming
+        /// a message that came back after a removal took it away is refused ([`CAME_BACK`]).
         since: Option<Digest32>,
+        /// Return only matching rows after this position, the last row's arrival in this saved
+        /// room: how a read continues, since a message that comes back arrives again and its
+        /// hash no longer says where the reader was (ADR-053 MP-11). One of another saved copy
+        /// of the room is refused. Sent only when set, so an older node still answers a first
+        /// page.
+        resume: Option<HistoryCursor>,
     },
     /// A room's messages carrying every tag in `tags` (#636), and only `from`'s when it is
     /// named, in arrival order, answered as [`Frame::FilteredRows`]. Its explicit scan cursor
@@ -1266,8 +1280,11 @@ pub enum Request {
         channel_id: Digest32,
         /// The General message's entry hash.
         root: Digest32,
-        /// Only replies after this matching row.
+        /// Only replies after this matching row; one naming a message that came back after a
+        /// removal took it away is refused ([`CAME_BACK`]).
         since: Option<Digest32>,
+        /// Only replies after this position, as [`Request::Structured`]'s `resume`.
+        resume: Option<HistoryCursor>,
     },
     /// A thread's exact readable reply count and latest send time, with one bounded page of
     /// authors in fingerprint order. The room's existing thread index supplies the summary.
@@ -1541,8 +1558,9 @@ impl Request {
                 types,
                 ops,
                 since,
+                resume,
             } => {
-                e.array(5)
+                e.array(5 + usize::from(resume.is_some()))
                     .uint(T_STRUCTURED)
                     .bytes(channel_id)
                     .array(types.len());
@@ -1554,6 +1572,9 @@ impl Request {
                     e.text(o);
                 }
                 e.bytes(since.as_ref().map_or(&[][..], |d| &d[..]));
+                if let Some(resume) = resume {
+                    encode_history_cursor(&mut e, *resume);
+                }
             }
             Request::Tagged {
                 channel_id,
@@ -1577,12 +1598,16 @@ impl Request {
                 channel_id,
                 root,
                 since,
+                resume,
             } => {
-                e.array(4)
+                e.array(4 + usize::from(resume.is_some()))
                     .uint(T_THREAD)
                     .bytes(channel_id)
                     .bytes(root)
                     .bytes(since.as_ref().map_or(&[][..], |d| &d[..]));
+                if let Some(resume) = resume {
+                    encode_history_cursor(&mut e, *resume);
+                }
             }
             Request::ThreadSummary {
                 channel_id,
@@ -2501,7 +2526,7 @@ impl Request {
                     .map_err(|_| Error::MalformedIpc("work board trailing"))?;
                 Ok(Request::WorkBoard { channel_id, query })
             }
-            (T_STRUCTURED, 5) => {
+            (T_STRUCTURED, arity @ (5 | 6)) => {
                 let channel_id = digest(&mut d)?;
                 let n = d.array().map_err(|_| Error::MalformedIpc("ipc types"))?;
                 if n > MAX_FIND {
@@ -2520,6 +2545,7 @@ impl Request {
                     ops.push(text(&mut d, "ipc op")?);
                 }
                 let since = optional_digest(&mut d)?;
+                let resume = (arity == 6).then(|| history_cursor(&mut d)).transpose()?;
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Structured {
@@ -2527,6 +2553,7 @@ impl Request {
                     types,
                     ops,
                     since,
+                    resume,
                 })
             }
             (T_TAGGED, 6) => {
@@ -2552,16 +2579,18 @@ impl Request {
                     resume,
                 })
             }
-            (T_THREAD, 4) => {
+            (T_THREAD, arity @ (4 | 5)) => {
                 let channel_id = digest(&mut d)?;
                 let root = digest(&mut d)?;
                 let since = optional_digest(&mut d)?;
+                let resume = (arity == 5).then(|| history_cursor(&mut d)).transpose()?;
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Thread {
                     channel_id,
                     root,
                     since,
+                    resume,
                 })
             }
             (T_THREAD_SUMMARY_REQ, 4) => {
@@ -7866,6 +7895,51 @@ async fn serve_post(
     }
 }
 
+/// One page of a room's messages in `selection` by arrival, for [`Request::Structured`] and
+/// [`Request::Thread`]: after the message `since` names, or after the position `resume`. A
+/// position is answered only in the saved copy of the room it was taken in; the node's page of
+/// another starts from that copy's first message, so it is refused rather than read as more.
+async fn selected_rows(
+    handle: &NodeHandle,
+    channel_id: Digest32,
+    selection: crate::node::channel::history::Selection,
+    since: Option<Digest32>,
+    resume: Option<HistoryCursor>,
+) -> Frame {
+    use crate::node::channel::history::{Query, Reply};
+    let query = match (since, resume) {
+        (Some(_), Some(_)) => {
+            return Frame::Error {
+                reason: "a read continues after a message or a position, not both".into(),
+            }
+        }
+        (_, Some(at)) => Query::CursorPage {
+            after: Some(at),
+            selection: Some(selection),
+            limit: PAGE_ENTRIES,
+        },
+        (since, None) => Query::Filtered {
+            selection,
+            since,
+            resume: None,
+            limit: PAGE_ENTRIES,
+        },
+    };
+    match handle.room_history(channel_id, query).await {
+        Ok(Reply::Page { rows, .. }) => Frame::Rows { rows },
+        Ok(Reply::CursorPage(page)) if resume.is_some_and(|at| at.instance == page.instance) => {
+            Frame::Rows { rows: page.rows }
+        }
+        Ok(Reply::CursorPage(_)) => Frame::Error {
+            reason: "the saved room changed while reading; read again".into(),
+        },
+        Ok(_) => Frame::Error {
+            reason: "unexpected history answer".into(),
+        },
+        Err(reason) => Frame::Error { reason },
+    }
+}
+
 /// Answer one request against the node.
 ///
 /// Every failure comes back as [`Frame::Error`] rather than ending the
@@ -8654,56 +8728,25 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             types,
             ops,
             since,
+            resume,
         } => {
-            use crate::node::channel::history::{Filter, Query, Reply, Selection};
+            use crate::node::channel::history::{Filter, Selection};
             let filters = types
                 .into_iter()
                 .map(Filter::Type)
                 .chain(ops.into_iter().map(Filter::Op))
                 .collect();
-            match handle
-                .room_history(
-                    channel_id,
-                    Query::Filtered {
-                        selection: Selection::Any(filters),
-                        since,
-                        resume: None,
-                        limit: PAGE_ENTRIES,
-                    },
-                )
-                .await
-            {
-                Ok(Reply::Page { rows, .. }) => Frame::Rows { rows },
-                Ok(_) => Frame::Error {
-                    reason: "unexpected history answer".into(),
-                },
-                Err(reason) => Frame::Error { reason },
-            }
+            selected_rows(handle, channel_id, Selection::Any(filters), since, resume).await
         }
         Request::Thread {
             channel_id,
             root,
             since,
+            resume,
         } => {
-            use crate::node::channel::history::{Filter, Query, Reply, Selection};
-            match handle
-                .room_history(
-                    channel_id,
-                    Query::Filtered {
-                        selection: Selection::Any(vec![Filter::Thread(root)]),
-                        since,
-                        resume: None,
-                        limit: PAGE_ENTRIES,
-                    },
-                )
-                .await
-            {
-                Ok(Reply::Page { rows, .. }) => Frame::Rows { rows },
-                Ok(_) => Frame::Error {
-                    reason: "unexpected history answer".into(),
-                },
-                Err(reason) => Frame::Error { reason },
-            }
+            use crate::node::channel::history::{Filter, Selection};
+            let selection = Selection::Any(vec![Filter::Thread(root)]);
+            selected_rows(handle, channel_id, selection, since, resume).await
         }
         Request::ThreadPage {
             channel_id,
@@ -10164,17 +10207,74 @@ impl IpcClient {
         channel_id: Digest32,
         since: Option<Digest32>,
     ) -> Result<Frame> {
-        // A read from a cursor is a feed by arrival, so its next page follows the last row
-        // as a cursor. A read of the whole room is in the room's order, so its next page
-        // follows the last row as a page mark: as a cursor it would become that feed, and
-        // lose every late arrival above the page boundary.
+        // A read of the whole room is in the room's order, so its next page follows the last
+        // row as a page mark: as a cursor it would become the feed by arrival, and lose every
+        // late arrival above the page boundary. A read from a cursor is that feed: its next page
+        // follows the last row's arrival as a position, never its hash, which the node refuses
+        // once it names a message that came back (ADR-053 MP-11, [`CAME_BACK`]).
         let mut all = Vec::new();
-        let (mut cursor, mut mark) = (since, None);
+        if let Some(since) = since {
+            let instance = match self.request(&Request::ArrivalHead { channel_id }).await? {
+                Frame::ArrivalHead { head } => head.instance,
+                other => return Ok(other),
+            };
+            match self
+                .request(&Request::Read {
+                    channel_id,
+                    since: Some(since),
+                    after: None,
+                    limit: 0,
+                })
+                .await?
+            {
+                Frame::Rows { rows } => all = rows,
+                other => return Ok(other),
+            }
+            let Some(last) = all.last() else {
+                return Ok(Frame::Rows { rows: all });
+            };
+            let mut after = HistoryCursor {
+                instance,
+                arrival: last.arrival,
+            };
+            loop {
+                match self
+                    .request(&Request::ArrivalPage { channel_id, after })
+                    .await?
+                {
+                    Frame::ArrivalPage {
+                        rows,
+                        instance: answered,
+                        next,
+                    } => {
+                        if answered != instance {
+                            return Err(Error::MalformedIpc(
+                                "the saved room changed while reading",
+                            ));
+                        }
+                        // A node that ignored the position is an error, not a hang.
+                        if rows.first().is_some_and(|r| r.arrival <= after.arrival) {
+                            return Err(Error::MalformedIpc("ipc rows page did not advance"));
+                        }
+                        all.extend(rows);
+                        match next {
+                            Some(next) if next.arrival > after.arrival => after = next,
+                            Some(_) => {
+                                return Err(Error::MalformedIpc("ipc rows page did not advance"))
+                            }
+                            None => return Ok(Frame::Rows { rows: all }),
+                        }
+                    }
+                    other => return Ok(other),
+                }
+            }
+        }
+        let mut mark = None;
         loop {
             match self
                 .request(&Request::Read {
                     channel_id,
-                    since: cursor,
+                    since: None,
                     after: mark,
                     limit: 0,
                 })
@@ -10185,16 +10285,11 @@ impl IpcClient {
                         return Ok(Frame::Rows { rows: all });
                     };
                     // A page that ends where the last one did would be asked for again
-                    // forever; a node that ignored the cursor or the mark is an error, not a hang.
-                    let marker = if since.is_some() {
-                        &mut cursor
-                    } else {
-                        &mut mark
-                    };
-                    if *marker == Some(last.entry_hash) {
+                    // forever; a node that ignored the mark is an error, not a hang.
+                    if mark == Some(last.entry_hash) {
                         return Err(Error::MalformedIpc("ipc rows page did not advance"));
                     }
-                    *marker = Some(last.entry_hash);
+                    mark = Some(last.entry_hash);
                     all.extend(rows);
                 }
                 other => return Ok(other),
@@ -10204,7 +10299,9 @@ impl IpcClient {
 
     /// A room's structured posts of `types`, and those whose operation id is in `ops`, however
     /// many replies that takes ([`Request::Structured`], V210-120). Rows matched by an id's hash
-    /// alone are included: filter on the id.
+    /// alone are included: filter on the id. Its next page follows the last row's arrival as a
+    /// position, never its hash, which the node refuses once it names a message that came back
+    /// (ADR-053 MP-11, [`CAME_BACK`]).
     ///
     /// # Errors
     /// If the node cannot be reached or answers with a malformed frame.
@@ -10214,57 +10311,34 @@ impl IpcClient {
         types: &[&str],
         ops: &[String],
     ) -> Result<Frame> {
-        let mut all = Vec::new();
-        let mut cursor = None;
+        let instance = match self.request(&Request::ArrivalHead { channel_id }).await? {
+            Frame::ArrivalHead { head } => head.instance,
+            other => return Ok(other),
+        };
+        let mut all: Vec<MessageRow> = Vec::new();
         loop {
+            let resume = all.last().map(|last| HistoryCursor {
+                instance,
+                arrival: last.arrival,
+            });
             match self
                 .request(&Request::Structured {
                     channel_id,
                     types: types.iter().map(|t| (*t).to_owned()).collect(),
                     ops: ops.to_vec(),
-                    since: cursor,
+                    since: None,
+                    resume,
                 })
                 .await?
             {
                 Frame::Rows { rows } => {
-                    let Some(last) = rows.last() else {
+                    let Some(first) = rows.first() else {
                         return Ok(Frame::Rows { rows: all });
                     };
-                    if cursor == Some(last.entry_hash) {
+                    // A node that ignored the position is an error, not a hang.
+                    if resume.is_some_and(|at| first.arrival <= at.arrival) {
                         return Err(Error::MalformedIpc("ipc rows page did not advance"));
                     }
-                    cursor = Some(last.entry_hash);
-                    all.extend(rows);
-                }
-                other => return Ok(other),
-            }
-        }
-    }
-
-    /// Read the replies of one thread through the room's index, across bounded row pages.
-    ///
-    /// # Errors
-    /// If the daemon refuses, disconnects, or does not advance its page.
-    pub async fn read_thread(&mut self, channel_id: Digest32, root: Digest32) -> Result<Frame> {
-        let mut all = Vec::new();
-        let mut cursor = None;
-        loop {
-            match self
-                .request(&Request::Thread {
-                    channel_id,
-                    root,
-                    since: cursor,
-                })
-                .await?
-            {
-                Frame::Rows { rows } => {
-                    let Some(last) = rows.last() else {
-                        return Ok(Frame::Rows { rows: all });
-                    };
-                    if cursor == Some(last.entry_hash) {
-                        return Err(Error::MalformedIpc("ipc rows page did not advance"));
-                    }
-                    cursor = Some(last.entry_hash);
                     all.extend(rows);
                 }
                 other => return Ok(other),

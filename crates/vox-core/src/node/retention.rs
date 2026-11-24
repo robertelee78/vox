@@ -227,6 +227,10 @@ pub(crate) struct Tracked {
     pub cache_id: Option<u64>,
     /// Encrypted Session activity, including a body this node cannot decrypt.
     pub steps: bool,
+    /// The message came back after a removal took it away (ADR-053 MP-11) and arrived again: its
+    /// plaintext row has a newer arrival than the one a reader of it was given before. A
+    /// continuation that names it by hash is refused, since its place in arrival moved.
+    pub returned: bool,
 }
 
 impl Tracked {
