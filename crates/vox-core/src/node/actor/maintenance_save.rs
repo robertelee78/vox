@@ -630,8 +630,14 @@ impl Node {
     }
 
     pub(super) fn store_save_pending(&self) -> bool {
-        !self.pending_posts.is_empty()
-            || self.pending_session_bookkeeping.is_some()
+        !self.pending_posts.is_empty() || self.node_save_pending()
+    }
+
+    /// A pending save other than one room's own native save (`pending_posts`): the node's
+    /// startup, policy, metadata, key and Session bookkeeping saves, and a room publication that
+    /// holds its authority.
+    fn node_save_pending(&self) -> bool {
+        self.pending_session_bookkeeping.is_some()
             || self.policy_save_pending()
             || self.metadata_save_pending()
             || self.pending_startup.is_some()
@@ -645,7 +651,16 @@ impl Node {
     }
 
     pub(super) fn fresh_maintenance_allowed(&self) -> bool {
-        !self.store_save_pending()
+        self.pending_posts.is_empty() && self.room_change_allowed()
+    }
+
+    /// Whether a governance turn or a room's publication may begin. Each waits for the node's
+    /// saves (`node_save_pending`) and for the computer's publication writer, not for another
+    /// room's own save: it skips a room whose own save is pending (`advance_governance_turn`,
+    /// `preparation_save::publication_eligible`), so posts that keep one room's save pending
+    /// never hold another room's change.
+    pub(super) fn room_change_allowed(&self) -> bool {
+        !self.node_save_pending()
             && self
                 .computer
                 .as_ref()
