@@ -1272,6 +1272,18 @@ impl RenderView<'_> {
             .visible_summary(self.roots().display, true, None, false)?
             .count)
     }
+    /// The first rendered message whose hash is at or after `hash`, in hash order.
+    pub(crate) fn rendered_from(&self, hash: &Digest32) -> Result<Option<Digest32>> {
+        let read = &self.order.read;
+        Ok(self
+            .source()
+            .first(read.sek, read.channel, self.roots().hash, &hashed(hash), 0)?
+            .map(|(key, _)| {
+                let mut found = [0; 32];
+                found.copy_from_slice(&key[..32]);
+                found
+            }))
+    }
     pub(crate) fn before(&self, key: OrderKey) -> Result<u64> {
         Ok(self
             .visible_summary(

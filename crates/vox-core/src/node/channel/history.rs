@@ -43,6 +43,12 @@ pub(crate) enum Query {
     Governance(crate::node::api::GovernanceQuery),
     DisplayRevision,
     ReadRevision,
+    /// The readable messages whose id starts with a base32 prefix, up to
+    /// [`crate::node::ipc::PREFIX_MATCHES`] and one past it, answered as [`Reply::Order`]: what a
+    /// reply by prefix resolves.
+    Prefix {
+        prefix: String,
+    },
     ArrivalHead,
     OperationPage {
         author: Digest32,
@@ -209,6 +215,18 @@ impl Selection {
     }
 }
 
+/// The next hash in byte order, none past the last.
+fn successor_hash(mut hash: Digest32) -> Option<Digest32> {
+    for byte in hash.iter_mut().rev() {
+        let (next, carry) = byte.overflowing_add(1);
+        *byte = next;
+        if !carry {
+            return Some(hash);
+        }
+    }
+    None
+}
+
 /// A short query may be followed by a client wait, but no Store snapshot or room lock is.
 /// A read that takes several requests gives each row as it is when that request is answered:
 /// any row may change the instant after it is read, in one request or five. This token refuses
@@ -231,15 +249,6 @@ impl Revision {
                 "a read spanning requests is refused when a message arrives",
             ) {
                 order = order.wrapping_add(ch.generation);
-            }
-            if ch.effective_retention() != 0
-                && crate::node::mp11_mutant(
-                    "VOX_MUTANT_READ_REFUSES_EXPIRY",
-                    "a read spanning requests in a room with a message lifetime is refused once \
-                     time has passed, when a row can expire",
-                )
-            {
-                order = order.wrapping_add(ch.now_hint);
             }
         }
         Ok(Self {
@@ -288,6 +297,7 @@ impl View<'_> {
                 | Query::Agreement { .. }
                 | Query::OperationPage { .. }
                 | Query::Order { .. }
+                | Query::Prefix { .. }
                 | Query::ThreadPage { .. }
                 | Query::ThreadSummary { .. }
         ) && (!self.ch.projection_ready
@@ -1286,6 +1296,55 @@ impl View<'_> {
                     }
                 }
                 Ok(Reply::DisplayRevision(hash.finalize().into()))
+            }
+            // One snapshot answers the whole question, so it is never refused because the room
+            // moved. Rendered rows are keyed by their hash: a prefix is one range of that index.
+            Query::Prefix { prefix } => {
+                // The lowest hash with this prefix: the prefix padded with zero bits ('a').
+                if prefix.is_empty() {
+                    return Err(Failure::Request("invalid entry prefix"));
+                }
+                let start = crate::node::link::b32_decode(&format!("{prefix:a<52}"), "prefix")
+                    .map_err(|_| Failure::Request("invalid entry prefix"))?;
+                let mut entries = Vec::new();
+                let mut from = Some(start);
+                while let Some(at) = from {
+                    let Some(hash) = self.rendered.rendered_from(&at)? else {
+                        break;
+                    };
+                    if !crate::node::link::b32_encode(&hash).starts_with(prefix.as_str()) {
+                        break;
+                    }
+                    // Only what this reader may read now, as a plain read: not an expired row.
+                    if self.row(&hash)?.is_some()
+                        || crate::node::mp11_mutant(
+                            "VOX_MUTANT_PREFIX_MATCHES_UNREADABLE",
+                            "a reply prefix matches a message this reader cannot read",
+                        )
+                    {
+                        let (clock, _) = self
+                            .rendered
+                            .order()
+                            .key(&hash)?
+                            .ok_or(Error::MalformedAtRest("rendered entry not published"))?;
+                        entries.push((hash, clock));
+                        if entries.len() > crate::node::ipc::PREFIX_MATCHES
+                            || crate::node::mp11_mutant(
+                                "VOX_MUTANT_PREFIX_FIRST_MATCH",
+                                "a reply prefix resolves to its first match",
+                            )
+                        {
+                            break;
+                        }
+                    }
+                    from = successor_hash(hash);
+                }
+                entries.sort_by_key(|&(hash, clock)| (clock, hash));
+                Ok(Reply::Order {
+                    entries,
+                    next: None,
+                    revision: self.rendered.order().revision(),
+                })
             }
             Query::Governance(_) => Err(Failure::Request(
                 "governance requires its checked authority reader",
