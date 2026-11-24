@@ -212,14 +212,16 @@ impl Selection {
 /// A short query may be followed by a client wait, but no Store snapshot or room lock is.
 /// This token rejects, before another part of one answer is read, a room whose rows already
 /// read may have moved or changed: an entry moved by a late parent, a row taken away, returned
-/// or given its body, a body dropped, a reclassified row, a retention change, a rebuilt
-/// rendering. A message that merely arrives changes no row already read, so it is not here: one
-/// that sorts into the part already read is as if it had arrived just after the read. (So it
-/// compares `display_removals`, not `display_rewrite`, which also moves for such an arrival.)
+/// or given its body, a row expiring (left out of reads before it is removed), a row marked late
+/// by an arrival shown earlier than it (the clock stepped back), a body dropped, a reclassified
+/// row, a retention change, a rebuilt rendering. A message that merely arrives changes no row
+/// already read, so it is not here: one that sorts into the part already read is as if it had
+/// arrived just after the read. (So it compares `display_removals` and `shown_row_rewrites`, not
+/// `display_rewrite`, which also moves for such an arrival.)
 #[derive(Clone)]
 pub(crate) struct Revision {
     incarnation: Arc<std::sync::atomic::AtomicU64>,
-    facts: [u64; 9],
+    facts: [u64; 11],
 }
 
 impl Revision {
@@ -227,6 +229,7 @@ impl Revision {
         #[allow(unused_mut)]
         let mut facts = [
             ch.display_removals,
+            ch.shown_row_rewrites,
             ch.reorder_generation,
             rendered.order().revision(),
             ch.body_generation,
@@ -237,6 +240,13 @@ impl Revision {
             rendered.display_roots()[3],
             // Whether "not received yet" rows are shown (ADR-036 H-4): pages gain or lose them.
             u64::from(ch.owed_shown),
+            // Rows due by now, which reads leave out before they are removed.
+            rendered.due_count(
+                ch.now_hint,
+                ch.effective_retention(),
+                ch.effective_step_retention(),
+                ch.retention_floor,
+            )?,
         ];
         #[cfg(feature = "test-knobs")]
         {
@@ -244,7 +254,7 @@ impl Revision {
                 "VOX_MUTANT_READ_KEEPS_NOTHING",
                 "a read spanning requests compares nothing of the rows already read",
             ) {
-                facts = [0; 9];
+                facts = [0; 11];
             }
             if crate::node::mp11_mutant(
                 "VOX_MUTANT_READ_REFUSES_ARRIVALS",

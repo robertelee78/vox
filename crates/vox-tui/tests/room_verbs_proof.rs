@@ -1136,14 +1136,14 @@ fn a_debug_daemon_makes_a_room_takes_a_post_and_keeps_running() {
         "PRODUCT: unique older-page prefix {older_prefix} did not reply to canonical parent {older_target}: {canonical_parent}"
     );
 
-    // A multi-page selector is one logical read. Hold the shipped CLI after its first page,
-    // change the room through a second shipped CLI, then let it continue (ledger 95).
+    // A selector's scan is one logical read. Hold the shipped CLI after its first page, change
+    // the room through a second shipped CLI, then let it continue (ledger 95).
     // - A message that only arrives changes no row the scan has read: the reply resolves and is
     //   posted. Mutant `VOX_MUTANT_READ_REFUSES_ARRIVALS` (the arrival fields compared again):
     //   the scan is refused because someone posted.
-    // - A retention change changes what the rows already read are: the scan is refused and
-    //   posts nothing. Mutant `VOX_MUTANT_READ_KEEPS_NOTHING`: the reply is posted against pages
-    //   that were never one room view.
+    // - A row the scan has read expires, and a plain read no longer shows it: the scan is
+    //   refused and posts nothing. Mutant `VOX_MUTANT_READ_KEEPS_NOTHING`: the reply is posted
+    //   against a page that is no longer the room.
     #[cfg(feature = "test-knobs")]
     {
         test_knobs::require(&["VOX_TEST_REPLY_PREFIX_HOLD_FILE"]);
@@ -1159,20 +1159,19 @@ fn a_debug_daemon_makes_a_room_takes_a_post_and_keeps_running() {
                     .then_some((entry.clone(), prefix.to_owned()))
             })
             .expect("APPARATUS: no older printed entry had a unique 51-character prefix");
-        // `vox room post --re PREFIX TEXT`, held after its first page while `change` runs.
-        let held_scan = |text: &str, change: &dyn Fn() -> String| {
+        // `vox room post ROOM --re PREFIX TEXT`, held after its first page while `change` runs.
+        let held_scan = |room: &str, prefix: &str, text: &str, change: &dyn Fn() -> String| {
             let hold = tmp.path().join(format!("{text}.hold"));
             let reached = hold.with_extension("reached");
             std::fs::write(&hold, b"hold")
                 .expect("APPARATUS: could not stage the reply-prefix scan hold");
-            let (scan_data, scan_cfg, scan_room, scan_hold) =
-                (data.clone(), cfg.clone(), room.clone(), hold.clone());
-            let (prefix, text) = (changing_prefix.clone(), text.to_owned());
+            let (scan_data, scan_cfg, scan_hold) = (data.clone(), cfg.clone(), hold.clone());
+            let (room, prefix, text) = (room.to_owned(), prefix.to_owned(), text.to_owned());
             let scan = std::thread::spawn(move || {
                 vox_with_env(
                     &scan_data,
                     &scan_cfg,
-                    &["room", "post", &scan_room, "--re", &prefix, &text],
+                    &["room", "post", &room, "--re", &prefix, &text],
                     None,
                     &[("VOX_TEST_REPLY_PREFIX_HOLD_FILE", scan_hold.as_os_str())],
                 )
@@ -1200,27 +1199,36 @@ fn a_debug_daemon_makes_a_room_takes_a_post_and_keeps_running() {
             }
             (changed, result)
         };
-        let rows_now = || {
-            let (ok, rows, err) = vox(&data, &cfg, &["room", "read", &room, "--json"], None);
+        // A plain read, once it answers: a room removing expired messages says so until it has.
+        let rows_now = |room: &str| loop {
+            let (ok, rows, err) = vox(&data, &cfg, &["room", "read", room, "--json"], None);
+            if !ok && err.contains("the room is refreshing saved history; retry") {
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
             assert!(ok, "PRODUCT: room read failed: {rows}{err}");
-            rows.lines()
+            break rows
+                .lines()
                 .map(|line| {
                     serde_json::from_str::<serde_json::Value>(line).unwrap_or_else(|error| {
                         panic!("PRODUCT: room read returned invalid JSON row {line:?}: {error}")
                     })
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
         };
 
-        let (arrived, (ok, out, err)) = held_scan("PREFIX-SCAN-PAST-AN-ARRIVAL", &|| {
-            post(&["PREFIX-ARRIVES-WHILE-SCANNED"])
-        });
+        let (arrived, (ok, out, err)) = held_scan(
+            &room,
+            &changing_prefix,
+            "PREFIX-SCAN-PAST-AN-ARRIVAL",
+            &|| post(&["PREFIX-ARRIVES-WHILE-SCANNED"]),
+        );
         assert!(
             ok,
             "PRODUCT: a reply-prefix scan was refused because message {arrived} arrived while it \
              read; no row it had read changed: {out}{err}"
         );
-        let reply = rows_now()
+        let reply = rows_now(&room)
             .into_iter()
             .find(|row| row.to_string().contains("PREFIX-SCAN-PAST-AN-ARRIVAL"));
         assert!(
@@ -1231,42 +1239,106 @@ fn a_debug_daemon_makes_a_room_takes_a_post_and_keeps_running() {
              {changing_target}: {reply:?}"
         );
 
-        let (changed, (ok, out, err)) = held_scan("PREFIX-SCAN-PAST-A-RETENTION-CHANGE", &|| {
-            let notices = |rows: &str| rows.matches("vox.room.notice/1").count();
-            let read_notices = || {
-                let (ok, out, err) = vox(
-                    &data,
-                    &cfg,
-                    &["room", "read", &room, "--json", "--notices"],
-                    None,
-                );
-                assert!(
-                    ok,
-                    "PRODUCT (staging): room read --notices failed: {out}{err}"
-                );
-                notices(&out)
-            };
-            let before = read_notices();
-            let (ok, out, err) = vox(&data, &cfg, &["room", "retention", &room, "1w"], None);
-            assert!(
-                ok,
-                "PRODUCT (staging): vox room retention 1w failed: {out}{err}"
-            );
-            // The room has applied it when its notice is read: only then does the scan read on.
-            while read_notices() == before {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            "a retention of one week".to_owned()
-        });
-        assert!(
-            !ok && err.contains("room changed"),
-            "PRODUCT: reply-prefix scan accepted pages read before {changed} changed the rows it \
-             had read, while resolving {changing_target}: {out}{err}"
+        // A second room, of one page (with more, the oldest row of the first page, gone, would
+        // anchor the next page and refuse it on its own). Its message lifetime is set before
+        // anything is posted, so only the expiry changes the room while the scan holds: a
+        // message, then `GAP` later the reply's target; the scan reads both and holds; the first
+        // expires, and a plain read shows it gone and the target still there.
+        const LIFETIME_SECS: u64 = 16;
+        const GAP: Duration = Duration::from_secs(LIFETIME_SECS / 2);
+        let (ok, _, err) = vox(
+            &data,
+            &cfg,
+            &[
+                "room",
+                "create",
+                "--passphrase-file",
+                "-",
+                "--name",
+                "expiring-in-debug",
+            ],
+            Some("channel passphrase"),
         );
         assert!(
-            rows_now().iter().all(|row| !row
-                .to_string()
-                .contains("PREFIX-SCAN-PAST-A-RETENTION-CHANGE")),
+            ok,
+            "PRODUCT (staging): vox room create expiring-in-debug failed: {err}"
+        );
+        let (ok, out, err) = vox(&data, &cfg, &["room", "list"], None);
+        let expiring = out
+            .lines()
+            .find(|l| l.contains("expiring-in-debug"))
+            .and_then(|l| l.split_whitespace().next())
+            .filter(|_| ok)
+            .unwrap_or_else(|| {
+                panic!("PRODUCT (staging): the daemon does not list expiring-in-debug: {out}{err}")
+            })
+            .to_owned();
+        let lifetime = LIFETIME_SECS.to_string();
+        let (ok, out, err) = vox(
+            &data,
+            &cfg,
+            &["room", "retention", &expiring, &lifetime],
+            None,
+        );
+        assert!(
+            ok,
+            "PRODUCT (staging): vox room retention {lifetime} failed: {out}{err}"
+        );
+        rows_now(&expiring);
+        let post_in = |text: &str| {
+            let (ok, out, err) = vox(
+                &data,
+                &cfg,
+                &["room", "post", &expiring, "--json", text],
+                None,
+            );
+            assert!(ok, "PRODUCT (staging): room post {text} failed: {out}{err}");
+            serde_json::from_str::<serde_json::Value>(&out)
+                .ok()
+                .and_then(|row| row["entry_hash"].as_str().map(str::to_owned))
+                .unwrap_or_else(|| panic!("PRODUCT (staging): post {text} named no entry: {out}"))
+        };
+        let shown = |rows: &[serde_json::Value], entry: &str| {
+            rows.iter().any(|row| row["entry_hash"] == entry)
+        };
+        let expires = post_in("EXPIRES-WHILE-SCANNED");
+        std::thread::sleep(GAP);
+        let target = post_in("STAYS-WHILE-SCANNED");
+        let rows = rows_now(&expiring);
+        assert!(
+            shown(&rows, &expires) && shown(&rows, &target),
+            "APPARATUS: expiring-in-debug does not show {expires} and {target}: {rows:?}"
+        );
+        let target_prefix = &target[..51];
+        let (changed, (ok, out, err)) = held_scan(
+            &expiring,
+            target_prefix,
+            "PREFIX-SCAN-PAST-AN-EXPIRY",
+            &|| {
+                loop {
+                    let rows = rows_now(&expiring);
+                    assert!(
+                        shown(&rows, &target),
+                        "APPARATUS: the reply's target {target} expired before the scan was \
+                         released: the staging took longer than its {GAP:?} gap"
+                    );
+                    if !shown(&rows, &expires) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                format!("message {expires} expired and a plain read no longer showed it")
+            },
+        );
+        assert!(
+            !ok && err.contains("room changed"),
+            "PRODUCT: a reply-prefix scan accepted its page after {changed}, a row it had read, \
+             and resolved {target}: {out}{err}"
+        );
+        assert!(
+            rows_now(&expiring)
+                .iter()
+                .all(|row| !row.to_string().contains("PREFIX-SCAN-PAST-AN-EXPIRY")),
             "PRODUCT: a refused reply-prefix scan posted its reply"
         );
     }

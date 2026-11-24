@@ -1127,6 +1127,41 @@ impl RenderView<'_> {
         self.expired_owed = expired_owed;
         Ok(false)
     }
+    /// How many rows are due at `now`, which a read leaves out before they are removed: to
+    /// [`DUE_ENTRIES`] of each kind and one past it. It only grows as time passes, and removing
+    /// them moves the room's removal count, so a read spanning requests that compares it
+    /// notices a row it has read expiring although nothing was written.
+    pub(crate) fn due_count(
+        &self,
+        now: u64,
+        ttl: u64,
+        step_ttl: u64,
+        floor: [u64; 2],
+    ) -> Result<u64> {
+        let read = &self.order.read;
+        let mut count = 0;
+        if read.retention_due(now, ttl, step_ttl, floor, 0)?.1 {
+            let (due, more) = read.retention_due(now, ttl, step_ttl, floor, DUE_ENTRIES)?;
+            count = due.len() + usize::from(more);
+        }
+        let mut key = [0; 64];
+        for _ in 0..=DUE_ENTRIES {
+            let Some((found, _)) =
+                self.source()
+                    .first(read.sek, read.channel, self.roots().owed_expiry, &key, 0)?
+            else {
+                break;
+            };
+            let (expires, _) = order_key(found)?;
+            if expires == u64::MAX || expires > now {
+                break;
+            }
+            count += 1;
+            let Some(next) = successor(found) else { break };
+            key = next;
+        }
+        Ok(u64::try_from(count).unwrap_or(u64::MAX))
+    }
     pub(crate) fn snapshot(&self) -> &crate::node::store::Snapshot {
         &self.order.read.snapshot
     }
