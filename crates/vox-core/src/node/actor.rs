@@ -40,7 +40,6 @@ use crate::node::api::{
     NodeView, Outcome, Secret,
 };
 use crate::node::channel::{ChannelState, Rendered, SessionAdvance, SessionRefresh};
-use crate::node::daemonipc::StartupWork;
 use crate::node::net::PeerPolicy;
 use crate::node::network::{BoardExchangeScope, Inbound, NodeNet};
 use crate::node::open_rooms::OpenRooms;
@@ -1036,8 +1035,6 @@ pub struct NodeConfig {
     /// (V210-100): before the node exists, so it cannot be an event. A CLI verb prints its words
     /// on stderr; `None` says nothing.
     pub on_profile_wait: Option<Arc<dyn Fn() + Send + Sync>>,
-    /// Publish or clear the reason storage work keeps this node from Ready.
-    pub on_startup_work: Option<Arc<dyn Fn(Option<StartupWork>) + Send + Sync>>,
 }
 
 /// [`crate::node::channel::CHECKPOINT_IDLE_SECS`], unless the **test-only**
@@ -1096,7 +1093,6 @@ impl NodeConfig {
             checkpoint_idle_secs: checkpoint_idle_from_env(),
             serve_only: None,
             on_profile_wait: None,
-            on_startup_work: None,
         }
     }
 
@@ -7291,7 +7287,6 @@ pub struct Node {
     /// [`LocalNode`]: crate::transport::quic::LocalNode
     stuck_after: Duration,
     argon2: Argon2Profile,
-    on_startup_work: Option<Arc<dyn Fn(Option<StartupWork>) + Send + Sync>>,
     view_tx: watch::Sender<NodeView>,
     /// A publication owed to network events, due by this instant (`publish_soon`).
     view_owed: Option<tokio::time::Instant>,
@@ -7507,7 +7502,6 @@ impl Node {
             checkpoint_idle_secs,
             serve_only,
             on_profile_wait,
-            on_startup_work,
         } = cfg;
         let profile_wait = move || {
             if let Some(notice) = &on_profile_wait {
@@ -7777,7 +7771,6 @@ impl Node {
             failed_post_reads: BTreeMap::new(),
             clock,
             argon2,
-            on_startup_work,
             view_tx: watch::Sender::new(NodeView::default()),
             view_owed: None,
             event_tx,
@@ -8011,7 +8004,24 @@ impl Node {
                 later.push(release);
             }
         }
-        let _ = reply.send(self.status_report(&budget));
+        let report = self.status_report(&budget);
+        // What the store holds is measured off the actor, and only when no writer holds the
+        // store: a held writer never delays this answer (RG-12, RG-13).
+        match self.profile.as_ref().map(Profile::store_handle) {
+            Some(store) => {
+                tokio::spawn(async move {
+                    let mut report = report;
+                    report.store = match tokio::task::spawn_blocking(move || store.space()).await {
+                        Ok(space) => space.map(Ok),
+                        Err(error) => Some(Err(error.to_string())),
+                    };
+                    let _ = reply.send(report);
+                });
+            }
+            None => {
+                let _ = reply.send(report);
+            }
+        }
         for release in later {
             if self.bounded_sync.accept_pool_release(release) {
                 self.sched_rooms.insert(release.room);
@@ -12264,7 +12274,7 @@ impl Node {
                         .collect();
                     for room in rooms {
                         crate::node::status::SyncBook::with(&self.sync_book, room, peer, |c| {
-                            c.last_failure = Some(why.clone());
+                            c.note_failure(why.clone());
                             c.consecutive_failures = c.consecutive_failures.saturating_add(1);
                             c.failing_since.get_or_insert_with(std::time::Instant::now);
                         });
@@ -13542,7 +13552,7 @@ impl Node {
                         &self.sync_book,
                         channel_id,
                         peer,
-                        |status| status.last_failure = Some(reason),
+                        |status| status.note_failure(reason),
                     );
                 }
                 self.say_session_news(&channel_id).await;
@@ -13833,7 +13843,7 @@ impl Node {
                             Ok(_) => counts.partial += 1,
                             Err(error) => {
                                 counts.failed += 1;
-                                counts.last_failure = Some(error.to_string());
+                                counts.note_failure(error.to_string());
                             }
                         },
                     );
@@ -18407,7 +18417,7 @@ impl Node {
                 }
                 Some(f) => {
                     c.failed += 1;
-                    c.last_failure = Some(f.to_string());
+                    c.note_failure(f.to_string());
                     c.consecutive_failures = c.consecutive_failures.saturating_add(1);
                     c.failing_since.get_or_insert_with(std::time::Instant::now);
                 }
@@ -24432,7 +24442,7 @@ impl Node {
                 drop(slot);
                 self.private_pulls.remove(&key);
                 crate::node::status::SyncBook::with(&self.sync_book, channel_id, peer, |status| {
-                    status.last_failure = Some(error.to_string())
+                    status.note_failure(error.to_string());
                 });
                 return;
             }
@@ -24441,8 +24451,9 @@ impl Node {
         else {
             self.private_pulls.remove(&key);
             crate::node::status::SyncBook::with(&self.sync_book, channel_id, peer, |status| {
-                status.last_failure =
-                    Some("private page reservation is smaller than its page envelope".into())
+                status.note_failure(
+                    "private page reservation is smaller than its page envelope".into(),
+                );
             });
             return;
         };
@@ -24738,23 +24749,33 @@ impl Node {
 
     /// Say [`NodeEvent::SessionEntry`] once for each session of the room `channel_id` with an
     /// entry placed since it was last said (ADR-029 CL-2): its entries are not room messages, so no
-    /// other event tells a client of them.
+    /// other event tells a client of them. And say [`NodeEvent::Synced`], with nothing applied,
+    /// once a governance turn took shown rows away or brought retained ones back since it was last
+    /// said (ADR-053 MP-11): no row arrived, so no other event tells a client to read the room's
+    /// preview and unread again.
     async fn say_session_news(&self, channel_id: &Digest32) {
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return;
         };
-        let news = {
+        let (news, display) = {
             let mut ch = shared.lock().await;
             // A room this identity left is out of sight (ADR-023 RL-8.1a): nothing of it is said.
             if is_leaving(&ch) {
                 return;
             }
-            ch.take_session_news()
+            (ch.take_session_news(), ch.take_display_news())
         };
         for session_id in news {
             let _ = self.event_tx.send(NodeEvent::SessionEntry {
                 channel_id: *channel_id,
                 session_id,
+            });
+        }
+        if display {
+            let _ = self.event_tx.send(NodeEvent::Synced {
+                channel_id: *channel_id,
+                applied: 0,
+                rendered: 0,
             });
         }
     }

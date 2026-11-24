@@ -2360,24 +2360,40 @@ impl WriteTransaction {
     // Relocate pages to lower number regions/pages
     // Returns true if a page(s) was moved
     pub(crate) fn compact_pages(&mut self) -> Result<bool> {
-        let mut progress = false;
+        self.compact_pages_within(MAX_PAGES_PER_COMPACTION, u64::MAX)
+            .map(|moved| moved > 0)
+    }
 
-        // Find the 1M highest pages
+    // Vox: `compact_pages`, choosing at most `most_pages` of the highest pages and copying at most
+    // `most_bytes`: the moved pages and the parents rewritten with them, at least one page.
+    // Returns the bytes it copied; zero when no page moved.
+    fn compact_pages_within(&mut self, most_pages: usize, most_bytes: u64) -> Result<u64> {
+        // Find the highest pages
         let mut highest_pages = BTreeMap::new();
         let mut tables = self.tables.lock().unwrap();
         let table_tree = &mut tables.table_tree;
-        table_tree.highest_index_pages(MAX_PAGES_PER_COMPACTION, &mut highest_pages)?;
+        table_tree.highest_index_pages(most_pages, &mut highest_pages)?;
         let mut system_tables = self.system_tables.lock().unwrap();
         let system_table_tree = &mut system_tables.table_tree;
-        system_table_tree.highest_index_pages(MAX_PAGES_PER_COMPACTION, &mut highest_pages)?;
+        system_table_tree.highest_index_pages(most_pages, &mut highest_pages)?;
 
         let page_allocator = table_tree.page_allocator().clone();
+        let page_size = u32::try_from(page_allocator.get_page_size()).unwrap();
+        let mut moved = 0_u64;
 
         // Calculate how many of them can be relocated to lower pages, starting from the last page
         let mut relocation_map = PageNumberHashMap::default();
         for path in highest_pages.into_values().rev() {
             if relocation_map.contains_key(&path.page_number()) {
                 continue;
+            }
+            let copies: u64 = core::iter::once(&path.page_number())
+                .chain(path.parents())
+                .filter(|page| !relocation_map.contains_key(*page))
+                .map(|page| page.page_size_bytes(page_size))
+                .sum();
+            if !relocation_map.is_empty() && moved.saturating_add(copies) > most_bytes {
+                break;
             }
             let old_page = page_allocator.get_page(path.page_number(), PageHint::None)?;
             let mut new_page =
@@ -2389,6 +2405,7 @@ impl WriteTransaction {
             drop(new_page);
             // We're able to move this to a lower page, so insert it and rewrite all its parents
             if new_page_number < path.page_number() {
+                moved = moved.saturating_add(copies);
                 relocation_map.insert(path.page_number(), new_page_number);
                 for parent in path.parents() {
                     if relocation_map.contains_key(parent) {
@@ -2410,13 +2427,11 @@ impl WriteTransaction {
             }
         }
 
-        if !relocation_map.is_empty() {
-            progress = true;
-        }
-
         table_tree.relocate_tables(&relocation_map)?;
         #[cfg(feature = "vox-test-knobs")]
-        if progress && let Some(marker) = std::env::var_os("VOX_TEST_COMPACT_RELOCATED") {
+        if !relocation_map.is_empty()
+            && let Some(marker) = std::env::var_os("VOX_TEST_COMPACT_RELOCATED")
+        {
             std::fs::write(&marker, "table pages relocated before commit")
                 .map_err(crate::StorageError::from)?;
             while std::path::Path::new(&marker).exists() {
@@ -2425,7 +2440,61 @@ impl WriteTransaction {
         }
         system_table_tree.relocate_tables(&relocation_map)?;
 
-        Ok(progress)
+        Ok(moved)
+    }
+
+    /// Vox: one give-back step while the database is shared. Moves at most `most_bytes` of the
+    /// highest pages (with the parents rewritten for them; at least one page, however large)
+    /// into the lowest free ones and trims, at this commit, all free space at the end of the
+    /// file; returns the bytes it copied. The pages it vacates are freed like any write's: only
+    /// once no open read can still see them, so reads go on, and a later commit
+    /// ([`Self::trim_at_commit`]) trims that space. Unlike
+    /// [`crate::Database::compact`] it neither waits for reads nor needs the database alone;
+    /// the caller must make no savepoints, since moved pages are not tracked for one.
+    pub fn compact_pages_and_trim(&mut self, most_bytes: u64) -> Result<u64> {
+        self.trim_at_commit();
+        let page = self.mem.get_page_size() as u64;
+        let most_pages = usize::try_from(most_bytes / page)
+            .unwrap_or(usize::MAX)
+            .clamp(1, MAX_PAGES_PER_COMPACTION);
+        self.compact_pages_within(most_pages, most_bytes)
+    }
+
+    /// Vox: this commit trims all free space at the end of the file, not only a quarter or more.
+    pub fn trim_at_commit(&mut self) {
+        self.set_shrink_policy(ShrinkPolicy::Maximum);
+    }
+
+    /// Vox: what the file holds and where its free space lies, read by a write transaction so
+    /// that no commit changes it meanwhile. Abort the transaction afterwards.
+    pub fn space(&self) -> Result<Space> {
+        let page = self.mem.get_page_size() as u64;
+        let bytes = |freed: PageNumber| page << freed.page_order;
+        let mut retired: u64 = self
+            .mem
+            .unpersisted_data_freed_pages()
+            .into_iter()
+            .map(bytes)
+            .sum();
+        let mut system_tables = self.system_tables.lock().unwrap();
+        if system_tables
+            .get_system_table_root(DATA_FREED_TABLE)?
+            .is_some()
+        {
+            let freed = system_tables.open_system_table(DATA_FREED_TABLE)?;
+            for entry in freed.range::<TransactionIdWithPagination>(..)? {
+                let (_, list) = entry?;
+                let pages = list.value();
+                for i in 0..pages.len() {
+                    retired += bytes(pages.get(i));
+                }
+            }
+        }
+        Ok(Space {
+            allocated: self.mem.count_allocated_pages()? * page,
+            retired,
+            free_at_end: self.mem.trailing_free_bytes(),
+        })
     }
 
     // NOTE: must be called before store_system_freed_pages() during commit, since this can create
@@ -2776,6 +2845,18 @@ impl Drop for WriteTransaction {
             .unwrap()
             .apply_on_abort(&self.transaction_tracker);
     }
+}
+
+/// Vox: what a database file holds, from [`WriteTransaction::space`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Space {
+    /// Allocated bytes, metadata included.
+    pub allocated: u64,
+    /// Allocated bytes of data pages that committed transactions freed and that cannot be reused
+    /// yet: an open read may still see them, or only the next commit releases them.
+    pub retired: u64,
+    /// Free bytes at the end of the file, which a trim gives back.
+    pub free_at_end: u64,
 }
 
 /// A read-only transaction

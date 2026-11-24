@@ -6090,164 +6090,315 @@ fn an_existing_session_index_keeps_its_listing_when_upgraded() {
     assert!(bytes<=bound,"PRODUCT: rename after upgrading the base index rewrote unrelated Sessions: {bytes} OS-write bytes; bound={bound}");
 }
 
-/// A restart reclaims deleted bodies without losing the messages or private steps we kept.
-/// The crash arm kills the real daemon after backend relocation but before that commit.
+/// A store that holds much less than its file gives the space back while its daemon runs: after
+/// a retention prune, beside reads, with no restart. A crash during that pass, at a move before
+/// its commit and again where a commit that shrank the file is durable and the file not yet
+/// cut, loses no acknowledged row or post, and the next start gives the rest back (RG-13).
 #[cfg(feature = "test-knobs")]
 #[test]
-#[ignore = "real daemon, grown/expired store and crash during in-place compaction"]
-fn a_restart_compacts_expired_space_and_keeps_acknowledged_rows_after_a_crash() {
-    compaction_journey(false, false, false);
+#[ignore = "real daemon: expired store given back while running, and a crash during the pass"]
+fn a_running_node_gives_expired_space_back_and_keeps_acknowledged_rows_after_a_crash() {
+    compaction_journey(GiveBack::Crash);
+}
+
+/// A give-back pass that fails leaves the node Ready and its rooms readable and writable.
+#[cfg(feature = "test-knobs")]
+#[test]
+#[ignore = "real daemon: expired store whose give-back pass fails"]
+fn a_failed_give_back_leaves_the_node_and_its_rooms_open() {
+    compaction_journey(GiveBack::Failure);
+}
+
+/// The large store (12,000 posts of 60,000 bytes) gives space back while running and after a
+/// restart; measures how long posts waited meanwhile.
+#[cfg(feature = "test-knobs")]
+#[test]
+#[ignore = "real daemon: large expired store given back while running and after a restart"]
+fn a_large_store_gives_space_back_while_running_and_after_a_restart() {
+    compaction_journey(GiveBack::Large);
+}
+
+/// A read of the store begins before compact-a expires and stays open through its prunes and
+/// their passes (as a pending save's pinned read can); posts go on meanwhile. After the last
+/// pass, ordinary posts grow the file while the read is still open, so its end is free. Then
+/// the read ends, and nothing else happens on the node, no prune, no post and no command but
+/// `vox status`. The store file still comes within the bound of what the store holds (RG-13:
+/// space a read kept is given back when it ends, without a later trigger, also when the first
+/// trim gives back the end and leaves the pages its own commit wrote on top).
+#[cfg(feature = "test-knobs")]
+#[test]
+#[ignore = "real daemon: expired store given back on a node that goes quiet after its last prune"]
+fn a_quiet_node_gives_space_back_after_its_last_prune() {
+    compaction_journey(GiveBack::Quiet);
+}
+
+/// A store grown to about 200 MB gives space back while running and after a restart; measures
+/// how long one post waited meanwhile (ADR-053 MP-15's prerequisite to removing startup
+/// compaction). Each phase grows its own room to about 200 MB before it expires.
+#[cfg(feature = "test-knobs")]
+#[test]
+#[ignore = "real daemon: 200 MB expired store given back while running and after a restart"]
+fn a_200_mb_store_gives_space_back_while_running_and_after_a_restart() {
+    compaction_journey(GiveBack::Measure);
+}
+
+/// Two reads begin before compact-a expires. After its passes wait for them, the first ends and
+/// resumes a pass; the second, the last read begun before the expiry, ends just before that pass
+/// begins to wait for reads; a new read begins after it began to wait, and one ordinary post
+/// retires pages that read sees, before the pass's last trim. That trim leaves only the new
+/// read's pages: the pass waits. When the new read ends, nothing else happens on the node but
+/// `vox status`, and the store file still comes within the bound of what it holds (RG-13: the
+/// end of a read admitted while the pass began to wait resumes it).
+#[cfg(feature = "test-knobs")]
+#[test]
+#[ignore = "real daemon: a read admitted while a give-back pass begins to wait for reads"]
+fn a_read_begun_as_a_pass_waits_for_reads_resumes_it() {
+    compaction_journey(GiveBack::Handshake);
 }
 
 #[cfg(feature = "test-knobs")]
-#[test]
-#[ignore = "real daemon and grown/expired store with compaction failure"]
-fn a_failed_startup_compaction_still_opens_the_node_and_its_rooms() {
-    compaction_journey(true, false, false);
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GiveBack {
+    Crash,
+    Failure,
+    Large,
+    Quiet,
+    Measure,
+    Handshake,
 }
 
+/// Posts to one room until stopped (or `limit` acknowledged posts), at least once, and keeps
+/// each acknowledged post's wait and text and every post that was not acknowledged; a post
+/// that got no answer (its daemon gone) ends it.
 #[cfg(feature = "test-knobs")]
-#[test]
-#[ignore = "real daemon and large expired store held during startup compaction"]
-fn a_large_store_reports_and_finishes_startup_compaction() {
-    compaction_journey(false, true, false);
-}
-
-#[cfg(feature = "test-knobs")]
-#[test]
-#[ignore = "real scratch daemon restart during a held large-store compaction"]
-fn a_restart_reports_held_storage_work_without_calling_it_a_failure() {
-    compaction_journey(false, true, true);
-}
-
-#[cfg(feature = "test-knobs")]
-struct CompactionRelease {
+struct Probe {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    worker: Option<std::thread::JoinHandle<()>>,
+    worker: Option<std::thread::JoinHandle<Probed>>,
+}
+
+/// What one probe saw: each acknowledged post's wait and text, and each post that was not
+/// acknowledged, with the answer it got or why it got none.
+#[cfg(feature = "test-knobs")]
+#[derive(Default)]
+struct Probed {
+    waits: Vec<Duration>,
+    acknowledged: Vec<String>,
+    failed: Vec<String>,
 }
 
 #[cfg(feature = "test-knobs")]
-impl CompactionRelease {
-    fn start(marker: &Path) -> Self {
-        let marker = marker.to_owned();
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+impl Probed {
+    fn longest(&self) -> Duration {
+        self.waits.iter().max().copied().unwrap_or_default()
+    }
+
+    fn said(&self) -> String {
+        let mut waits = self.waits.clone();
+        waits.sort();
+        let middle = waits.get(waits.len() / 2).copied().unwrap_or_default();
+        format!(
+            "posts={} median_ms={} longest_ms={} not_acknowledged={}",
+            waits.len(),
+            middle.as_millis(),
+            self.longest().as_millis(),
+            self.failed.len()
+        )
+    }
+
+    /// A measured phase: at least one post was acknowledged, and every post was.
+    fn measured(&self, phase: &str) {
+        assert!(
+            !self.waits.is_empty() && self.failed.is_empty(),
+            "PRODUCT: {phase}: {} of the probe's posts were acknowledged and {} were not: {:?}",
+            self.waits.len(),
+            self.failed.len(),
+            self.failed.iter().take(20).collect::<Vec<_>>()
+        );
+    }
+}
+
+#[cfg(feature = "test-knobs")]
+impl Probe {
+    fn start(socket: PathBuf, room: [u8; 32], tag: &'static str, limit: usize) -> Self {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use vox_core::node::ipc::{Frame, IpcClient, NodeSocket, Request};
+        use vox_core::node::paths::NodeName;
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
         let done = stop.clone();
         let worker = std::thread::spawn(move || {
-            while !done.load(std::sync::atomic::Ordering::Relaxed) {
-                let _ = std::fs::remove_file(&marker);
-                std::thread::sleep(Duration::from_millis(20));
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("APPARATUS: probe runtime");
+            let mut probed = Probed::default();
+            let mut sent = 0_usize;
+            while (sent == 0 || !done.load(Ordering::Relaxed)) && probed.waits.len() < limit {
+                let text = format!("{tag}-probe-{sent}");
+                sent += 1;
+                let started = Instant::now();
+                let frame = rt.block_on(async {
+                    let mut client = IpcClient::open_at(&NodeSocket::one_shot(
+                        socket.clone(),
+                        NodeName::parse("default").unwrap(),
+                    ))
+                    .await
+                    .map_err(|error| format!("no connection: {error}"))?;
+                    client
+                        .request(&Request::Post {
+                            channel_id: room,
+                            text: text.clone(),
+                            card: false,
+                        })
+                        .await
+                        .map_err(|error| format!("no answer: {error}"))
+                });
+                match frame {
+                    Ok(Frame::Ok) => {
+                        probed.waits.push(started.elapsed());
+                        probed.acknowledged.push(text);
+                        // Four posts a second at most: unpaced, about 15 a second into one room
+                        // kept another room's retention change from applying for 20 minutes.
+                        std::thread::sleep(Duration::from_millis(250));
+                    }
+                    Ok(other) => {
+                        probed.failed.push(format!("{text}: {other:?}"));
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    Err(error) => {
+                        probed.failed.push(format!("{text}: {error}"));
+                        break;
+                    }
+                }
             }
+            probed
         });
         Self {
             stop,
             worker: Some(worker),
         }
     }
+
+    fn finish(self) -> Probed {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.joined()
+    }
+
+    /// What it saw, once the worker has stopped by itself (its `limit`, or its daemon gone) or
+    /// been told to.
+    fn joined(mut self) -> Probed {
+        self.worker
+            .take()
+            .unwrap()
+            .join()
+            .expect("APPARATUS: join probe")
+    }
 }
 
 #[cfg(feature = "test-knobs")]
-impl Drop for CompactionRelease {
+impl Drop for Probe {
     fn drop(&mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         if let Some(worker) = self.worker.take() {
-            worker.join().expect("APPARATUS: join compaction releaser");
+            let _ = worker.join();
         }
     }
 }
 
+/// Every give-back line the daemon wrote, as the receipt of each pass's start, steps and time;
+/// printed, never a verdict.
 #[cfg(feature = "test-knobs")]
-struct ScratchRestartCleanup {
-    marker: PathBuf,
-    socket: PathBuf,
-}
-
-#[cfg(feature = "test-knobs")]
-impl Drop for ScratchRestartCleanup {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.marker);
-        if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            rt.block_on(async {
-                let _ = tokio::time::timeout(Duration::from_secs(5), async {
-                    if let Ok(mut daemon) =
-                        vox_core::node::daemonipc::DaemonClient::open(&self.socket).await
-                    {
-                        let _ = daemon
-                            .request(vox_core::node::daemonipc::DaemonRequest::Stop)
-                            .await;
-                    }
-                })
-                .await;
-            });
-        }
+fn passes_said(log: &str) {
+    for line in log.lines().filter(|l| {
+        l.contains("giving back disk space")
+            || l.contains("store file is now")
+            || l.contains("store compaction skipped")
+    }) {
+        eprintln!("PASS {line}");
     }
 }
 
+/// Diagnostic only, printed with each MEASUREMENT: the most bytes one move step copied, as the
+/// daemon's pass lines say. Not a verdict (ADR-018): what a person gets is a post's wait.
 #[cfg(feature = "test-knobs")]
-fn compaction_journey(failure: bool, large: bool, restart: bool) {
+fn largest_step(log: &str) -> u64 {
+    log.lines()
+        .filter_map(|l| l.split("one step moved at most ").nth(1))
+        .filter_map(|rest| rest.split(' ').next()?.parse::<u64>().ok())
+        .max()
+        .unwrap_or(0)
+}
+
+#[cfg(feature = "test-knobs")]
+fn compaction_journey(arm: GiveBack) {
     watchdog::arm();
-    use redb::ReadableDatabase;
     use vox_core::node::ipc::{Frame, IpcClient, NodeSocket, Request};
     use vox_core::node::paths::{NodeName, Paths};
-    const DAY: i64 = 86_400_000;
-    let measure = large && !restart && std::env::var_os("VOX_MUTANT_RG13_MEASURE").is_some();
+    const SLACK: u64 = 64 * 1024 * 1024;
+    // The daemon says it is busy past five seconds (`STALL_BUDGET`, vox-core node/actor.rs): a
+    // post during a pass waits less than that.
+    const BUSY: Duration = Duration::from_secs(5);
+    // Each mutant its own variable; every arm under one asserts the daemon engaged it.
+    let mutant = [
+        ("VOX_MUTANT_RG13_NO_GIVE_BACK", "rg13-no-give-back"),
+        ("VOX_MUTANT_RG13_NO_RESUME", "rg13-no-resume"),
+        ("VOX_MUTANT_RG13_NO_REWAIT", "rg13-no-rewait"),
+        (
+            "VOX_MUTANT_RG13_NO_TRIM_AFTER_MOVE",
+            "rg13-no-trim-after-move",
+        ),
+    ]
+    .into_iter()
+    .find(|(env, _)| std::env::var_os(env).is_some())
+    .map(|(_, named)| named);
     let tmp = tempfile::tempdir().expect("APPARATUS: scratch account");
     let root = tmp.path();
     std::fs::create_dir(root.join("cfg")).unwrap();
+    // Quiet and handshake arms: while one of these files exists the daemon holds one store
+    // read open, and `<file>.open` exists.
+    let held_reads = match arm {
+        GiveBack::Quiet => vec![root.join("held-read")],
+        GiveBack::Handshake => vec![root.join("held-read"), root.join("held-read-2")],
+        _ => Vec::new(),
+    };
+    // Handshake arm: while this file exists a pass about to wait for reads stops before and
+    // after it begins to wait, until the act removes `<file>.before` and `<file>.armed`.
+    let wait_hold = (arm == GiveBack::Handshake).then(|| root.join("wait-hold"));
     let keychain = attach::keychain(root);
-    let launch = |tag: &str, step: i64, marker: Option<&Path>| {
+    let launch = |tag: &str, marker: Option<&Path>| {
         let mut cmd = Command::new(VOX);
         cmd.args(["daemon", "--listen", "127.0.0.1:0"])
             .env("VOX_DATA_DIR", root)
             .env("VOX_CONFIG_DIR", root.join("cfg"))
             .env("VOX_TEST_KEYCHAIN", &keychain)
-            .env("VOX_TEST_CLOCK_STEP_MS", step.to_string())
             .env("VOX_PROXY", "127.0.0.1:0")
             .env_remove("VOX_ROOM")
             .env_remove("VOX_NODE")
             .env_remove("VOX_IDENTITY_PASSPHRASE")
             .env_remove("VOX_TEST_COMPACT_RELOCATED")
             .env_remove("VOX_TEST_COMPACT_FAIL")
-            .env_remove("VOX_TEST_COMPACT_FAILURE_LOCKS")
-            .env_remove("VOX_TEST_SKIP_STARTUP_COMPACTION")
-            .env_remove("VOX_TEST_COMPACT_IGNORE_CAP")
-            .env_remove("VOX_TEST_RG13_NO_STARTUP_REASON")
-            .env_remove("VOX_TEST_RG13_NO_COMMAND_WAIT")
-            .env_remove("VOX_TEST_RG13_UPDATE_STORAGE_FAILURE")
+            .env_remove("VOX_TEST_FX28_MUTANT")
+            .env_remove("VOX_TEST_HOLD_STORE_READ_FILE")
+            .env_remove("VOX_TEST_HOLD_GIVE_BACK_WAIT_FILE")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(std::fs::File::create(root.join(format!("daemon-{tag}.err"))).unwrap());
         if let Some(marker) = marker {
             cmd.env("VOX_TEST_COMPACT_RELOCATED", marker);
         }
-        if std::env::var_os("VOX_MUTANT_SKIP_STARTUP_COMPACTION").is_some() {
-            cmd.env("VOX_TEST_SKIP_STARTUP_COMPACTION", "1");
-        }
-        for (selector, knob) in [
-            (
-                "VOX_MUTANT_RG13_NO_STARTUP_REASON",
-                "VOX_TEST_RG13_NO_STARTUP_REASON",
-            ),
-            (
-                "VOX_MUTANT_RG13_NO_COMMAND_WAIT",
-                "VOX_TEST_RG13_NO_COMMAND_WAIT",
-            ),
-            (
-                "VOX_MUTANT_RG13_UPDATE_STORAGE_FAILURE",
-                "VOX_TEST_RG13_UPDATE_STORAGE_FAILURE",
-            ),
-        ] {
-            if std::env::var_os(selector).is_some() {
-                cmd.env(knob, "1");
-            }
-        }
-        if tag == "failed" {
+        if arm == GiveBack::Failure {
             cmd.env("VOX_TEST_COMPACT_FAIL", "1");
-            if std::env::var_os("VOX_MUTANT_COMPACTION_FAILURE_LOCKS").is_some() {
-                cmd.env("VOX_TEST_COMPACT_FAILURE_LOCKS", "1");
-            }
+        }
+        if let Some(named) = mutant {
+            cmd.env("VOX_TEST_FX28_MUTANT", named);
+        }
+        if !held_reads.is_empty() {
+            cmd.env(
+                "VOX_TEST_HOLD_STORE_READ_FILE",
+                std::env::join_paths(&held_reads).expect("APPARATUS: held read paths"),
+            );
+        }
+        if let Some(wait_hold) = &wait_hold {
+            cmd.env("VOX_TEST_HOLD_GIVE_BACK_WAIT_FILE", wait_hold);
         }
         let mut child = cmd.spawn().expect("APPARATUS: spawn scratch daemon");
         writeln!(child.stdin.take().unwrap(), "{IDENTITY}").unwrap();
@@ -6260,7 +6411,12 @@ fn compaction_journey(failure: bool, large: bool, restart: bool) {
             .expect("APPARATUS: signal own daemon");
         daemon.0.wait().expect("APPARATUS: reap own daemon");
     };
+    let log = |tag: &str| {
+        std::fs::read_to_string(root.join(format!("daemon-{tag}.err"))).unwrap_or_default()
+    };
     let paths = Paths::resolve("default", Some(root), Some(&root.join("cfg"))).unwrap();
+    let file = paths.store_file();
+    let file_len = || std::fs::metadata(&file).unwrap().len();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -6293,140 +6449,31 @@ fn compaction_journey(failure: bool, large: bool, restart: bool) {
     };
     let (ok, out, err) = vox(root, &["id"], None);
     assert!(ok, "PRODUCT (staging): identity: {out}{err}");
-    let initial = launch("grown", 0, None);
+    let initial = launch("grown", None);
     attached(root, "grown");
-    if restart {
-        // Remember the identity while its store is small: an already Ready attachment does
-        // not save credentials, and unlocking the bloated store here would compact it early.
-        let (ok, out, err) = vox(root, &["node", "lock", "default"], None);
-        assert!(
-            ok,
-            "APPARATUS: lock scratch node before remembering: {out}{err}"
+    for name in ["kept", "compact-a", "compact-b"] {
+        let (ok, out, err) = vox(
+            root,
+            &["room", "create", "--passphrase-file", "-", "--name", name],
+            Some(&format!("{ROOMPASS}\n")),
         );
-        let (ok, out, err) = vox(root, &["node", "unlock", "default"], None);
-        assert!(ok, "APPARATUS: remember scratch node: {out}{err}");
-        use vox_core::node::daemonipc::{DaemonClient, DaemonFrame, DaemonRequest};
-        let nodes = rt.block_on(async {
-            let mut daemon = DaemonClient::open(&paths.account().socket()).await.unwrap();
-            daemon.request(DaemonRequest::Nodes).await.unwrap()
-        });
-        assert!(
-            matches!(&nodes, DaemonFrame::Nodes(nodes)
-                if nodes.iter().any(|node| node.name.as_str() == "default" && node.keep)),
-            "APPARATUS: restart fixture has no remembered node: {nodes:?}"
-        );
+        assert!(ok, "PRODUCT (staging): create room {name}: {out}{err}");
     }
-    let (ok, out, err) = vox(
-        root,
-        &[
-            "room",
-            "create",
-            "--passphrase-file",
-            "-",
-            "--name",
-            "compact",
-        ],
-        Some(&format!("{ROOMPASS}\n")),
-    );
-    assert!(ok, "PRODUCT (staging): create room: {out}{err}");
     let Frame::Rooms { rooms } = request(Request::Rooms { after: None }) else {
         panic!("APPARATUS: room listing frame");
     };
-    let cid = rooms
-        .iter()
-        .find(|(_, name, ..)| name == "compact")
-        .unwrap()
-        .0;
-    let room = vox_core::node::link::b32_encode(&cid);
-    let read_room = || loop {
-        let (ok, shown, err) = vox(root, &["room", "read", &room, "--json"], None);
-        if ok {
-            break shown;
-        }
-        assert!(
-            err.contains("preparing its saved history") || err.contains("refreshing saved history"),
-            "PRODUCT (staging): saved room did not become readable: {shown}{err}"
-        );
-        std::thread::sleep(Duration::from_millis(100));
+    let cid = |wanted: &str| {
+        rooms
+            .iter()
+            .find(|(_, name, ..)| name == wanted)
+            .expect("APPARATUS: created room listed")
+            .0
     };
-    if !failure && !large {
-        stop(initial);
-        let small_file = paths.store_file();
-        let before = std::fs::metadata(&small_file).unwrap().len();
-        assert!(
-            before < 64 * 1024 * 1024,
-            "APPARATUS: small-store fixture reached 64 MiB: {before}"
-        );
-        let small = launch("small", 0, None);
-        attached(root, "small");
-        let after = std::fs::metadata(&small_file).unwrap().len();
-        let log = std::fs::read_to_string(root.join("daemon-small.err")).unwrap();
-        assert_eq!(
-            before, after,
-            "PRODUCT: startup resized a small store: {log}"
-        );
-        assert!(
-            !log.contains("giving back disk space"),
-            "PRODUCT: small store startup announced compaction: {log}"
-        );
-        eprintln!("PRODUCT: small store unchanged at {before} bytes; no compaction wait line");
-        stop(small);
-    } else {
-        stop(initial);
-    }
-    let initial = launch("grow", 0, None);
-    attached(root, "grow");
-    let _ = read_room();
-    if !large {
-        let (ok, out, err) = vox(root, &["room", "retention", &room, "1d"], None);
-        assert!(ok, "PRODUCT (staging): retention: {out}{err}");
-    }
-    let mut id = 0;
-    loop {
-        let posts = if large { 12_000 } else { 1024 };
-        if id >= posts {
-            break;
-        }
-        let frame = request(Request::Post {
-            channel_id: cid,
-            text: format!("expire-{id:04}-{}", "x".repeat(60_000)),
-            card: false,
-        });
-        assert!(
-            matches!(frame, Frame::Ok),
-            "PRODUCT (staging): grow post {id}: {frame:?}"
-        );
-        id += 1;
-    }
-    eprintln!(
-        "APPARATUS: grew store through {id} acknowledged 60000-byte posts; file {} bytes",
-        std::fs::metadata(paths.store_file()).unwrap().len()
-    );
-    let expired = if large {
-        // Expire in the running daemon so startup cannot first shrink a just-grown file.
-        let (ok, out, err) = vox(root, &["room", "retention", &room, "1s"], None);
-        assert!(ok, "PRODUCT (staging): large-store expiry: {out}{err}");
-        initial
-    } else {
-        stop(initial);
-        let expired = launch("expiry", 2 * DAY, None);
-        attached(root, "expiry");
-        expired
-    };
-    loop {
-        let shown = read_room();
-        if !shown.contains("expire-") {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    if large {
-        let (ok, out, err) = vox(root, &["room", "retention", &room, "forever"], None);
-        assert!(ok, "PRODUCT (staging): retain measurement rows: {out}{err}");
-    }
+    let (kept, room_a, room_b) = (cid("kept"), cid("compact-a"), cid("compact-b"));
+    let kept_name = vox_core::node::link::b32_encode(&kept);
     for id in 0..8 {
         let frame = request(Request::Post {
-            channel_id: cid,
+            channel_id: kept,
             text: format!("retained-message-{id}"),
             card: false,
         });
@@ -6440,7 +6487,7 @@ fn compaction_journey(failure: bool, large: bool, restart: bool) {
         "data":{"session":{"harness":"compaction proof"}}})
     .to_string();
     let frame = request(Request::Post {
-        channel_id: cid,
+        channel_id: kept,
         text: opening,
         card: false,
     });
@@ -6449,7 +6496,7 @@ fn compaction_journey(failure: bool, large: bool, restart: bool) {
         "PRODUCT (staging): open retained Session: {frame:?}"
     );
     let frame = request(Request::AppendSession {
-        channel_id: cid,
+        channel_id: kept,
         session_id: "compact-session".into(),
         body: serde_json::json!({"v":1,"session":"compact-session","kind":"reply","seq":1,
             "text":"retained-private-step"})
@@ -6460,23 +6507,19 @@ fn compaction_journey(failure: bool, large: bool, restart: bool) {
         "PRODUCT (staging): retained private step: {frame:?}"
     );
     let retained = || {
-        let shown = small_row_all_messages(root, &room);
+        let shown = small_row_all_messages(root, &kept_name);
         for id in 0..8 {
             assert!(
                 shown.contains(&format!("retained-message-{id}")),
                 "PRODUCT: acknowledged retained message {id} missing: {shown}"
             );
         }
-        assert!(
-            !shown.contains("expire-"),
-            "PRODUCT: expired body returned: {shown}"
-        );
         let started = Instant::now();
         loop {
-            let _ = vox(root, &["room", "sessions", &room, "--json"], None);
+            let _ = vox(root, &["room", "sessions", &kept_name, "--json"], None);
             let (ok, shown, err) = vox(
                 root,
-                &["room", "session", &room, "compact-session", "--json"],
+                &["room", "session", &kept_name, "compact-session", "--json"],
                 None,
             );
             if ok && shown.contains("retained-private-step") {
@@ -6490,418 +6533,581 @@ fn compaction_journey(failure: bool, large: bool, restart: bool) {
         }
     };
     retained();
-    if restart {
-        let marker = root.join("restart-relocated");
-        let _cleanup = ScratchRestartCleanup {
-            marker: marker.clone(),
-            socket: paths.account().socket(),
+    // A small store neither waits nor changes at startup.
+    stop(initial);
+    let before = file_len();
+    assert!(
+        before < SLACK,
+        "APPARATUS: small-store fixture reached 64 MiB: {before}"
+    );
+    let small = launch("small", None);
+    attached(root, "small");
+    let after = file_len();
+    assert_eq!(
+        before,
+        after,
+        "PRODUCT: startup resized a small store: {}",
+        log("small")
+    );
+    stop(small);
+    let grow = launch("grow", None);
+    attached(root, "grow");
+    let grow_room = |room: [u8; 32], prefix: &str, count: usize| {
+        for id in 0..count {
+            let frame = request(Request::Post {
+                channel_id: room,
+                text: format!("{prefix}-{id:04}-{}", "x".repeat(60_000)),
+                card: false,
+            });
+            assert!(
+                matches!(frame, Frame::Ok),
+                "PRODUCT (staging): grow post {prefix} {id}: {frame:?}"
+            );
+        }
+    };
+    // About 250 KB of file per post: 800 posts grow a store to about 200 MB.
+    let (first_a, first_b) = match arm {
+        GiveBack::Large => (6000, 6000),
+        GiveBack::Quiet | GiveBack::Handshake => (1500, 0),
+        GiveBack::Measure => (800, 0),
+        GiveBack::Crash | GiveBack::Failure => (1500, 1500),
+    };
+    grow_room(room_a, "a-expire", first_a);
+    grow_room(room_b, "b-expire", first_b);
+    let grown = file_len();
+    eprintln!("APPARATUS: grew compact-a by {first_a} and compact-b by {first_b} acknowledged 60000-byte posts; file {grown} bytes");
+    // What `vox status --json` says: the room's message count, and of the node's own store what
+    // it holds (`None` when the answer is an earlier measure, taken while a write held the
+    // store) and whether it is giving space back or waits for reads to end. `None` while the
+    // node does not answer or does not list the room.
+    let status_said = |room: &str| -> Option<(u64, Option<u64>, bool, bool)> {
+        let (ok, json, _) = vox(root, &["status", "--json"], None);
+        let v: serde_json::Value = serde_json::from_str(&json).ok().filter(|_| ok)?;
+        let entries = v["rooms"]
+            .as_array()?
+            .iter()
+            .find(|r| r["name"] == room)?
+            .get("entries")?
+            .as_u64()?;
+        let store = v["stores"]
+            .as_array()?
+            .iter()
+            .find(|s| s["node"] == "default")?;
+        let (Some(giving_back), Some(waiting)) = (
+            store["giving_back"].as_bool(),
+            store["waiting_for_reads"].as_bool(),
+        ) else {
+            panic!("PRODUCT: vox status does not say whether the store gives space back: {store}");
         };
-        let stdout = root.join("restart.out");
-        let stderr = root.join("restart.err");
-        let mut cmd = Command::new(VOX);
-        cmd.args(["daemon", "--restart"])
-            .env("VOX_DATA_DIR", root)
-            .env("VOX_CONFIG_DIR", root.join("cfg"))
-            .env("VOX_TEST_KEYCHAIN", &keychain)
-            .env("VOX_TEST_COMPACT_RELOCATED", &marker)
-            .env("VOX_PROXY", "127.0.0.1:0")
-            .env_remove("VOX_NODE")
-            .env_remove("VOX_ROOM")
-            .stdin(Stdio::null())
-            .stdout(std::fs::File::create(&stdout).unwrap())
-            .stderr(std::fs::File::create(&stderr).unwrap());
-        if std::env::var_os("VOX_MUTANT_RG13_UPDATE_STORAGE_FAILURE").is_some() {
-            cmd.env("VOX_TEST_RG13_UPDATE_STORAGE_FAILURE", "1");
-        }
-        let mut restarting = Daemon(cmd.spawn().expect("APPARATUS: scratch restart"));
-        while !marker.exists() {
-            if let Some(exit) = restarting.0.try_wait().unwrap() {
-                assert!(
-                    exit.success(),
-                    "PRODUCT: restart failed before held compaction: {}{}",
-                    std::fs::read_to_string(&stdout).unwrap(),
-                    std::fs::read_to_string(&stderr).unwrap()
-                );
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        // This stages the requested >30-second hold; silence is not a verdict.
-        std::thread::sleep(Duration::from_secs(31));
-        let exit = restarting.0.wait().expect("APPARATUS: wait for restart");
-        let out = std::fs::read_to_string(&stdout).unwrap();
-        let err = std::fs::read_to_string(&stderr).unwrap();
-        if std::env::var_os("VOX_MUTANT_RG13_UPDATE_STORAGE_FAILURE").is_some() {
-            let log = std::fs::read_to_string(paths.account().log_file()).unwrap_or_default();
-            assert!(
-                log.contains("mutant rg13_update_storage_failure engaged"),
-                "APPARATUS: restart mutant not engaged in daemon: {log}"
-            );
-            eprintln!("{log}");
-        }
-        let release = CompactionRelease::start(&marker);
-        attached(root, "replacement");
-        drop(release);
-        retained();
-        use vox_core::node::daemonipc::{DaemonClient, DaemonRequest};
-        rt.block_on(async {
-            let mut daemon = DaemonClient::open(&paths.account().socket())
-                .await
-                .expect("APPARATUS: connect scratch replacement for cleanup");
-            daemon
-                .request(DaemonRequest::Stop)
-                .await
-                .expect("APPARATUS: stop scratch replacement");
-        });
-        drop(expired);
-        assert!(
-            exit.success()
-                && out.contains("giving back disk space")
-                && !out.contains("remembered nodes are Ready"),
-            "PRODUCT: restart misreported held storage: {exit}: {out}{err}"
-        );
-        return;
-    }
-    stop(expired);
-    let file = paths.store_file();
-    let db = redb::Database::open(&file).expect("APPARATUS: inspect stopped store");
-    let txn = db.begin_read().unwrap();
-    let used = txn.allocated_bytes().unwrap();
-    drop(txn);
-    drop(db);
-    let before = std::fs::metadata(&file).unwrap().len();
-    assert!(
-        before > used.checked_mul(2).unwrap(),
-        "APPARATUS: expiry did not reach compaction threshold: file {before}, reachable {used}"
-    );
-    assert!(
-        before - 2 * used >= 64 * 1024 * 1024,
-        "APPARATUS: file minus twice held is below 64 MiB: file {before}, used {used}"
-    );
-    if large {
-        assert!(
-            used > 256 * 1024 * 1024,
-            "APPARATUS: large fixture holds only {used} bytes"
-        );
-        let marker = root.join("large-relocated");
-        let mut held = launch("large-held", 0, Some(&marker));
-        while !marker.exists() {
-            assert!(
-                held.0.try_wait().unwrap().is_none(),
-                "PRODUCT: daemon exited before relocation: {}",
-                std::fs::read_to_string(root.join("daemon-large-held.err")).unwrap()
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        let log = std::fs::read_to_string(root.join("daemon-large-held.err")).unwrap();
-        for (selector, receipt) in [
-            (
-                "VOX_MUTANT_RG13_NO_STARTUP_REASON",
-                "mutant rg13_no_startup_reason engaged",
-            ),
-            (
-                "VOX_MUTANT_RG13_NO_COMMAND_WAIT",
-                "mutant rg13_no_command_wait engaged",
-            ),
-            (
-                "VOX_MUTANT_RG13_UPDATE_STORAGE_FAILURE",
-                "mutant rg13_update_storage_failure engaged",
-            ),
-        ] {
-            if std::env::var_os(selector).is_some() {
-                assert!(
-                    log.contains(receipt),
-                    "APPARATUS: mutant not engaged: {log}"
-                );
-                eprintln!("{log}");
-            }
-        }
-        let (ok, human, err) = vox(root, &["status"], None);
-        eprintln!("RECEIPT vox status success={ok}: stdout={human:?} stderr={err:?}");
-        assert!(
-            ok && human.contains("giving back disk space"),
-            "PRODUCT: status omitted startup reason: {human}{err}"
-        );
-        let (ok, json, err) = vox(root, &["status", "--json"], None);
-        eprintln!("RECEIPT vox status --json success={ok}: stdout={json:?} stderr={err:?}");
-        assert!(ok, "PRODUCT: status --json failed: {json}{err}");
-        let value: serde_json::Value =
-            serde_json::from_str(&json).expect("PRODUCT: status --json is not JSON");
-        let reason = value["startup"].as_str().unwrap_or("");
-        let public_file = value["startup_file_bytes"]
-            .as_u64()
-            .expect("PRODUCT: status omitted numeric startup_file_bytes");
-        let public_held = value["startup_held_bytes"]
-            .as_u64()
-            .expect("PRODUCT: status omitted numeric startup_held_bytes");
-        let actual_file = std::fs::metadata(&file).unwrap().len();
-        assert_eq!(
-            before, actual_file,
-            "APPARATUS: file changed while staging compaction"
-        );
-        assert_eq!(
-            public_file, actual_file,
-            "PRODUCT: startup file byte count differs from store file"
-        );
-        assert!(
-            public_held > 256 * 1024 * 1024,
-            "APPARATUS: public held count did not exceed 256 MiB: {public_held}"
-        );
-        assert!(
-            public_file
-                .checked_sub(public_held.saturating_mul(2))
-                .is_some_and(|reclaim| reclaim >= 64 * 1024 * 1024),
-            "APPARATUS: public counts did not reach floor: file {public_file}, held {public_held}"
-        );
-        assert!(
-            reason.contains("giving back disk space")
-                && reason.contains("default")
-                && reason.contains(&public_file.to_string())
-                && reason.contains(&public_held.to_string())
-                && human.contains(reason),
-            "PRODUCT: status did not report node, file and used bytes consistently: {human}; {json}"
-        );
-        eprintln!("MEASUREMENT staging file={public_file} held={public_held}");
-        if measure {
-            held.0.kill().expect("APPARATUS: kill relocating daemon");
-            held.0.wait().expect("APPARATUS: reap relocating daemon");
-            drop(held);
-            let interrupted = std::fs::metadata(&file).unwrap().len();
-            let started = Instant::now();
-            let mut recovered = launch("measurement-recovered", 0, None);
-            let mut first_reason = None;
-            let elapsed = loop {
-                assert!(
-                    recovered.0.try_wait().unwrap().is_none(),
-                    "PRODUCT: recovery daemon exited: {}",
-                    std::fs::read_to_string(root.join("daemon-measurement-recovered.err")).unwrap()
-                );
-                let (ok, shown, err) = vox(root, &["status", "--json"], None);
-                if ok {
-                    let sample: serde_json::Value = serde_json::from_str(&shown)
-                        .expect("PRODUCT: recovery status was not JSON");
-                    if first_reason.is_none() {
-                        match sample.get("startup") {
-                            Some(serde_json::Value::String(reason))
-                                if reason.contains("giving back disk space") =>
-                            {
-                                let elapsed = started.elapsed();
-                                eprintln!(
-                                    "MEASUREMENT first-startup-reason={:.6}s status={shown}",
-                                    elapsed.as_secs_f64()
-                                );
-                                first_reason = Some(elapsed);
-                            }
-                            Some(serde_json::Value::String(_) | serde_json::Value::Null) | None => {
-                            }
-                            _ => panic!("PRODUCT: invalid startup status: {shown}"),
-                        }
-                    }
-                    match sample["status"].as_str() {
-                        Some("Ready") => break started.elapsed(),
-                        Some(_) => {}
-                        None if sample["status"].is_null() => {}
-                        None => panic!("PRODUCT: invalid recovery status: {shown}"),
-                    }
-                } else {
-                    eprintln!("APPARATUS: recovery status not yet available: {shown}{err}");
-                }
-                std::thread::sleep(Duration::from_millis(200));
-            };
-            match first_reason {
-                Some(first) => eprintln!(
-                    "MEASUREMENT launch-to-first-reason={:.6}s first-reason-to-Ready={:.6}s launch-to-Ready={:.6}s",
-                    first.as_secs_f64(),
-                    (elapsed - first).as_secs_f64(),
-                    elapsed.as_secs_f64()
-                ),
-                None => eprintln!(
-                    "MEASUREMENT first-startup-reason NOT OBSERVED; launch-to-Ready={:.6}s",
-                    elapsed.as_secs_f64()
-                ),
-            }
-            retained();
-            let after = std::fs::metadata(&file).unwrap().len();
-            eprintln!(
-                "MEASUREMENT interrupted-to-Ready={:.6}s file-before={public_file} held-before={public_held} inspector-held={used} file-interrupted={interrupted} file-after={after}",
-                elapsed.as_secs_f64()
-            );
-            stop(recovered);
-            return;
-        }
-        let stdout = root.join("waiting-room-list.out");
-        let stderr = root.join("waiting-room-list.err");
-        let mut cmd = Command::new(VOX);
-        cmd.args(["room", "list"])
-            .env("VOX_DATA_DIR", root)
-            .env("VOX_CONFIG_DIR", root.join("cfg"))
-            .env("VOX_TEST_KEYCHAIN", &keychain)
-            .env_remove("VOX_NODE")
-            .env_remove("VOX_ROOM")
-            .stdin(Stdio::null())
-            .stdout(std::fs::File::create(&stdout).unwrap())
-            .stderr(std::fs::File::create(&stderr).unwrap());
-        if std::env::var_os("VOX_MUTANT_RG13_NO_COMMAND_WAIT").is_some() {
-            cmd.env("VOX_TEST_RG13_NO_COMMAND_WAIT", "1");
-        }
-        let mut command = Daemon(cmd.spawn().expect("APPARATUS: start waiting room list"));
+        let held = if store["held_now"] == false {
+            None
+        } else {
+            Some(store["held_bytes"].as_u64().unwrap_or_else(|| {
+                panic!("PRODUCT: vox status does not say what the store holds: {store}")
+            }))
+        };
+        Some((entries, held, giving_back, waiting))
+    };
+    // The same, measured for this answer.
+    let status = |room: &str| -> Option<(u64, u64, bool, bool)> {
+        let (entries, held, giving_back, waiting) = status_said(room)?;
+        Some((entries, held?, giving_back, waiting))
+    };
+    // Settled: the room shows no message, and the node says it is neither giving space back nor
+    // waiting for reads to go on (or, under the mutant that never resumes, that mutant skipped a
+    // resumption). Returns what vox status then says the store holds.
+    let settle = |room: &str, tag: &str, daemon: &mut Daemon| -> u64 {
         loop {
-            let notice = std::fs::read_to_string(&stderr).unwrap();
-            if notice.contains("giving back disk space") {
-                break;
+            if let Some((entries, held, false, waiting)) = status(room) {
+                if entries == 0
+                    && (!waiting
+                        || mutant == Some("rg13-no-resume")
+                            && log(tag).contains("[vox mutant] engaged rg13-no-resume"))
+                {
+                    return held;
+                }
             }
-            if let Some(exit) = command.0.try_wait().unwrap() {
-                panic!(
-                    "PRODUCT: room list exited {exit} without startup notice: {}{notice}",
-                    std::fs::read_to_string(&stdout).unwrap()
-                );
-            }
+            assert!(
+                daemon.0.try_wait().unwrap().is_none(),
+                "PRODUCT: daemon {tag} exited while expiring {room}: {}",
+                log(tag)
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    // The verdict: with the daemon still running, the store file's length on disk is below what
+    // it was before the expiry and within 1.25 times what vox status says it holds, plus 64 MiB.
+    let gave_back = |phase: &str, before: u64, held: u64, daemon: &mut Daemon, tag: &str| {
+        let file = file_len();
+        assert!(
+            daemon.0.try_wait().unwrap().is_none(),
+            "PRODUCT: daemon {tag} exited: {}",
+            log(tag)
+        );
+        assert!(
+            file < before && file <= held + held / 4 + SLACK,
+            "PRODUCT: {phase}: every expired message is gone, and while the daemon runs the store file on disk is {file} bytes (before the expiry {before}); vox status says the store holds {held} bytes; the bound is 1.25 x held + 64 MiB = {} bytes",
+            held + held / 4 + SLACK
+        );
+        file
+    };
+    let socket = paths.account().socket();
+    let quiet = Probe::start(socket.clone(), kept, "quiet", 50).joined();
+    quiet.measured("posts before any expiry");
+    eprintln!(
+        "MEASUREMENT quiet posts before any expiry: {}",
+        quiet.said()
+    );
+    // Every post a probe saw acknowledged: after the last start, each must read back.
+    let mut acknowledged = Vec::new();
+    let mut grow = grow;
+    // Until `marker` exists (or no longer does), the daemon running meanwhile.
+    let until = |marker: &Path, exists: bool, what: &str, daemon: &mut Daemon| {
+        while marker.exists() != exists {
+            assert!(
+                daemon.0.try_wait().unwrap().is_none(),
+                "PRODUCT: daemon grow exited {what}: {}",
+                log("grow")
+            );
             std::thread::sleep(Duration::from_millis(20));
         }
-        eprintln!(
-            "RECEIPT held vox room list stderr={:?}",
-            std::fs::read_to_string(&stderr).unwrap()
+    };
+    // Quiet and handshake arms: reads of the store begin before compact-a expires and stay
+    // open through its prunes and their passes, as a pending save's pinned read can.
+    for held in &held_reads {
+        std::fs::write(held, "hold").expect("APPARATUS: hold a store read");
+        until(
+            &held.with_extension("open"),
+            true,
+            "before it held a read",
+            &mut grow,
         );
+    }
+    // Expire compact-a in the running daemon: its prunes start the pass (warm).
+    let mut probe =
+        (arm != GiveBack::Failure).then(|| Probe::start(socket.clone(), kept, "warm", usize::MAX));
+    let (ok, out, err) = vox(root, &["room", "retention", "compact-a", "1s"], None);
+    assert!(ok, "PRODUCT (staging): expire compact-a: {out}{err}");
+    let mut warm = None;
+    // Handshake arm: no pass resumed when the last held read ended.
+    let mut stuck = false;
+    if !held_reads.is_empty() {
+        // The last prune is installed once the room shows no message, and its pass has run once
+        // no pass is counted. The probe stops.
+        let (file, holds, waiting) = loop {
+            if let Some((0, holds, false, waiting)) = status("compact-a") {
+                break (file_len(), holds, waiting);
+            }
+            assert!(
+                grow.0.try_wait().unwrap().is_none(),
+                "PRODUCT: daemon grow exited while expiring compact-a: {}",
+                log("grow")
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        warm = probe.take().map(Probe::finish);
+        eprintln!("APPARATUS: compact-a shows no message and no pass runs while {} read(s) begun before its expiry are open: file {file} bytes; vox status says the store holds {holds} bytes, waiting for reads: {waiting}; the probe stopped", held_reads.len());
+        let end_read = |held: &Path, daemon: &mut Daemon| {
+            std::fs::remove_file(held).expect("APPARATUS: end a held read");
+            until(
+                &held.with_extension("open"),
+                false,
+                "while its held read ended",
+                daemon,
+            );
+        };
+        // Passes begun so far. A read that ends while the node waits for reads resumes a pass,
+        // counted before the read's end returns: after it, vox status says the pass, or the
+        // pass already began (and said so), or the node waits no more.
+        let begun = || log("grow").matches("giving back disk space (file").count();
+        let resumed = |passes: usize, daemon: &mut Daemon| loop {
+            if let Some((_, _, giving_back, waiting)) = status_said("compact-a") {
+                break giving_back || !waiting || begun() > passes;
+            }
+            assert!(
+                daemon.0.try_wait().unwrap().is_none(),
+                "PRODUCT: daemon grow exited after a held read ended: {}",
+                log("grow")
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        if arm == GiveBack::Quiet {
+            // Ordinary posts while the read is held, until the file is longer than the last
+            // pass left it: nothing below its end is free to reuse, so the file grew and its end
+            // is free when the read ends, and the pass it resumes gives that end back in the
+            // same trim that frees what the read kept. None when the file already grew.
+            let said = log("grow");
+            let left: u64 = said
+                .rsplit("store file is now ")
+                .next()
+                .filter(|_| said.contains("store file is now "))
+                .and_then(|rest| rest.split(' ').next())
+                .and_then(|bytes| bytes.parse().ok())
+                .expect("APPARATUS: the last pass said what it left the file");
+            let mut posts = 0;
+            while file_len() <= left {
+                assert!(
+                    posts < 50,
+                    "APPARATUS: 50 ordinary posts did not grow the file past {left} bytes"
+                );
+                let text = format!("quiet-grow-{posts}");
+                let frame = request(Request::Post {
+                    channel_id: kept,
+                    text: text.clone(),
+                    card: false,
+                });
+                assert!(
+                    matches!(frame, Frame::Ok),
+                    "PRODUCT: an ordinary post while a read was held: {frame:?}"
+                );
+                acknowledged.push(text);
+                posts += 1;
+            }
+            eprintln!(
+                "APPARATUS: the last pass left the file at {left} bytes; after {posts} ordinary post(s) while the read was held it is {} bytes",
+                file_len()
+            );
+            end_read(&held_reads[0], &mut grow);
+            eprintln!("APPARATUS: the held read ended; from now on nothing happens on the node but vox status");
+        } else {
+            let (first, second) = (&held_reads[0], &held_reads[1]);
+            let wait_hold = wait_hold.as_ref().expect("APPARATUS: handshake hold");
+            let (before, armed) = (
+                wait_hold.with_extension("before"),
+                wait_hold.with_extension("armed"),
+            );
+            std::fs::write(wait_hold, "hold").expect("APPARATUS: hold the waiting pass");
+            // 1. The first read ends; the pass it resumes stops before it begins to wait for
+            // reads, the second read still open.
+            let passes = begun();
+            end_read(first, &mut grow);
+            if resumed(passes, &mut grow) {
+                until(&before, true, "before its pass began to wait", &mut grow);
+                // 2. The last read begun before the expiry ends before the pass begins to wait.
+                end_read(second, &mut grow);
+                std::fs::remove_file(&before).expect("APPARATUS: let the pass begin to wait");
+                until(&armed, true, "as its pass began to wait", &mut grow);
+                // 3. After the pass began to wait a new read begins, and one ordinary post
+                // retires pages that read sees.
+                std::fs::write(first, "hold").expect("APPARATUS: hold a new store read");
+                until(
+                    &first.with_extension("open"),
+                    true,
+                    "before it held a new read",
+                    &mut grow,
+                );
+                let text = "handshake-post".to_owned();
+                let frame = request(Request::Post {
+                    channel_id: kept,
+                    text: text.clone(),
+                    card: false,
+                });
+                assert!(
+                    matches!(frame, Frame::Ok),
+                    "PRODUCT: an ordinary post while a pass waited: {frame:?}"
+                );
+                acknowledged.push(text);
+                // 4. The pass's last trim: it waits for the new read.
+                std::fs::remove_file(wait_hold).expect("APPARATUS: end the pass hold");
+                std::fs::remove_file(&armed).expect("APPARATUS: let the pass trim");
+                loop {
+                    match status_said("compact-a") {
+                        Some((_, _, false, true)) => break,
+                        Some((_, _, false, false)) => panic!(
+                            "APPARATUS: the pass did not wait for the read begun after it began to wait: {}",
+                            log("grow")
+                        ),
+                        _ => {}
+                    }
+                    assert!(
+                        grow.0.try_wait().unwrap().is_none(),
+                        "PRODUCT: daemon grow exited while its pass waited: {}",
+                        log("grow")
+                    );
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                eprintln!("APPARATUS: the last read begun before the expiry ended before the pass began to wait; a read begun after that sees pages an ordinary post retired before the pass's last trim; the pass waits for reads; file {} bytes", file_len());
+                // 5. That read ends; from then on nothing happens on the node but vox status.
+                let passes = begun();
+                end_read(first, &mut grow);
+                stuck = !resumed(passes, &mut grow);
+                eprintln!("APPARATUS: the read begun after the pass began to wait ended; a pass resumed: {}", !stuck);
+            } else {
+                let passes = begun();
+                end_read(second, &mut grow);
+                stuck = !resumed(passes, &mut grow);
+                eprintln!("APPARATUS: no pass resumed when the first held read ended; the second ended too; a pass resumed: {}", !stuck);
+            }
+        }
+    }
+    let held = if stuck {
+        // No pass resumed when the last read ended, and nothing else happens on the node.
+        loop {
+            if let Some((_, held, false, _)) = status("compact-a") {
+                break held;
+            }
+            assert!(
+                grow.0.try_wait().unwrap().is_none(),
+                "PRODUCT: daemon grow exited: {}",
+                log("grow")
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    } else {
+        settle("compact-a", "grow", &mut grow)
+    };
+    let warm = warm
+        .or_else(|| probe.take().map(Probe::finish))
+        .unwrap_or_default();
+    acknowledged.extend(warm.acknowledged.iter().cloned());
+    let said = log("grow");
+    passes_said(&said);
+    if let Some(named) = mutant {
+        let engaged = format!("[vox mutant] engaged {named}");
         assert!(
-            command.0.try_wait().unwrap().is_none(),
-            "PRODUCT: room list returned while storage was held: {}{}",
-            std::fs::read_to_string(&stdout).unwrap(),
-            std::fs::read_to_string(&stderr).unwrap()
+            said.contains(&engaged),
+            "APPARATUS: mutant {named} not engaged: {said}"
         );
-        let (hook_ok, hook) = small_row_command(
-            root,
-            &[
-                "agent", "hook", "--node", "default", "--room", &room, "--format", "text",
-            ],
-            Some(r#"{"hook_event_name":"UserPromptSubmit","session_id":"compact-held-hook"}"#),
-        );
+        eprintln!("APPARATUS: daemon grow says \"{engaged}\"");
+    }
+    // The longest wait of one post while the node gave space back, against the product's bound.
+    let waited = |phase: &str, longest: Duration| {
+        if matches!(
+            arm,
+            GiveBack::Large | GiveBack::Measure | GiveBack::Quiet | GiveBack::Handshake
+        ) {
+            assert!(
+                longest < BUSY,
+                "PRODUCT: {phase}: while the node gave space back one post waited {} ms; the daemon says it is busy past {} ms",
+                longest.as_millis(),
+                BUSY.as_millis()
+            );
+        }
+    };
+    if arm == GiveBack::Failure {
+        // A failed pass is told in the daemon log, where a person reads why space did not
+        // come back; vox status says nothing of it.
         assert!(
-            hook_ok
-                && (hook.contains("Vox is preparing node default")
-                    || hook.contains("Vox daemon registration timed out")),
-            "PRODUCT: held-storage hook did not finish with its bounded startup note: {hook}"
+            said.contains("node default: store compaction skipped:")
+                && said.contains("compaction fault staged by proof")
+                && said.contains("continuing"),
+            "PRODUCT: the running node expired compact-a (file {}, grown {grown}) and did not attempt to give space back: {said}",
+            file_len()
         );
-        assert!(
-            command.0.try_wait().unwrap().is_none(),
-            "PRODUCT: room list returned while compaction was still held: {}{}",
-            std::fs::read_to_string(&stdout).unwrap(),
-            std::fs::read_to_string(&stderr).unwrap()
-        );
-        let release = CompactionRelease::start(&marker);
-        let exit = command.0.wait().expect("APPARATUS: wait for room list");
-        drop(release);
-        let out = std::fs::read_to_string(&stdout).unwrap();
-        let err = std::fs::read_to_string(&stderr).unwrap();
-        eprintln!("RECEIPT completed vox room list stdout={out:?} stderr={err:?}");
-        assert!(
-            exit.success() && out.contains(&room[..12]),
-            "PRODUCT: waiting room list failed: {exit}: {out}{err}"
-        );
-        assert_eq!(
-            err.matches("giving back disk space").count(),
-            1,
-            "PRODUCT: waiting room list did not print exactly one notice: {err}"
-        );
-        retained();
-        let after = std::fs::metadata(&file).unwrap().len();
-        assert!(public_file.saturating_sub(after) >= 64 * 1024 * 1024,
-            "PRODUCT: large store reclaimed less than 64 MiB: before {public_file}, after {after}, held {public_held}");
-        eprintln!(
-            "PRODUCT: large store shrank from {public_file} to {after} bytes; held {public_held}"
-        );
-        stop(held);
-        let after_close = std::fs::metadata(&file).unwrap().len();
-        let again = launch("large-again", 0, None);
-        attached(root, "large-again");
         let (ok, status, err) = vox(root, &["status"], None);
         assert!(
-            ok && !status.contains("giving back disk space"),
-            "PRODUCT: unchanged store reported another compaction: {status}{err}"
+            ok && status.contains("Ready"),
+            "PRODUCT: a failed give-back left the node not Ready: {status}{err}"
         );
-        let again_log = std::fs::read_to_string(root.join("daemon-large-again.err")).unwrap();
-        assert!(
-            !again_log.contains("giving back disk space"),
-            "PRODUCT: immediate restart compacted again: {again_log}"
-        );
-        let again_size = std::fs::metadata(&file).unwrap().len();
-        assert_eq!(after_close, again_size,
-            "PRODUCT: unchanged store resized on immediate restart: before {after_close}, after {again_size}");
         retained();
-        stop(again);
+        let frame = request(Request::Post {
+            channel_id: kept,
+            text: "after-failed-give-back".into(),
+            card: false,
+        });
+        assert!(
+            matches!(frame, Frame::Ok),
+            "PRODUCT: a failed give-back left kept unwritable: {frame:?}"
+        );
+        assert!(
+            small_row_all_messages(root, &kept_name).contains("after-failed-give-back"),
+            "PRODUCT: the post after a failed give-back is not readable"
+        );
+        eprintln!("PRODUCT: the give-back failed while running; node Ready, kept readable and writable; {said}");
+        stop(grow);
         return;
     }
-    if failure {
-        let failed = launch("failed", 2 * DAY, None);
-        // Unlock's own reply reports the terminal startup outcome, not elapsed silence.
-        let (ok, out, err) = vox(root, &["node", "unlock", "default"], None);
-        let log = std::fs::read_to_string(root.join("daemon-failed.err")).unwrap();
-        if std::env::var_os("VOX_MUTANT_COMPACTION_FAILURE_LOCKS").is_some() {
-            assert!(
-                log.contains("mutant compaction_failure_locks engaged"),
-                "APPARATUS: mutant not seen in daemon: {log}"
-            );
-            eprintln!("{log}");
+    let phase = match arm {
+        GiveBack::Quiet => {
+            "a read begun before compact-a expired ended after its last pass, and the node went quiet"
         }
+        GiveBack::Handshake => {
+            "a read begun after the pass began to wait for reads ended, and the node went quiet"
+        }
+        _ => "the running node expired compact-a",
+    };
+    let running = gave_back(phase, grown, held, &mut grow, "grow");
+    let largest = largest_step(&said);
+    eprintln!(
+        "MEASUREMENT warm: grown={grown} running-file={running} held={held} passes={} largest-step={largest} probe {}",
+        said.matches("giving back disk space (file").count(),
+        warm.said()
+    );
+    warm.measured(phase);
+    waited("while the node ran", warm.longest());
+    let read_back = |tag: &str, acknowledged: &[String]| {
+        let shown = small_row_all_messages(root, &kept_name);
+        let lost: Vec<&String> = acknowledged
+            .iter()
+            .filter(|text| !shown.contains(&format!("\"{text}\"")))
+            .collect();
         assert!(
-            ok && out.contains("Ready"),
-            "PRODUCT: failed compaction kept node from Ready: {out}{err}; daemon: {log}"
+            lost.is_empty(),
+            "PRODUCT: {} of {} acknowledged probe posts are missing after {tag}: {:?}",
+            lost.len(),
+            acknowledged.len(),
+            lost.iter().take(20).collect::<Vec<_>>()
         );
-        retained();
-        assert!(
-            log.contains("node default: store compaction skipped:")
-                && log.contains("compaction fault staged by proof")
-                && log.contains("continuing startup"),
-            "PRODUCT: compaction failure did not name node and true reason: {log}"
+        eprintln!(
+            "RECEIPT: all {} probe posts acknowledged during the passes read back after {tag}",
+            acknowledged.len()
         );
-        eprintln!("PRODUCT: compaction failed, node Ready, room and retained private step readable; {log}");
-        stop(failed);
+    };
+    if matches!(arm, GiveBack::Quiet | GiveBack::Handshake) {
+        read_back("the pass", &acknowledged);
+        stop(grow);
         return;
     }
-    let saved = root.join("acknowledged.redb");
-    std::fs::copy(&file, &saved).unwrap();
-    let restarted = launch("compacted", 2 * DAY, None);
-    attached(root, "compacted");
-    retained();
-    let log = std::fs::read_to_string(root.join("daemon-compacted.err")).unwrap();
-    if std::env::var_os("VOX_MUTANT_SKIP_STARTUP_COMPACTION").is_some() {
-        assert!(
-            log.contains("mutant skip_startup_compaction engaged"),
-            "APPARATUS: skip mutant not seen in daemon: {log}"
+    if arm == GiveBack::Measure {
+        grow_room(room_b, "b-expire", 800);
+        eprintln!(
+            "APPARATUS: grew compact-b by 800 acknowledged 60000-byte posts; file {} bytes",
+            file_len()
         );
-        eprintln!("{log}");
     }
-    let after = std::fs::metadata(&file).unwrap().len();
-    assert!(after <= before - 4096,
-        "PRODUCT: daemon restart left expired space allocated: before {before}, after {after}, reachable {used}");
-    let note = std::fs::read_to_string(root.join("daemon-compacted.err")).unwrap();
-    assert!(
-        note.contains("giving back disk space") && note.contains("Ready when compaction finishes"),
-        "PRODUCT: the startup wait did not explain compaction: {note}"
-    );
-    stop(restarted);
-    std::fs::remove_file(&file).unwrap();
-    std::fs::copy(saved, &file).unwrap();
-    let marker = root.join("relocated");
-    let mut crashing = launch("relocating", 2 * DAY, Some(&marker));
-    while !marker.exists() {
+    stop(grow);
+    let before = file_len();
+    // After a start, staging waits until kept takes a post (`request` waits out the room's
+    // preparation); from then on every probe post must be acknowledged.
+    let writable = |tag: &str| -> String {
+        let text = format!("{tag}-writable");
+        let frame = request(Request::Post {
+            channel_id: kept,
+            text: text.clone(),
+            card: false,
+        });
         assert!(
-            crashing.0.try_wait().unwrap().is_none(),
-            "PRODUCT: daemon exited before compaction relocation: {}",
-            std::fs::read_to_string(root.join("daemon-relocating.err")).unwrap()
+            matches!(frame, Frame::Ok),
+            "PRODUCT (staging): kept after the {tag} start: {frame:?}"
         );
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    crashing
-        .0
-        .kill()
-        .expect("APPARATUS: kill own relocating daemon");
-    crashing.0.wait().unwrap();
-    drop(crashing);
-    let recovered = launch("recovered", 2 * DAY, None);
-    attached(root, "recovered");
-    retained();
-    assert!(
-        std::fs::metadata(&file).unwrap().len() < before,
-        "PRODUCT: restart after killed relocation did not reclaim the store"
+        text
+    };
+    let (tag, mut daemon, held, cold) = if arm == GiveBack::Crash {
+        let marker = root.join("relocated");
+        const MOVED: &str = "table pages relocated before commit";
+        const CUT: &str = "smaller layout committed before truncation";
+        // Wait until the daemon parks where `wanted` says; any other park is let go on.
+        let park = |daemon: &mut Daemon, tag: &str, wanted: &str, verdict: &str| loop {
+            match std::fs::read_to_string(&marker).as_deref() {
+                Ok(said) if said == wanted => return,
+                Ok(said) if said == MOVED || said == CUT => {
+                    let _ = std::fs::remove_file(&marker);
+                }
+                _ => {}
+            }
+            assert!(
+                daemon.0.try_wait().unwrap().is_none(),
+                "PRODUCT: daemon {tag} exited before its pass reached \"{wanted}\": {}",
+                log(tag)
+            );
+            assert!(
+                !matches!(status("compact-b"), Some((0, _, false, false))),
+                "{verdict}: the node {tag} expired compact-b and finished giving back without reaching \"{wanted}\": file {}; {}",
+                file_len(),
+                log(tag)
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        // Until the act waits for its park, every park is let go on in the background: a
+        // commit that shrinks the store may park the daemon before compact-b expires.
+        let released = {
+            let marker = marker.clone();
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let done = stop.clone();
+            let worker = std::thread::spawn(move || {
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    if std::fs::read_to_string(&marker).is_ok_and(|said| said == CUT) {
+                        let _ = std::fs::remove_file(&marker);
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            });
+            move || {
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                worker.join().expect("APPARATUS: join park releaser");
+            }
+        };
+        let mut crashing = launch("crash", Some(&marker));
+        attached(root, "crash");
+        let probe = Probe::start(socket.clone(), kept, "crash", usize::MAX);
+        let (ok, out, err) = vox(root, &["room", "retention", "compact-b", "1s"], None);
+        assert!(ok, "PRODUCT (staging): expire compact-b: {out}{err}");
+        released();
+        park(&mut crashing, "crash", MOVED, "PRODUCT");
+        // The pass holds the writer with its moved pages not yet committed: reads go on.
+        let shown = small_row_all_messages(root, &kept_name);
+        assert!(
+            (0..8).all(|id| shown.contains(&format!("retained-message-{id}"))),
+            "PRODUCT: a read while the pass held its moved pages lost rows: {shown}"
+        );
+        eprintln!("RECEIPT: while the pass held its uncommitted moves, vox room read returned every retained row");
+        let interrupted = file_len();
+        crashing
+            .0
+            .kill()
+            .expect("APPARATUS: kill own daemon during its pass");
+        crashing.0.wait().unwrap();
+        drop(crashing);
+        // The probe ends with its daemon; what it saw acknowledged must survive the crash.
+        // Posts it saw refused or unanswered are the parked pass and the kill: not measured.
+        let crash = probe.joined();
+        acknowledged.extend(crash.acknowledged.iter().cloned());
+        eprintln!(
+            "APPARATUS: killed the daemon at a move before its commit; file {interrupted} bytes; probe {}",
+            crash.said()
+        );
+        // The second kill point: a commit that shrank the store is durable, the file not cut.
+        let mut crashing = launch("crash2", Some(&marker));
+        park(&mut crashing, "crash2", CUT, "APPARATUS");
+        let interrupted = file_len();
+        crashing
+            .0
+            .kill()
+            .expect("APPARATUS: kill own daemon before its truncation");
+        crashing.0.wait().unwrap();
+        drop(crashing);
+        eprintln!("APPARATUS: killed the daemon after a commit that shrank the store, before the file was cut; file {interrupted} bytes");
+        let mut recovered = launch("recovered", None);
+        attached(root, "recovered");
+        acknowledged.push(writable("recovered"));
+        let probe = Probe::start(socket.clone(), kept, "cold", usize::MAX);
+        let held = settle("compact-b", "recovered", &mut recovered);
+        retained();
+        ("recovered", recovered, held, probe.finish())
+    } else {
+        let mut restarted = launch("restarted", None);
+        attached(root, "restarted");
+        acknowledged.push(writable("restarted"));
+        let probe = Probe::start(socket.clone(), kept, "cold", usize::MAX);
+        let (ok, out, err) = vox(root, &["room", "retention", "compact-b", "1s"], None);
+        assert!(ok, "PRODUCT (staging): expire compact-b: {out}{err}");
+        let held = settle("compact-b", "restarted", &mut restarted);
+        retained();
+        ("restarted", restarted, held, probe.finish())
+    };
+    acknowledged.extend(cold.acknowledged.iter().cloned());
+    let said = log(tag);
+    passes_said(&said);
+    let phase = format!("after the {tag} start the node expired compact-b");
+    let running = gave_back(&phase, before, held, &mut daemon, tag);
+    let largest = largest_step(&said);
+    eprintln!(
+        "MEASUREMENT cold ({tag}): before={before} running-file={running} held={held} passes={} largest-step={largest} probe {}",
+        said.matches("giving back disk space (file").count(),
+        cold.said()
     );
-    stop(recovered);
+    cold.measured(&phase);
+    waited(&format!("after the {tag} start"), cold.longest());
+    read_back(tag, &acknowledged);
+    stop(daemon);
+    let db = redb::ReadOnlyDatabase::open(&file).expect("APPARATUS: inspect stopped store");
+    let allocated = {
+        use redb::ReadableDatabase;
+        db.begin_read().unwrap().allocated_bytes().unwrap()
+    };
+    drop(db);
+    eprintln!(
+        "RECEIPT: stopped store file {} bytes, {allocated} bytes allocated (grown {grown})",
+        file_len()
+    );
 }

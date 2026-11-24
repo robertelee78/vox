@@ -1050,6 +1050,19 @@ impl Node {
         };
         channel.note_publication_complete();
         drop(channel);
+        // A prune is what frees space: give it back now, not at the next start, once this
+        // room's save has let go of the view it kept for readers (RG-13). A private drive's
+        // expiry is the same retention deletion, completed as its own kind.
+        if installable
+            && matches!(
+                &result,
+                Ok(Saved::Retention(pending_retention::Installed { pruned, .. })
+                    | Saved::Private(private_save::Saved::Expired { pruned }))
+                    if *pruned > 0
+            )
+        {
+            pending.store.give_back_space();
+        }
         if installable
             && matches!(
                 &result,

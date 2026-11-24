@@ -1782,7 +1782,9 @@ impl Database {
             writer_lock,
             #[cfg(feature = "experimental-multiprocess")]
             header_lock,
-            AllocationPolicy::Default,
+            // Vox: every write takes the lowest free page, so live pages drift down and the
+            // end of the file empties for ordinary commits to trim (cberner/redb#1165)
+            AllocationPolicy::Lowest,
         )
     }
 }

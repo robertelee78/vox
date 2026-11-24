@@ -720,6 +720,7 @@ impl SemanticProjection {
                 .and_then(|tracked| tracked.claimed_ms)
                 .or_else(|| steps.then_some(entry.skeleton.claimed_ms)),
             cache_id: previous.and_then(|tracked| tracked.cache_id),
+            returned: previous.is_some_and(|tracked| tracked.returned),
         };
         let age = seal_segment(
             sek,
@@ -768,6 +769,7 @@ impl SemanticProjection {
                 first_seen_ms: self.now,
                 claimed_ms: steps.then_some(entry.skeleton.claimed_ms),
                 cache_id: None,
+                returned: false,
             }),
         )?;
         index.seal()

@@ -146,8 +146,6 @@ pub struct NodeSummary {
     pub state: String,
     /// `Ready` or `Locked`; absent while the daemon is starting or stopping this node.
     pub status: Option<String>,
-    /// Known startup storage work, if this node is still preparing.
-    pub startup: Option<String>,
     /// Its identity fingerprint, base32; empty until the daemon knows it.
     pub fingerprint: String,
     /// Attached with `--keep`: attached again whenever the daemon starts.
@@ -3234,47 +3232,6 @@ impl VoxClient {
             .map_err(|_| failed("the app's connection to vox stopped"))?
     }
 
-    /// An attach may take longer only while this node reports known startup work.
-    async fn on_rt_attaching<T, F>(&self, node: NodeName, fut: F) -> Result<T, VoxError>
-    where
-        T: Send + 'static,
-        F: Future<Output = Result<T, VoxError>> + Send + 'static,
-    {
-        let socket = self.socket.clone();
-        self.rt
-            .spawn(async move {
-                tokio::pin!(fut);
-                loop {
-                    let deadline = tokio::time::Instant::now() + REQUEST_WITHIN;
-                    tokio::select! {
-                        result = &mut fut => return result,
-                        () = tokio::time::sleep_until(deadline - std::time::Duration::from_secs(1)) => {}
-                    }
-                    let observation = tokio::time::timeout_at(
-                        deadline,
-                        DaemonClient::observe(&socket),
-                    );
-                    let preparing = tokio::select! {
-                        result = &mut fut => return result,
-                        result = observation => result.ok().and_then(Result::ok).is_some_and(|daemon| {
-                            daemon.attached.iter().any(|info| info.name == node && info.startup.is_some())
-                        }),
-                    };
-                    tokio::select! {
-                        result = &mut fut => return result,
-                        () = tokio::time::sleep_until(deadline) => {}
-                    }
-                    if !preparing {
-                        return Err(VoxError::Unknown {
-                            reason: "vox did not finish this request within 60 seconds; its outcome is unknown. Try again to reconnect.".into(),
-                        });
-                    }
-                }
-            })
-            .await
-            .map_err(|_| failed("the app's connection to vox stopped"))?
-    }
-
     async fn anchor_request(&self, req: DaemonRequest) -> Result<Vec<AnchorSummary>, VoxError> {
         match self.daemon(req).await? {
             DaemonFrame::Anchors(anchors) => Ok(anchors.into_iter().map(Into::into).collect()),
@@ -3286,10 +3243,6 @@ impl VoxClient {
     async fn daemon(&self, req: DaemonRequest) -> Result<DaemonFrame, VoxError> {
         // Only Nodes is classified here as an authoritative read; other requests may mutate.
         let read_only = matches!(&req, DaemonRequest::Nodes);
-        let attaching = match &req {
-            DaemonRequest::Attach { node, .. } => Some(node.clone()),
-            _ => None,
-        };
         let socket = self.socket.clone();
         let request = async move {
             let mut d = DaemonClient::open(&socket)
@@ -3312,10 +3265,7 @@ impl VoxClient {
                 Err(e) => Err(said(&socket, e)),
             }
         };
-        match attaching {
-            Some(node) => self.on_rt_attaching(node, request).await,
-            None => self.on_rt(request).await,
-        }
+        self.on_rt(request).await
     }
 
     /// A bind or a no for an ask, and what the daemon said of it.
@@ -3752,7 +3702,6 @@ impl VoxClient {
                     }
                     .to_owned(),
                     status: n.status.map(|s| s.as_str().to_owned()),
-                    startup: n.startup.map(|work| work.reason),
                     fingerprint: n.fingerprint.map(|f| b32_encode(&f)).unwrap_or_default(),
                     keep: n.keep,
                 })
@@ -3847,7 +3796,7 @@ impl VoxClient {
         let held = Arc::clone(&self.held);
         let following = Arc::clone(&self.following);
         let socket = self.socket.clone();
-        self.on_rt_attaching(name.clone(), async move {
+        self.on_rt(async move {
             let mut slot = held.lock().await;
             stop_follow(&following);
             // The node held before is let go first, so a switch never holds two.
@@ -4444,49 +4393,6 @@ impl VoxClient {
                     .iter()
                     .find(|r| r.entry_hash == root && !r.owed)
                     .map(|r| rendered(r, &names, me.as_deref()))),
-                other => Err(unexpected(&other)),
-            }
-        })
-    }
-
-    /// One bounded page of readable thread replies in arrival order, matching `thread_summary`.
-    /// Opaque owed rows have no readable thread metadata and are not included. Empty `since`
-    /// starts the thread; the next request follows the last returned id. An empty page finishes
-    /// the read. A cursor removed by retention is an explicit error; reload from the beginning.
-    /// This does not drain later pages or read another room.
-    ///
-    /// # Errors
-    /// A malformed id, an invalid cursor, or the node's refusal.
-    pub async fn read_thread_page(
-        &self,
-        room: String,
-        root: String,
-        since: String,
-    ) -> Result<Vec<RoomMessage>, VoxError> {
-        let channel_id = digest(&room, "room id")?;
-        let root = digest(&root, "thread root")?;
-        let since = if since.is_empty() {
-            None
-        } else {
-            Some(digest(&since, "message id")?)
-        };
-        on_held!(self, |c| {
-            let names = names(c).await?;
-            let me = c.me().map(|f| b32_encode(&f));
-            match ask(
-                c,
-                &Request::Thread {
-                    channel_id,
-                    root,
-                    since,
-                },
-            )
-            .await?
-            {
-                Frame::Rows { rows } => Ok(rows
-                    .iter()
-                    .map(|r| rendered(r, &names, me.as_deref()))
-                    .collect()),
                 other => Err(unexpected(&other)),
             }
         })
@@ -8493,12 +8399,11 @@ async fn follow(
                 ev @ (NodeEvent::Synced { .. } | NodeEvent::SenderKeyReceived { .. }),
             ))) => {
                 let room = match &ev {
-                    NodeEvent::Synced {
-                        channel_id,
-                        rendered,
-                        ..
-                    } => (*rendered > 0).then_some(*channel_id),
-                    NodeEvent::SenderKeyReceived { channel_id, .. } => Some(*channel_id),
+                    // A turn with nothing applied can still bring a message back after a
+                    // removal took it away (ADR-053 MP-11): it arrives again, past this cursor,
+                    // so the room's arrivals are read on every turn it reports.
+                    NodeEvent::Synced { channel_id, .. }
+                    | NodeEvent::SenderKeyReceived { channel_id, .. } => Some(*channel_id),
                     _ => None,
                 };
                 if !owner.notice(listener, ev.words()).await {

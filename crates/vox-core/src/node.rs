@@ -93,3 +93,30 @@ pub mod trust;
 pub mod tunnel;
 pub mod up;
 pub mod work_board;
+
+/// A `test-knobs` mutant switch of the ADR-053 MP-11 proofs: whether `name` is set in this
+/// process's environment, said on stderr (with `effect`) the first time it is read set. A `vox`
+/// built without `test-knobs` reads none and answers false.
+#[must_use]
+pub fn mp11_mutant(name: &'static str, effect: &'static str) -> bool {
+    #[cfg(feature = "test-knobs")]
+    {
+        static SAID: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+        let on = std::env::var_os(name).is_some();
+        if on {
+            let mut said = SAID
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !said.contains(&name) {
+                said.push(name);
+                eprintln!("vox: {name} engaged: {effect}");
+            }
+        }
+        on
+    }
+    #[cfg(not(feature = "test-knobs"))]
+    {
+        let _ = (name, effect);
+        false
+    }
+}

@@ -400,6 +400,10 @@ pub struct StatusReport {
     /// Whether the actor has bounded governance maintenance queued. A room's displayed
     /// projection remains the last complete one while this is true.
     pub governance_pending: bool,
+    /// What the node's store holds, and whether it is giving disk space back or waits for
+    /// reads to end to go on (RG-13), said without waiting for its writer; the error when the
+    /// measuring task failed. `None` while the store is not open for writing.
+    pub store: Option<std::result::Result<crate::node::store::StoreSpace, String>>,
     /// When the machine's network last changed, unix milliseconds, and the change in one line
     /// (ADR-012 N-52); `None` if it has not since the daemon started.
     pub network_changed: Option<(u64, String)>,
@@ -596,6 +600,23 @@ impl StatusReport {
         );
         let _ = write!(j, "\"networked\":{},", self.networked);
         let _ = write!(j, "\"governance_pending\":{},", self.governance_pending);
+        let _ = write!(
+            j,
+            "\"store\":{},",
+            match &self.store {
+                None => "null".to_owned(),
+                Some(Ok(space)) => format!(
+                    "{{\"held_bytes\":{},\"held_now\":{},\"giving_back\":{},\"waiting_for_reads\":{}}}",
+                    space
+                        .held_bytes
+                        .map_or_else(|| "null".to_owned(), |held| held.to_string()),
+                    space.held_now,
+                    space.giving_back,
+                    space.waiting_for_reads
+                ),
+                Some(Err(error)) => format!("{{\"held_error\":{}}}", q(error)),
+            }
+        );
         let _ = write!(
             j,
             "\"keyring_open_secs\":{},",
@@ -1427,8 +1448,13 @@ pub struct PortCounters {
     pub partial: u64,
     /// Sessions that failed.
     pub failed: u64,
-    /// The last failure's reason.
+    /// The last failure's reason, kept after rounds complete again as diagnostic history
+    /// (`vox status --json` `last_failure`). Set through [`PortCounters::note_failure`].
     pub last_failure: Option<String>,
+    /// The rounds with this peer that had ended without error (`completed` + `partial`) when
+    /// `last_failure` was recorded. The failure stands while that count has not grown
+    /// ([`PortCounters::last_failure_stands`]).
+    pub last_failure_at: u64,
     /// Start of this uninterrupted run of failed syncs, cleared by a successful session.
     pub failing_since: Option<std::time::Instant>,
     /// Consecutive sessions that failed in either direction.
@@ -1460,6 +1486,51 @@ pub struct PortCounters {
     /// since when, and when it started (V210-110). A session that never ends was otherwise only a counter that did
     /// not move; with this, `vox status` says which session is stuck, and at which step.
     pub running: BTreeMap<u64, (bool, SyncStep, std::time::Instant, std::time::Instant)>,
+}
+
+impl PortCounters {
+    /// The rounds with this peer, in either direction, that ended without error: completed, or
+    /// answered short of all that was asked (`partial`).
+    fn answered(&self) -> u64 {
+        self.completed.saturating_add(self.partial)
+    }
+
+    /// A round with this peer failed, for `why`: it stands until a later round with the peer
+    /// ends without error.
+    pub(crate) fn note_failure(&mut self, why: String) {
+        self.last_failure = Some(why);
+        self.last_failure_at = self.answered();
+        #[cfg(feature = "test-knobs")]
+        if failure_outlives_answers_mutant() {
+            self.last_failure_at = u64::MAX;
+        }
+    }
+
+    /// `last_failure` is still the peer's latest outcome: no round with the peer has ended
+    /// without error since it (`vox status --json` `last_failure_stands`). `vox status` names the
+    /// failure only while it stands, so a peer that answers again does not carry an old reason.
+    #[must_use]
+    pub fn last_failure_stands(&self) -> bool {
+        self.last_failure.is_some() && self.answered() <= self.last_failure_at
+    }
+}
+
+/// `VOX_MUTANT_FAILURE_OUTLIVES_ANSWERS`: a failure is stored ahead of every later round count, so
+/// a round that ends without error leaves it standing. Says so once on stderr when the daemon
+/// first reads it.
+#[cfg(feature = "test-knobs")]
+fn failure_outlives_answers_mutant() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let on = std::env::var_os("VOX_MUTANT_FAILURE_OUTLIVES_ANSWERS").is_some();
+        if on {
+            eprintln!(
+                "vox: VOX_MUTANT_FAILURE_OUTLIVES_ANSWERS engaged: a round that ends without \
+                 error leaves the last failure standing"
+            );
+        }
+        on
+    });
+    *ON
 }
 
 /// The step a sync session is at (V210-110).
@@ -1907,7 +1978,7 @@ impl SyncBook {
                  \"served_completed\":{},\"served_empty\":{},\"history_fetched\":{},\"history_served\":{},\
                  \"history_declined\":{},\"history_offered\":{},\"history_rearmed\":{},\
                  \"history_refusal_stale\":{},\"history_refusal_saved\":{},\
-                 \"partial\":{},\"failed\":{},\"last_failure\":{},\
+                 \"partial\":{},\"failed\":{},\"last_failure\":{},\"last_failure_stands\":{},\
                  \"stale\":{},\"refused\":{},\"skipped_at_cap\":{},\"queued\":{},\
                  \"board_records_received\":{},\"board_anchor_records_received\":{},\
                  \"board_sync_records_received\":{},\"board_sync_owner_waits\":{},\
@@ -1937,6 +2008,7 @@ impl SyncBook {
                 c.last_failure
                     .as_deref()
                     .map_or_else(|| "null".to_owned(), q),
+                c.last_failure_stands(),
                 c.stale,
                 c.refused,
                 c.skipped_at_cap,

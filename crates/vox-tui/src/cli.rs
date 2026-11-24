@@ -812,7 +812,7 @@ pub struct ShareArgs {
     /// May interrupt the addressed members' agents mid-turn.
     #[arg(long)]
     pub urgent: bool,
-    /// The entry hash this share answers. A session woken by one message answers it without.
+    /// The entry hash this share answers.
     #[arg(long)]
     pub re: Option<String>,
     /// A note, carried in the share itself.
@@ -1012,8 +1012,11 @@ pub struct RoomTailArgs {
     pub profile: NodeArgs,
     /// The room's id, or a unique prefix of it.
     pub room: String,
-    /// Start after this entry hash — the full 52 characters — rather than at the
-    /// live edge.
+    /// Start after this position (`@<arrival>:<instance>`, as `vox room read` prints for the
+    /// next page and a stopped tail prints to resume from) or this entry hash — the full 52
+    /// characters — rather than at the live edge.
+    /// A hash naming a message that came back after a removal took it away is refused: its
+    /// place in arrival moved.
     #[arg(long)]
     pub since: Option<String>,
     /// One `vox.room.row/1` JSON object per line.
@@ -1590,11 +1593,14 @@ pub struct RoomReadArgs {
     pub profile: NodeArgs,
     /// The room's id, or a unique prefix of it.
     pub room: String,
-    /// Return only what arrived after this entry hash, in the order it arrived — the
-    /// full 52 characters, as the first column prints it. Arrival, not position: a
-    /// message from a member who was offline takes its place *above* newer ones, and
-    /// is still returned. Not prefix-matched: a cursor comes from previous output, and
-    /// a prefix that matched the wrong entry would silently skip or repeat messages.
+    /// Return only what arrived after this position or entry hash, in the order it arrived.
+    /// A position is `@<arrival>:<instance>`, as "For the next page" prints it; it does not
+    /// move. A hash is the full 52 characters, as the first column prints it; one naming a
+    /// message that came back after a removal took it away is refused, since it arrived again
+    /// past what came meanwhile. Arrival, not position: a message from a member who was
+    /// offline takes its place *above* newer ones, and is still returned. Not prefix-matched:
+    /// a cursor comes from previous output, and a prefix that matched the wrong entry would
+    /// silently skip or repeat messages.
     #[arg(long)]
     pub since: Option<String>,
     /// Read the bounded page before this entry; otherwise open at the newest page.

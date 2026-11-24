@@ -51,11 +51,9 @@ pub async fn status(paths: &Paths, json: bool) -> Result<(), AppError> {
         let mut value = serde_json::json!({
             "node": name.as_str(), "status": info.status.map(|s| s.as_str()),
             "identity": info.fingerprint.map(|f| vox_core::node::link::b32_encode(&f)),
-            "startup": info.startup.as_ref().map(|work| &work.reason),
-            "startup_file_bytes": info.startup.as_ref().map(|work| work.file_bytes),
-            "startup_held_bytes": info.startup.as_ref().map(|work| work.held_bytes),
         });
         value["stores"] = stores;
+        held_by_node(&mut value, name.as_str());
         vox_core::node::status::set_anchor_inventory(
             &mut value,
             vox_core::node::status::request_anchors(&at).await,
@@ -63,11 +61,7 @@ pub async fn status(paths: &Paths, json: bool) -> Result<(), AppError> {
         if json {
             println!("{value}");
         } else {
-            if let Some(work) = &info.startup {
-                println!("{}", work.reason);
-            } else {
-                println!("node {name}  {}", info.status.map_or("…", |s| s.as_str()));
-            }
+            println!("node {name}  {}", info.status.map_or("…", |s| s.as_str()));
             if info.status == Some(NodeStatus::Locked) {
                 println!(
                     "Unlock with {}",
@@ -85,6 +79,7 @@ pub async fn status(paths: &Paths, json: bool) -> Result<(), AppError> {
     let mut v: Value = serde_json::from_str(&report)
         .map_err(|e| AppError::Usage(format!("the node's report did not parse: {e}")))?;
     v["stores"] = stores;
+    held_by_node(&mut v, name.as_str());
     if json {
         println!("{v}");
         return Ok(());
@@ -124,6 +119,40 @@ fn store_inventory(paths: &Paths, nodes: &[vox_core::node::daemonipc::NodeInfo])
     )
 }
 
+/// What the node's own store holds, and whether it is giving space back, from its report
+/// (RG-13): only the node that answered can measure its store; another node's says it. The
+/// node measures without waiting for a write: while one holds the store it says what it last
+/// measured, or that it has not measured yet.
+fn held_by_node(v: &mut Value, node: &str) {
+    let report = v
+        .as_object_mut()
+        .and_then(|report| report.remove("store"))
+        .unwrap_or_default();
+    let Some(stores) = v["stores"].as_array_mut() else {
+        return;
+    };
+    for store in stores {
+        if store["node"] != node {
+            store["held_error"] = "said by that node's own vox status".into();
+        } else if let Some(held) = report["held_bytes"].as_u64() {
+            store["held_bytes"] = held.into();
+            store["held_now"] = report["held_now"].clone();
+            store["giving_back"] = report["giving_back"].clone();
+            store["waiting_for_reads"] = report["waiting_for_reads"].clone();
+        } else if report["giving_back"].is_boolean() {
+            store["held_error"] = "not measured yet: a write holds the store".into();
+            store["held_now"] = false.into();
+            store["giving_back"] = report["giving_back"].clone();
+            store["waiting_for_reads"] = report["waiting_for_reads"].clone();
+        } else {
+            store["held_error"] = report["held_error"]
+                .as_str()
+                .unwrap_or("measured once the node is Ready")
+                .into();
+        }
+    }
+}
+
 fn render_stores(v: &Value) -> String {
     use std::fmt::Write as _;
     let Some(stores) = v["stores"].as_array() else {
@@ -141,6 +170,24 @@ fn render_stores(v: &Value) -> String {
             let _ = write!(out, "{bytes} bytes");
         } else {
             let _ = write!(out, "unavailable ({})", s(store, "file_error"));
+        }
+        out.push_str("; holds ");
+        if let Some(bytes) = store["held_bytes"].as_u64() {
+            if store["held_now"] == false {
+                let _ = write!(
+                    out,
+                    "{bytes} bytes when last measured (a write holds the store now)"
+                );
+            } else {
+                let _ = write!(out, "{bytes} bytes");
+            }
+        } else {
+            let _ = write!(out, "unavailable ({})", s(store, "held_error"));
+        }
+        if store["giving_back"] == true {
+            out.push_str("; giving back disk space");
+        } else if store["waiting_for_reads"] == true {
+            out.push_str("; giving back disk space when reads end");
         }
         out.push_str("; free disk: ");
         if let Some(bytes) = store["free_bytes"].as_u64() {
@@ -642,7 +689,14 @@ fn render(v: &Value) -> Result<String, AppError> {
                 n(b, "failures")
             );
         }
-        if let Some(f) = r.get("last_failure").and_then(Value::as_str) {
+        // A failure is named only while it is the peer's latest outcome: once a round with the
+        // peer has ended without error since, `--json` keeps it as `last_failure`, history only.
+        let stands = r.get("last_failure_stands").and_then(Value::as_bool) != Some(false);
+        if let Some(f) = r
+            .get("last_failure")
+            .and_then(Value::as_str)
+            .filter(|_| stands)
+        {
             let _ = write!(o, "; last failure: {f}");
         }
         // A session that runs on: which end opened it, the step it is at and for how long

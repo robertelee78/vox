@@ -187,6 +187,7 @@ impl ChannelState {
             self.dag.feed(author).map_or(0, |feed| feed.max_seq()),
             author,
             required.as_slice(),
+            None,
         )
     }
 
@@ -448,6 +449,9 @@ impl<'r, 'a> AuthoredReach<'r, 'a> {
     }
 }
 
+/// `reserved`: a removal's target. Its latest settled tip keeps one of the sixteen `seen` slots
+/// whatever the other authors' clocks, so the removal's cut is at the tip its author held
+/// (ADR-053 MP-6), never only at the target's last control the context reaches.
 pub(super) fn authored_context(
     read: &entry_store::Read<'_>,
     channel_id: Digest32,
@@ -455,6 +459,7 @@ pub(super) fn authored_context(
     own_seq: u64,
     author: &Digest32,
     required: &[Digest32],
+    reserved: Option<&Digest32>,
 ) -> Result<(ControlContext, Vec<EntryReference>, bool)> {
     if authors.len() > MAX_CONTEXT_AUTHORS {
         return Err(Error::SizeLimitExceeded("local context authors"));
@@ -490,8 +495,16 @@ pub(super) fn authored_context(
             .ok_or_else(|| authored_missing("required governance ancestor missing"))?;
         required_positions.push((required_author, seq));
     }
+    // The test-side attacker: a delegated admin whose removal leaves its target out of `seen`.
+    #[cfg(feature = "test-knobs")]
+    let omitted = reserved.filter(|_| std::env::var_os("VOX_TEST_REMOVAL_OMITS_TARGET").is_some());
+    #[cfg(not(feature = "test-knobs"))]
+    let omitted: Option<&Digest32> = None;
     let mut tips = BTreeMap::new();
-    for other in authors.keys().filter(|other| *other != author) {
+    for other in authors
+        .keys()
+        .filter(|other| *other != author && Some(*other) != omitted)
+    {
         let Some(tip) = read.history_settled_tip(other)? else {
             continue;
         };
@@ -505,13 +518,13 @@ pub(super) fn authored_context(
             (
                 // Only a required position the initial own committed context does not
                 // already reach needs a `seen` slot; covered authors keep ordinary priority.
-                required_positions.iter().any(|(required_author, seq)| {
-                    required_author == other
-                        && !context
-                            .coordinates
-                            .iter()
-                            .any(|coordinate| coordinate.author == *other && coordinate.seq >= *seq)
-                }),
+                Some(other) == reserved
+                    || required_positions.iter().any(|(required_author, seq)| {
+                        required_author == other
+                            && !context.coordinates.iter().any(|coordinate| {
+                                coordinate.author == *other && coordinate.seq >= *seq
+                            })
+                    }),
                 clock,
                 hash,
             ),

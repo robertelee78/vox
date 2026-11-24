@@ -52,22 +52,34 @@ fn read_option(d: &mut Decoder<'_>) -> Result<Option<u64>> {
         _ => Err(invalid("retention optional id")),
     }
 }
+/// Six fields; a message that came back carries a seventh, `1` (ADR-053 MP-11). A fact written
+/// before that, or of any other message, has six and reads as not returned.
 pub(super) fn write_fact(t: Tracked, e: &mut Encoder) {
-    e.array(6).uint(5).uint(t.log_id).uint(t.first_seen_ms);
+    e.array(if t.returned { 7 } else { 6 })
+        .uint(5)
+        .uint(t.log_id)
+        .uint(t.first_seen_ms);
     option(e, t.claimed_ms);
     option(e, t.cache_id);
     e.uint(u64::from(t.steps));
+    if t.returned {
+        e.uint(1);
+    }
 }
-pub(super) fn read_fact(d: &mut Decoder<'_>) -> Result<Tracked> {
+pub(super) fn read_fact(d: &mut Decoder<'_>, arity: usize) -> Result<Tracked> {
     let t = Tracked {
         log_id: d.uint()?,
         first_seen_ms: d.uint()?,
         claimed_ms: read_option(d)?,
         cache_id: read_option(d)?,
         steps: flag(d)?,
+        returned: arity == 7 && flag(d)?,
     };
     if t.log_id == 0 || t.cache_id == Some(0) {
         return Err(invalid("retention zero location"));
+    }
+    if arity == 7 && !t.returned {
+        return Err(invalid("retention returned mark"));
     }
     Ok(t)
 }

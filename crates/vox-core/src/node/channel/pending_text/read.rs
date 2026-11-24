@@ -116,6 +116,7 @@ impl ReadAppend {
                 steps: false,
                 claimed_ms: Some(row.created_millis),
                 cache_id: Some(id),
+                returned: false,
             }),
         )?;
         // This deletes exactly these pending marks in the same transaction as the receipt.

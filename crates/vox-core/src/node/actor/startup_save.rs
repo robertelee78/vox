@@ -188,7 +188,6 @@ fn run(
     argon2: Argon2Profile,
     decisions: &DecisionLog,
     events: &broadcast::Sender<NodeEvent>,
-    startup_work: Option<&(dyn Fn(Option<super::StartupWork>) + Send + Sync)>,
 ) -> (Option<Profile>, std::result::Result<(), Fault>) {
     let waiting = || {
         let _ = events.send(NodeEvent::WaitingForProfile);
@@ -237,37 +236,6 @@ fn run(
                 error => fault_noting(events, "unlock the identity", &error),
             };
             return (Some(profile), Err(fault));
-        }
-        // Only this node's secret_work read lease is held here: no Room, Computer.state,
-        // changes or publications guard. Policy installation takes the computer gate later.
-        let name = profile
-            .paths()
-            .profile_dir
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "<unreadable>".into());
-        if let Err(error) = profile.compact_store(|file, used| {
-            let note = format!(
-                "node {name}: giving back disk space (file {file} bytes, holds {used} bytes); \
-                 this node becomes Ready when compaction finishes"
-            );
-            if let Some(publish) = startup_work {
-                publish(Some(super::StartupWork {
-                    reason: note.clone(),
-                    file_bytes: file,
-                    held_bytes: used,
-                }));
-            }
-            eprintln!("vox daemon: {note}");
-            let _ = events.send(NodeEvent::NodeNote { note });
-        }) {
-            let note =
-                format!("node {name}: store compaction skipped: {error}; continuing startup");
-            eprintln!("vox daemon: {note}");
-            let _ = events.send(NodeEvent::NodeNote { note });
-        }
-        if let Some(publish) = startup_work {
-            publish(None);
         }
     }
     (Some(profile), Ok(()))
@@ -460,7 +428,6 @@ impl Node {
         let paths = self.paths.clone();
         let now = self.now_ms().get();
         let argon2 = self.argon2;
-        let startup_work = self.on_startup_work.clone();
         let decisions = self.decisions.clone();
         let worker_decisions = decisions.clone();
         let events = self.event_tx.clone();
@@ -474,19 +441,12 @@ impl Node {
                 let unlock_decisions = worker_decisions.clone();
                 let unlock_events = events.clone();
                 let (profile, unlocked, secret) = tokio::task::spawn_blocking(move || {
-                    let (profile, unlocked) = run(
-                        work,
-                        paths,
-                        now,
-                        argon2,
-                        &unlock_decisions,
-                        &unlock_events,
-                        startup_work.as_deref(),
-                    );
+                    let (profile, unlocked) =
+                        run(work, paths, now, argon2, &unlock_decisions, &unlock_events);
                     (profile, unlocked, secret)
                 })
                 .await?;
-                // Compaction has finished before either daemon-wide publication guard is taken.
+                // The identity is open before either daemon-wide publication guard is taken.
                 let exclusive = match computer.as_ref() {
                     Some(computer) => Some(Arc::new(computer.publication_transition().await)),
                     None => None,
@@ -713,8 +673,20 @@ impl Node {
         };
         // The secret lease remains held until Ready is published and the command is answered.
         self.publish().await;
+        let ready = matches!(outcome, Outcome::Done);
         if let Some(reply) = pending.reply {
             let _ = reply.send(outcome);
+        }
+        // Once after Ready, beside reads: space the store kept since it last ran (RG-13).
+        if let Some(store) = self
+            .profile
+            .as_ref()
+            .filter(|_| ready)
+            .map(Profile::store_handle)
+        {
+            #[cfg(feature = "test-knobs")]
+            store.hold_read_for_proof();
+            store.give_back_space();
         }
         drop(returned.exclusive);
         drop(returned._secret);

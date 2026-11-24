@@ -1939,7 +1939,7 @@ impl Node {
             }
             (
                 DriveStage::Upgrade,
-                maintenance_save::Saved::Private(Saved::Imported | Saved::Expired),
+                maintenance_save::Saved::Private(Saved::Imported | Saved::Expired { .. }),
             ) => Some((
                 DriveStage::Upgrade,
                 maintenance_save::Work::Private(Work::Upgrade {
