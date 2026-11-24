@@ -109,7 +109,7 @@ impl ChannelState {
         after_departure: bool,
         recover_own: bool,
     ) -> Result<()> {
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         if self.post_pending() {

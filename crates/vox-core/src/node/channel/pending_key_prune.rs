@@ -165,7 +165,7 @@ impl ChannelState {
         trusted: &BTreeSet<Digest32>,
         now: crate::time::Ms,
     ) -> Result<Option<Prepared>> {
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         // Uncommitted ratchets cannot be reconstructed from disk. Their ordinary bounded

@@ -124,7 +124,7 @@ impl ChannelState {
         write: TrustWrite,
     ) -> Result<PendingTrust> {
         let marking = matches!(&write, TrustWrite::MarkDecisions);
-        if self.poisoned && !marking {
+        if self.poisoned.get() && !marking {
             return Err(self.save_failure());
         }
         let mut normal = None;

@@ -631,24 +631,6 @@ impl ChannelState {
         })
     }
 
-    pub(crate) fn recovery_context_allowed(
-        &self,
-        store: &Store,
-        author: &Digest32,
-        context: &Digest32,
-    ) -> Result<bool> {
-        let read = self.history_read(store)?;
-        let Some(id) = read.recovery_context_head(author, context)? else {
-            return Ok(false);
-        };
-        let head = read
-            .history_head(&id)?
-            .ok_or(Error::MalformedAtRest("recovery context head missing"))?;
-        Ok(head.binding.room == self.channel_id
-            && head.binding.author == *author
-            && head.binding.scope == LogScope::Public)
-    }
-
     /// Narrow standing for reconstructing a returning author's own signed prefix and keys.
     /// It is not membership and must never authorize general history, Read, Drive or services.
     pub(crate) fn recovery_standing(&self, store: &Store, author: &Digest32) -> Result<bool> {

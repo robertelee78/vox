@@ -119,7 +119,7 @@ impl Completed {
             }
             if self.poison {
                 if let Err(error) = &self.result {
-                    channel.poisoned = true;
+                    channel.mark_poisoned();
                     channel.save_error = Some(error.to_string());
                 }
             }

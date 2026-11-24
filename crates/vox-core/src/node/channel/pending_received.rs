@@ -86,7 +86,7 @@ impl ChannelState {
         body_expected: bool,
         historical: bool,
     ) -> Result<PendingReceived> {
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         let input = self.history_read(store)?;
@@ -271,7 +271,7 @@ impl ChannelState {
         historical: bool,
         key_body: Option<crate::node::history_stream::KeyBodyNeed>,
     ) -> Result<PendingReceived> {
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         if entry.payload.is_none()

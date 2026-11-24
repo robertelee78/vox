@@ -6,7 +6,7 @@ use crate::node::api::{
     HistoryDemandAction as Action, HistoryDemandPhase as Phase, HistoryDemandStatus as Status,
 };
 use crate::node::channel::legacy_provisional::LegacyProvisionalOwner;
-use crate::node::channel::{entry_store::sparse::ObjectKind, ChannelState};
+use crate::node::channel::{entry_store::sparse::ObjectKind, ChannelState, ServedRoom};
 use crate::node::history_budget::{Job, Lane, Ticket};
 use crate::node::history_demand::{self as demand, Binding, Bounds, Context};
 use crate::node::history_stream::{self as stream, Query, RequestId, Staging};

@@ -68,7 +68,7 @@ impl PageFlow {
         channel.private_sessions.pulling.remove(&peer);
         let page = page?;
         channel.require_governance_ready(store, crate::time::Ms(now))?;
-        if channel.poisoned
+        if channel.poisoned.get()
             || !channel.private_peer_current(store, &peer)?
             || page.revision != revision
             || page.query != PrivateQuery::LiveTail
@@ -328,7 +328,7 @@ impl PageFlow {
         now: crate::time::Ms,
     ) -> Result<PagePreparation> {
         if channel.private_sessions.revision != self.revision
-            || channel.poisoned
+            || channel.poisoned.get()
             || !channel.private_peer_current(store, &self.peer)?
         {
             return Err(Error::StreamRefused(

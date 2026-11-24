@@ -151,7 +151,7 @@ impl ChannelState {
         step: Step,
         now: crate::time::Ms,
     ) -> Result<Option<PendingRetention>> {
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         if self.post_pending() || self.legacy_cache_only(store)? {
@@ -622,7 +622,7 @@ impl ChannelState {
         me: Digest32,
         now: crate::time::Ms,
     ) -> Result<Option<PendingCheckpoint>> {
-        if self.poisoned
+        if self.poisoned.get()
             || !self.governance_display_current(now.get())
             || (self.room_retention() == 0 && self.room_step_retention() == 0)
         {

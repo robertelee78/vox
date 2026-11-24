@@ -595,7 +595,7 @@ impl Completed {
                 .retain_authors(|peer| channel.authors.contains_key(peer));
         }
         if let Some(error) = self.poison {
-            channel.poisoned = true;
+            channel.mark_poisoned();
             channel.save_error = Some(error);
         }
         channel.release_pending_text(&self.pending.owner, false);

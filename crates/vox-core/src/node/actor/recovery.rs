@@ -94,6 +94,7 @@ impl Node {
             let tx = self.net_tx.clone();
             let secret_work = Arc::clone(&self.secret_work);
             // Retire every sync before taking a replacement room from disk.
+            self.serving.retire(id, None);
             for ((room, _), port) in &mut self.ports {
                 if *room == id {
                     port.poisoned = true;

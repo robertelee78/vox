@@ -94,7 +94,7 @@ pub(super) async fn answer(
         let peer = source.peer;
         let check = query.clone();
         let allowed = recovery_source
-            .read(io.job(), 128 * 1024, move |room, store| {
+            .serve_read(io.job(), 128 * 1024, move |room, store| {
                 #[cfg(feature = "test-knobs")]
                 let mutant = crate::node::computer::fx28_mutant("sync-departed-peer")
                     && room.has_left(&peer);
@@ -416,7 +416,7 @@ async fn respond(
                 return Err(Error::MalformedBundle("key availability requires control"));
             }
             let (instance, page) = match source
-                .read(&job, 512 * 1024, move |room, store| {
+                .serve_read(&job, 512 * 1024, move |room, store| {
                     Ok(Some((
                         room.history_instance(store)?,
                         room.history_key_available_page(store, after)?,
@@ -449,7 +449,7 @@ async fn respond(
             // Only a Control Head is a role receipt; Live Head is commitment discovery.
             let receipt = preamble.purpose == Purpose::Control && author == source.peer;
             let found = source
-                .read(&job, 128 * 1024, move |room, store| {
+                .serve_read(&job, 128 * 1024, move |room, store| {
                     let Some(head) = (if receipt {
                         room.history_role_head(store, &author)?
                     } else {
@@ -503,7 +503,7 @@ async fn respond(
         }
         Query::Context(hash) => {
             let found = source
-                .read(&job, 2 * MIB, move |room, store| {
+                .serve_read(&job, 2 * MIB, move |room, store| {
                     room.history_context(store, &hash)
                 })
                 .await?;
@@ -544,7 +544,7 @@ async fn respond(
             let work_job = resolved.job();
             let resolved = resolved.value;
             let found = source
-                .read(&work_job, 128 * 1024, move |room, store| {
+                .serve_read(&work_job, 128 * 1024, move |room, store| {
                     Ok(room
                         .history_proof_header(store, &resolved, seq)?
                         .map(|header| (resolved, header)))
@@ -867,7 +867,7 @@ async fn entry(
                 return Err(Error::Profile("history entry without a resolved head"));
             };
             let provider_head = match source
-                .read(&job, 128 * 1024, move |room, store| {
+                .serve_read(&job, 128 * 1024, move |room, store| {
                     let read = room.history_read(store)?;
                     Ok(read
                         .history_validated_header(&author, seq)?
@@ -883,7 +883,7 @@ async fn entry(
                 Lookup::Missing => return Ok(result),
             };
             provider = match source
-                .read(&job, 128 * 1024, move |room, store| {
+                .serve_read(&job, 128 * 1024, move |room, store| {
                     Ok(room
                         .history_head_by_id(store, &provider_head)?
                         .map(|head| ResolvedTarget::exact(&head)))
@@ -909,7 +909,7 @@ async fn entry(
     }
     let author = target.target.binding.author;
     let header = match source
-        .read(&job, 128 * 1024, move |room, store| {
+        .serve_read(&job, 128 * 1024, move |room, store| {
             room.history_header(store, &author, seq)
         })
         .await?
@@ -968,7 +968,7 @@ async fn entry(
         let peer = source.peer;
         let header = parsed.clone();
         match source
-            .read(&job, 128 * 1024, move |room, store| {
+            .serve_read(&job, 128 * 1024, move |room, store| {
                 Ok(Some(
                     room.recipient_body_eligibility(store, &peer, &header)?,
                 ))
@@ -1000,7 +1000,7 @@ async fn entry(
     let live = if preamble.purpose == Purpose::Live {
         let through = target.target.root.leaves;
         let latest = source
-            .read(&job, 128 * 1024, move |room, store| {
+            .serve_read(&job, 128 * 1024, move |room, store| {
                 Ok(Some(room.history_head(store, &author)?.is_some_and(
                     |current| {
                         let bound = crate::log::history::MAX_PAGE_ENTRIES as u64;

@@ -11,7 +11,7 @@ mod member_fold;
 mod sparse;
 mod view;
 pub(in crate::node::channel) use view::{
-    ConsentFacts, SemanticState, SemanticWork, PAGE_ROWS, REFRESHING,
+    recipient_body_eligibility_at, ConsentFacts, SemanticState, SemanticWork, PAGE_ROWS, REFRESHING,
 };
 
 pub(crate) use sparse::{

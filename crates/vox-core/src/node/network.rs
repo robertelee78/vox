@@ -637,6 +637,8 @@ pub struct NodeNet {
     /// invalid". **Such a refusal from a board still untold is asked again once it is told**
     /// ([`BOARD_TOLD_PATIENCE`]); a board that already knows this node is asked at once, as before.
     untold: Arc<Mutex<HashSet<Digest32>>>,
+    /// The rooms whose members' history requests each connection's own task answers.
+    serving: Option<Arc<crate::node::history_stream::Serving>>,
 }
 
 /// Which room a new helper operation serves. A join may use its exact link routes before
@@ -757,6 +759,7 @@ impl NodeNet {
             policy: SharedPolicy::new(),
             clock,
             untold: Arc::new(Mutex::new(HashSet::new())),
+            serving: None,
         })
     }
 
@@ -809,6 +812,16 @@ impl NodeNet {
     /// [`crate::nat::service::RendezvousService::on_admitted`] for why this seam exists.
     pub fn on_board_growth(&mut self, hook: crate::nat::service::AdmittedHook) {
         self.service.on_admitted(hook);
+    }
+
+    /// Answer members' history requests on each connection's own task from these rooms. Set
+    /// before this is shared, like [`Self::on_board_growth`].
+    pub(crate) fn serve_history(&mut self, serving: Arc<crate::node::history_stream::Serving>) {
+        self.serving = Some(serving);
+    }
+
+    pub(crate) fn serving(&self) -> Option<&Arc<crate::node::history_stream::Serving>> {
+        self.serving.as_ref()
     }
 
     /// Be told when a signed withdraw takes records off this node's board (V030-14). Set before
@@ -2661,6 +2674,33 @@ impl NodeNet {
         let store = self.service.store();
         let guard = store.lock().unwrap_or_else(PoisonError::into_inner);
         guard.bundle(channel_id, epoch, author, now).is_some()
+    }
+
+    /// This node's own live records for `(channel, epoch)` on its own board, as wire frames: the
+    /// bundle first, then the address record, whose key a board that does not know `me` yet takes
+    /// from that bundle. Put on a peer's board before the first request of a connection for the
+    /// room (ledger 91).
+    pub(crate) fn own_board_records(
+        &self,
+        channel_id: &Digest32,
+        epoch: u64,
+        me: &Digest32,
+    ) -> Vec<Vec<u8>> {
+        let now = self.now_ms();
+        let store = self.service.store();
+        let guard = store.lock().unwrap_or_else(PoisonError::into_inner);
+        guard
+            .bundle(channel_id, epoch, me, now)
+            .map(MemberBundleRecord::to_wire)
+            .into_iter()
+            .chain(
+                guard
+                    .current_members(channel_id, epoch, now)
+                    .into_iter()
+                    .filter(|record| record.author_id == *me)
+                    .map(|record| record.to_wire()),
+            )
+            .collect()
     }
 
     /// Every *other* member's live records this node's board holds for `(channel,

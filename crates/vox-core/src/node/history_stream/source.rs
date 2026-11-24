@@ -17,7 +17,9 @@ use crate::log::history::{
     Descriptor, HeadTarget, InclusionProof, MAX_CONTROL_HEADERS, MAX_PROOF_TOKENS, MAX_TREE_DEPTH,
 };
 use crate::node::channel::pending_text::PENDING_WRITE_WAIT;
-use crate::node::channel::{ChannelState, ResolvedTarget};
+use crate::node::channel::{
+    ChannelState, ResolvedTarget, RoomSnapshot, RoomSnapshotCell, ServedRoom,
+};
 use crate::node::history_budget::{BufferCharge, Job};
 use crate::node::store::Store;
 use crate::transport::stream_transport::Fence;
@@ -127,6 +129,8 @@ pub(super) struct Source {
     own_recovery: bool,
     work_committed: Arc<AtomicBool>,
     retirement_request: Option<RequestId>,
+    /// An answer to a peer reads the room's published snapshot, never the room itself.
+    snapshot: Option<Arc<RoomSnapshotCell>>,
 }
 
 impl Source {
@@ -263,9 +267,135 @@ impl Source {
             own_recovery: false,
             work_committed,
             retirement_request,
+            snapshot: None,
         }
     }
 
+    /// Answer a peer from the room's published snapshot (see [`RoomSnapshot`]): its reads of
+    /// headers, proofs and bodies wait on neither the room's lock, the actor nor this node's own
+    /// pending save. Served inventory still takes the store's writer
+    /// ([`Self::flush_authors_before_ack`], a changed decline's forget).
+    pub(super) fn serving(mut self, snapshot: Arc<RoomSnapshotCell>) -> Self {
+        self.snapshot = Some(snapshot);
+        self
+    }
+
+    /// The access a served read requires, decided on the room's published snapshot; the
+    /// peer's applied removal is read in the store, as the room-locked check read it.
+    fn snapshot_access(&self, snapshot: &RoomSnapshot) -> Result<()> {
+        let peer = &self.peer;
+        let departed_receipt =
+            self.own_head_receipt && snapshot.is_author(peer) && snapshot.has_left(peer);
+        let recovery = self.own_recovery && snapshot.recovery_standing(peer);
+        #[cfg(feature = "test-knobs")]
+        let mutant =
+            crate::node::computer::fx28_mutant("sync-departed-peer") && snapshot.has_left(peer);
+        #[cfg(not(feature = "test-knobs"))]
+        let mutant = false;
+        if snapshot.epoch() != self.epoch
+            || (!mutant && !snapshot.is_member(peer) && !departed_receipt && !recovery)
+            || snapshot.peer_removal_applied(&self.store, peer)?
+        {
+            return Err(Error::Unreachable("history room access changed"));
+        }
+        Ok(())
+    }
+
+    /// One served read: through the room's published snapshot when answering a peer, through
+    /// the room for a client's own flow.
+    pub(super) async fn serve_read<T, F>(
+        &self,
+        job: &Job,
+        envelope: usize,
+        read: F,
+    ) -> Result<Lookup<T>>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut dyn ServedRoom, &Store) -> Result<Option<T>> + Send + 'static,
+    {
+        self.serve_read_charged(job, envelope, DIRECTORY_ENVELOPE, read)
+            .await
+    }
+
+    /// `VOX_MUTANT_SERVE_WAITS_ON_ROOM` (test-knobs): a served read goes back through the room's
+    /// lock and stands aside for this node's own pending save as before this change, answering
+    /// Busy past the old cap. `true` = answer Busy.
+    async fn room_wait_mutant(&self) -> Result<bool> {
+        #[cfg(feature = "test-knobs")]
+        if std::env::var_os("VOX_MUTANT_SERVE_WAITS_ON_ROOM").is_some() {
+            let cap = Instant::now() + PENDING_WRITE_WAIT;
+            loop {
+                let room = self.room.lock().await;
+                if !room.post_pending() {
+                    return Ok(false);
+                }
+                let wake = room.history_publication_wake();
+                drop(room);
+                tokio::select! {
+                    () = tokio::time::sleep_until(cap) => {
+                        eprintln!("vox: VOX_MUTANT_SERVE_WAITS_ON_ROOM answered busy");
+                        return Ok(true);
+                    }
+                    () = wake => {}
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    async fn serve_read_charged<T, F>(
+        &self,
+        job: &Job,
+        envelope: usize,
+        temporary: usize,
+        read: F,
+    ) -> Result<Lookup<T>>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut dyn ServedRoom, &Store) -> Result<Option<T>> + Send + 'static,
+    {
+        let Some(cell) = self.snapshot.as_ref() else {
+            return self
+                .read_charged(
+                    job,
+                    envelope,
+                    temporary,
+                    ReadBoundary::Observing,
+                    move |room, store| read(room, store),
+                )
+                .await;
+        };
+        self.current()?;
+        if self.room_wait_mutant().await? {
+            return Ok(Lookup::Busy);
+        }
+        let admission = match self.reserve_read(job, envelope, temporary).await {
+            Ok(Some(admission)) => admission,
+            Ok(None) | Err(Error::HistoryCapacity(_)) => return Ok(Lookup::Busy),
+            Err(error) => return Err(error),
+        };
+        let snapshot = cell
+            .current()
+            .ok_or(Error::Unreachable("history room access changed"))?;
+        let source = self.clone();
+        // The blocking reader owns both charges; a dropped waiter cannot free them early.
+        tokio::task::spawn_blocking(move || {
+            let PreparedRead { charge, scratch } = admission;
+            source.current()?;
+            source.snapshot_access(&snapshot)?;
+            let value = snapshot.with(|view| read(view, &source.store))?;
+            drop(scratch);
+            Ok(match value {
+                Some(value) => Lookup::Found(Held {
+                    value,
+                    _charge: charge,
+                }),
+                None => Lookup::Missing,
+            })
+        })
+        .await
+        .map_err(|_| Error::Unreachable("history disk reader stopped"))?
+    }
     /// Record user-visible history work at the commit edge, independently of whether the
     /// surrounding exchange is later cancelled, superseded, retired or rejected.
     pub(super) fn note_work_committed(&self) {
@@ -401,13 +531,13 @@ impl Source {
     ) -> Result<Lookup<T>>
     where
         T: Send + 'static,
-        F: FnOnce(&mut ChannelState, &Store) -> Result<Option<T>> + Send + 'static,
+        F: FnOnce(&mut dyn ServedRoom, &Store) -> Result<Option<T>> + Send + 'static,
     {
         let temporary = envelope
             .checked_sub(retained)
             .filter(|temporary| *temporary >= DIRECTORY_ENVELOPE)
             .ok_or(Error::SizeLimitExceeded("history body envelope"))?;
-        self.read_charged(job, retained, temporary, ReadBoundary::Observing, read)
+        self.serve_read_charged(job, retained, temporary, read)
             .await
     }
 
@@ -1009,7 +1139,7 @@ impl Source {
 
     pub(super) async fn authorize(&self, job: &Job) -> Result<bool> {
         Ok(matches!(
-            self.read_charged(job, 0, 0, ReadBoundary::Observing, |_, _| Ok(Some(())))
+            self.serve_read_charged(job, 0, 0, |_, _| Ok(Some(())))
                 .await?,
             Lookup::Found(_)
         ))
@@ -1033,7 +1163,7 @@ impl Source {
         // The P guards' forked provider (test-knobs; always false otherwise).
         let fork = crate::node::channel::bad_prefix("fork");
         let found = self
-            .read(job, 128 * 1024, move |room, store| {
+            .serve_read(job, 128 * 1024, move |room, store| {
                 let read = room.history_read(store)?;
                 let id = target.id();
                 if read.history_head_committed(&id, target.binding)? {
@@ -1129,54 +1259,62 @@ impl Source {
         leaves: u64,
     ) -> Result<Lookup<Descriptor>> {
         let mut cursor = crate::node::channel::ProofRangeRestore::new(target, start, leaves)?;
+        // A client building its own proof reads the same published snapshot of its room.
+        let cell = match &self.snapshot {
+            Some(cell) => Arc::clone(cell),
+            None => self.room.lock().await.room_snapshot(),
+        };
         loop {
             self.current()?;
-            let peer = self.peer;
-            let authorization = self.authorization;
-            // One bounded physical step: Directory scratch is separately reserved by read;
-            // this envelope covers the two contexts/join/encoded context and scalar DFS.
-            let step = self
-                .write_owned(
+            if self.room_wait_mutant().await? {
+                return Ok(Lookup::Busy);
+            }
+            // One bounded physical step: Directory scratch is separately reserved; this
+            // envelope covers the two contexts/join/encoded context and scalar DFS.
+            let Some(admission) = self
+                .reserve_read(
                     job,
-                    (
-                        crate::node::channel::ProofRangeRestore::WORK_BYTES,
-                        DIRECTORY_ENVELOPE,
-                        false,
-                    ),
-                    move |room, store| {
-                        let pending =
-                            room.prepare_proof_range(store, peer, &cursor, authorization)?;
-                        Ok((cursor, pending))
-                    },
-                    move |(mut cursor, pending), store| {
-                        let step = pending.advance(store, &mut cursor)?;
-                        Ok((cursor, step))
-                    },
-                    |_, _, value| Ok(value),
+                    crate::node::channel::ProofRangeRestore::WORK_BYTES,
+                    DIRECTORY_ENVELOPE,
                 )
-                .await?;
-            let Lookup::Found(step) = step else {
-                return Ok(match step {
-                    Lookup::Busy => Lookup::Busy,
-                    _ => Lookup::Missing,
-                });
+                .await?
+            else {
+                return Ok(Lookup::Busy);
             };
-            let (next, outcome) = step.value;
+            let snapshot = cell
+                .current()
+                .ok_or(Error::Unreachable("history room access changed"))?;
+            let source = self.clone();
+            let (next, outcome, charge) = tokio::task::spawn_blocking(move || {
+                let PreparedRead { charge, scratch } = admission;
+                source.current()?;
+                source.snapshot_access(&snapshot)?;
+                let step = crate::node::channel::serve_proof_range(
+                    &snapshot,
+                    &source.store,
+                    source.peer,
+                    &mut cursor,
+                )?;
+                drop(scratch);
+                Ok::<_, Error>((cursor, step, charge))
+            })
+            .await
+            .map_err(|_| Error::Unreachable("history disk reader stopped"))??;
             cursor = next;
             match outcome {
                 crate::node::channel::ProofRangeStep::Complete(value) => {
                     return Ok(Lookup::Found(Held {
                         value,
-                        _charge: step._charge,
+                        _charge: charge,
                     }));
                 }
                 crate::node::channel::ProofRangeStep::Missing => return Ok(Lookup::Missing),
                 crate::node::channel::ProofRangeStep::Busy => return Ok(Lookup::Busy),
                 crate::node::channel::ProofRangeStep::Progress => {}
             }
-            // The worker, RoomMutex, snapshot and decode buffers have actually dropped.
-            // Same request/Job remains owned; this is not a second admission or a timer retry.
-            drop(step._charge);
+            // The worker, snapshot read and decode buffers have actually dropped. Same
+            // request/Job remains owned; this is not a second admission or a timer retry.
+            drop(charge);
             tokio::task::yield_now().await;
         }
     }
@@ -1344,7 +1482,7 @@ impl Source {
                     }
                     let author = head.binding.author;
                     let found = self
-                        .read(job, 128 * 1024, move |room, store| {
+                        .serve_read(job, 128 * 1024, move |room, store| {
                             room.history_header(store, &author, start)?
                                 .map(|header| Entry::from_wire(&header.wire))
                                 .transpose()
@@ -1512,7 +1650,7 @@ impl Source {
         for _ in 0..=crate::log::history::MAX_CONTEXT_AUTHORS / 64 {
             self.current()?;
             let page = self
-                .read(job, 64 * 1024, move |room, store| {
+                .serve_read(job, 64 * 1024, move |room, store| {
                     room.history_head_hints(store, after)
                         .map(|page| Some((room.channel_id(), page)))
                 })
@@ -1534,7 +1672,7 @@ impl Source {
                 None => {
                     let peer = self.peer;
                     let role = match self
-                        .read(job, 128 * 1024, move |room, store| {
+                        .serve_read(job, 128 * 1024, move |room, store| {
                             let owner = room.role_owed();
                             let role =
                                 room.history_role_head(store, &peer)?
@@ -1563,7 +1701,7 @@ impl Source {
                         Lookup::Busy | Lookup::Missing => return Ok(Lookup::Busy),
                     };
                     let (key_catalog, catalog_announcement) = match self
-                        .read(job, 128 * 1024, move |room, store| {
+                        .serve_read(job, 128 * 1024, move |room, store| {
                             let instance = room.history_instance(store)?;
                             let tip = room.history_read(store)?.key_package_tip()?;
                             let owner = room.role_owed();
@@ -1583,8 +1721,8 @@ impl Source {
                     }
                     self.flush_authors_before_ack(room_id, authors).await?;
                     let Lookup::Found(availability) = self
-                        .read(job, 0, move |room, _| {
-                            Ok(Some(room.availability_peer(peer, None)?.local()))
+                        .serve_read(job, 0, move |room, _| {
+                            Ok(Some(room.availability_peer(peer)?.local()))
                         })
                         .await?
                     else {
@@ -1615,9 +1753,8 @@ impl Source {
     ) -> Result<()> {
         let peer = self.peer;
         match self
-            .read(job, 0, move |room, _| {
-                room.availability_peer(peer, None)?
-                    .observe(connection, token);
+            .serve_read(job, 0, move |room, _| {
+                room.availability_peer(peer)?.observe(connection, token);
                 Ok(Some(()))
             })
             .await?
@@ -1644,7 +1781,7 @@ impl Source {
         let peer = self.peer;
         let epoch = self.epoch;
         let current = self
-            .read(job, 128, move |room, store| {
+            .serve_read(job, 128, move |room, store| {
                 if room.channel_id() != room_id || room.me() != author {
                     return Err(Error::MalformedBundle("history role hint binding"));
                 }
@@ -1697,7 +1834,7 @@ impl Source {
         }
         let peer = self.peer;
         match self
-            .read(job, 128, move |room, _store| {
+            .serve_read(job, 128, move |room, _store| {
                 room.role_owed()
                     .observe_key_catalog(peer, instance, tip, connection_serial);
                 Ok(Some(()))
@@ -1866,7 +2003,7 @@ impl Source {
                 + std::mem::size_of::<Digest32>())
             + std::mem::size_of::<usize>();
         let filtered = self
-            .read(job, output_envelope, move |room, store| {
+            .serve_read(job, output_envelope, move |room, store| {
                 let _input_charge = input_charge;
                 if room.channel_id() != room_id {
                     return Err(Error::MalformedBundle("inventory room binding"));

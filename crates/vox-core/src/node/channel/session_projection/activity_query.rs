@@ -419,7 +419,7 @@ impl ChannelState {
         now: u64,
     ) -> std::result::Result<Reply, String> {
         let resource = self.history_read_resource();
-        if self.poisoned
+        if self.poisoned.get()
             && !resource
                 .as_ref()
                 .is_some_and(|read| read.has_pending_snapshot())

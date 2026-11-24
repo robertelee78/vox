@@ -1630,6 +1630,7 @@ fn finish_connection(
         tunnels: Arc::new(Mutex::new(0)),
         dropped: None,
         tracked: None,
+        introduced: Mutex::new(std::collections::BTreeSet::new()),
     })
 }
 
@@ -1707,6 +1708,9 @@ pub struct VoxConnection {
     dropped: Option<tokio::sync::oneshot::Sender<()>>,
     /// Its entry in the endpoint's per-node list, taken out when this is dropped.
     tracked: Option<Tracked>,
+    /// The rooms whose request streams the peer has answered on this connection: it knows this
+    /// node there, so later requests open without this node's board record (ledger 91).
+    introduced: Mutex<std::collections::BTreeSet<Digest32>>,
 }
 
 impl Drop for VoxConnection {
@@ -2286,6 +2290,20 @@ impl VoxConnection {
     /// Whether this exact authenticated TLS connection negotiated availability notifications.
     pub(crate) fn supports_availability(&self) -> bool {
         self.availability
+    }
+    /// Whether the peer answered a request of this node's for `room` on this connection.
+    pub(crate) fn introduced(&self, room: &Digest32) -> bool {
+        lock(&self.introduced).contains(room)
+    }
+    /// The peer answered a request for `room`, or (`known` false) refused this node as one it
+    /// does not know, after which requests open with the board record again.
+    pub(crate) fn note_introduced(&self, room: Digest32, known: bool) {
+        let mut introduced = lock(&self.introduced);
+        if known {
+            introduced.insert(room);
+        } else {
+            introduced.remove(&room);
+        }
     }
 
     /// Whether this exact authenticated TLS connection negotiated own-key recovery.

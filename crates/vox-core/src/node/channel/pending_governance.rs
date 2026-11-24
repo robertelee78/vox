@@ -126,7 +126,7 @@ impl ChannelState {
         work: Work,
         now: crate::time::Ms,
     ) -> Result<Option<Prepared>> {
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         let native = match work {

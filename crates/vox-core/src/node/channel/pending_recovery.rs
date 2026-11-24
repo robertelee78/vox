@@ -252,7 +252,7 @@ impl ChannelState {
         now: crate::time::Ms,
         peers: impl FnOnce() -> Vec<(Digest32, Option<(u64, crate::node::ports::OwnProbe)>)>,
     ) -> Result<bool> {
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         let sparse = self.uses_sparse_history(store)?;

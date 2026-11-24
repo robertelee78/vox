@@ -207,7 +207,7 @@ impl ChannelState {
         if !self.private_policy_ready(store, now.get())? {
             return Ok(Preparation::Waiting(UpgradeWait::Governance));
         }
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         if self.private_sessions.upgrading {
@@ -275,7 +275,7 @@ impl ChannelState {
         now: crate::time::Ms,
         authority: Option<TrustNonce>,
     ) -> Result<Box<PendingUpgrade>> {
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         self.require_governance_ready(store, now)?;
@@ -1699,7 +1699,7 @@ impl ChannelState {
         owner: Arc<()>,
         now: crate::time::Ms,
     ) -> Result<Box<PendingUpgrade>> {
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         let replay = (|| {
@@ -1724,7 +1724,7 @@ impl ChannelState {
         now: crate::time::Ms,
     ) -> Result<Box<PendingUpgrade>> {
         self.require_governance_ready(store, now)?;
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         if wire.len() > crate::node::sessionstream::MAX_RECORD {
@@ -1740,7 +1740,7 @@ impl ChannelState {
         hash: Digest32,
         now: crate::time::Ms,
     ) -> Result<Box<PendingUpgrade>> {
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         self.prepare_private_component(
@@ -1765,7 +1765,7 @@ impl ChannelState {
         let (peer, cursor, revision, authority, blocked, gap, unknown, gap_stamp, opening_basis) =
             request;
         self.require_governance_ready(store, now)?;
-        if self.poisoned
+        if self.poisoned.get()
             || self.private_sessions.revision != revision
             || !self.private_peer_current(store, &peer)?
         {
@@ -1887,7 +1887,7 @@ impl ChannelState {
         now: crate::time::Ms,
     ) -> Result<Box<PendingUpgrade>> {
         self.require_governance_ready(store, now)?;
-        if self.poisoned
+        if self.poisoned.get()
             || self.private_sessions.revision != revision
             || !self.private_peer_current(store, &peer)?
             || selected.query != page.query
