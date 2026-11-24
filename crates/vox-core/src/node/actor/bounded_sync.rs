@@ -252,6 +252,24 @@ fn fetch_discard_mutant() -> bool {
     *ON
 }
 
+/// `VOX_MUTANT_PARKED_FLOW_KEEPS_READY`: a flow parked in the ready position for one member keeps
+/// every other member's Public and Archive work waiting until that member's own port starts, as
+/// before ledger 78 (only Private was moved aside). Says so once on stderr when first read.
+#[cfg(feature = "test-knobs")]
+fn parked_flow_keeps_ready_mutant() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let on = std::env::var_os("VOX_MUTANT_PARKED_FLOW_KEEPS_READY").is_some();
+        if on {
+            eprintln!(
+                "vox: VOX_MUTANT_PARKED_FLOW_KEEPS_READY engaged: a parked flow keeps the ready \
+                 position from every other member"
+            );
+        }
+        on
+    });
+    *ON
+}
+
 fn retirement_key(flow: &Flow) -> RetirementKey {
     RetirementKey {
         actor: flow.actor_incarnation(),
@@ -4313,15 +4331,31 @@ impl Node {
         }
         self.bounded_sync
             .prioritize_control_admission_owner(room, peer, service);
-        // A parked Private continuation owns its exact port, not every Private port.
-        // Keep it whole in the bounded queue before selecting this port's retained owner.
-        if service == OutboundService::Private
+        // A parked continuation owns its exact port, not every port of its service: a flow
+        // parked for one member (stopped since, or backing off) must not keep every other
+        // member's work waiting until that member's own port starts again (ledger 78). Keep it
+        // whole in the bounded queue, ahead of its own port's other parked flows, where that
+        // port's next start promotes it; then select this port's retained owner.
+        #[cfg(feature = "test-knobs")]
+        let displace = service == OutboundService::Private || !parked_flow_keeps_ready_mutant();
+        #[cfg(not(feature = "test-knobs"))]
+        let displace = true;
+        if displace
             && self.bounded_sync.ready[ready_index]
                 .as_ref()
                 .is_some_and(|flow| flow.room != room || flow.peer != peer)
         {
             if let Some(flow) = self.bounded_sync.ready[ready_index].take() {
-                self.bounded_sync.deferred.push_back(flow);
+                let deferred = &mut self.bounded_sync.deferred;
+                let at = deferred
+                    .iter()
+                    .position(|other| {
+                        other.room == flow.room
+                            && other.peer == flow.peer
+                            && other.service == flow.service
+                    })
+                    .unwrap_or(deferred.len());
+                deferred.insert(at, flow);
             }
         }
         if self.bounded_sync.ready[ready_index]

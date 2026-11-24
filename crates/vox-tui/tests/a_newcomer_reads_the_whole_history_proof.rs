@@ -10120,6 +10120,15 @@ fn a_newcomer_shows_nothing_a_holder_serves_with_a_corrupt_control_proof() {
     rg1::holder_serves_a_prefix_it_never_committed(rg1::Provider::CorruptControl);
 }
 
+/// Ledger 78 (A): a member that posted and stopped comes back to a reader whose request for that
+/// post went on to another member, stopped since; the reader reads the returning member at once.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "three real daemons, a stopped holder and a returning author; optional"]
+fn a_returning_author_is_read_while_the_member_its_reader_asked_is_stopped() {
+    rg1::returning_author_read_while_its_holder_is_stopped();
+}
+
 #[cfg(feature = "optional-proofs")]
 #[path = "support/port_forward.rs"]
 mod port_forward;
@@ -11925,6 +11934,291 @@ mod rg1 {
                 report["lanes"]
             );
             std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    /// Ledger 78 (A)'s mutant: a flow parked in the node's ready position for one member keeps
+    /// every other member's new work waiting until that member's own port starts, as on main.
+    const OFFLINE_SLOT_MUTANT: &str = "VOX_MUTANT_PARKED_FLOW_KEEPS_READY";
+
+    fn wait_shown(w: &Worker, id: &str, text: &str, why: &str) {
+        let staging = Instant::now();
+        while !read(w, id, Some(text)).0.contains(text) {
+            if staging.elapsed() > Duration::from_secs(240) {
+                let full = report(w);
+                panic!(
+                    "APPARATUS: {} never showed {text:?} ({why}); its rooms: {}; its lanes: {}",
+                    w.name, full["rooms"], full["lanes"]
+                );
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    /// The whole `vox status --json` answer.
+    fn report(w: &Worker) -> Value {
+        let out = w.vox(None, &["status", "--json"]);
+        assert!(out.ok, "RED PRODUCT: {}'s status refused: {out:?}", w.name);
+        out.json()
+    }
+
+    /// The bounded flows (`lanes.bounded` `ready`, `running`, `deferred`) owed to `peer`.
+    fn flows_for(report: &Value, peer: &str, lists: &[&str]) -> Vec<Value> {
+        lists
+            .iter()
+            .filter_map(|list| report["lanes"]["bounded"][*list].as_array())
+            .flatten()
+            .filter(|flow| flow["peer"].as_str() == Some(peer))
+            .cloned()
+            .collect()
+    }
+
+    /// Ledger 78 (A): a member posts, stops, and comes back to a reader whose request for that
+    /// post went to another member that has stopped since. The reader asked the holder for the
+    /// author's post; the holder answered it does not have the evidence
+    /// (`VOX_TEST_UNAVAILABLE_HEAD_FILE` names the author and the reader on the holder only), so
+    /// the reader routed the request to the stopped author. The holder stops; the author comes
+    /// back and posts again. Its turn returns the request's flow to the stopped holder, where it
+    /// parks in the reader's one live position. Main then left the author's new posts unasked
+    /// until the holder came back. GREEN when the reader shows both of the author's posts. RED
+    /// when, in three status answers in a row, the reader is connected to the author, wants it
+    /// (`needs`), holds the same verified position below the author's advertised one with no
+    /// round toward it completed, and has no flow of the author ready or running. Mutant:
+    /// `VOX_MUTANT_PARKED_FLOW_KEEPS_READY`.
+    pub(super) fn returning_author_read_while_its_holder_is_stopped() {
+        let mutant = std::env::var_os(OFFLINE_SLOT_MUTANT).is_some();
+        let root = root();
+        let exe = binary();
+        let mut knobs = vec!["VOX_TEST_UNAVAILABLE_HEAD_FILE"];
+        if mutant {
+            knobs.push(OFFLINE_SLOT_MUTANT);
+        }
+        crate::test_knobs::require_in(&exe, &knobs);
+        let author = room::worker_as(root.path(), "back-author", &exe);
+        let holder = room::worker_as(root.path(), "back-holder", &exe);
+        let reader = room::worker_as(root.path(), "back-reader", &exe);
+        let refusal = root.path().join("holder-refuses-the-author-head");
+        let author_daemon = start(&author, "127.0.0.1:0", None);
+        let holder_daemon = start_with(
+            &holder,
+            "127.0.0.1:0",
+            None,
+            &[("VOX_TEST_UNAVAILABLE_HEAD_FILE", refusal.clone())],
+        );
+        let reader_daemon = start(&reader, "127.0.0.1:0", None);
+        for w in [&author, &holder, &reader] {
+            for peer in [&author, &holder, &reader] {
+                if w.name != peer.name {
+                    w.vox_env(
+                        None,
+                        &[("VOX_IDENTITY_PASSPHRASE", room::ID_PASS)],
+                        &["trust", "add", &peer.b32(), "--name", &peer.name],
+                        None,
+                    )
+                    .expect_ok("trust before the room");
+                }
+            }
+        }
+        let id = create(&author);
+        let link = author.vox(None, &["room", "link", &id]);
+        link.expect_ok("author room link");
+        for w in [&holder, &reader] {
+            w.vox_in(
+                None,
+                &["room", "join", "--passphrase-file", "-", link.stdout.trim()],
+                Some(room::ROOM_PASS),
+            )
+            .expect_ok("member joins the author's room");
+            returning_reader_ready(w, &id);
+        }
+        post(&author, &id, "BACK-FIRST", true);
+        wait_shown(&holder, &id, "BACK-FIRST", "before the staging");
+        wait_shown(&reader, &id, "BACK-FIRST", "before the staging");
+        // The author posts while the reader is stopped, and stops once the holder shows it. The
+        // post waits until the holder shows the reader gone, so the holder's fetch of it does not
+        // run in the same instant as the reader's connection closing (in every run before this
+        // wait the post reached the holder 0.05-0.25 s after that close).
+        reader_daemon.stop();
+        let staging = Instant::now();
+        while member(&status(&holder, &id), &reader.b32())
+            .is_some_and(|row| row["connected"] == true)
+        {
+            assert!(
+                staging.elapsed() < Duration::from_secs(240),
+                "APPARATUS: the holder never saw the reader stop"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        post(&author, &id, "BACK-BEFORE", true);
+        wait_shown(&holder, &id, "BACK-BEFORE", "the post the reader missed");
+        author_daemon.stop();
+        std::fs::write(&refusal, format!("{} {}\n", author.b32(), reader.b32()))
+            .expect("APPARATUS: write the holder's refusal");
+        let _reader_daemon = start(&reader, "127.0.0.1:0", None);
+        returning_reader_ready(&reader, &id);
+        // The reader learns of the author's post from the holder alone and is refused it there;
+        // its request now waits for the stopped author. The holder then stops, and the request
+        // must still wait for the author once the reader sees the holder gone. It does not when
+        // the refusal came over a connection the two then retired for a newer one (both dial at
+        // the reader's start): the closing connection re-arms the refusal and the request goes
+        // back to the holder (seen in actA3 and actA4 on main, "history rearm retained"). Then
+        // the holder is started again, refuses again, and is stopped again; at most three times.
+        let mut holder_daemon = holder_daemon;
+        let mut attempt = 1;
+        loop {
+            let staging = Instant::now();
+            loop {
+                let routed = flows_for(&report(&reader), &author.b32(), &["deferred"]);
+                if !routed.is_empty() {
+                    eprintln!(
+                        "[ledger 78 A] attempt {attempt}: the reader's request waits for the \
+                         author: {routed:?}"
+                    );
+                    break;
+                }
+                assert!(
+                    staging.elapsed() < Duration::from_secs(240),
+                    "APPARATUS: the reader never routed its request to the stopped author: {}",
+                    report(&reader)["lanes"]["bounded"]
+                );
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            holder_daemon.stop();
+            let staging = Instant::now();
+            while member(&status(&reader, &id), &holder.b32())
+                .is_some_and(|row| row["connected"] == true)
+            {
+                assert!(
+                    staging.elapsed() < Duration::from_secs(240),
+                    "APPARATUS: the reader never saw the holder stop"
+                );
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            let bounded = report(&reader)["lanes"]["bounded"].clone();
+            if bounded["deferred"]
+                .as_array()
+                .is_some_and(|flows| flows.iter().any(|flow| flow["peer"] == author.b32()))
+            {
+                break;
+            }
+            assert!(
+                attempt < 3,
+                "APPARATUS: in three attempts the reader's request never still waited for the \
+                 author once the holder stopped; bounded flows: {bounded}"
+            );
+            eprintln!(
+                "[ledger 78 A] attempt {attempt}: the request went back to the stopped holder; \
+                 the holder starts again"
+            );
+            attempt += 1;
+            holder_daemon = start_with(
+                &holder,
+                "127.0.0.1:0",
+                None,
+                &[("VOX_TEST_UNAVAILABLE_HEAD_FILE", refusal.clone())],
+            );
+        }
+        let _author_daemon = start(&author, "127.0.0.1:0", None);
+        returning_reader_ready(&author, &id);
+        let staging = Instant::now();
+        while !member(&status(&reader, &id), &author.b32())
+            .is_some_and(|row| row["connected"] == true)
+        {
+            assert!(
+                staging.elapsed() < Duration::from_secs(240),
+                "APPARATUS: the reader never connected to the returning author"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        post(&author, &id, "BACK-AT-ONCE", true);
+        eprintln!("[ledger 78 A] the author is back and posted; the holder stays stopped");
+        let wanted = ["BACK-BEFORE", "BACK-AT-ONCE"];
+        let started = Instant::now();
+        let mut still = Vec::new();
+        loop {
+            let (shown, _, _) = read(&reader, &id, None);
+            if wanted.iter().all(|text| shown.contains(*text)) {
+                assert!(
+                    !mutant,
+                    "APPARATUS: {OFFLINE_SLOT_MUTANT} was set and the reader still read the \
+                     author"
+                );
+                eprintln!(
+                    "GREEN: with the holder stopped, the reader shows the returning author's \
+                     posts {wanted:?}"
+                );
+                return;
+            }
+            let full = report(&reader);
+            let room = full["rooms"]
+                .as_array()
+                .and_then(|rows| rows.iter().find(|row| row["id"].as_str() == Some(&id)))
+                .cloned()
+                .unwrap_or(Value::Null);
+            let row = member(&room, &author.b32()).cloned().unwrap_or(Value::Null);
+            let port = full["lanes"]["ports"]
+                .as_array()
+                .and_then(|ports| {
+                    ports
+                        .iter()
+                        .find(|port| port["peer"].as_str() == Some(&author.b32()))
+                })
+                .cloned()
+                .unwrap_or(Value::Null);
+            let completed = full["sync"].as_array().and_then(|rows| {
+                rows.iter()
+                    .find(|sync| {
+                        sync["room"].as_str() == Some(&id)
+                            && sync["peer"].as_str() == Some(&author.b32())
+                    })
+                    .and_then(|sync| sync["completed"].as_u64())
+            });
+            let behind = row["advertised_through"]
+                .as_u64()
+                .is_some_and(|advertised| {
+                    row["verified_through"].as_u64().unwrap_or(0) < advertised
+                });
+            let wedged = row["connected"] == true
+                && behind
+                && port["needs"] == true
+                && flows_for(&full, &author.b32(), &["ready", "running"]).is_empty();
+            if wedged {
+                still.push((row["verified_through"].clone(), completed));
+                if still.len() > 3 {
+                    still.remove(0);
+                }
+            } else {
+                still.clear();
+            }
+            if still.len() == 3 && still.iter().all(|sample| *sample == still[0]) {
+                let engaged = std::fs::read_to_string(reader.data.with_extension("err"))
+                    .unwrap_or_default()
+                    .lines()
+                    .find(|line| line.contains(&format!("{OFFLINE_SLOT_MUTANT} engaged")))
+                    .map(str::to_owned);
+                assert!(
+                    !mutant || engaged.is_some(),
+                    "APPARATUS: {OFFLINE_SLOT_MUTANT} was set but the reader never said it \
+                     engaged; see {}",
+                    reader.data.with_extension("err").display()
+                );
+                panic!(
+                    "RED PRODUCT: the reader does not show {wanted:?} (shows {shown:?}) and, in \
+                     three status answers in a row, is connected to the returning author, needs \
+                     it, holds the same verified position below the author's advertised one \
+                     with no round toward it completed, and has no flow of the author ready or \
+                     running: {still:?}. Author row: {row}; port toward the author: {port}; \
+                     bounded flows: {}; mutant line: {engaged:?}",
+                    full["lanes"]["bounded"]
+                );
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(900),
+                "APPARATUS: NO RESULT after 900 s: neither the author's posts nor a wedge; \
+                 shows {shown:?}; author row: {row}; port toward the author: {port}; lanes: {}",
+                full["lanes"]
+            );
+            std::thread::sleep(Duration::from_secs(1));
         }
     }
 
