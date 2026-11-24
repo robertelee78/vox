@@ -1427,8 +1427,13 @@ pub struct PortCounters {
     pub partial: u64,
     /// Sessions that failed.
     pub failed: u64,
-    /// The last failure's reason.
+    /// The last failure's reason, kept after rounds complete again as diagnostic history
+    /// (`vox status --json` `last_failure`). Set through [`PortCounters::note_failure`].
     pub last_failure: Option<String>,
+    /// `last_failure` is still the peer's latest outcome: no round this node ran toward the peer
+    /// has completed since it (`vox status --json` `last_failure_stands`). `vox status` names the
+    /// failure only while it stands, so a peer that answers again does not carry an old reason.
+    pub last_failure_stands: bool,
     /// Start of this uninterrupted run of failed syncs, cleared by a successful session.
     pub failing_since: Option<std::time::Instant>,
     /// Consecutive sessions that failed in either direction.
@@ -1460,6 +1465,42 @@ pub struct PortCounters {
     /// since when, and when it started (V210-110). A session that never ends was otherwise only a counter that did
     /// not move; with this, `vox status` says which session is stuck, and at which step.
     pub running: BTreeMap<u64, (bool, SyncStep, std::time::Instant, std::time::Instant)>,
+}
+
+impl PortCounters {
+    /// A round with this peer failed, for `why`: the peer's latest outcome until a round this
+    /// node runs toward it completes.
+    pub(crate) fn note_failure(&mut self, why: String) {
+        self.last_failure = Some(why);
+        self.last_failure_stands = true;
+    }
+
+    /// A round this node ran toward the peer completed, or ended without error short of all it
+    /// asked for: an earlier failure is no longer the peer's latest outcome.
+    pub(crate) fn note_answered(&mut self) {
+        #[cfg(feature = "test-knobs")]
+        if failure_outlives_answers_mutant() {
+            return;
+        }
+        self.last_failure_stands = false;
+    }
+}
+
+/// `VOX_MUTANT_FAILURE_OUTLIVES_ANSWERS`: a round completed toward a peer leaves its last failure
+/// standing. Says so once on stderr when the daemon first reads it.
+#[cfg(feature = "test-knobs")]
+fn failure_outlives_answers_mutant() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let on = std::env::var_os("VOX_MUTANT_FAILURE_OUTLIVES_ANSWERS").is_some();
+        if on {
+            eprintln!(
+                "vox: VOX_MUTANT_FAILURE_OUTLIVES_ANSWERS engaged: a round completed toward a \
+                 peer leaves its last failure standing"
+            );
+        }
+        on
+    });
+    *ON
 }
 
 /// The step a sync session is at (V210-110).
@@ -1907,7 +1948,7 @@ impl SyncBook {
                  \"served_completed\":{},\"served_empty\":{},\"history_fetched\":{},\"history_served\":{},\
                  \"history_declined\":{},\"history_offered\":{},\"history_rearmed\":{},\
                  \"history_refusal_stale\":{},\"history_refusal_saved\":{},\
-                 \"partial\":{},\"failed\":{},\"last_failure\":{},\
+                 \"partial\":{},\"failed\":{},\"last_failure\":{},\"last_failure_stands\":{},\
                  \"stale\":{},\"refused\":{},\"skipped_at_cap\":{},\"queued\":{},\
                  \"board_records_received\":{},\"board_anchor_records_received\":{},\
                  \"board_sync_records_received\":{},\"board_sync_owner_waits\":{},\
@@ -1937,6 +1978,7 @@ impl SyncBook {
                 c.last_failure
                     .as_deref()
                     .map_or_else(|| "null".to_owned(), q),
+                c.last_failure.is_some() && c.last_failure_stands,
                 c.stale,
                 c.refused,
                 c.skipped_at_cap,

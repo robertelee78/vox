@@ -12264,7 +12264,7 @@ impl Node {
                         .collect();
                     for room in rooms {
                         crate::node::status::SyncBook::with(&self.sync_book, room, peer, |c| {
-                            c.last_failure = Some(why.clone());
+                            c.note_failure(why.clone());
                             c.consecutive_failures = c.consecutive_failures.saturating_add(1);
                             c.failing_since.get_or_insert_with(std::time::Instant::now);
                         });
@@ -13542,7 +13542,7 @@ impl Node {
                         &self.sync_book,
                         channel_id,
                         peer,
-                        |status| status.last_failure = Some(reason),
+                        |status| status.note_failure(reason),
                     );
                 }
                 self.say_session_news(&channel_id).await;
@@ -13833,7 +13833,7 @@ impl Node {
                             Ok(_) => counts.partial += 1,
                             Err(error) => {
                                 counts.failed += 1;
-                                counts.last_failure = Some(error.to_string());
+                                counts.note_failure(error.to_string());
                             }
                         },
                     );
@@ -18392,6 +18392,7 @@ impl Node {
             crate::node::ports::Dir::In => crate::node::status::RoundReason::Served,
             crate::node::ports::Dir::Out => attempt.reason,
         };
+        let outbound = matches!(attempt.dir, crate::node::ports::Dir::Out);
         crate::node::status::SyncBook::with(&self.sync_book, channel_id, peer, |c| {
             c.refused += u64::try_from(o.refused).unwrap_or(u64::MAX);
             match &report.fail {
@@ -18404,10 +18405,13 @@ impl Node {
                     }
                     c.consecutive_failures = 0;
                     c.failing_since = None;
+                    if outbound {
+                        c.note_answered();
+                    }
                 }
                 Some(f) => {
                     c.failed += 1;
-                    c.last_failure = Some(f.to_string());
+                    c.note_failure(f.to_string());
                     c.consecutive_failures = c.consecutive_failures.saturating_add(1);
                     c.failing_since.get_or_insert_with(std::time::Instant::now);
                 }
@@ -24432,7 +24436,7 @@ impl Node {
                 drop(slot);
                 self.private_pulls.remove(&key);
                 crate::node::status::SyncBook::with(&self.sync_book, channel_id, peer, |status| {
-                    status.last_failure = Some(error.to_string())
+                    status.note_failure(error.to_string());
                 });
                 return;
             }
@@ -24441,8 +24445,9 @@ impl Node {
         else {
             self.private_pulls.remove(&key);
             crate::node::status::SyncBook::with(&self.sync_book, channel_id, peer, |status| {
-                status.last_failure =
-                    Some("private page reservation is smaller than its page envelope".into())
+                status.note_failure(
+                    "private page reservation is smaller than its page envelope".into(),
+                );
             });
             return;
         };

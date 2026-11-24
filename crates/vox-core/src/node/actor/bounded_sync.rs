@@ -3716,6 +3716,7 @@ impl Node {
                         counts.completed += 1;
                         counts.consecutive_failures = 0;
                         counts.failing_since = None;
+                        counts.note_answered();
                         counts
                             .reasons
                             .count(crate::node::status::RoundReason::Announce);
@@ -3923,7 +3924,7 @@ impl Node {
                         work.peer,
                         |counts| {
                             counts.failed += 1;
-                            counts.last_failure = Some(error);
+                            counts.note_failure(error);
                         },
                     );
                     if let Some(backoff) = backoff {
@@ -3942,7 +3943,7 @@ impl Node {
                         work.peer,
                         |counts| {
                             counts.failed += 1;
-                            counts.last_failure = Some(error);
+                            counts.note_failure(error);
                         },
                     );
                     if let Some(backoff) = backoff {
@@ -4003,7 +4004,7 @@ impl Node {
                     work.peer,
                     |counts| {
                         counts.failed += 1;
-                        counts.last_failure = Some(error);
+                        counts.note_failure(error);
                     },
                 );
                 if let Some(backoff) = backoff {
@@ -4040,6 +4041,7 @@ impl Node {
                         counts.completed += 1;
                         counts.consecutive_failures = 0;
                         counts.failing_since = None;
+                        counts.note_answered();
                         counts.reasons.count(reason);
                         counts.fetched_completed += 1;
                         // Returning one dependency turn to its advertising source is a lane
@@ -4353,6 +4355,7 @@ impl Node {
                         counts.completed += 1;
                         counts.consecutive_failures = 0;
                         counts.failing_since = None;
+                        counts.note_answered();
                         counts.reasons.count(reason);
                         counts.fetched_completed += 1;
                         if !brought {

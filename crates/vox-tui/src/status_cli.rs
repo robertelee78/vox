@@ -642,7 +642,14 @@ fn render(v: &Value) -> Result<String, AppError> {
                 n(b, "failures")
             );
         }
-        if let Some(f) = r.get("last_failure").and_then(Value::as_str) {
+        // A failure is named only while it is the peer's latest outcome: once a round toward
+        // the peer has completed since, `--json` keeps it as `last_failure`, history only.
+        let stands = r.get("last_failure_stands").and_then(Value::as_bool) != Some(false);
+        if let Some(f) = r
+            .get("last_failure")
+            .and_then(Value::as_str)
+            .filter(|_| stands)
+        {
             let _ = write!(o, "; last failure: {f}");
         }
         // A session that runs on: which end opened it, the step it is at and for how long
