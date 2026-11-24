@@ -25024,9 +25024,10 @@ impl Node {
                         .get(id)
                         .map(|(_, detail)| detail)
                         .or_else(|| prev.open_channels.iter().find(|d| d.channel_id == *id));
-                    // The rows as last published, with the detail kept or the summary kept.
+                    // The rows as last published, with the detail kept or the summary kept; a
+                    // kept "not received yet" row whose decision is open now is not counted.
                     let rows = kept
-                        .map(|detail| detail.display_stamp.rows())
+                        .map(|detail| detail.display_stamp.rows_kept(ch.owed_rows_shown()))
                         .or_else(|| {
                             prev.channels
                                 .iter()

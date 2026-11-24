@@ -39,11 +39,16 @@ enum Work {
     Cleanup {
         remove: Vec<(Digest32, u64, Option<Digest32>)>,
         /// "Not received yet" rows of signed messages to write (`Some`: owed to this node, no
-        /// row yet) or take away (`None`: refused as not for this node), and the removal
-        /// generation those decisions were made under. The missing position itself is kept.
+        /// row yet) or take away (`None`: refused as not for this node, or not decidable yet),
+        /// and the removal generation those decisions were made under. The missing position
+        /// itself is kept, so an undecided one is decided again on a later turn.
         rows: Vec<(Digest32, Option<(u64, u64)>)>,
         generation: u64,
         next: Option<(Digest32, u64)>,
+        /// The governance turn this page was decided in (`None`: no current authority view),
+        /// and whether it is the first page of a pass (`history::OwedDecided`).
+        turn: Option<u64>,
+        first: bool,
     },
     KeyDebt {
         debts: Vec<Obligation>,
@@ -168,17 +173,19 @@ impl ChannelState {
         }
         let work = match step {
             Step::OwedCleanup => {
-                let (positions, next) =
-                    read.missing_page(self.projection_state.cleanup_cursor, 64)?;
+                let start = self.projection_state.cleanup_cursor;
+                let (positions, next) = read.missing_page(start, 64)?;
                 // ADR-036 H-4: a signed message's body is owed until held, expired or refused as
-                // not for this node, by this node's own decision; undecided, it waits for a later
-                // turn. Without a current authority view nothing is decided here.
+                // not for this node, by this node's own decision; undecided, its row is taken
+                // away and its missing position kept for a later turn. Without a current
+                // authority view nothing is decided here.
                 let generation = self.removal_generation(store)?;
                 let view = match self.checked_governance(store, now_ms) {
                     Ok(view) => Some(view),
                     Err(error) if governance::refreshing(&error) => None,
                     Err(error) => return Err(error),
                 };
+                let turn = view.is_some().then(|| self.owed_decided.turn());
                 let mut rendered = None;
                 let mut remove = Vec::new();
                 let mut rows = Vec::new();
@@ -212,8 +219,16 @@ impl ChannelState {
                         remove.push((author, seq, entry.map(|entry| entry.entry_hash())));
                         continue;
                     }
-                    let (Some(owed), Some(entry), Some(ttl)) = (owed, &entry, ttl) else {
+                    let (Some(entry), Some(ttl)) = (&entry, ttl) else {
                         continue;
+                    };
+                    if !signed_content {
+                        continue;
+                    }
+                    let owed = match owed {
+                        Some(owed) => owed,
+                        None if history::owed_rows_shown_undecided() => continue,
+                        None => false,
                     };
                     if owed && history::owed_rows_unwritten() {
                         continue;
@@ -245,6 +260,8 @@ impl ChannelState {
                     rows,
                     generation,
                     next,
+                    turn,
+                    first: start.is_none(),
                 }
             }
             Step::KeyDebt => {
@@ -677,7 +694,12 @@ impl ChannelState {
         if result.is_ok() {
             self.now_hint = self.now_hint.max(pending.now);
             match pending.work {
-                Work::Cleanup { next, .. } => self.projection_state.cleanup_cursor = next,
+                Work::Cleanup {
+                    next, turn, first, ..
+                } => {
+                    self.projection_state.cleanup_cursor = next;
+                    self.owed_decided.page(turn, first, next.is_none());
+                }
                 Work::Projection { state, .. } => self.projection_state = state,
                 Work::KeyDebt { more, .. } => {
                     self.key_debt_retention_pending = more;

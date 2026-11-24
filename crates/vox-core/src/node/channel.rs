@@ -1000,6 +1000,19 @@ impl DisplayStamp {
     pub(crate) fn rows(&self) -> u64 {
         self.rendered_count.saturating_add(self.owed_count)
     }
+
+    /// [`Self::rows`] of a stamp kept from an earlier publication while the room cannot be
+    /// published again (governance refreshing): its "not received yet" rows count only while
+    /// their decision stands now (`owed_shown`, [`ChannelState::owed_rows_shown`]). A row whose
+    /// decision is open is neither shown nor counted (ADR-036 H-4).
+    #[must_use]
+    pub(crate) fn rows_kept(&self, owed_shown: bool) -> u64 {
+        if owed_shown {
+            self.rows()
+        } else {
+            self.rendered_count
+        }
+    }
 }
 
 impl PartialEq for DisplayStamp {
@@ -1345,6 +1358,8 @@ pub struct ChannelState {
     /// where no clock is passed in (the view, the want-list).
     now_hint: u64,
     projection_state: history::State,
+    /// Which governance the "not received yet" rows were last decided under (in memory).
+    owed_decided: history::OwedDecided,
     /// Constant-size display watermarks; plaintext bodies live only in the sealed cache.
     /// A late insertion or canonical move invalidates a notice scan, but an end append does not.
     display_tail: Option<(u64, Digest32)>,
@@ -2314,6 +2329,7 @@ impl ChannelState {
             received_retries: Arc::new(ReceivedRetries::default()),
             owed_asked_to: None,
             now_hint: now_ms,
+            owed_decided: history::OwedDecided::default(),
             projection_state: history::State::default(),
             display_tail: None,
             display_order_revision: 0,
@@ -2956,6 +2972,7 @@ impl ChannelState {
             received_retries: Arc::new(ReceivedRetries::default()),
             owed_asked_to: None,
             now_hint: now_ms,
+            owed_decided: history::OwedDecided::default(),
             projection_state: match restart.projection.as_deref() {
                 Some(bytes) => history::State::from_bytes(bytes)?,
                 None => history::State::default(),
@@ -3460,6 +3477,7 @@ impl ChannelState {
             received_retries: Arc::new(ReceivedRetries::default()),
             owed_asked_to: None,
             now_hint: now_ms,
+            owed_decided: history::OwedDecided::default(),
             projection_state: history::State::default(),
             display_tail: None,
             display_order_revision: 0,
@@ -5958,7 +5976,12 @@ impl ChannelState {
         let rendered = self
             .entries
             .render_view(store, &self.sek, &self.channel_id)?;
-        let owed_count = rendered.owed_before(None)?;
+        // A row whose decision is open is neither shown nor counted (ADR-036 H-4).
+        let owed_count = if self.owed_rows_shown() {
+            rendered.owed_before(None)?
+        } else {
+            0
+        };
         Ok(DisplayPublication {
             display_stamp: DisplayStamp {
                 incarnation: self.gen.clone(),

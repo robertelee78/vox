@@ -872,19 +872,24 @@ impl ChannelState {
     }
 
     pub(super) fn require_history_source_boundary(&self, entry: &Entry) -> Result<()> {
-        if entry.skeleton.channel_id != self.channel_id
-            || !self.admission.is_admitted(
-                &self.channel_id,
-                entry.skeleton.epoch,
-                &entry.skeleton.author_id,
-            )
-            || self.dag.is_frozen(&entry.skeleton.author_id)
-        {
+        if !self.history_source_admissible(entry) {
             return Err(Error::MalformedGovernance(
                 "history source room, epoch or author boundary changed",
             ));
         }
         Ok(())
+    }
+
+    /// Whether this node would still admit a body of `entry` as a history source: its room, its
+    /// epoch's admission of its author, and its author not frozen by a fork proof.
+    pub(super) fn history_source_admissible(&self, entry: &Entry) -> bool {
+        entry.skeleton.channel_id == self.channel_id
+            && self.admission.is_admitted(
+                &self.channel_id,
+                entry.skeleton.epoch,
+                &entry.skeleton.author_id,
+            )
+            && !self.dag.is_frozen(&entry.skeleton.author_id)
     }
 
     pub(crate) fn history_author_key(&self, author: &Digest32) -> Option<CompositePublicKey> {

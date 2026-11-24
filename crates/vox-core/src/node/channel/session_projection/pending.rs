@@ -202,6 +202,9 @@ impl ChannelState {
                     self.governance_display.revision != display.revision || !self.governance_ready;
                 self.governance_display = display;
                 self.governance_ready = true;
+                if progress.changed {
+                    self.owed_decided.governance_changed();
+                }
             }
             Ok(ProjectionProgress::Governance(progress))
         });

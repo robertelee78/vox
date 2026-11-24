@@ -998,12 +998,16 @@ fn a_queued_key_and_history_debt_cannot_cross_room_removal() {
 // boundary 2 off.
 
 /// `VOX_MUTANT_OWED_ROW=unchecked|unwritten` from the runner, for carol's daemon
-/// (`VOX_TEST_OWED_ROW`): the "not received yet" row knob.
+/// (`VOX_TEST_OWED_ROW`): the "not received yet" row knob. Any other value is CANNOT MEASURE.
 fn mp10_owed_knob() -> Option<(&'static str, &'static str)> {
     match std::env::var("VOX_MUTANT_OWED_ROW").as_deref() {
         Ok("unchecked") => Some(("VOX_TEST_OWED_ROW", "unchecked")),
         Ok("unwritten") => Some(("VOX_TEST_OWED_ROW", "unwritten")),
-        _ => None,
+        Ok("") | Err(_) => None,
+        Ok(other) => panic!(
+            "CANNOT MEASURE (precondition unmet): VOX_MUTANT_OWED_ROW={other:?} is not a mutant \
+             of this act (unchecked, unwritten)"
+        ),
     }
 }
 
@@ -1213,6 +1217,7 @@ fn mp10_readmitted_member_gets_no_gap_body(send: [bool; 3], render: bool, red: &
     // would run it unstaged and could pass without isolating its boundary.
     let knobs: Vec<&str> = mp10_env(send.contains(&true), render)
         .into_iter()
+        .chain(mp10_owed_knob())
         .map(|(knob, _)| knob)
         .collect();
     test_knobs::require(&knobs);

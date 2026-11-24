@@ -541,6 +541,32 @@ impl View<'_> {
         Ok(answer)
     }
 
+    /// "Not received yet" rows are shown and counted only while the room's governance is
+    /// current and every row has been decided under it (`OwedDecided`); otherwise their decision
+    /// is open, and a placeholder written before stays out of every page and count.
+    fn owed_shown(&self) -> bool {
+        owed_rows_shown_undecided() || (self.ch.owed_shown && !self.provisional)
+    }
+    fn is_owed(&self, hash: &Digest32) -> Result<bool> {
+        Ok(self.owed_shown() && self.rendered.is_owed(hash)?)
+    }
+    fn owed_before(&self, before: Option<(u64, Digest32)>) -> Result<u64> {
+        if !self.owed_shown() {
+            return Ok(0);
+        }
+        self.rendered.owed_before(before)
+    }
+    fn owed_step(
+        &self,
+        cursor: Option<(u64, Digest32)>,
+        backwards: bool,
+    ) -> Result<Option<(u64, Digest32)>> {
+        if !self.owed_shown() {
+            return Ok(None);
+        }
+        self.rendered.owed_step(cursor, backwards)
+    }
+
     fn row(&self, hash: &Digest32) -> Result<Option<MessageRow>> {
         let order = self.rendered.order();
         if let Some(row) = self.rendered.row(hash)? {
@@ -559,7 +585,7 @@ impl View<'_> {
             }
             return Ok(Some(Self::message(row)));
         }
-        if !self.rendered.is_owed(hash)? {
+        if !self.is_owed(hash)? {
             return Ok(None);
         }
         let Some(entry) = order.entry(hash)? else {
@@ -619,7 +645,7 @@ impl View<'_> {
             .rendered
             .step(None, true, *cursor, backwards)?
             .map(|(key, _)| key);
-        let owed = self.rendered.owed_step(*cursor, backwards)?;
+        let owed = self.owed_step(*cursor, backwards)?;
         let key = match (rendered, owed) {
             (Some(a), Some(b)) => Some(if backwards { a.max(b) } else { a.min(b) }),
             (a, b) => a.or(b),
@@ -636,7 +662,7 @@ impl View<'_> {
             Some(mark) => self.rendered.before(mark)?,
             None => self.rendered.count()?,
         };
-        let owed = self.rendered.owed_before(before)?;
+        let owed = self.owed_before(before)?;
         if owed != 0 {
             self.require_classification_complete()?;
         }
@@ -683,7 +709,7 @@ impl View<'_> {
     }
     fn view_contains(&self, filter: &Filter, hash: &Digest32) -> Result<bool> {
         Ok(self.rendered.contains(filter, hash)?
-            || (matches!(filter, Filter::General) && self.rendered.is_owed(hash)?))
+            || (matches!(filter, Filter::General) && self.is_owed(hash)?))
     }
     fn view_page(
         &self,
@@ -722,7 +748,7 @@ impl View<'_> {
         };
         let mut total = self.rendered.selected_before(&filter, cursor)?;
         if matches!(filter, Filter::General) {
-            let owed = self.rendered.owed_before(cursor)?;
+            let owed = self.owed_before(cursor)?;
             if owed != 0 {
                 self.require_classification_complete()?;
             }
@@ -738,7 +764,7 @@ impl View<'_> {
                 .step(Some(&filter), true, cursor, true)?
                 .map(|(key, _)| key);
             let owed = if matches!(filter, Filter::General) {
-                self.rendered.owed_step(cursor, true)?
+                self.owed_step(cursor, true)?
             } else {
                 None
             };
@@ -2065,12 +2091,14 @@ impl ChannelState {
     }
 
     /// Whether the body of a signed message is owed to this node, by this node's own decision
-    /// (ADR-036 H-4: owed "until held, expired or refused as not for this node"). It is the
-    /// decision recipient render makes (MP-10 boundary 2): the author's eligibility for the
-    /// entry, and once this node knows its own applied removal, its own readmission cut.
-    /// `Some(true)`: owed, a row may stand for it. `Some(false)`: not for this node, no row, ever.
-    /// `None`: not decidable yet, no row until it is. Only ordinary signed Content is shown;
-    /// a legacy entry keeps its legacy meaning.
+    /// (ADR-036 H-4: owed "until held, expired or refused as not for this node"): a body this
+    /// node would admit as a history source ([`Self::history_source_admissible`], the fence a
+    /// refill passes: room, epoch admission, an author not frozen by a fork proof), and that
+    /// ordinary rendering would show here ([`Self::body_render_decision`]: the author's
+    /// eligibility, this node's own readmission cut, the author's consent to this reader).
+    /// `Some(true)`: owed, a row may stand for it. `Some(false)`: not for this node, no row.
+    /// `None`: not decidable yet, no row shown until it is. Only ordinary signed Content is
+    /// shown; a legacy entry keeps its legacy meaning.
     pub(super) fn signed_body_owed_to_me(
         &self,
         view: &governance::View<'_>,
@@ -2087,20 +2115,59 @@ impl ChannelState {
         if owed_rows_unchecked() {
             return Ok(Some(true));
         }
-        let decide = |eligibility| match eligibility {
-            governance::ContentEligibility::Eligible => Some(true),
-            governance::ContentEligibility::Ineligible => Some(false),
-            governance::ContentEligibility::Refreshing => None,
-        };
-        let author = decide(view.content_eligibility(entry)?);
-        if author != Some(true) || generation == 0 {
-            return Ok(author);
+        if !self.history_source_admissible(entry) {
+            return Ok(Some(false));
         }
-        Ok(decide(view.recipient_body_eligibility(
-            &self.me(),
-            entry,
-            now,
-        )?))
+        // No body is held here, so nothing of it is readable here yet.
+        self.body_render_decision(view, generation, entry, now, || Ok(false))
+    }
+
+    /// Whether this room's "not received yet" rows may be shown now: governance is current and
+    /// the owed sweep has decided every row under it ([`OwedDecided`]).
+    pub(crate) fn owed_rows_shown(&self) -> bool {
+        owed_rows_shown_undecided()
+            || (self.governance_display_current(self.now_hint) && self.owed_decided.shown())
+    }
+}
+
+/// Which governance this room's "not received yet" rows were last decided under, in memory
+/// only. A row's decision depends on the room's governance (ADR-036 H-4); while governance is
+/// refreshing nothing is decided, and a row written before stays in the index with its missing
+/// position. So the rows are shown only once the owed sweep (`pending_retention`,
+/// `Step::OwedCleanup`) has passed over every missing position under the governance current
+/// now: every governance change that becomes current starts a new turn, and until a whole pass
+/// has been decided in that turn, no row is shown or counted.
+#[derive(Default)]
+pub(super) struct OwedDecided {
+    turn: u64,
+    pass: Option<u64>,
+    settled: Option<u64>,
+}
+impl OwedDecided {
+    /// Governance became current with a change: every row waits for a pass decided under it.
+    pub(super) fn governance_changed(&mut self) {
+        self.turn = self.turn.wrapping_add(1);
+    }
+    pub(super) fn turn(&self) -> u64 {
+        self.turn
+    }
+    pub(super) fn shown(&self) -> bool {
+        owed_rows_shown_undecided() || self.settled == Some(self.turn)
+    }
+    /// One owed-sweep page installed: decided in `turn` (`None`: without a current authority
+    /// view), starting a pass when `first`, ending it when `last`.
+    pub(super) fn page(&mut self, turn: Option<u64>, first: bool, last: bool) {
+        if first {
+            self.pass = turn;
+        } else if self.pass != turn {
+            self.pass = None;
+        }
+        if last {
+            if self.pass == Some(self.turn) {
+                self.settled = self.pass;
+            }
+            self.pass = None;
+        }
     }
 }
 
@@ -2140,12 +2207,25 @@ const fn owed_rows_unchecked() -> bool {
     false
 }
 
+/// `VOX_TEST_OWED_ROW=undecided` (proofs only): "not received yet" rows are shown while their
+/// decision is open (governance refreshing, or not yet swept under the current governance), and
+/// the owed sweep keeps an undecided row.
+#[cfg(feature = "test-knobs")]
+pub(super) fn owed_rows_shown_undecided() -> bool {
+    owed_row_mutant() == Some("undecided")
+}
+#[cfg(not(feature = "test-knobs"))]
+pub(super) const fn owed_rows_shown_undecided() -> bool {
+    false
+}
+
 #[cfg(feature = "test-knobs")]
 fn owed_row_mutant() -> Option<&'static str> {
     static MODE: std::sync::LazyLock<Option<&'static str>> = std::sync::LazyLock::new(|| {
         let mode = match std::env::var("VOX_TEST_OWED_ROW").as_deref() {
             Ok("unwritten") => Some("unwritten"),
             Ok("unchecked") => Some("unchecked"),
+            Ok("undecided") => Some("undecided"),
             _ => None,
         };
         if let Some(mode) = mode {
