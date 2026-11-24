@@ -12526,6 +12526,11 @@ impl Node {
                     self.sched_rooms
                         .extend(self.bounded_sync.cancel_peer_pool_admissions(peer));
                 }
+                // The closed port cannot run: its archive ticket would hold every other port's
+                // archive work, and its wake may already be spent. It asks again when it runs.
+                if let Some(room) = self.bounded_sync.release_archive_admission_of_peer(peer) {
+                    self.sched_rooms.insert(room);
+                }
             }
             NetEvent::SkdmRefused {
                 channel_id,
@@ -13059,6 +13064,17 @@ impl Node {
                 service,
             } => {
                 if self.port_runnable(&(room, peer), service, std::time::Instant::now()) {
+                    // This wake is spent; the start it schedules can end before its archive
+                    // check (a busy physical slot, any earlier gate). Listen again first, so a
+                    // held ticket never waits on a spent wake.
+                    if service == OutboundService::Archive {
+                        self.bounded_sync.rearm_archive_wake(
+                            &self.net_tx,
+                            &mut self.next_token,
+                            room,
+                            peer,
+                        );
+                    }
                     self.sched_rooms.insert(room);
                 } else {
                     // Admission happened after this exact port stopped being runnable. Return the

@@ -1597,35 +1597,86 @@ fn ports_of(status: &serde_json::Value, room: &str) -> Vec<serde_json::Value> {
 const ARCHIVE_TURN_STAGING: Duration = Duration::from_secs(300);
 
 /// PR #1398 review P2: a reader's node keeps one queued archive turn, its place in the daemon's
-/// fair archive queue. `codex`, one of three nodes hosted by one daemon, leaves `quiet-1` and
-/// joins it again, so it must recover its own history there: an automatic Archive page on that
-/// room's port. `robert` and `claude` hold both of the daemon's archive jobs meanwhile (an older
-/// page each, `VOX_TEST_HOLD_ARCHIVE_JOB_FILE`), so codex's recovery waits in the queue. Codex
-/// then asks for an older page of another room (`vox room read --history older`): a second
-/// Archive request on another port of the same node.
+/// fair archive queue. `codex`, one of three nodes hosted by one daemon, posts in `own-1`, a room
+/// of bob's, and leaves it; `claude` confirms the departure and then leaves too, so when codex
+/// joins again bob is its only member and it must recover its own history on bob's port.
+/// `robert` and `claude` hold both of the daemon's archive jobs meanwhile (an older page each,
+/// `VOX_TEST_HOLD_ARCHIVE_JOB_FILE`), so codex's recovery waits in the queue. Codex then asks for
+/// an older page of another room (`vox room read --history older`): a second Archive request on
+/// another port of the same node.
 ///
 /// RED PRODUCT when codex's status shows its queued archive turn moved from the recovery to the
 /// older-page request while neither ran: the recovery's place in the queue was dropped, and the
-/// two requests then keep sending each other to the back of the daemon's queue. GREEN when, in
-/// three status answers in a row, the older-page port's last start ended `archive_budget_busy`
-/// while the turn is still the recovery's, and, once the jobs are let go, codex can post in
-/// `quiet-1` again and its older page completes. Mutant: `VOX_MUTANT_ARCHIVE_TURN_CANCELS_OTHER_PORT`.
+/// two requests then keep sending each other to the back of the daemon's queue. Mutant:
+/// `VOX_MUTANT_ARCHIVE_TURN_CANCELS_OTHER_PORT`.
+///
+/// Review P2 of the second verdict: bob's daemon then stops, so the recovery's port cannot run.
+/// RED PRODUCT when, with bob shown gone, codex's turn stays the recovery's in three status
+/// answers in a row. Mutant: `VOX_MUTANT_CLOSED_PORT_KEEPS_ARCHIVE_TURN`. GREEN when the turn
+/// moves to the older-page request while both jobs are held, the older page completes once the
+/// jobs are let go with bob still stopped, and, with bob back, the recovery starts an Archive
+/// round on his port again.
 #[cfg(feature = "optional-proofs")]
 #[test]
 #[ignore = "two real vox daemons, three hosted nodes and held archive jobs; optional"]
 fn a_reader_keeps_its_archive_place_while_it_recovers_its_own_history() {
     const MUTANT: &str = "VOX_MUTANT_ARCHIVE_TURN_CANCELS_OTHER_PORT";
+    const CLOSED_MUTANT: &str = "VOX_MUTANT_CLOSED_PORT_KEEPS_ARCHIVE_TURN";
     let mutant = std::env::var_os(MUTANT).is_some();
+    let closed_mutant = std::env::var_os(CLOSED_MUTANT).is_some();
     let mut knobs = vec!["VOX_TEST_HOLD_ARCHIVE_JOB_FILE"];
     if mutant {
         knobs.push(MUTANT);
     }
+    if closed_mutant {
+        knobs.push(CLOSED_MUTANT);
+    }
     test_knobs::require(&knobs);
     watchdog::arm();
-    let staged = stage_hosted_nodes(&ARCHIVE_TURN_HOSTED, true, false, false);
+    let mut staged = stage_hosted_nodes(&ARCHIVE_TURN_HOSTED, true, false, false);
     let reader = ARCHIVE_TURN_HOSTED[2];
-    let (host, (peer_dir, peer_node, _, _)) = (&staged.host, &staged.everyone[staged.hosted]);
-    let own_room = staged.rooms[0].clone();
+    let host = staged.host.clone();
+    let host = &host;
+    let (peer_dir, peer_node, _, bob_fp) = staged.everyone[staged.hosted].clone();
+    let (peer_dir, peer_node) = (&peer_dir, &peer_node);
+    // The reader's own room has bob as its only other member, so its recovery is bob's port.
+    let (ok, _, err) = vox(
+        peer_dir,
+        &as_node(
+            &[
+                "room",
+                "create",
+                "--passphrase-file",
+                "-",
+                "--name",
+                "own-1",
+            ],
+            *peer_node,
+        ),
+        Some(&format!("{ROOMPASS}\n")),
+    );
+    assert!(ok, "APPARATUS: bob's own-1 creation failed: {err}");
+    let listed = attached_as(peer_dir, "peer", *peer_node);
+    let selector = listed
+        .lines()
+        .find(|line| line.contains("own-1"))
+        .and_then(|line| line.split_whitespace().next())
+        .unwrap_or_else(|| panic!("APPARATUS: own-1 is not listed: {listed}"))
+        .to_owned();
+    let own_room =
+        vox_core::node::link::b32_encode(&room_id_as(peer_dir, *peer_node, "bob", &selector));
+    let bob_link = || {
+        let (ok, link, err) = vox(
+            peer_dir,
+            &as_node(&["room", "link", &own_room], *peer_node),
+            None,
+        );
+        assert!(ok, "APPARATUS: bob could not give a link: {err}");
+        link.lines()
+            .find(|line| line.starts_with("vox://"))
+            .unwrap_or(link.trim())
+            .to_owned()
+    };
     let staging = |what: &str, since: Instant, shown: &dyn Fn() -> String| {
         assert!(
             since.elapsed() < ARCHIVE_TURN_STAGING,
@@ -1635,8 +1686,64 @@ fn a_reader_keeps_its_archive_place_while_it_recovers_its_own_history() {
         );
         std::thread::sleep(Duration::from_millis(200));
     };
+    let roster_of = |dir: &Path, node: Option<&str>| {
+        let (ok, roster, err) = vox(dir, &as_node(&["room", "roster", &own_room], node), None);
+        ok.then_some(roster).ok_or(err)
+    };
+    // A member that left can join again only once a member has confirmed its departure over the
+    // leaver's own exchange. A member refuses that exchange once it has applied the creator's
+    // removal of the leaver, so bob, the creator, refuses it as soon as he has the departure: in
+    // runs with bob the only other member, bob's roster dropped codex and codex kept own-1 as
+    // leaving. claude, a member that is not the creator, confirms it while bob's removal is on
+    // its way. So codex and claude join own-1, each posts, and each sees the other.
+    let taker = ARCHIVE_TURN_HOSTED[1];
+    let reader_fp = staged.everyone[2].3.clone();
+    let taker_fp = staged.everyone[1].3.clone();
+    for node in [reader, taker] {
+        let (ok, out, err) = vox(
+            host,
+            &as_node(
+                &["room", "join", "--passphrase-file", "-", &bob_link()],
+                Some(node),
+            ),
+            Some(&format!("{ROOMPASS}\n")),
+        );
+        assert!(
+            ok,
+            "APPARATUS: {node}'s join of own-1 was refused: {out}{err}"
+        );
+        stage_post(
+            host,
+            Some(node),
+            node,
+            &own_room,
+            &format!("{node} in own-1"),
+        );
+    }
+    let since = Instant::now();
+    loop {
+        let rosters = (roster_of(host, Some(reader)), roster_of(host, Some(taker)));
+        if rosters
+            .0
+            .as_ref()
+            .is_ok_and(|roster| roster.contains(&taker_fp))
+            && rosters
+                .1
+                .as_ref()
+                .is_ok_and(|roster| roster.contains(&reader_fp))
+        {
+            break;
+        }
+        staging(
+            "the reader and claude seeing each other in own-1",
+            since,
+            &|| format!("{rosters:?}"),
+        );
+    }
 
-    // The reader leaves the room it posted in, while every archive job is still free.
+    // The reader leaves the room it posted in, while every archive job is still free, and
+    // waits until its departure is taken: bob's roster no longer names it, and its own status no
+    // longer holds the room as leaving (its left copy is deleted).
     let (ok, out, err) = vox(
         host,
         &as_node(&["room", "leave", &own_room], Some(reader)),
@@ -1646,6 +1753,51 @@ fn a_reader_keeps_its_archive_place_while_it_recovers_its_own_history() {
         ok,
         "APPARATUS: {reader}'s `vox room leave` failed: {out}{err}"
     );
+    let since = Instant::now();
+    loop {
+        let roster = roster_of(peer_dir, *peer_node);
+        let status = hosted_status(host, reader);
+        let leaving = status["leaving"]
+            .as_array()
+            .is_none_or(|rooms| rooms.iter().any(|held| held["id"] == own_room));
+        if roster
+            .as_ref()
+            .is_ok_and(|roster| !roster.contains(&reader_fp))
+            && !leaving
+        {
+            break;
+        }
+        staging("the reader's departure taken", since, &|| {
+            format!(
+                "bob's roster: {roster:?}; the reader's leaving: {}",
+                status["leaving"]
+            )
+        });
+    }
+    // claude leaves too, so bob is the reader's only member when it joins again, and its
+    // recovery is bob's port. claude itself never joins again.
+    let (ok, out, err) = vox(
+        host,
+        &as_node(&["room", "leave", &own_room], Some(taker)),
+        None,
+    );
+    assert!(
+        ok,
+        "APPARATUS: {taker}'s `vox room leave` failed: {out}{err}"
+    );
+    let since = Instant::now();
+    loop {
+        let roster = roster_of(peer_dir, *peer_node);
+        if roster
+            .as_ref()
+            .is_ok_and(|roster| !roster.contains(&taker_fp) && !roster.contains(&reader_fp))
+        {
+            break;
+        }
+        staging("bob taking claude's departure", since, &|| {
+            format!("bob's roster: {roster:?}")
+        });
+    }
 
     // Both archive jobs held by the first two nodes' older pages of another room.
     let archive_hold = staged
@@ -1660,20 +1812,15 @@ fn a_reader_keeps_its_archive_place_while_it_recovers_its_own_history() {
     });
     let archive = stage_two_archive_jobs(&staged);
     let older_room = archive.room.clone();
-    let reader_fp = staged.everyone[2].3.clone();
 
     // The reader joins its room again: its own history there must be recovered, by an archive
     // page that now waits in the daemon's queue.
     let (ok, link, err) = vox(
-        host,
-        &as_node(&["room", "link", &own_room], Some(ARCHIVE_TURN_HOSTED[0])),
+        peer_dir,
+        &as_node(&["room", "link", &own_room], *peer_node),
         None,
     );
-    assert!(
-        ok,
-        "APPARATUS: {} could not give a link: {err}",
-        ARCHIVE_TURN_HOSTED[0]
-    );
+    assert!(ok, "APPARATUS: bob could not give a link: {err}");
     let link = link
         .lines()
         .find(|line| line.starts_with("vox://"))
@@ -1704,6 +1851,10 @@ fn a_reader_keeps_its_archive_place_while_it_recovers_its_own_history() {
         );
     };
     eprintln!("[archive-turn] the reader's recovery is queued: {first}");
+    assert!(
+        first["peer"] == bob_fp,
+        "APPARATUS: the reader's recovery is not on bob's port: {first}"
+    );
 
     // The reader joins the held room and asks for the page below its oldest row there.
     let (ok, link, err) = vox(
@@ -1840,7 +1991,52 @@ fn a_reader_keeps_its_archive_place_while_it_recovers_its_own_history() {
         panic!("APPARATUS: {MUTANT} was set and the reader's turn was kept");
     }
 
-    // Let the jobs go: both of the reader's requests complete.
+    // bob, the recovery's only peer, stops: the recovery's port cannot run. Its ticket must not
+    // keep the older page waiting (verdict-2 P2).
+    drop(staged.peer_daemon.take());
+    let since = Instant::now();
+    while member_connected_as(host, Some(reader), &own_room, &bob_fp) != Some(false) {
+        staging("the reader seeing bob gone", since, &|| String::new());
+    }
+    let mut kept = Vec::new();
+    loop {
+        let status = hosted_status(host, reader);
+        let turn = archive_turn_of(&status);
+        if turn.as_ref().is_some_and(|turn| turn["room"] == older_room) {
+            eprintln!("[archive-turn] bob gone: the older page holds the turn: {turn:?}");
+            break;
+        }
+        if turn.as_ref().is_some_and(|turn| {
+            turn["room"] == first["room"] && turn["request"] == first["request"]
+        }) && member_connected_as(host, Some(reader), &own_room, &bob_fp) == Some(false)
+        {
+            kept.push(turn.clone());
+            if kept.len() == 3 {
+                let engaged = said(host, "host")
+                    .lines()
+                    .find(|line| line.contains(CLOSED_MUTANT))
+                    .map(str::to_owned);
+                panic!(
+                    "RED PRODUCT: with bob, the recovery's only peer, stopped and shown gone, the \
+                     reader's archive turn stayed the recovery's in three status answers in a \
+                     row ({kept:?}) and its older page kept waiting; older-page ports: {:?}; \
+                     mutant line: {engaged:?}",
+                    ports_of(&status, &older_room)
+                );
+            }
+        } else {
+            kept.clear();
+        }
+        staging("the older page taking the turn", since, &|| {
+            format!("{turn:?}")
+        });
+    }
+    if closed_mutant {
+        panic!("APPARATUS: {CLOSED_MUTANT} was set and the closed port's turn was released");
+    }
+
+    // Let the jobs go while bob is still stopped: the older page, which now holds the turn, runs
+    // and completes.
     std::fs::remove_file(archive_hold).unwrap_or_else(|error| {
         panic!(
             "APPARATUS: could not remove {}: {error}",
@@ -1848,29 +2044,7 @@ fn a_reader_keeps_its_archive_place_while_it_recovers_its_own_history() {
         )
     });
     let since = Instant::now();
-    let mut recovered = false;
-    let mut paged = false;
-    while !(recovered && paged) {
-        if !recovered {
-            let (ok, out, err) = vox(
-                host,
-                &as_node(
-                    &[
-                        "room",
-                        "post",
-                        &own_room,
-                        "codex after recovering its own history",
-                    ],
-                    Some(reader),
-                ),
-                None,
-            );
-            assert!(
-                ok || err.contains("own history") || err.contains("still being applied"),
-                "PRODUCT: {reader}'s post after the jobs were let go was refused: {out}{err}"
-            );
-            recovered = ok;
-        }
+    loop {
         let (ok, out, err) = vox(
             host,
             &as_node(
@@ -1888,22 +2062,61 @@ fn a_reader_keeps_its_archive_place_while_it_recovers_its_own_history() {
         });
         use vox_core::node::api::HistoryDemandPhase as Phase;
         match reply.status.phase {
-            Phase::Complete | Phase::More => paged = true,
+            Phase::Complete | Phase::More => break,
             Phase::Cancelled | Phase::Paused | Phase::Idle => {
                 panic!("RED PRODUCT: {reader}'s older page ended without its rows: {out}")
             }
             _ => {}
         }
-        if !(recovered && paged) {
-            staging("both of the reader's requests complete", since, &|| {
-                format!("recovered {recovered}; older page {out}")
-            });
+        staging("the older page completing with bob stopped", since, &|| {
+            let status = hosted_status(host, reader);
+            format!(
+                "{out}; older-page ports {:?}; own-1 ports {:?}; the reader's bounded lanes {}; \
+                 budget {}",
+                ports_of(&status, &older_room),
+                ports_of(&status, &own_room),
+                status["lanes"]["bounded"],
+                status["lanes"]["budget"]
+            )
+        });
+    }
+
+    // bob comes back: the recovery, whose ticket was given back, asks again and is admitted to
+    // an archive job: its port to bob starts an Archive round after bob's restart.
+    let restarted = Instant::now();
+    staged.peer_daemon = Some(daemon(peer_dir, "peer"));
+    attached_as(peer_dir, "peer", None);
+    loop {
+        let status = hosted_status(host, reader);
+        let port = ports_of(&status, &own_room)
+            .into_iter()
+            .find(|port| port["peer"] == bob_fp);
+        if port.as_ref().is_some_and(|port| {
+            port["start_service"] == "Archive"
+                && port["start_outcome"] == "started"
+                && port["start_age_ms"]
+                    .as_u64()
+                    .is_some_and(|age| u128::from(age) < restarted.elapsed().as_millis())
+        }) {
+            eprintln!("[archive-turn] bob back: the recovery started again: {port:?}");
+            break;
         }
+        staging(
+            "the recovery starting again after bob's restart",
+            restarted,
+            &|| {
+                format!(
+                    "{port:?}; the reader's bounded lanes {}",
+                    status["lanes"]["bounded"]
+                )
+            },
+        );
     }
     println!(
         "GREEN: while both archive jobs were held, the reader's older-page port was told to wait \
-         and its own-history recovery kept its queued turn; once let go, it recovered its own \
-         history and its older page completed"
+         and its own-history recovery kept its queued turn; with bob, the recovery's only peer, \
+         stopped, the turn moved to the older page, which completed once the jobs were let go; \
+         with bob back, the recovery started again"
     );
 }
 

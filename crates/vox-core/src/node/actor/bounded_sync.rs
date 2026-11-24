@@ -288,6 +288,23 @@ fn archive_turn_cancels_other_port_mutant() -> bool {
     *ON
 }
 
+/// `VOX_MUTANT_CLOSED_PORT_KEEPS_ARCHIVE_TURN`: a port whose connection closed keeps the node's
+/// queued archive ticket, as before fix2. Says so once on stderr when first read.
+#[cfg(feature = "test-knobs")]
+fn closed_port_keeps_archive_turn_mutant() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let on = std::env::var_os("VOX_MUTANT_CLOSED_PORT_KEEPS_ARCHIVE_TURN").is_some();
+        if on {
+            eprintln!(
+                "vox: VOX_MUTANT_CLOSED_PORT_KEEPS_ARCHIVE_TURN engaged: a closed port keeps the \
+                 node's archive ticket"
+            );
+        }
+        on
+    });
+    *ON
+}
+
 fn retirement_key(flow: &Flow) -> RetirementKey {
     RetirementKey {
         actor: flow.actor_incarnation(),
@@ -1205,6 +1222,65 @@ impl Controller {
         {
             self.cancel_archive_admission();
         }
+    }
+    /// A port whose connection closed cannot run, so it holds no archive place another port
+    /// needs: the node's ticket of any room toward `peer` is returned. The port asks again when
+    /// it runs again. Returns the released ticket's room.
+    pub(super) fn release_archive_admission_of_peer(&mut self, peer: Digest32) -> Option<Digest32> {
+        #[cfg(feature = "test-knobs")]
+        if closed_port_keeps_archive_turn_mutant() {
+            return None;
+        }
+        let room = self
+            .archive_admission
+            .as_ref()
+            .filter(|admission| admission.peer == peer)
+            .map(|admission| admission.room)?;
+        self.cancel_archive_admission();
+        Some(room)
+    }
+    /// This ticket's wake was just spent on a runnable port, whose start can still end before
+    /// its archive check (a busy physical slot, any earlier gate): listen again, so a held
+    /// ticket never waits on a spent wake.
+    pub(super) fn rearm_archive_wake(
+        &mut self,
+        net_tx: &mpsc::Sender<NetEvent>,
+        next_token: &mut u64,
+        room: Digest32,
+        peer: Digest32,
+    ) {
+        if let Some(admission) = self
+            .archive_admission
+            .as_mut()
+            .filter(|admission| admission.room == room && admission.peer == peer)
+        {
+            let wake = admission.ticket.wake();
+            Self::arm_archive_wake(admission, wake, net_tx, next_token);
+        }
+    }
+    fn arm_archive_wake(
+        admission: &mut ArchiveAdmission,
+        wake: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+        net_tx: &mpsc::Sender<NetEvent>,
+        next_token: &mut u64,
+    ) {
+        admission.task.abort();
+        let tx = net_tx.clone();
+        let wake_token = *next_token;
+        *next_token += 1;
+        admission.token = wake_token;
+        let (room, peer) = (admission.room, admission.peer);
+        admission.task = tokio::spawn(async move {
+            wake.await;
+            let _ = tx
+                .send(NetEvent::BoundedAdmissionReady {
+                    token: wake_token,
+                    room,
+                    peer,
+                    service: OutboundService::Archive,
+                })
+                .await;
+        });
     }
     fn cancel_foreground_admission(&mut self, index: usize) {
         if let Some(admission) = self.foreground_admission[index].take() {
@@ -2516,22 +2592,7 @@ impl Controller {
                 admission.task.abort();
                 return ArchiveTurn::Ready(job);
             }
-            admission.task.abort();
-            let tx = net_tx.clone();
-            let wake_token = *next_token;
-            *next_token += 1;
-            admission.token = wake_token;
-            admission.task = tokio::spawn(async move {
-                wake.await;
-                let _ = tx
-                    .send(NetEvent::BoundedAdmissionReady {
-                        token: wake_token,
-                        room,
-                        peer,
-                        service: OutboundService::Archive,
-                    })
-                    .await;
-            });
+            Self::arm_archive_wake(&mut admission, wake, net_tx, next_token);
             self.archive_admission = Some(admission);
             return ArchiveTurn::Waiting;
         }
