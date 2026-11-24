@@ -15,9 +15,9 @@ pub(in crate::node::channel) use view::{
 };
 
 pub(crate) use sparse::{
-    sparse_control_evaluation, ControlEvaluation, PayloadValidation, SparsePayloadState,
-    SparseValidation, SparseValidationStep, TypedSparseBody, ValidatedSparseEntry,
-    VerifiedParentPrefix,
+    sparse_control_evaluation, termination_admitted, ControlEvaluation, PayloadValidation,
+    SparsePayloadState, SparseValidation, SparseValidationStep, TypedSparseBody,
+    ValidatedSparseEntry, VerifiedParentPrefix,
 };
 
 use super::entry_store::EntryIndex;

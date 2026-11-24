@@ -608,25 +608,51 @@ impl SparseValidation {
 
 /// `VOX_MUTANT_TERMINATION=unchecked` (ADR-053 MP-10 (c)): accept a later position without the
 /// author-local termination evidence — no wait for the author's own control prefix or own
-/// context coordinates, no read of its recorded termination. Says so once when first read.
+/// context coordinates, no read of its recorded termination. `admitted` does the same, and
+/// [`termination_admitted`] holds too. Says so once when first read.
 #[cfg(feature = "test-knobs")]
 fn termination_unchecked() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        let on = std::env::var("VOX_MUTANT_TERMINATION").is_ok_and(|value| value == "unchecked");
-        if on {
-            eprintln!(
-                "vox: VOX_MUTANT_TERMINATION=unchecked engaged: later positions accepted \
-                 without the author's own termination evidence"
-            );
-        }
-        on
-    });
-    *ON
+    termination_mode().is_some()
 }
 
 #[cfg(not(feature = "test-knobs"))]
 const fn termination_unchecked() -> bool {
     false
+}
+
+/// `VOX_MUTANT_TERMINATION=admitted` (ADR-053 MP-10 (c)): a later position is admitted as a
+/// source while its author's termination is withheld. Besides [`termination_unchecked`] here,
+/// every other place that needs the author's own controls under the head passes over them when
+/// absent: admission's preflight (`history_stream/admission.rs`), the effect stage
+/// (`pending_received.rs`), and the history runtime, which fetches a head's ordinary bodies
+/// before that head's control closure.
+#[cfg(feature = "test-knobs")]
+pub(crate) fn termination_admitted() -> bool {
+    termination_mode() == Some("admitted")
+}
+
+#[cfg(not(feature = "test-knobs"))]
+pub(crate) const fn termination_admitted() -> bool {
+    false
+}
+
+#[cfg(feature = "test-knobs")]
+fn termination_mode() -> Option<&'static str> {
+    static MODE: std::sync::LazyLock<Option<&'static str>> = std::sync::LazyLock::new(|| {
+        let mode = match std::env::var("VOX_MUTANT_TERMINATION").as_deref() {
+            Ok("unchecked") => Some("unchecked"),
+            Ok("admitted") => Some("admitted"),
+            _ => None,
+        };
+        if let Some(mode) = mode {
+            eprintln!(
+                "vox: VOX_MUTANT_TERMINATION={mode} engaged: later positions accepted without \
+                 the author's own termination evidence"
+            );
+        }
+        mode
+    });
+    *MODE
 }
 
 fn validate_control_coordinate(

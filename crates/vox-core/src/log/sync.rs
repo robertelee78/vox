@@ -1678,8 +1678,9 @@ where
 ///   its signature intact;
 /// - `author-unclassifiable` (V210-74): what it posts is a signed entry whose payload is neither a
 ///   governance body nor a sender-key message;
-/// - `author-misbound` (V210-74): what it posts is a signed consent grant whose body names an
-///   epoch 7 past the entry's own, so it classifies as governance and does not bind;
+/// - `author-misbound` (V210-74): what it posts is a consent grant signed with kind Governance
+///   whose body names an epoch 7 past the entry's own, so it is governance and does not bind; its
+///   own node skips that binding (`GovEntry::body_bound_to`) so it holds and serves the grant;
 /// - `refuse-sessions` (PRD-001 R36, #85): it refuses every sync session a peer opens to it, with
 ///   the coded reason `EpochMismatch`, so the peer's session ends as the peer's refusal and the
 ///   correct node's log is what a proof reads.
@@ -1861,7 +1862,8 @@ pub mod mutant {
     }
 
     /// Whether what this build posts is a governance body bound to another epoch
-    /// (`author-misbound`): a signed consent grant whose body epoch is the entry's own plus 7.
+    /// (`author-misbound`): a consent grant signed with kind Governance whose body epoch is the
+    /// entry's own plus 7.
     #[must_use]
     pub fn misbound() -> bool {
         mode() == Mode::AuthorMisbound

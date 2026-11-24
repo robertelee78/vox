@@ -974,11 +974,13 @@ impl PendingText {
         let payload = self.sender.encrypt(&plaintext)?.to_wire();
         #[cfg(feature = "mutant-sender")]
         let payload = crate::log::sync::mutant::authored(payload);
+        // `author-misbound`: a real consent grant, signed with kind Governance, whose body names
+        // an epoch 7 past the entry's own, so a reader reaches the governance binding check.
         #[cfg(feature = "mutant-sender")]
-        let payload = if crate::log::sync::mutant::misbound() {
+        let (payload, kind, signed_kind) = if crate::log::sync::mutant::misbound() {
             let (iteration, key) = self.sender.current_position();
             let skdm = self.sender.skdm_for(signer, iteration, key)?;
-            crate::governance::membership::issue_consent_grant(
+            let grant = crate::governance::membership::issue_consent_grant(
                 signer,
                 &self.room,
                 self.epoch + 7,
@@ -986,10 +988,13 @@ impl PendingText {
                 &skdm,
                 self.history_mode,
             )?
-            .to_wire()
+            .to_wire();
+            (grant, EntryKind::Governance, SignedEntryKind::Governance)
         } else {
-            payload
+            (payload, EntryKind::Content, SignedEntryKind::Content)
         };
+        #[cfg(not(feature = "mutant-sender"))]
+        let (kind, signed_kind) = (EntryKind::Content, SignedEntryKind::Content);
         let rendered = Rendered {
             entry_hash: [0; 32],
             author: signer.fingerprint(),
@@ -1004,8 +1009,8 @@ impl PendingText {
             store,
             signer,
             payload,
-            EntryKind::Content,
-            SignedEntryKind::Content,
+            kind,
+            signed_kind,
             Some(rendered),
             &[],
             None,

@@ -21,15 +21,20 @@
 //! 4. nothing was set aside when it reopened: the entry was refused before it was stored.
 //!
 //! ## A governance entry that does not bind to itself ([`a_misbound_governance_entry_is_refused_and_the_room_syncs_on`])
-//! Mallory runs as `author-misbound`: what she posts is a real consent grant, signed, whose body
-//! names an epoch 7 past the entry's own. It was written for the issue's first case: a governance
-//! body with the wrong channel or epoch, which classifies as governance and does not bind. Since
-//! the typed v2 headers (6b425ba42) the mode signs the grant as ordinary content, so Bob refuses it
-//! earlier, at the typed-carrier check ("ordinary content carrier"), before any binding is read;
-//! the binding of a governance-kind entry is not staged by this mode. Asserted as for the
-//! unclassifiable entry: Bob refused it, Alice's next post reaches Bob, none of Bob's sessions
-//! failed with the old binding reason, and after a restart the room is open with nothing set
-//! aside. Arm and mode by the verifier (vox-0e-ver74).
+//! Mallory runs as `author-misbound`: what she posts is a real consent grant, signed with kind
+//! Governance, whose body names an epoch 7 past the entry's own: the issue's first case, a
+//! governance body with the wrong channel or epoch. Its signed kind and its body agree, so Bob's
+//! typed check reaches the governance binding (`GovEntry::body_bound_to`, from
+//! `TypedSparseBody::verify`). Asserted:
+//! 1. Bob refused it at that binding, before holding it, as the serving peer's fault: a sync
+//!    session's `last_failure` names "governance body epoch disagrees with log entry", and his
+//!    verified prefix of Mallory never reaches the grant (RED when it does: he took it);
+//! 2. Alice's next post reaches Bob;
+//! 3. after a restart Bob's room is open, with Alice's post in it and nothing set aside.
+//!
+//! Mutant `VOX_PROOF_GOV_BINDING=unchecked` (the act hands `VOX_MUTANT_GOV_BINDING=unchecked` to
+//! Bob's daemon only; a `test-knobs` build): `body_bound_to` skips its channel and epoch binding.
+//! Red at (1): Bob takes the grant. Arm and mode by the verifier (vox-0e-ver74).
 //!
 //! ## A body stripped in transit is owed ([`a_stripped_body_is_owed_and_asked_for_until_it_arrives`])
 //! Mallory runs as `strip-payload`: she serves every entry without its payload (the legacy serve)
@@ -52,24 +57,40 @@
 //! ADR-053 MP-10 (c). Mallory first runs as an ordinary member (mode `correct`) and posts; then her
 //! daemon restarts as `terminate-and-withhold`: her next post is preceded by a signed
 //! `Termination` of her own feed, she posts twice more past it, and she never serves the
-//! termination's header (to Bob, Alice or the anchor), so the only copy is hers. Asserted on Bob
-//! (shipped binary):
-//! 1. while it is withheld: Bob knows Mallory's later positions (her advertised head is past both
-//!    posts) and shows Alice's post written after them, and in three status answers in a row, with
-//!    rounds toward Mallory completing, Bob shows neither later post and holds neither as a verified
-//!    source (his verified prefix of Mallory stays below the first) — unrendered and non-citable;
+//! termination's header (to Bob, Alice or the anchor), so the only copy is hers. Her later
+//! positions' headers, bodies and proofs are served. Asserted on Bob (shipped binary):
+//! 1. while it is withheld, Bob knows Mallory's later positions (her advertised head is past both
+//!    posts) and shows Alice's post written after them; then:
+//!    - non-citable, by a control's outcome rather than by Bob's contiguous verified prefix
+//!      (which does not move past an unfinished predecessor, where a settled tip can): after
+//!      three more completed rounds toward Mallory, Bob posts. His writer names the newest
+//!      settled tip it holds of every other member in the `seen` of what it signs, with a
+//!      control first when that changes his context (`local_history::authored_context`), so
+//!      were either later post a settled source on Bob, that control and his post would rest
+//!      on it, and Alice, from whom the termination is withheld too, could not admit them.
+//!      Asserted on Alice: she shows Bob's post. RED when instead his post fails, or Alice knows
+//!      his head past it and over three completed rounds toward him her verified prefix of him
+//!      stays below it;
+//!    - unrendered: in three status answers in a row, with rounds toward Mallory completing,
+//!      Bob shows neither later post and his verified prefix of Mallory stays below the first;
 //! 2. once Mallory restarts as `terminated-serves` and the termination is supplied (Bob's verified
 //!    prefix of Mallory moves past what it was), Bob still shows neither later post, holds neither as
 //!    a source over three answers with rounds completing, shows Alice's next post, and nothing he
 //!    reports names a store error;
 //! 3. the same after Bob's daemon restarts.
 //!
-//! Mutant `VOX_MUTANT_TERMINATION=unchecked` (given to Bob's daemon only): the validator accepts a
-//! later position without the author's own termination evidence. It goes red at (2): once the
-//! termination is supplied, the later entry reaches publication's last fence and Bob reports
-//! `malformed at-rest artifact: sparse source follows a terminated feed` (also what v0.4.31 main
-//! reports). At (1) the entry is still not shown under this mutant: a later stage also needs the
-//! author's own controls (not traced to its line), so (1) stays green under this mutant.
+//! Two mutants, each handed by the act to Bob's daemon only as `VOX_MUTANT_TERMINATION` (a
+//! `test-knobs` build), named to the act by `VOX_PROOF_TERMINATION`:
+//! - `unchecked`: the validator accepts a later position without the author's own termination
+//!   evidence. Red at (2): once the termination is supplied, the later entry reaches
+//!   publication's last fence and Bob reports
+//!   `malformed at-rest artifact: sparse source follows a terminated feed` (also what v0.4.31
+//!   main reports). (1) stays green under it: admission's preflight and the effect stage still
+//!   need the author's own controls under the head, the withheld termination among them;
+//! - `admitted`: a later position is admitted as a source while the termination is withheld:
+//!   `unchecked`, and preflight, the effect stage and the history runtime's control closure pass
+//!   over the author's own absent controls. Red at (1), non-citable: Bob holds the later post
+//!   as a source, his post rests on it and Alice cannot admit it.
 //!
 //! ## Mutations
 //! - no refusal of an unclassifiable entry before it is held (`unclassifiable` answering `None`):
@@ -80,15 +101,18 @@
 //! - a body not received taken as expired (never owed): the stripped arm goes red at (2), and Bob
 //!   never asks again;
 //! - no report of a lost message: arm 3 goes red;
-//! - no binding check before holding (`unclassifiable` answering `None` for governance): the
-//!   misbound arm goes red, the entry was stored.
-//! - `VOX_MUTANT_TERMINATION=unchecked`: the hidden-termination arm goes red at (2).
+//! - no binding check of a governance body (`VOX_PROOF_GOV_BINDING=unchecked`): the misbound arm
+//!   goes red at (1), Bob takes the grant;
+//! - `VOX_PROOF_TERMINATION=unchecked`: the hidden-termination arm goes red at (2);
+//! - `VOX_PROOF_TERMINATION=admitted`: the hidden-termination arm goes red at (1), non-citable.
 
 #![cfg(unix)]
 
 #[path = "support/sync_pair.rs"]
 mod sync_pair;
 
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
@@ -103,6 +127,10 @@ const ARRIVES_WITHIN: Duration = Duration::from_secs(30);
 /// kind is ordinary content and its body is not a group message (`governance/sparse.rs`, the
 /// typed-carrier check).
 const CARRIER: &str = "malformed identity bundle: ordinary content carrier";
+
+/// Bob's session failure when he refuses mallory's misbound grant before holding it: its signed
+/// kind is governance and its body names another epoch (`GovEntry::body_bound_to`).
+const BINDING: &str = "malformed governance struct: governance body epoch disagrees with log entry";
 
 /// Whether `m` reads `text` in `room` now (`vox room read`, which needs the room open); `Err`
 /// quotes a `vox room read` that failed, so a failing read is never taken for "not yet".
@@ -485,6 +513,15 @@ fn a_stripped_body_is_owed_and_asked_for_until_it_arrives() {
 fn a_misbound_governance_entry_is_refused_and_the_room_syncs_on() {
     const MODE: &str = "author-misbound";
     watchdog::arm();
+    // The reader mutant goes to Bob's daemon only; Mallory is the attacker, Alice a witness.
+    let mutant = std::env::var("VOX_PROOF_GOV_BINDING").ok();
+    if mutant.is_some() {
+        test_knobs::require(&["VOX_MUTANT_GOV_BINDING"]);
+    }
+    let bob_env: Vec<(&str, &str)> = mutant
+        .as_deref()
+        .map(|m| vec![("VOX_MUTANT_GOV_BINDING", m)])
+        .unwrap_or_default();
     let sender = mutant_sender();
     let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
     let root = tmp.path();
@@ -497,7 +534,7 @@ fn a_misbound_governance_entry_is_refused_and_the_room_syncs_on() {
         b.trust(a);
     }
     let _alice_d = alice.daemon(Some(&spec));
-    let bob_d = bob.daemon(Some(&spec));
+    let bob_d = bob.daemon_with_anchor(Some(&spec), &bob_env);
     let mallory_d = mallory.daemon_mutant(&sender, MODE, Some(&spec));
     let room = alice.create("hostile");
     let link = alice.invite(&room);
@@ -510,26 +547,22 @@ fn a_misbound_governance_entry_is_refused_and_the_room_syncs_on() {
         "PRODUCT (staging): alice's first post never reached bob, before anything hostile"
     );
 
-    let since = refusals(&bob);
+    let (head_before, _) = feed_view(&bob.status(), &room, &mallory);
+    let base = head_before.unwrap_or(0);
     mallory.post(&room, "whatever mallory typed");
     // From whichever peer served it first: Mallory, or the anchor holding it for her.
-    let refused = refused_by(&bob, since, CARRIER);
+    let refused = refused_at_binding(&bob, &room, &mallory, base);
     assert!(
         announced(&mallory_d, MODE),
         "APPARATUS (the mutant peer): mallory's daemon never announced {MODE:?}:\n{}",
         mallory_d.transcript()
     );
-    let Some(refused) = refused else {
-        panic!(
-            "PRODUCT (staging): bob never refused mallory's entry (it never reached him)\nbob's status: {}",
-            bob.status()
-        );
-    };
     let after = "alice, after mallory's entry";
     alice.post(&room, after);
     let took = arrives(&bob, &room, after);
     println!(
-        "[proof] misbound: bob refused it ({refused}); alice's next post reached him: {took:?}"
+        "[proof] misbound: bob refused it at its binding ({refused}); alice's next post reached \
+         him: {took:?}"
     );
     if let Err(e) = &took {
         panic!(
@@ -539,21 +572,9 @@ fn a_misbound_governance_entry_is_refused_and_the_room_syncs_on() {
             bob_d.transcript()
         );
     }
-    // A refusal is not a failed session: before, it ended bob's session with the refusal as its
-    // reason and poisoned the room's sync until a reopen, and alice's post came only when she
-    // pushed it again. The reason is hard-coded here.
-    let poisoned: Vec<String> = failures(&bob.status())
-        .into_iter()
-        .filter(|f| f.contains("disagrees with log entry"))
-        .collect();
-    assert!(
-        poisoned.is_empty(),
-        "PRODUCT: mallory's misbound governance entry failed bob's sync sessions: {poisoned:?}"
-    );
-
     // ---- bob restarts: the room is held again, whole, and nothing hostile was stored --------
     drop(bob_d);
-    let _bob_d = bob.daemon(Some(&spec));
+    let _bob_d = bob.daemon_with_anchor(Some(&spec), &bob_env);
     let reopened = arrives(&bob, &room, after);
     let aside = set_aside(&bob);
     println!("[proof] misbound: after a restart bob reads it: {reopened:?}; set aside: {aside:?}");
@@ -573,8 +594,17 @@ fn a_misbound_governance_entry_is_refused_and_the_room_syncs_on() {
 
 /// `of`'s feed as `status` reports it in `room`: (advertised head, verified contiguous prefix).
 fn feed_view(status: &serde_json::Value, room: &str, of: &Member) -> (Option<u64>, Option<u64>) {
+    let row = member_row(status, room, of);
+    (
+        row["advertised_through"].as_u64(),
+        row["verified_through"].as_u64(),
+    )
+}
+
+/// `of`'s member row in `room` as `status` reports it; `null` when there is none.
+fn member_row(status: &serde_json::Value, room: &str, of: &Member) -> serde_json::Value {
     let same = |a: &str, b: &str| a.starts_with(b) || b.starts_with(a);
-    let row = status["rooms"]
+    status["rooms"]
         .as_array()
         .and_then(|rooms| {
             rooms
@@ -586,13 +616,82 @@ fn feed_view(status: &serde_json::Value, room: &str, of: &Member) -> (Option<u64
             members
                 .iter()
                 .find(|m| m["id"].as_str().is_some_and(|id| same(id, &of.fp)))
-        });
-    row.map_or((None, None), |r| {
-        (
-            r["advertised_through"].as_u64(),
-            r["verified_through"].as_u64(),
-        )
-    })
+        })
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// `writer` posts `text`, and `reader` must show it; how it went. `writer`'s entries name in
+/// `seen` the newest settled tip it holds of every other member (a control first, when that
+/// changes its context), so the post rests on whatever `writer` holds as a source. The RED
+/// verdict: the post fails, or `reader` knows `writer`'s head past what she had verified before
+/// it and, over three completed rounds toward `writer`, her verified prefix of him stays below
+/// that head without the post shown: she cannot admit what it rests on. Neither within 600 s is
+/// APPARATUS NO RESULT.
+fn rests_on_nothing_later(
+    writer: &Member,
+    reader: &Member,
+    room: &str,
+    text: &str,
+    phase: &str,
+) -> String {
+    let (_, before) = feed_view(&reader.status(), room, writer);
+    let before = before.unwrap_or(0);
+    let (ok, out, err) = writer.vox(&["room", "post", room, text], None);
+    assert!(
+        ok,
+        "RED PRODUCT ({phase}): {}'s `vox room post` failed: {out}{err}",
+        writer.name
+    );
+    let started = Instant::now();
+    let mut wedged: Option<(u64, u64, u64)> = None;
+    loop {
+        match reads(reader, room, text) {
+            Ok(true) => {
+                return format!(
+                    "{} shows it; her verified prefix of {} {before} -> {:?}",
+                    reader.name,
+                    writer.name,
+                    feed_view(&reader.status(), room, writer).1
+                )
+            }
+            Ok(false) => {}
+            Err(e) => panic!(
+                "PRODUCT ({phase}): {}'s `vox room read` failed: {e}",
+                reader.name
+            ),
+        }
+        let status = reader.status();
+        let rounds = rounds_toward(&status, writer);
+        let (head, verified) = feed_view(&status, room, writer);
+        let verified = verified.unwrap_or(0);
+        wedged = match (head, wedged) {
+            (Some(head), Some((h, v, first))) if head == h && verified == v => Some((h, v, first)),
+            (Some(head), _) if head > before && verified < head => Some((head, verified, rounds)),
+            _ => None,
+        };
+        if let Some((head, verified, first)) = wedged {
+            assert!(
+                rounds < first + 3,
+                "RED PRODUCT ({phase}): {} cannot admit {}'s post {text:?}: she knows his head \
+                 {head}, and over rounds toward him {first} -> {rounds} her verified prefix of \
+                 him stays at {verified}; what it rests on is no source she can admit\n{}'s row \
+                 for him: {}",
+                reader.name,
+                writer.name,
+                reader.name,
+                member_row(&status, room, writer)
+            );
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(600),
+            "APPARATUS NO RESULT ({phase}): in 600 s {} neither showed {}'s post nor held his \
+             verified prefix below his head over three rounds toward him: status {status}",
+            reader.name,
+            writer.name
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    }
 }
 
 /// Rounds `status` reports completed toward `peer`, empty ones included: evidence it asked.
@@ -601,6 +700,77 @@ fn rounds_toward(status: &serde_json::Value, peer: &Member) -> u64 {
         .iter()
         .map(|key| counter(status, key, Some(&peer.fp)))
         .sum()
+}
+
+/// Wait until `m` reports `n` more completed rounds toward `peer` than now; how many it took.
+/// Fewer within 600 s is APPARATUS NO RESULT.
+fn rounds_after(m: &Member, peer: &Member, n: u64, phase: &str) -> u64 {
+    let first = rounds_toward(&m.status(), peer);
+    let started = Instant::now();
+    loop {
+        let now = rounds_toward(&m.status(), peer);
+        if now >= first + n {
+            return now - first;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(600),
+            "APPARATUS NO RESULT ({phase}): in 600 s {}'s rounds toward {} went {first} -> {now}, \
+             fewer than {n} more",
+            m.name,
+            peer.name
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// Watch `bob` until one of his sync sessions' last failure names [`BINDING`]: he refused `of`'s
+/// misbound grant before holding it, as the serving peer's fault; how. The RED verdict is the
+/// other outcome: his verified prefix of `of` reaches her head past `base` (her grant) and stays
+/// there over three status answers with rounds toward her completing, and no session named the
+/// binding: he took it. Neither within 600 s is APPARATUS NO RESULT.
+fn refused_at_binding(bob: &Member, room: &str, of: &Member, base: u64) -> String {
+    let started = Instant::now();
+    let mut samples: Vec<(u64, u64)> = Vec::new();
+    loop {
+        let status = bob.status();
+        let named: Vec<String> = failures(&status)
+            .into_iter()
+            .filter(|f| f.contains(BINDING))
+            .collect();
+        if !named.is_empty() {
+            return format!(
+                "{} session(s) failed in all, refusing it as the peer's fault: {named:?}",
+                counter(&status, "failed", None)
+            );
+        }
+        match feed_view(&status, room, of) {
+            (Some(head), Some(verified)) if head > base && verified >= head => {
+                samples.push((head, rounds_toward(&status, of)));
+                if samples.len() > 3 {
+                    samples.remove(0);
+                }
+            }
+            _ => samples.clear(),
+        }
+        if samples.len() == 3
+            && samples.iter().all(|s| s.0 == samples[0].0)
+            && samples[2].1 > samples[0].1
+        {
+            panic!(
+                "RED PRODUCT: bob took {}'s misbound governance grant: his verified prefix of her \
+                 reached her head {} (past {base}) over three answers with rounds toward her \
+                 completing, and no session refused it at its binding\nbob's status: {status}",
+                of.name, samples[2].0
+            );
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(600),
+            "APPARATUS NO RESULT: in 600 s bob neither refused {}'s grant at its binding nor took \
+             it (samples {samples:?})\nbob's status: {status}",
+            of.name
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    }
 }
 
 /// Nothing `m` reports names a store error from a terminated feed: its status and its room read.
@@ -696,13 +866,16 @@ fn holds_back(
 #[ignore = "real daemons against the mutant sender build (VOX_MUTANT_SENDER); CI runs it in release"]
 fn a_post_after_a_hidden_termination_is_never_shown() {
     watchdog::arm();
-    let sender = mutant_sender();
     // The reader mutant goes to Bob's daemon only; Mallory is the attacker, Alice a witness.
-    let mutant = std::env::var("VOX_MUTANT_TERMINATION").ok();
+    let mutant = std::env::var("VOX_PROOF_TERMINATION").ok();
+    if mutant.is_some() {
+        test_knobs::require(&["VOX_MUTANT_TERMINATION"]);
+    }
     let bob_env: Vec<(&str, &str)> = mutant
         .as_deref()
         .map(|m| vec![("VOX_MUTANT_TERMINATION", m)])
         .unwrap_or_default();
+    let sender = mutant_sender();
     // Kept: the run directory holds every daemon's log for the record.
     let tmp = tempfile::tempdir().expect("APPARATUS: tempdir").keep();
     let root = tmp.as_path();
@@ -776,6 +949,19 @@ fn a_post_after_a_hidden_termination_is_never_shown() {
         );
         std::thread::sleep(Duration::from_secs(1));
     };
+    // Non-citable first: three more completed rounds toward mallory, so whatever bob takes of
+    // her later positions while the termination is withheld he has taken before he posts.
+    let asked = rounds_after(&bob, &mallory, 3, "withheld");
+    println!(
+        "[proof] withheld: after {asked} more rounds toward mallory, bob's row for her: {}",
+        member_row(&bob.status(), &room, &mallory)
+    );
+    let cited = "bob, while mallory's termination is withheld";
+    let took = rests_on_nothing_later(&bob, &alice, &room, cited, "withheld");
+    println!(
+        "[proof] hidden termination, withheld: bob's post, which names the newest tips he \
+         holds, reached alice ({took}): no later post of mallory's is a source he cites"
+    );
     // `head - 1` is the first later post's position or the termination's: neither may be held.
     let withheld = holds_back(&bob, &room, &mallory, &later, (base, head - 1), "withheld");
     no_store_error(&bob, &room, "withheld");

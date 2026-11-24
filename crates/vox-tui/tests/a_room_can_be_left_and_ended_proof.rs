@@ -81,6 +81,8 @@ optional_proof::not_run!(
 mod pty_driver;
 #[path = "support/room.rs"]
 mod support;
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
@@ -1166,6 +1168,13 @@ fn mp10_readmitted_member_gets_no_gap_body(send: [bool; 3], render: bool, red: &
     const CAROL: usize = 2;
     const DAVE: usize = 3;
     let holder_env = |i: usize| mp10_env(send[if i == DAVE { 2 } else { i }], false);
+    // Every knob this staging sets must be read by the `vox` under test, or a default build
+    // would run it unstaged and could pass without isolating its boundary.
+    let knobs: Vec<&str> = mp10_env(send.contains(&true), render)
+        .into_iter()
+        .map(|(knob, _)| knob)
+        .collect();
+    test_knobs::require(&knobs);
     let rt = runtime();
     let tmp = support::diagnostic_tempdir();
     let mut room = room_of(&rt, tmp.path(), &["alice", "bob", "carol", "dave"]);

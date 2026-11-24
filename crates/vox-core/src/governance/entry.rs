@@ -327,6 +327,9 @@ impl GovEntry {
             ));
         }
         let (body_channel, body_epoch) = body.channel_and_epoch();
+        if binding_unchecked() {
+            return Ok(body);
+        }
         if body_channel != entry.skeleton.channel_id {
             return Err(Error::MalformedGovernance(
                 "governance body room id disagrees with log entry",
@@ -339,4 +342,37 @@ impl GovEntry {
         }
         Ok(body)
     }
+}
+
+/// Whether [`GovEntry::body_bound_to`] skips its (channel, epoch) binding. Never in a shipped
+/// build. The `author-misbound` mutant sender skips it, so its own node holds the misbound grant
+/// it signs and serves it. `VOX_MUTANT_GOV_BINDING=unchecked` (a `test-knobs` build; the proof of
+/// a misbound governance entry hands it to one reader) skips it on that reader.
+fn binding_unchecked() -> bool {
+    #[cfg(feature = "mutant-sender")]
+    if crate::log::sync::mutant::misbound() {
+        return true;
+    }
+    binding_knob()
+}
+
+/// `VOX_MUTANT_GOV_BINDING=unchecked`; says so once when first read.
+#[cfg(feature = "test-knobs")]
+fn binding_knob() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let on = std::env::var("VOX_MUTANT_GOV_BINDING").is_ok_and(|value| value == "unchecked");
+        if on {
+            eprintln!(
+                "vox: VOX_MUTANT_GOV_BINDING=unchecked engaged: a governance body is taken \
+                 whatever channel and epoch it names"
+            );
+        }
+        on
+    });
+    *ON
+}
+
+#[cfg(not(feature = "test-knobs"))]
+const fn binding_knob() -> bool {
+    false
 }
