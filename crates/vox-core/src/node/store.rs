@@ -68,8 +68,176 @@ const SEK_WRAPS: TableDefinition<Digest32, &[u8]> = TableDefinition::new("sek_wr
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const META_SCHEMA: &str = "schema_version";
 
-// redb can double a compacted file on its next write; reclaim only excess above that slack.
+// The file grows by a quarter and commits trim a quarter free at its end; give back only excess
+// above that slack.
 const MIN_COMPACTION_RECLAIM_BYTES: u64 = 64 * 1024 * 1024;
+
+// One give-back move step copies at most this many bytes of pages, unless its first group (a
+// page and the parents rewritten with it) alone is larger, as a leaf holding one value over
+// 16 MiB is. Choosing the pages still walks every table page, so a step's time grows with the
+// store's pages. A mitigation (RG-13 fix2), adopted after one post waited 12.7 s on a 2.75 GB
+// store after a restart, before any cap; no measured run fails without it.
+const GIVE_BACK_STEP_BYTES: u64 = 16 * 1024 * 1024;
+
+/// What one give-back pass left: file and held bytes, its commits, how long it took, the
+/// longest commit writers waited for, the most bytes one move step copied, and the retired
+/// bytes it left for reads to release.
+struct GaveBack {
+    file: u64,
+    held: u64,
+    steps: u32,
+    took: std::time::Duration,
+    longest: std::time::Duration,
+    largest_move: u64,
+    waiting: u64,
+}
+
+/// What a store file is and holds, measured under the writer: the file's length, the bytes it
+/// holds (allocated, less pages committed transactions retired), those retired bytes, and the
+/// free bytes at its end.
+#[derive(Clone, Copy)]
+struct Measured {
+    file: u64,
+    held: u64,
+    retired: u64,
+    free_at_end: u64,
+}
+
+/// What `vox status` says of a store: what it holds, and whether it is giving space back or
+/// waits for reads to end to go on (RG-13). It never waits for the store's writer (RG-12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoreSpace {
+    /// Bytes the store holds: allocated, less pages committed transactions retired. `None`
+    /// until the store has measured them.
+    pub held_bytes: Option<u64>,
+    /// `held_bytes` was measured for this answer. Otherwise a write held the store, and it is
+    /// the store's last measure: at a give-back step or an earlier answer.
+    pub held_now: bool,
+    /// A give-back pass is started and not finished.
+    pub giving_back: bool,
+    /// A pass stopped where reads still see the pages it retired; their end resumes it.
+    pub waiting_for_reads: bool,
+}
+
+/// A store's give-back passes (RG-13). Every read of the store shares it: a pass that finds
+/// pages it retired still seen by reads records which reads those are, and the end of one of
+/// them resumes it. No timer and no fixed number of commits.
+#[derive(Default)]
+struct GiveBack {
+    now: Mutex<GiveBackNow>,
+    /// Counts each time a pass began to wait; a read keeps the count it began under, so only
+    /// reads begun before the wait resume it.
+    waits: AtomicU64,
+    /// One pass at a time; a pass asked for meanwhile sets `again` and the running one repeats.
+    pass: Mutex<()>,
+    again: AtomicBool,
+    /// Set by the first pass, which always starts from the shared store on the daemon's
+    /// runtime: a read may end on any thread, and the pass it resumes runs on that runtime.
+    store: std::sync::OnceLock<(std::sync::Weak<Store>, tokio::runtime::Handle)>,
+}
+
+#[derive(Default)]
+struct GiveBackNow {
+    /// Passes started (or resumed) and not finished.
+    passes: u32,
+    /// The `waits` count of the wait reads may end, while a pass waits for them.
+    waiting: Option<u64>,
+    /// A read begun after that count ended while the pass waited.
+    missed: bool,
+    /// What the store held when it last measured, under its writer.
+    held: Option<u64>,
+}
+
+impl GiveBack {
+    fn now(&self) -> MutexGuard<'_, GiveBackNow> {
+        self.now.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Wait for the reads begun until now. Set before the pass's last trim, so a read that ends
+    /// after that trim freed what it could always finds it set.
+    fn wait_for_reads(&self) -> u64 {
+        let wait = self.waits.fetch_add(1, Ordering::SeqCst);
+        let mut now = self.now();
+        now.waiting = Some(wait);
+        now.missed = false;
+        wait
+    }
+
+    /// The last trim left retired pages. Reads begun after `wait` may see some of them: one
+    /// begun before a commit (an ordinary post, or that trim itself) retired pages it sees.
+    /// Wait for every read begun until now, which includes each read that can still see one;
+    /// or, when one of those later reads already ended (after the trim, perhaps, so its pages
+    /// are still retired), `false`: wait and trim again. `true` too when a read the pass waited
+    /// for ended and resumed it.
+    fn wait_again(&self, wait: u64) -> bool {
+        let mut now = self.now();
+        #[cfg(feature = "test-knobs")]
+        if super::computer::fx28_mutant("rg13-no-rewait") {
+            return true;
+        }
+        if now.waiting != Some(wait) {
+            return true;
+        }
+        if now.missed {
+            return false;
+        }
+        now.waiting = Some(self.waits.fetch_add(1, Ordering::SeqCst));
+        true
+    }
+
+    fn stop_waiting(&self, wait: u64) {
+        let mut now = self.now();
+        if now.waiting == Some(wait) {
+            now.waiting = None;
+        }
+    }
+
+    /// A read begun under `began` ended: when a pass waits for it, resume the pass.
+    fn read_ended(&self, began: u64) {
+        let resume = {
+            let mut now = self.now();
+            match now.waiting {
+                Some(wait) if began <= wait => {
+                    #[cfg(feature = "test-knobs")]
+                    if super::computer::fx28_mutant("rg13-no-resume") {
+                        return;
+                    }
+                    now.waiting = None;
+                    now.passes += 1;
+                    Some(wait)
+                }
+                Some(_) => {
+                    now.missed = true;
+                    None
+                }
+                None => None,
+            }
+        };
+        if let Some(wait) = resume {
+            if let Some((store, runtime)) = self.store.get() {
+                if let Some(store) = store.upgrade() {
+                    Store::spawn_give_back(store, runtime);
+                    return;
+                }
+            }
+            let mut now = self.now();
+            now.passes -= 1;
+            now.waiting.get_or_insert(wait);
+        }
+    }
+}
+
+/// The end of one read of a store; see [`GiveBack`].
+struct ReadEnd {
+    give_back: Arc<GiveBack>,
+    began: u64,
+}
+
+impl Drop for ReadEnd {
+    fn drop(&mut self) {
+        self.give_back.read_ended(self.began);
+    }
+}
 
 /// Successful store-backend flush calls across this process, including opening, recovery and
 /// rewrite files. Count the completed I/O, not transactions classified as durable.
@@ -230,6 +398,8 @@ struct Cached<T> {
     database: Option<Arc<Database>>,
     cache: Arc<DatabaseCacheLease>,
     profile: Option<Arc<ProfileOwner>>,
+    /// A read's end, after `inner` has ended it: it may resume a waiting give-back pass.
+    read_end: Option<ReadEnd>,
 }
 
 impl<T> std::ops::Deref for Cached<T> {
@@ -254,6 +424,7 @@ impl Cached<Arc<Database>> {
             database: Some(Arc::clone(&self.inner)),
             cache: Arc::clone(&self.cache),
             profile: self.profile.clone(),
+            read_end: None,
         })
     }
 
@@ -265,6 +436,7 @@ impl Cached<Arc<Database>> {
             database: Some(Arc::clone(&self.inner)),
             cache: Arc::clone(&self.cache),
             profile: self.profile.clone(),
+            read_end: None,
         })
     }
 }
@@ -278,6 +450,7 @@ impl Cached<ReadOnlyDatabase> {
             database: None,
             cache: Arc::clone(&self.cache),
             profile: self.profile.clone(),
+            read_end: None,
         })
     }
 }
@@ -289,6 +462,7 @@ impl Cached<redb::WriteTransaction> {
             database,
             cache,
             profile,
+            read_end: _,
         } = self;
         let result = inner.commit();
         drop(database);
@@ -328,6 +502,7 @@ fn open_database(path: &Path) -> std::result::Result<Cached<Arc<Database>>, redb
         database: None,
         cache,
         profile: None,
+        read_end: None,
     })
 }
 
@@ -340,6 +515,7 @@ fn open_read_only_database(
         database: None,
         cache,
         profile: None,
+        read_end: None,
     })
 }
 
@@ -549,6 +725,8 @@ pub struct Store {
     /// handle, and the lock with it — never before, which let a vox waiting for the lock open a
     /// store the other was still closing and be refused.
     profile_owner: Option<Arc<ProfileOwner>>,
+    /// Its give-back passes, shared with its reads (RG-13).
+    give_back: Arc<GiveBack>,
 }
 
 /// How the store's file is open.
@@ -630,6 +808,7 @@ impl Store {
             writer: Mutex::new(Epochs::default()),
             agreement_settlement: Arc::new(tokio::sync::Semaphore::new(1)),
             profile_owner: None,
+            give_back: Arc::default(),
         };
         store.init_schema()?;
         Ok(store)
@@ -660,6 +839,7 @@ impl Store {
             writer: Mutex::new(Epochs::default()),
             agreement_settlement: Arc::new(tokio::sync::Semaphore::new(1)),
             profile_owner: None,
+            give_back: Arc::default(),
         };
         if store.schema_is_current()? {
             Ok(store)
@@ -977,12 +1157,20 @@ impl Store {
         Ok(())
     }
 
-    /// Begin a read transaction on whichever handle is open.
+    /// Begin a read transaction on whichever handle is open. Its end may resume a give-back
+    /// pass that waits for it: the count is taken before the read begins.
     fn begin_read(&self) -> Result<Cached<redb::ReadTransaction>> {
-        self.db
+        let began = self.give_back.waits.load(Ordering::SeqCst);
+        let mut txn = self
+            .db
             .read()
             .unwrap_or_else(PoisonError::into_inner)
-            .begin_read()
+            .begin_read()?;
+        txn.read_end = Some(ReadEnd {
+            give_back: Arc::clone(&self.give_back),
+            began,
+        });
+        Ok(txn)
     }
 
     /// Begin a write transaction, holding the store's writer — refused, writing nothing, while
@@ -1593,29 +1781,162 @@ impl Store {
         Ok(())
     }
 
-    /// Startup only, before sharing the store: allocated pages include the metadata trees,
-    /// unlike the sum of row bodies. An overflowing comparison cannot exceed a u64 file.
-    pub(crate) fn compact_if_needed(&mut self, notice: impl FnOnce(u64, u64)) -> Result<bool> {
-        let used_bytes = {
-            let backing = self.db.get_mut().unwrap_or_else(PoisonError::into_inner);
-            let Backing::Writable(db) = backing else {
-                return Ok(false);
-            };
-            let txn = db.inner.begin_read().map_err(storage("measure store"))?;
-            txn.allocated_bytes().map_err(storage("measure store"))?
+    /// Give space back while the store is shared (RG-13): after a prune (retention, or a private
+    /// drive's expiry), once after Ready, and when a read ends that a pass waits for. While the
+    /// file exceeds 1.25 times what it holds by 64 MiB, a pass trims the end of the file, moves
+    /// the highest pages into the lowest free ones, and trims again. Each step is one durable
+    /// commit under the writer: writers wait for one step at a time, reads never wait. The pass
+    /// is counted at once, so `vox status` says so before it starts. Best effort: a failure is
+    /// logged and the node goes on.
+    pub(crate) fn give_back_space(self: &Arc<Self>) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
         };
-        let file_bytes = std::fs::metadata(&self.path)
-            .map_err(storage("measure store file"))?
-            .len();
-        let Some((used_bytes, twice_used)) =
-            used_bytes.checked_mul(2).map(|twice| (used_bytes, twice))
-        else {
-            return Ok(false);
-        };
-        if file_bytes <= twice_used || file_bytes - twice_used < MIN_COMPACTION_RECLAIM_BYTES {
-            return Ok(false);
+        let _ = self
+            .give_back
+            .store
+            .set((Arc::downgrade(self), runtime.clone()));
+        self.give_back.now().passes += 1;
+        Self::spawn_give_back(Arc::clone(self), &runtime);
+    }
+
+    /// Run one counted pass on a blocking thread of the daemon's runtime.
+    fn spawn_give_back(store: Arc<Self>, runtime: &tokio::runtime::Handle) {
+        runtime.spawn_blocking(move || {
+            store.give_back_passes();
+            store.give_back.now().passes -= 1;
+        });
+    }
+
+    /// One pass at a time: a pass asked for while another runs makes that one run again rather
+    /// than wait beside it.
+    fn give_back_passes(&self) {
+        #[cfg(feature = "test-knobs")]
+        if super::computer::fx28_mutant("rg13-no-give-back") {
+            return;
         }
-        notice(file_bytes, used_bytes);
+        let give_back = &self.give_back;
+        loop {
+            give_back.again.store(true, Ordering::SeqCst);
+            let pass = match give_back.pass.try_lock() {
+                Ok(pass) => pass,
+                Err(std::sync::TryLockError::Poisoned(pass)) => pass.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => return,
+            };
+            give_back.again.store(false, Ordering::SeqCst);
+            self.give_back_pass();
+            drop(pass);
+            if !give_back.again.load(Ordering::SeqCst) {
+                return;
+            }
+        }
+    }
+
+    fn give_back_pass(&self) {
+        let node = self
+            .path
+            .parent()
+            .and_then(Path::file_name)
+            .map_or_else(|| "<node>".into(), |name| name.to_string_lossy());
+        match self.give_back_rounds(|file, held| {
+            eprintln!(
+                "vox daemon: node {node}: giving back disk space (file {file} bytes, holds {held} bytes)"
+            );
+        }) {
+            Ok(Some(pass)) => eprintln!(
+                "vox daemon: node {node}: store file is now {} bytes, holds {} bytes; \
+                 {} steps in {} ms; writes waited at most {} ms; one step moved at most {} bytes{}",
+                pass.file,
+                pass.held,
+                pass.steps,
+                pass.took.as_millis(),
+                pass.longest.as_millis(),
+                pass.largest_move,
+                if pass.waiting > 0 {
+                    format!(
+                        "; reads still see {} retired bytes, and giving back goes on when they end",
+                        pass.waiting
+                    )
+                } else {
+                    String::new()
+                }
+            ),
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("vox daemon: node {node}: store compaction skipped: {error}; continuing");
+            }
+        }
+    }
+
+    /// What the pass left, or `None` when nothing was over the threshold or the store closed.
+    ///
+    /// Held bytes are allocated pages, metadata trees included, less the data pages committed
+    /// transactions retired: a commit frees those only once no open read still sees them. The
+    /// invariant: after the last event that frees space, once no read still sees a page a
+    /// commit retired, the file is within 1.25 times what it holds plus 64 MiB without any
+    /// further trigger. A pass ends within that bound; or waiting for the reads that still see
+    /// pages it retired, the end of each of which resumes it ([`GiveBack`]); or when a move found
+    /// nothing lower free for the highest pages.
+    fn give_back_rounds(&self, notice: impl FnOnce(u64, u64)) -> Result<Option<GaveBack>> {
+        let began = std::time::Instant::now();
+        let mut steps = 0_u32;
+        let mut longest = std::time::Duration::ZERO;
+        let mut largest_move = 0_u64;
+        let over = |at: &Measured| {
+            at.file.saturating_sub(at.held.saturating_add(at.held / 4))
+                >= MIN_COMPACTION_RECLAIM_BYTES
+        };
+        // Under the writer: one durable commit, a trim (`Some(false)`), which first frees what
+        // no open read still sees and then gives back the free end, or a move of the highest
+        // pages (`Some(true)`); then, before any other writer, what the file is and holds.
+        let mut step = |work: Option<bool>| -> Result<Option<Measured>> {
+            let mut epochs = self.writer()?;
+            let started = std::time::Instant::now();
+            if let Some(relocate) = work {
+                let mut txn = match &*self.db.read().unwrap_or_else(PoisonError::into_inner) {
+                    Backing::Writable(db) => {
+                        db.begin_write().map_err(storage("begin give back"))?
+                    }
+                    Backing::ReadOnly(_) | Backing::Closed => return Ok(None),
+                };
+                if relocate {
+                    let moved = txn
+                        .compact_pages_and_trim(GIVE_BACK_STEP_BYTES)
+                        .map_err(storage("give back space"))?;
+                    largest_move = largest_move.max(moved);
+                } else {
+                    txn.trim_at_commit();
+                }
+                self.commit_flushed(txn, &mut epochs, "give back space")?;
+                steps += 1;
+            }
+            let txn = match &*self.db.read().unwrap_or_else(PoisonError::into_inner) {
+                Backing::Writable(db) => db.begin_write().map_err(storage("measure store"))?,
+                Backing::ReadOnly(_) | Backing::Closed => return Ok(None),
+            };
+            let space = txn.space().map_err(storage("measure store"))?;
+            drop(txn);
+            let file = std::fs::metadata(&self.path)
+                .map_err(storage("measure store file"))?
+                .len();
+            let held = space.allocated.saturating_sub(space.retired);
+            // Published before the writer is released, so a later measure (taken only under
+            // the writer) is never overwritten by this older one.
+            self.give_back.now().held = Some(held);
+            drop(epochs);
+            longest = longest.max(started.elapsed());
+            Ok(Some(Measured {
+                file,
+                held,
+                retired: space.retired,
+                free_at_end: space.free_at_end,
+            }))
+        };
+        let Some(mut now) = step(None)?.filter(|at| over(at)) else {
+            self.give_back.now().waiting = None;
+            return Ok(None);
+        };
+        notice(now.file, now.held);
         #[cfg(feature = "test-knobs")]
         if std::env::var_os("VOX_TEST_COMPACT_FAIL").is_some() {
             return Err(Error::Storage {
@@ -1623,7 +1944,167 @@ impl Store {
                 detail: "compaction fault staged by proof".into(),
             });
         }
-        self.compact()
+        // A trim's last free pass runs after the trim, so what it releases the next trim gives
+        // back: trim again while a trim shrinks the file, releases retired pages or frees more
+        // of the end. Retired pages left after that are seen by reads. A move is always followed
+        // by a trim: the system pages it vacated (and those its commit rewrote) are freed only
+        // by the next commit, and no measure counts them until then. A move whose trims gave
+        // nothing back found nothing lower.
+        let mut trims_progress = true;
+        let mut moved = false;
+        let mut moved_at = u64::MAX;
+        let waiting = loop {
+            if !over(&now) {
+                break 0;
+            }
+            if moved || (trims_progress && (now.free_at_end > 0 || now.retired > 0)) {
+                let Some(after) = step(Some(false))? else {
+                    return Ok(None);
+                };
+                trims_progress = after.file < now.file
+                    || after.retired < now.retired
+                    || after.free_at_end > now.free_at_end;
+                moved = false;
+                now = after;
+                continue;
+            }
+            if now.retired > 0 {
+                // Wait for the reads begun until now, before one more trim frees what those
+                // that already ended let go: a read ending after it resumes the pass. Reads
+                // begun meanwhile are waited for once that trim shows what is left.
+                #[cfg(feature = "test-knobs")]
+                Self::hold_wait_for_proof("before");
+                let wait = self.give_back.wait_for_reads();
+                #[cfg(feature = "test-knobs")]
+                Self::hold_wait_for_proof("armed");
+                let Some(after) = step(Some(false))? else {
+                    return Ok(None);
+                };
+                now = after;
+                if now.retired > 0 {
+                    if self.give_back.wait_again(wait) {
+                        break now.retired;
+                    }
+                    continue;
+                }
+                self.give_back.stop_waiting(wait);
+                trims_progress = true;
+                continue;
+            }
+            if now.file >= moved_at {
+                break 0;
+            }
+            moved_at = now.file;
+            let Some(after) = step(Some(true))? else {
+                return Ok(None);
+            };
+            now = after;
+            moved = true;
+            // Mutant: the move judged by what its own commit shows, as before RG-13 fix3.
+            #[cfg(feature = "test-knobs")]
+            if super::computer::fx28_mutant("rg13-no-trim-after-move") {
+                moved = false;
+                trims_progress = true;
+            }
+        };
+        if waiting == 0 {
+            self.give_back.now().waiting = None;
+        }
+        Ok(Some(GaveBack {
+            file: now.file,
+            held: now.held,
+            steps,
+            took: began.elapsed(),
+            longest,
+            largest_move,
+            waiting,
+        }))
+    }
+
+    /// What `vox status` says of this store, without waiting for its writer (RG-12): measured
+    /// now when no writer holds the store, between two steps of a pass, never inside one;
+    /// otherwise what it last measured. `None` while it is not open for writing.
+    pub(crate) fn space(&self) -> Option<StoreSpace> {
+        let mut fresh = None;
+        if let Ok(epochs) = self.writer.try_lock() {
+            if !epochs.replacement {
+                let space = match self.db.try_read().as_deref() {
+                    Ok(Backing::Writable(db)) => {
+                        db.begin_write().ok().and_then(|txn| txn.space().ok())
+                    }
+                    Ok(Backing::ReadOnly(_) | Backing::Closed) => return None,
+                    Err(_) => None,
+                };
+                if let Some(space) = space {
+                    let held = space.allocated.saturating_sub(space.retired);
+                    // Published while the writer is held, as every pass step does.
+                    self.give_back.now().held = Some(held);
+                    fresh = Some(held);
+                }
+            }
+            drop(epochs);
+        }
+        let now = self.give_back.now();
+        Some(StoreSpace {
+            // Measured now: this answer's own measure, never the shared one another
+            // measurer may have replaced since.
+            held_bytes: fresh.or(now.held),
+            held_now: fresh.is_some(),
+            giving_back: now.passes > 0,
+            waiting_for_reads: now.waiting.is_some(),
+        })
+    }
+
+    /// Test apparatus (RG-13): while the file `VOX_TEST_HOLD_GIVE_BACK_WAIT_FILE` names exists,
+    /// a pass about to wait for reads stops before it begins to wait (`<file>.before` exists)
+    /// and again after (`<file>.armed`), each time until that marker is removed.
+    #[cfg(feature = "test-knobs")]
+    fn hold_wait_for_proof(stage: &str) {
+        let Some(path) = std::env::var_os("VOX_TEST_HOLD_GIVE_BACK_WAIT_FILE").map(PathBuf::from)
+        else {
+            return;
+        };
+        if !path.exists() {
+            return;
+        }
+        let marker = path.with_extension(stage);
+        let _ = std::fs::write(&marker, stage);
+        while marker.exists() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// Test apparatus (RG-13): while a file `VOX_TEST_HOLD_STORE_READ_FILE` names exists (a
+    /// path list: one held read each), one read of this store stays open, as a pending save's
+    /// pinned read does; `<file>.open` exists while it is open. Each time the file appears
+    /// again, a new read is held.
+    #[cfg(feature = "test-knobs")]
+    pub(crate) fn hold_read_for_proof(self: &Arc<Self>) {
+        let Some(paths) = std::env::var_os("VOX_TEST_HOLD_STORE_READ_FILE") else {
+            return;
+        };
+        for path in std::env::split_paths(&paths) {
+            let store = Arc::downgrade(self);
+            let open = path.with_extension("open");
+            let pause = || std::thread::sleep(std::time::Duration::from_millis(20));
+            std::thread::spawn(move || loop {
+                while !path.exists() {
+                    if store.strong_count() == 0 {
+                        return;
+                    }
+                    pause();
+                }
+                let Some(read) = store.upgrade().and_then(|store| store.begin_read().ok()) else {
+                    return;
+                };
+                let _ = std::fs::write(&open, "a store read is open");
+                while path.exists() {
+                    pause();
+                }
+                drop(read);
+                let _ = std::fs::remove_file(&open);
+            });
+        }
     }
 
     /// Repartition only this opened room. Each native transaction examines at most 64
@@ -1724,20 +2205,6 @@ impl Store {
                     std::thread::sleep(std::time::Duration::from_millis(20));
                 }
             }
-        }
-    }
-
-    /// Reclaim space after deletions. Returns whether anything was compacted.
-    pub fn compact(&mut self) -> Result<bool> {
-        match self.db.get_mut().unwrap_or_else(PoisonError::into_inner) {
-            Backing::Writable(db) => Arc::get_mut(&mut db.inner)
-                .ok_or_else(|| Error::Storage {
-                    op: "compact",
-                    detail: "the store still has active transactions".into(),
-                })?
-                .compact()
-                .map_err(storage("compact")),
-            Backing::ReadOnly(_) | Backing::Closed => Ok(false),
         }
     }
 }

@@ -1856,6 +1856,16 @@ impl TransactionalMemory {
         self.storage.flush()?;
 
         if shrunk {
+            // Vox: the crash proof's second kill point, the smaller layout durable and the file
+            // not yet truncated; the same marker parks after a move's table relocation
+            #[cfg(feature = "vox-test-knobs")]
+            if let Some(marker) = std::env::var_os("VOX_TEST_COMPACT_RELOCATED") {
+                std::fs::write(&marker, "smaller layout committed before truncation")
+                    .map_err(crate::StorageError::from)?;
+                while std::path::Path::new(&marker).exists() {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
             self.storage.resize(header.layout().len())?;
         }
         // Everything this stood in for is now durable: durable_commit() flushed the allocation
@@ -2311,16 +2321,17 @@ impl TransactionalMemory {
         if trailing_free == 0 {
             return Ok(false);
         }
-        if trailing_free < last_allocator_len / 2 && !force {
+        // Vox: an ordinary commit trims once a quarter of the last region is free at its end,
+        // and then trims all of it. Growth adds a quarter, which leaves a fifth free: no
+        // commit trims what the growth just added
+        if trailing_free < last_allocator_len / 4 && !force {
             return Ok(false);
         }
         let reduce_by = if layout.num_regions() > 1 && trailing_free == last_allocator_len {
             trailing_free
-        } else if force {
+        } else {
             // Do not shrink the database to zero size
             min(last_allocator_len - 1, trailing_free)
-        } else {
-            trailing_free / 2
         };
 
         let mut new_layout = layout;
@@ -2352,8 +2363,9 @@ impl TransactionalMemory {
                 layout.usable_bytes() + max_region_size
             }
         } else {
+            // Vox: grow by a quarter, not double, so the file stays near what it holds
             max(
-                layout.usable_bytes() * 2,
+                layout.usable_bytes() + layout.usable_bytes() / 4,
                 layout.usable_bytes() + required_growth * 2,
             )
         };
@@ -2425,6 +2437,13 @@ impl TransactionalMemory {
         }
 
         Ok(count)
+    }
+
+    /// Vox: free bytes at the end of the last region, which a trim gives back.
+    pub(crate) fn trailing_free_bytes(&self) -> u64 {
+        let state = self.state.lock().unwrap();
+        let last = state.header.layout().num_regions() - 1;
+        u64::from(state.get_region(last).trailing_free_pages()) * u64::from(self.page_size)
     }
 
     pub(crate) fn get_page_size(&self) -> usize {
