@@ -10075,6 +10075,16 @@ fn a_newcomer_reads_a_member_after_the_holder_answered_busy_and_stopped() {
     rg1::a_stopped_flow_leaves_the_body_slot(rg1::SlotDoor::Busy);
 }
 
+/// A moved body whose partial another flow ended is staged again under a fresh request; when
+/// that staging meets byte pressure, the retry carries the fresh request, so once the pressure
+/// clears the newcomer still reads every post of the returned author, once each and in order.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "three real daemons, a stopped author, a refusing holder and byte pressure; optional"]
+fn a_newcomer_reads_the_author_after_a_renewed_body_met_byte_pressure() {
+    rg1::a_stopped_flow_leaves_the_body_slot(rg1::SlotDoor::Renewed);
+}
+
 /// ADR-053 MP-7 (a) without the misleading newer head: the holder's later post depends on a
 /// control in the stopped author's feed (the author's context advance after the holder's post).
 /// The holder restarts; a newcomer that reaches only the holder must verify that control
@@ -11240,12 +11250,16 @@ mod rg1 {
 
     /// Which way a flow of the newcomer comes to wait on a peer that is not there while it holds
     /// the daemon's one live body slot (byte-gate, ledger 80).
+    #[derive(Clone, Copy, PartialEq, Eq)]
     pub(super) enum SlotDoor {
         /// The holder refuses a body (EvidenceUnavailable) and the flow moves to the stopped
         /// author's port.
         Moved,
         /// The holder answers a body ask Busy, then stops.
         Busy,
+        /// As `Moved`; the holder's post then ends the moved body's partial, and the staging
+        /// that starts the moved body again under a fresh request meets byte pressure once.
+        Renewed,
     }
 
     /// The author posts thirty, the holder reads them, the author stops, and a newcomer joins
@@ -11259,22 +11273,38 @@ mod rg1 {
     ///   (its stderr says `ask=entry`: a body ask moved). The holder posts; the newcomer must
     ///   read it. Then the author starts again and posts once; the newcomer's walk of that newer
     ///   head (or of a later one: the author writes on once it learns of the newcomer) moves the
-    ///   refused body asks to the author's port, now reachable. Until that walk reaches position
-    ///   1, no round of the newcomer toward the author or the holder may fail
-    ///   (`vox status --json` `sync`); a moved body ask that reuses a spent staging request fails
-    ///   "history request ID must be fresh". Then the newcomer must show every one of the
-    ///   author's thirty posts, the twenty the holder refused among them, once each and in order.
+    ///   refused body asks to the author's port, now reachable. From that post on (the author's
+    ///   room is open again: while a restarted author reopens it, a round toward it may be
+    ///   refused "authenticator invalid") until that walk reaches position 1, no round of the
+    ///   newcomer toward the author or the holder may fail (`vox status --json` `sync`); a moved
+    ///   body ask that reuses a spent staging request fails "history request ID must be fresh".
+    ///   Then the newcomer must show every one of the author's thirty posts, the twenty the
+    ///   holder refused among them, once each and in order.
     /// - `Busy`: Busy (the holder's stderr says so); then the holder stops and the author starts
     ///   again; the newcomer must read, from the author, the last post the holder answered Busy
     ///   for.
+    /// - `Renewed`: as `Moved` until the holder's post is read; staging the holder's post body
+    ///   ended the moved body's partial. Before the author starts again the newcomer's
+    ///   `VOX_TEST_RENEWAL_PRESSURE_FILE` is placed: the first staging after a renewal (its
+    ///   stderr says `history body renewed`) answers byte pressure once. Once that pressure has
+    ///   been answered, the newcomer must show every one of the author's thirty posts once each
+    ///   and in order; RED PRODUCT when five status answers in a row show its flow toward the
+    ///   author waiting on the same byte admission(s) with nothing running, nothing ready and no
+    ///   budget held (a retry under the old request waits on the slot its renewed request holds).
     ///
     /// A flow that is not running keeps no body slot whose body waits on a peer; before that
     /// rule the waiting flow kept the slot, and every later body of the newcomer waited for it.
-    /// Mutant: `VOX_MUTANT_PARKED_FLOW_KEEPS_BODY_SLOT=1`; its engaged line is asserted on every
+    /// Mutants: `VOX_MUTANT_PARKED_FLOW_KEEPS_BODY_SLOT=1` (`Moved`, `Busy`) and
+    /// `VOX_MUTANT_RENEWAL_KEPT_FROM_RETRY=1` (`Renewed`); the engaged line is asserted on every
     /// mutant run, green or red.
     pub(super) fn a_stopped_flow_leaves_the_body_slot(door: SlotDoor) {
         const POSTS: usize = 30;
-        const MUTANT: &str = "VOX_MUTANT_PARKED_FLOW_KEEPS_BODY_SLOT";
+        let renewed = door == SlotDoor::Renewed;
+        let mutant_name = if renewed {
+            "VOX_MUTANT_RENEWAL_KEPT_FROM_RETRY"
+        } else {
+            "VOX_MUTANT_PARKED_FLOW_KEEPS_BODY_SLOT"
+        };
         let root = root();
         let exe = binary();
         let mut knobs = vec![
@@ -11282,9 +11312,15 @@ mod rg1 {
             "history reroute origin=",
             "live window passed author=",
         ];
-        let mutant = std::env::var_os(MUTANT).is_some();
+        if renewed {
+            knobs.extend([
+                "VOX_TEST_RENEWAL_PRESSURE_FILE answered byte pressure",
+                "history body renewed purpose=",
+            ]);
+        }
+        let mutant = std::env::var_os(mutant_name).is_some();
         if mutant {
-            knobs.push(MUTANT);
+            knobs.push(mutant_name);
         }
         crate::test_knobs::require_in(&exe, &knobs);
         let author = room::worker_as(root.path(), "slot-author", &exe);
@@ -11340,7 +11376,7 @@ mod rg1 {
                 before_posts + 11,
                 feed(),
                 match door {
-                    SlotDoor::Moved => "",
+                    SlotDoor::Moved | SlotDoor::Renewed => "",
                     SlotDoor::Busy => " busy",
                 }
             ),
@@ -11359,7 +11395,13 @@ mod rg1 {
         await_shown(&holder, &id, &format!("SL-A-{POSTS:02}"));
         author_daemon.stop();
         eprintln!("[slot] author stopped");
-        let _reader_daemon = start(&reader, "127.0.0.1:0", None);
+        let pressure = reader.data.with_extension("renewal-pressure");
+        let _reader_daemon = start_with(
+            &reader,
+            "127.0.0.1:0",
+            None,
+            &[("VOX_TEST_RENEWAL_PRESSURE_FILE", pressure.clone())],
+        );
         trust(&holder, &reader);
         trust(&reader, &holder);
         trust(&reader, &author);
@@ -11393,10 +11435,13 @@ mod rg1 {
             !mutant
                 || std::fs::read_to_string(&err)
                     .unwrap_or_default()
-                    .contains(&format!("{MUTANT} engaged"))
+                    .contains(&format!("{mutant_name} engaged"))
         };
+        // The renewal mutant engages only once the renewed staging fails, after the author is
+        // back; the holder's post is read before that.
+        let engaged_before_author = || renewed || engaged();
         match door {
-            SlotDoor::Moved => {
+            SlotDoor::Moved | SlotDoor::Renewed => {
                 // Staging: the newcomer's walk of the author's window met a refused body at the
                 // holder, and that body ask moved to the stopped author's port.
                 let moved = format!(
@@ -11422,34 +11467,85 @@ mod rg1 {
                      the refused positions (from {}); the staging itself would refuse its post",
                     before_posts + 11
                 );
-                shown_or_wedged(&reader, &id, wanted, &holder, &author, &engaged, MUTANT);
+                shown_or_wedged(
+                    &reader,
+                    &id,
+                    wanted,
+                    &holder,
+                    &author,
+                    &engaged_before_author,
+                    mutant_name,
+                );
                 eprintln!(
                     "[slot] with a flow moved to the stopped author's port, the newcomer reads \
                      the holder's post"
                 );
+                if renewed {
+                    std::fs::write(&pressure, "once")
+                        .expect("APPARATUS: renewal-pressure staging file");
+                }
                 let _author_daemon = start(&author, &author_at, None);
                 eprintln!("[slot] author started again at {author_at}");
-                let before = failed_rounds(&reader, &[&author, &holder]);
                 post(&author, &id, "SL-A-back", true);
-                // The newcomer's walk of the author's newer head moves the refused body asks to
-                // the author's port again, now reachable: it ends at position 1. The author may
-                // write on (its key for the newcomer, once it learns of it): a walk of any head
-                // from this one on counts.
-                no_round_fails_until(&reader, &[&author, &holder], &before, &err, &author, feed());
+                // The post is accepted once the author's room is open again; rounds refused
+                // while it reopened the room ("authenticator invalid") are not counted.
+                let before = failed_rounds(&reader, &[&author, &holder]);
                 let posts: Vec<String> = (1..=POSTS).map(|n| format!("SL-A-{n:02}")).collect();
-                shown_once_each_in_order(&reader, &id, &posts);
+                if renewed {
+                    staged(
+                        &err,
+                        &|line| {
+                            line.contains(
+                                "VOX_TEST_RENEWAL_PRESSURE_FILE answered byte pressure after a \
+                                 renewal",
+                            )
+                        },
+                        "a staging after a renewal met byte pressure",
+                    );
+                    shown_once_each_in_order(
+                        &reader,
+                        &id,
+                        &posts,
+                        Some(&author),
+                        &engaged,
+                        mutant_name,
+                    );
+                } else {
+                    // The newcomer's walk of the author's newer head moves the refused body asks
+                    // to the author's port again, now reachable: it ends at position 1. The
+                    // author may write on (its key for the newcomer, once it learns of it): a
+                    // walk of any head from this one on counts.
+                    no_round_fails_until(
+                        &reader,
+                        &[&author, &holder],
+                        &before,
+                        &err,
+                        &author,
+                        feed(),
+                    );
+                    shown_once_each_in_order(&reader, &id, &posts, None, &engaged, mutant_name);
+                }
                 assert!(
                     engaged(),
-                    "APPARATUS: {MUTANT} was set but the newcomer never said it engaged; see {}",
+                    "APPARATUS: {mutant_name} was set but the newcomer never said it engaged; \
+                     see {}",
                     err.display()
                 );
-                eprintln!(
-                    "GREEN: with a flow moved to the stopped author's port, the newcomer reads \
-                     the holder's post, and once the author is back its walk of the author's \
-                     newer head moves the refused body asks to the author without a failed round, \
-                     and it shows every post of the author, the refused ones among them, once \
-                     each and in order"
-                );
+                if renewed {
+                    eprintln!(
+                        "GREEN: with a moved body's partial ended by another flow and its \
+                         renewed staging met by byte pressure, the newcomer shows every post of \
+                         the returned author once each and in order"
+                    );
+                } else {
+                    eprintln!(
+                        "GREEN: with a flow moved to the stopped author's port, the newcomer \
+                         reads the holder's post, and once the author is back its walk of the \
+                         author's newer head moves the refused body asks to the author without a \
+                         failed round, and it shows every post of the author, the refused ones \
+                         among them, once each and in order"
+                    );
+                }
             }
             SlotDoor::Busy => {
                 let holder_err = holder.data.with_extension("err");
@@ -11467,7 +11563,15 @@ mod rg1 {
                 let _author_daemon = start(&author, &author_at, None);
                 eprintln!("[slot] author started again at {author_at}");
                 let wanted = format!("SL-A-{POSTS:02}");
-                shown_or_wedged(&reader, &id, &wanted, &author, &holder, &engaged, MUTANT);
+                shown_or_wedged(
+                    &reader,
+                    &id,
+                    &wanted,
+                    &author,
+                    &holder,
+                    &engaged,
+                    mutant_name,
+                );
                 eprintln!(
                     "GREEN: with a body ask answered Busy by a holder that then stopped, the \
                      newcomer reads from the author the post the holder answered Busy for"
@@ -11503,41 +11607,7 @@ mod rg1 {
                 );
                 return;
             }
-            let report = reader.vox(None, &["status", "--json"]);
-            report.expect_ok("newcomer status");
-            let report = report.json();
-            let lanes = &report["lanes"];
-            let bounded = &lanes["bounded"];
-            let budget = &lanes["budget"];
-            let empty = |slots: &Value| {
-                slots
-                    .as_array()
-                    .is_some_and(|slots| slots.iter().all(Value::is_null))
-            };
-            let waits: Vec<String> = bounded["admissions"]
-                .as_array()
-                .map(|rows| {
-                    rows.iter()
-                        .filter(|row| {
-                            row["gate"] == "bytes" && row["peer"].as_str() == Some(&toward.b32())
-                        })
-                        .map(|row| row["admission"].to_string())
-                        .collect()
-                })
-                .unwrap_or_default();
-            let away_unreached = lanes["ports"].as_array().is_some_and(|ports| {
-                ports.iter().any(|port| {
-                    port["peer"].as_str() == Some(&away.b32()) && port["connected"] != true
-                })
-            });
-            let wedged = !waits.is_empty()
-                && away_unreached
-                && empty(&bounded["running"])
-                && empty(&bounded["ready"])
-                && budget["control"] == 0
-                && budget["foreground"] == 0
-                && budget["flow_state"]["in_use"] == 0;
-            let now = wedged.then(|| waits.join(","));
+            let (now, lanes) = slot_wait(reader, toward, Some(away));
             unchanged = if now.is_some() && now == last {
                 unchanged + 1
             } else {
@@ -11568,10 +11638,69 @@ mod rg1 {
         }
     }
 
+    /// One `vox status --json` of `reader`: the byte admission(s) its flows toward `toward` wait
+    /// on when nothing runs, nothing is ready, no budget is held and (with `away`) `away`'s port
+    /// is not connected, so that only a release can wake them and nothing that runs can release
+    /// anything; and the lanes it read.
+    fn slot_wait(
+        reader: &Worker,
+        toward: &Worker,
+        away: Option<&Worker>,
+    ) -> (Option<String>, Value) {
+        let report = reader.vox(None, &["status", "--json"]);
+        report.expect_ok("newcomer status");
+        let lanes = report.json()["lanes"].clone();
+        let bounded = &lanes["bounded"];
+        let budget = &lanes["budget"];
+        let empty = |slots: &Value| {
+            slots
+                .as_array()
+                .is_some_and(|slots| slots.iter().all(Value::is_null))
+        };
+        let waits: Vec<String> = bounded["admissions"]
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .filter(|row| {
+                        row["gate"] == "bytes" && row["peer"].as_str() == Some(&toward.b32())
+                    })
+                    .map(|row| row["admission"].to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let away_unreached = away.is_none_or(|away| {
+            lanes["ports"].as_array().is_some_and(|ports| {
+                ports.iter().any(|port| {
+                    port["peer"].as_str() == Some(&away.b32()) && port["connected"] != true
+                })
+            })
+        });
+        let wedged = !waits.is_empty()
+            && away_unreached
+            && empty(&bounded["running"])
+            && empty(&bounded["ready"])
+            && budget["control"] == 0
+            && budget["foreground"] == 0
+            && budget["flow_state"]["in_use"] == 0;
+        (wedged.then(|| waits.join(",")), lanes)
+    }
+
     /// Until `reader` shows every one of `wanted` (one page of `vox room read --json`, oldest
-    /// first): RED PRODUCT as soon as one of them is shown twice or two of them out of order.
-    fn shown_once_each_in_order(reader: &Worker, id: &str, wanted: &[String]) {
+    /// first): RED PRODUCT as soon as one of them is shown twice or two of them out of order,
+    /// and (with `toward`) when five status answers in a row show its flows toward `toward`
+    /// waiting on the same byte admission(s) with nothing running, nothing ready and no budget
+    /// held. The mutant's engaged line is asserted before a wedge is called.
+    fn shown_once_each_in_order(
+        reader: &Worker,
+        id: &str,
+        wanted: &[String],
+        toward: Option<&Worker>,
+        engaged: &dyn Fn() -> bool,
+        mutant: &str,
+    ) {
         let started = Instant::now();
+        let mut last: Option<String> = None;
+        let mut unchanged = 0;
         loop {
             let out = reader.vox(None, &["room", "read", id, "--json", "--limit", "200"]);
             out.expect_ok("newcomer room read");
@@ -11613,6 +11742,30 @@ mod rg1 {
                     named(&shown)
                 );
                 return;
+            }
+            if let Some(toward) = toward {
+                let (now, lanes) = slot_wait(reader, toward, None);
+                unchanged = if now.is_some() && now == last {
+                    unchanged + 1
+                } else {
+                    0
+                };
+                last = now;
+                if unchanged >= 4 {
+                    assert!(
+                        engaged(),
+                        "APPARATUS: {mutant} was set but the newcomer never said it engaged"
+                    );
+                    panic!(
+                        "RED PRODUCT: the newcomer shows {:?} of the {} posts: in five status \
+                         answers in a row its flow toward {} waits on byte admission(s) {}, \
+                         nothing runs, nothing is ready and no budget is held; lanes: {lanes}",
+                        named(&shown),
+                        wanted.len(),
+                        toward.name,
+                        last.unwrap_or_default()
+                    );
+                }
             }
             assert!(
                 started.elapsed() < Duration::from_secs(600),

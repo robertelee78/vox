@@ -201,6 +201,29 @@ fn parked_flow_keeps_body_slot_mutant() -> bool {
 const fn parked_flow_keeps_body_slot_mutant() -> bool {
     false
 }
+/// `VOX_MUTANT_RENEWAL_KEPT_FROM_RETRY`: when staging fails after `ensure_stage` renewed the
+/// body's request, the popped task and its retry owner keep the old request, as before. Says so
+/// once on stderr when it first does.
+#[cfg(feature = "test-knobs")]
+fn renewal_kept_from_retry_mutant(failed: bool) -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("VOX_MUTANT_RENEWAL_KEPT_FROM_RETRY").is_some()
+    });
+    static SAID: std::sync::Once = std::sync::Once::new();
+    if *ON && failed {
+        SAID.call_once(|| {
+            eprintln!(
+                "vox: VOX_MUTANT_RENEWAL_KEPT_FROM_RETRY engaged: a staging error kept the renewed \
+                 request from the retry owner"
+            );
+        });
+    }
+    *ON && failed
+}
+#[cfg(not(feature = "test-knobs"))]
+const fn renewal_kept_from_retry_mutant(_failed: bool) -> bool {
+    false
+}
 fn body_slot(purpose: Purpose, key_body: bool) -> Option<usize> {
     if key_body && purpose == Purpose::Control {
         return Some(2);
@@ -3137,8 +3160,16 @@ impl Flow {
                         let mut request = task.request;
                         let start = self
                             .ensure_stage(task.purpose, &mut request, head, seq, job)
-                            .await?;
-                        if request != task.request {
+                            .await;
+                        // `ensure_stage` renews the body's request in one in-memory step (the
+                        // slot, its owner, the retained Entry ask and its local owner) before
+                        // any fallible staging step. The popped task and its retry owner take
+                        // that identity before an error propagates: byte pressure and the Busy
+                        // refusals restore `retry_task`, and a retry under the old request
+                        // would wait on the slot its own renewed identity holds.
+                        if request != task.request
+                            && !renewal_kept_from_retry_mutant(start.is_err())
+                        {
                             if let Some(retry) = retry_task
                                 .as_mut()
                                 .filter(|retry| retry.request == task.request)
@@ -3147,6 +3178,7 @@ impl Flow {
                             }
                             task.request = request;
                         }
+                        let start = start?;
                         match start {
                             StageStart::Ready => {}
                             StageStart::Waiting => {
@@ -4186,7 +4218,11 @@ impl Flow {
     }
     /// Claim `purpose`'s body slot and stage the body at `head`/`seq`. When another claimant
     /// ended this flow's partial while the flow held no slot (`release_waiting_body_slots`),
-    /// the body starts again under a fresh request, written back to `request`.
+    /// the body starts again under a fresh request: the slot, its owner, the retained Entry ask
+    /// and its local owner are renamed and the fresh request is written back to `request` in
+    /// one step, which can fail only before it changes anything (`request_id`) and comes before
+    /// any fallible staging step; the caller carries `request` to the popped task and its retry
+    /// owner whether this returns `Ok` or `Err`.
     async fn ensure_stage(
         &mut self,
         purpose: Purpose,
@@ -4238,6 +4274,22 @@ impl Flow {
                 self.owners[index] = Some(fresh);
             }
             *request = fresh;
+            #[cfg(feature = "test-knobs")]
+            {
+                eprintln!("history body renewed purpose={purpose:?}");
+                // Proof-only: the staging after a renewal answers byte pressure once, while the
+                // file exists, as its first byte reservation (`demand::inspect`) does when the
+                // pool is full.
+                if let Some(path) = std::env::var_os("VOX_TEST_RENEWAL_PRESSURE_FILE") {
+                    if std::fs::remove_file(&path).is_ok() {
+                        eprintln!(
+                            "vox: VOX_TEST_RENEWAL_PRESSURE_FILE answered byte pressure after a \
+                             renewal"
+                        );
+                        return Err(Error::HistoryCapacity(Box::new(job.byte_pressure(1)?)));
+                    }
+                }
+            }
         }
         let request = *request;
         let context = match purpose {
