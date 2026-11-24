@@ -262,8 +262,42 @@ pub(super) async fn answer(
             });
     #[cfg(not(feature = "test-knobs"))]
     let staged_unavailable = false;
+    // `VOX_TEST_REFUSE_ENTRIES_FILE` = `<peer> <from> <to> [busy]`: that peer's body asks
+    // (`Query::Entry`) at positions `from..=to` are answered EvidenceUnavailable, or Busy with
+    // `busy`; every other ask is served as usual. Each such answer is said on stderr.
+    #[cfg(feature = "test-knobs")]
+    let staged_refusal = std::env::var_os("VOX_TEST_REFUSE_ENTRIES_FILE")
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| {
+            let peer = crate::node::link::b32_encode(&source.peer);
+            let mut words = text.split_whitespace();
+            let named = words.next() == Some(peer.as_str());
+            let mut bound = || words.next().and_then(|at| at.parse::<u64>().ok());
+            let (from, to) = (bound(), bound());
+            let busy = words.next() == Some("busy");
+            match (&query, from, to) {
+                (Query::Entry { seq, .. }, Some(from), Some(to))
+                    if named && (from..=to).contains(seq) =>
+                {
+                    eprintln!(
+                        "vox: VOX_TEST_REFUSE_ENTRIES_FILE answered {} peer={peer} seq={seq}",
+                        if busy { "busy" } else { "evidence-unavailable" }
+                    );
+                    Some(if busy {
+                        Status::Busy
+                    } else {
+                        Status::EvidenceUnavailable
+                    })
+                }
+                _ => None,
+            }
+        });
+    #[cfg(not(feature = "test-knobs"))]
+    let staged_refusal: Option<Status> = None;
     let (status, continuation) = if staged_unavailable {
         (Status::EvidenceUnavailable, None)
+    } else if let Some(status) = staged_refusal {
+        (status, None)
     } else if credit.remaining_wire() < super::DONE_RESERVE {
         (Status::Busy, None)
     } else {

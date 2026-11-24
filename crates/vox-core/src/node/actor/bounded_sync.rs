@@ -252,6 +252,59 @@ fn fetch_discard_mutant() -> bool {
     *ON
 }
 
+/// `VOX_MUTANT_PARKED_FLOW_KEEPS_READY`: a flow parked in the ready position for one member keeps
+/// every other member's Public and Archive work waiting until that member's own port starts, as
+/// before ledger 78 (only Private was moved aside). Says so once on stderr when first read.
+#[cfg(feature = "test-knobs")]
+fn parked_flow_keeps_ready_mutant() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let on = std::env::var_os("VOX_MUTANT_PARKED_FLOW_KEEPS_READY").is_some();
+        if on {
+            eprintln!(
+                "vox: VOX_MUTANT_PARKED_FLOW_KEEPS_READY engaged: a parked flow keeps the ready \
+                 position from every other member"
+            );
+        }
+        on
+    });
+    *ON
+}
+
+/// `VOX_MUTANT_ARCHIVE_TURN_CANCELS_OTHER_PORT`: a port that reaches the node's one archive turn
+/// cancels another port's queued ticket whose owner is still retained, and queues its own at the
+/// back, as before this fix. Says so once on stderr when first read.
+#[cfg(feature = "test-knobs")]
+fn archive_turn_cancels_other_port_mutant() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let on = std::env::var_os("VOX_MUTANT_ARCHIVE_TURN_CANCELS_OTHER_PORT").is_some();
+        if on {
+            eprintln!(
+                "vox: VOX_MUTANT_ARCHIVE_TURN_CANCELS_OTHER_PORT engaged: a port's archive turn \
+                 cancels another port's queued ticket"
+            );
+        }
+        on
+    });
+    *ON
+}
+
+/// `VOX_MUTANT_UNRUNNABLE_PORT_KEEPS_ARCHIVE_TURN`: a port that can no longer run keeps the
+/// node's queued archive ticket, as on main. Says so once on stderr when first read.
+#[cfg(feature = "test-knobs")]
+fn unrunnable_port_keeps_archive_turn_mutant() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let on = std::env::var_os("VOX_MUTANT_UNRUNNABLE_PORT_KEEPS_ARCHIVE_TURN").is_some();
+        if on {
+            eprintln!(
+                "vox: VOX_MUTANT_UNRUNNABLE_PORT_KEEPS_ARCHIVE_TURN engaged: a port that cannot \
+                 run keeps the node's archive ticket"
+            );
+        }
+        on
+    });
+    *ON
+}
+
 fn retirement_key(flow: &Flow) -> RetirementKey {
     RetirementKey {
         actor: flow.actor_incarnation(),
@@ -1170,6 +1223,76 @@ impl Controller {
             self.cancel_archive_admission();
         }
     }
+    /// The port the node's archive ticket was queued for, if one is held.
+    pub(super) fn archive_admission_port(&self) -> Option<(Digest32, Digest32)> {
+        self.archive_admission
+            .as_ref()
+            .map(|admission| (admission.room, admission.peer))
+    }
+    /// Whether the node's archive ticket is the daemon archive queue's admissible head now.
+    pub(super) fn archive_admission_would_admit(&self) -> bool {
+        self.archive_admission
+            .as_ref()
+            .is_some_and(|admission| admission.ticket.would_admit())
+    }
+    /// The port `(room, peer)` cannot run: the node's archive ticket, if it is that port's, is
+    /// given back, so no other port waits behind it. The port asks again when it runs again.
+    pub(super) fn release_archive_admission_of_port(&mut self, room: Digest32, peer: Digest32) {
+        #[cfg(feature = "test-knobs")]
+        if unrunnable_port_keeps_archive_turn_mutant() {
+            return;
+        }
+        if self
+            .archive_admission
+            .as_ref()
+            .is_some_and(|admission| admission.room == room && admission.peer == peer)
+        {
+            self.cancel_archive_admission();
+        }
+    }
+    /// This ticket's wake was just spent on a runnable port, whose start can still end before
+    /// its archive check (a busy physical slot, any earlier gate): listen again, so a held
+    /// ticket never waits on a spent wake.
+    pub(super) fn rearm_archive_wake(
+        &mut self,
+        net_tx: &mpsc::Sender<NetEvent>,
+        next_token: &mut u64,
+        room: Digest32,
+        peer: Digest32,
+    ) {
+        if let Some(admission) = self
+            .archive_admission
+            .as_mut()
+            .filter(|admission| admission.room == room && admission.peer == peer)
+        {
+            let wake = admission.ticket.wake();
+            Self::arm_archive_wake(admission, wake, net_tx, next_token);
+        }
+    }
+    fn arm_archive_wake(
+        admission: &mut ArchiveAdmission,
+        wake: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+        net_tx: &mpsc::Sender<NetEvent>,
+        next_token: &mut u64,
+    ) {
+        admission.task.abort();
+        let tx = net_tx.clone();
+        let wake_token = *next_token;
+        *next_token += 1;
+        admission.token = wake_token;
+        let (room, peer) = (admission.room, admission.peer);
+        admission.task = tokio::spawn(async move {
+            wake.await;
+            let _ = tx
+                .send(NetEvent::BoundedAdmissionReady {
+                    token: wake_token,
+                    room,
+                    peer,
+                    service: OutboundService::Archive,
+                })
+                .await;
+        });
+    }
     fn cancel_foreground_admission(&mut self, index: usize) {
         if let Some(admission) = self.foreground_admission[index].take() {
             admission.task.abort();
@@ -1613,6 +1736,22 @@ impl Controller {
         service: crate::node::ports::OutboundService,
     ) {
         self.pool_admission.remove(&(room, peer, service));
+    }
+
+    /// A connection-close edge: a parked Flow toward that peer cannot run until the peer
+    /// returns, so it keeps no body slot whose body waits on that peer
+    /// (`Flow::release_waiting_body_slots`); its partial stays on disk.
+    pub(super) fn release_body_slots_toward(&mut self, peer: Digest32) {
+        for flow in self
+            .ready
+            .iter_mut()
+            .flatten()
+            .chain(self.deferred.iter_mut())
+        {
+            if flow.peer == peer {
+                flow.release_waiting_body_slots();
+            }
+        }
     }
 
     /// A real connection-close edge retires every exact continuation for that peer before the
@@ -2439,7 +2578,9 @@ impl Controller {
         self.poll_cleanup();
     }
 
-    // The queue ticket binds one exact node, room, peer and retained request.
+    // The queue ticket binds one exact node, room, peer and retained request. Another port's
+    // ticket whose owner is still retained (`held_elsewhere`) is that port's place in the
+    // daemon's archive queue: this port waits, and asks again once that ticket is spent.
     #[allow(clippy::too_many_arguments)]
     fn archive_turn(
         &mut self,
@@ -2452,7 +2593,14 @@ impl Controller {
         request: stream::RequestId,
         generation: Digest32,
         instance: [u8; 16],
+        held_elsewhere: bool,
     ) -> ArchiveTurn {
+        #[cfg(feature = "test-knobs")]
+        let held_elsewhere = held_elsewhere && !archive_turn_cancels_other_port_mutant();
+        if held_elsewhere {
+            return ArchiveTurn::Waiting;
+        }
+        // What is left to replace: this port's own earlier ticket, or one whose owner has ended.
         if self.archive_admission.as_ref().is_some_and(|admission| {
             admission.room != room
                 || admission.peer != peer
@@ -2471,22 +2619,7 @@ impl Controller {
                 admission.task.abort();
                 return ArchiveTurn::Ready(job);
             }
-            admission.task.abort();
-            let tx = net_tx.clone();
-            let wake_token = *next_token;
-            *next_token += 1;
-            admission.token = wake_token;
-            admission.task = tokio::spawn(async move {
-                wake.await;
-                let _ = tx
-                    .send(NetEvent::BoundedAdmissionReady {
-                        token: wake_token,
-                        room,
-                        peer,
-                        service: OutboundService::Archive,
-                    })
-                    .await;
-            });
+            Self::arm_archive_wake(&mut admission, wake, net_tx, next_token);
             self.archive_admission = Some(admission);
             return ArchiveTurn::Waiting;
         }
@@ -2907,6 +3040,36 @@ impl Node {
         result
     }
 
+    /// Whether the node's one queued archive turn belongs to another port than `(room, peer)`
+    /// and its owner is still retained: the exact dispatch not yet consumed, or the exact parked
+    /// Flow it was queued for. That ticket is the other port's place in the daemon's archive
+    /// queue; a start of this port must not drop it.
+    fn archive_turn_held_elsewhere(&self, room: Digest32, peer: Digest32) -> bool {
+        self.bounded_sync
+            .archive_admission
+            .as_ref()
+            .is_some_and(|admission| {
+                (admission.room != room || admission.peer != peer)
+                    && (self
+                        .history_demand
+                        .unstarted_binding(admission.room, admission.peer)
+                        == Some((admission.request, admission.generation, admission.instance))
+                        || self
+                            .bounded_sync
+                            .ready
+                            .iter()
+                            .flatten()
+                            .chain(self.bounded_sync.deferred.iter())
+                            .any(|flow| {
+                                flow.room == admission.room
+                                    && flow.peer == admission.peer
+                                    && flow.archive_request == Some(admission.request)
+                                    && flow.generation == admission.generation
+                                    && flow.instance == admission.instance
+                            }))
+            })
+    }
+
     /// A flow whose start ended before its round retains the exact work already consumed while
     /// constructing it: an archive dispatch, required dependency, or scalar hint. Park it in its
     /// lane so the relevant admission/release event retries that same work; reconstructing only a
@@ -3307,6 +3470,11 @@ impl Node {
             }) {
                 self.sched_rooms.insert(work.room);
             }
+            // The peer's connection closed while this worker ran: the close edge could not reach
+            // a running Flow, and it cannot run again until that peer returns.
+            if !self.connected.contains(&work.peer) {
+                flow.release_waiting_body_slots();
+            }
             // A policy intent captured this exact sparse request and immutable Running root
             // before retiring the fence. The physical worker may have settled that request and
             // removed it from the Flow before returning; its absence now is not an owner error.
@@ -3642,12 +3810,13 @@ impl Node {
             if let Some(target) = flow.reroute.take() {
                 #[cfg(feature = "test-knobs")]
                 eprintln!(
-                    "history reroute origin={} target={} serial={} owner={:?} transient={}",
+                    "history reroute origin={} target={} serial={} owner={:?} transient={} ask={}",
                     crate::node::link::b32_encode(&work.peer),
                     crate::node::link::b32_encode(&target),
                     flow.availability_connection,
                     flow.hint_owner,
-                    flow.transient_refused
+                    flow.transient_refused,
+                    flow.retained_ask()
                 );
                 // EvidenceUnavailable named the author of the exact missing signed dependency.
                 // Keep this flow, its in-flight hint owner and its exact query/continuation
@@ -4313,15 +4482,31 @@ impl Node {
         }
         self.bounded_sync
             .prioritize_control_admission_owner(room, peer, service);
-        // A parked Private continuation owns its exact port, not every Private port.
-        // Keep it whole in the bounded queue before selecting this port's retained owner.
-        if service == OutboundService::Private
+        // A parked continuation owns its exact port, not every port of its service: a flow
+        // parked for one member (stopped since, or backing off) must not keep every other
+        // member's work waiting until that member's own port starts again (ledger 78). Keep it
+        // whole in the bounded queue, ahead of its own port's other parked flows, where that
+        // port's next start promotes it; then select this port's retained owner.
+        #[cfg(feature = "test-knobs")]
+        let displace = service == OutboundService::Private || !parked_flow_keeps_ready_mutant();
+        #[cfg(not(feature = "test-knobs"))]
+        let displace = true;
+        if displace
             && self.bounded_sync.ready[ready_index]
                 .as_ref()
                 .is_some_and(|flow| flow.room != room || flow.peer != peer)
         {
             if let Some(flow) = self.bounded_sync.ready[ready_index].take() {
-                self.bounded_sync.deferred.push_back(flow);
+                let deferred = &mut self.bounded_sync.deferred;
+                let at = deferred
+                    .iter()
+                    .position(|other| {
+                        other.room == flow.room
+                            && other.peer == flow.peer
+                            && other.service == flow.service
+                    })
+                    .unwrap_or(deferred.len());
+                deferred.insert(at, flow);
             }
         }
         if self.bounded_sync.ready[ready_index]
@@ -4519,6 +4704,7 @@ impl Node {
                         if let Some((request, generation, instance)) =
                             self.history_demand.ready_binding(room, peer)
                         {
+                            let held_elsewhere = self.archive_turn_held_elsewhere(room, peer);
                             match self.bounded_sync.archive_turn(
                                 &self.history_budget,
                                 &self.net_tx,
@@ -4529,6 +4715,7 @@ impl Node {
                                 request,
                                 generation,
                                 instance,
+                                held_elsewhere,
                             ) {
                                 ArchiveTurn::Ready(job) => admitted_archive = Some(job),
                                 ArchiveTurn::Waiting => {
@@ -5086,6 +5273,7 @@ impl Node {
                     self.bounded_sync.dispose(flow);
                     return false;
                 };
+                let held_elsewhere = self.archive_turn_held_elsewhere(flow.room, flow.peer);
                 match self.bounded_sync.archive_turn(
                     &self.history_budget,
                     &self.net_tx,
@@ -5096,6 +5284,7 @@ impl Node {
                     request,
                     flow.generation,
                     flow.instance,
+                    held_elsewhere,
                 ) {
                     ArchiveTurn::Ready(job) => job,
                     ArchiveTurn::Waiting => {

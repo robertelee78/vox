@@ -11,6 +11,23 @@ pub(super) struct Retry {
     pub(super) busy: bool,
 }
 
+/// **For proofs only.** While the file this names exists, every room of this node whose base32
+/// id is a line of it cannot save: it is poisoned as a failed write poisons it, and each storage
+/// recovery of it fails, so it stays poisoned until the file is removed. Not compiled in without
+/// the `test-knobs` feature.
+#[cfg(feature = "test-knobs")]
+const TEST_POISON_ROOM_FILE_ENV: &str = "VOX_TEST_POISON_ROOM_FILE";
+
+#[cfg(feature = "test-knobs")]
+fn poisoned_for_proof(id: &Digest32) -> bool {
+    std::env::var_os(TEST_POISON_ROOM_FILE_ENV)
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .is_some_and(|rooms| {
+            let id = crate::node::link::b32_encode(id);
+            rooms.lines().any(|line| line.trim() == id)
+        })
+}
+
 impl Node {
     pub(super) fn recover_storage(&mut self) {
         let Some(profile) = self.profile.as_ref() else {
@@ -29,6 +46,22 @@ impl Node {
             .retain(|id, _| self.channels.contains_key(id));
         self.store_recovered
             .retain(|id, _| self.channels.contains_key(id));
+        #[cfg(feature = "test-knobs")]
+        for (id, shared) in &self.channels {
+            let Ok(mut ch) = shared.try_lock() else {
+                continue;
+            };
+            if !ch.is_poisoned() && poisoned_for_proof(id) {
+                eprintln!(
+                    "vox: {TEST_POISON_ROOM_FILE_ENV} engaged: room {} cannot save",
+                    crate::node::link::b32_encode(id)
+                );
+                ch.poison(&Error::Storage {
+                    op: "save room",
+                    detail: "a room store fault staged by a proof".into(),
+                });
+            }
+        }
         for (id, shared) in &self.channels {
             let Ok(ch) = shared.try_lock() else { continue };
             if !ch.is_poisoned() {
@@ -71,6 +104,13 @@ impl Node {
             }
             tokio::spawn(async move {
                 let opened = secret_blocking(&secret_work, move || {
+                    #[cfg(feature = "test-knobs")]
+                    if poisoned_for_proof(&id) {
+                        return Err(Error::Storage {
+                            op: "recover room",
+                            detail: "a room store fault staged by a proof".into(),
+                        });
+                    }
                     // Establish a real durable writer before opening a replacement room.
                     // A latched native backend requires fresh-inode reconstruction; failure
                     // leaves the original poisoned room and its committed read pin authoritative.
