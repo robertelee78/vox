@@ -12602,6 +12602,7 @@ impl Node {
                     self.role_connection_serials.remove(&peer);
                 }
                 self.connected.remove(&peer);
+                self.bounded_sync.release_body_slots_toward(peer);
                 self.status
                     .receipt_waits
                     .retain(|(_, member), _| *member != peer);
