@@ -38,17 +38,32 @@
 //! marker; the clock starts then.
 //!
 //! ## Asserted
-//! Alice shows the marker within [`STREAK_BOUND`] of Bob posting it. A red is `PRODUCT` with
-//! what her status showed for Bob's port (backing off while connected), or `APPARATUS (runner
-//! stalled)` when the runner's own clock ([`RunnerStall`], a thread of this process sleeping
-//! 10 ms at a time) overslept more than [`APPARATUS_BUDGET`]. Every wait before the clock is
-//! causal (her `failed` rising, the posts shown) and `APPARATUS (staging not reached)` on expiry.
+//! 1. Alice shows the marker within [`STREAK_BOUND`] of Bob posting it. A red is `PRODUCT` with
+//!    what her status showed for Bob's port (backing off while connected), or `APPARATUS (runner
+//!    stalled)` when the runner's own clock ([`RunnerStall`], a thread of this process sleeping
+//!    10 ms at a time) overslept more than [`APPARATUS_BUDGET`].
+//! 2. **Alice's `vox status` names no failure for Bob once he answers again**: read after she
+//!    shows his [`HEALTHY_POSTS`] (rounds with him ended without error since the first hiccup,
+//!    her own among them: her `--json` row's `completed` less `reasons.served` rose), her sync
+//!    line for him names no `last failure`. A person reading status otherwise sees a member that
+//!    answers carry the reason of a hiccup it recovered from (on main `4966688ae` the first
+//!    hiccup's "the peer refused: transport failed" stays for good). The red is `PRODUCT` with
+//!    the line she read.
+//!
+//! Every wait before the clock is causal (her `failed` rising, the posts shown) and `APPARATUS
+//! (staging not reached)` on expiry.
 //!
 //! ## Mutation
 //! `VOX_MUTANT_TRANSPORT_STREAK`, forwarded to both daemons (test-knobs build): an answered turn
 //! no longer ends the transport failure streak. The second failure then extends the first one's
 //! streak past 30 s, the port stops for 30 s, and the marker arrives late. Alice's daemon says
 //! when the mutant first keeps a streak; the act requires that line when the mutant is asked for.
+//! `VOX_MUTANT_FAILURE_OUTLIVES_ANSWERS`, forwarded to Alice's daemon (test-knobs build): a
+//! failure is stored ahead of every later round count, so it stands after rounds end without
+//! error again, and (2) goes red. Alice's daemon says when it reads the mutant; the act requires
+//! that line when the mutant is asked for.
+//!
+//! Every knob and mutant this act uses must be in the `vox` it runs ([`test_knobs::require`]).
 //!
 //! # Second act: a member that keeps refusing is retried less and less often
 //! [`a_peer_that_keeps_refusing_is_retried_less_and_less_often`]: ending the streak on an answer
@@ -66,6 +81,9 @@
 
 #[path = "support/sync_pair.rs"]
 mod sync_pair;
+
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
@@ -85,6 +103,8 @@ const STREAK_BOUND: Duration = Duration::from_secs(10);
 const HEALTHY_POSTS: usize = 35;
 /// What Alice's daemon says when `VOX_MUTANT_TRANSPORT_STREAK` first keeps a streak.
 const STREAK_MUTANT_LINE: &str = "VOX_MUTANT_TRANSPORT_STREAK engaged";
+/// What Alice's daemon says when it reads `VOX_MUTANT_FAILURE_OUTLIVES_ANSWERS`.
+const OUTLIVES_MUTANT_LINE: &str = "VOX_MUTANT_FAILURE_OUTLIVES_ANSWERS engaged";
 /// How long Alice's status is read while Bob keeps refusing.
 const REFUSING_WINDOW: Duration = Duration::from_secs(20);
 /// The unreachable streak Alice's status must reach for a Bob who keeps refusing.
@@ -208,11 +228,23 @@ fn a_peer_that_failed_twice_half_a_minute_apart_still_delivers_in_seconds() {
         .to_str()
         .expect("APPARATUS: the scratch path is not UTF-8")
         .to_owned();
+    let outlives = std::env::var("VOX_MUTANT_FAILURE_OUTLIVES_ANSWERS").ok();
+    let mut knobs = vec!["VOX_TEST_REFUSE_HISTORY_FILE"];
+    if mutant.is_some() {
+        knobs.push("VOX_MUTANT_TRANSPORT_STREAK");
+    }
+    if outlives.is_some() {
+        knobs.push("VOX_MUTANT_FAILURE_OUTLIVES_ANSWERS");
+    }
+    test_knobs::require(&knobs);
     let mut alice_env: Vec<(&str, &str)> = Vec::new();
     if let Some(m) = mutant.as_deref() {
         alice_env.push(("VOX_MUTANT_TRANSPORT_STREAK", m));
     }
     let mut bob_env = alice_env.clone();
+    if let Some(m) = outlives.as_deref() {
+        alice_env.push(("VOX_MUTANT_FAILURE_OUTLIVES_ANSWERS", m));
+    }
     bob_env.push(("VOX_TEST_REFUSE_HISTORY_FILE", &refuse_text));
     let alice = Member::new(root, "alice");
     let bob = Member::new(root, "bob");
@@ -277,6 +309,21 @@ fn a_peer_that_failed_twice_half_a_minute_apart_still_delivers_in_seconds() {
         std::thread::sleep(Duration::from_millis(250));
     }
     let a_good = alice.status();
+    // (2) is read now, while Bob answers: what a person reading Alice's status sees of him.
+    let answered = answered_toward(&a_good, &bob.fp);
+    assert!(
+        answered > answered_toward(&a_first, &bob.fp),
+        "APPARATUS (staging not reached): alice showed bob's {HEALTHY_POSTS} posts, but no round \
+         she ran toward him completed since his first hiccup (her row for him then: {}; now: {})",
+        peer_row(&a_first["sync"], &bob.fp),
+        peer_row(&a_good["sync"], &bob.fp)
+    );
+    let (ok, healthy_shown, err) = alice.vox(&["status"], None);
+    assert!(
+        ok,
+        "PRODUCT: alice's `vox status` failed: {healthy_shown}{err}"
+    );
+    let healthy_line = sync_line(&healthy_shown, &bob.fp);
 
     // The second hiccup.
     let (second_at, a_second) = hiccup_until_failed(
@@ -364,6 +411,48 @@ fn a_peer_that_failed_twice_half_a_minute_apart_still_delivers_in_seconds() {
              {second_seen}; at {STREAK_BOUND:?}: {late_seen:?}"
         );
     }
+    let outlives_line = said.lines().find(|l| l.contains(OUTLIVES_MUTANT_LINE));
+    println!(
+        "[proof] streak (2): the first hiccup's failure in alice's `--json` row for bob: {}; once \
+         her rounds toward him completed again ({} -> {answered}), her `vox status` line for him: \
+         {healthy_line:?}; her `--json` row then: last_failure {} last_failure_stands {}; mutant \
+         asked: {outlives:?}, alice's daemon said: {outlives_line:?}",
+        peer_row(&a_first["sync"], &bob.fp)["last_failure"],
+        answered_toward(&a_first, &bob.fp),
+        peer_row(&a_good["sync"], &bob.fp)["last_failure"],
+        peer_row(&a_good["sync"], &bob.fp)["last_failure_stands"],
+    );
+    if outlives.is_some() {
+        assert!(
+            outlives_line.is_some(),
+            "APPARATUS: VOX_MUTANT_FAILURE_OUTLIVES_ANSWERS was asked for but alice's daemon \
+             never said it engaged\nalice:\n{said}"
+        );
+    }
+    assert!(
+        healthy_line
+            .as_deref()
+            .is_some_and(|l| !l.contains("last failure:")),
+        "PRODUCT: bob answers again (alice showed his {HEALTHY_POSTS} posts, and her own rounds \
+         toward him completed since his first hiccup), yet her `vox status` still names a \
+         failure for him: {healthy_line:?}\n{healthy_shown}"
+    );
+}
+
+/// Rounds this node ran toward `fp` that completed, as its `vox status --json` counts them:
+/// `completed` less the rounds it served (`reasons.served`).
+fn answered_toward(status: &serde_json::Value, fp: &str) -> u64 {
+    let row = peer_row(&status["sync"], fp);
+    row["completed"]
+        .as_u64()
+        .unwrap_or(0)
+        .saturating_sub(row["reasons"]["served"].as_u64().unwrap_or(0))
+}
+
+/// The `vox status` sync line for the peer `fp`, as a person reads it.
+fn sync_line(shown: &str, fp: &str) -> Option<String> {
+    let peer = format!("peer {}: opened", &fp[..12]);
+    shown.lines().find(|l| l.contains(&peer)).map(str::to_owned)
 }
 
 #[test]

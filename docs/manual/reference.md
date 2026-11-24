@@ -304,7 +304,10 @@ mean zero network bytes.
 
 An ongoing `sync-failing` problem must clear after a successful current bounded or legacy
 completion. Historical `last_failure` values and cumulative failure counts remain diagnostic
-history, not current-health verdicts.
+history, not current-health verdicts. `last_failure_stands` says whether the last failure is
+still that peer's latest outcome; it turns false once a later round with the peer, in either
+direction, ends without error (its `completed` or `partial` count grows). Plain status names a
+peer's last failure only while it stands.
 
 Status output can reveal rooms, peers, addresses and paths. Share the smallest excerpt that shows
 the problem.
