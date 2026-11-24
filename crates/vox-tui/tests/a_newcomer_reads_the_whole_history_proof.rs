@@ -1610,26 +1610,59 @@ const ARCHIVE_TURN_STAGING: Duration = Duration::from_secs(300);
 /// two requests then keep sending each other to the back of the daemon's queue. Mutant:
 /// `VOX_MUTANT_ARCHIVE_TURN_CANCELS_OTHER_PORT`.
 ///
-/// Review P2 of the second verdict: bob's daemon then stops, so the recovery's port cannot run.
-/// RED PRODUCT when, with bob shown gone, codex's turn stays the recovery's in three status
-/// answers in a row. Mutant: `VOX_MUTANT_CLOSED_PORT_KEEPS_ARCHIVE_TURN`. GREEN when the turn
-/// moves to the older-page request while both jobs are held, the older page completes once the
-/// jobs are let go with bob still stopped, and, with bob back, the recovery starts an Archive
-/// round on his port again.
+/// Review P2 of the second and third verdicts: the recovery's port then stops being able to run
+/// ([`OwnerStops`]): bob's daemon stops (this act), or own-1 cannot save and its storage recovery
+/// keeps failing ([`a_reader_whose_recovering_room_cannot_save_gives_back_its_archive_place`]).
+/// RED PRODUCT when, with that shown, codex's turn stays the recovery's in three status answers
+/// in a row. Mutant: `VOX_MUTANT_UNRUNNABLE_PORT_KEEPS_ARCHIVE_TURN`. GREEN when the turn moves to
+/// the older-page request while both jobs are held and the older page completes once the jobs
+/// are let go with the recovery's port still unable to run; in this act, also when, with bob
+/// back, the recovery starts an Archive round on bob's port again.
 #[cfg(feature = "optional-proofs")]
 #[test]
 #[ignore = "two real vox daemons, three hosted nodes and held archive jobs; optional"]
 fn a_reader_keeps_its_archive_place_while_it_recovers_its_own_history() {
+    archive_turn_act(OwnerStops::PeerStopped);
+}
+
+/// [`a_reader_keeps_its_archive_place_while_it_recovers_its_own_history`], with the recovery's
+/// port made unable to run by its room instead of its peer: once codex's turn is shown kept,
+/// own-1 cannot save (`VOX_TEST_POISON_ROOM_FILE`: poisoned as a failed write poisons it, and its
+/// storage recovery fails while the file names it), so its ports are poisoned while bob stays
+/// connected. It ends when the older page completes, with own-1 still unable to save.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "two real vox daemons, three hosted nodes and held archive jobs; optional"]
+fn a_reader_whose_recovering_room_cannot_save_gives_back_its_archive_place() {
+    archive_turn_act(OwnerStops::RoomCannotSave);
+}
+
+/// What makes the recovery's port unable to run in [`archive_turn_act`].
+#[cfg(feature = "optional-proofs")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OwnerStops {
+    /// bob, the recovery's only peer, stops.
+    PeerStopped,
+    /// own-1 cannot save, and its storage recovery fails.
+    RoomCannotSave,
+}
+
+#[cfg(feature = "optional-proofs")]
+fn archive_turn_act(owner_stops: OwnerStops) {
     const MUTANT: &str = "VOX_MUTANT_ARCHIVE_TURN_CANCELS_OTHER_PORT";
-    const CLOSED_MUTANT: &str = "VOX_MUTANT_CLOSED_PORT_KEEPS_ARCHIVE_TURN";
+    const UNRUNNABLE_MUTANT: &str = "VOX_MUTANT_UNRUNNABLE_PORT_KEEPS_ARCHIVE_TURN";
+    const POISON: &str = "VOX_TEST_POISON_ROOM_FILE";
     let mutant = std::env::var_os(MUTANT).is_some();
-    let closed_mutant = std::env::var_os(CLOSED_MUTANT).is_some();
+    let unrunnable_mutant = std::env::var_os(UNRUNNABLE_MUTANT).is_some();
     let mut knobs = vec!["VOX_TEST_HOLD_ARCHIVE_JOB_FILE"];
+    if owner_stops == OwnerStops::RoomCannotSave {
+        knobs.push(POISON);
+    }
     if mutant {
         knobs.push(MUTANT);
     }
-    if closed_mutant {
-        knobs.push(CLOSED_MUTANT);
+    if unrunnable_mutant {
+        knobs.push(UNRUNNABLE_MUTANT);
     }
     test_knobs::require(&knobs);
     watchdog::arm();
@@ -1991,37 +2024,90 @@ fn a_reader_keeps_its_archive_place_while_it_recovers_its_own_history() {
         panic!("APPARATUS: {MUTANT} was set and the reader's turn was kept");
     }
 
-    // bob, the recovery's only peer, stops: the recovery's port cannot run. Its ticket must not
-    // keep the older page waiting (verdict-2 P2).
-    drop(staged.peer_daemon.take());
+    // The recovery's port stops being able to run: bob, its only peer, stops (verdict-2 P2), or
+    // own-1 cannot save and its storage recovery keeps failing, so its ports are poisoned while
+    // bob stays connected (verdict-3 P2). Its ticket must not keep the older page waiting.
+    let room_cannot_save = |status: &serde_json::Value| {
+        let key = format!("room-store:{own_room}");
+        status["unhealthy"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|line| line["key"] == key.as_str())
+            && ports_of(status, &own_room)
+                .iter()
+                .any(|port| port["peer"] == bob_fp && port["needs_classes"][2] == false)
+    };
+    let cannot_run = |status: &serde_json::Value| match owner_stops {
+        OwnerStops::PeerStopped => {
+            member_connected_as(host, Some(reader), &own_room, &bob_fp) == Some(false)
+        }
+        OwnerStops::RoomCannotSave => room_cannot_save(status),
+    };
+    let (stopped, still) = match owner_stops {
+        OwnerStops::PeerStopped => {
+            drop(staged.peer_daemon.take());
+            (
+                "with bob, the recovery's only peer, stopped and shown gone",
+                "with bob still stopped",
+            )
+        }
+        OwnerStops::RoomCannotSave => {
+            let poison = staged
+                .poison_room
+                .as_ref()
+                .expect("APPARATUS: room-fault path was not staged");
+            std::fs::write(poison, format!("{own_room}\n")).unwrap_or_else(|error| {
+                panic!("APPARATUS: could not write {}: {error}", poison.display())
+            });
+            (
+                "with own-1 unable to save (its storage recovery failing) and the recovery's port \
+                 to bob shown not needing an Archive round",
+                "with own-1 still unable to save",
+            )
+        }
+    };
     let since = Instant::now();
-    while member_connected_as(host, Some(reader), &own_room, &bob_fp) != Some(false) {
-        staging("the reader seeing bob gone", since, &|| String::new());
+    loop {
+        let status = hosted_status(host, reader);
+        if cannot_run(&status) {
+            break;
+        }
+        staging("the recovery's port shown unable to run", since, &|| {
+            format!(
+                "unhealthy {}; own-1 ports {:?}",
+                status["unhealthy"],
+                ports_of(&status, &own_room)
+            )
+        });
     }
     let mut kept = Vec::new();
     loop {
         let status = hosted_status(host, reader);
         let turn = archive_turn_of(&status);
         if turn.as_ref().is_some_and(|turn| turn["room"] == older_room) {
-            eprintln!("[archive-turn] bob gone: the older page holds the turn: {turn:?}");
+            eprintln!(
+                "[archive-turn] the recovery's port unable to run: the older page holds the \
+                 turn: {turn:?}"
+            );
             break;
         }
         if turn.as_ref().is_some_and(|turn| {
             turn["room"] == first["room"] && turn["request"] == first["request"]
-        }) && member_connected_as(host, Some(reader), &own_room, &bob_fp) == Some(false)
+        }) && cannot_run(&status)
         {
             kept.push(turn.clone());
             if kept.len() == 3 {
                 let engaged = said(host, "host")
                     .lines()
-                    .find(|line| line.contains(CLOSED_MUTANT))
+                    .find(|line| line.contains(UNRUNNABLE_MUTANT))
                     .map(str::to_owned);
                 panic!(
-                    "RED PRODUCT: with bob, the recovery's only peer, stopped and shown gone, the \
-                     reader's archive turn stayed the recovery's in three status answers in a \
-                     row ({kept:?}) and its older page kept waiting; older-page ports: {:?}; \
-                     mutant line: {engaged:?}",
-                    ports_of(&status, &older_room)
+                    "RED PRODUCT: {stopped}, the reader's archive turn stayed the recovery's in \
+                     three status answers in a row ({kept:?}) and its older page kept waiting; \
+                     older-page ports: {:?}; own-1 ports: {:?}; mutant line: {engaged:?}",
+                    ports_of(&status, &older_room),
+                    ports_of(&status, &own_room)
                 );
             }
         } else {
@@ -2031,18 +2117,21 @@ fn a_reader_keeps_its_archive_place_while_it_recovers_its_own_history() {
             format!("{turn:?}")
         });
     }
-    if closed_mutant {
-        panic!("APPARATUS: {CLOSED_MUTANT} was set and the closed port's turn was released");
+    if unrunnable_mutant {
+        panic!(
+            "APPARATUS: {UNRUNNABLE_MUTANT} was set and the unrunnable port's turn was released"
+        );
     }
 
-    // Let the jobs go while bob is still stopped: the older page, which now holds the turn, runs
-    // and completes.
+    // Let the jobs go while the recovery's port still cannot run: the older page, which now holds
+    // the turn, runs and completes.
     std::fs::remove_file(archive_hold).unwrap_or_else(|error| {
         panic!(
             "APPARATUS: could not remove {}: {error}",
             archive_hold.display()
         )
     });
+    let completing = format!("the older page completing {still}");
     let since = Instant::now();
     loop {
         let (ok, out, err) = vox(
@@ -2068,7 +2157,7 @@ fn a_reader_keeps_its_archive_place_while_it_recovers_its_own_history() {
             }
             _ => {}
         }
-        staging("the older page completing with bob stopped", since, &|| {
+        staging(&completing, since, &|| {
             let status = hosted_status(host, reader);
             format!(
                 "{out}; older-page ports {:?}; own-1 ports {:?}; the reader's bounded lanes {}; \
@@ -2081,11 +2170,23 @@ fn a_reader_keeps_its_archive_place_while_it_recovers_its_own_history() {
         });
     }
 
+    if owner_stops == OwnerStops::RoomCannotSave {
+        // Not asserted here: once the room saves again and is reopened, the recovery's old Flow
+        // waits in retirement on a cleanup that failed while the room was poisoned, and in the
+        // one run of that step the recovery did not start again (fix3 report, poisG1).
+        println!(
+            "GREEN: while both archive jobs were held, the reader's older-page port was told to \
+             wait and its own-history recovery kept its queued turn; {stopped}, the turn moved to \
+             the older page, which completed once the jobs were let go"
+        );
+        return;
+    }
     // bob comes back: the recovery, whose ticket was given back, asks again and is admitted to
     // an archive job: its port to bob starts an Archive round after bob's restart.
     let restarted = Instant::now();
     staged.peer_daemon = Some(daemon(peer_dir, "peer"));
     attached_as(peer_dir, "peer", None);
+    let back = "bob back";
     loop {
         let status = hosted_status(host, reader);
         let port = ports_of(&status, &own_room)
@@ -2098,25 +2199,25 @@ fn a_reader_keeps_its_archive_place_while_it_recovers_its_own_history() {
                     .as_u64()
                     .is_some_and(|age| u128::from(age) < restarted.elapsed().as_millis())
         }) {
-            eprintln!("[archive-turn] bob back: the recovery started again: {port:?}");
+            eprintln!("[archive-turn] {back}: the recovery started again: {port:?}");
             break;
         }
         staging(
-            "the recovery starting again after bob's restart",
+            &format!("the recovery starting again with {back}"),
             restarted,
             &|| {
                 format!(
-                    "{port:?}; the reader's bounded lanes {}",
-                    status["lanes"]["bounded"]
+                    "{port:?}; unhealthy {}; the reader's bounded lanes {}",
+                    status["unhealthy"], status["lanes"]["bounded"]
                 )
             },
         );
     }
     println!(
         "GREEN: while both archive jobs were held, the reader's older-page port was told to wait \
-         and its own-history recovery kept its queued turn; with bob, the recovery's only peer, \
-         stopped, the turn moved to the older page, which completed once the jobs were let go; \
-         with bob back, the recovery started again"
+         and its own-history recovery kept its queued turn; {stopped}, the turn moved to the \
+         older page, which completed once the jobs were let go; with {back}, the recovery \
+         started again"
     );
 }
 
@@ -2159,6 +2260,8 @@ struct Staged {
     archive_hold: Option<std::path::PathBuf>,
     release_hold: Option<std::path::PathBuf>,
     pool_floor: Option<std::path::PathBuf>,
+    /// While it exists, the rooms it names cannot save on the host (`VOX_TEST_POISON_ROOM_FILE`).
+    poison_room: Option<std::path::PathBuf>,
     _tmp: tempfile::TempDir,
 }
 
@@ -2467,6 +2570,7 @@ fn stage_hosted_nodes(
     let archive_hold = hold_live_jobs.then(|| root.join("hold-archive-job"));
     let release_hold = hold_live_jobs.then(|| root.join("hold-flow-release"));
     let pool_floor = hold_live_jobs.then(|| root.join("flow-state-floor"));
+    let poison_room = hold_live_jobs.then(|| root.join("poison-room"));
     let live_hold_text = live_hold
         .as_ref()
         .map(|path| path.to_string_lossy().into_owned());
@@ -2477,6 +2581,9 @@ fn stage_hosted_nodes(
         .as_ref()
         .map(|path| path.to_string_lossy().into_owned());
     let pool_floor_text = pool_floor
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned());
+    let poison_room_text = poison_room
         .as_ref()
         .map(|path| path.to_string_lossy().into_owned());
     let mut env: Vec<(&str, &str)> = vec![("VOX_TEST_KEYCHAIN", keychain.as_str())];
@@ -2499,6 +2606,9 @@ fn stage_hosted_nodes(
     }
     if let Some(path) = pool_floor_text.as_deref() {
         env.push(("VOX_TEST_FLOW_STATE_FLOOR_FILE", path));
+    }
+    if let Some(path) = poison_room_text.as_deref() {
+        env.push(("VOX_TEST_POISON_ROOM_FILE", path));
     }
     if single_foreground_job {
         env.push(("VOX_TEST_FOREGROUND_JOBS", "1"));
@@ -2627,6 +2737,7 @@ fn stage_hosted_nodes(
         archive_hold,
         release_hold,
         pool_floor,
+        poison_room,
         _tmp: tmp,
     }
 }

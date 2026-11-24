@@ -12526,11 +12526,6 @@ impl Node {
                     self.sched_rooms
                         .extend(self.bounded_sync.cancel_peer_pool_admissions(peer));
                 }
-                // The closed port cannot run: its archive ticket would hold every other port's
-                // archive work, and its wake may already be spent. It asks again when it runs.
-                if let Some(room) = self.bounded_sync.release_archive_admission_of_peer(peer) {
-                    self.sched_rooms.insert(room);
-                }
             }
             NetEvent::SkdmRefused {
                 channel_id,
@@ -17164,6 +17159,10 @@ impl Node {
             .flat_map(|queue| queue.all())
             .collect();
         scope.extend(queued_before.iter().copied());
+        // The port the node's archive ticket was queued for is evaluated in every pass, wherever
+        // the event was: the ticket is given back in the first pass after that port stops being
+        // able to run (below).
+        scope.extend(self.bounded_sync.archive_admission_port());
         scope.sort_unstable();
         scope.dedup();
         let mut newly_queued = Vec::new();
@@ -17193,9 +17192,27 @@ impl Node {
                 OutboundService::Archive,
             ] {
                 let eligible = self.port_eligible(&key, service, now);
-                if !self.port_runnable(&key, service, now) && cancel_ineligible {
+                let runnable = self.port_runnable(&key, service, now);
+                if !runnable && cancel_ineligible {
                     self.bounded_sync
                         .cancel_pool_admission_for(room, peer, service);
+                }
+                // An archive ticket is held only for a port that can run. Whatever stopped this
+                // one (its connection closed, its room poisoned, a publish round in flight, the
+                // port or its need gone), its ticket would make every other port of this node
+                // wait, and every ticket behind it in the daemon's archive queue, for an owner
+                // that cannot use it and whose wake may never fire. The port asks again from
+                // its next start, once the event that makes it runnable queues it. A backoff
+                // alone ends by itself (`BackoffExpired` queues the port): while it lasts, a
+                // ticket still waiting its turn keeps its place, which holds back only what the
+                // daemon's queue would; once it would be admitted it goes as for the rest.
+                if !runnable
+                    && service == OutboundService::Archive
+                    && (!self.port_runnable_but_for_backoff(&key, service)
+                        || self.bounded_sync.archive_admission_would_admit())
+                {
+                    self.bounded_sync
+                        .release_archive_admission_of_port(room, peer);
                 }
                 let Some(port) = self.ports.get_mut(&key) else {
                     continue;
@@ -17339,11 +17356,20 @@ impl Node {
         service: OutboundService,
         now: std::time::Instant,
     ) -> bool {
-        let Some(port) = self.ports.get(key) else {
-            return false;
-        };
+        self.port_runnable_but_for_backoff(key, service)
+            && self.ports.get(key).is_some_and(|port| {
+                !port.backing_off_for(service, now) || port.busy_bypass(service, now)
+            })
+    }
+
+    /// [`Self::port_runnable`] but for its backoff: the port needs a round, no publish round to
+    /// its peer for the room is in flight, and its peer is connected.
+    fn port_runnable_but_for_backoff(
+        &self,
+        key: &(Digest32, Digest32),
+        service: OutboundService,
+    ) -> bool {
         self.port_needs(*key, service)
-            && (!port.backing_off_for(service, now) || port.busy_bypass(service, now))
             && !self.publishing.contains(key)
             && self
                 .net

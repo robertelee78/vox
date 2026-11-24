@@ -288,16 +288,16 @@ fn archive_turn_cancels_other_port_mutant() -> bool {
     *ON
 }
 
-/// `VOX_MUTANT_CLOSED_PORT_KEEPS_ARCHIVE_TURN`: a port whose connection closed keeps the node's
-/// queued archive ticket, as before fix2. Says so once on stderr when first read.
+/// `VOX_MUTANT_UNRUNNABLE_PORT_KEEPS_ARCHIVE_TURN`: a port that can no longer run keeps the
+/// node's queued archive ticket, as on main. Says so once on stderr when first read.
 #[cfg(feature = "test-knobs")]
-fn closed_port_keeps_archive_turn_mutant() -> bool {
+fn unrunnable_port_keeps_archive_turn_mutant() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        let on = std::env::var_os("VOX_MUTANT_CLOSED_PORT_KEEPS_ARCHIVE_TURN").is_some();
+        let on = std::env::var_os("VOX_MUTANT_UNRUNNABLE_PORT_KEEPS_ARCHIVE_TURN").is_some();
         if on {
             eprintln!(
-                "vox: VOX_MUTANT_CLOSED_PORT_KEEPS_ARCHIVE_TURN engaged: a closed port keeps the \
-                 node's archive ticket"
+                "vox: VOX_MUTANT_UNRUNNABLE_PORT_KEEPS_ARCHIVE_TURN engaged: a port that cannot \
+                 run keeps the node's archive ticket"
             );
         }
         on
@@ -1223,21 +1223,32 @@ impl Controller {
             self.cancel_archive_admission();
         }
     }
-    /// A port whose connection closed cannot run, so it holds no archive place another port
-    /// needs: the node's ticket of any room toward `peer` is returned. The port asks again when
-    /// it runs again. Returns the released ticket's room.
-    pub(super) fn release_archive_admission_of_peer(&mut self, peer: Digest32) -> Option<Digest32> {
+    /// The port the node's archive ticket was queued for, if one is held.
+    pub(super) fn archive_admission_port(&self) -> Option<(Digest32, Digest32)> {
+        self.archive_admission
+            .as_ref()
+            .map(|admission| (admission.room, admission.peer))
+    }
+    /// Whether the node's archive ticket is the daemon archive queue's admissible head now.
+    pub(super) fn archive_admission_would_admit(&self) -> bool {
+        self.archive_admission
+            .as_ref()
+            .is_some_and(|admission| admission.ticket.would_admit())
+    }
+    /// The port `(room, peer)` cannot run: the node's archive ticket, if it is that port's, is
+    /// given back, so no other port waits behind it. The port asks again when it runs again.
+    pub(super) fn release_archive_admission_of_port(&mut self, room: Digest32, peer: Digest32) {
         #[cfg(feature = "test-knobs")]
-        if closed_port_keeps_archive_turn_mutant() {
-            return None;
+        if unrunnable_port_keeps_archive_turn_mutant() {
+            return;
         }
-        let room = self
+        if self
             .archive_admission
             .as_ref()
-            .filter(|admission| admission.peer == peer)
-            .map(|admission| admission.room)?;
-        self.cancel_archive_admission();
-        Some(room)
+            .is_some_and(|admission| admission.room == room && admission.peer == peer)
+        {
+            self.cancel_archive_admission();
+        }
     }
     /// This ticket's wake was just spent on a runnable port, whose start can still end before
     /// its archive check (a busy physical slot, any earlier gate): listen again, so a held
