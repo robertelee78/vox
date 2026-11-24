@@ -3583,26 +3583,41 @@ async fn seat_round(
 /// **A join refused because its room is catching up asks again only once it may not be** (ledger
 /// 75). A member that has just restarted folds what it received into the room's governance before
 /// it can admit anyone; until then a join's seat and its admission are answered "refreshing", and
-/// while a save holds the room its admission is answered "room publication is busy". Both end by
-/// themselves. Called after such a refusal (`busy` for the second); says whether to ask again, and
-/// says yes only before `patience`.
+/// while a save holds the room, or a Computer policy transition holds its publication lease, its
+/// admission is answered "room publication is busy". All end by themselves. Called after such a
+/// refusal (`busy` for the second); says whether to ask again, and says yes only before
+/// `patience`.
 ///
 /// The refusal itself is not progress. An admission refused "refreshing" ended its own room save,
 /// and that save's completion woke every publication waiter before the refusal reached this task
 /// (`complete_pending_maintenance`, then the admission's answer), so a wake armed before the
 /// request proves nothing. The wake waited on here is subscribed after the refusal, under the room
 /// lock and before the check, and the check is the readiness both doors ask: yes when it answers
-/// anything but "refreshing" (the actor then gives the real answer). A busy refusal saved nothing
-/// and woke no one, so `armed`, subscribed before that request, first waits for the save that held
-/// the room to end; then the same check decides.
+/// anything but "refreshing" (the actor then gives the real answer).
+///
+/// "Busy" comes from two gates, and each is seen free before the admission is asked again,
+/// whichever refused it (the other's wait ends at once when its gate is free):
+/// - the room's publication: another save holds the room (`begin_pending_maintenance`, refused
+///   without a save or a wake, so `armed`, subscribed before that request, waits for a save of the
+///   room to end), or its write or history publication is in flight when the worker prepares
+///   (`reserve_pending_write`); then, under the room lock, a fresh wake is subscribed before
+///   checking that condition (`history_publication_busy`), and while it holds that wake is waited
+///   for;
+/// - this node's Computer publication lease (`maintenance_save`'s worker): that failed worker's
+///   room save ends with the same wake, so `armed` proves nothing for it; the lease's own read
+///   (`Computer::wait_publication_writer`, subscribed before it checks) waits for the writer to
+///   release it.
 async fn join_may_ask_again(
     room: &std::sync::Weak<tokio::sync::Mutex<ChannelState>>,
+    computer: Option<&std::sync::Weak<crate::node::computer::Computer>>,
     store: &crate::node::store::Store,
     clock: &crate::time::Clock,
     armed: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + Sync>>>,
     busy: bool,
     patience: tokio::time::Instant,
 ) -> bool {
+    #[cfg(feature = "test-knobs")]
+    let mut lease_waited = true;
     #[cfg(feature = "test-knobs")]
     match std::env::var("VOX_MUTANT_JOIN_REFRESH").ok().as_deref() {
         // The refused request's own completion taken for progress, as in the first version.
@@ -3615,6 +3630,8 @@ async fn join_may_ask_again(
                 None => false,
             }
         }
+        // A busy refusal's own completion taken for the lease's release, as in the second version.
+        Some("busy-own-wake") => lease_waited = false,
         // Refused at once, as before ledger 75.
         Some(_) => return false,
         None => {}
@@ -3625,6 +3642,16 @@ async fn join_may_ask_again(
         };
         if tokio::time::timeout_at(patience, armed).await.is_err() {
             return false;
+        }
+        #[cfg(feature = "test-knobs")]
+        let computer = computer.filter(|_| lease_waited);
+        if let Some(computer) = computer.and_then(std::sync::Weak::upgrade) {
+            if tokio::time::timeout_at(patience, computer.wait_publication_writer())
+                .await
+                .is_err()
+            {
+                return false;
+            }
         }
     }
     loop {
@@ -3643,12 +3670,15 @@ async fn join_may_ask_again(
             use crate::node::channel::pending_roster::join_refresh_hold;
             join_refresh_hold("", None, join_refresh_hold(".seat", None, ready))
         };
+        let held = busy && channel.history_publication_busy(store).unwrap_or(false);
         drop(channel);
         drop(room);
         if tokio::time::Instant::now() >= patience {
             return false;
         }
-        if !ready.is_err_and(|error| matches!(fault_of(&error), Fault::GovernanceRefreshing)) {
+        if !held
+            && !ready.is_err_and(|error| matches!(fault_of(&error), Fault::GovernanceRefreshing))
+        {
             return true;
         }
         if tokio::time::timeout_at(patience, wake).await.is_err() {
@@ -14714,6 +14744,7 @@ impl Node {
             .to_string_lossy()
             .into_owned();
         let admission_clock = Arc::clone(&self.clock);
+        let admission_computer = self.computer.as_ref().map(Arc::downgrade);
         self.join_tasks.spawn(async move {
             let _slot = slot;
             let _carried = conn;
@@ -14776,6 +14807,7 @@ impl Node {
                             if !matches!(fault_of(&error), Fault::GovernanceRefreshing)
                                 || !join_may_ask_again(
                                     &admission_room,
+                                    admission_computer.as_ref(),
                                     &admission_store,
                                     &admission_clock,
                                     None,
@@ -14838,6 +14870,7 @@ impl Node {
                             if !sent
                                 || !join_may_ask_again(
                                     &admission_room,
+                                    admission_computer.as_ref(),
                                     &admission_store,
                                     &admission_clock,
                                     armed,

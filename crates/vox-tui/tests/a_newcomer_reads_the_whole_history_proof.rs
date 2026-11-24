@@ -74,7 +74,10 @@
 //!    the hold never released: alice asks bob's admission once, stops at her admission patience
 //!    (20 s), bob is told before his own 30 s wait for her answer ends, neither side counts him a
 //!    member, and once released his second join and dave's get in:
-//!    [`a_join_whose_admission_stays_refreshing_is_refused_in_time_and_leaves_nothing`].
+//!    [`a_join_whose_admission_stays_refreshing_is_refused_in_time_and_leaves_nothing`]. And the
+//!    other "busy": alice's Computer publication lease held from bob's admission request
+//!    (`<file>.lease`, as a policy transition holds it): one attempt while it stands, and bob gets
+//!    in once it is released: [`a_join_whose_admission_meets_the_computer_lease_gets_in_once_it_is_released`].
 //!
 //! **Mutations, one per claim:**
 //! - a first-use refusal or wait on the room's convergence put back (a text post refused as
@@ -90,7 +93,10 @@
 //!   at the admission and at the seat;
 //! - a refused admission's own completion taken for the room having moved on
 //!   (`VOX_MUTANT_JOIN_REFRESH=self-wake`): the run-out red, alice asking bob's admission again
-//!   and again while nothing changed.
+//!   and again while nothing changed;
+//! - a busy admission's own completion taken for the Computer lease's release
+//!   (`VOX_MUTANT_JOIN_REFRESH=busy-own-wake`): the lease arm red, alice asking bob's admission
+//!   again and again while the lease stood.
 
 // Two blocking-or-optional arms (decider, 2026-10-01: "Valid proofs block; rest optional"). The
 // 257-post history BLOCKS: a newcomer reads every post exactly once and in order, the part below
@@ -1387,12 +1393,19 @@ fn a_newcomer_talks_both_ways_at_one_wait_fresh_or_behind_a_backlog() {
 /// The test-only hold alice's restarted daemon reads (ledger 75): while its file exists her join
 /// admissions are answered "room governance is refreshing", and while `<file>.seat` exists so are
 /// her joins' seats. Each admission answered so, held or not, appends its joiner's fingerprint to
-/// `<file>.met`, each seat to `<file>.seat.met`: one line per answer.
+/// `<file>.met`, each seat to `<file>.seat.met`: one line per answer. While `<file>.lease` exists
+/// her daemon's Computer publication lease is held from the next admission request on, as a
+/// policy transition holds it, and each admission requested while it is held appends its joiner
+/// to `<file>.lease.met`.
 const JOIN_REFRESH_HOLD: &str = "VOX_TEST_HOLD_JOIN_REFRESH_FILE";
 /// The mutant switch alice's daemon reads: `self-wake` takes a refused admission's own completion
-/// for the room having moved on (the first version of the fix); any other value answers a join at
-/// once while the room's governance refreshes, as before ledger 75.
+/// for the room having moved on (the first version of the fix); `busy-own-wake` takes a busy
+/// admission's own completion for the Computer lease's release (the second); any other value
+/// answers a join at once while the room's governance refreshes, as before ledger 75.
 const JOIN_REFRESH_MUTANT: &str = "VOX_MUTANT_JOIN_REFRESH";
+/// How long the lease arm keeps alice's Computer publication lease held once bob's admission has
+/// met it: staging, well inside her 20 s admission patience; no verdict reads it.
+const LEASE_HELD_FOR: Duration = Duration::from_secs(3);
 
 /// Alice's room just after her restart (ledger 75): alice and carol in it, carol reading alice;
 /// alice's daemon stopped while carol posted, then started again on its own address reading the
@@ -1845,6 +1858,72 @@ fn a_join_through_a_member_refreshing_when_its_seat_is_reserved_gets_in() {
     println!(
         "[proof] bob joined through alice, just restarted, his seat having met her governance \
          refresh; listed once"
+    );
+}
+
+/// **A join whose admission meets the Computer's publication lease held gets in once it is
+/// released** (claim 3, the second source of "room publication is busy"). From bob's admission
+/// request alice's daemon holds its Computer publication lease, as a policy transition holds it,
+/// so his admission is answered "busy". While it stands nothing releases it, so alice must ask
+/// bob's admission once; the proof keeps it for [`LEASE_HELD_FOR`], then releases it, and bob's
+/// join must succeed and alice list him once.
+#[test]
+#[ignore = "real vox daemons, a restart and a test-only hold; run with test-knobs in release"]
+fn a_join_whose_admission_meets_the_computer_lease_gets_in_once_it_is_released() {
+    watchdog::arm();
+    let at = just_restarted(&["bob"], &[".lease"]);
+    let (_, bob, bob_fp) = &at.newcomers[0];
+    let mut join = at.join("bob", bob, 1);
+    let mut met = None;
+    let mut released = false;
+    while join.try_wait().ok().flatten().is_none() {
+        if met.is_none() && at.met(".lease.met").contains(bob_fp) {
+            met = Some(Instant::now());
+        }
+        if !released && met.is_some_and(|met| met.elapsed() >= LEASE_HELD_FOR) {
+            at.release(".lease");
+            released = true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let exit = join
+        .wait()
+        .unwrap_or_else(|e| panic!("APPARATUS: waiting for bob's join: {e}"));
+    let bob_said = at.join_said("bob", 1);
+    // Recorded only while the hold's file exists: the attempts made while the lease stood.
+    let attempts = at
+        .met(".lease.met")
+        .iter()
+        .filter(|fp| *fp == bob_fp)
+        .count();
+    assert!(
+        attempts >= 1,
+        "APPARATUS: bob's admission never met alice's held Computer publication lease, so this run \
+         did not stage it ({exit}); bob said: {bob_said}"
+    );
+    assert!(
+        attempts == 1,
+        "PRODUCT: alice asked bob's admission {attempts} times while her Computer publication \
+         lease stood and nothing released it: a busy refusal taken for the lease's release \
+         ({exit})\nbob said: {bob_said}\nalice's daemon said: {:?}",
+        at.alice_refused()
+    );
+    assert!(
+        released && exit.success(),
+        "PRODUCT: bob's `vox room join` through alice was refused although her Computer \
+         publication lease was released inside her admission patience (released: {released}, \
+         {exit}):\n{bob_said}\nalice's daemon said: {:?}",
+        at.alice_refused()
+    );
+    let members = at.members();
+    let times = members.iter().filter(|id| *id == bob_fp).count();
+    assert!(
+        times == 1,
+        "PRODUCT: alice lists bob {times} time(s) among the room's members: {members:?}"
+    );
+    println!(
+        "[proof] bob's admission met alice's held Computer publication lease once; released after \
+         {LEASE_HELD_FOR:?}, he joined and is listed once"
     );
 }
 
