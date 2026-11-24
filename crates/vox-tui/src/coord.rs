@@ -729,8 +729,11 @@ pub async fn read_upto(
                     return Ok(Some(rows));
                 }
             }
+            // The node says this refusal bare when its actor answers, and with its own "node: "
+            // prefix (`Error::Profile`) when the room's published read answers (9c77e22db).
             Frame::Error { reason }
-                if reason == "cursor not in this room's timeline"
+                if reason.strip_prefix("node: ").unwrap_or(&reason)
+                    == "cursor not in this room's timeline"
                     && since.is_some()
                     && rows.is_empty()
                     && cursor == since =>
