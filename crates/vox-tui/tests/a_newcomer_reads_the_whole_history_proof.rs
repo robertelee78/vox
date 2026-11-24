@@ -2231,6 +2231,662 @@ fn a_newcomer_who_keeps_posting_is_trusted_back_on_a_slow_path() {
     drop(alice_daemon);
 }
 
+/// The hosted nodes of [`a_reader_keeps_its_archive_place_while_it_recovers_its_own_history`]:
+/// the first two hold both of the daemon's archive jobs, the third is the reader.
+const ARCHIVE_TURN_HOSTED: [&str; 3] = ["robert", "claude", "codex"];
+/// `vox status --json` of one hosted node, parsed.
+fn hosted_status(dir: &Path, node: &str) -> serde_json::Value {
+    serde_json::from_str(&fx35_synced(dir, Some(node)).status)
+        .unwrap_or_else(|error| panic!("PRODUCT: {node}'s status is not JSON: {error}"))
+}
+/// The node's one queued archive turn in its status (`lanes.bounded.admissions`, gate `archive`).
+fn archive_turn_of(status: &serde_json::Value) -> Option<serde_json::Value> {
+    status["lanes"]["bounded"]["admissions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|admission| admission["gate"] == "archive")
+        .cloned()
+}
+/// The node's ports of `room` as its status shows them.
+fn ports_of(status: &serde_json::Value, room: &str) -> Vec<serde_json::Value> {
+    status["lanes"]["ports"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|port| port["room"] == room)
+        .cloned()
+        .collect()
+}
+/// How long a staging step of the archive-turn act may go without its edge before the act stops
+/// as APPARATUS NO RESULT. Never a product verdict.
+const ARCHIVE_TURN_STAGING: Duration = Duration::from_secs(300);
+
+/// PR #1398 review P2: a reader's node keeps one queued archive turn, its place in the daemon's
+/// fair archive queue. `codex`, one of three nodes hosted by one daemon, posts in `own-1`, a room
+/// of bob's, and leaves it; `claude` confirms the departure and then leaves too, so when codex
+/// joins again bob is its only member and it must recover its own history on bob's port.
+/// `robert` and `claude` hold both of the daemon's archive jobs meanwhile (an older page each,
+/// `VOX_TEST_HOLD_ARCHIVE_JOB_FILE`), so codex's recovery waits in the queue. Codex then asks for
+/// an older page of another room (`vox room read --history older`): a second Archive request on
+/// another port of the same node.
+///
+/// RED PRODUCT when codex's status shows its queued archive turn moved from the recovery to the
+/// older-page request while neither ran: the recovery's place in the queue was dropped, and the
+/// two requests then keep sending each other to the back of the daemon's queue. Mutant:
+/// `VOX_MUTANT_ARCHIVE_TURN_CANCELS_OTHER_PORT`.
+///
+/// Review P2 of the second and third verdicts: the recovery's port then stops being able to run
+/// ([`OwnerStops`]): bob's daemon stops (this act), or own-1 cannot save and its storage recovery
+/// keeps failing ([`a_reader_whose_recovering_room_cannot_save_gives_back_its_archive_place`]).
+/// RED PRODUCT when, with that shown, codex's turn stays the recovery's in three status answers
+/// in a row. Mutant: `VOX_MUTANT_UNRUNNABLE_PORT_KEEPS_ARCHIVE_TURN`. GREEN when the turn moves to
+/// the older-page request while both jobs are held and the older page completes once the jobs
+/// are let go with the recovery's port still unable to run; in this act, also when, with bob
+/// back, the recovery starts an Archive round on bob's port again.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "two real vox daemons, three hosted nodes and held archive jobs; optional"]
+fn a_reader_keeps_its_archive_place_while_it_recovers_its_own_history() {
+    archive_turn_act(OwnerStops::PeerStopped);
+}
+
+/// [`a_reader_keeps_its_archive_place_while_it_recovers_its_own_history`], with the recovery's
+/// port made unable to run by its room instead of its peer: once codex's turn is shown kept,
+/// own-1 cannot save (`VOX_TEST_POISON_ROOM_FILE`: poisoned as a failed write poisons it, and its
+/// storage recovery fails while the file names it), so its ports are poisoned while bob stays
+/// connected. It ends when the older page completes, with own-1 still unable to save.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "two real vox daemons, three hosted nodes and held archive jobs; optional"]
+fn a_reader_whose_recovering_room_cannot_save_gives_back_its_archive_place() {
+    archive_turn_act(OwnerStops::RoomCannotSave);
+}
+
+/// What makes the recovery's port unable to run in [`archive_turn_act`].
+#[cfg(feature = "optional-proofs")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OwnerStops {
+    /// bob, the recovery's only peer, stops.
+    PeerStopped,
+    /// own-1 cannot save, and its storage recovery fails.
+    RoomCannotSave,
+}
+
+#[cfg(feature = "optional-proofs")]
+fn archive_turn_act(owner_stops: OwnerStops) {
+    const MUTANT: &str = "VOX_MUTANT_ARCHIVE_TURN_CANCELS_OTHER_PORT";
+    const UNRUNNABLE_MUTANT: &str = "VOX_MUTANT_UNRUNNABLE_PORT_KEEPS_ARCHIVE_TURN";
+    const POISON: &str = "VOX_TEST_POISON_ROOM_FILE";
+    let mutant = std::env::var_os(MUTANT).is_some();
+    let unrunnable_mutant = std::env::var_os(UNRUNNABLE_MUTANT).is_some();
+    let mut knobs = vec!["VOX_TEST_HOLD_ARCHIVE_JOB_FILE"];
+    if owner_stops == OwnerStops::RoomCannotSave {
+        knobs.push(POISON);
+    }
+    if mutant {
+        knobs.push(MUTANT);
+    }
+    if unrunnable_mutant {
+        knobs.push(UNRUNNABLE_MUTANT);
+    }
+    test_knobs::require(&knobs);
+    watchdog::arm();
+    let mut staged = stage_hosted_nodes(&ARCHIVE_TURN_HOSTED, true, false, false);
+    let reader = ARCHIVE_TURN_HOSTED[2];
+    let host = staged.host.clone();
+    let host = &host;
+    let (peer_dir, peer_node, _, bob_fp) = staged.everyone[staged.hosted].clone();
+    let (peer_dir, peer_node) = (&peer_dir, &peer_node);
+    // The reader's own room has bob as its only other member, so its recovery is bob's port.
+    let (ok, _, err) = vox(
+        peer_dir,
+        &as_node(
+            &[
+                "room",
+                "create",
+                "--passphrase-file",
+                "-",
+                "--name",
+                "own-1",
+            ],
+            *peer_node,
+        ),
+        Some(&format!("{ROOMPASS}\n")),
+    );
+    assert!(ok, "APPARATUS: bob's own-1 creation failed: {err}");
+    let listed = attached_as(peer_dir, "peer", *peer_node);
+    let selector = listed
+        .lines()
+        .find(|line| line.contains("own-1"))
+        .and_then(|line| line.split_whitespace().next())
+        .unwrap_or_else(|| panic!("APPARATUS: own-1 is not listed: {listed}"))
+        .to_owned();
+    let own_room =
+        vox_core::node::link::b32_encode(&room_id_as(peer_dir, *peer_node, "bob", &selector));
+    let bob_link = || {
+        let (ok, link, err) = vox(
+            peer_dir,
+            &as_node(&["room", "link", &own_room], *peer_node),
+            None,
+        );
+        assert!(ok, "APPARATUS: bob could not give a link: {err}");
+        link.lines()
+            .find(|line| line.starts_with("vox://"))
+            .unwrap_or(link.trim())
+            .to_owned()
+    };
+    let staging = |what: &str, since: Instant, shown: &dyn Fn() -> String| {
+        assert!(
+            since.elapsed() < ARCHIVE_TURN_STAGING,
+            "APPARATUS: NO RESULT: {what} not reached in {} s: {}",
+            ARCHIVE_TURN_STAGING.as_secs(),
+            shown()
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let roster_of = |dir: &Path, node: Option<&str>| {
+        let (ok, roster, err) = vox(dir, &as_node(&["room", "roster", &own_room], node), None);
+        ok.then_some(roster).ok_or(err)
+    };
+    // A member that left can join again only once a member has confirmed its departure over the
+    // leaver's own exchange. A member refuses that exchange once it has applied the creator's
+    // removal of the leaver, so bob, the creator, refuses it as soon as he has the departure: in
+    // runs with bob the only other member, bob's roster dropped codex and codex kept own-1 as
+    // leaving. claude, a member that is not the creator, confirms it while bob's removal is on
+    // its way. So codex and claude join own-1, each posts, and each sees the other.
+    let taker = ARCHIVE_TURN_HOSTED[1];
+    let reader_fp = staged.everyone[2].3.clone();
+    let taker_fp = staged.everyone[1].3.clone();
+    for node in [reader, taker] {
+        let (ok, out, err) = vox(
+            host,
+            &as_node(
+                &["room", "join", "--passphrase-file", "-", &bob_link()],
+                Some(node),
+            ),
+            Some(&format!("{ROOMPASS}\n")),
+        );
+        assert!(
+            ok,
+            "APPARATUS: {node}'s join of own-1 was refused: {out}{err}"
+        );
+        stage_post(
+            host,
+            Some(node),
+            node,
+            &own_room,
+            &format!("{node} in own-1"),
+        );
+    }
+    let since = Instant::now();
+    loop {
+        let rosters = (roster_of(host, Some(reader)), roster_of(host, Some(taker)));
+        if rosters
+            .0
+            .as_ref()
+            .is_ok_and(|roster| roster.contains(&taker_fp))
+            && rosters
+                .1
+                .as_ref()
+                .is_ok_and(|roster| roster.contains(&reader_fp))
+        {
+            break;
+        }
+        staging(
+            "the reader and claude seeing each other in own-1",
+            since,
+            &|| format!("{rosters:?}"),
+        );
+    }
+
+    // The reader leaves the room it posted in, while every archive job is still free, and
+    // waits until its departure is taken: bob's roster no longer names it, and its own status no
+    // longer holds the room as leaving (its left copy is deleted).
+    let (ok, out, err) = vox(
+        host,
+        &as_node(&["room", "leave", &own_room], Some(reader)),
+        None,
+    );
+    assert!(
+        ok,
+        "APPARATUS: {reader}'s `vox room leave` failed: {out}{err}"
+    );
+    let since = Instant::now();
+    loop {
+        let roster = roster_of(peer_dir, *peer_node);
+        let status = hosted_status(host, reader);
+        let leaving = status["leaving"]
+            .as_array()
+            .is_none_or(|rooms| rooms.iter().any(|held| held["id"] == own_room));
+        if roster
+            .as_ref()
+            .is_ok_and(|roster| !roster.contains(&reader_fp))
+            && !leaving
+        {
+            break;
+        }
+        staging("the reader's departure taken", since, &|| {
+            format!(
+                "bob's roster: {roster:?}; the reader's leaving: {}",
+                status["leaving"]
+            )
+        });
+    }
+    // claude leaves too, so bob is the reader's only member when it joins again, and its
+    // recovery is bob's port. claude itself never joins again.
+    let (ok, out, err) = vox(
+        host,
+        &as_node(&["room", "leave", &own_room], Some(taker)),
+        None,
+    );
+    assert!(
+        ok,
+        "APPARATUS: {taker}'s `vox room leave` failed: {out}{err}"
+    );
+    let since = Instant::now();
+    loop {
+        let roster = roster_of(peer_dir, *peer_node);
+        if roster
+            .as_ref()
+            .is_ok_and(|roster| !roster.contains(&taker_fp) && !roster.contains(&reader_fp))
+        {
+            break;
+        }
+        staging("bob taking claude's departure", since, &|| {
+            format!("bob's roster: {roster:?}")
+        });
+    }
+
+    // Both archive jobs held by the first two nodes' older pages of another room.
+    let archive_hold = staged
+        .archive_hold
+        .as_ref()
+        .expect("APPARATUS: archive hold path was not staged");
+    std::fs::File::create(archive_hold).unwrap_or_else(|error| {
+        panic!(
+            "APPARATUS: could not create {}: {error}",
+            archive_hold.display()
+        )
+    });
+    let archive = stage_two_archive_jobs(&staged);
+    let older_room = archive.room.clone();
+
+    // The reader joins its room again: its own history there must be recovered, by an archive
+    // page that now waits in the daemon's queue.
+    let (ok, link, err) = vox(
+        peer_dir,
+        &as_node(&["room", "link", &own_room], *peer_node),
+        None,
+    );
+    assert!(ok, "APPARATUS: bob could not give a link: {err}");
+    let link = link
+        .lines()
+        .find(|line| line.starts_with("vox://"))
+        .unwrap_or(link.trim())
+        .to_owned();
+    let (ok, out, err) = vox(
+        host,
+        &as_node(
+            &["room", "join", "--passphrase-file", "-", &link],
+            Some(reader),
+        ),
+        Some(&format!("{ROOMPASS}\n")),
+    );
+    assert!(
+        ok,
+        "APPARATUS: {reader}'s join again was refused: {out}{err}"
+    );
+    let since = Instant::now();
+    let first = loop {
+        let status = hosted_status(host, reader);
+        if let Some(turn) = archive_turn_of(&status).filter(|turn| turn["room"] == own_room) {
+            break turn;
+        }
+        staging(
+            "the reader's own-history recovery queued for an archive job",
+            since,
+            &|| format!("{}", status["lanes"]["bounded"]),
+        );
+    };
+    eprintln!("[archive-turn] the reader's recovery is queued: {first}");
+    assert!(
+        first["peer"] == bob_fp,
+        "APPARATUS: the reader's recovery is not on bob's port: {first}"
+    );
+
+    // The reader joins the held room and asks for the page below its oldest row there.
+    let (ok, link, err) = vox(
+        peer_dir,
+        &as_node(&["room", "link", &older_room], *peer_node),
+        None,
+    );
+    assert!(ok, "APPARATUS: the peer could not give a link: {err}");
+    let link = link
+        .lines()
+        .find(|line| line.starts_with("vox://"))
+        .unwrap_or(link.trim())
+        .to_owned();
+    let (ok, out, err) = vox(
+        host,
+        &as_node(
+            &["room", "join", "--passphrase-file", "-", &link],
+            Some(reader),
+        ),
+        Some(&format!("{ROOMPASS}\n")),
+    );
+    assert!(
+        ok,
+        "APPARATUS: {reader}'s join of the held room was refused: {out}{err}"
+    );
+    let page = vox_core::log::history::MAX_PAGE_ENTRIES.to_string();
+    let since = Instant::now();
+    let oldest = loop {
+        let (ok, out, err) = vox(
+            host,
+            &as_node(
+                &["room", "read", &older_room, "--json", "--limit", &page],
+                Some(reader),
+            ),
+            None,
+        );
+        assert!(
+            ok,
+            "APPARATUS: {reader}'s read of the held room was refused: {out}{err}"
+        );
+        let oldest = out
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|row| {
+                row["text"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with("archive-pressure-"))
+            })
+            .and_then(|row| row["entry_hash"].as_str().map(str::to_owned));
+        if let Some(oldest) = oldest {
+            break oldest;
+        }
+        staging("the reader's live window of the held room", since, &|| {
+            out.clone()
+        });
+    };
+    let (ok, out, err) = vox(
+        host,
+        &as_node(
+            &[
+                "room",
+                "read",
+                &older_room,
+                "--history",
+                "older",
+                "--before",
+                &oldest,
+            ],
+            Some(reader),
+        ),
+        None,
+    );
+    assert!(
+        ok,
+        "APPARATUS: {reader}'s older-history request was refused: {out}{err}"
+    );
+
+    // Both requests wait while the jobs are held. The older page's port starts and is told to
+    // wait; the recovery's queued turn must still be its own.
+    let since = Instant::now();
+    let mut in_a_row = Vec::new();
+    while in_a_row.len() < 3 {
+        let status = hosted_status(host, reader);
+        let holders: Vec<&str> = status["lanes"]["budget"]["archive_nodes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        assert!(
+            !holders.contains(&reader_fp.as_str()),
+            "APPARATUS: the reader was given an archive job while both were held: {}",
+            status["lanes"]["budget"]
+        );
+        let turn = archive_turn_of(&status);
+        if let Some(turn) = turn
+            .as_ref()
+            .filter(|turn| turn["room"] != first["room"] || turn["request"] != first["request"])
+        {
+            let engaged = said(host, "host")
+                .lines()
+                .find(|line| line.contains(MUTANT))
+                .map(str::to_owned);
+            panic!(
+                "RED PRODUCT: the reader's queued archive turn moved from its own-history \
+                 recovery ({first}) to {turn} while neither ran and both archive jobs were held \
+                 by {holders:?}: the recovery's place in the daemon's archive queue was dropped. \
+                 Budget: {}; recovery ports: {:?}; older-page ports: {:?}; mutant line: {engaged:?}",
+                status["lanes"]["budget"],
+                ports_of(&status, &own_room),
+                ports_of(&status, &older_room)
+            );
+        }
+        let refused = ports_of(&status, &older_room).into_iter().find(|port| {
+            port["start_service"] == "Archive"
+                && port["start_outcome"] == "not_started"
+                && port["start_reason"] == "archive_budget_busy"
+        });
+        match (turn, refused) {
+            (Some(turn), Some(port)) => in_a_row.push((turn, port)),
+            (turn, _) => {
+                in_a_row.clear();
+                staging("the older page's port told to wait", since, &|| {
+                    format!("turn {turn:?}; ports {:?}", ports_of(&status, &older_room))
+                });
+            }
+        }
+    }
+    eprintln!(
+        "[archive-turn] three status answers in a row: the older page waits, the recovery keeps \
+         its turn: {in_a_row:?}"
+    );
+    if mutant {
+        panic!("APPARATUS: {MUTANT} was set and the reader's turn was kept");
+    }
+
+    // The recovery's port stops being able to run: bob, its only peer, stops (verdict-2 P2), or
+    // own-1 cannot save and its storage recovery keeps failing, so its ports are poisoned while
+    // bob stays connected (verdict-3 P2). Its ticket must not keep the older page waiting.
+    let room_cannot_save = |status: &serde_json::Value| {
+        let key = format!("room-store:{own_room}");
+        status["unhealthy"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|line| line["key"] == key.as_str())
+            && ports_of(status, &own_room)
+                .iter()
+                .any(|port| port["peer"] == bob_fp && port["needs_classes"][2] == false)
+    };
+    let cannot_run = |status: &serde_json::Value| match owner_stops {
+        OwnerStops::PeerStopped => {
+            member_connected_as(host, Some(reader), &own_room, &bob_fp) == Some(false)
+        }
+        OwnerStops::RoomCannotSave => room_cannot_save(status),
+    };
+    let (stopped, still) = match owner_stops {
+        OwnerStops::PeerStopped => {
+            drop(staged.peer_daemon.take());
+            (
+                "with bob, the recovery's only peer, stopped and shown gone",
+                "with bob still stopped",
+            )
+        }
+        OwnerStops::RoomCannotSave => {
+            let poison = staged
+                .poison_room
+                .as_ref()
+                .expect("APPARATUS: room-fault path was not staged");
+            std::fs::write(poison, format!("{own_room}\n")).unwrap_or_else(|error| {
+                panic!("APPARATUS: could not write {}: {error}", poison.display())
+            });
+            (
+                "with own-1 unable to save (its storage recovery failing) and the recovery's port \
+                 to bob shown not needing an Archive round",
+                "with own-1 still unable to save",
+            )
+        }
+    };
+    let since = Instant::now();
+    loop {
+        let status = hosted_status(host, reader);
+        if cannot_run(&status) {
+            break;
+        }
+        staging("the recovery's port shown unable to run", since, &|| {
+            format!(
+                "unhealthy {}; own-1 ports {:?}",
+                status["unhealthy"],
+                ports_of(&status, &own_room)
+            )
+        });
+    }
+    let mut kept = Vec::new();
+    loop {
+        let status = hosted_status(host, reader);
+        let turn = archive_turn_of(&status);
+        if turn.as_ref().is_some_and(|turn| turn["room"] == older_room) {
+            eprintln!(
+                "[archive-turn] the recovery's port unable to run: the older page holds the \
+                 turn: {turn:?}"
+            );
+            break;
+        }
+        if turn.as_ref().is_some_and(|turn| {
+            turn["room"] == first["room"] && turn["request"] == first["request"]
+        }) && cannot_run(&status)
+        {
+            kept.push(turn.clone());
+            if kept.len() == 3 {
+                let engaged = said(host, "host")
+                    .lines()
+                    .find(|line| line.contains(UNRUNNABLE_MUTANT))
+                    .map(str::to_owned);
+                panic!(
+                    "RED PRODUCT: {stopped}, the reader's archive turn stayed the recovery's in \
+                     three status answers in a row ({kept:?}) and its older page kept waiting; \
+                     older-page ports: {:?}; own-1 ports: {:?}; mutant line: {engaged:?}",
+                    ports_of(&status, &older_room),
+                    ports_of(&status, &own_room)
+                );
+            }
+        } else {
+            kept.clear();
+        }
+        staging("the older page taking the turn", since, &|| {
+            format!("{turn:?}")
+        });
+    }
+    if unrunnable_mutant {
+        panic!(
+            "APPARATUS: {UNRUNNABLE_MUTANT} was set and the unrunnable port's turn was released"
+        );
+    }
+
+    // Let the jobs go while the recovery's port still cannot run: the older page, which now holds
+    // the turn, runs and completes.
+    std::fs::remove_file(archive_hold).unwrap_or_else(|error| {
+        panic!(
+            "APPARATUS: could not remove {}: {error}",
+            archive_hold.display()
+        )
+    });
+    let completing = format!("the older page completing {still}");
+    let since = Instant::now();
+    loop {
+        let (ok, out, err) = vox(
+            host,
+            &as_node(
+                &["room", "read", &older_room, "--history", "status", "--json"],
+                Some(reader),
+            ),
+            None,
+        );
+        assert!(
+            ok,
+            "PRODUCT: {reader}'s older-page status failed: {out}{err}"
+        );
+        let reply: HistoryDemandReply = serde_json::from_str(&out).unwrap_or_else(|error| {
+            panic!("PRODUCT: {reader}'s older-page status is not JSON ({error}): {out}")
+        });
+        use vox_core::node::api::HistoryDemandPhase as Phase;
+        match reply.status.phase {
+            Phase::Complete | Phase::More => break,
+            Phase::Cancelled | Phase::Paused | Phase::Idle => {
+                panic!("RED PRODUCT: {reader}'s older page ended without its rows: {out}")
+            }
+            _ => {}
+        }
+        staging(&completing, since, &|| {
+            let status = hosted_status(host, reader);
+            format!(
+                "{out}; older-page ports {:?}; own-1 ports {:?}; the reader's bounded lanes {}; \
+                 budget {}",
+                ports_of(&status, &older_room),
+                ports_of(&status, &own_room),
+                status["lanes"]["bounded"],
+                status["lanes"]["budget"]
+            )
+        });
+    }
+
+    if owner_stops == OwnerStops::RoomCannotSave {
+        // Not asserted here: once the room saves again and is reopened, the recovery's old Flow
+        // waits in retirement on a cleanup that failed while the room was poisoned, and in the
+        // one run of that step the recovery did not start again (fix3 report, poisG1).
+        println!(
+            "GREEN: while both archive jobs were held, the reader's older-page port was told to \
+             wait and its own-history recovery kept its queued turn; {stopped}, the turn moved to \
+             the older page, which completed once the jobs were let go"
+        );
+        return;
+    }
+    // bob comes back: the recovery, whose ticket was given back, asks again and is admitted to
+    // an archive job: its port to bob starts an Archive round after bob's restart.
+    let restarted = Instant::now();
+    staged.peer_daemon = Some(daemon(peer_dir, "peer"));
+    attached_as(peer_dir, "peer", None);
+    let back = "bob back";
+    loop {
+        let status = hosted_status(host, reader);
+        let port = ports_of(&status, &own_room)
+            .into_iter()
+            .find(|port| port["peer"] == bob_fp);
+        if port.as_ref().is_some_and(|port| {
+            port["start_service"] == "Archive"
+                && port["start_outcome"] == "started"
+                && port["start_age_ms"]
+                    .as_u64()
+                    .is_some_and(|age| u128::from(age) < restarted.elapsed().as_millis())
+        }) {
+            eprintln!("[archive-turn] {back}: the recovery started again: {port:?}");
+            break;
+        }
+        staging(
+            &format!("the recovery starting again with {back}"),
+            restarted,
+            &|| {
+                format!(
+                    "{port:?}; unhealthy {}; the reader's bounded lanes {}",
+                    status["unhealthy"], status["lanes"]["bounded"]
+                )
+            },
+        );
+    }
+    println!(
+        "GREEN: while both archive jobs were held, the reader's older-page port was told to wait \
+         and its own-history recovery kept its queued turn; {stopped}, the turn moved to the \
+         older page, which completed once the jobs were let go; with {back}, the recovery \
+         started again"
+    );
+}
+
 /// How long the converged room idles while its sync rounds are counted.
 const IDLE: Duration = Duration::from_secs(60);
 
@@ -2270,6 +2926,8 @@ struct Staged {
     archive_hold: Option<std::path::PathBuf>,
     release_hold: Option<std::path::PathBuf>,
     pool_floor: Option<std::path::PathBuf>,
+    /// While it exists, the rooms it names cannot save on the host (`VOX_TEST_POISON_ROOM_FILE`).
+    poison_room: Option<std::path::PathBuf>,
     _tmp: tempfile::TempDir,
 }
 
@@ -2578,6 +3236,7 @@ fn stage_hosted_nodes(
     let archive_hold = hold_live_jobs.then(|| root.join("hold-archive-job"));
     let release_hold = hold_live_jobs.then(|| root.join("hold-flow-release"));
     let pool_floor = hold_live_jobs.then(|| root.join("flow-state-floor"));
+    let poison_room = hold_live_jobs.then(|| root.join("poison-room"));
     let live_hold_text = live_hold
         .as_ref()
         .map(|path| path.to_string_lossy().into_owned());
@@ -2588,6 +3247,9 @@ fn stage_hosted_nodes(
         .as_ref()
         .map(|path| path.to_string_lossy().into_owned());
     let pool_floor_text = pool_floor
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned());
+    let poison_room_text = poison_room
         .as_ref()
         .map(|path| path.to_string_lossy().into_owned());
     let mut env: Vec<(&str, &str)> = vec![("VOX_TEST_KEYCHAIN", keychain.as_str())];
@@ -2610,6 +3272,9 @@ fn stage_hosted_nodes(
     }
     if let Some(path) = pool_floor_text.as_deref() {
         env.push(("VOX_TEST_FLOW_STATE_FLOOR_FILE", path));
+    }
+    if let Some(path) = poison_room_text.as_deref() {
+        env.push(("VOX_TEST_POISON_ROOM_FILE", path));
     }
     if single_foreground_job {
         env.push(("VOX_TEST_FOREGROUND_JOBS", "1"));
@@ -2738,6 +3403,7 @@ fn stage_hosted_nodes(
         archive_hold,
         release_hold,
         pool_floor,
+        poison_room,
         _tmp: tmp,
     }
 }
@@ -10817,6 +11483,15 @@ fn a_newcomer_shows_nothing_a_holder_serves_with_a_corrupt_control_proof() {
     rg1::holder_serves_a_prefix_it_never_committed(rg1::Provider::CorruptControl);
 }
 
+/// Ledger 78 (A): a member that posted and stopped comes back to a reader whose request for that
+/// post went on to another member, stopped since; the reader reads the returning member at once.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "three real daemons, a stopped holder and a returning author; optional"]
+fn a_returning_author_is_read_while_the_member_its_reader_asked_is_stopped() {
+    rg1::returning_author_read_while_its_holder_is_stopped();
+}
+
 #[cfg(feature = "optional-proofs")]
 #[path = "support/port_forward.rs"]
 mod port_forward;
@@ -13218,6 +13893,291 @@ mod rg1 {
                 report["lanes"]
             );
             std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    /// Ledger 78 (A)'s mutant: a flow parked in the node's ready position for one member keeps
+    /// every other member's new work waiting until that member's own port starts, as on main.
+    const OFFLINE_SLOT_MUTANT: &str = "VOX_MUTANT_PARKED_FLOW_KEEPS_READY";
+
+    fn wait_shown(w: &Worker, id: &str, text: &str, why: &str) {
+        let staging = Instant::now();
+        while !read(w, id, Some(text)).0.contains(text) {
+            if staging.elapsed() > Duration::from_secs(240) {
+                let full = report(w);
+                panic!(
+                    "APPARATUS: {} never showed {text:?} ({why}); its rooms: {}; its lanes: {}",
+                    w.name, full["rooms"], full["lanes"]
+                );
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    /// The whole `vox status --json` answer.
+    fn report(w: &Worker) -> Value {
+        let out = w.vox(None, &["status", "--json"]);
+        assert!(out.ok, "RED PRODUCT: {}'s status refused: {out:?}", w.name);
+        out.json()
+    }
+
+    /// The bounded flows (`lanes.bounded` `ready`, `running`, `deferred`) owed to `peer`.
+    fn flows_for(report: &Value, peer: &str, lists: &[&str]) -> Vec<Value> {
+        lists
+            .iter()
+            .filter_map(|list| report["lanes"]["bounded"][*list].as_array())
+            .flatten()
+            .filter(|flow| flow["peer"].as_str() == Some(peer))
+            .cloned()
+            .collect()
+    }
+
+    /// Ledger 78 (A): a member posts, stops, and comes back to a reader whose request for that
+    /// post went to another member that has stopped since. The reader asked the holder for the
+    /// author's post; the holder answered it does not have the evidence
+    /// (`VOX_TEST_UNAVAILABLE_HEAD_FILE` names the author and the reader on the holder only), so
+    /// the reader routed the request to the stopped author. The holder stops; the author comes
+    /// back and posts again. Its turn returns the request's flow to the stopped holder, where it
+    /// parks in the reader's one live position. Main then left the author's new posts unasked
+    /// until the holder came back. GREEN when the reader shows both of the author's posts. RED
+    /// when, in three status answers in a row, the reader is connected to the author, wants it
+    /// (`needs`), holds the same verified position below the author's advertised one with no
+    /// round toward it completed, and has no flow of the author ready or running. Mutant:
+    /// `VOX_MUTANT_PARKED_FLOW_KEEPS_READY`.
+    pub(super) fn returning_author_read_while_its_holder_is_stopped() {
+        let mutant = std::env::var_os(OFFLINE_SLOT_MUTANT).is_some();
+        let root = root();
+        let exe = binary();
+        let mut knobs = vec!["VOX_TEST_UNAVAILABLE_HEAD_FILE"];
+        if mutant {
+            knobs.push(OFFLINE_SLOT_MUTANT);
+        }
+        crate::test_knobs::require_in(&exe, &knobs);
+        let author = room::worker_as(root.path(), "back-author", &exe);
+        let holder = room::worker_as(root.path(), "back-holder", &exe);
+        let reader = room::worker_as(root.path(), "back-reader", &exe);
+        let refusal = root.path().join("holder-refuses-the-author-head");
+        let author_daemon = start(&author, "127.0.0.1:0", None);
+        let holder_daemon = start_with(
+            &holder,
+            "127.0.0.1:0",
+            None,
+            &[("VOX_TEST_UNAVAILABLE_HEAD_FILE", refusal.clone())],
+        );
+        let reader_daemon = start(&reader, "127.0.0.1:0", None);
+        for w in [&author, &holder, &reader] {
+            for peer in [&author, &holder, &reader] {
+                if w.name != peer.name {
+                    w.vox_env(
+                        None,
+                        &[("VOX_IDENTITY_PASSPHRASE", room::ID_PASS)],
+                        &["trust", "add", &peer.b32(), "--name", &peer.name],
+                        None,
+                    )
+                    .expect_ok("trust before the room");
+                }
+            }
+        }
+        let id = create(&author);
+        let link = author.vox(None, &["room", "link", &id]);
+        link.expect_ok("author room link");
+        for w in [&holder, &reader] {
+            w.vox_in(
+                None,
+                &["room", "join", "--passphrase-file", "-", link.stdout.trim()],
+                Some(room::ROOM_PASS),
+            )
+            .expect_ok("member joins the author's room");
+            returning_reader_ready(w, &id);
+        }
+        post(&author, &id, "BACK-FIRST", true);
+        wait_shown(&holder, &id, "BACK-FIRST", "before the staging");
+        wait_shown(&reader, &id, "BACK-FIRST", "before the staging");
+        // The author posts while the reader is stopped, and stops once the holder shows it. The
+        // post waits until the holder shows the reader gone, so the holder's fetch of it does not
+        // run in the same instant as the reader's connection closing (in every run before this
+        // wait the post reached the holder 0.05-0.25 s after that close).
+        reader_daemon.stop();
+        let staging = Instant::now();
+        while member(&status(&holder, &id), &reader.b32())
+            .is_some_and(|row| row["connected"] == true)
+        {
+            assert!(
+                staging.elapsed() < Duration::from_secs(240),
+                "APPARATUS: the holder never saw the reader stop"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        post(&author, &id, "BACK-BEFORE", true);
+        wait_shown(&holder, &id, "BACK-BEFORE", "the post the reader missed");
+        author_daemon.stop();
+        std::fs::write(&refusal, format!("{} {}\n", author.b32(), reader.b32()))
+            .expect("APPARATUS: write the holder's refusal");
+        let _reader_daemon = start(&reader, "127.0.0.1:0", None);
+        returning_reader_ready(&reader, &id);
+        // The reader learns of the author's post from the holder alone and is refused it there;
+        // its request now waits for the stopped author. The holder then stops, and the request
+        // must still wait for the author once the reader sees the holder gone. It does not when
+        // the refusal came over a connection the two then retired for a newer one (both dial at
+        // the reader's start): the closing connection re-arms the refusal and the request goes
+        // back to the holder (seen in actA3 and actA4 on main, "history rearm retained"). Then
+        // the holder is started again, refuses again, and is stopped again; at most three times.
+        let mut holder_daemon = holder_daemon;
+        let mut attempt = 1;
+        loop {
+            let staging = Instant::now();
+            loop {
+                let routed = flows_for(&report(&reader), &author.b32(), &["deferred"]);
+                if !routed.is_empty() {
+                    eprintln!(
+                        "[ledger 78 A] attempt {attempt}: the reader's request waits for the \
+                         author: {routed:?}"
+                    );
+                    break;
+                }
+                assert!(
+                    staging.elapsed() < Duration::from_secs(240),
+                    "APPARATUS: the reader never routed its request to the stopped author: {}",
+                    report(&reader)["lanes"]["bounded"]
+                );
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            holder_daemon.stop();
+            let staging = Instant::now();
+            while member(&status(&reader, &id), &holder.b32())
+                .is_some_and(|row| row["connected"] == true)
+            {
+                assert!(
+                    staging.elapsed() < Duration::from_secs(240),
+                    "APPARATUS: the reader never saw the holder stop"
+                );
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            let bounded = report(&reader)["lanes"]["bounded"].clone();
+            if bounded["deferred"]
+                .as_array()
+                .is_some_and(|flows| flows.iter().any(|flow| flow["peer"] == author.b32()))
+            {
+                break;
+            }
+            assert!(
+                attempt < 3,
+                "APPARATUS: in three attempts the reader's request never still waited for the \
+                 author once the holder stopped; bounded flows: {bounded}"
+            );
+            eprintln!(
+                "[ledger 78 A] attempt {attempt}: the request went back to the stopped holder; \
+                 the holder starts again"
+            );
+            attempt += 1;
+            holder_daemon = start_with(
+                &holder,
+                "127.0.0.1:0",
+                None,
+                &[("VOX_TEST_UNAVAILABLE_HEAD_FILE", refusal.clone())],
+            );
+        }
+        let _author_daemon = start(&author, "127.0.0.1:0", None);
+        returning_reader_ready(&author, &id);
+        let staging = Instant::now();
+        while !member(&status(&reader, &id), &author.b32())
+            .is_some_and(|row| row["connected"] == true)
+        {
+            assert!(
+                staging.elapsed() < Duration::from_secs(240),
+                "APPARATUS: the reader never connected to the returning author"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        post(&author, &id, "BACK-AT-ONCE", true);
+        eprintln!("[ledger 78 A] the author is back and posted; the holder stays stopped");
+        let wanted = ["BACK-BEFORE", "BACK-AT-ONCE"];
+        let started = Instant::now();
+        let mut still = Vec::new();
+        loop {
+            let (shown, _, _) = read(&reader, &id, None);
+            if wanted.iter().all(|text| shown.contains(*text)) {
+                assert!(
+                    !mutant,
+                    "APPARATUS: {OFFLINE_SLOT_MUTANT} was set and the reader still read the \
+                     author"
+                );
+                eprintln!(
+                    "GREEN: with the holder stopped, the reader shows the returning author's \
+                     posts {wanted:?}"
+                );
+                return;
+            }
+            let full = report(&reader);
+            let room = full["rooms"]
+                .as_array()
+                .and_then(|rows| rows.iter().find(|row| row["id"].as_str() == Some(&id)))
+                .cloned()
+                .unwrap_or(Value::Null);
+            let row = member(&room, &author.b32()).cloned().unwrap_or(Value::Null);
+            let port = full["lanes"]["ports"]
+                .as_array()
+                .and_then(|ports| {
+                    ports
+                        .iter()
+                        .find(|port| port["peer"].as_str() == Some(&author.b32()))
+                })
+                .cloned()
+                .unwrap_or(Value::Null);
+            let completed = full["sync"].as_array().and_then(|rows| {
+                rows.iter()
+                    .find(|sync| {
+                        sync["room"].as_str() == Some(&id)
+                            && sync["peer"].as_str() == Some(&author.b32())
+                    })
+                    .and_then(|sync| sync["completed"].as_u64())
+            });
+            let behind = row["advertised_through"]
+                .as_u64()
+                .is_some_and(|advertised| {
+                    row["verified_through"].as_u64().unwrap_or(0) < advertised
+                });
+            let wedged = row["connected"] == true
+                && behind
+                && port["needs"] == true
+                && flows_for(&full, &author.b32(), &["ready", "running"]).is_empty();
+            if wedged {
+                still.push((row["verified_through"].clone(), completed));
+                if still.len() > 3 {
+                    still.remove(0);
+                }
+            } else {
+                still.clear();
+            }
+            if still.len() == 3 && still.iter().all(|sample| *sample == still[0]) {
+                let engaged = std::fs::read_to_string(reader.data.with_extension("err"))
+                    .unwrap_or_default()
+                    .lines()
+                    .find(|line| line.contains(&format!("{OFFLINE_SLOT_MUTANT} engaged")))
+                    .map(str::to_owned);
+                assert!(
+                    !mutant || engaged.is_some(),
+                    "APPARATUS: {OFFLINE_SLOT_MUTANT} was set but the reader never said it \
+                     engaged; see {}",
+                    reader.data.with_extension("err").display()
+                );
+                panic!(
+                    "RED PRODUCT: the reader does not show {wanted:?} (shows {shown:?}) and, in \
+                     three status answers in a row, is connected to the returning author, needs \
+                     it, holds the same verified position below the author's advertised one \
+                     with no round toward it completed, and has no flow of the author ready or \
+                     running: {still:?}. Author row: {row}; port toward the author: {port}; \
+                     bounded flows: {}; mutant line: {engaged:?}",
+                    full["lanes"]["bounded"]
+                );
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(900),
+                "APPARATUS: NO RESULT after 900 s: neither the author's posts nor a wedge; \
+                 shows {shown:?}; author row: {row}; port toward the author: {port}; lanes: {}",
+                full["lanes"]
+            );
+            std::thread::sleep(Duration::from_secs(1));
         }
     }
 
