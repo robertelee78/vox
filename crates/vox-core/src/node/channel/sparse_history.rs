@@ -524,7 +524,7 @@ impl ChannelState {
         store: &Store,
         authorization: Option<(Digest32, Digest32)>,
     ) -> Result<PendingHistoryAdmission> {
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         if self.post_pending() {
@@ -761,7 +761,7 @@ impl ChannelState {
     }
 
     pub(crate) fn uses_sparse_history(&self, store: &Store) -> Result<bool> {
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         Ok(self
@@ -940,7 +940,7 @@ impl ChannelState {
                 "room publication is busy; retry this operation",
             ));
         }
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         let mut batch = store.batch()?;
@@ -977,7 +977,7 @@ impl ChannelState {
     }
 
     pub(crate) fn history_read<'a>(&'a self, store: &Store) -> Result<entry_store::Read<'a>> {
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         let read = self.entries.read(store, &self.sek, &self.channel_id)?;
@@ -1426,7 +1426,7 @@ impl ChannelState {
                 "room publication is busy; retry this operation",
             ));
         }
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         if entry.skeleton.channel_id != self.channel_id
@@ -1593,7 +1593,7 @@ impl ChannelState {
                 "room publication is busy; retry this operation",
             ));
         }
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         self.require_history_source_boundary(entry)?;

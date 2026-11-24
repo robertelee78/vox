@@ -485,7 +485,7 @@ impl ChannelState {
             self.availability_peer(author, None)?;
         }
         self.publish_room_snapshot(&store);
-        if self.poisoned {
+        if self.poisoned.get() {
             // A definitive failed write cannot certify whatever roots redb exposes after
             // its error. The actor retains this exact save's pre-preparation MVCC lease
             // until reopen/revoke; poisoned writers cannot grow that retained view.

@@ -264,7 +264,7 @@ impl ChannelState {
     ) -> Result<PendingText> {
         // A left room takes no post (the decider, 2026-11-11): the leave is not undone by one.
         self.ensure_local_append_available_for(store, false)?;
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         if !self.settled {
@@ -699,7 +699,7 @@ impl ChannelState {
             }
         }
         if let Some(error) = failure {
-            self.poisoned = true;
+            self.mark_poisoned();
             self.save_error = Some(error);
         }
         self.history_publication_changed.notify_waiters();
@@ -714,7 +714,7 @@ impl ChannelState {
         {
             self.pending_text = None;
             if poison {
-                self.poisoned = true;
+                self.mark_poisoned();
                 self.save_error.get_or_insert_with(|| {
                     "room save did not complete; check vox status and reopen this room before posting again"
                         .to_owned()

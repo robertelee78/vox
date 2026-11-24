@@ -141,6 +141,18 @@ fn poison_keeps_snapshot(room: &Digest32, say: bool) -> bool {
     false
 }
 
+/// Whether a room is poisoned (a failed save; it refuses until reopened). Its field is private to
+/// this module, so [`ChannelState::mark_poisoned`] is the only code that can set it, and it
+/// revokes the room's published snapshot in the same step.
+#[derive(Debug, Default)]
+pub(super) struct Poisoned(bool);
+
+impl Poisoned {
+    pub(super) fn get(&self) -> bool {
+        self.0
+    }
+}
+
 impl ChannelState {
     /// The cell serving reads this room's published snapshot from.
     pub(crate) fn room_snapshot(&self) -> Arc<RoomSnapshotCell> {
@@ -150,7 +162,7 @@ impl ChannelState {
     /// Publish what serving needs after a committed history write. A poisoned room publishes
     /// nothing (see [`Self::mark_poisoned`]).
     pub(crate) fn publish_room_snapshot(&self, store: &Store) {
-        let snapshot = if !self.poisoned {
+        let snapshot = if !self.poisoned.get() {
             self.capture_room_snapshot(store).ok().map(Arc::new)
         } else if poison_keeps_snapshot(&self.channel_id, false) {
             return;
@@ -165,8 +177,8 @@ impl ChannelState {
     /// is published while it stays poisoned. Its storage recovery opens a new room instance,
     /// which publishes its own snapshot when the actor installs it (`Node::open_room`).
     pub(super) fn mark_poisoned(&mut self) {
-        let keeps = poison_keeps_snapshot(&self.channel_id, !self.poisoned);
-        self.poisoned = true;
+        let keeps = poison_keeps_snapshot(&self.channel_id, !self.poisoned.get());
+        self.poisoned = Poisoned(true);
         if !keeps {
             self.room_snapshot.revoke();
         }

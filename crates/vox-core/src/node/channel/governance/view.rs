@@ -1649,7 +1649,7 @@ impl super::super::ChannelState {
         {
             return Ok(vec![Eligible; entries.len()]);
         }
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(self.save_failure());
         }
         recipient_eligibility_at(

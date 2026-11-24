@@ -107,7 +107,7 @@ impl ChannelState {
     ) -> Result<Option<PendingSupport>> {
         let me = self.me();
         if !self.settled
-            || self.poisoned
+            || self.poisoned.get()
             || self.has_left(&me)
             || (self.private_sessions.support_rediscovery && !discovery_ready)
         {

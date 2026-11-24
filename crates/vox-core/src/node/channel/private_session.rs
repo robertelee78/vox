@@ -1077,7 +1077,7 @@ impl ChannelState {
     /// but the catch-up closes the gap, and until it does every answer about that author is
     /// "Session control facts are refreshing".
     pub(crate) fn session_controls_lagging(&self, store: &Store) -> Result<bool> {
-        if self.poisoned || self.has_left(&self.me()) {
+        if self.poisoned.get() || self.has_left(&self.me()) {
             return Ok(false);
         }
         self.current_session_controls_ready(store)
@@ -1675,7 +1675,7 @@ impl ChannelState {
         if super::governance::refreshing(error) || Self::authorization_refreshing(error) {
             return;
         }
-        self.poisoned = true;
+        self.mark_poisoned();
         self.save_error = Some(error.to_string());
     }
 }
@@ -1703,7 +1703,7 @@ impl ChannelState {
         peer: Digest32,
         projection_causal: bool,
     ) -> PrivatePullIntent {
-        if self.poisoned
+        if self.poisoned.get()
             || self.drive.receivers.is_empty()
             || self.private_sessions.pulling.contains(&peer)
             || !self.drive_members().contains(&peer)
@@ -1733,7 +1733,7 @@ impl ChannelState {
         {
             return Ok(None);
         }
-        if self.poisoned
+        if self.poisoned.get()
             || self.drive.receivers.is_empty()
             || !self.supports_private(store, &peer)?
             || !self.private_peer_current(store, &peer)?
@@ -1809,7 +1809,7 @@ impl ChannelState {
         peer: &Digest32,
     ) -> Result<(Cursor, Digest32)> {
         self.require_governance_ready(store, crate::time::Ms(self.now_hint))?;
-        if self.poisoned
+        if self.poisoned.get()
             || !self.private_peer_current(store, peer)?
             || !self.current_session_controls_ready(store)?
         {

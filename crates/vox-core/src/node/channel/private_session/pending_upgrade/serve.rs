@@ -37,7 +37,7 @@ impl ChannelState {
         charge: BufferCharge,
     ) -> Result<Box<PendingUpgrade>> {
         self.require_governance_ready(store, crate::time::Ms(self.now_hint))?;
-        if self.poisoned
+        if self.poisoned.get()
             || self.needs_session_upgrade()
             || ask.room != self.channel_id
             || ask.epoch != self.epoch
@@ -77,7 +77,7 @@ impl ChannelState {
         admission: MediaAdmission,
     ) -> Result<Box<PendingUpgrade>> {
         self.require_governance_ready(store, crate::time::Ms(self.now_hint))?;
-        if self.poisoned
+        if self.poisoned.get()
             || self.needs_session_upgrade()
             || !self.private_peer_current(store, &admission.peer)?
         {
