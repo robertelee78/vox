@@ -25,8 +25,17 @@ pub(crate) async fn exchange(
     query: Query,
     fence: Arc<Fence>,
     deadline: tokio::time::Instant,
+    introduction: &[Vec<u8>],
 ) -> Result<Received> {
     query.validate()?;
+    // Ledger 91: the first time this connection is used for the room, this node's own board
+    // records go to the peer's board, and the request waits for the board's answer. A member the
+    // peer does not know yet is then on its board, so the Sync stream gate takes it and the
+    // peer's roster admission runs on the request itself. A refusal as a stranger puts them again.
+    if !conn.introduced(&preamble.room) && !board_offer_mutant() {
+        introduce(conn, introduction, &fence, deadline).await;
+        conn.note_introduced(preamble.room, true);
+    }
     let opening = job.reserve_or_pressure(1024)?;
     let streams = tokio::select! {
         biased;
@@ -54,6 +63,14 @@ pub(crate) async fn exchange(
         conn.serial(),
     )
     .await;
+    if matches!(
+        result,
+        Err(Error::PeerRefused(
+            WireError::NotYetMember | WireError::AuthenticatorInvalid
+        ))
+    ) {
+        conn.note_introduced(preamble.room, false);
+    }
     if let Err(error) = &result {
         io.abort(match error {
             Error::HistoryCapacity(_) => WireError::SessionBusy,
@@ -62,6 +79,53 @@ pub(crate) async fn exchange(
         });
     }
     result
+}
+
+/// Put this node's own board records (its bundle, then its address record, whose key the bundle
+/// carries) on the peer's board, and wait for its answer. A refusal is the peer's board policy
+/// speaking (an older claim, a record it already holds): the request goes on either way.
+async fn introduce(
+    conn: &VoxConnection,
+    records: &[Vec<u8>],
+    fence: &Fence,
+    deadline: tokio::time::Instant,
+) {
+    if records.is_empty() {
+        return;
+    }
+    let put = async {
+        let mut client = crate::nat::service::RendezvousClient::open(conn).await?;
+        for record in records {
+            let _ = client.put(record).await;
+        }
+        client.finish();
+        Ok::<_, Error>(())
+    };
+    tokio::select! {
+        biased;
+        () = fence.retired() => {}
+        _ = tokio::time::timeout_at(deadline, put) => {}
+    }
+}
+
+/// `VOX_MUTANT_BOARD_OFFER_CONDITIONAL` (test-knobs): a request does not first put this node's
+/// records on the peer's board, as before ledger 91 (only the conditional board exchange of a
+/// fresh inventory flow or a key waiting on a bundle offered them). Says so once on stderr.
+#[cfg(feature = "test-knobs")]
+fn board_offer_mutant() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let on = std::env::var_os("VOX_MUTANT_BOARD_OFFER_CONDITIONAL").is_some();
+        if on {
+            eprintln!("vox: VOX_MUTANT_BOARD_OFFER_CONDITIONAL engaged: no board put first");
+        }
+        on
+    });
+    *ON
+}
+
+#[cfg(not(feature = "test-knobs"))]
+const fn board_offer_mutant() -> bool {
+    false
 }
 
 async fn handshake_and_pull(

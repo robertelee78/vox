@@ -84,9 +84,13 @@ mod own_historical_keys;
 mod own_history;
 pub(crate) mod own_writer_gate;
 mod proof_range;
+pub(crate) mod room_snapshot;
+pub(crate) use room_snapshot::{RoomSnapshot, RoomSnapshotCell, ServedRoom};
 mod receiver_overlay;
 mod receiver_releases;
-pub(crate) use proof_range::{bad_prefix, ProofRangeRestore, ProofRangeStep, ResolvedTarget};
+pub(crate) use proof_range::{
+    bad_prefix, serve_proof_range, ProofRangeRestore, ProofRangeStep, ResolvedTarget,
+};
 pub(crate) mod session_floor;
 pub(crate) mod session_projection;
 mod sparse_history;
@@ -1484,6 +1488,8 @@ pub struct ChannelState {
     gen: Arc<std::sync::atomic::AtomicU64>,
     /// Revocable committed history publication, independent of the mutable room lane.
     history_read: Option<Arc<history::ReadResource>>,
+    /// What answering another member reads instead of this room (see [`RoomSnapshot`]).
+    room_snapshot: Arc<RoomSnapshotCell>,
     /// Each author's in-memory jump over positions its live walk already passed
     /// ([`entry_store::sparse::LiveResume`]); empty after a restart.
     pub(crate) live_resume: BTreeMap<Digest32, entry_store::sparse::LiveResume>,
@@ -1494,6 +1500,7 @@ impl Drop for ChannelState {
         if let Some(resource) = &self.history_read {
             resource.revoke();
         }
+        self.room_snapshot.revoke();
         self.sek.lock_now();
     }
 }
@@ -2362,6 +2369,7 @@ impl ChannelState {
             settled: true,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             history_read: None,
+            room_snapshot: Arc::default(),
             live_resume: BTreeMap::new(),
         };
         // The room's name is stated on its log as its first entry after the genesis, so every
@@ -3005,6 +3013,7 @@ impl ChannelState {
             settled,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             history_read: None,
+            room_snapshot: Arc::default(),
             live_resume: BTreeMap::new(),
         };
         room.entries
@@ -3507,6 +3516,7 @@ impl ChannelState {
             settled: false,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             history_read: None,
+            room_snapshot: Arc::default(),
             live_resume: BTreeMap::new(),
         })
     }
@@ -9186,14 +9196,11 @@ impl ChannelState {
     /// only the later signed departure closes that return.
     #[must_use]
     pub fn has_left(&self, author: &Digest32) -> bool {
-        #[cfg(feature = "test-knobs")]
-        if *author != self.me()
-            && crate::node::computer::fx28_mutant("sync-departed-peer")
-            && std::env::var_os("VOX_TEST_DEPARTED_AS_MEMBER_FILE")
-                .is_some_and(|path| std::path::Path::new(&path).is_file())
-        {
-            return false;
-        }
+        !room_snapshot::departed_as_member(author, &self.me()) && self.departed(author)
+    }
+
+    /// [`Self::has_left`] without its test knob.
+    fn departed(&self, author: &Digest32) -> bool {
         let Some(seq) = self.left_at(author) else {
             return false;
         };
@@ -9563,6 +9570,7 @@ impl ChannelState {
         if let Some(resource) = &self.history_read {
             resource.revoke();
         }
+        self.room_snapshot.revoke();
         self.sek.lock_now();
         self.continuity_key.lock_now();
         self.history_publication_changed.notify_waiters();

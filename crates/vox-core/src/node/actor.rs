@@ -39,7 +39,7 @@ use crate::node::api::{
     ChannelDetail, ChannelSummary, Fault, IdentityInfo, MessageRow, NodeCommand, NodeEvent,
     NodeView, Outcome, Secret,
 };
-use crate::node::channel::{ChannelState, Rendered, SessionAdvance, SessionRefresh};
+use crate::node::channel::{ChannelState, Rendered, ServedRoom, SessionAdvance, SessionRefresh};
 use crate::node::net::PeerPolicy;
 use crate::node::network::{BoardExchangeScope, Inbound, NodeNet};
 use crate::node::open_rooms::OpenRooms;
@@ -797,11 +797,59 @@ fn command_name(c: &NodeCommand) -> &'static str {
     }
 }
 
+/// File one answered bounded request in `vox status`, whether the actor or the connection's own
+/// task answered it. Count the actual user-visible transfer edge even if the round later ends
+/// partial, fails, or its attempt has already retired: a sent history object, or a newly
+/// accepted symmetric inventory hint, did happen and must not disappear from the lane's account
+/// because terminal DONE did not arrive. Only a `current` attempt files its outcome.
+fn note_served(
+    book: &crate::node::status::SharedSyncBook,
+    channel_id: Digest32,
+    peer: Digest32,
+    current: bool,
+    result: &crate::error::Result<crate::node::history_stream::Status>,
+    moved: bool,
+) {
+    if moved {
+        crate::node::status::SyncBook::with(book, channel_id, peer, |counts| {
+            counts.history_served = counts.history_served.saturating_add(1);
+        });
+    }
+    if !current {
+        return;
+    }
+    crate::node::status::SyncBook::with(book, channel_id, peer, |counts| match result {
+        Ok(crate::node::history_stream::Status::Complete) => {
+            counts.completed += 1;
+            // A current authenticated bounded completion settles the same failure streak as a
+            // successful legacy session.
+            counts.consecutive_failures = 0;
+            counts.failing_since = None;
+            counts
+                .reasons
+                .count(crate::node::status::RoundReason::Served);
+            counts.served_completed += 1;
+            // A served round that moved nothing is as empty as a fetched one: in a quiet room
+            // both periodic directions are (FX-29).
+            if !moved {
+                counts.empty += 1;
+                counts.served_empty += 1;
+            }
+        }
+        Ok(_) => counts.partial += 1,
+        Err(error) => {
+            counts.failed += 1;
+            counts.last_failure = Some(error.to_string());
+        }
+    });
+}
+
 /// A short name for what inbound work was, for the stall report.
 fn net_event_name(e: &NetEvent) -> &'static str {
     match e {
         NetEvent::JoinRequest { .. } => "answering somebody's join",
         NetEvent::SyncRequest { .. } => "answering a sync",
+        NetEvent::Served { .. } => "filing a request answered off the actor",
         NetEvent::Pairwise(..) => "taking a pairwise stream",
         NetEvent::OwnKeyDonorBusy { .. }
         | NetEvent::OwnKeyDonorSlot { .. }
@@ -1569,6 +1617,13 @@ enum NetEvent {
         /// The stream's receive half.
         recv: quinn::RecvStream,
     },
+    /// A member's bounded request was answered on its connection's own task (see
+    /// `answer_off_actor`): its port exists, and a new inventory hint wakes the room.
+    Served {
+        channel_id: Digest32,
+        peer: Digest32,
+        inventory_added: bool,
+    },
     /// A peer's pairwise stream, its frames **already read** off the actor (V210-71).
     Pairwise(PairwiseIn),
     /// A bounded worker has prepared an encrypted own-key response; current authority and
@@ -2312,6 +2367,144 @@ fn spawn_stream_loop(
     })
 }
 
+/// **A member's bounded history request is accepted and answered on its connection's own task**,
+/// authorized from the room's published snapshot ([`crate::node::channel::RoomSnapshot`]): it
+/// never waits for the actor's turn, the room's lock or this node's own saving. A peer the room
+/// does not know is read up to its opening Hello: the board record it carries goes on this
+/// node's board and to the roster admission, and it is told "not yet a member" meanwhile
+/// (ledger 91). Everything else (a room not open or not at that epoch, a departed or removed
+/// peer) goes to the actor as before: the streams come back.
+async fn answer_off_actor(
+    net: &Arc<NodeNet>,
+    tx: &mpsc::Sender<NetEvent>,
+    conn: Arc<VoxConnection>,
+    peer: Digest32,
+    preamble: crate::node::history_stream::Preamble,
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+) -> Option<(quinn::SendStream, quinn::RecvStream)> {
+    use crate::node::history_budget::Lane;
+    use crate::node::history_stream::Purpose;
+    use crate::wire::WireError;
+    let channel_id = preamble.room;
+    // Proof diagnostics only: why a request went to the actor, or how a stranger was answered.
+    let said = |what: &str| {
+        #[cfg(feature = "test-knobs")]
+        eprintln!(
+            "vox: history request peer={} {what}",
+            crate::node::link::b32_encode(&peer)
+        );
+        #[cfg(not(feature = "test-knobs"))]
+        let _ = what;
+    };
+    let Some(serving) = net.serving().cloned() else {
+        said("to the actor: no serving");
+        return Some((send, recv));
+    };
+    let Some(room) = serving.room(&channel_id) else {
+        said("to the actor: room not served");
+        return Some((send, recv));
+    };
+    let (Some(cell), Some(shared), Some(store)) = (
+        room.snapshot.upgrade(),
+        room.channel.upgrade(),
+        room.store.upgrade(),
+    ) else {
+        said("to the actor: room gone");
+        return Some((send, recv));
+    };
+    let Some(snapshot) = cell.current() else {
+        said("to the actor: no snapshot");
+        return Some((send, recv));
+    };
+    if snapshot.epoch() != preamble.epoch || !snapshot.sparse() {
+        said("to the actor: other epoch or not sparse");
+        return Some((send, recv));
+    }
+    // A peer this room does not know yet: its board records, put on this node's board before
+    // its first request (ledger 91), let the actor's roster admission run on this very request,
+    // as it always has (`run_sync_session`, `After::Sync`).
+    if !snapshot.is_author(&peer) {
+        said("to the actor: not an author here yet");
+        return Some((send, recv));
+    }
+    if !snapshot.is_member(&peer) {
+        said("to the actor: departed author");
+        return Some((send, recv));
+    }
+    let removed = {
+        let (snapshot, store) = (Arc::clone(&snapshot), Arc::clone(&store));
+        tokio::task::spawn_blocking(move || snapshot.peer_removal_applied(&store, &peer)).await
+    };
+    if !matches!(removed, Ok(Ok(false))) {
+        return Some((send, recv));
+    }
+    // The mutant build's `refuse-sessions` (#85): every inbound session refused, with a reason.
+    #[cfg(feature = "mutant-sender")]
+    if let Some(code) = crate::log::sync::mutant::refuses() {
+        crate::node::net::refuse_stream_because(&mut send, &mut recv, code);
+        return None;
+    }
+    let lane = match preamble.purpose {
+        Purpose::Control => Lane::Control,
+        Purpose::Live => Lane::Live,
+        Purpose::History => Lane::Archive,
+    };
+    // Up to `INBOUND_PER_PORT` answers per peer; past that refused at once, never held.
+    let fence = crate::transport::stream_transport::Fence::new();
+    let Some(token) = serving.begin(channel_id, peer, Arc::clone(&fence)) else {
+        crate::node::status::SyncBook::with(&serving.book, channel_id, peer, |c| {
+            c.busy_refused += 1;
+        });
+        crate::node::net::refuse_stream_because(&mut send, &mut recv, WireError::SessionBusy);
+        return None;
+    };
+    let Some(job) = serving.budget.try_start(room.node, lane) else {
+        serving.end(channel_id, token);
+        crate::node::net::refuse_stream_because(&mut send, &mut recv, WireError::SessionBusy);
+        return None;
+    };
+    let running = crate::node::status::Running::start(
+        &serving.book,
+        channel_id,
+        peer,
+        token,
+        false,
+        crate::node::status::SyncStep::Exchanging,
+    );
+    let availability = conn.supports_availability().then_some(conn.serial());
+    let task = tokio::spawn(crate::node::history_stream::serve(
+        shared,
+        store,
+        peer,
+        conn.serial(),
+        preamble,
+        send,
+        recv,
+        job,
+        fence,
+        Arc::clone(&serving.inbox),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        availability,
+        cell,
+    ));
+    serving.running(channel_id, token, task.abort_handle());
+    let answered = task.await;
+    let current = serving.end(channel_id, token);
+    drop(running);
+    if let Ok((result, inventory_added, moved)) = answered {
+        note_served(&serving.book, channel_id, peer, current, &result, moved);
+        let _ = tx
+            .send(NetEvent::Served {
+                channel_id,
+                peer,
+                inventory_added: current && inventory_added,
+            })
+            .await;
+    }
+    None
+}
+
 /// A stream whose kind has been read: the kind and both halves.
 type Typed = (
     crate::transport::streams::StreamKind,
@@ -2549,6 +2742,7 @@ async fn serve_typed(
             state.failures = 0;
             let tx = tx.clone();
             let conn = Arc::clone(&conn);
+            let net = Arc::clone(net);
             tokio::spawn(async move {
                 let mut recv = recv;
                 let Ok(preamble) = crate::node::syncstream::read_request_preamble(&mut recv).await
@@ -2556,9 +2750,24 @@ async fn serve_typed(
                     return;
                 };
                 let (channel_id, epoch) = preamble.room_epoch();
-                let history = match preamble {
-                    crate::node::syncstream::RequestPreamble::Legacy { .. } => None,
-                    crate::node::syncstream::RequestPreamble::Bounded(preamble) => Some(preamble),
+                let (history, send, recv) = match preamble {
+                    crate::node::syncstream::RequestPreamble::Legacy { .. } => (None, send, recv),
+                    crate::node::syncstream::RequestPreamble::Bounded(preamble) => {
+                        let Some((send, recv)) = answer_off_actor(
+                            &net,
+                            &tx,
+                            Arc::clone(&conn),
+                            peer,
+                            preamble,
+                            send,
+                            recv,
+                        )
+                        .await
+                        else {
+                            return;
+                        };
+                        (Some(preamble), send, recv)
+                    }
                 };
                 let _ = tx
                     .send(NetEvent::SyncRequest {
@@ -6712,6 +6921,8 @@ pub struct Node {
     /// lock/unlock controller replacement and this actor unwinding until cleanup completes.
     bounded_retirement_ledger: Arc<crate::node::history_budget::RetirementLedger>,
     history_hints: Arc<crate::node::history_stream::HintInbox>,
+    /// The rooms whose members' history requests each connection's own task answers.
+    serving: Arc<crate::node::history_stream::Serving>,
     /// Scalar scheduling identities only. Durable targets and pages remain in the room/store.
     own_recovery_rooms: BTreeMap<Digest32, (Digest32, u64, bool)>,
     /// The exact authenticated own message whose body the readability audit still needs.
@@ -7545,6 +7756,13 @@ impl Node {
             bounded_sync.recover_node_retirements(node);
         }
         let (termination, termination_state) = watch::channel(TerminationState::default());
+        let history_hints = crate::node::history_stream::HintInbox::new();
+        let sync_book = crate::node::status::SyncBook::shared();
+        let serving = Arc::new(crate::node::history_stream::Serving::new(
+            Arc::clone(&history_budget),
+            Arc::clone(&sync_book),
+            Arc::clone(&history_hints),
+        ));
         let node = Self {
             termination,
             history_demand: history_demand::Controller::default(),
@@ -7554,7 +7772,8 @@ impl Node {
             key_body_scan: key_body_scan::Controller::default(),
             availability_wake: Arc::new(tokio::sync::Notify::new()),
             bounded_retirement_ledger,
-            history_hints: crate::node::history_stream::HintInbox::new(),
+            history_hints,
+            serving,
             own_recovery_rooms: BTreeMap::new(),
             own_recovery_body_debts: BTreeMap::new(),
             own_readable_effects: BTreeMap::new(),
@@ -7803,7 +8022,7 @@ impl Node {
             offered: std::collections::BTreeMap::new(),
             app: Arc::new(crate::node::app::AppHub::default()),
             status: crate::node::status::StatusBook::default(),
-            sync_book: crate::node::status::SyncBook::shared(),
+            sync_book,
         };
         let mut node = node;
         node.status.started = (node.clock)();
@@ -9326,6 +9545,7 @@ impl Node {
                 let _ = tx.try_send(NetEvent::BoardWithdrew);
             }));
         }
+        net.serve_history(Arc::clone(&self.serving));
         let net = Arc::new(net);
         self.net = Some(Arc::clone(&net));
         self.board_exchange_retirement =
@@ -12169,6 +12389,18 @@ impl Node {
                 self.run_sync_session(conn, peer, channel_id, epoch, history, send, recv, false)
                     .await;
             }
+            NetEvent::Served {
+                channel_id,
+                peer,
+                inventory_added,
+            } => {
+                // The peer spoke first: its port exists for the room held now, as the actor made
+                // sure when it accepted requests itself.
+                self.ensure_port(&channel_id, &peer).await;
+                if inventory_added {
+                    self.sched_rooms.insert(channel_id);
+                }
+            }
             NetEvent::AddressesDiscovered => {
                 // Re-publish every open channel's records: the addresses in them were
                 // composed before discovery and may name only loopback.
@@ -13805,49 +14037,14 @@ impl Node {
                 let limited_recovery = current
                     .as_ref()
                     .is_some_and(|attempt| attempt.limited_recovery);
-                // Count the actual user-visible transfer edge even if the round later ends
-                // partial, fails, or its actor attempt has already retired. A sent history
-                // object, or a newly accepted symmetric inventory hint, did happen and must not
-                // disappear from the lane's account because terminal DONE did not arrive.
-                if moved {
-                    crate::node::status::SyncBook::with(
-                        &self.sync_book,
-                        channel_id,
-                        peer,
-                        |counts| counts.history_served = counts.history_served.saturating_add(1),
-                    );
-                }
-                if current.is_some() {
-                    crate::node::status::SyncBook::with(
-                        &self.sync_book,
-                        channel_id,
-                        peer,
-                        |counts| match result {
-                            Ok(crate::node::history_stream::Status::Complete) => {
-                                counts.completed += 1;
-                                // A current authenticated bounded completion settles the same
-                                // failure streak as a successful legacy session.
-                                counts.consecutive_failures = 0;
-                                counts.failing_since = None;
-                                counts
-                                    .reasons
-                                    .count(crate::node::status::RoundReason::Served);
-                                counts.served_completed += 1;
-                                // A served round that moved nothing is as empty as a fetched
-                                // one: in a quiet room both periodic directions are (FX-29).
-                                if !moved {
-                                    counts.empty += 1;
-                                    counts.served_empty += 1;
-                                }
-                            }
-                            Ok(_) => counts.partial += 1,
-                            Err(error) => {
-                                counts.failed += 1;
-                                counts.last_failure = Some(error.to_string());
-                            }
-                        },
-                    );
-                }
+                note_served(
+                    &self.sync_book,
+                    channel_id,
+                    peer,
+                    current.is_some(),
+                    &result,
+                    moved,
+                );
                 // A scalar wake schedules only already bounded new head hints. It does not
                 // authorize archive demand, and a retired inbound attempt cannot wake a room.
                 if current.is_some() && inventory_added {
@@ -17157,6 +17354,7 @@ impl Node {
         }
         self.bounded_sync.retire_port(*channel_id, *peer);
         self.history_hints.retire_port(*channel_id, *peer);
+        self.serving.retire(*channel_id, Some(*peer));
         if let Some(mut port) = self.ports.remove(&(*channel_id, *peer)) {
             for a in port.take_attempts() {
                 a.retire();
@@ -18427,6 +18625,7 @@ impl Node {
         if let Some(SyncFailure::Poisoned(_)) = &report.fail {
             // The room is poisoned: its ports retire their attempts and wait for a reopen, which
             // holds a new room instance and so new ports. No retry until then.
+            self.serving.retire(channel_id, None);
             let keys: Vec<(Digest32, Digest32)> = self
                 .ports
                 .keys()
@@ -19230,6 +19429,30 @@ impl Node {
         }
     }
 
+    /// The one way a room becomes open on this node: it publishes its read snapshot, enters
+    /// `channels`, and is answered for on each connection's own task from then on. Every room
+    /// held open is therefore served; none depends on a call site remembering to install it.
+    fn open_room(&mut self, id: Digest32, room: ChannelState) {
+        let store = self.log_store();
+        if let Some(store) = &store {
+            room.publish_room_snapshot(store);
+        }
+        let snapshot = room.room_snapshot();
+        let shared = Arc::new(tokio::sync::Mutex::new(room));
+        if let (Some(store), Some(profile)) = (store, self.profile.as_ref()) {
+            self.serving.install(
+                id,
+                crate::node::history_stream::OpenRoom {
+                    channel: Arc::downgrade(&shared),
+                    snapshot: Arc::downgrade(&snapshot),
+                    store: Arc::downgrade(&store),
+                    node: profile.fingerprint(),
+                },
+            );
+        }
+        self.channels.insert(id, shared);
+    }
+
     fn start_bounded_inbound(
         &mut self,
         peer: Digest32,
@@ -19260,6 +19483,14 @@ impl Node {
                 &mut recv,
                 crate::wire::WireError::SessionBusy,
             );
+            return;
+        };
+        let Some(snapshot) = self
+            .serving
+            .room(&channel_id)
+            .and_then(|room| room.snapshot.upgrade())
+        else {
+            crate::node::net::refuse_stream(&mut send, &mut recv);
             return;
         };
         let Some(port) = self.ports.get_mut(&(channel_id, peer)) else {
@@ -19311,6 +19542,7 @@ impl Node {
                 inbox,
                 departure_receipt,
                 availability_connection,
+                snapshot,
             )
             .await;
             let _ = tx
@@ -20651,6 +20883,7 @@ impl Node {
         self.session_ingress_waits
             .retain(|(room, _), _| room != channel_id);
         self.channels.remove(channel_id);
+        self.serving.withdraw(*channel_id);
         self.room_publication_authority.remove(channel_id);
         self.fresh_details.remove(channel_id);
         self.board_routes.retain(|(room, _), _| room != channel_id);
@@ -21260,8 +21493,7 @@ impl Node {
             if let Some(net) = self.net.as_ref() {
                 net.forget_board_exchange_room(&channel_id);
             }
-            self.channels
-                .insert(channel_id, Arc::new(tokio::sync::Mutex::new(ch)));
+            self.open_room(channel_id, ch);
         };
         let published = match &lifetime {
             Some(held) => held.publish(install),
@@ -21648,6 +21880,7 @@ impl Node {
         if let Some(net) = self.net.as_ref() {
             net.forget_board_exchange_room(&room);
         }
+        self.serving.withdraw(room);
         let retirement = self.take_bounded_room(room, true);
         let mut room_cancel = self.own_key_room_watch(room);
         let mut epoch_changed = self.pairwise_epoch.subscribe();
@@ -21771,6 +22004,7 @@ impl Node {
         if let Some(net) = self.net.as_ref() {
             net.forget_board_exchange_room(&room);
         }
+        self.serving.withdraw(room);
         let retirement = self.take_bounded_room(room, true);
         let mut room_cancel = self.own_key_room_watch(room);
         let mut epoch_changed = self.pairwise_epoch.subscribe();

@@ -472,6 +472,12 @@ impl ChannelState {
         trusted: Option<&BTreeSet<Digest32>>,
         retain_snapshot: bool,
     ) -> Result<Arc<ReadResource>> {
+        // Every admitted author has its serving scalar before the snapshot shares them.
+        let authors: Vec<Digest32> = self.authors.keys().copied().collect();
+        for author in authors {
+            self.availability_peer(author, None)?;
+        }
+        self.publish_room_snapshot(&store);
         if self.poisoned {
             // A definitive failed write cannot certify whatever roots redb exposes after
             // its error. The actor retains this exact save's pre-preparation MVCC lease

@@ -1072,6 +1072,7 @@ impl Node {
         self.retire_parked_private_drive(room, Fault::ChannelNotOpen);
         self.session_ingress_waits.retain(|(id, _), _| id != room);
         let removed = self.channels.remove(room);
+        self.serving.withdraw(*room);
         drop(transition);
         let outcome = match removed {
             Some(shared) => {
@@ -1147,6 +1148,7 @@ impl Node {
         self.retire_parked_private_drive(room, Fault::ChannelNotOpen);
         self.session_ingress_waits.retain(|(id, _), _| id != room);
         self.channels.remove(room);
+        self.serving.withdraw(*room);
         drop(transition);
         self.reopening.remove(room);
         if let Some(net) = self.net.as_ref() {

@@ -1,6 +1,7 @@
 //! Bounded current-message work and explicitly requested archive work share the existing ports.
 //! Events carry tokens only; private slots retain capabilities until workers actually finish.
 use super::*;
+use crate::node::channel::ServedRoom;
 use crate::node::history_stream::{
     self as stream,
     runtime::{Flow, RetirementStep},
@@ -5561,6 +5562,15 @@ impl Node {
         // hinted or not (ADR-038 FX-35); once the bundle is held the fact is gone.
         flow.wants_board =
             service == OutboundService::Public && self.key_waiting.contains_key(&(room, peer));
+        // Its first request on this connection puts this node's own board records on the
+        // peer's board, so a peer that does not know it yet admits it (ledger 91).
+        flow.introduction = self.net.as_ref().map_or_else(
+            || Arc::from([]),
+            |net| {
+                net.own_board_records(&room, epoch, &profile.fingerprint())
+                    .into()
+            },
+        );
         flow.availability_connection = conn.serial();
         flow.availability_captured = self
             .ports
