@@ -2863,6 +2863,41 @@ impl Computer {
         drop(self.publications.read().await);
     }
 
+    /// Test-only (ledger 75): while `<VOX_TEST_HOLD_JOIN_REFRESH_FILE>.lease` exists, this
+    /// Computer's publication lease is held as a policy transition holds it: taken when a join
+    /// admission is requested, released once the file is gone. Each admission requested while the
+    /// file exists and a writer holds the lease appends its joiner to `<file>.lease.met`.
+    #[cfg(feature = "test-knobs")]
+    pub(crate) fn hold_publications_for_join_proof(&self, joiner: &Digest32) {
+        let Some(mut held) = std::env::var_os("VOX_TEST_HOLD_JOIN_REFRESH_FILE") else {
+            return;
+        };
+        held.push(".lease");
+        let held = std::path::PathBuf::from(held);
+        if !held.is_file() {
+            return;
+        }
+        if let Some(lease) = self.publications.try_write() {
+            let until = held.clone();
+            std::thread::spawn(move || {
+                while until.exists() {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                drop(lease);
+            });
+        }
+        if self.publications.writer_pending() {
+            let mut met = held.into_os_string();
+            met.push(".met");
+            let line = format!("{}\n", crate::node::link::b32_encode(joiner));
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(met)
+                .and_then(|mut met| std::io::Write::write_all(&mut met, line.as_bytes()));
+        }
+    }
+
     /// A synchronous writer waits at most until the transaction's own deadline, else the
     /// return window (`publication_gate::Gate::blocking_write_until`).
     fn changes_writer(
