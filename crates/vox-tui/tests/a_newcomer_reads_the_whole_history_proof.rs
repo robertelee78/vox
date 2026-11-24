@@ -10055,12 +10055,24 @@ fn a_newcomer_reads_a_member_while_the_author_it_cites_is_stopped() {
 }
 
 /// A flow moved to a stopped author's port gives back its body slot: the newcomer still reads
-/// the holder it reaches (byte-gate: a flow waited for good on a slot the moved flow kept).
+/// the holder it reaches (byte-gate: a flow waited for good on a slot the moved flow kept). Then
+/// the author starts again, and the newcomer reads every post the holder refused it, once each
+/// and in order (the moved body is staged again under a fresh request).
 #[cfg(feature = "optional-proofs")]
 #[test]
 #[ignore = "three real daemons, a stopped author and a holder refusing its bodies; optional"]
 fn a_newcomer_reads_the_holder_while_a_body_waits_on_the_stopped_author() {
-    rg1::a_moved_flow_leaves_the_body_slot();
+    rg1::a_stopped_flow_leaves_the_body_slot(rg1::SlotDoor::Moved);
+}
+
+/// A flow whose body ask the holder answered Busy, and whose holder then stopped, gives back its
+/// body slot: once the author is back, the newcomer reads from it the post the holder answered
+/// Busy for.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "three real daemons, a holder answering Busy and then stopped; optional"]
+fn a_newcomer_reads_a_member_after_the_holder_answered_busy_and_stopped() {
+    rg1::a_stopped_flow_leaves_the_body_slot(rg1::SlotDoor::Busy);
 }
 
 /// ADR-053 MP-7 (a) without the misleading newer head: the holder's later post depends on a
@@ -11226,22 +11238,50 @@ mod rg1 {
         }
     }
 
-    /// A newcomer's flow that walks a stopped author's window through a holder is moved to the
-    /// author's port when the holder refuses a body (`VOX_TEST_REFUSE_ENTRIES_FILE`: the holder
-    /// answers the newcomer EvidenceUnavailable for the bodies of the author's last twenty posts;
-    /// the knob names positions, not authors, so the holder's own short feed stays below them;
-    /// the author's grants for the holder come after them and are served, so the holder's own
-    /// post needs nothing refused). The author is stopped, so
-    /// the moved flow waits for good. Once the newcomer's stderr names that move, the holder
-    /// posts; the newcomer must read the holder's post. Before the fix the moved flow kept the
-    /// daemon's one live body slot, and the holder's post waited for it.
-    /// Mutant: `VOX_MUTANT_REROUTE_KEEPS_BODY_SLOT=1`.
-    pub(super) fn a_moved_flow_leaves_the_body_slot() {
+    /// Which way a flow of the newcomer comes to wait on a peer that is not there while it holds
+    /// the daemon's one live body slot (byte-gate, ledger 80).
+    pub(super) enum SlotDoor {
+        /// The holder refuses a body (EvidenceUnavailable) and the flow moves to the stopped
+        /// author's port.
+        Moved,
+        /// The holder answers a body ask Busy, then stops.
+        Busy,
+    }
+
+    /// The author posts thirty, the holder reads them, the author stops, and a newcomer joins
+    /// through the holder. The author and the newcomer trust each other from the start: a member
+    /// releases its key only to members it trusts, so without that the newcomer could never show
+    /// a post of the author, whatever it fetched. The holder answers the newcomer's body asks for
+    /// the author's last twenty posts (`VOX_TEST_REFUSE_ENTRIES_FILE`; the knob names positions,
+    /// not authors, so the holder's own short feed stays below them and its post needs nothing
+    /// refused):
+    /// - `Moved`: EvidenceUnavailable, so the newcomer's flow moves to the stopped author's port
+    ///   (its stderr says `ask=entry`: a body ask moved). The holder posts; the newcomer must
+    ///   read it. Then the author starts again and posts once; the newcomer's walk of that newer
+    ///   head (or of a later one: the author writes on once it learns of the newcomer) moves the
+    ///   refused body asks to the author's port, now reachable. Until that walk reaches position
+    ///   1, no round of the newcomer toward the author or the holder may fail
+    ///   (`vox status --json` `sync`); a moved body ask that reuses a spent staging request fails
+    ///   "history request ID must be fresh". Then the newcomer must show every one of the
+    ///   author's thirty posts, the twenty the holder refused among them, once each and in order.
+    /// - `Busy`: Busy (the holder's stderr says so); then the holder stops and the author starts
+    ///   again; the newcomer must read, from the author, the last post the holder answered Busy
+    ///   for.
+    ///
+    /// A flow that is not running keeps no body slot whose body waits on a peer; before that
+    /// rule the waiting flow kept the slot, and every later body of the newcomer waited for it.
+    /// Mutant: `VOX_MUTANT_PARKED_FLOW_KEEPS_BODY_SLOT=1`; its engaged line is asserted on every
+    /// mutant run, green or red.
+    pub(super) fn a_stopped_flow_leaves_the_body_slot(door: SlotDoor) {
         const POSTS: usize = 30;
-        const MUTANT: &str = "VOX_MUTANT_REROUTE_KEEPS_BODY_SLOT";
+        const MUTANT: &str = "VOX_MUTANT_PARKED_FLOW_KEEPS_BODY_SLOT";
         let root = root();
         let exe = binary();
-        let mut knobs = vec!["VOX_TEST_REFUSE_ENTRIES_FILE", "history reroute origin="];
+        let mut knobs = vec![
+            "VOX_TEST_REFUSE_ENTRIES_FILE answered ",
+            "history reroute origin=",
+            "live window passed author=",
+        ];
         let mutant = std::env::var_os(MUTANT).is_some();
         if mutant {
             knobs.push(MUTANT);
@@ -11251,8 +11291,17 @@ mod rg1 {
         let holder = room::worker_as(root.path(), "slot-holder", &exe);
         let reader = room::worker_as(root.path(), "slot-reader", &exe);
         let refuse = holder.data.with_extension("refuse-entries");
-        let author_daemon = start(&author, "127.0.0.1:0", None);
-        let _holder_daemon = start_with(
+        // The author starts again at the same address the others hold for it.
+        let author_at = {
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0")
+                .expect("APPARATUS: a free address for the author");
+            socket
+                .local_addr()
+                .expect("APPARATUS: the author's address")
+                .to_string()
+        };
+        let author_daemon = start(&author, &author_at, None);
+        let holder_daemon = start_with(
             &holder,
             "127.0.0.1:0",
             None,
@@ -11269,6 +11318,7 @@ mod rg1 {
         };
         trust(&author, &holder);
         trust(&holder, &author);
+        trust(&author, &reader);
         let id = create(&author);
         let feed = || {
             status(&author, &id)["own_feed_through"]
@@ -11279,12 +11329,21 @@ mod rg1 {
         for n in 1..=POSTS {
             post(&author, &id, &format!("SL-A-{n:02}"), true);
         }
-        // The holder refuses the newcomer the bodies of the last twenty of these posts; the
-        // author's entries before them and its grants for the holder after them are served, and
-        // the holder's own feed (a few entries) stays below them.
+        // The holder answers the newcomer's asks for the bodies of the last twenty of these
+        // posts; the author's entries before them and its grants for the holder after them are
+        // served, and the holder's own feed (a few entries) stays below them.
         std::fs::write(
             &refuse,
-            format!("{} {} {}", reader.b32(), before_posts + 11, feed()),
+            format!(
+                "{} {} {}{}",
+                reader.b32(),
+                before_posts + 11,
+                feed(),
+                match door {
+                    SlotDoor::Moved => "",
+                    SlotDoor::Busy => " busy",
+                }
+            ),
         )
         .expect("APPARATUS: refuse-entries staging file");
         let link = author.vox(None, &["room", "link", &id]);
@@ -11299,10 +11358,11 @@ mod rg1 {
         returning_reader_ready(&holder, &id);
         await_shown(&holder, &id, &format!("SL-A-{POSTS:02}"));
         author_daemon.stop();
-        eprintln!("[slot] author stopped for the rest of the act");
+        eprintln!("[slot] author stopped");
         let _reader_daemon = start(&reader, "127.0.0.1:0", None);
         trust(&holder, &reader);
         trust(&reader, &holder);
+        trust(&reader, &author);
         let link = holder.vox(None, &["room", "link", &id]);
         link.expect_ok("holder room link");
         reader
@@ -11312,48 +11372,134 @@ mod rg1 {
                 Some(room::ROOM_PASS),
             )
             .expect_ok("newcomer joins through the holder");
-        // Staging: the newcomer's walk of the author's window met a refused body at the holder
-        // and its flow moved to the stopped author's port.
-        let moved = format!(
-            "history reroute origin={} target={}",
-            holder.b32(),
-            author.b32()
-        );
         let err = reader.data.with_extension("err");
-        let staging = Instant::now();
-        while !std::fs::read_to_string(&err)
-            .unwrap_or_default()
-            .contains(&moved)
-        {
-            assert!(
-                staging.elapsed() < Duration::from_secs(600),
-                "APPARATUS: the newcomer never moved a flow to the stopped author; see {}",
-                err.display()
-            );
-            std::thread::sleep(Duration::from_millis(200));
+        let staged = |path: &Path, line: &dyn Fn(&str) -> bool, what: &str| {
+            let staging = Instant::now();
+            while !std::fs::read_to_string(path)
+                .unwrap_or_default()
+                .lines()
+                .any(line)
+            {
+                assert!(
+                    staging.elapsed() < Duration::from_secs(600),
+                    "APPARATUS: {what} never happened; see {}",
+                    path.display()
+                );
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            eprintln!("[slot] {what}");
+        };
+        let engaged = || {
+            !mutant
+                || std::fs::read_to_string(&err)
+                    .unwrap_or_default()
+                    .contains(&format!("{MUTANT} engaged"))
+        };
+        match door {
+            SlotDoor::Moved => {
+                // Staging: the newcomer's walk of the author's window met a refused body at the
+                // holder, and that body ask moved to the stopped author's port.
+                let moved = format!(
+                    "history reroute origin={} target={}",
+                    holder.b32(),
+                    author.b32()
+                );
+                staged(
+                    &err,
+                    &|line| line.contains(&moved) && line.ends_with(" ask=entry"),
+                    "the newcomer moved a body ask to the stopped author's port",
+                );
+                let wanted = "SL-H-after-the-move";
+                post(&holder, &id, wanted, true);
+                // The staging refuses positions, not authors: the holder's own post must lie
+                // below them, or the staging itself would refuse it.
+                let holder_through = status(&holder, &id)["own_feed_through"]
+                    .as_u64()
+                    .expect("APPARATUS: the holder's status has no own_feed_through");
+                assert!(
+                    holder_through < before_posts + 11,
+                    "APPARATUS: the holder's own feed reached position {holder_through}, inside \
+                     the refused positions (from {}); the staging itself would refuse its post",
+                    before_posts + 11
+                );
+                shown_or_wedged(&reader, &id, wanted, &holder, &author, &engaged, MUTANT);
+                eprintln!(
+                    "[slot] with a flow moved to the stopped author's port, the newcomer reads \
+                     the holder's post"
+                );
+                let _author_daemon = start(&author, &author_at, None);
+                eprintln!("[slot] author started again at {author_at}");
+                let before = failed_rounds(&reader, &[&author, &holder]);
+                post(&author, &id, "SL-A-back", true);
+                // The newcomer's walk of the author's newer head moves the refused body asks to
+                // the author's port again, now reachable: it ends at position 1. The author may
+                // write on (its key for the newcomer, once it learns of it): a walk of any head
+                // from this one on counts.
+                no_round_fails_until(&reader, &[&author, &holder], &before, &err, &author, feed());
+                let posts: Vec<String> = (1..=POSTS).map(|n| format!("SL-A-{n:02}")).collect();
+                shown_once_each_in_order(&reader, &id, &posts);
+                assert!(
+                    engaged(),
+                    "APPARATUS: {MUTANT} was set but the newcomer never said it engaged; see {}",
+                    err.display()
+                );
+                eprintln!(
+                    "GREEN: with a flow moved to the stopped author's port, the newcomer reads \
+                     the holder's post, and once the author is back its walk of the author's \
+                     newer head moves the refused body asks to the author without a failed round, \
+                     and it shows every post of the author, the refused ones among them, once \
+                     each and in order"
+                );
+            }
+            SlotDoor::Busy => {
+                let holder_err = holder.data.with_extension("err");
+                let busy = format!(
+                    "VOX_TEST_REFUSE_ENTRIES_FILE answered busy peer={}",
+                    reader.b32()
+                );
+                staged(
+                    &holder_err,
+                    &|line| line.contains(&busy),
+                    "the holder answered a body ask of the newcomer Busy",
+                );
+                holder_daemon.stop();
+                eprintln!("[slot] holder stopped");
+                let _author_daemon = start(&author, &author_at, None);
+                eprintln!("[slot] author started again at {author_at}");
+                let wanted = format!("SL-A-{POSTS:02}");
+                shown_or_wedged(&reader, &id, &wanted, &author, &holder, &engaged, MUTANT);
+                eprintln!(
+                    "GREEN: with a body ask answered Busy by a holder that then stopped, the \
+                     newcomer reads from the author the post the holder answered Busy for"
+                );
+            }
         }
-        eprintln!("[slot] the newcomer moved a flow to the stopped author's port");
-        let wanted = "SL-H-after-the-move";
-        post(&holder, &id, wanted, true);
-        // The staging refuses positions, not authors: the holder's own post must lie below them,
-        // or the staging itself would refuse it.
-        let holder_through = status(&holder, &id)["own_feed_through"]
-            .as_u64()
-            .expect("APPARATUS: the holder's status has no own_feed_through");
-        assert!(
-            holder_through < before_posts + 11,
-            "APPARATUS: the holder's own feed reached position {holder_through}, inside the \
-             refused positions (from {}); the staging itself would refuse its post",
-            before_posts + 11
-        );
+    }
+
+    /// Until `reader` shows `wanted`; RED PRODUCT when five status answers in a row show its flow
+    /// toward `toward` waiting on the same byte admission(s) while `away`'s port is not
+    /// connected, nothing runs, nothing is ready and no budget is held: only a release can wake
+    /// it, and nothing that runs can release anything. The mutant's engaged line is asserted
+    /// either way.
+    fn shown_or_wedged(
+        reader: &Worker,
+        id: &str,
+        wanted: &str,
+        toward: &Worker,
+        away: &Worker,
+        engaged: &dyn Fn() -> bool,
+        mutant: &str,
+    ) {
+        let err = reader.data.with_extension("err");
         let started = Instant::now();
         let mut last: Option<String> = None;
         let mut unchanged = 0;
         loop {
-            if read(&reader, &id, Some(wanted)).0.contains(wanted) {
-                eprintln!(
-                    "GREEN: with a flow moved to the stopped author's port, the newcomer reads \
-                     the holder's post"
+            if read(reader, id, Some(wanted)).0.contains(wanted) {
+                assert!(
+                    engaged(),
+                    "APPARATUS: {mutant} was set but the newcomer never said it engaged; see {}",
+                    err.display()
                 );
                 return;
             }
@@ -11373,22 +11519,19 @@ mod rg1 {
                 .map(|rows| {
                     rows.iter()
                         .filter(|row| {
-                            row["gate"] == "bytes" && row["peer"].as_str() == Some(&holder.b32())
+                            row["gate"] == "bytes" && row["peer"].as_str() == Some(&toward.b32())
                         })
                         .map(|row| row["admission"].to_string())
                         .collect()
                 })
                 .unwrap_or_default();
-            let author_unreached = lanes["ports"].as_array().is_some_and(|ports| {
+            let away_unreached = lanes["ports"].as_array().is_some_and(|ports| {
                 ports.iter().any(|port| {
-                    port["peer"].as_str() == Some(&author.b32()) && port["connected"] != true
+                    port["peer"].as_str() == Some(&away.b32()) && port["connected"] != true
                 })
             });
-            // Nothing runs, nothing is ready, no budget is held, and a flow toward the holder
-            // waits on a byte admission: only a release can wake it, and nothing that runs can
-            // release anything.
             let wedged = !waits.is_empty()
-                && author_unreached
+                && away_unreached
                 && empty(&bounded["running"])
                 && empty(&bounded["ready"])
                 && budget["control"] == 0
@@ -11403,24 +11546,146 @@ mod rg1 {
             last = now;
             if unchanged >= 4 {
                 assert!(
-                    !mutant
-                        || std::fs::read_to_string(&err)
-                            .unwrap_or_default()
-                            .contains(&format!("{MUTANT} engaged")),
-                    "APPARATUS: {MUTANT} was set but the newcomer never said it engaged; see {}",
+                    engaged(),
+                    "APPARATUS: {mutant} was set but the newcomer never said it engaged; see {}",
                     err.display()
                 );
                 panic!(
                     "RED PRODUCT: the newcomer does not show {wanted:?}: in five status answers \
-                     in a row its flow toward the holder waits on byte admission(s) {} while \
-                     nothing runs, nothing is ready and no budget is held; lanes: {lanes}",
-                    last.unwrap_or_default()
+                     in a row its flow toward {} waits on byte admission(s) {} while {}'s port is \
+                     not connected, nothing runs, nothing is ready and no budget is held; lanes: \
+                     {lanes}",
+                    toward.name,
+                    last.unwrap_or_default(),
+                    away.name
                 );
             }
             assert!(
                 started.elapsed() < Duration::from_secs(600),
-                "APPARATUS: NO RESULT after 600 s: neither the holder's post nor a wedge; \
-                 lanes: {lanes}"
+                "APPARATUS: NO RESULT after 600 s: neither {wanted:?} nor a wedge; lanes: {lanes}"
+            );
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+
+    /// Until `reader` shows every one of `wanted` (one page of `vox room read --json`, oldest
+    /// first): RED PRODUCT as soon as one of them is shown twice or two of them out of order.
+    fn shown_once_each_in_order(reader: &Worker, id: &str, wanted: &[String]) {
+        let started = Instant::now();
+        loop {
+            let out = reader.vox(None, &["room", "read", id, "--json", "--limit", "200"]);
+            out.expect_ok("newcomer room read");
+            assert!(
+                !out.stderr.contains("older messages not shown:"),
+                "APPARATUS: the newcomer's room holds more than one page and this check reads \
+                 one: {out:?}"
+            );
+            let shown: Vec<usize> = out
+                .stdout
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(|line| {
+                    serde_json::from_str::<Value>(line).unwrap_or_else(|error| {
+                        panic!("RED PRODUCT: the newcomer's room read is not NDJSON: {error}")
+                    })
+                })
+                .filter_map(|row| {
+                    let text = row["text"].as_str()?;
+                    wanted.iter().position(|post| post == text)
+                })
+                .collect();
+            let named = |at: &[usize]| at.iter().map(|n| wanted[*n].as_str()).collect::<Vec<_>>();
+            if let Some(pair) = shown.windows(2).find(|pair| pair[0] >= pair[1]) {
+                panic!(
+                    "RED PRODUCT: the newcomer shows {:?} {}: it shows {:?}",
+                    wanted[pair[1]],
+                    if pair[0] == pair[1] {
+                        "twice".to_owned()
+                    } else {
+                        format!("after {:?}", wanted[pair[0]])
+                    },
+                    named(&shown)
+                );
+            }
+            if shown.len() == wanted.len() {
+                eprintln!(
+                    "[slot] the newcomer shows {:?} once each in order",
+                    named(&shown)
+                );
+                return;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(600),
+                "APPARATUS: NO RESULT after 600 s: the newcomer shows {:?} of the {} posts",
+                named(&shown),
+                wanted.len()
+            );
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+
+    /// Each peer's `failed` count in `reader`'s `vox status --json` (`sync`).
+    fn failed_rounds(reader: &Worker, peers: &[&Worker]) -> Vec<(u64, Value)> {
+        let report = reader.vox(None, &["status", "--json"]);
+        report.expect_ok("newcomer status");
+        let report = report.json();
+        peers
+            .iter()
+            .map(|peer| {
+                let row = report["sync"].as_array().and_then(|rows| {
+                    rows.iter()
+                        .find(|row| row["peer"].as_str() == Some(&peer.b32()))
+                });
+                (
+                    row.and_then(|row| row["failed"].as_u64()).unwrap_or(0),
+                    row.map_or(Value::Null, |row| row["last_failure"].clone()),
+                )
+            })
+            .collect()
+    }
+
+    /// Until `reader`'s stderr says its walk of `author`'s feed under a head of `through` or more
+    /// entries reached position 1, then once more: RED PRODUCT when a round of `reader` toward
+    /// any of `peers` failed since `before` (`vox status --json` `sync`: `failed`,
+    /// `last_failure`).
+    fn no_round_fails_until(
+        reader: &Worker,
+        peers: &[&Worker],
+        before: &[(u64, Value)],
+        err: &Path,
+        author: &Worker,
+        through: u64,
+    ) {
+        let prefix = format!("live window passed author={} through=", author.b32());
+        let started = Instant::now();
+        loop {
+            let done = std::fs::read_to_string(err)
+                .unwrap_or_default()
+                .lines()
+                .find(|line| {
+                    line.split_once(&prefix)
+                        .and_then(|(_, rest)| rest.split_once(" at=1 to=0"))
+                        .and_then(|(head, _)| head.parse::<u64>().ok())
+                        .is_some_and(|head| head >= through)
+                })
+                .map(str::to_owned);
+            let now = failed_rounds(reader, peers);
+            for ((peer, (was, _)), (is, why)) in peers.iter().zip(before).zip(&now) {
+                assert!(
+                    is <= was,
+                    "RED PRODUCT: a round of the newcomer toward {} failed (failed {was} -> \
+                     {is}) once the author was back: {why}",
+                    peer.name
+                );
+            }
+            if let Some(walked) = done {
+                eprintln!("[slot] {walked}; failed rounds {now:?}");
+                return;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(600),
+                "APPARATUS: NO RESULT after 600 s: the newcomer's stderr never said \
+                 {prefix}<{through} or more> at=1 to=0; failed rounds {now:?}"
             );
             std::thread::sleep(Duration::from_secs(1));
         }
